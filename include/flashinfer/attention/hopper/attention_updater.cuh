@@ -228,12 +228,17 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = pv_scale / sum;
-      scores_scale(mi) = inv_sum;
-      if constexpr (WITH_SCALE) {
-        row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
+      // Keep fully masked rows at zero instead of normalizing masked entries.
+      if (row_max(mi) == fill_value) {
+        scores_scale(mi) = 0.f;
+        row_sum(mi) = fill_value;
       } else {
-        row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
+        scores_scale(mi) = pv_scale / sum;
+        if constexpr (WITH_SCALE) {
+          row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
+        } else {
+          row_sum(mi) = row_max(mi) + math::ptx_log2(sum);
+        }
       }
     }
   };

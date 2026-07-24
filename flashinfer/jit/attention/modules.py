@@ -20,15 +20,16 @@ from typing import List, Optional
 import jinja2
 import torch
 
+from ...jit.cubin_loader import get_artifact, get_meta_hash
+from ...utils import MaskMode
 from .. import env as jit_env
 from ..core import (
     JitSpec,
+    current_compilation_context,
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
-    current_compilation_context,
 )
-from ...jit.cubin_loader import get_artifact, get_meta_hash
 from ..utils import (
     dtype_map,
     dtype_map_kv,
@@ -37,9 +38,9 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import _is_nvfp4_kv_dtype, generate_additional_params
-from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+from .fmha_v2.generate_kernels import enumerate_kernels
+from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 
 
 def get_single_decode_uri(
@@ -991,12 +992,14 @@ def gen_batch_prefill_module(
     # KV-only quant is not influenced by this flag
     fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
 
-    assert backend in ["fa2", "fa3"], (
-        f"backend must be fa2 or fa3 in gen_batch_prefill_module(), got: {backend}"
-    )
-    assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], (
-        "FP8 output is not supported in fa2/fa3 backends yet"
-    )
+    assert backend in [
+        "fa2",
+        "fa3",
+    ], f"backend must be fa2 or fa3 in gen_batch_prefill_module(), got: {backend}"
+    assert dtype_o not in [
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ], "FP8 output is not supported in fa2/fa3 backends yet"
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
@@ -1362,6 +1365,58 @@ def gen_customize_single_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    """Public shared single-prefill gen. Compiles only the standard mask list
+    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
+    product. Block Extend uses the dedicated
+    gen_customize_block_extend_single_prefill_module dispatch path."""
+    return _gen_customize_single_prefill_module_impl(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+        [0, 1, 2, 3],
+        config_template_fa2="single_prefill_customize_config.jinja",
+        config_template_sm90="single_prefill_sm90_customize_config.jinja",
+    )
+
+
+def _gen_customize_single_prefill_module_impl(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+    mask_modes: Optional[List[int]] = None,
+    config_template_fa2: str = "single_prefill_customize_config.jinja",
+    config_template_sm90: str = "single_prefill_sm90_customize_config.jinja",
+) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1388,9 +1443,7 @@ def gen_customize_single_prefill_module(
             )
         )
 
-        with open(
-            jit_env.FLASHINFER_CSRC_DIR / "single_prefill_customize_config.jinja"
-        ) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / config_template_fa2) as f:
             config_templ = jinja2.Template(f.read())
 
         with open(
@@ -1410,7 +1463,8 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1454,7 +1508,6 @@ def gen_customize_single_prefill_module(
             )
         )
 
-        _file_config = "single_prefill_sm90_customize_config.jinja"
         if fp8_enabled:
             _file_kernel_inst = "single_prefill_fp8_sm90_kernel_inst.jinja"
             _file_csrc = "single_prefill_fp8_sm90.cu"
@@ -1462,7 +1515,7 @@ def gen_customize_single_prefill_module(
             _file_kernel_inst = "single_prefill_sm90_kernel_inst.jinja"
             _file_csrc = "single_prefill_sm90.cu"
 
-        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / config_template_sm90) as f:
             config_templ = jinja2.Template(f.read())
 
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_kernel_inst) as f:
@@ -1480,7 +1533,8 @@ def gen_customize_single_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -1510,6 +1564,149 @@ def gen_customize_single_prefill_module(
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")
+
+
+# Dedicated Block Extend front-ends keep mode 4 out of the shared JIT product.
+# They compile only the supported dtype, head-dimension, layout, and backend axes.
+
+_BLOCK_EXTEND_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_BLOCK_EXTEND_SUPPORTED_HEAD_DIMS = {64, 128}
+
+
+def _check_block_extend_axes(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> None:
+    for name, dtype in (
+        ("dtype_q", dtype_q),
+        ("dtype_kv", dtype_kv),
+        ("dtype_o", dtype_o),
+    ):
+        if dtype not in _BLOCK_EXTEND_SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Block-extend (dLLM) only supports {_BLOCK_EXTEND_SUPPORTED_DTYPES}, "
+                f"got {name}={dtype}."
+            )
+    if (
+        head_dim_qk not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS
+        or head_dim_vo not in _BLOCK_EXTEND_SUPPORTED_HEAD_DIMS
+    ):
+        raise ValueError(
+            f"Block-extend (dLLM) only supports head_dim in "
+            f"{sorted(_BLOCK_EXTEND_SUPPORTED_HEAD_DIMS)}, got "
+            f"head_dim_qk={head_dim_qk}, head_dim_vo={head_dim_vo}."
+        )
+
+
+def gen_customize_block_extend_single_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> "JitSpec":
+    """Dedicated single-prefill front-end for Block Extend attention.
+
+    Compiles only ``MaskMode::kBlockExtend`` over the supported product
+    using a standalone congregate-config class that hard-codes the dispatch
+    — a separate small cartesian product, not a new value multiplied into the
+    big shared prefill one.
+    """
+    _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
+    return _gen_customize_single_prefill_module_impl(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+        [MaskMode.BLOCK_EXTEND.value],
+        config_template_fa2="block_extend_single_prefill_customize_config.jinja",
+        config_template_sm90="block_extend_single_prefill_sm90_customize_config.jinja",
+    )
+
+
+def gen_customize_block_extend_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+) -> "JitSpec":
+    """Dedicated batch-prefill front-end for Block Extend attention.
+
+    Compiles only ``MaskMode::kBlockExtend`` over the supported product
+    using a standalone congregate-config class that hard-codes the dispatch
+    — a separate small cartesian product, not a new value multiplied into the
+    big shared prefill one.
+    """
+    _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
+    return _gen_customize_batch_prefill_module_impl(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+        [MaskMode.BLOCK_EXTEND.value],
+        config_template_fa2="block_extend_batch_prefill_customize_config.jinja",
+        config_template_sm90="block_extend_batch_prefill_sm90_customize_config.jinja",
+    )
 
 
 def gen_customize_batch_decode_module(
@@ -1617,6 +1814,60 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    """Public shared batch-prefill gen. Compiles only the standard mask list
+    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
+    product. Block Extend uses the dedicated
+    gen_customize_block_extend_batch_prefill_module dispatch path."""
+    return _gen_customize_batch_prefill_module_impl(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+        [0, 1, 2, 3],
+        config_template_fa2="batch_prefill_customize_config.jinja",
+        config_template_sm90="batch_prefill_sm90_customize_config.jinja",
+    )
+
+
+def _gen_customize_batch_prefill_module_impl(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+    mask_modes: Optional[List[int]] = None,
+    config_template_fa2: str = "batch_prefill_customize_config.jinja",
+    config_template_sm90: str = "batch_prefill_sm90_customize_config.jinja",
+) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1647,9 +1898,7 @@ def gen_customize_batch_prefill_module(
             additional_params_setter, additional_tensor_names
         )
 
-        with open(
-            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja"
-        ) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / config_template_fa2) as f:
             config_templ = jinja2.Template(f.read())
 
         with open(
@@ -1674,7 +1923,8 @@ def gen_customize_batch_prefill_module(
         os.makedirs(gen_directory, exist_ok=True)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             dest_path = (
                 gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
             )
@@ -1727,7 +1977,6 @@ def gen_customize_batch_prefill_module(
             )
         )
 
-        _file_config = "batch_prefill_sm90_customize_config.jinja"
         if fp8_enabled:
             _file_paged_kernel_inst = "batch_prefill_fp8_paged_sm90_kernel_inst.jinja"
             _file_ragged_kernel_inst = "batch_prefill_fp8_ragged_sm90_kernel_inst.jinja"
@@ -1737,7 +1986,7 @@ def gen_customize_batch_prefill_module(
             _file_ragged_kernel_inst = "batch_prefill_ragged_sm90_kernel_inst.jinja"
             _file_csrc = "batch_prefill_sm90.cu"
 
-        with open(jit_env.FLASHINFER_CSRC_DIR / _file_config) as f:
+        with open(jit_env.FLASHINFER_CSRC_DIR / config_template_sm90) as f:
             config_templ = jinja2.Template(f.read())
 
         with open(jit_env.FLASHINFER_CSRC_DIR / _file_paged_kernel_inst) as f:
@@ -1754,7 +2003,8 @@ def gen_customize_batch_prefill_module(
         generated_inc_str = config_templ.render(**kwargs)
 
         source_paths = []
-        for mask_mode in [0, 1, 2, 3]:
+        _mask_modes = mask_modes if mask_modes is not None else [0, 1, 2, 3]
+        for mask_mode in _mask_modes:
             filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)

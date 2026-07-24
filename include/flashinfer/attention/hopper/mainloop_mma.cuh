@@ -12,12 +12,13 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include "../../utils.cuh"
 #include "variants.cuh"
 
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
-          typename WarpScheduler, typename AttentionVariant, typename Params,
+template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND,
+          bool MULTIITEMSCORING, typename WarpScheduler, typename AttentionVariant, typename Params,
           typename MainloopPipeline, typename PipelineState, typename SharedStorage,
           typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
@@ -26,9 +27,9 @@ CUTLASS_DEVICE void mma_f16(
     FrgTensorO& tOrO, AttentionUpdater& attention_updater, int kv_tile_idx_count,
     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,
-    const int32_t qo_head_idx, const int32_t kv_head_idx, const uint32_t prefix_len,
-    uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
-    const int num_kv_tiles_prefix = 0) {
+    const int32_t qo_head_idx, const int32_t kv_head_idx, const int32_t batch_idx,
+    const uint32_t prefix_len, uint16_t* token_pos_in_items,
+    const int num_kv_tiles_outside_items_window = 0, const int num_kv_tiles_prefix = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -95,6 +96,56 @@ CUTLASS_DEVICE void mma_f16(
   auto col_limit_left = [&](int qo_idx) {
     return qo_idx + kv_len - qo_len - mainloop_params.window_left;
   };
+
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // Block Extend Mask Helper
+  // ════════════════════════════════════════════════════════════════════════════════════
+  //   mask[q, k] = (q_global / B) >= (kv_global / B)
+  //   q_global = q_offset + qo_idx
+  //   kv_global = kv_offset + kv_idx
+  // ════════════════════════════════════════════════════════════════════════════════════
+  int64_t dllm_block_size = 1;
+  int64_t q_block_extend_offset = 0;
+  int64_t kv_block_extend_offset = 0;  // kv_offset support for Cascade Current Chunk
+  if constexpr (BLOCK_EXTEND) {
+    if constexpr (has_dllm_block_size_v<decltype(mainloop_params.additional_params)>) {
+      dllm_block_size = mainloop_params.additional_params.dllm_block_size;
+    }
+    // Prefer reading per-batch offset from maybe_q_block_extend_offset array
+    // Otherwise fallback to scalar q_block_extend_offset
+    if constexpr (has_maybe_q_block_extend_offset_v<decltype(mainloop_params.additional_params)>) {
+      auto* offset_ptr = mainloop_params.additional_params.maybe_q_block_extend_offset;
+      if (offset_ptr != nullptr) {
+        q_block_extend_offset = offset_ptr[batch_idx];
+      }
+    } else if constexpr (has_q_block_extend_offset_v<decltype(mainloop_params.additional_params)>) {
+      q_block_extend_offset = mainloop_params.additional_params.q_block_extend_offset;
+    }
+    // Read kv_offset (for Cascade Current Chunk scenario)
+    // Prefer reading per-batch offset from maybe_kv_block_extend_offset array
+    // Otherwise fallback to scalar kv_block_extend_offset
+    if constexpr (has_maybe_kv_block_extend_offset_v<decltype(mainloop_params.additional_params)>) {
+      auto* offset_ptr = mainloop_params.additional_params.maybe_kv_block_extend_offset;
+      if (offset_ptr != nullptr) {
+        kv_block_extend_offset = offset_ptr[batch_idx];
+      }
+    } else if constexpr (has_kv_block_extend_offset_v<
+                             decltype(mainloop_params.additional_params)>) {
+      kv_block_extend_offset = mainloop_params.additional_params.kv_block_extend_offset;
+    }
+  }
+  auto block_extend_col_limit = [&](int qo_idx) -> int {
+    // q_block = (q_offset + qo_idx) / B
+    // Consider kv_offset: kv_global = kv_offset + kv_idx < (q_block + 1) * B
+    // So kv_idx < (q_block + 1) * B - kv_offset
+    // Fix: Ensure result is non-negative (return 0 when max_kv_global <= kv_offset)
+    int64_t q_global = q_block_extend_offset + qo_idx;
+    int64_t q_block = q_global / dllm_block_size;
+    int64_t max_kv_global = (q_block + 1) * dllm_block_size;
+    int64_t visible_kv_len = std::max(max_kv_global - kv_block_extend_offset, int64_t(0));
+    return static_cast<int>(std::min<int64_t>(kv_len, visible_kv_len));
+  };
+
   auto mask_multi_item_scoring = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool out_of_boundary =
@@ -150,10 +201,15 @@ CUTLASS_DEVICE void mma_f16(
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
       if constexpr (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
+      } else if constexpr (BLOCK_EXTEND) {
+        // Block Extend Mask: (q_block >= k_block) && (kv_idx < kv_len)
+        if (kv_idx >= std::min(kv_len, block_extend_col_limit(qo_idx))) {
+          tSrS(i) = AttentionUpdater::fill_value;
+        }
       } else if constexpr (!CAUSAL) {  // Just masking based on col
         if (kv_idx >= kv_len) {
           tSrS(i) = AttentionUpdater::fill_value;
@@ -175,8 +231,9 @@ CUTLASS_DEVICE void mma_f16(
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
-  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
-                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+  constexpr int n_masking_steps =
+      MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+                       : ((CAUSAL || BLOCK_EXTEND) ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
   // masking loops
   // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
 #pragma unroll
@@ -202,10 +259,15 @@ CUTLASS_DEVICE void mma_f16(
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
       if (MULTIITEMSCORING) {
         mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
+      } else if constexpr (BLOCK_EXTEND) {
+        // Fix: Add kv_len boundary check to be consistent with initial mask logic
+        if (kv_idx >= std::min(kv_len, block_extend_col_limit(qo_idx))) {
+          tSrS(i) = AttentionUpdater::fill_value;
+        }
       } else {
         if (kv_idx >= col_limit_right(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
@@ -248,7 +310,7 @@ CUTLASS_DEVICE void mma_f16(
     for (int i = 0; i < size(tSrS); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
+      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
     }
     if constexpr (MULTIITEMSCORING) {
@@ -294,7 +356,7 @@ CUTLASS_DEVICE void mma_f16(
       for (int i = 0; i < size(tSrS); ++i) {
         int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
         int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
+        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                           qo_head_idx, kv_head_idx);
         if (kv_idx < col_limit_left(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
