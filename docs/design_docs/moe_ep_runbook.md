@@ -146,6 +146,222 @@ Notes:
 
 ---
 
+## Benchmarking
+
+Two harnesses live in the companion **`moe_ep_benchmark`** repo (kept next to
+the flashinfer checkout — not part of this tree): a single-node
+**microbenchmark** (`fi_mega` / `model_shapes`) and a **vLLM 0.25.1
+end-to-end** suite (`vllm_e2e/`). Clone it beside your flashinfer checkout:
+
+```bash
+export ROOT=/path/to            # parent dir; hold both checkouts here
+cd "$ROOT"
+git clone https://github.com/mhoqueanik/moe_ep_benchmark.git
+# $ROOT now has both flashinfer-2/flashinfer-moe_ep and moe_ep_benchmark/
+```
+
+All numbers below were measured on **4× GB200 (SM100)** at the `4_5_2-perf-fix`
+branch tip on **nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own pin; at 4.6.1
+parity since the MR!27 mainloop WAR — see
+[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md)).
+
+### 1. Microbenchmark
+
+Every table below comes from one sweep — `model_shapes/run_model_shapes.sh` —
+which runs five variants (the table columns) across the MoE geometries of real
+models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
+(7168 / 2048 / 256 / top-8) **is** the default-geometry table.
+
+| column          | variant          | backend          | env |
+|-----------------|------------------|------------------|-----|
+| `dg`            | `fi_dg`          | `deep_gemm_mega` | — |
+| `nvfp4 bf16`    | `fi_fp4`         | `nvfp4_cutedsl`  | — |
+| `+ikr`          | `fi_ikr`         | `nvfp4_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
+| `+combine_nvfp4`| `fi_combine_fp4` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
+| `+combine_mxfp8`| `fi_combine_fp8` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+
+Inside the flashinfer-EP container (editable install per "Build & test
+environment" above), pin the DSL and run the sweep:
+
+```bash
+# pin the DSL the numbers were measured on ($ROOT set at clone time above)
+python -m pip install "nvidia-cutlass-dsl[cu13]==4.5.2"
+python -c "import cutlass; assert cutlass.__version__=='4.5.2', cutlass.__version__"
+
+cd "$ROOT/moe_ep_benchmark"
+# all six shapes × five variants; e2e_pipelined timing is the sweep default
+SEQ_LENS="8 64 512 1024 2048 4096 8192" GPUS=4 \
+  bash model_shapes/run_model_shapes.sh
+# just the default-geometry table:
+SHAPES=deepseek_v3 SEQ_LENS="8 64 512 1024 2048 4096 8192" \
+  bash model_shapes/run_model_shapes.sh
+# render markdown (speedup-vs-dg columns) from the CSV(s):
+python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
+```
+
+- `MEGA_TIMING=e2e_pipelined` (steady-state, iters back-to-back enqueued) is the
+  default and the methodology of these tables — don't override it.
+- First-time `cute.compile` scales with experts/rank (~12 min per kernel config
+  at 64 experts/rank; `qwen3_5_397b` at 128/rank is the worst case). Compiles
+  cache under `~/.cache/flashinfer`, so resubmits are cheap.
+
+#### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
+
+Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
+knobs, speedup vs `deep_gemm_mega` in parens:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 215.0  | 222.2 (0.97x)  | 234.0 (0.92x)  | 228.3 (0.94x)      | 228.8 (0.94x)  |
+| 64       | 288.8  | 287.7 (1.00x)  | 314.8 (0.92x)  | 304.2 (0.95x)      | 308.2 (0.94x)  |
+| 512      | 346.1  | 359.3 (0.96x)  | 362.5 (0.95x)  | 328.7 (1.05x)      | 334.8 (1.03x)  |
+| 1024     | 474.1  | 428.6 (1.11x)  | 431.8 (1.10x)  | **375.8 (1.26x)**  | 384.0 (1.23x)  |
+| 2048     | 822.3  | 621.5 (1.32x)  | 615.4 (1.34x)  | **545.8 (1.51x)**  | 573.4 (1.43x)  |
+| 4096     | 1501.7 | 1001.5 (1.50x) | 989.2 (1.52x)  | **931.3 (1.61x)**  | 947.5 (1.58x)  |
+| 8192     | 3072.9 | 1896.4 (1.62x) | 1878.3 (1.64x) | **1655.3 (1.86x)** | 1752.0 (1.75x) |
+
+Shape of the curve: **parity with dg through ~512 tok/rank, crossover between
+512 and 1024, win growing to 1.62x at 8192** (1.86x with the fp4 combine wire).
+The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
+
+**Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
+holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
+tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
+`deep_gemm_mega` in parens.
+
+_deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
+same-session re-run of the default table; matches within run noise):
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 211.1  | 220.5 (0.96x)  | 233.9 (0.90x)  | 228.3 (0.92x)      | 227.2 (0.93x)  |
+| 64       | 286.7  | 285.7 (1.00x)  | 314.4 (0.91x)  | 303.2 (0.95x)      | 306.0 (0.94x)  |
+| 512      | 348.2  | 357.4 (0.97x)  | 361.5 (0.96x)  | 326.7 (1.07x)      | 332.8 (1.05x)  |
+| 2048     | 830.0  | 612.2 (1.36x)  | 609.2 (1.36x)  | **539.6 (1.54x)**  | 566.2 (1.47x)  |
+| 8192     | 3129.4 | 1942.5 (1.61x) | 1916.9 (1.63x) | **1728.0 (1.81x)** | 1784.3 (1.75x) |
+
+_deepseek_v4_flash_ — hidden 4096, inter 2048, 256 experts, top-6:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4    | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|------------------:|---------------:|
+| 8        | 127.8  | 142.1 (0.90x)  | 148.5 (0.86x)  | 148.3 (0.86x)     | 151.6 (0.84x)  |
+| 64       | 176.2  | 190.3 (0.93x)  | 204.7 (0.86x)  | 195.2 (0.90x)     | 197.6 (0.89x)  |
+| 512      | 206.8  | 231.1 (0.89x)  | 229.2 (0.90x)  | 216.0 (0.96x)     | 220.2 (0.94x)  |
+| 2048     | 401.4  | 344.6 (1.16x)  | 344.1 (1.17x)  | **303.1 (1.32x)** | 318.5 (1.26x)  |
+| 8192     | 1294.9 | 1070.1 (1.21x) | 1061.6 (1.22x) | **794.1 (1.63x)** | 901.1 (1.44x)  |
+
+_deepseek_v4_pro_ — hidden 7168, inter 3072, 384 experts, top-6:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 286.7  | 304.2 (0.94x)  | 310.4 (0.92x)  | 309.2 (0.93x)      | 312.8 (0.92x)  |
+| 64       | 540.7  | 562.2 (0.96x)  | 575.5 (0.94x)  | 566.0 (0.96x)      | 570.1 (0.95x)  |
+| 512      | 603.1  | 621.6 (0.97x)  | 621.8 (0.97x)  | 601.1 (1.00x)      | 607.2 (0.99x)  |
+| 2048     | 921.1  | 760.8 (1.21x)  | 758.1 (1.22x)  | **695.3 (1.32x)**  | 715.7 (1.29x)  |
+| 8192     | 3093.5 | 1897.4 (1.63x) | 1880.4 (1.65x) | **1773.6 (1.74x)** | 1836.5 (1.68x) |
+
+_kimi_k2_6_ — hidden 7168, inter 2048, 384 experts, top-8:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 247.8  | 253.0 (0.98x)  | 275.4 (0.90x)  | 261.2 (0.95x)      | 263.2 (0.94x)  |
+| 64       | 409.6  | 401.2 (1.02x)  | 440.2 (0.93x)  | 416.8 (0.98x)      | 419.8 (0.98x)  |
+| 512      | 472.2  | 469.0 (1.01x)  | 470.4 (1.00x)  | 442.4 (1.07x)      | 449.0 (1.05x)  |
+| 2048     | 834.5  | 668.8 (1.25x)  | 662.2 (1.26x)  | **603.1 (1.38x)**  | 619.5 (1.35x)  |
+| 8192     | 3188.3 | 2000.3 (1.59x) | 1982.9 (1.61x) | **1701.9 (1.87x)** | 1894.4 (1.68x) |
+
+_qwen3_5_397b_ — hidden 4096, inter 1024, 512 experts, top-10:
+
+| tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
+|---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
+| 8        | 129.0  | 145.7 (0.89x)  | 167.8 (0.77x)  | 157.7 (0.82x)      | 161.8 (0.80x)  |
+| 64       | 194.6  | 213.0 (0.91x)  | 264.3 (0.74x)  | 234.5 (0.83x)      | 238.6 (0.82x)  |
+| 512      | 233.5  | 253.9 (0.92x)  | 256.0 (0.91x)  | 238.6 (0.98x)      | 243.8 (0.96x)  |
+| 2048     | 495.6  | 459.0 (1.08x)  | 461.8 (1.07x)  | **361.6 (1.37x)**  | 391.0 (1.27x)  |
+| 8192     | 1772.8 | 1506.0 (1.18x) | 1544.7 (1.15x) | **1100.9 (1.61x)** | 1270.8 (1.40x) |
+
+_gpt_oss_120b_ — hidden 2880, inter 2880, 128 experts, top-4. No `dg` column:
+2880 fails deep_gemm's hard-%128 wire alignment, so this geometry runs only via
+the cutedsl %64 relaxation (fp4 variants only):
+
+| tok/rank | dg | nvfp4 bf16 | +ikr   | +combine_nvfp4 | +combine_mxfp8 |
+|---------:|:--:|-----------:|-------:|---------------:|---------------:|
+| 8        | —  | 111.6      | 113.9  | 115.1          | 116.7          |
+| 64       | —  | 125.9      | 132.5  | 132.1          | 135.6          |
+| 512      | —  | 150.5      | 150.5  | 150.5          | 150.0          |
+| 2048     | —  | 261.1      | 261.0  | **252.7**      | 259.1          |
+| 8192     | —  | 697.3      | 678.9  | **551.9**      | 609.3          |
+
+### 2. End-to-end vLLM benchmark
+
+The backend integrated into vLLM 0.25.1 (integration lands as a separate PR),
+driven from `vllm_e2e/` — see `vllm_e2e/RUNBOOK.md` for the full recipe and
+`vllm_e2e/FINDINGS.md` for the measured numbers. Backend is selected per-run by
+env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated):
+
+| config   | env |
+|----------|-----|
+| native   | `FI_MOE_EP=0` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=deep_gemm_mega` |
+| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl` |
+
+```bash
+W=$ROOT/moe_ep_benchmark/vllm_e2e
+# 1) hold a 4-GPU node; run every command through the container helper:
+JOBID=$(sbatch --parsable -A coreai_libraries_cudnn -p batch -N1 \
+    --ntasks-per-node=1 --time=04:00:00 -J fi.vllm_e2e.hold \
+    --output=$W/logs/hold_%j.log --wrap "sleep 14400")
+# 2) one-time venv: vllm==0.25.1 + editable fi branch + patch_0251 (keeps
+#    vllm's own cutlass-dsl 4.5.2 pin):
+JOBID=$JOBID bash $W/in_container.sh 'bash setup_container.sh'
+# 3) throughput A/B (backend env-only):
+JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
+# 4) GSM8K fairness gate (both checkpoints must land in the same band):
+JOBID=$JOBID bash $W/in_container.sh \
+  'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
+JOBID=$JOBID bash $W/in_container.sh \
+  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
+```
+
+Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
+- **Prefill, 8k-token chunks**: `WORKLOADS="prefill:8192:1" MAX_BATCHED_TOKENS=8192 bash bench_throughput.sh`.
+- **Decode @ 1024-seq concurrency**: run the decode workload with CUDA-graph
+  capture covering the prefill chunk shapes (vLLM
+  `max_cudagraph_capture_size` >= the chunk size). With the default small
+  capture list the chunks fall to eager, the extra inter-rank launch skew is
+  absorbed as collective spin, and decode reads ~4 % **below** native — a config
+  artifact, not a kernel property.
+- **Per-role offline knob caches**: build prefill- and decode-tuned caches with
+  `python -m flashinfer.moe_ep.tune` before the timed runs.
+- **Two-checkpoint fairness**: `fi_nvfp4` consumes the prequantized NVFP4
+  checkpoint directly via the weight-pack path; native and `fi_dg` run the mxfp4
+  checkpoint. The GSM8K gate must show both in the same accuracy band before a
+  throughput delta is apples-to-apples.
+- Repeat each cell ≥3× and use medians — prefill-heavy cells showed ±35 %
+  cross-restart variance; decode/mixed were stable to ~2 %.
+
+#### End-to-end results (vLLM 0.25.1, 2026-07-20)
+
+DeepSeek-V4-Flash (4096 hidden / 2048 inter / 256 experts / top-6), 4× GB200
+TP4/EP4, CUDA graphs capturing all recurring step shapes (incl. the 4096-token
+prefill chunks), per-role offline knob caches.
+
+| Workload                                     | native vLLM | fi_dg           | fi_nvfp4            |
+|----------------------------------------------|------------:|----------------:|--------------------:|
+| Prefill, 8k-token chunks (tok/s)             | 45,701      | 47,534 (1.04x)  | **53,962 (1.18x)**  |
+| Decode @ 1024-seq concurrency (output tok/s) | 21,049      | 21,540 (1.02x)  | **22,614 (1.07x)**  |
+| GSM8K (200q, greedy)                         | 0.965       | 0.965           | **0.975**           |
+
+- `fi_dg` is the same deep_gemm kernel routed through this integration layer —
+  parity-or-better shows the layer itself costs nothing under graphs; the nvfp4
+  deltas above it are kernel-side.
+- 2026-07-22: both headline cells reproduce on nvidia-cutlass-dsl 4.5.2
+  (vLLM 0.25.1's own pin): prefill-8k native 45,582 / fi_nvfp4 53,623 = 1.176x;
+  decode-1k native 32,086 / fi_nvfp4 34,263 total tok/s = 1.068x (every cell
+  within 0.7 % of the 4.6.1-stack reference).
+
+---
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
