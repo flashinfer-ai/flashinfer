@@ -190,7 +190,8 @@ def _moe_core_impl(
         x_sf: Scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
-        w1_weight: GEMM1 weights (gate + up fused).
+        w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
+            single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
         fc2_input_scale: Global scale for GEMM2 input quantization.
@@ -552,8 +553,6 @@ class CuteDslMoEWrapper:
         self._main_event: Optional[torch.cuda.Event] = None
         self._memset_event: Optional[torch.cuda.Event] = None
 
-        # W4A4 needs the wrapper-owned CUDA graph resources, so its runners use
-        # a weak trampoline. W4A16 owns both its launch and workspaces.
         self._runner: Optional[CuteDslFusedMoENvfp4Runner] = None
         self._per_token_runner: Optional[CuteDslFusedMoENvfp4Runner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
@@ -732,7 +731,8 @@ class CuteDslMoEWrapper:
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
         w1_weight : torch.Tensor
-            GEMM1 weights (gate + up fused).
+            GEMM1 weights (gate + up fused for gated activations, or a single
+            projection for non-gated activations).
         w1_weight_sf : torch.Tensor
             Scale factors for ``w1_weight``.
         w1_alpha : torch.Tensor
@@ -750,8 +750,7 @@ class CuteDslMoEWrapper:
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
         per_token_scale : Optional[torch.Tensor]
-            Per-token input row scale for GEMM1. Passing this enables the
-            per-token activation path.
+            Optional W4A4 per-token input row scale for GEMM1.
 
         Returns
         -------
@@ -984,7 +983,8 @@ def cute_dsl_fused_moe_nvfp4(
     token_final_scales : torch.Tensor
         Routing weights of shape ``[num_tokens, top_k]``.
     w1_weight : torch.Tensor
-        GEMM1 weights (gate + up fused).
+        GEMM1 weights (gate + up fused for gated activations, or a single
+        projection for non-gated activations).
     w1_weight_sf : torch.Tensor
         Scale factors for ``w1_weight``.
     w1_alpha : torch.Tensor
@@ -1029,8 +1029,7 @@ def cute_dsl_fused_moe_nvfp4(
         Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``. Defaults
         to ``"w4a4"``.
     per_token_scale : Optional[torch.Tensor]
-        Per-token input row scale for GEMM1. Passing this enables the
-        per-token activation path.
+        Optional W4A4 per-token input row scale for GEMM1.
 
     Returns
     -------
