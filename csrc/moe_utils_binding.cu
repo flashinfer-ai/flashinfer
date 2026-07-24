@@ -405,6 +405,7 @@ void moe_sort(
   routingData.mNumExpertGroups = 1;
   routingData.mNumLimitedGroups = 1;
   routingData.mRouteScale = 1.0f;
+  routingData.mSumEpsilon = 1e-20f;
   routingData.mUseRoutingSoftmax = false;
 
   // Run the routing kernel

@@ -194,6 +194,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
     routingData.mUseRoutingSoftmax = false;
 
     int32_t const numDevices = (localNumExperts > 0) ? numExperts / localNumExperts : 1;
