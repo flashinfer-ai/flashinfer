@@ -306,6 +306,15 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
+    cu_seqlens : Optional[torch.Tensor]
+        Cumulative sequence boundaries for packed variable-length input, as a
+        one-dimensional int32 CUDA tensor.  When provided, ``x`` must have
+        shape ``(1, total_tokens, nheads, dim)`` and ``max_seqlen`` is required.
+    max_seqlen : Optional[int]
+        Upper bound on every packed sequence length.  In variable-length mode
+        this is the JIT-specialized predicted-token count used to derive the
+        logical replay window from the ring-buffer size.  Must be ``None`` when
+        ``cu_seqlens`` is not provided.
     precompute_heads_per_cta : int
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
