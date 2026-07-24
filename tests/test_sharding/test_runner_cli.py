@@ -652,6 +652,8 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
         "--deadline-seconds",
         "0",
     )
+    finalize_env = os.environ.copy()
+    finalize_env["PYTHONPATH"] = str(REPO_ROOT)
     finalized = subprocess.run(
         [
             sys.executable,
@@ -661,6 +663,7 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
             str(tmp_path / "junit"),
         ],
         cwd=REPO_ROOT,
+        env=finalize_env,
         text=True,
         capture_output=True,
         check=False,

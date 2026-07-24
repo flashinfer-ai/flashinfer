@@ -315,7 +315,11 @@ def validate_plan(plan: Plan) -> list[str]:
         if not 0 <= unit.shard_index < plan.options.shard_count:
             errors.append(f"unit {unit.id} has invalid shard {unit.shard_index}")
         for batch in unit.batches:
-            sources = {sources_by_nodeid[nodeid] for nodeid in batch.nodeids}
+            sources = {
+                sources_by_nodeid.get(nodeid, batch.source_file)
+                for nodeid in batch.nodeids
+                if nodeid in sources_by_nodeid
+            } or {batch.source_file}
             if sources != {batch.source_file}:
                 errors.append(f"batch {batch.id} crosses source files")
     return errors

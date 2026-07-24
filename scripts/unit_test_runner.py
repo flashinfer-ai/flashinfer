@@ -155,7 +155,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workers",
         type=_positive,
-        default=_env_int("UNIT_TEST_WORKERS", len(visible_devices())),
+        default=_env_int("UNIT_TEST_WORKERS", max(1, len(visible_devices()))),
         help="local workers, at most visible GPU count (UNIT_TEST_WORKERS)",
     )
     parser.add_argument(

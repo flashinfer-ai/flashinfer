@@ -520,7 +520,7 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
             f"pytest exited with infrastructure exit code {outcome.returncode}",
         )
     if not artifacts.temporary_xml.exists():
-        artifacts.selection.unlink(missing_ok=True)
+        _discard_temporary_artifacts(*artifacts.temporary)
         return BatchExecution("infrastructure", "pytest did not produce JUnit XML")
     validation = validate_batch_xml(artifacts.temporary_xml, request.batch.nodeids)
     if not validation.valid:

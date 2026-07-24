@@ -83,22 +83,23 @@ def state_lock(junit_dir: Path) -> Iterator[None]:
     lock_path = junit_dir / "lock"
     _publish_runner_lock(lock_path)
     try:
-        with lock_path.open("r+") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            try:
-                stream.seek(0)
-                marker = stream.read()
-                if marker != _LOCK_MARKER:
-                    raise RunnerStateError(
-                        f"runner-owned lock path has foreign content: {lock_path}"
-                    )
-                yield
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream = lock_path.open("r+")
     except OSError as error:
         raise RunnerStateError(
             f"cannot open runner-owned lock path {lock_path}: {error}"
         ) from error
+    with stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            stream.seek(0)
+            marker = stream.read()
+            if marker != _LOCK_MARKER:
+                raise RunnerStateError(
+                    f"runner-owned lock path has foreign content: {lock_path}"
+                )
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def sha256_file(path: Path) -> str:
