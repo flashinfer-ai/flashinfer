@@ -1744,3 +1744,72 @@ def test_trtllm_batch_decode_spec(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+@pytest.mark.parametrize("q_len_per_req", [5, 6, 7, 8])
+def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
+    """Regression test for #3929: uniform multi-token decode (q_len_per_req
+    only, no cum_seq_lens_q) must index packed Q/O correctly when
+    q_len_per_req does not divide the grouped-token kernel's token group
+    (tileSizeQ / numHeadsQPerKv). Before the packed cum_seq_lens_q synthesis,
+    every request > 0 was read/written at padded offsets: batched outputs
+    diverged from per-request outputs and late requests wrote past `out`
+    (asynchronous illegal memory access when the stray write left mapped VA).
+
+    q_len_per_req=8 (divides the token group; correct before the synthesis
+    too) is the control locking output+LSE equivalence of the var-seq routing
+    for previously-working shapes.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen decode kernels require SM100-class GPUs")
+    torch.manual_seed(42)
+    batch_size, page_size, max_seq_len = 10, 64, 1024
+    num_pages_per_seq = max_seq_len // page_size
+    dtype = torch.bfloat16
+    device = GPU_DEVICE
+    # GQA8, head_dim 512: numHeadsQPerKv * q_len_per_req in (40, 48, 56)
+    # selects the tileSizeQ=64 KeepsMmaAbForGeneration kernels (the family
+    # with the padded uniform fallback).
+    q = torch.randn(batch_size * q_len_per_req, 16, 512, dtype=dtype, device=device)
+    k = torch.randn(
+        num_pages_per_seq * batch_size, 2, page_size, 512, dtype=dtype, device=device
+    )
+    v = torch.randn_like(k)
+    block_tables = torch.arange(
+        num_pages_per_seq * batch_size, dtype=torch.int32, device=device
+    ).view(batch_size, num_pages_per_seq)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def run(q_, block_tables_, seq_lens_):
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q_,
+            kv_cache=(k, v),
+            workspace_buffer=workspace,
+            block_tables=block_tables_,
+            seq_lens=seq_lens_,
+            max_seq_len=max_seq_len,
+            bmm1_scale=512**-0.5,
+            bmm2_scale=1.0,
+            q_len_per_req=q_len_per_req,
+            out_dtype=dtype,
+            return_lse=True,
+        )
+
+    batched, batched_lse = run(q, block_tables, seq_lens)
+    torch.cuda.synchronize()
+    for req in range(batch_size):
+        lo, hi = req * q_len_per_req, (req + 1) * q_len_per_req
+        single, single_lse = run(
+            q[lo:hi].contiguous(),
+            block_tables[req : req + 1].contiguous(),
+            seq_lens[req : req + 1].contiguous(),
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            batched[lo:hi].float(), single.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            batched_lse[lo:hi].float(), single_lse.float(), atol=2e-2, rtol=2e-2
+        )

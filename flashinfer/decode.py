@@ -3001,6 +3001,46 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
+# The trtllm-gen grouped-token generation kernels (KeepsMmaAbForGeneration,
+# tileSizeQ 64/128) index Q/O with a PADDED per-request token stride
+# (tileSizeQ / numHeadsQPerKv) when cum_seq_lens_q is absent, while the tensors
+# are PACKED at q_len_per_req tokens per request. For q_len_per_req values that
+# do not divide the token group (e.g. q_len 5/6/7 with GQA group size 8), every
+# request > 0 is read/written at inflated offsets: outputs are silently
+# misplaced on every launch and late requests write past `out` (an asynchronous
+# illegal memory access whenever a stray write leaves mapped VA — see #3929).
+# Always hand the kernels an explicit packed layout instead of the fallback.
+_uniform_cum_seq_lens_cache: dict = {}
+
+
+def _get_uniform_cum_seq_lens_q(
+    batch_size: int, q_len: int, device: torch.device
+) -> torch.Tensor:
+    # Cached per (batch_size, q_len, device) so CUDA-graph capture bakes a
+    # stable, pre-existing tensor (cache misses normally happen during eager
+    # warmup, outside capture).
+    key = (batch_size, q_len, device.index)
+    t = _uniform_cum_seq_lens_cache.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            # The tensor would be allocated from the capture's private memory
+            # pool and then cached: correct within this graph, but any other
+            # graph hitting the cache later would bake a pointer whose contents
+            # only this graph's replays maintain.
+            warnings.warn(
+                "cum_seq_lens_q synthesized during CUDA-graph capture for "
+                f"(batch_size={batch_size}, q_len_per_req={q_len}); run an "
+                "eager warmup call with the same shape before capturing so the "
+                "cached layout tensor lives outside the capture pool.",
+                stacklevel=3,
+            )
+        t = torch.arange(
+            0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=device
+        )
+        _uniform_cum_seq_lens_cache[key] = t
+    return t
+
+
 @flashinfer_api(trace=trtllm_batch_decode_trace_dispatch)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
@@ -3424,6 +3464,15 @@ def trtllm_batch_decode_with_kv_cache(
         if q_len_per_req is not None:
             max_q_len = q_len_per_req
             batch_size = query.size(0) // q_len_per_req
+            if cum_seq_lens_q is None and q_len_per_req > 1:
+                # Route multi-token uniform decode through the packed var-seq
+                # layout: the uniform fallback mis-indexes packed Q/O whenever
+                # q_len_per_req does not divide the kernel's token group,
+                # silently corrupting outputs and writing out of bounds
+                # (#3929). See _get_uniform_cum_seq_lens_q above.
+                cum_seq_lens_q = _get_uniform_cum_seq_lens_q(
+                    batch_size, q_len_per_req, query.device
+                )
         else:
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
