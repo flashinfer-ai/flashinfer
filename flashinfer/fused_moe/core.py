@@ -632,7 +632,17 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
 
-        if profile_ids is None:
+        if (
+            profile_ids is None
+            and backend in ("120", "121")
+            and use_mxfp8_act_scaling
+            and fc1_expert_weights.dtype == torch.int64
+        ):
+            # The SM120 profiler cannot safely construct MXFP8 x MXFP4 TMA
+            # inputs yet. Profiling these tactics can poison the CUDA context,
+            # so use the runner's fallback tactics for this mode.
+            gemm_tactic_1, gemm_tactic_2 = -1, -1
+        elif profile_ids is None:
             tuner = AutoTuner.get()
             MoERunner.refine_tuning_config(tune_max_num_tokens)
 
