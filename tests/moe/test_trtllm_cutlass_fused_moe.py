@@ -1498,6 +1498,9 @@ def dequant_mxfp8_batches(
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
+# use_autotune=True covers #4049: SM12x must fall back without launching
+# the unsafe MXFP8xMXFP4 CUTLASS profiler.
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
@@ -1512,6 +1515,7 @@ def test_moe_mxfp8_mxfp4(
     alpha,
     beta,
     limit,
+    use_autotune,
 ):
     """
     Test MoE with MXFP8 activations and MXFP4 weights.
@@ -1562,21 +1566,22 @@ def test_moe_mxfp8_mxfp4(
         beta_t = None
 
     # Call cutlass_fused_moe with MXFP8 activations and MXFP4 weights
-    _ = fused_moe.cutlass_fused_moe(
-        mxfp8_x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        mxfp4_w1.contiguous().view(torch.long),
-        mxfp4_w2.contiguous().view(torch.long),
-        otype,
-        swiglu_alpha=alpha_t,
-        swiglu_limit=limit_t,
-        swiglu_beta=beta_t,
-        quant_scales=quant_scales,
-        input_sf=mxfp8_x_sf,
-        use_mxfp8_act_scaling=True,
-        output=flash_output,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            mxfp8_x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            mxfp4_w1.contiguous().view(torch.long),
+            mxfp4_w2.contiguous().view(torch.long),
+            otype,
+            swiglu_alpha=alpha_t,
+            swiglu_limit=limit_t,
+            swiglu_beta=beta_t,
+            quant_scales=quant_scales,
+            input_sf=mxfp8_x_sf,
+            use_mxfp8_act_scaling=True,
+            output=flash_output,
+        )
 
     dq_mxfp8_x = (
         mxfp8_dequantize_host(

@@ -632,7 +632,17 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
 
-        if profile_ids is None:
+        # The SM12x CUTLASS profiler cannot currently construct valid TMA
+        # inputs for MXFP8 activations with packed MXFP4 weights. Profiling
+        # these tactics can leave the CUDA context in an illegal-instruction
+        # state (see #4049), while the normal fallback path is valid.
+        skip_unsafe_mxfp8_mxfp4_profiling = (
+            backend in ("120", "121")
+            and use_mxfp8_act_scaling
+            and fc1_expert_weights.dtype == torch.int64
+        )
+
+        if profile_ids is None and not skip_unsafe_mxfp8_mxfp4_profiling:
             tuner = AutoTuner.get()
             MoERunner.refine_tuning_config(tune_max_num_tokens)
 
@@ -667,12 +677,20 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 ],
                 gemm_idx=2,
             )
-        else:
+        elif profile_ids is not None:
             if len(profile_ids) != 2:
                 raise ValueError(
                     "profile_ids must contain [gemm1_profile, gemm2_profile]"
                 )
             gemm_tactic_1, gemm_tactic_2 = profile_ids
+        else:
+            if AutoTuner.get().is_tuning_mode:
+                logger.warning_once(
+                    "[AutoTuner]: Skipping SM12x MXFP8xMXFP4 fused-MoE profiling "
+                    "because it can leave the CUDA context unusable (see #4049). "
+                    "Using fallback tactics."
+                )
+            gemm_tactic_1, gemm_tactic_2 = -1, -1
 
         run_moe = (
             moe_runner.fused_moe_runner.run_moe_min_latency
