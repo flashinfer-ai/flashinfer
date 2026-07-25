@@ -60,16 +60,23 @@ from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
+from flashinfer.utils import is_confidential_compute
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import _initialize_allreduce_fusion_protocol
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 from .trtllm_ar import trtllm_moe_allreduce_fusion
 from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import (
+    CommBackend,
+    SymmDeviceMemory,
+    all_ranks_support_mnnvl,
+    is_multicast_supported,
+)
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -125,7 +132,9 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """
         super().__init__(tp_size, tp_rank)
 
-        # Call the actual workspace creation function
+        # NVIDIA Confidential Computing requires multicast-free IPC workspaces so needs to disable symmetric device memory
+        use_symm_dev_mem = not is_confidential_compute()
+
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -135,19 +144,32 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
-            use_symm_dev_mem=True,
+            use_symm_dev_mem=use_symm_dev_mem,
         )
 
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
-        workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
-            self._internal_workspace,
-        )
-        self.ipc_handles = workspace_tuple[0]
-        self.workspace_tensor = workspace_tuple[1]
-        self.mem_handles = workspace_tuple[2]
-        self.metadata = workspace_tuple[3]
+        if use_symm_dev_mem:
+            # use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles, metadata)
+            symm_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = symm_workspace_tuple[0]
+            self.workspace_tensor = symm_workspace_tuple[1]
+            self.mem_handles = symm_workspace_tuple[2]
+            self.metadata = symm_workspace_tuple[3]
+        else:
+            # use_symm_dev_mem=False: (ipc_handles, workspace_tensor, metadata)
+            ipc_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = ipc_workspace_tuple[0]
+            self.workspace_tensor = ipc_workspace_tuple[1]
+            self.metadata = ipc_workspace_tuple[2]
+            # No symmetric-memory handles for the multicast-free IPC path.
+            self.mem_handles = []
 
     @property
     def backend(self) -> str:
@@ -177,6 +199,67 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         except ValueError as e:
             logger.warning("Workspace is insufficient for problem size. %s", e)
             return False
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing; repeated successful calls are no-ops."""
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if not any(mapped):
+            return
+        if not all(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+
+        for handle in self.mem_handles:
+            handle._unmap_and_release_handles()
+        # Do not return until every rank has released all workspace handles.
+        self.mem_handles[0].comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange workspace
+            memory handles. It must have the same rank and world size as the
+            original allocation.
+        """
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if all(mapped):
+            return
+        if any(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+        for handle in self.mem_handles:
+            handle._create_and_map_handles(comm_backend)
+
+        _initialize_allreduce_fusion_protocol(
+            ipc_handles=self.ipc_handles,
+            tp_rank=self.rank,
+            flag_size=self.metadata["flag_size"],
+            lamport_buffer_size=self.metadata["lamport_buffer_size"],
+            lamport_comm_size=self.metadata["lamport_comm_size"],
+            use_fp32_lamport=self.metadata["use_fp32_lamport"],
+            control_flag_ptr=self.metadata["control_flag_ptr"],
+        )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
@@ -210,22 +293,6 @@ def _trtllm_workspace_check(
     - Up to 16 ranks supported.
     """
     return world_size <= 16
-
-
-def _mnnvl_workspace_check(
-    backend: str,
-    world_size: int,
-    rank: int,
-    max_token_num: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-) -> bool:
-    """
-    Check if mnnvl backend CAN be used for workspace creation.
-
-    """
-
-    return True
 
 
 # ============================================================================
@@ -399,13 +466,9 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
         ):
             suitable_backends.append("trtllm")
-        if _mnnvl_workspace_check(
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
+        local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
+        if all_ranks_support_mnnvl(
+            local_mnnvl_supported, world_size, comm_backend, group
         ):
             suitable_backends.append("mnnvl")
 
@@ -439,6 +502,12 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
+        if is_confidential_compute():
+            raise ValueError(
+                "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
+                "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
+                "Use backend='trtllm' instead."
+            )
         mapping = Mapping(
             world_size=world_size,
             rank=rank,
@@ -676,6 +745,11 @@ def allreduce_fusion(
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
+        if any(
+            isinstance(handle, SymmDeviceMemory) and not handle.mapped
+            for handle in workspace.mem_handles
+        ):
+            raise RuntimeError("TRT-LLM symmetric-memory handles are not attached")
 
         # ---- MOE Reduction pattern ----
         if pattern == AllReduceFusionPattern.kMoEReductionARResidualRMSNorm:

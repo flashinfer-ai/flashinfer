@@ -38,7 +38,10 @@
 #
 # Build args:
 #   CUDA_IMAGE   — base image (default: the 26.05 PyTorch image).
-#   NCCL_VERSION — nvidia-nccl-cu13 pin (default 2.30.7, matching nccl4py 0.3.1).
+#   FI_NCCL_VERSION — nvidia-nccl-cu13 pin (default 2.30.7, matching nccl4py
+#                  0.3.1). FI_-prefixed because the base image's ENV
+#                  NCCL_VERSION (Debian version, e.g. 2.28.3-1) would override
+#                  a same-named ARG inside RUN and break the pip pin.
 #   NCCL4PY_SPEC — nccl4py pin (default nccl4py[cu13]==0.3.1).
 
 ARG CUDA_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
@@ -65,12 +68,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2.30.4) so we get the 2.30.7 libnccl_ep.so expects. --no-deps on the NCCL wheels
 # keeps the base torch intact; nccl.ep also imports cuda.core / cuda.bindings,
 # installed explicitly at ep_bench's exact versions.
-ARG NCCL_VERSION=2.30.7
+ARG FI_NCCL_VERSION=2.30.7
 ARG NCCL4PY_SPEC=nccl4py[cu13]==0.3.1
 ARG CUDA_CORE_VERSION=1.0.1
 ARG CUDA_BINDINGS_VERSION=13.2.0
 RUN PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
-        "nvidia-nccl-cu13==${NCCL_VERSION}" \
+        "nvidia-nccl-cu13==${FI_NCCL_VERSION}" \
         "${NCCL4PY_SPEC}" \
     && PIP_CONSTRAINT= pip install --no-cache-dir \
         "cuda-core==${CUDA_CORE_VERSION}" \
@@ -96,10 +99,20 @@ RUN BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
     pip install --no-cache-dir --no-build-isolation -e .
 
-# Smoke probe — fail the build if NCCL-EP didn't actually come up.
+# The full-dep editable install above lets pip's resolver downgrade
+# nvidia-nccl-cu13 to torch's exact pin, undoing the 2.30.7 pin — re-assert it.
+# (ARG FI_NCCL_VERSION from above is still in scope: single-stage build.)
+RUN PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
+        "nvidia-nccl-cu13==${FI_NCCL_VERSION}"
+
+# Smoke probe — fail the build if NCCL-EP didn't actually come up or the
+# NCCL pin was lost.
 RUN python -c "\
 from flashinfer.moe_ep import available_backends; \
 b = available_backends(); print('moe_ep backends:', b); \
-assert 'nccl_ep' in b, 'nccl_ep backend missing'"
+assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
+from importlib.metadata import version; \
+nccl = version('nvidia-nccl-cu13'); print('nvidia-nccl-cu13:', nccl); \
+assert nccl == '${FI_NCCL_VERSION}', f'NCCL pin lost: {nccl}'"
 
 CMD ["bash"]

@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -37,31 +39,40 @@ def test_bmm_mxfp8(
     # Block size is 32 in MXFP8
     assert input_mxfp8.numel() == (input_scale.numel() * 32)
 
-    mat2 = (
-        torch.randn([b, n, k], device="cuda", dtype=input_dtype)
-        .transpose(-2, -1)
-        .contiguous()
-    )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
+    weight = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
+    weight_mxfp8, weight_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
+    mat2_mxfp8 = weight_mxfp8.transpose(-2, -1)
 
-    assert mat2_mxfp8.numel() == (mat2_scale.numel() * 32)
+    assert mat2_mxfp8.shape == (b, k, n)
+    assert mat2_mxfp8.stride(-2) == 1
+
+    assert weight_mxfp8.numel() == (weight_scale.numel() * 32)
 
     # Compute reference result
-    reference = torch.bmm(input_mat, mat2)
+    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
 
     # Create output tensor
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
 
-    with autotune(auto_tuning):
-        bmm_mxfp8(
-            input_mxfp8,
-            mat2_mxfp8,
-            input_scale,
-            mat2_scale,
-            res_dtype,
-            res,
-            backend=backend,
-        )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with autotune(auto_tuning):
+            bmm_mxfp8(
+                input_mxfp8,
+                mat2_mxfp8,
+                input_scale,
+                weight_scale,
+                res_dtype,
+                res,
+                backend=backend,
+            )
+
+    fallback_warnings = [
+        warning
+        for warning in caught
+        if "falling back to default tactic=-1" in str(warning.message)
+    ]
+    assert not fallback_warnings
 
     # Verify output properties
     assert res.shape == (b, m, n), f"Expected shape {(b, m, n)}, got {res.shape}"

@@ -43,6 +43,7 @@ from .fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,  # Used by activation.py
 )
 
@@ -93,6 +94,7 @@ __all__ = [
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
+    "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
 ]
 

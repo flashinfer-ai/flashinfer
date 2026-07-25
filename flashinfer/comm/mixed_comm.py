@@ -22,7 +22,6 @@ import os
 import pathlib
 import socket
 import statistics
-import struct
 import tempfile
 from itertools import product
 from typing import Dict, List
@@ -45,6 +44,7 @@ except ImportError:
 
 from ..api_logging import flashinfer_api
 from ..cuda_utils import checkCudaErrors
+from .fd_exchange import recv_fd_dgram, send_fd_dgram
 from ..jit.comm import gen_mixed_comm_module
 from ..testing.utils import bench_gpu_time
 from ..utils import backend_requirement, supported_compute_capability
@@ -654,24 +654,11 @@ class MixedCommHandler:
 
         def send_fd(sock, fd, rank):
             """Send a file descriptor to the specified rank via Unix socket."""
-            sock.sendmsg(
-                [b"\x00"],
-                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
-                0,
-                get_socket_path(rank),
-            )
+            send_fd_dgram(sock, fd, get_socket_path(rank))
 
         def recv_fd(sock):
             """Receive a file descriptor from a Unix socket."""
-            ancdata = sock.recvmsg(
-                1,
-                socket.CMSG_SPACE(struct.calcsize("i")),
-            )[1]
-            for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-                    fd = struct.unpack("i", cmsg_data)[0]
-                    return fd
-            raise RuntimeError("Failed to receive file descriptor")
+            return recv_fd_dgram(sock)
 
         def create_and_allgather_uc_handle(sock, uc_prop):
             """Create a unicast memory handle and exchange it with all local ranks."""

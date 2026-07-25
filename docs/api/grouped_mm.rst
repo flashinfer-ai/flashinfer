@@ -51,3 +51,11 @@ MXFP8 MoE GEMM (SM120 cute backend)
     :toctree: ../generated
 
     moe_gemm_mxfp8_nt_groupwise
+
+FP8 MoE GEMM (SM120 cute backend)
+---------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    moe_gemm_fp8_nt_groupwise

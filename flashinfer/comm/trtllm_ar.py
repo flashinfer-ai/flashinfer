@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import logging
-from ctypes import c_void_p, cast
+from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 from typing_extensions import deprecated
@@ -431,7 +431,7 @@ OneShotMaxToken = 128
 MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
-_symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
+_symm_workspace_refs: dict[int, list[object]] = {}
 
 
 @deprecated(
@@ -555,6 +555,34 @@ BarrierFlagCount = 256
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
+def _initialize_allreduce_fusion_protocol(
+    ipc_handles: List[List[int]],
+    tp_rank: int,
+    flag_size: int,
+    lamport_buffer_size: int,
+    lamport_comm_size: int,
+    use_fp32_lamport: bool,
+    control_flag_ptr: int,
+) -> None:
+    cudart.cudaMemset(c_void_p(ipc_handles[1][tp_rank]), 0, flag_size)
+
+    lamport_dtype = torch.float32 if use_fp32_lamport else torch.float16
+    aligned_size = round_up(lamport_buffer_size, 16)
+    trtllm_lamport_initialize(
+        ipc_handles[2][tp_rank],
+        aligned_size // (4 if use_fp32_lamport else 2),
+        lamport_dtype,
+    )
+
+    cudart.cudaMemset(c_void_p(control_flag_ptr), 0, 5 * 4)
+    lamport_comm_size_bytes = create_string_buffer(
+        lamport_comm_size.to_bytes(4, byteorder="little"), 4
+    )
+    cudart.cudaMemcpy(
+        c_void_p(control_flag_ptr + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
+    )
+
+
 @deprecated(
     "use the unified API allreduce.py instead. It will internally call trtllm_create_ipc_workspace_for_all_reduce_fusion."
 )
@@ -592,7 +620,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
       use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
     - If create_metadata=True: and use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles,metadata)
       where metadata contains: tp_rank, tp_size, max_token_num, hidden_dim,
-      use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
+      use_fp32_lamport, buffer_size, flag_size, lamport_comm_size,
+      lamport_buffer_size, control_flag_ptr
       and mem_handles is a list of SymmDeviceMemory objects.
 
     Note: The optional parameters make the API clunky at this time. This will be refactored in the future, at the cost of backward compatibility, where the default behavior will be
@@ -639,12 +668,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     lamport_buffer_size = lamport_comm_size * 3
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = (
-        group.group_name
-        if group is not None
-        else torch.distributed.group.WORLD.group_name
-    )
-    symm_refs: list[torch.Tensor] = []
+    symm_refs: list[object] = []
 
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
@@ -659,16 +683,35 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     ]:
         aligned_size = round_up(size, 16)
 
-        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
-        )
-        symm_refs.append((tensor, handle))
+        if use_symm_dev_mem:
+            assert comm_backend is not None
+            handle = SymmDeviceMemory(
+                buf_size=aligned_size,
+                group_size=tp_size,
+                group_rank=tp_rank,
+                device_idx=device.index,
+                comm_backend_for_handle_transfer=comm_backend,
+                enable_multicast=False,
+                allocate_signal_pads=False,
+            )
+            ptrs = handle.get_buffer_ptrs_host()
+            symm_refs.append(handle)
+            mem_handles.append(handle)
+        else:
+            group_name = (
+                group.group_name
+                if group is not None
+                else torch.distributed.group.WORLD.group_name
+            )
+            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+                aligned_size,
+                tp_size,
+                dtype,
+                device,
+                group_name,
+            )
+            symm_refs.append((tensor, handle))
         ipc_handles.append(ptrs)
-        mem_handles.append(handle)
 
     logger.debug(
         "rank %s allocated ipc_handles: %s",
@@ -677,6 +720,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     _symm_workspace_refs[id(ipc_handles)] = symm_refs
+
+    if use_symm_dev_mem:
+        cudart.cudaMemset(c_void_p(ipc_handles[1][tp_rank]), 0, flag_size)
 
     # Initialize lamport buffer
     aligned_lamport_buffer_size = round_up(lamport_buffer_size, 16)
@@ -728,6 +774,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     )
 
     if use_symm_dev_mem:
+        torch.cuda.synchronize()
         comm_backend.barrier()  # must sync after create_workspace
     else:
         dist.barrier(group=group)
@@ -745,6 +792,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             "lamport_buffer_size": lamport_buffer_size,
         }
         if use_symm_dev_mem:
+            metadata["control_flag_ptr"] = flag_ptr.value
             return ipc_handles, workspace_tensor, mem_handles, metadata
         else:
             return ipc_handles, workspace_tensor, metadata

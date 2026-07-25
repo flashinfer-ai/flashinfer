@@ -329,7 +329,9 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
     import flashinfer.gdn_prefill  # chunk_gated_delta_rule
     import flashinfer.gemm  # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
+    import flashinfer.kda_decode  # recurrent_kda
     import flashinfer.mla  # BatchMLAPagedAttentionWrapper
+    import flashinfer.msa_ops  # msa_proxy_score, msa_sparse_attention, decode
     import flashinfer.norm  # rmsnorm, fused_add_rmsnorm
     import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
     import flashinfer.sampling  # noqa: F401  # top_k_sampling_from_probs, etc.

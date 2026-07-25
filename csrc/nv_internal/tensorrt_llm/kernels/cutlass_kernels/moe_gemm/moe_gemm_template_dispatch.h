@@ -68,6 +68,9 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+#if defined(ENABLE_FP4)
+using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
+#endif
 
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
@@ -97,7 +100,7 @@ struct genericMoeGemmKernelLauncher {
     static_assert(cutlass::platform::is_same<T, WeightType>::value ||
                   cutlass::platform::is_same<WeightType, uint8_t>::value ||
 #if defined(ENABLE_FP4)
-                  cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value ||
+                  cutlass::platform::is_same<WeightType, Fp4Type>::value ||
 #endif
                   cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value);
 
@@ -253,7 +256,7 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
   constexpr bool isFp8 = false;
 #endif
 #if defined(ENABLE_FP4)
-  constexpr bool isFp4 = std::is_same_v<T, __nv_fp4_e2m1>;
+  constexpr bool isFp4 = std::is_same_v<T, Fp4Type>;
 #else
   constexpr bool isFp4 = false;
 #endif
@@ -532,17 +535,17 @@ void dispatchMoeGemmToCutlass(
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getConfigs(
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getConfigs(
     bool supports_finalize_fusion) const {
   return getConfigs(sm_, supports_finalize_fusion);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getConfigs(
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getConfigs(
     int sm, bool supports_finalize_fusion) {
   std::vector<cutlass_extensions::CutlassGemmConfig> candidate_configs =
       getTmaWarpSpecializedConfigs(sm, supports_finalize_fusion);
@@ -552,9 +555,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getConfigs(
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfigs(int sm) {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+std::vector<cutlass_extensions::CutlassGemmConfig> MoeGemmRunner<
+    T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getAmpereConfigs(int sm) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -581,10 +584,11 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfi
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 std::vector<cutlass_extensions::CutlassGemmConfig>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpecializedConfigs(
-    int sm, bool supports_finalize_fusion) {
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+              Sm90Wfp4Afp8Mode>::getTmaWarpSpecializedConfigs(int sm,
+                                                              bool supports_finalize_fusion) {
   using tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   static constexpr auto weight_only_flag =
       std::is_same<T, WeightType>::value ? CutlassGemmConfig::NONE : CutlassGemmConfig::WEIGHT_ONLY;
@@ -596,8 +600,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
   int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag =
       use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
-  static constexpr auto fp4_only_flag =
-      (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
+  static constexpr auto fp4_only_flag = (use_fp4 || (use_wfp4afp8 && !use_sm90_humming_pre_mma))
+                                            ? CutlassGemmConfig::FP4_ONLY
+                                            : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
       use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
@@ -668,28 +673,45 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
                    return config;
                  });
 
-  if (use_w4_groupwise) {
-    // w4 groupwise implementation requires swap_ab to be true
+  if (use_sm90_mixed_input_gemm) {
+    // The SM90 mixed-input grouped GEMM implementation requires swap_ab.
     tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
                                         [](auto& config) { return !config.swap_ab; }),
                          tma_ws_configs.end());
+  }
+
+  if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {
+    if (sm == 90) {
+      using Tile = cutlass_extensions::CutlassTileConfigSM90;
+      using Schedule = cutlass_extensions::MainloopScheduleType;
+      for (Tile tile : {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B,
+                        Tile::CtaShape128x32x128B, Tile::CtaShape128x40x128B}) {
+        for (Schedule schedule :
+             {Schedule::SINGLE_WARPGROUP_PREFILL, Schedule::SINGLE_WARPGROUP_ROLLING}) {
+          CutlassGemmConfig config(tile, schedule, cutlass_extensions::EpilogueScheduleType::AUTO,
+                                   cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+          config.swap_ab = true;
+          tma_ws_configs.push_back(config);
+        }
+      }
+    }
   }
 
   return tma_ws_configs;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::isTmaWarpSpecialized(
-    cutlass_extensions::CutlassGemmConfig gemm_config) const {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
+    isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const {
   bool config_is_tma_warp_specialized = gemm_config.is_tma_warp_specialized;
   return supportsTmaWarpSpecialized() && config_is_tma_warp_specialized;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsTmaWarpSpecialized(
-    int sm) {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+                   Sm90Wfp4Afp8Mode>::supportsTmaWarpSpecialized(int sm) {
   return (sm == 90 &&
           tensorrt_llm::kernels::cutlass_kernels::isValidHopperMOESpecialisation<T,
                                                                                  WeightType>()) ||
@@ -701,16 +723,18 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsT
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getSM() const {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::getSM()
+    const {
   return this->sm_;
 }
 
 // currently support sm80 bf16/fp16 gate activation, only set predication tensor for m direction
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsFusedGatedActivation(
-    ActivationType activation_type, int gemm_n, int gemm_k) const {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+                   Sm90Wfp4Afp8Mode>::supportsFusedGatedActivation(ActivationType activation_type,
+                                                                   int gemm_n, int gemm_k) const {
   constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
   return (activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu) &&
          std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8 &&
@@ -719,17 +743,18 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::supportsF
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::isFusedGatedActivation(
-    cutlass_extensions::CutlassGemmConfig gemm_config, ActivationType activation_type, int gemm_n,
-    int gemm_k) const {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
+    isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
+                           ActivationType activation_type, int gemm_n, int gemm_k) const {
   return supportsFusedGatedActivation(activation_type, gemm_n, gemm_k) &&
          !gemm_config.is_tma_warp_specialized;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::MoeGemmRunner() {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+              Sm90Wfp4Afp8Mode>::MoeGemmRunner() {
   int device{-1};
   tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
   sm_ = tensorrt_llm::common::getSMVersion();
@@ -738,11 +763,11 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::MoeGemmRunner(
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchToArch(
-    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
-    TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
+    dispatchToArch(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+                   TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   static_assert(
       std::is_same_v<ScaleBiasType, OutputType>,
       "Separate Scale/Bias type is not supported. This is assumed to be the gemm output type");
@@ -758,7 +783,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
 
   if (sm_ >= 75 && sm_ < 80) {
 #if defined(ENABLE_FP4)
-    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    constexpr bool is_fp4 = std::is_same_v<WeightType, Fp4Type>;
 #else
     constexpr bool is_fp4 = false;
 #endif
@@ -771,7 +796,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
     }
   } else if (sm_ >= 80 && sm_ < 90) {
 #if defined(ENABLE_FP4)
-    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    constexpr bool is_fp4 = std::is_same_v<WeightType, Fp4Type>;
 #else
     constexpr bool is_fp4 = false;
 #endif
@@ -809,7 +834,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
 
     if constexpr (tensorrt_llm::kernels::cutlass_kernels::
                       isValidTmaWarpSpecializedMOESpecialisation<T, WeightType, EpilogueTag>() &&
-                  !use_w4_groupwise) {
+                  !use_sm90_mixed_input_gemm) {
       // We allow both tma warp specialized and SM80 configurations to coexist because for some
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
@@ -893,12 +918,13 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
       return;
     }
 
-    if constexpr (use_wfp4a16) {
-      TLLM_CHECK_WITH_INFO(inputs.gemm_config.is_tma_warp_specialized,
-                           "wfp4a16 is only supported for TMA warp specialization");
+    if constexpr (use_wfp4a16 || use_wfp4afp8) {
+      TLLM_CHECK_WITH_INFO(
+          inputs.gemm_config.is_tma_warp_specialized,
+          "MXFP4 mixed-input Hopper path is only supported for TMA warp specialization");
       // EpilogueTag is ignored
       cutlass_kernels_oss::sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass<
-          T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 1>(
+          T, WeightType, ScaleBiasType, cutlass_extensions::EpilogueOpDefault, 1, Sm90Wfp4Afp8Mode>(
           inputs, hopper_inputs, multi_processor_count_, nullptr);
       return;
     }
@@ -936,9 +962,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getMaxWorkspaceSize(
-    int num_experts) const {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+                     Sm90Wfp4Afp8Mode>::getMaxWorkspaceSize(int num_experts) const {
   if (num_experts != num_experts_) {
     TLLM_LOG_TRACE("Calling getMaxWorkspaceSize() with a new expert count %d vs %d", num_experts,
                    num_experts_);
@@ -949,13 +975,12 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getMaxW
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::calcMaxWorkspaceSize(
-    int num_experts) const {
-  if constexpr (use_w4_groupwise) {
-    return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<T, WeightType,
-                                                                                 OutputType>(
-        num_experts, multi_processor_count_);
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
+                     Sm90Wfp4Afp8Mode>::calcMaxWorkspaceSize(int num_experts) const {
+  if constexpr (use_sm90_mixed_input_gemm) {
+    return cutlass_kernels_oss::calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput<
+        T, WeightType, OutputType, Sm90Wfp4Afp8Mode>(num_experts, multi_processor_count_);
   }
   if (!supportsTmaWarpSpecialized()) {
     return 0;
@@ -1009,19 +1034,19 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::calcMax
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
 template <typename EpilogueTag>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::runGemm(
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::runGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   dispatchToArch<EpilogueTag>(inputs, hopper_inputs);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemmBiasAct(
-    GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
-    TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
+    moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
+                   TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   switch (inputs.activation_type) {
     case ActivationType::Relu:
       runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs, hopper_inputs);
@@ -1054,17 +1079,17 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemmBi
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::moeGemm(
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::moeGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType,
-          bool IsMXFPX>
-int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::queryOccupancyForConfig(
-    cutlass_extensions::CutlassGemmConfig const& config) {
+          bool IsMXFPX, Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode>
+int MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Afp8Mode>::
+    queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) {
   // TMA warp-specialized configs (Hopper/Blackwell native) do not use the Ampere GroupedGEMM
   // occupancy path, so we conservatively report them as supported (occupancy > 0).
   if (config.is_tma_warp_specialized) {

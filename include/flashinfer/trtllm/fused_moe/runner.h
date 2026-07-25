@@ -443,6 +443,10 @@ class Runner {
                                                            int32_t numLocalExperts,
                                                            int32_t numTokens) const;
 
+  [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numLocalExperts,
+                                        int32_t numTokens) const;
+
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts,

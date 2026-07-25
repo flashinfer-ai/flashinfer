@@ -159,10 +159,10 @@ def skip_unless_sm120() -> None:
         sys.exit(0)
 
     capability = torch.cuda.get_device_capability()
-    if capability != (12, 0):
+    if capability not in ((12, 0), (12, 1)):
         print(f"Current device capability: {capability}.")
         print(
-            "Skipping: NVFP4 attention SM120 benchmark requires compute capability (12, 0)."
+            "Skipping: NVFP4 attention SM120 benchmark requires compute capability (12, 0) or (12, 1)."
         )
         sys.exit(0)
 

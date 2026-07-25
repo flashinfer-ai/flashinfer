@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
 import math
 import os
 import statistics
@@ -27,13 +28,22 @@ from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import is_sm100a_supported
 
 # ---------------------------------------------------------------------------
-# Hardware gate
+# Hardware / dependency gates
 # ---------------------------------------------------------------------------
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
-)
+_HAS_QUACK = importlib.util.find_spec("quack") is not None
+
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+        reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
+    ),
+    pytest.mark.skipif(
+        not _HAS_QUACK,
+        reason="VSA Blackwell backend requires the quack package "
+        "(pip install git+https://github.com/Dao-AILab/quack.git)",
+    ),
+]
 
 # BSA blk128 kernel block granularity: 128-token Q/KV blocks
 R = C = 128

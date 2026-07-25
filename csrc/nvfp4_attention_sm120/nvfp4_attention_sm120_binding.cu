@@ -231,8 +231,8 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   cudaError_t status = cudaGetDeviceProperties(&props, q_fp4.device().device_id);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cudaGetDeviceProperties failed: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(props.major == 12 && props.minor == 0)
-      << "NVFP4 attention SM120 kernel requires compute capability 12.0";
+  TVM_FFI_ICHECK(props.major == 12 && (props.minor == 0 || props.minor == 1))
+      << "NVFP4 attention SM120 kernel requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp4.size(0);
   const int64_t num_heads = q_fp4.size(1);
@@ -265,9 +265,12 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(v_scale_t.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len / 16);
 
+  // Compact correction: one row per 128-token Q block. The kernel's TMA
+  // layout addresses the tensor this way and broadcasts each row across
+  // the rows of the corresponding Q tile.
   TVM_FFI_ICHECK_EQ(qk_correction.size(0), batch);
   TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len : 128);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len / 128 : 1);
   TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len);
 
   TVM_FFI_ICHECK_EQ(out.size(0), batch);
