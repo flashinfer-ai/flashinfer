@@ -24,13 +24,15 @@ Flush semantics per (request b, v-head hv)
     sum_j w_j u_j (k_j.x) == S_h x), so y matches the verify kernel;
   - the T current drafts are NOT folded: their fresh corrections U, normed
     k, and LOCAL cumulative log-decay (restarting at 0, since the reference
-    checkpoint is now S_h) are appended at ring slots [0, T);
-  - hist_len is zeroed for flushed requests BY THE WRAPPER after launch
-    (in-kernel writes would race with later CTA waves still reading it).
+    checkpoint is now S_h) are appended at ring slots (base+P+s) & RING_MASK
+    — PAST the fold-source window [base, base+P), so no CTA ever overwrites
+    rows a sibling is still reading (ring semantics; RING_SLOTS = 32);
+  - cursor commits (base slide, len reset) are CALLER-OWNED, outside the
+    launch — identical to Triton commit_gdn_replayssm_spec: flush rows
+    base' = (base+P) & RING_MASK, len' = accepted.
 The fold runs at the CTA tail: re-stream S0 half-by-half via TMA, form
 D = b_d @ khist via MMA strips (b_d = the w-scaled u tile; khist from a
-register snapshot taken before the shared buffer is re-tenanted — a gmem
-re-read would race with the k-group leader's restart append), then
+register snapshot taken before the shared buffer is re-tenanted), then
 S_h = bdec*S0 + D per element, stored straight to the pool (f32 accumulate,
 one rounding to the state dtype).
 
@@ -88,8 +90,8 @@ High-level flow
   4. GEMM the state S0 against the packed [k; q] tile, add the history-ring
      contribution, and produce the token outputs.
   5. Compute the new corrections u and append (normed k, u, G) to the ring.
-  6. On flush (P >= flush_min): fold the ring into S0, write it back, and
-     restart the ring at slots [0, T).
+  6. On flush (P >= flush_min): fold the window into S0 and write it back;
+     the caller's cursor commit then slides base past the folded window.
 
 Implementation notes
 --------------------
@@ -281,7 +283,14 @@ f32 = cutlass.Float32
 WARP = 32
 THREADS = 128
 T_PAD = 16
-W_RING = 16  # history-ring slots per (request, head) — one 16-row MMA tile
+W_RING = 16  # max history WINDOW rows (one 16-row MMA tile) — smem/tile constant
+# Physical ring depth (Triton-ReplaySSM-compatible circular ring). The live
+# window is [base, base+P) mod RING_SLOTS with P <= W_RING; appends land at
+# (base+P+s) & RING_MASK — always PAST the window, so a flush never overwrites
+# rows any sibling CTA is still reading (the old single-buffer restart race).
+# Cursor commits (base slide / len reset) are CALLER-OWNED, outside the launch.
+RING_SLOTS = 32
+RING_MASK = RING_SLOTS - 1
 
 # The state tile is streamed in two K-halves so its SMEM buffer is 16 KiB
 # instead of 32 KiB. Shared-memory rows are padded by 8 elements to avoid
@@ -1232,6 +1241,7 @@ class GdnDecodeUCacheFlushKernel:
         gUC: cute.Tensor,
         gGC: cute.Tensor,
         gHlen: cute.Tensor,
+        gBase: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         HV: cutlass.Int32,
@@ -1279,6 +1289,7 @@ class GdnDecodeUCacheFlushKernel:
             gUC,
             gGC,
             gHlen,
+            gBase,
             gOut,
             scale,
             tiled_mma,
@@ -1312,6 +1323,7 @@ class GdnDecodeUCacheFlushKernel:
         gUC: cute.Tensor,
         gGC: cute.Tensor,
         gHlen: cute.Tensor,
+        gBase: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -1394,6 +1406,12 @@ class GdnDecodeUCacheFlushKernel:
         # u_cache [pool, HV, W_RING, V] bf16,
         # g_cache [pool, HV, W_RING] f32 (absolute log-decay since ckpt).
         P_hist = gHlen.iterator[pid_b]
+        # Ring window origin (Triton cache_base semantics). All HISTORY row
+        # addresses below are (ring_base + logical_row) & RING_MASK; appends
+        # use (ring_base + P_hist + s) & RING_MASK. Smem/logical rows stay
+        # [0, W_RING) — order is carried by the per-row g values, so the
+        # rotate-at-load keeps every downstream tile/GEMM unchanged.
+        ring_base = gBase.iterator[pid_b]
         # Pool/head strides from the descriptor layouts, NOT dense shape
         # products: paged serving pools (vLLM) are block-strided views whose
         # dim-0 stride spans the whole multi-component page; inner dims stay
@@ -1441,24 +1459,27 @@ class GdnDecodeUCacheFlushKernel:
         # g_cache is f32 so the load is direct.
         _g_hist_f32 = f32(0.0)
         if warp_id == 1 and lane_id < W_RING:
-            _g_hist_f32 = gGC.iterator[_gc_pool_e64 + Int64(lane_id)]
+            _g_hist_f32 = gGC.iterator[
+                _gc_pool_e64 + Int64((ring_base + lane_id) & Int32(RING_MASK))
+            ]
 
         # (perf) L2-prefetch the live khist/u ring rows (rows < P; 2 x
         # 128-B lines per row) at kernel entry — the mid-kernel cp.async
         # waves then hit L2, shrinking their exposed latency at small B.
         _pf_row = (tidx & Int32(31)) >> 1
         _pf_half = (tidx & Int32(1)) * Int32(64)
+        _pf_ring = (ring_base + _pf_row) & Int32(RING_MASK)
         if _pf_row < P_hist:
             if tidx < Int32(32):
                 _prefetch_l2_bf16(
                     gKC.iterator.toint() + _kc_pool_e64 * 2,
-                    _pf_row * K_DIM
+                    _pf_ring * K_DIM
                     + _pf_half,
                 )
             if tidx >= Int32(32) and tidx < Int32(64):
                 _prefetch_l2_bf16(
                     gUC.iterator.toint() + _uc_pool_e64 * 2,
-                    _pf_row * V_DIM
+                    _pf_ring * V_DIM
                     + _pf_half,
                 )
 
@@ -1788,19 +1809,22 @@ class GdnDecodeUCacheFlushKernel:
                 # G-ring append: g_new[s] = G_P + cumsum_s. sGamma[0:T]
                 # (log-domain cumsum, warp 3) was published by the K/Q-wait
                 # sync before this norm phase.
-                # (flush) restart layout for flushing requests: slots [0, T)
-                # with LOCAL decay (the reference checkpoint becomes S_h,
-                # which absorbs e^{G_P}). Safe this early: no CTA re-reads
-                # gGC after its entry LDG (w_j live in sGhist), and g rows
-                # are (cache_idx, hv)-exclusive.
+                # (flush) flushing requests append with LOCAL decay (the
+                # reference checkpoint becomes S_h, which absorbs e^{G_P}).
+                # Safe this early: no CTA re-reads gGC after its entry LDG
+                # (w_j live in sGhist), g rows are (cache_idx, hv)-exclusive,
+                # and the target (base+P+s)&mask is past the live window.
                 if lane_id < Int32(self._t_input):
-                    _g_app_off = Int32(0) if P_hist >= flush_min else P_hist
+                    # Ring append at (base+P+s) — PAST the live window for
+                    # flush and verify rows alike. Value rule unchanged:
+                    # flush rows restart with LOCAL decay (the fold absorbs
+                    # e^{G_P} into the checkpoint).
                     _g_app_val = (
                         f32(0.0) if P_hist >= flush_min else _gp
                     ) + sGamma.iterator[lane_id]
                     _st_global_f32(
                         _gGC_base_st,
-                        _g_app_off + lane_id,
+                        (ring_base + P_hist + lane_id) & Int32(RING_MASK),
                         _g_app_val,
                     )
         else:
@@ -1856,12 +1880,11 @@ class GdnDecodeUCacheFlushKernel:
         # of sK rows [0:t) (read-only vs the Grams below), so NO extra
         # barrier is needed — it overlaps the Grams.
         # ============================================================
-        # (flush) the normed-k LDS is hoisted OUT of the append guards and kept
-        # as a register snapshot: flushing CTAs must NOT append at [P, P+T)
-        # (their ring restarts at [0, T) — written at the tail, AFTER the fold
-        # has consumed the old ring), and by tail time the sK rows are
-        # bdec-scaled and the buffer re-tenanted, so this pre-scale snapshot
-        # is the only correct append source. The LDS itself is safe for all
+        # The normed-k LDS is hoisted OUT of the append guard and kept as a
+        # register snapshot: the append source must be the PRE-bdec-scale
+        # values, and the ring append target (base+P+s)&mask is past every
+        # sibling's fold-source window, so flush and verify rows append
+        # identically right here. The LDS itself is safe for all
         # 128 threads (rows 0..15 of the sK tile); only the STG is gated.
         _gKC_base_st = gKC.iterator.toint()
         _kc_row = tidx // Int32(K_DIM // 8)
@@ -1886,17 +1909,18 @@ class GdnDecodeUCacheFlushKernel:
             _kr2 = _kv2
             _kr3 = _kv3
         if (pid_hv % (HV // H)) == 0:
-            if P_hist < flush_min:
-                _kc_wr_off = P_hist * K_DIM
-                if tidx < Int32(self._t_input * (K_DIM // 8)):
-                    _st_global_v4_b32(
-                        _gKC_base_st + _kc_pool_e64 * 2,
-                        _kc_wr_off + _kc_row * K_DIM + _kc_pos * Int32(8),
-                        _kr0,
-                        _kr1,
-                        _kr2,
-                        _kr3,
-                    )
+            # Ring append at (base+P+s)&mask — past the live window for flush
+            # and verify rows alike (the fold reads [base, base+P); disjoint).
+            if tidx < Int32(self._t_input * (K_DIM // 8)):
+                _st_global_v4_b32(
+                    _gKC_base_st + _kc_pool_e64 * 2,
+                    ((ring_base + P_hist + _kc_row) & Int32(RING_MASK)) * K_DIM
+                    + _kc_pos * Int32(8),
+                    _kr0,
+                    _kr1,
+                    _kr2,
+                    _kr3,
+                )
 
         # KKT (warps 0-1) || QKT (warps 2-3) — direct acc → SMEM writes.
         acc.fill(f32(0.0))
@@ -1985,9 +2009,13 @@ class GdnDecodeUCacheFlushKernel:
                 _kh_row = _kh_group // Int32(K_DIM // 8)
                 _kh_col = (_kh_group % Int32(K_DIM // 8)) * Int32(8)
                 if _kh_row < P_hist:
+                    # ring-rotate at load: gmem row (base+j)&mask lands in
+                    # smem/logical row j — downstream tiles unchanged.
                     _cp_async_bf16x8(
                         _gKC_base_rd,
-                        _kc_rd_base + _kh_row * K_DIM + _kh_col,
+                        _kc_rd_base
+                        + ((ring_base + _kh_row) & Int32(RING_MASK)) * K_DIM
+                        + _kh_col,
                         _sQ_base_async
                         + _kh_row * Int32(K_PADDED * 2)
                         + _kh_col * Int32(2),
@@ -2317,9 +2345,8 @@ class GdnDecodeUCacheFlushKernel:
         # khist tile (16 rows x 128 cols bf16 = 8 i32/thread) in registers
         # across the qv_buf tenant switch: the tail fold needs khist AND the
         # u tile simultaneously, but they are sequential tenants of the same
-        # 4.3 KB buffer, and re-reading gKC at the tail would race with the
-        # k-group leader's restart append (slots [0,T) overlap the fold
-        # source [0,P) across sibling CTAs). Rows >= P hold stale-but-finite
+        # 4.3 KB buffer, so the snapshot avoids a second gKC round-trip at
+        # the tail. Rows >= P hold stale-but-finite
         # bytes; the fold's A-operand w-mask zeroes their contribution.
         # Thread t owns row (t//8), i32 cols (t%8)*8 .. +8 (bf16 cols
         # (t%8)*16 .. +16). The gated sync orders the snapshot before any
@@ -2366,7 +2393,9 @@ class GdnDecodeUCacheFlushKernel:
             if _uh_row < P_hist:
                 _cp_async_bf16x8_cg(
                     _gUC_base,
-                    _uc_base + _uh_row * V_DIM + _uh_col,
+                    _uc_base
+                    + ((ring_base + _uh_row) & Int32(RING_MASK)) * V_DIM
+                    + _uh_col,
                     _sV_base_async_u
                     + _uh_row * Int32(V_PADDED * 2)
                     + _uh_col * Int32(2),
@@ -2899,66 +2928,51 @@ class GdnDecodeUCacheFlushKernel:
 
         # Ring append straight from OutStage rows [8:8+t) — same barrier and
         # staging tile as the output, so this overlaps the output STGs above
-        # (no extra pass, no extra barrier). Flushing CTAs skip it here: their
-        # ring restarts at [0, T), and slots [0, P) are still the fold source —
-        # the restart append runs at the tail AFTER the u reload, from this
-        # same OutStage tile (resident until the tail re-TMA overwrites sH).
-        _uc_wr_base = _uc_base + P_hist * V_DIM
-        if P_hist < flush_min:
-            if tidx < Int32(self._t_input * (V_DIM_C // 8)):
-                _uf_row = tidx // Int32(V_DIM_C // 8)
-                _uf_pos = tidx % Int32(V_DIM_C // 8)
-                _uv0, _uv1, _uv2, _uv3 = _lds_v4_b32(
-                    _sOutStage_base
-                    + (8 + _uf_row) * Int32(V_PADDED * 2)
-                    + _uf_pos * Int32(16)
-                )
-                _st_global_v4_b32(
-                    _gUC_base,
-                    _uc_wr_base + _uf_row * V_DIM + _uf_pos * Int32(8),
-                    _uv0,
-                    _uv1,
-                    _uv2,
-                    _uv3,
-                )
+        # (no extra pass, no extra barrier). Flush rows append here too: the
+        # ring target (base+P+s)&mask is PAST the fold-source window
+        # [base, base+P), so there is no write-after-read hazard.
+        if tidx < Int32(self._t_input * (V_DIM_C // 8)):
+            _uf_row = tidx // Int32(V_DIM_C // 8)
+            _uf_pos = tidx % Int32(V_DIM_C // 8)
+            _uv0, _uv1, _uv2, _uv3 = _lds_v4_b32(
+                _sOutStage_base
+                + (8 + _uf_row) * Int32(V_PADDED * 2)
+                + _uf_pos * Int32(16)
+            )
+            _st_global_v4_b32(
+                _gUC_base,
+                _uc_base
+                + ((ring_base + P_hist + _uf_row) & Int32(RING_MASK)) * V_DIM
+                + _uf_pos * Int32(8),
+                _uv0,
+                _uv1,
+                _uv2,
+                _uv3,
+            )
 
         # ============================================================
-        # PER-REQUEST STATE FOLD + WRITE-BACK + RING RESTART.
+        # PER-REQUEST STATE FOLD + WRITE-BACK (ring semantics: NO restart
+        # writes — this step's tokens were appended at (base+P+s)&mask in
+        # the main pipeline, past the fold-source window [base, base+P);
+        # cursor slide/reset is the CALLER's commit, outside the launch).
         # Runs only for CTAs whose request crossed flush_min. The predicate
         # is CTA-uniform (P_hist is per-request), so the sync_threads and
-        # mbarrier waits inside this branch are safe. Ordering is
-        # load-bearing:
-        #   1. reload the OLD u rows [0,P) into k_buf (dead after the H
+        # mbarrier waits inside this branch are safe. Ordering:
+        #   1. reload the OLD u window rows into k_buf (dead after the H
         #      GEMM) and restore the khist snapshot into qv_buf (dead after
-        #      the y/U GEMMs) — BEFORE the restart appends overwrite ring
-        #      slots [0,T) in gmem.
-        #   2. restart appends at [0,T): u from OutStage (still resident),
-        #      normed k from the pre-scale register snapshot (k-group
-        #      leader only). g was appended local in the norm phase;
-        #      hist_len is zeroed by the WRAPPER after the launch (an
-        #      in-kernel store would race with later-launching CTA waves
-        #      of the same request still reading it).
-        #   3. b_d = w_j * u_j in place over the u stage (w = 0 for
+        #      the y/U GEMMs).
+        #   2. b_d = w_j * u_j in place over the u stage (w = 0 for
         #      j >= P zeroes the k16 padding and any stale bytes).
-        #   4. re-TMA S0 half-by-half into sH (mbarrier phases continue at
+        #   3. re-TMA S0 half-by-half into sH (mbarrier phases continue at
         #      literal parities 0, 1) and fold: D = b_d @ khist via
         #      _qtv_4mma strips, then S_h = bdec*S0 + D per element, STG
         #      straight to the state pool.
         # ============================================================
         if P_hist >= flush_min:
-            # --- 1) U register snapshot from OutStage (sK) — taken BEFORE
-            #        the u reload overwrites k_buf. LDS is safe for all 128
-            #        threads (rows [8:16) of the tile); the append STG is
-            #        gated. 4 i32/thread. ---
-            _uf_row = tidx // Int32(V_DIM_C // 8)
-            _uf_pos = tidx % Int32(V_DIM_C // 8)
-            _us0, _us1, _us2, _us3 = _lds_v4_b32(
-                _sOutStage_base
-                + (8 + _uf_row) * Int32(V_PADDED * 2)
-                + _uf_pos * Int32(16)
-            )
+            # Order all earlier OutStage reads (output STGs + ring appends)
+            # before the u reload re-tenants k_buf below.
             sync_threads()
-            # --- 2) u reload (rows < P; .cg) into k_buf + khist snapshot
+            # --- 1) u reload (rows < P; .cg) into k_buf + khist snapshot
             #        restore into qv_buf ---
             for _fr in cutlass.range_constexpr(2):
                 _fr_group = tidx + _fr * THREADS
@@ -2967,7 +2981,9 @@ class GdnDecodeUCacheFlushKernel:
                 if _fr_row < P_hist:
                     _cp_async_bf16x8_cg(
                         _gUC_base,
-                        _uc_base + _fr_row * V_DIM + _fr_col,
+                        _uc_base
+                        + ((ring_base + _fr_row) & Int32(RING_MASK)) * V_DIM
+                        + _fr_col,
                         _sK_base_async
                         + _fr_row * Int32(K_PADDED * 2)
                         + _fr_col * Int32(2),
@@ -2989,19 +3005,7 @@ class GdnDecodeUCacheFlushKernel:
             _sQ_i32.iterator[_kh_sts + 7] = _khs7
             _cp_async_wait_group_0()
             sync_threads()
-            # --- 3) restart appends at slots [0, T): u from the register
-            #        snapshot (the gmem u rows [0,P) were reloaded above,
-            #        so the write-after-read order holds) ---
-            if tidx < Int32(self._t_input * (V_DIM_C // 8)):
-                _st_global_v4_b32(
-                    _gUC_base,
-                    _uc_base + _uf_row * V_DIM + _uf_pos * Int32(8),
-                    _us0,
-                    _us1,
-                    _us2,
-                    _us3,
-                )
-            # --- 4) b_d = w_j * u_j in place over the u stage (k_buf) ---
+            # --- 2) b_d = w_j * u_j in place over the u stage (k_buf) ---
             for _ws in cutlass.range_constexpr(9):
                 _ws_g = tidx + _ws * THREADS
                 _ws_r = _ws_g // Int32(V_PADDED // 2)
@@ -3123,24 +3127,10 @@ class GdnDecodeUCacheFlushKernel:
                         _cv2,
                         _cv3,
                     )
-            # --- 6) restart k-append (group leader), LAST in the tail: the
-            #        k ring rows [0,T) are read by SIBLING CTAs' khist
-            #        waves (old values = their fold source), and there is
-            #        no inter-CTA sync — placing the overwrite at the very
-            #        end maximizes the launch-skew margin (a sibling would
-            #        need to trail its pid-adjacent leader by nearly a full
-            #        CTA duration to observe it). Source = the pre-bdec-scale
-            #        register snapshot. ---
-            if (pid_hv % (HV // H)) == 0:
-                if tidx < Int32(self._t_input * (K_DIM // 8)):
-                    _st_global_v4_b32(
-                        _gKC_base_st + _kc_pool_e64 * 2,
-                        _kc_rd_base + _kc_row * K_DIM + _kc_pos * Int32(8),
-                        _kr0,
-                        _kr1,
-                        _kr2,
-                        _kr3,
-                    )
+            # (ring) no tail k restart: this step's normed k was appended at
+            # (base+P+s)&mask by the k-group leader in the main pipeline —
+            # past every sibling's fold-source window, so no inter-CTA
+            # ordering is required.
 
 
 # ============================================================================
@@ -3250,6 +3240,7 @@ def gated_delta_rule_mtp_ucache_flush(
     u_cache: Optional[torch.Tensor] = None,
     g_cache: Optional[torch.Tensor] = None,
     hist_len: Optional[torch.Tensor] = None,
+    cache_base: Optional[torch.Tensor] = None,
     flush_min: Optional[int] = None,
     restart_hist_on_flush: bool = True,
     pdl_trigger: bool = False,
@@ -3261,15 +3252,21 @@ def gated_delta_rule_mtp_ucache_flush(
     and ring appends to the verify kernel); requests with hist_len[b] >=
     flush_min additionally FOLD their ring into the state pool
     (S0 <- e^{G_P} S0 + sum_j w_j u_j k_j^T, written in place at
-    initial_state_indices[b]) and RESTART their ring — the T new
-    (u, normed-k, LOCAL-g) entries land at slots [0, T) and this wrapper
-    zeroes their hist_len after the launch (graph-capturable
-    ``masked_fill_``). The serving loop's contract stays
-    ``hist_len += accepted`` unconditionally, after acceptance.
+    initial_state_indices[b]). RING SEMANTICS (Triton-ReplaySSM-compatible):
+    the live window is ``[cache_base[b], cache_base[b]+hist_len[b]) mod 32``
+    and the T new (u, normed-k, LOCAL-g) entries are appended at
+    ``(cache_base+hist_len+s) & 31`` — past the window, for flush and verify
+    rows alike, so a flush never overwrites rows a sibling CTA still reads.
+    Cursor commits are CALLER-OWNED (outside the launch): flush rows
+    ``base' = (base+len) & 31, len' = accepted``; verify rows
+    ``len' = len + accepted`` — i.e. Triton's commit_gdn_replayssm_spec.
+    ``restart_hist_on_flush=True`` applies that commit here as a
+    convenience for standalone use (graph-capturable fused ops).
 
     flush_min defaults to W_RING - T + 1 (lazy: flush exactly when the
-    ring cannot hold another window). Pass a smaller value (e.g. 9) for
-    predictive flushing. Legal hist_len at call time: [0, 16].
+    window cannot hold another T). Pass a smaller value (e.g. 9) for
+    predictive flushing. Legal hist_len at call time: [0, 16];
+    cache_base: [0, 32).
 
     Returns ``output`` of shape ``[B, T, HV, V]`` in the module IO dtype
     (bf16 default; fp16 when the module was imported with
@@ -3388,8 +3385,9 @@ def gated_delta_rule_mtp_ucache_flush(
         f"GDN_UCACHE_RING_DTYPE); got {k_cache.dtype}."
     )
     _pools_contig &= _inner_dense(k_cache, "k_cache")
-    assert tuple(k_cache.shape) == (_pool, HK, 16, K_dim), (
-        f"k_cache must be [pool={_pool}, H={HK}, 16, K={K_dim}]; got {tuple(k_cache.shape)}"
+    assert tuple(k_cache.shape) == (_pool, HK, RING_SLOTS, K_dim), (
+        f"k_cache must be [pool={_pool}, H={HK}, {RING_SLOTS}, K={K_dim}]; "
+        f"got {tuple(k_cache.shape)}"
     )
     assert u_cache.dtype == RING_TORCH, (
         f"u_cache must be {RING_TORCH} (module RING dtype, see "
@@ -3397,12 +3395,16 @@ def gated_delta_rule_mtp_ucache_flush(
         f"point); got {u_cache.dtype}."
     )
     _pools_contig &= _inner_dense(u_cache, "u_cache")
-    assert tuple(u_cache.shape) == (_pool, HV, 16, V_dim)
+    assert tuple(u_cache.shape) == (_pool, HV, RING_SLOTS, V_dim)
     assert g_cache.dtype == torch.float32
     _pools_contig &= _inner_dense(g_cache, "g_cache")
-    assert tuple(g_cache.shape) == (_pool, HV, 16)
+    assert tuple(g_cache.shape) == (_pool, HV, RING_SLOTS)
     assert hist_len.dtype == torch.int32 and hist_len.shape[0] == B
     hist_len = hist_len.contiguous()
+    if cache_base is None:
+        cache_base = torch.zeros_like(hist_len)
+    assert cache_base.dtype == torch.int32 and cache_base.shape[0] == B
+    cache_base = cache_base.contiguous()
     if T not in (4, 8):
         raise NotImplementedError(
             f"gated_delta_rule_mtp_ucache_flush: T={T} unsupported — native T in "
@@ -3648,6 +3650,7 @@ def gated_delta_rule_mtp_ucache_flush(
         mk_dyn(u_cache),
         mk_dyn(g_cache),
         mk_dyn(hist_len),
+        mk_dyn(cache_base),
         mk_dyn(out16),
         scale,
         HV,
@@ -3673,17 +3676,19 @@ def gated_delta_rule_mtp_ucache_flush(
         )
     _CACHE[cache_key](*args)
 
-    # (flush) ring restart: zero hist_len for every request that flushed.
-    # Host-side (one fused, graph-capturable op) rather than in-kernel: a
-    # kernel store would race with later-launching CTA waves of the same
-    # request still reading hist_len at entry. In-place, so the caller's
-    # tensor reflects the restart before the usual `hist_len += accepted`.
-    # restart_hist_on_flush=False hands the restart to the caller: when N
-    # layers share one hist_len within a step (vLLM serving), zeroing after
-    # layer 1 would flip layers 2..N onto the P=0 path mid-step — the caller
-    # must instead fold the restart into its own commit bookkeeping.
+    # (flush) ring cursor commit for STANDALONE use: flush rows slide the
+    # base past the folded window and reset the length (Triton
+    # commit_gdn_replayssm_spec semantics, host-side, graph-capturable).
+    # restart_hist_on_flush=False hands the commit to the caller: when N
+    # layers share one cursor set within a step (vLLM serving), committing
+    # after layer 1 would flip layers 2..N onto the wrong window mid-step —
+    # the caller folds it into its own per-step commit bookkeeping.
     if restart_hist_on_flush:
-        hist_len.masked_fill_(hist_len >= flush_min, 0)
+        _flushed = hist_len >= flush_min
+        cache_base.copy_(
+            (cache_base + hist_len * _flushed) & (RING_SLOTS - 1)
+        )
+        hist_len.masked_fill_(_flushed, 0)
 
     if output is None:
         return out16[:, :T]  # zero-copy view of the valid tokens
@@ -3698,4 +3703,6 @@ __all__ = [
     "K_DIM",
     "V_DIM_C",
     "W_RING",
+    "RING_SLOTS",
+    "RING_MASK",
 ]
