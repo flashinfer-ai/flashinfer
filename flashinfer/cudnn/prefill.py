@@ -890,9 +890,18 @@ def cudnn_batch_prefill_with_kv_cache(
     if o_data_type is None:
         o_data_type = q.dtype
 
+    out_shape = (num_tokens, h_qo, d_vo)
     if out is None:
-        out_shape = (num_tokens, h_qo, d_vo)
         out = torch.empty(out_shape, device=q.device, dtype=o_data_type)
+    else:
+        if out.shape != out_shape:
+            raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
+        if out.dtype != o_data_type:
+            raise ValueError(f"out must have dtype {o_data_type}, got {out.dtype}")
+        if out.device != q.device:
+            raise ValueError(f"out must be on device {q.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     if batch_offsets_units == "tokens":
         # Convenience feature to allow user to set just batch_offsets_{q,k} if desired.
@@ -902,6 +911,21 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_v = batch_offsets_k
 
     if CUDNN_AVAILABLE and backend != "cubin":
+        # cuDNN 9.20/9.24 on SM89 silently miscompute mixed HALF/BFLOAT16 O
+        # descriptors. Keep SDPA's O in the input dtype and make the API
+        # conversion explicit instead of relying on backend conversion.
+        needs_output_cast = (
+            q.dtype in (torch.float16, torch.bfloat16)
+            and o_data_type in (torch.float16, torch.bfloat16)
+            and o_data_type != q.dtype
+        )
+        cudnn_out = (
+            torch.empty(out_shape, device=q.device, dtype=q.dtype)
+            if needs_output_cast
+            else out
+        )
+        cudnn_o_data_type = q.dtype if needs_output_cast else o_data_type
+
         # The cuDNN graph declares packed q/out with THD nominal strides
         # (batch stride == one token), which is only addressable through ragged
         # offsets. Without them the graph is well-formed but reads/writes batch
@@ -932,9 +956,9 @@ def cudnn_batch_prefill_with_kv_cache(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            out=out,
+            out=cudnn_out,
             lse=lse,
-            o_data_type=o_data_type,
+            o_data_type=cudnn_o_data_type,
         )
 
         if batch_offsets_units == "tokens":
@@ -978,7 +1002,7 @@ def cudnn_batch_prefill_with_kv_cache(
                 batch_offsets_v = apply_multiplier(batch_offsets_v, h_kv * d_vo)
                 batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
 
-        return _batch_prefill_with_kv_cache(
+        cudnn_out, lse = _batch_prefill_with_kv_cache(
             **run_kwargs,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_o,
@@ -986,6 +1010,9 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_v=batch_offsets_v,
             batch_offsets_stats=batch_offsets_stats,
         )
+        if needs_output_cast:
+            out.copy_(cudnn_out)
+        return out, lse
     else:
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:
             raise ValueError(
