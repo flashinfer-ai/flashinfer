@@ -244,7 +244,8 @@ class GemvBf16Fp4Sm12x:
         idx = Int32(bidx) * Int32(self._reduce_threads) + tidx
         if idx < total:
             acc_sum = Float32(0.0)
-            for s in cutlass.range_constexpr(self._splits):
+            # Dynamic loop: fill-derived splits reach ~100+, too many to unroll.
+            for s in cutlass.range(self._splits):
                 acc_sum = acc_sum + Float32(mPartial[Int32(s) * total + idx])
             mC_flat[idx] = mC_flat.element_type(acc_sum)
 

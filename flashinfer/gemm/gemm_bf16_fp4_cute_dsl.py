@@ -391,7 +391,7 @@ def _prepare_cute_dsl(
 
 
 def _bf16_fp4_cute_dsl_tactic_configs(
-    n: int, k: int
+    n: int, k: int, sm_count: Optional[int] = None
 ) -> List[
     Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int, str]
 ]:
@@ -401,7 +401,10 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     use_fp16_mma, tile_swizzle, k_splits, occupancy, kind)`` tuples,
     where ``kind`` selects the kernel: ``"mma"`` (the dense GEMM, all
     fields live) or ``"gemv"`` (the m=1 streaming kernel, which only
-    reads ``k_splits``).
+    reads ``k_splits``).  ``sm_count`` additionally enables the
+    fill-derived gemv split; callers must pass the same value to keep
+    tactic indices consistent (it only appends, and per-device tuning
+    always sees one device).
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -503,9 +506,20 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     # and to the m=1 bucket.
     if n % 64 == 0:
         k_tiles16 = k // 16
-        for splits in (1, 2, 4, 8, 16, 32):
-            if splits * 4 <= k_tiles16:
-                configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
+        gemv_splits = [s for s in (1, 2, 4, 8, 16, 32) if s * 4 <= k_tiles16]
+        # Fill-derived split: size the grid to just under one full wave of
+        # the kernel's 6 resident CTAs/SM (1536-thread SM limit / 256).  The
+        # 0.95 target leaves slack for stragglers and the PDL-overlapped
+        # tail of the previous kernel; at ~1.0 waves the grid tips into a
+        # second wave (+3% measured at 1.08 waves).
+        if sm_count is not None and gemv_splits:
+            ctas = -(-(n // 64) // 8)
+            fill = int(0.95 * sm_count * 6 / ctas)
+            fill = max(1, min(fill, k_tiles16 // 4))
+            if fill not in gemv_splits:
+                gemv_splits.append(fill)
+        for splits in gemv_splits:
+            configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
 
     return configs
 
@@ -553,7 +567,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             # since the autotuner ranks by time and would not catch a
             # wrong-but-fast kernel on an unvalidated arch.
             gemv_ok = get_compute_capability(a.device)[0] == 12
-            configs = _bf16_fp4_cute_dsl_tactic_configs(n, k)
+            configs = _bf16_fp4_cute_dsl_tactic_configs(n, k, sm_count)
 
             def split_reduces_makespan(cfg) -> bool:
                 # Offer a split only if it shrinks the last wave >= 25%:
@@ -603,7 +617,11 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             k = int(b.shape[0]) * int(block_size)
             m = int(a.shape[0])
             cfg = (
-                _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic] if tactic >= 0 else None
+                _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(a.device))[
+                    tactic
+                ]
+                if tactic >= 0
+                else None
             )
             if cfg is not None and cfg[7] == "gemv":
                 if m != 1:

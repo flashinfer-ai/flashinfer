@@ -286,6 +286,7 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
         _cute_dsl_bf16_fp4_runner,
         _prepare_bf16_fp4_alpha,
     )
+    from flashinfer.utils import get_device_sm_count
 
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -301,7 +302,9 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
     sf_u8 = sf_p.view(torch.uint8).contiguous()
     alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
-    for tactic, cfg in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k)):
+    for tactic, cfg in enumerate(
+        _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
+    ):
         if cfg[7] == "gemv" and m != 1:
             continue
         outs = []
@@ -327,6 +330,7 @@ def test_cute_dsl_gemv_fp16_out():
         _cute_dsl_bf16_fp4_runner,
         _prepare_bf16_fp4_alpha,
     )
+    from flashinfer.utils import get_device_sm_count
 
     device = torch.device("cuda")
     m, n, k = 1, 2048, 7168
@@ -345,7 +349,9 @@ def test_cute_dsl_gemv_fp16_out():
     alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
     gemv = [
         i
-        for i, c in enumerate(_bf16_fp4_cute_dsl_tactic_configs(n, k))
+        for i, c in enumerate(
+            _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
+        )
         if c[7] == "gemv"
     ]
     assert gemv, "expected gemv tactics for this shape"
