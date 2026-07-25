@@ -71,7 +71,8 @@ pytestmark = pytest.mark.long_running
 DEV = "cuda"
 # Qwen3.5-122B GDN geometry at TP1; T=4 == MTP draft-3 verify window.
 H, HV, K, V = 16, 64, 128, 128
-T, W = 4, 16
+T, W = 4, 16          # W = max history WINDOW (kernel W_RING)
+RING = 32             # physical ring depth (kernel RING_SLOTS); window wraps mod RING
 FLUSH_MIN = 13  # == W - T + 1
 SCALE = 1.0 / math.sqrt(K)
 
@@ -168,7 +169,8 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
 # ---------------------------------------------------------------------------
 # Case builder: consistent inputs + rings for B requests.
 # ---------------------------------------------------------------------------
-def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None):
+def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None,
+               bases=None):
     ring_dtype = ring_dtype or io_dtype
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -181,21 +183,36 @@ def _make_case(B, hist_lens, io_dtype, state_dtype, seed, ring_dtype=None):
              + torch.rand(HV, generator=g, device=DEV) * 0.3).to(io_dtype)
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
-    kc = torch.zeros(B, H, W, K, dtype=ring_dtype, device=DEV)
-    uc = torch.zeros(B, HV, W, V, dtype=ring_dtype, device=DEV)
-    gc = torch.zeros(B, HV, W, dtype=torch.float32, device=DEV)
+    kc = torch.zeros(B, H, RING, K, dtype=ring_dtype, device=DEV)
+    uc = torch.zeros(B, HV, RING, V, dtype=ring_dtype, device=DEV)
+    gc = torch.zeros(B, HV, RING, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
+    bases = bases or [0] * B
+    cb = torch.tensor(bases, dtype=torch.int32, device=DEV)
     for r in range(B):
         P = int(hl[r])
         if P == 0:
             continue
+        # logical history rows j land at PHYSICAL ring rows (base + j) % RING
+        rows = torch.tensor([(bases[r] + j) % RING for j in range(P)],
+                            dtype=torch.long, device=DEV)
         kh = torch.randn(H, P, K, generator=g, device=DEV)
-        kc[r, :, :P] = F.normalize(kh, dim=-1).to(ring_dtype)
-        uc[r, :, :P] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
+        kc[r, :, rows] = F.normalize(kh, dim=-1).to(ring_dtype)
+        uc[r, :, rows] = (torch.randn(HV, P, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
         la = -(torch.rand(HV, P, generator=g, device=DEV) * 0.3 + 0.003)
-        gc[r, :, :P] = torch.cumsum(la, dim=-1)
+        gc[r, :, rows] = torch.cumsum(la, dim=-1)
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
-    return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx
+    return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx
+
+
+def _logical_rings(kc_r, uc_r, gc_r, base):
+    """Gather one request's PHYSICAL ring rows into logical window order
+    (row j = physical (base+j) % RING) so the fp32 oracle stays unchanged."""
+    rows = torch.tensor([(base + j) % RING for j in range(W)],
+                        dtype=torch.long, device=kc_r.device)
+    return (kc_r.index_select(1, rows),
+            uc_r.index_select(1, rows),
+            gc_r.index_select(1, rows))
 
 
 HISTORIES = {
@@ -203,61 +220,116 @@ HISTORIES = {
     "replay_P12": [12, 12, 12, 12],
     "fold_mixed": [13, 12, 13, 12],  # rows 0 and 2 fold
 }
+BASES = {
+    "base0": [0, 0, 0, 0],
+    # wrapped windows: base+P crosses RING for some rows (the ring path)
+    "wrap": [28, 5, 30, 17],
+}
 Y_TOL = 8e-3      # observed max ~7e-4 across arms; 10x margin
 STATE_TOL = 2e-2  # committed state accumulates P outer products first
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
 @pytest.mark.parametrize("history", list(HISTORIES))
-def test_output_matches_fp32_reference(arm, history):
+@pytest.mark.parametrize("basecase", list(BASES))
+def test_output_matches_fp32_reference(arm, history, basecase):
     _skip_if_not_sm90_or_later()
     mod = _load_flush(arm)
     _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     B = 4
-    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
+    bases = BASES[basecase]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
         B, HISTORIES[history], io_dtype, state_dtype, seed=1234,
-        ring_dtype=ring_dtype)
+        ring_dtype=ring_dtype, bases=bases)
     pool_before = pool.clone()  # fold rows mutate the pool; ref needs the old state
 
     y = mod.gated_delta_rule_mtp_ucache_flush(
         A_log, a, dt_bias, q=q, k=k, v=v, b=b,
         initial_state_source=pool, initial_state_indices=idx,
         k_cache=kc.clone(), u_cache=uc.clone(), g_cache=gc.clone(),
-        hist_len=hl.clone(),  # kernel mutates rings (appends/restarts); ref reads originals
+        hist_len=hl.clone(),  # kernel mutates rings (appends); ref reads originals
+        cache_base=cb.clone(),
         scale=SCALE, flush_min=FLUSH_MIN)
 
     for r in range(B):
+        kc_l, uc_l, gc_l = _logical_rings(kc[r], uc[r], gc[r], bases[r])
         y_ref, _ = _ref_fp32(q[r], k[r], v[r], a[r], b[r], A_log, dt_bias,
-                             pool_before[r], kc[r], uc[r], gc[r], int(hl[r]))
+                             pool_before[r], kc_l, uc_l, gc_l, int(hl[r]))
         err = (y[r].float() - y_ref).abs().max().item()
-        assert err < Y_TOL, f"row {r} ({history}, {arm}): |y - fp32 ref| = {err:.2e}"
+        assert err < Y_TOL, (
+            f"row {r} ({history}, {arm}, {basecase}): |y - fp32 ref| = {err:.2e}")
 
 
 @pytest.mark.parametrize("arm", list(ARMS))
-def test_folded_state_matches_fp32_reference(arm):
+@pytest.mark.parametrize("basecase", list(BASES))
+def test_folded_state_matches_fp32_reference(arm, basecase):
     """On a fold (hist_len >= flush_min) the kernel writes the ring-folded
     checkpoint back to the pool. Compare that committed state to the oracle."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush(arm)
     _, _, _, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     B = 4
-    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
+    bases = BASES[basecase]
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
         B, [13, 13, 13, 13], io_dtype, state_dtype, seed=99,
-        ring_dtype=ring_dtype)
+        ring_dtype=ring_dtype, bases=bases)
     pool_before = pool.clone()
 
     mod.gated_delta_rule_mtp_ucache_flush(
         A_log, a, dt_bias, q=q, k=k, v=v, b=b,
         initial_state_source=pool, initial_state_indices=idx,
         k_cache=kc.clone(), u_cache=uc.clone(), g_cache=gc.clone(),
-        hist_len=hl.clone(),  # kernel mutates rings (appends/restarts); ref reads originals
+        hist_len=hl.clone(),  # kernel mutates rings (appends); ref reads originals
+        cache_base=cb.clone(),
         scale=SCALE, flush_min=FLUSH_MIN)
 
     for r in range(B):
+        kc_l, uc_l, gc_l = _logical_rings(kc[r], uc[r], gc[r], bases[r])
         _, S_ref = _ref_fp32(q[r], k[r], v[r], a[r], b[r], A_log, dt_bias,
-                             pool_before[r], kc[r], uc[r], gc[r], 13)
+                             pool_before[r], kc_l, uc_l, gc_l, 13)
         err = (pool[r].float() - S_ref).abs().max().item()
-        assert err < STATE_TOL, f"row {r} ({arm}): |committed - fp32 ref| = {err:.2e}"
+        assert err < STATE_TOL, (
+            f"row {r} ({arm}, {basecase}): |committed - fp32 ref| = {err:.2e}")
+
+
+def test_flush_never_overwrites_live_window():
+    """THE ring property (the old single-buffer design's race): a flush must
+    not modify any physical ring row inside the live window [base, base+P) —
+    sibling CTAs read those rows as their fold source. Appends must land at
+    (base+P+s) & RING_MASK only."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16")
+    _, _, _, io_dtype, state_dtype, ring_dtype = ARMS["bf16"]
+    B = 4
+    bases = [28, 0, 30, 12]           # rows 0/2 wrap through the ring end
+    hist = [13, 13, 14, 16]           # ALL rows flush (P >= 13)
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        B, hist, io_dtype, state_dtype, seed=4242, ring_dtype=ring_dtype,
+        bases=bases)
+    kc_in, uc_in, gc_in = kc.clone(), uc.clone(), gc.clone()
+
+    mod.gated_delta_rule_mtp_ucache_flush(
+        A_log, a, dt_bias, q=q, k=k, v=v, b=b,
+        initial_state_source=pool, initial_state_indices=idx,
+        k_cache=kc, u_cache=uc, g_cache=gc, hist_len=hl.clone(),
+        cache_base=cb.clone(), scale=SCALE, flush_min=FLUSH_MIN)
+
+    for r in range(B):
+        P = hist[r]
+        window = [(bases[r] + j) % RING for j in range(P)]
+        appends = [(bases[r] + P + s) % RING for s in range(T)]
+        for rows, name, before, after in (
+            (window, "k", kc_in, kc), (window, "u", uc_in, uc),
+            (window, "g", gc_in, gc),
+        ):
+            w = torch.tensor(rows, dtype=torch.long, device=DEV)
+            assert torch.equal(
+                before[r].index_select(1, w), after[r].index_select(1, w)
+            ), f"row {r}: flush modified live {name} window rows {rows}"
+        # and the appends actually landed (k rows are L2-normed, non-zero)
+        ap = torch.tensor(appends, dtype=torch.long, device=DEV)
+        assert kc[r].index_select(1, ap).float().abs().sum() > 0, (
+            f"row {r}: no k append at {appends}")
 
 
 def test_fp16_state_commits_more_precisely_than_bf16():
@@ -272,15 +344,15 @@ def test_fp16_state_commits_more_precisely_than_bf16():
         tot = 0.0
         for seed in (7, 8, 9, 10):
             B = 4
-            q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, idx = _make_case(
-                B, [13] * B, io_dtype, state_dtype, seed=seed,
-                ring_dtype=ring_dtype)
+            q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = (
+                _make_case(B, [13] * B, io_dtype, state_dtype, seed=seed,
+                           ring_dtype=ring_dtype))
             pool_before = pool.clone()
             mod.gated_delta_rule_mtp_ucache_flush(
                 A_log, a, dt_bias, q=q, k=k, v=v, b=b,
                 initial_state_source=pool, initial_state_indices=idx,
                 k_cache=kc.clone(), u_cache=uc.clone(), g_cache=gc.clone(),
-        hist_len=hl.clone(),  # kernel mutates rings (appends/restarts); ref reads originals
+                hist_len=hl.clone(), cache_base=cb.clone(),
                 scale=SCALE, flush_min=FLUSH_MIN)
             for r in range(B):
                 _, S_ref = _ref_fp32(q[r], k[r], v[r], a[r], b[r], A_log,
