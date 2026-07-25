@@ -100,6 +100,9 @@ from .fp4_kv_quantization import (
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )
+from .mxfp8_attention_sm120 import (
+    gen_mxfp8_attention_sm120_module as gen_mxfp8_attention_sm120_module,
+)
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
 from .monomoe import gen_monomoe_module as gen_monomoe_module
