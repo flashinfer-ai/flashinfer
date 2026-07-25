@@ -132,7 +132,7 @@ def make_case(B, seed, io_dtype=torch.bfloat16, state_dtype=torch.bfloat16,
 
 
 def bench_point(uc_flush, B, rate_pct, iters, seed, io_dtype, state_dtype,
-                ring_dtype=torch.bfloat16, base=0):
+                ring_dtype=torch.bfloat16, base=0, no_commit=False):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
         B, seed, io_dtype, state_dtype, ring_dtype)
     nf = 0 if rate_pct == 0 else max(1, round(B * rate_pct / 100))
@@ -152,10 +152,12 @@ def bench_point(uc_flush, B, rate_pct, iters, seed, io_dtype, state_dtype,
                  initial_state_source=pool, initial_state_indices=idx,
                  k_cache=kc, u_cache=uc, g_cache=gc, hist_len=hl,
                  cache_base=cb,
-                 scale=SCALE, flush_min=FLUSH_MIN)
-        # wrapper commits cursors for flushed rows; restore for next iter
-        hl.copy_(hl_src)
-        cb.copy_(cb_src)
+                 scale=SCALE, flush_min=FLUSH_MIN,
+                 restart_hist_on_flush=not no_commit)
+        if not no_commit:
+            # wrapper committed cursors for flushed rows; restore them
+            hl.copy_(hl_src)
+            cb.copy_(cb_src)
 
     times = bench_gpu_time(graphed(fn), enable_cupti=True, cold_l2_cache=True,
                            dry_run_iters=10, repeat_iters=iters)
@@ -171,6 +173,14 @@ def main():
                     default=[0, 20, 40, 80])
     ap.add_argument("--arm", choices=list(ARMS), default="bf16",
                     help="dtype config: bf16 | fp16_state | fp16_io")
+    ap.add_argument("--no-commit", action="store_true",
+                    help="pure-kernel timing: disable the wrapper's standalone "
+                         "cursor commit AND the per-iter cursor restores (the "
+                         "kernel never mutates cursors, so iterations are "
+                         "identical). Without this flag the timed graph also "
+                         "contains ~4-6us of commit/restore elementwise ops — "
+                         "fine for wrapper-level A/Bs, misleading for "
+                         "kernel-level ones.")
     ap.add_argument("--base", type=int, default=0,
                     help="ring window origin for all rows (28 exercises the "
                          "wrapped-window path: base+P crosses RING_SLOTS)")
@@ -189,7 +199,8 @@ def main():
     print("-" * len(hdr))
     for B in args.batches:
         row = [bench_point(uc_flush, B, r, args.iters, 1000 + B + r,
-                           io_dtype, state_dtype, ring_dtype, base=args.base)
+                           io_dtype, state_dtype, ring_dtype, base=args.base,
+                           no_commit=args.no_commit)
                for r in args.rates]
         print(f"{B:4d} | " + " | ".join(f"{t:9.2f}" for t in row), flush=True)
 
