@@ -245,8 +245,6 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
         is_causal: bool = True,
         lse: Optional[torch.Tensor] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
@@ -304,8 +302,6 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
-            use_fp16_softmax,
-            uses_spcompress,
             is_causal,
             lse,
             lse_stride_tokens,
@@ -696,8 +692,6 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
@@ -736,8 +730,6 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                use_fp16_softmax=use_fp16_softmax,
-                uses_spcompress=uses_spcompress,
                 is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
                 lse=maybe_lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
@@ -882,8 +874,6 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         pass
@@ -2544,8 +2534,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2566,8 +2554,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=gqa_paged_prefill_trace)
@@ -2589,8 +2575,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
-        use_fp16_softmax: Optional[bool] = None,
-        uses_spcompress: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2658,16 +2642,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
-            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
-        use_fp16_softmax : Optional[bool]
-            trtllm-gen backend only. Select the ``…Fp16Softmax…`` cubin variant
-            (FP16 softmax accumulator). Currently only shipped for BF16 Q/KV/O context
-            kernels. Ignored by other backends.
-        uses_spcompress : Optional[bool]
-            trtllm-gen backend only. Select the ``…Spcomp…`` cubin variant
-            (sparse compression). Currently only shipped for FP8 Q context kernels.
-            Ignored by other backends.
 
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
         skip_softmax_threshold_scale_factor : Optional[float]
             Threshold scale factor for skipping softmax operations.  Providing a
             value enables skip-softmax sparsity as described in
@@ -2903,8 +2879,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
-                    use_fp16_softmax,
-                    uses_spcompress,
                     self._trtllm_gen_multi_ctas_kv_counter_buffer,
                 ]
 
@@ -4481,8 +4455,6 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    use_fp16_softmax: Optional[bool] = None,
-    uses_spcompress: Optional[bool] = None,
     sage_attn_sfs: Tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -4545,14 +4517,6 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
-    use_fp16_softmax : Optional[bool]
-        Select the trtllm-gen ``Fp16Softmax`` cubin variant (BF16 Q/KV/O only).
-        When ``None`` (default) or ``False`` the standard FP32-accumulator softmax cubin is used.
-        Setting ``True`` for non-BF16 inputs will fail kernel selection.
-    uses_spcompress : Optional[bool]
-        Select the trtllm-gen ``Spcomp`` cubin variant (FP8 Q, with FP8 or BF16 output).
-        When ``None`` (default) or ``False`` the standard cubin is used.
-        Setting ``True`` for non-FP8 Q will fail kernel selection.
     sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
         SageAttention scale-factor tensors for the four sub-blocks ``(q_sf, k_sf, p_sf, v_sf)``.
         The outputs from :func:`trtllm_sage_attention_quantize` can be supplied as Q, K, and V scales (with ``p_sf=None``).
@@ -4710,8 +4674,6 @@ def trtllm_ragged_attention_deepseek(
             attention_sinks,
             skip_softmax_threshold_scale_factor,
             lse,
-            use_fp16_softmax,
-            uses_spcompress,
             sage_attn_sfs_q,
             sage_attn_sfs_k,
             sage_attn_sfs_p,
@@ -4758,8 +4720,6 @@ def trtllm_batch_context_with_kv_cache(
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
-    use_fp16_softmax: Optional[bool] = None,
-    uses_spcompress: Optional[bool] = None,
     causal: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -4866,12 +4826,6 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
-    use_fp16_softmax : Optional[bool] = None
-        Select the ``…Fp16Softmax…`` cubin variant (FP16 softmax accumulator).
-        Currently only shipped for BF16 Q/KV/O kernels.
-    uses_spcompress : Optional[bool] = None
-        Select the ``…Spcomp…`` cubin variant (sparse compression).
-        Currently only shipped for FP8 Q kernels.
     causal : bool = True
         Whether to apply a causal mask. Set to ``False`` to request dense / bidirectional
         attention. For the TRTLLM-gen paged context path, non-causal currently requires
@@ -5077,8 +5031,6 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
-        use_fp16_softmax,
-        uses_spcompress,
         causal,
         lse,
         lse_stride_tokens,

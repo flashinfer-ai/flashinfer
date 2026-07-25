@@ -2070,7 +2070,6 @@ def _cute_dsl_incompatibility_reason(
     is_var_seq: bool,
     return_lse: bool,
     lse: Optional[torch.Tensor],
-    use_fp16_softmax: Optional[bool] = None,
     cute_dsl_impl: str = "auto",
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
@@ -2121,8 +2120,6 @@ def _cute_dsl_incompatibility_reason(
             "cute-dsl backend (MLA decode kernel) does not support separate KV "
             "page indices (uses_shared_paged_kv_idx=False)"
         )
-    if use_fp16_softmax:
-        return "cute-dsl backend (MLA decode kernel) does not support use_fp16_softmax"
     # LSE is supported on the monolithic path; the modular path raises a
     # clear NotImplementedError in wrappers/batch_mla.py if it gets picked
     # for an LSE request (e.g. when ``sinks`` forces the modular dispatch).
@@ -2279,7 +2276,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         uses_shared_paged_kv_idx: bool,
         return_lse: bool,
         lse: Optional[torch.Tensor],
-        use_fp16_softmax: Optional[bool] = None,
     ):
         self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         self.kv_cache = kv_cache
@@ -2307,7 +2303,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
-        self.use_fp16_softmax = use_fp16_softmax
 
     def __hash__(self):
         # The default `TunableRunner.__hash__` walks `self.__dict__` and falls
@@ -2435,7 +2430,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
-            self.use_fp16_softmax,
         )
         return out
 
@@ -2601,7 +2595,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     backend: str = "auto",
     is_var_seq: bool = True,
     uses_shared_paged_kv_idx: bool = True,
-    use_fp16_softmax: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     cute_dsl_impl: str = "auto",
@@ -2708,14 +2701,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Whether K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
-        False is only supported for trtllm-gen backend.
-    use_fp16_softmax : Optional[bool]
-        Select the trtllm-gen ``Fp16Softmax`` cubin variant. MLA decode is the
-        primary consumer of this flag — `Fp16Softmax` generation cubins are
-        only shipped for MLA head dims (``head_dim_qk/v ∈ {576/512, 320/256}``).
-        When ``None`` (default) or ``False`` the standard FP32-accumulator
-        softmax cubin is used. Only supported by ``backend="trtllm-gen"``;
-        passing ``True`` to other backends raises ``ValueError``.
+        False is only supported by TRTLLM-GEN.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
         ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
@@ -2867,10 +2853,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if not uses_shared_paged_kv_idx:
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
-            )
-        if use_fp16_softmax:
-            raise ValueError(
-                "use_fp16_softmax is only supported by backend='trtllm-gen'"
             )
         if return_lse or lse is not None:
             raise NotImplementedError(
@@ -3068,7 +3050,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             0,  # lse_stride_tokens
             0,  # lse_stride_heads
             False,  # enable_block_sparse_attention
-            use_fp16_softmax,
         )
         return out
 
@@ -3144,7 +3125,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         is_var_seq,
         return_lse,
         lse,
-        use_fp16_softmax,
         cute_dsl_impl,
     )
     if backend == "cute-dsl":
@@ -3202,7 +3182,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 return_lse=return_lse,
                 lse=lse,
-                use_fp16_softmax=use_fp16_softmax,
             )
         )
     if "cute-dsl" in runner_names:
