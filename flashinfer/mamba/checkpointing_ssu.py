@@ -308,8 +308,10 @@ def checkpointing_ssu(
         Do not use it cause it will make things slow.
     cu_seqlens : Optional[torch.Tensor]
         Cumulative sequence boundaries for packed variable-length input, as a
-        one-dimensional int32 CUDA tensor.  When provided, ``x`` must have
-        shape ``(1, total_tokens, nheads, dim)`` and ``max_seqlen`` is required.
+        one-dimensional int32 CUDA tensor of shape ``(batch + 1,)``.  It must
+        start at 0, be monotonically nondecreasing, and end at ``total_tokens``.
+        When provided, ``x`` must have shape
+        ``(1, total_tokens, nheads, dim)`` and ``max_seqlen`` is required.
     max_seqlen : Optional[int]
         Upper bound on every packed sequence length.  In variable-length mode
         this is the JIT-specialized predicted-token count used to derive the
