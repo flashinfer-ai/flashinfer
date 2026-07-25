@@ -1728,6 +1728,117 @@ def _nvfp4_4over6_quant_from_values(
 
 
 @cute.jit
+def _silu_f32(g: Float32) -> Float32:
+    """Compute SiLU in FP32 using the CUDA-compatible fast exponential."""
+    from ..cute_dsl.fp4_common import fdiv_rn
+
+    denom = Float32(1.0) + cute.math.exp(-g, fastmath=True)
+    return fdiv_rn(g, denom)
+
+
+@cute.jit
+def _silu_and_mul_half2(gate_h2: Uint32, up_h2: Uint32) -> Uint32:
+    """Compute silu(gate) * up for one half2 pair, returned as a half2."""
+    from ..cute_dsl.fp4_common import cvt_f32x2_to_half2
+
+    g0, g1 = half2_to_float2_scaled(gate_h2, Float32(1.0))
+    u0, u1 = half2_to_float2_scaled(up_h2, Float32(1.0))
+    a0 = _silu_f32(g0) * u0
+    a1 = _silu_f32(g1) * u1
+    return cvt_f32x2_to_half2(a0, a1)
+
+
+@cute.jit
+def _silu_and_mul_bfloat2(gate_h2: Uint32, up_h2: Uint32) -> Uint32:
+    """Compute silu(gate) * up for one bfloat2 pair, returned as a bfloat2."""
+    from ..cute_dsl.fp4_common import cvt_f32x2_to_bfloat2
+
+    g0, g1 = bfloat2_to_float2_scaled(gate_h2, Float32(1.0))
+    u0, u1 = bfloat2_to_float2_scaled(up_h2, Float32(1.0))
+    a0 = _silu_f32(g0) * u0
+    a1 = _silu_f32(g1) * u1
+    return cvt_f32x2_to_bfloat2(a0, a1)
+
+
+@cute.jit
+def _quantize_nvfp4_from_h2x8_half(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Quantize 16 FP16 values to an E4M3 scale and packed E2M1 output."""
+    # Compute max absolute value across 16 elements
+    block_max_h2 = half2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = hmax_reduce_to_f32(block_max_h2)
+
+    if cutlass.const_expr(nvfp4_4over6_config is not None):
+        values = _half2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
+        return _nvfp4_4over6_quant_from_values(
+            values,
+            block_max,
+            global_scale,
+            row_amax,
+            disable_fp4_quant_fast_math,
+            nvfp4_4over6_config,
+        )
+
+    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
+        block_max, global_scale, disable_fp4_quant_fast_math
+    )
+    packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
+@cute.jit
+def _quantize_nvfp4_from_h2x8_bfloat(
+    h0: Uint32,
+    h1: Uint32,
+    h2: Uint32,
+    h3: Uint32,
+    h4: Uint32,
+    h5: Uint32,
+    h6: Uint32,
+    h7: Uint32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Quantize 16 BF16 values to an E4M3 scale and packed E2M1 output."""
+    # Compute max absolute value across 16 elements
+    block_max_h2 = bfloat2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+
+    if cutlass.const_expr(nvfp4_4over6_config is not None):
+        values = _bfloat2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
+        return _nvfp4_4over6_quant_from_values(
+            values,
+            block_max,
+            global_scale,
+            row_amax,
+            disable_fp4_quant_fast_math,
+            nvfp4_4over6_config,
+        )
+
+    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
+        block_max, global_scale, disable_fp4_quant_fast_math
+    )
+    packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
+@cute.jit
 def process_nvfp4_block_half(
     row_tensor,
     elem_base: Int32,
@@ -1764,27 +1875,20 @@ def process_nvfp4_block_half(
     h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
     h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
 
-    # Compute max absolute value across 16 elements
-    block_max_h2 = half2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
-    block_max = hmax_reduce_to_f32(block_max_h2)
-
-    if cutlass.const_expr(nvfp4_4over6_config is not None):
-        values = _half2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
-        return _nvfp4_4over6_quant_from_values(
-            values,
-            block_max,
-            global_scale,
-            row_amax,
-            disable_fp4_quant_fast_math,
-            nvfp4_4over6_config,
-        )
-
-    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fp4_quant_fast_math
+    return _quantize_nvfp4_from_h2x8_half(
+        h0,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6,
+        h7,
+        global_scale,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        row_amax,
     )
-    packed64 = half2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
-
-    return scale_fp8, packed64
 
 
 @cute.jit
@@ -1824,27 +1928,124 @@ def process_nvfp4_block_bfloat(
     h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
     h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
 
-    # Compute max absolute value across 16 elements
-    block_max_h2 = bfloat2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
-    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
-
-    if cutlass.const_expr(nvfp4_4over6_config is not None):
-        values = _bfloat2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
-        return _nvfp4_4over6_quant_from_values(
-            values,
-            block_max,
-            global_scale,
-            row_amax,
-            disable_fp4_quant_fast_math,
-            nvfp4_4over6_config,
-        )
-
-    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
-        block_max, global_scale, disable_fp4_quant_fast_math
+    return _quantize_nvfp4_from_h2x8_bfloat(
+        h0,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6,
+        h7,
+        global_scale,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        row_amax,
     )
-    packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
 
-    return scale_fp8, packed64
+
+@cute.jit
+def process_nvfp4_silu_block_half(
+    row_tensor,
+    elem_base: Int32,
+    up_offset: Int32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Apply SwiGLU to one FP16 block, then quantize it to NVFP4."""
+    from ..cute_dsl.fp4_common import (
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+    )
+
+    # Load matching gate and up blocks.
+    g_ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    g_ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+    u_ptr0 = get_ptr_as_int64(row_tensor, elem_base + up_offset)
+    u_ptr1 = get_ptr_as_int64(row_tensor, elem_base + up_offset + Int32(8))
+
+    g0, g1, g2, g3 = ld_global_v4_u32(g_ptr0)
+    g4, g5, g6, g7 = ld_global_v4_u32(g_ptr1)
+    u0, u1, u2, u3 = ld_global_v4_u32(u_ptr0)
+    u4, u5, u6, u7 = ld_global_v4_u32(u_ptr1)
+
+    h0 = _silu_and_mul_half2(g0, u0)
+    h1 = _silu_and_mul_half2(g1, u1)
+    h2 = _silu_and_mul_half2(g2, u2)
+    h3 = _silu_and_mul_half2(g3, u3)
+    h4 = _silu_and_mul_half2(g4, u4)
+    h5 = _silu_and_mul_half2(g5, u5)
+    h6 = _silu_and_mul_half2(g6, u6)
+    h7 = _silu_and_mul_half2(g7, u7)
+
+    return _quantize_nvfp4_from_h2x8_half(
+        h0,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6,
+        h7,
+        global_scale,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        row_amax,
+    )
+
+
+@cute.jit
+def process_nvfp4_silu_block_bfloat(
+    row_tensor,
+    elem_base: Int32,
+    up_offset: Int32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Apply SwiGLU to one BF16 block, then quantize it to NVFP4."""
+    from ..cute_dsl.fp4_common import (
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+    )
+
+    # Load matching gate and up blocks.
+    g_ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    g_ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+    u_ptr0 = get_ptr_as_int64(row_tensor, elem_base + up_offset)
+    u_ptr1 = get_ptr_as_int64(row_tensor, elem_base + up_offset + Int32(8))
+
+    g0, g1, g2, g3 = ld_global_v4_u32(g_ptr0)
+    g4, g5, g6, g7 = ld_global_v4_u32(g_ptr1)
+    u0, u1, u2, u3 = ld_global_v4_u32(u_ptr0)
+    u4, u5, u6, u7 = ld_global_v4_u32(u_ptr1)
+
+    h0 = _silu_and_mul_bfloat2(g0, u0)
+    h1 = _silu_and_mul_bfloat2(g1, u1)
+    h2 = _silu_and_mul_bfloat2(g2, u2)
+    h3 = _silu_and_mul_bfloat2(g3, u3)
+    h4 = _silu_and_mul_bfloat2(g4, u4)
+    h5 = _silu_and_mul_bfloat2(g5, u5)
+    h6 = _silu_and_mul_bfloat2(g6, u6)
+    h7 = _silu_and_mul_bfloat2(g7, u7)
+
+    return _quantize_nvfp4_from_h2x8_bfloat(
+        h0,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6,
+        h7,
+        global_scale,
+        disable_fp4_quant_fast_math,
+        nvfp4_4over6_config,
+        row_amax,
+    )
 
 
 @cute.jit
@@ -2086,6 +2287,8 @@ __all__ = [
     "bfloat2x8_to_e2m1x16_packed",
     "process_nvfp4_block_half",
     "process_nvfp4_block_bfloat",
+    "process_nvfp4_silu_block_half",
+    "process_nvfp4_silu_block_bfloat",
     # High-level helper functions (NVFP4 - FP8 input)
     "fp8x16_to_e2m1x16_packed",
     "fp8_max_abs_16",
