@@ -133,11 +133,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
-      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
-      if (options.mPatchF2fp && sm_version == 103) {
-        if (config.mSm != tg::CudaArch::Sm103a) continue;
+      if (sm_version == 107) {
+        if (config.mSm != tg::CudaArch::Sm107a) continue;
       }
-      if (options.mPatchF2fp && sm_version == 100) {
+      if (sm_version == 103) {
+        if (config.mSm != tg::CudaArch::Sm103a && config.mSm != tg::CudaArch::Sm100f) continue;
+        if (options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
+      }
+      if (sm_version == 100) {
         if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
       }
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {

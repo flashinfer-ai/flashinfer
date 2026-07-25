@@ -39,6 +39,8 @@ from cutlass import Float32, Int32, Int64, Uint32, Uint64, Uint8
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
+
 from ..api_logging import flashinfer_api
 from ..trace.templates.norm import add_rmsnorm_fp4quant_trace_dispatch
 from ..utils import device_support_pdl
@@ -1320,6 +1322,7 @@ def add_rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    _require_cute_dsl_arch_for(input.device)
     is_3d = input.dim() == 3
     if is_3d:
         B, S, H = input.shape

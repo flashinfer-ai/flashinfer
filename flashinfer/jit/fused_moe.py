@@ -86,7 +86,7 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
@@ -104,7 +104,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -279,9 +279,10 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
 
-    # currently only support Blackwell
+    # currently only support Blackwell (SM107 compiles as sm100f)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[10, 12],
+        map_sm107_to_100f=True,
     )
 
     return gen_jit_spec(
@@ -310,6 +311,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            "-DTLLM_RUBIN_FEATURES",
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
