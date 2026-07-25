@@ -45,7 +45,8 @@ from flashinfer.testing import bench_gpu_time
 
 DEV = "cuda"
 H, HV, K, V = 16, 64, 128, 128  # Qwen3.5-122B GDN @ TP1
-T, W = 4, 16
+T, W = 4, 16   # W = max history window (kernel W_RING)
+RING = 32      # physical ring depth (kernel RING_SLOTS)
 FLUSH_MIN = 13
 SCALE = 1.0 / math.sqrt(K)
 
@@ -119,17 +120,19 @@ def make_case(B, seed, io_dtype=torch.bfloat16, state_dtype=torch.bfloat16,
              + torch.rand(HV, generator=g, device=DEV) * 0.3).to(io_dtype)
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
-    kh = torch.randn(B, H, W, K, generator=g, device=DEV)
+    # 32-deep physical rings, fully populated (rows outside the live window
+    # are masked by the kernel; values just need to be finite).
+    kh = torch.randn(B, H, RING, K, generator=g, device=DEV)
     kc = (kh / kh.norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(ring_dtype)
-    uc = (torch.randn(B, HV, W, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
-    la = -(torch.rand(B, HV, W, generator=g, device=DEV) * 0.3 + 0.003)
+    uc = (torch.randn(B, HV, RING, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
+    la = -(torch.rand(B, HV, RING, generator=g, device=DEV) * 0.3 + 0.003)
     gc = torch.cumsum(la, dim=-1).float().contiguous()
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
     return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx
 
 
 def bench_point(uc_flush, B, rate_pct, iters, seed, io_dtype, state_dtype,
-                ring_dtype=torch.bfloat16):
+                ring_dtype=torch.bfloat16, base=0):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
         B, seed, io_dtype, state_dtype, ring_dtype)
     nf = 0 if rate_pct == 0 else max(1, round(B * rate_pct / 100))
@@ -141,13 +144,18 @@ def bench_point(uc_flush, B, rate_pct, iters, seed, io_dtype, state_dtype,
                          torch.tensor(13, dtype=torch.int32, device=DEV),
                          torch.tensor(12, dtype=torch.int32, device=DEV))
     hl = hl_src.clone()
+    cb_src = torch.full((B,), base, dtype=torch.int32, device=DEV)
+    cb = cb_src.clone()
 
     def fn():
         uc_flush(A_log, a, dt_bias, q=q, k=k, v=v, b=b,
                  initial_state_source=pool, initial_state_indices=idx,
                  k_cache=kc, u_cache=uc, g_cache=gc, hist_len=hl,
+                 cache_base=cb,
                  scale=SCALE, flush_min=FLUSH_MIN)
-        hl.copy_(hl_src)  # kernel zeroes flushed rows; restore for next iter
+        # wrapper commits cursors for flushed rows; restore for next iter
+        hl.copy_(hl_src)
+        cb.copy_(cb_src)
 
     times = bench_gpu_time(graphed(fn), enable_cupti=True, cold_l2_cache=True,
                            dry_run_iters=10, repeat_iters=iters)
@@ -163,13 +171,17 @@ def main():
                     default=[0, 20, 40, 80])
     ap.add_argument("--arm", choices=list(ARMS), default="bf16",
                     help="dtype config: bf16 | fp16_state | fp16_io")
+    ap.add_argument("--base", type=int, default=0,
+                    help="ring window origin for all rows (28 exercises the "
+                         "wrapped-window path: base+P crosses RING_SLOTS)")
     args = ap.parse_args()
 
     uc_flush, io_dtype, state_dtype, ring_dtype = load_flush(args.arm)
     print(f"GPU: {torch.cuda.get_device_name(0)} | fused verify+flush, "
           f"arm={args.arm} (io={io_dtype}, state={state_dtype}, "
           f"ring={ring_dtype}), "
-          f"T={T} W={W} fm={FLUSH_MIN} H={H} HV={HV} K=V={K} | "
+          f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} "
+          f"H={H} HV={HV} K=V={K} | "
           f"CUDA-graph replay, CUPTI cold-L2, median of {args.iters}",
           flush=True)
     hdr = "   B | " + " | ".join(f"{r:3d}% (us)" for r in args.rates)
@@ -177,7 +189,7 @@ def main():
     print("-" * len(hdr))
     for B in args.batches:
         row = [bench_point(uc_flush, B, r, args.iters, 1000 + B + r,
-                           io_dtype, state_dtype, ring_dtype)
+                           io_dtype, state_dtype, ring_dtype, base=args.base)
                for r in args.rates]
         print(f"{B:4d} | " + " | ".join(f"{t:9.2f}" for t in row), flush=True)
 
