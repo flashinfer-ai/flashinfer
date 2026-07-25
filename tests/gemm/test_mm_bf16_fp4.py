@@ -363,6 +363,64 @@ def test_cute_dsl_gemv_fp16_out():
         _assert_close_to_reference(out, ref, f"cute-dsl gemv fp16 tactic {tactic}")
 
 
+def test_cute_dsl_fallback_gemv_selector():
+    """Pin the m=1 no-autotune gemv fallback (smallest split reaching
+    ~20 warps/SM).  Expected picks match the measured-best splits on
+    84/188-SM parts for the Qwen decode shapes."""
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _select_bf16_fp4_gemv_split
+
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 12, 84) == 4
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 12, 188) == 7
+    assert _select_bf16_fp4_gemv_split(5120, 17408, 12, 84) == 21
+    assert _select_bf16_fp4_gemv_split(5120, 17408, 12, 188) == 47
+    # lm_head is wide enough to hit the target unsplit (the vLLM case).
+    assert _select_bf16_fp4_gemv_split(248320, 5120, 12, 84) == 1
+    assert _select_bf16_fp4_gemv_split(248320, 5120, 12, 188) == 1
+    # Non-SM12x, unpadded n, and starved grids stay on the MMA heuristic.
+    assert _select_bf16_fp4_gemv_split(34816, 5120, 10, 148) is None
+    assert _select_bf16_fp4_gemv_split(34800, 5120, 12, 84) is None
+    assert _select_bf16_fp4_gemv_split(64, 2048, 12, 84) is None
+
+
+def test_cute_dsl_fallback_gemv_matches_reference():
+    """tactic=-1 at m=1 routes through the gemv fallback; check its output."""
+    _skip_if_backend_unavailable("cute-dsl")
+    import flashinfer.gemm.gemm_bf16_fp4_cute_dsl as mod
+
+    if (
+        mod._select_bf16_fp4_gemv_split(
+            2048, 7168, *_device_cc_sm(torch.device("cuda"))
+        )
+        is None
+    ):
+        pytest.skip("gemv fallback not offered on this device")
+
+    device = torch.device("cuda")
+    m, n, k = 1, 2048, 7168
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+    ref = (a.float() @ _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16).T).to(
+        torch.bfloat16
+    )
+    runner = mod._cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    sf_u8 = sf_p.view(torch.uint8).contiguous()
+    alpha_l = mod._prepare_bf16_fp4_alpha(alpha_p, device)
+    out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+    runner.forward([a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=-1)
+    torch.cuda.synchronize()
+    _assert_close_to_reference(out, ref, "cute-dsl gemv fallback")
+
+
+def _device_cc_sm(device):
+    from flashinfer.utils import get_compute_capability, get_device_sm_count
+
+    return get_compute_capability(device)[0], get_device_sm_count(device)
+
+
 def test_cute_dsl_fallback_k_splits_selector():
     """Pin the no-autotune fallback's static split-K rule.
 
