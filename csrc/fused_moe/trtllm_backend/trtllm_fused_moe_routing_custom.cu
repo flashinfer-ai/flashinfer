@@ -1531,8 +1531,7 @@ void run(Data const& data, void* stream) {
       data.mNumExperts > DynBlockKernelMaxNumExperts &&
       topk::isInHighExpertLaneOwnedTopKRange(data.mNumExperts, data.mTopK) &&
       policySupportsBlockPerToken && data.mPreprocessType != RoutingPreprocessType::None;
-  bool const useStaticBlock =
-      data.mNumTokens <= BlockKernelMaxNumTokens && !useSplitStaticBoundary;
+  bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens && !useSplitStaticBoundary;
   bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens &&
                            dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
   bool const useSingleBlock = useStaticBlock || useDynBlock;
