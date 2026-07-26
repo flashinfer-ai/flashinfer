@@ -137,6 +137,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         num_heads: int = 128,
         seq_len_q: int = 1,
         fold_sq: bool = False,
+        causal: bool = True,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -201,6 +202,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # When fold_sq=True but the derived ratio is 1, the folding branch
         # is taken with F=1 (a no-op transform).
         self.fold_sq = fold_sq
+        self.causal = causal
         self.fold_sq_ratio = (
             BlackwellMultiHeadLatentAttentionForwardFP8.compute_fold_sq_ratio(
                 num_heads, seq_len_q, mma_qk_tiler_mn[0]
@@ -3053,7 +3055,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    k_bound = (
+                        common_params.K - (self.seq_len_q - 1) + q_tok
+                        if self.causal
+                        else common_params.K
+                    )
                     tTR_rAcc[i] = (
                         tTR_rAcc[i]
                         if cute.elem_less(
@@ -3100,7 +3106,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    k_bound = (
+                        common_params.K - (self.seq_len_q - 1) + q_tok
+                        if self.causal
+                        else common_params.K
+                    )
                     tTR_rAcc[i] = (
                         tTR_rAcc[i]
                         if cute.elem_less(
