@@ -290,8 +290,8 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_INPUT>
-__global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* temperature_arr,
-                                         DType temperature_val, uint32_t d) {
+__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
+    DType* logits, DType* output, DType* temperature_arr, DType temperature_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
@@ -407,9 +407,9 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* partial_results,
-                                       DType* temperature_arr, float temperature_val, uint32_t d,
-                                       uint32_t num_slices) {
+__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
+    DType* logits, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+    float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
@@ -492,10 +492,9 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ void OnlineSoftmaxReduceKernel(DType* logits, DType* output,
-                                          PartialSoftmaxResult* partial_results,
-                                          DType* temperature_arr, float temperature_val, uint32_t d,
-                                          uint32_t num_slices) {
+__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
+    DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+    float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
@@ -721,9 +720,9 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices, uint32_t d,
-                                         uint64_t* seed_arr, uint64_t seed_val,
-                                         uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromLogitsKernel(
+    DType* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
@@ -770,9 +769,9 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid, IdType* indices,
-                                       uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                       uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, uint32_t d, uint64_t* seed_arr,
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -834,10 +833,10 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, bool* valid
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
-                                           IdType* indices, IdType* top_k_arr, uint32_t top_k_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void TopKSamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
+    uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+    uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -967,10 +966,9 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* valid,
-                                           IdType* indices, float* top_p_arr, float top_p_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void TopPSamplingFromProbKernel(
+    DType* probs, IdType* output, bool* valid, IdType* indices, float* top_p_arr, float top_p_val,
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1094,10 +1092,9 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
-                                           bool* valid, IdType* indices, float min_p_val,
-                                           uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-                                           uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void MinPSamplingFromProbKernel(
+    DType* probs, float* min_p_arr, IdType* output, bool* valid, IdType* indices, float min_p_val,
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
@@ -1189,11 +1186,10 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
-                                               IdType* output, bool* valid, IdType* indices,
-                                               IdType top_k_val, float top_p_val, uint32_t d,
-                                               uint64_t* seed_arr, uint64_t seed_val,
-                                               uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+    DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
+    IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+    uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1660,8 +1656,10 @@ struct RenormTempStorage {
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType>
-__global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* top_p_arr,
-                                     float top_p_val, uint32_t d) {
+__global__ __launch_bounds__(BLOCK_THREADS) void TopPRenormProbKernel(DType* probs,
+                                                                      DType* renormed_prob,
+                                                                      float* top_p_arr,
+                                                                      float top_p_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
@@ -1857,13 +1855,11 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
-                                         DType* target_probs, IdType* output_token_ids,
-                                         IdType* output_accepted_token_num,
-                                         IdType* output_emitted_draft_token_num,
-                                         uint32_t num_speculative_tokens, uint32_t d,
-                                         uint64_t* seed_arr, uint64_t seed_val,
-                                         uint64_t* offset_arr, uint64_t offset_val) {
+__global__ __launch_bounds__(BLOCK_THREADS) void ChainSpeculativeSampling(
+    DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
+    IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num,
+    uint32_t num_speculative_tokens, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+    uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
 
