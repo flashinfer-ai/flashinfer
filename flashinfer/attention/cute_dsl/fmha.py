@@ -330,6 +330,7 @@ def cute_dsl_fmha_ragged_prefill(
     max_kv_len: Optional[int] = None,
     kernel_fn=None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    skip_rescale_threshold: float = 8.0,
     enable_pdl: bool = False,
 ) -> None:
     """Run DSL FMHA prefill kernel on ragged (variable-length) tensors.
@@ -386,6 +387,9 @@ def cute_dsl_fmha_ragged_prefill(
         Threshold scale factor for skip-softmax sparsity (https://arxiv.org/abs/2512.12087).
         The actual threshold = scale_factor / max_kv_len, then converted to log2 domain.
         None or 0 disables skip-softmax.
+    skip_rescale_threshold : float
+        Skip-correction threshold: =1 enables skip-correction when row_max is not updated;
+        >1 allows skipping at new_row_max < X * row_max.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
@@ -409,6 +413,8 @@ def cute_dsl_fmha_ragged_prefill(
         try:
             if k.dtype != v.dtype:
                 raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
+            if skip_rescale_threshold != 8.0:
+                raise RuntimeError("non-default skip_rescale_threshold requires JIT")
             if window_left != -1 or window_right != -1:
                 # The exported artifact matrix has no window axis: every
                 # prebuilt variant is traced with window_size_left=None (and
@@ -454,6 +460,7 @@ def cute_dsl_fmha_ragged_prefill(
                 q.device,
                 has_window_left=window_left != -1,
                 has_window_right=is_causal or window_right != -1,
+                skip_rescale_threshold=skip_rescale_threshold,
             )
             # JIT kernels are compiled with --enable-tvm-ffi; the CuTe-native branch
             # would not accept them.

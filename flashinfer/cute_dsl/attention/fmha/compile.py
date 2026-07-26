@@ -81,6 +81,7 @@ def compile_cute_dsl_fmha_kernel(
     device: torch.device,
     has_window_left: bool = False,
     has_window_right=None,
+    skip_rescale_threshold: float = 8.0,
 ):
     """Compile (and cache) the trtllm FMHA kernel for a static config.
 
@@ -117,6 +118,7 @@ def compile_cute_dsl_fmha_kernel(
         mask_type=_mask_type(has_window_left or has_window_right),
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
+        skip_rescale_threshold=skip_rescale_threshold,
         use_tma_store=False,  # varlen -> STG
     )
 
@@ -221,6 +223,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
     enable_skip_softmax: bool,
     use_pdl: bool,
     device: torch.device,
+    skip_rescale_threshold: float = 8.0,
 ):
     """Compile (and cache) the trtllm block-scaled FMHA kernel (batched, non-varlen)."""
     from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
@@ -241,6 +244,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
         use_tma_store=True,  # non-varlen
+        skip_rescale_threshold=skip_rescale_threshold,
     )
 
     sym_b = cute.sym_int()
