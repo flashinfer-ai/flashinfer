@@ -127,6 +127,7 @@ def selective_state_update(
     dst_state_batch_indices: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -210,6 +211,13 @@ def selective_state_update(
     num_accepted_tokens : Optional[torch.Tensor]
         Number of accepted tokens per sequence with shape (N,).
         Determines which state to read as initial state for each sequence.
+    retrieve_parent_token : Optional[torch.Tensor]
+        Parent step for each token with shape (batch, T), used for tree
+        speculative decoding. At step ``t > 0``, a non-negative value less
+        than ``t`` restores the cached intermediate state from that step
+        before applying the recurrence. Requires ``intermediate_states_buffer``
+        and is supported by the "simple" algorithm; "auto" selects it
+        automatically.
     algorithm : str
         Algorithm to use: "auto", "simple", "vertical", "horizontal"
 
@@ -293,6 +301,22 @@ def selective_state_update(
         raise ValueError(
             "intermediate_states_buffer and dst_state_batch_indices are mutually exclusive"
         )
+    if retrieve_parent_token is not None:
+        if retrieve_parent_token.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "retrieve_parent_token must have dtype int32 or int64, "
+                f"got {retrieve_parent_token.dtype}"
+            )
+        if intermediate_states_buffer is None:
+            raise ValueError(
+                "intermediate_states_buffer is required when "
+                "retrieve_parent_token is provided"
+            )
+        if state_scale is not None and intermediate_state_scales is None:
+            raise ValueError(
+                "intermediate_state_scales is required for tree decoding "
+                "with scaled state"
+            )
 
     if out is None:
         output = torch.empty_like(x)
@@ -307,6 +331,8 @@ def selective_state_update(
         stateIndex_dtype = dst_state_batch_indices.dtype
     elif intermediate_state_indices is not None:
         stateIndex_dtype = intermediate_state_indices.dtype
+    elif retrieve_parent_token is not None:
+        stateIndex_dtype = retrieve_parent_token.dtype
 
     # Extract dim/dstate/ntokens for JIT specialization
     dim = state.size(2)
@@ -356,6 +382,7 @@ def selective_state_update(
         cache_steps,
         cu_seqlens,
         num_accepted_tokens,
+        retrieve_parent_token,
         algorithm_int,
         philox_rounds,
         state.dtype,
@@ -404,6 +431,7 @@ def _selective_state_update(
     cache_steps: int,
     cu_seqlens: Optional[torch.Tensor],
     num_accepted_tokens: Optional[torch.Tensor],
+    retrieve_parent_token: Optional[torch.Tensor],
     algorithm: int,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -454,6 +482,7 @@ def _selective_state_update(
         cache_steps,
         cu_seqlens,
         num_accepted_tokens,
+        retrieve_parent_token,
         algorithm,
     )
 
@@ -483,6 +512,7 @@ def _selective_state_update_fake(
     cache_steps: int,
     cu_seqlens: Optional[torch.Tensor],
     num_accepted_tokens: Optional[torch.Tensor],
+    retrieve_parent_token: Optional[torch.Tensor],
     algorithm: int,
     philox_rounds: int,
     state_dtype: torch.dtype,

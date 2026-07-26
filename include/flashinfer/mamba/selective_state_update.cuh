@@ -100,7 +100,10 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
       nullptr};  // state_t: (icache_size, cache_steps, nheads, dim, dstate)
   void* __restrict__ intermediate_state_indices{nullptr};  // (batch,)
   void* __restrict__ intermediate_state_scales{
-      nullptr};  // float: (batch, cache_steps, nheads, dim)
+      nullptr};                                       // float: (batch, cache_steps, nheads, dim)
+  void* __restrict__ retrieve_parent_token{nullptr};  // stateIndex_t: (batch, ntokens_mtp)
+  int64_t retrieve_parent_token_stride_batch{};
+  int64_t retrieve_parent_token_stride_T{};
 
   void* __restrict__ cu_seqlens{nullptr};           // (n_sequences + 1,)
   void* __restrict__ num_accepted_tokens{nullptr};  // (n_sequences,)

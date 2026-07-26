@@ -24,7 +24,8 @@
 // 1. All warps cooperatively cp.async B/C/x/dt into smem.
 // 2. Each thread loads its state columns from global memory directly into rState[] registers.
 // 3. cp_async_wait_group<0>() + __syncthreads() — single sync.
-// 4. Step loop: pure register compute + smem reads for B/C/x. No further syncs until epilogue.
+// 4. Step loop: register compute + smem reads for B/C/x. Tree decoding also reloads
+//    cached parent states and uses a warp sync to publish quantization scales.
 
 #pragma once
 
@@ -78,6 +79,9 @@ struct SimpleStorage {
   // Precomputed per-step destination batch indices for state writes.
   // -1 means "skip this step".
   int64_t state_dst_slots[NTOKENS];
+  // Parent step to restore before each recurrence. -1 means keep the state
+  // already held in registers.
+  int64_t state_parent_steps[NTOKENS];
   // State prefetch buffer: cp.async loads state here before the barrier.
   // Single stage for DPC=16 (1 pass), 2 stages for DPC>16 (pipelined).
   alignas(128) state_t state_in[STATE_STAGES][ROWS_PER_PASS][DSTATE_PAD];
@@ -260,6 +264,25 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
       sram.state_dst_slots[step] =
           (step == seq_len - 1 && params.update_state) ? state_batch : SKIP;
     }
+
+    auto const* __restrict__ retrieve_parent_token =
+        reinterpret_cast<stateIndex_t const*>(params.retrieve_parent_token);
+    if (retrieve_parent_token) {
+      sram.state_parent_steps[step] = SKIP;
+      if constexpr (!IS_PAD) {
+        if (step > 0 && step < seq_len) {
+          auto const parent_step = static_cast<int64_t>(
+              retrieve_parent_token[seq_idx * params.retrieve_parent_token_stride_batch +
+                                    step * params.retrieve_parent_token_stride_T]);
+          // Ignore invalid or forward references rather than reading unwritten
+          // cache. Even parent == step - 1 is reloaded: the cache dtype is part
+          // of the tree-decoding contract, especially for quantized state.
+          if (parent_step >= 0 && parent_step < step) {
+            sram.state_parent_steps[step] = parent_step;
+          }
+        }
+      }
+    }
   }
 
   // Commit all cp.async and wait for completion
@@ -393,6 +416,35 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       if (step >= seq_len) break;
       // Prefetch dst_slot early so the LDS latency is hidden by the compute below
       int64_t const dst_slot = sram.state_dst_slots[step];
+      if (params.retrieve_parent_token) {
+        int64_t const parent_step = sram.state_parent_steps[step];
+        if (parent_step != simple_horiz::SKIP_WRITE_STATE) {
+          int64_t const parent_slot = sram.state_dst_slots[parent_step];
+          auto const parent_base = parent_slot * write_state_stride + (int64_t)head * DIM * DSTATE +
+                                   (int64_t)dd * DSTATE;
+          [[maybe_unused]] float parent_decode_scale = 1.f;
+          if constexpr (scaleState) {
+            parent_decode_scale =
+                write_scale_ptr[parent_slot * write_scale_stride + head * DIM + dd];
+          }
+#pragma unroll
+          for (int t = 0; t < numTiles; t++) {
+            int const col0 = baseCol(t, 0);
+            if (col0 >= DSTATE) continue;
+            packed_tile_t const parent_tile =
+                *reinterpret_cast<packed_tile_t const*>(&write_state_ptr[parent_base + col0]);
+#pragma unroll
+            for (int p = 0; p < pairsPerTileMember; p++) {
+              rState[t][p] = toFloat2(&parent_tile.val[p * 2]);
+              if constexpr (scaleState) {
+                float2 const decode_scale2 = {parent_decode_scale, parent_decode_scale};
+                mul_f32x2(rState[t][p], rState[t][p], decode_scale2);
+              }
+            }
+          }
+        }
+      }
+
       float const dt_value = *dt_step;
       float const dA = __expf(A_val * dt_value);
       float const x_value = toFloat(x_step[local_row]);
@@ -474,6 +526,11 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
             }
           }
         }
+      }
+      if (params.retrieve_parent_token) {
+        // State values are written by the reading lane, but block scales are
+        // produced by lane 0 and consumed by the other lanes on later steps.
+        __syncwarp();
       }
     }  // step loop
 

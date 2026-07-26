@@ -1126,6 +1126,149 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
             assert states_match, f"Intermediate state at step {t} mismatch"
 
 
+class TestSelectiveStateUpdateMTPRetrieveParentToken:
+    """Test tree speculative decoding with parent-state restoration."""
+
+    @pytest.mark.parametrize(
+        "state_dtype,index_dtype,algorithm",
+        [
+            (torch.bfloat16, torch.int64, "simple"),
+            (torch.bfloat16, torch.int32, "auto"),
+            (torch.int16, torch.int64, "simple"),
+        ],
+    )
+    def test_tree_parent_state_matches_reference(
+        self, state_dtype, index_dtype, algorithm
+    ):
+        batch, nheads, dim, dstate, ngroups, cache_steps = 2, 8, 64, 64, 2, 4
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            input_dtype=torch.bfloat16,
+            weight_dtype=torch.float32,
+            matrixA_dtype=torch.float32,
+            state_dtype=state_dtype,
+            generate_intermediate_states_buffer=True,
+            generate_retrieve_parent_token=True,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+        # Exercise two real branches rather than the generator's linear chain.
+        inputs["retrieve_parent_token"] = torch.tensor(
+            [[-1, 0, 0, 2], [-1, 0, 1, 0]],
+            dtype=index_dtype,
+            device="cuda",
+        )
+        inputs["slot_idx"] = inputs["slot_idx"].to(index_dtype)
+        inputs["intermediate_slot_idx"] = inputs["intermediate_slot_idx"].to(
+            index_dtype
+        )
+
+        state_ref = clone_preserving_strides(inputs["state_cache"])
+        state_scale_ref = (
+            inputs["state_scale"].clone()
+            if inputs.get("state_scale") is not None
+            else None
+        )
+        intermediate_states_ref = inputs["intermediate_states_buffer"].clone()
+        intermediate_scales_ref = (
+            inputs["intermediate_state_scales"].clone()
+            if inputs.get("intermediate_state_scales") is not None
+            else None
+        )
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_states_ref,
+            cache_steps=cache_steps,
+            retrieve_parent_token=inputs["retrieve_parent_token"],
+            intermediate_state_indices=inputs["intermediate_slot_idx"],
+            state_scale=state_scale_ref,
+            intermediate_state_scales=intermediate_scales_ref,
+        )
+
+        y_test = flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            disable_state_update=True,
+            intermediate_states_buffer=inputs["intermediate_states_buffer"],
+            intermediate_state_indices=inputs["intermediate_slot_idx"],
+            intermediate_state_scales=inputs.get("intermediate_state_scales"),
+            state_scale=inputs.get("state_scale"),
+            cache_steps=cache_steps,
+            retrieve_parent_token=inputs["retrieve_parent_token"],
+            algorithm=algorithm,
+        )
+
+        atol = 1e-1 if state_dtype == torch.int16 else 1e-3
+        assert torch.allclose(y_ref, y_test, atol=atol, rtol=1e-2)
+
+        if state_dtype == torch.int16:
+            ref_cache = (
+                intermediate_states_ref.float() * intermediate_scales_ref.unsqueeze(-1)
+            )
+            test_cache = inputs["intermediate_states_buffer"].float() * inputs[
+                "intermediate_state_scales"
+            ].unsqueeze(-1)
+        else:
+            ref_cache = intermediate_states_ref
+            test_cache = inputs["intermediate_states_buffer"]
+        assert torch.allclose(ref_cache, test_cache, atol=atol, rtol=1e-2)
+
+    def test_tree_parent_state_rejects_non_simple_algorithm(self):
+        inputs = create_test_inputs(
+            1,
+            8,
+            64,
+            64,
+            2,
+            input_dtype=torch.bfloat16,
+            generate_intermediate_states_buffer=True,
+            generate_retrieve_parent_token=True,
+            cache_steps=4,
+            seed=0,
+        )
+        with pytest.raises(RuntimeError, match="only supported by the 'simple'"):
+            flashinfer.mamba.selective_state_update(
+                inputs["state_cache"],
+                inputs["x"],
+                inputs["dt"],
+                inputs["A"],
+                inputs["B"],
+                inputs["C"],
+                D=inputs["D"],
+                dt_bias=inputs["dt_bias"],
+                dt_softplus=True,
+                state_batch_indices=inputs["slot_idx"],
+                disable_state_update=True,
+                intermediate_states_buffer=inputs["intermediate_states_buffer"],
+                intermediate_state_indices=inputs["intermediate_slot_idx"],
+                cache_steps=4,
+                retrieve_parent_token=inputs["retrieve_parent_token"],
+                algorithm="horizontal",
+            )
+
+
 class TestSelectiveStateUpdateMTPIndicesDtypeMismatch:
     """Test that selective_state_update fails with dtype mismatch between indices."""
 

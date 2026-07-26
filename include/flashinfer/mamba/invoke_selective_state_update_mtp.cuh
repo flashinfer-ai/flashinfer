@@ -60,6 +60,11 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   if (algorithm == SSUAlgorithm::kAsyncHorizontal) {
     algorithm = SSUAlgorithm::kSimple;
   }
+  if (params.retrieve_parent_token) {
+    FLASHINFER_CHECK(algorithm == SSUAlgorithm::kAuto || algorithm == SSUAlgorithm::kSimple,
+                     "retrieve_parent_token is only supported by the 'simple' MTP algorithm");
+    algorithm = SSUAlgorithm::kSimple;
+  }
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
