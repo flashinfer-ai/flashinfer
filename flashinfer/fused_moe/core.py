@@ -1377,10 +1377,16 @@ def _unpack_trtllm_moe_output(
     output: torch.Tensor,
     do_finalize: bool,
     gemm1_lora_delta: Optional[torch.Tensor],
+    expert_weights: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """Translate the ``Array<Tensor>`` returned by ``FusedMoeLauncher::run`` to
-    the Python-facing ``List[torch.Tensor]``. The caller-provided ``output``
-    buffer is reused in place for the ``do_finalize=True`` rows.
+    the Python-facing ``List[torch.Tensor]``.
+
+    A slot the launcher borrowed from the caller rather than allocated comes back
+    empty, and calling ``from_dlpack`` on it raises "invalid capsule". That is the
+    case for ``output``, which the caller always provides, and for
+    ``expert_weights`` whenever the caller passed a buffer down. For those two we
+    return the caller's own tensor instead of unpacking the slot.
     """
     if do_finalize and gemm1_lora_delta is None:
         return [output]
@@ -1390,19 +1396,23 @@ def _unpack_trtllm_moe_output(
             torch.from_dlpack(intermediate_output[1]),  # expanded_idx_to_permuted_idx
             torch.from_dlpack(intermediate_output[2]),  # gemm1_output
         ]
-    elif not do_finalize and gemm1_lora_delta is None:
-        return [
-            torch.from_dlpack(intermediate_output[0]),  # gemm2_output
-            torch.from_dlpack(intermediate_output[1]),  # expert_weights
-            torch.from_dlpack(intermediate_output[2]),  # expanded_idx_to_permuted_idx
-        ]
-    else:  # not do_finalize and gemm1_lora_delta is not None
-        return [
-            torch.from_dlpack(intermediate_output[0]),  # gemm2_output
-            torch.from_dlpack(intermediate_output[1]),  # expert_weights
-            torch.from_dlpack(intermediate_output[2]),  # expanded_idx_to_permuted_idx
-            torch.from_dlpack(intermediate_output[3]),  # gemm1_output
-        ]
+
+    # do_finalize=False: index 1 is expert_weights.  Only convert it when the
+    # launcher owned (allocated) the buffer -- converting a borrowed slot would
+    # dlpack an empty Tensor and raise "invalid capsule".
+    weights = (
+        expert_weights
+        if expert_weights is not None and expert_weights.numel() > 0
+        else torch.from_dlpack(intermediate_output[1])
+    )
+    result = [
+        torch.from_dlpack(intermediate_output[0]),  # gemm2_output
+        weights,  # expert_weights
+        torch.from_dlpack(intermediate_output[2]),  # expanded_idx_to_permuted_idx
+    ]
+    if gemm1_lora_delta is not None:
+        result.append(torch.from_dlpack(intermediate_output[3]))  # gemm1_output
+    return result
 
 
 def get_trtllm_moe_sm100_module():
@@ -2037,7 +2047,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
 
         return _unpack_trtllm_moe_output(
-            intermediate_output, output, do_finalize, gemm1_lora_delta
+            intermediate_output, output, do_finalize, gemm1_lora_delta, expert_weights
         )
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
@@ -2650,12 +2660,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             norm_topk_prob,
             routing_replay_out,
         )
-        result = _unpack_trtllm_moe_output(
-            intermediate_output, output, do_finalize, gemm1_lora_delta
+        return _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta, expert_weights
         )
-        if not do_finalize and routing_logits is None and expert_weights.numel() > 0:
-            result[1] = expert_weights
-        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
@@ -2923,17 +2930,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             norm_topk_prob,
             routing_replay_out,
         )
-        result = _unpack_trtllm_moe_output(
-            intermediate_output, output, do_finalize, gemm1_lora_delta
+        # FP4 always borrows the caller's topk_weights buffer (the launcher has
+        # no allocate branch), so it is always the source for expert_weights.
+        return _unpack_trtllm_moe_output(
+            intermediate_output, output, do_finalize, gemm1_lora_delta, topk_weights
         )
-        if (
-            not do_finalize
-            and routing_logits is None
-            and topk_weights is not None
-            and topk_weights.numel() > 0
-        ):
-            result[1] = topk_weights
-        return result
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
@@ -3139,7 +3140,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         )
 
         return _unpack_trtllm_moe_output(
-            intermediate_output, output, do_finalize, gemm1_lora_delta
+            intermediate_output, output, do_finalize, gemm1_lora_delta, expert_weights
         )
 
     @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")

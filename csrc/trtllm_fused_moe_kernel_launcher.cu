@@ -431,6 +431,10 @@ class FusedMoeLauncher {
   Tensor expanded_idx_to_permuted_idx;
   Tensor permuted_idx_to_token_idx;
   Tensor permuted_idx_to_expanded_idx;
+  // Launcher-owned routing weights, returned by run() on the do_finalize=false
+  // rows. Stays empty when a derived launcher borrows a caller-supplied buffer
+  // instead, in which case only workspace.expert_weights points at it and the
+  // caller must substitute its own buffer for that slot.
   Tensor expert_weights;
   Tensor expert_indexes;
   Tensor expert_count_histogram;
