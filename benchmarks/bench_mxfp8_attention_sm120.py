@@ -86,18 +86,18 @@ def main() -> None:
     v8, vs = quantize_per_tensor(v)
     indptr = torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=device)
 
+    wrapper = flashinfer.MXFP8AttentionSM120Wrapper()
+    wrapper.plan(indptr, indptr, Hq, Hkv, causal=args.causal)
+
     def run():
-        flashinfer.mxfp8_attention_sm120_fwd(
+        wrapper.run(
             q8,
             k8,
             v8,
-            indptr,
-            indptr,
             sm_scale=D**-0.5,
             q_scale=qs,
             k_scale=ks,
             v_scale=vs,
-            causal=args.causal,
         )
 
     for _ in range(args.warmup):

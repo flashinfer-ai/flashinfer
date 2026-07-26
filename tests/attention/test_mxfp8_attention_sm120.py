@@ -116,17 +116,16 @@ def _run_case(seed, lens, num_qo_heads, num_kv_heads, causal, out_dtype):
     v8, v_scale = _quantize_per_tensor(v)
     sm_scale = head_dim**-0.5
 
-    out, lse = flashinfer.mxfp8_attention_sm120_fwd(
+    wrapper = flashinfer.MXFP8AttentionSM120Wrapper()
+    wrapper.plan(qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, causal=causal)
+    out, lse = wrapper.run(
         q8,
         k8,
         v8,
-        qo_indptr,
-        kv_indptr,
         sm_scale=sm_scale,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        causal=causal,
         out_dtype=out_dtype,
     )
     o_ref, lse_ref = _reference_ragged_attention(
@@ -182,9 +181,91 @@ def test_mxfp8_attention_sm120_prefix_append():
     _run_case(3, lens, 8, 8, True, torch.bfloat16)
 
 
+def test_mxfp8_attention_sm120_wrapper_plan_reuse():
+    """One plan, two runs with different tensors: both must match the reference."""
+    _require_sm12x()
+    device = torch.device("cuda")
+    head_dim = 128
+    lens = [(128, 128), (37, 300), (256, 256)]
+    qo_lens = [q for q, _ in lens]
+    kv_lens = [k for _, k in lens]
+    qo_indptr = torch.tensor(
+        [0] + list(torch.tensor(qo_lens).cumsum(0)), dtype=torch.int32, device=device
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(torch.tensor(kv_lens).cumsum(0)), dtype=torch.int32, device=device
+    )
+    wrapper = flashinfer.MXFP8AttentionSM120Wrapper()
+    wrapper.plan(qo_indptr, kv_indptr, 8, 2, causal=True)
+    for seed in (10, 11):
+        torch.manual_seed(seed)
+        q = torch.randn(sum(qo_lens), 8, head_dim, device=device).to(torch.bfloat16)
+        k = torch.randn(sum(kv_lens), 2, head_dim, device=device).to(torch.bfloat16)
+        v = torch.randn(sum(kv_lens), 2, head_dim, device=device).to(torch.bfloat16)
+        q8, q_scale = _quantize_per_tensor(q)
+        k8, k_scale = _quantize_per_tensor(k)
+        v8, v_scale = _quantize_per_tensor(v)
+        out, lse = wrapper.run(
+            q8, k8, v8, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+        )
+        o_ref, lse_ref = _reference_ragged_attention(
+            q8,
+            k8,
+            v8,
+            qo_indptr,
+            kv_indptr,
+            (head_dim**-0.5, q_scale, k_scale, v_scale),
+            True,
+        )
+        o_diff = (out.float() - o_ref).abs()
+        assert o_diff.max().item() < 4e-2, f"seed {seed}: {o_diff.max().item()}"
+        assert (lse - lse_ref).abs().max().item() < 1e-2
+
+
+def test_mxfp8_attention_sm120_one_shot_functional():
+    """The functional one-shot API (plan+run in a single call)."""
+    _require_sm12x()
+    device = torch.device("cuda")
+    head_dim = 128
+    torch.manual_seed(20)
+    qo_indptr = torch.tensor([0, 100, 356], dtype=torch.int32, device=device)
+    kv_indptr = qo_indptr.clone()
+    q = torch.randn(356, 4, head_dim, device=device).to(torch.bfloat16)
+    k = torch.randn(356, 2, head_dim, device=device).to(torch.bfloat16)
+    v = torch.randn(356, 2, head_dim, device=device).to(torch.bfloat16)
+    q8, q_scale = _quantize_per_tensor(q)
+    k8, k_scale = _quantize_per_tensor(k)
+    v8, v_scale = _quantize_per_tensor(v)
+    out, lse = flashinfer.mxfp8_attention_sm120_fwd(
+        q8,
+        k8,
+        v8,
+        qo_indptr,
+        kv_indptr,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        causal=True,
+    )
+    o_ref, lse_ref = _reference_ragged_attention(
+        q8,
+        k8,
+        v8,
+        qo_indptr,
+        kv_indptr,
+        (head_dim**-0.5, q_scale, k_scale, v_scale),
+        True,
+    )
+    o_diff = (out.float() - o_ref).abs()
+    assert o_diff.max().item() < 4e-2, f"out max abs diff {o_diff.max().item()}"
+    assert (lse - lse_ref).abs().max().item() < 1e-2
+
+
 if __name__ == "__main__":
     test_mxfp8_attention_sm120_ragged_gqa_causal(torch.bfloat16)
     test_mxfp8_attention_sm120_ragged_mha_noncausal()
     test_mxfp8_attention_sm120_single_long_request()
     test_mxfp8_attention_sm120_prefix_append()
+    test_mxfp8_attention_sm120_wrapper_plan_reuse()
+    test_mxfp8_attention_sm120_one_shot_functional()
     print("PASS")

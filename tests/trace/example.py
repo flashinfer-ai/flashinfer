@@ -61,6 +61,7 @@ msa_proxy_score_h4_kv1_d128.json
 msa_sparse_attention_h64_kv4_d128_topk16.json
 msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_attention_sm120_fwd_head_dim128.json
+mxfp8_attention_sm120_run_head_dim128.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
@@ -1560,7 +1561,10 @@ with contextlib.suppress(Exception):
         )
 # mxfp8_attention_sm120_fwd (SM120/121 ragged per-tensor-FP8 prefill).
 with contextlib.suppress(Exception):
-    from flashinfer import mxfp8_attention_sm120_fwd as _mxfp8_fwd
+    from flashinfer import (
+        MXFP8AttentionSM120Wrapper as _MXFP8W,
+        mxfp8_attention_sm120_fwd as _mxfp8_fwd,
+    )
 
     _mx_B, _mx_Hq, _mx_Hkv, _mx_D = 4, 8, 2, 128
     _mx_qlens = [128, 37, 256, 64]
@@ -1589,3 +1593,7 @@ with contextlib.suppress(Exception):
         _mx_kv_indptr,
         causal=True,
     )
+    # plan/run path (plan amortized across per-layer runs)
+    _mx_w = _MXFP8W()
+    _mx_w.plan(_mx_qo_indptr, _mx_kv_indptr, _mx_Hq, _mx_Hkv, causal=True)
+    _mx_w.run(_mx_q, _mx_k, _mx_v)

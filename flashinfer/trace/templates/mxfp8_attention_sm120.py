@@ -52,3 +52,39 @@ mxfp8_attention_sm120_fwd_trace = TraceTemplate(
     ],
     tags=["sm120", "mxfp8", "fp8", "ragged"],
 )
+
+
+mxfp8_attention_sm120_run_trace = TraceTemplate(
+    op_type="attention",
+    name_prefix="mxfp8_attention_sm120_run",
+    description=(
+        "Run step of the SM120/SM121 ragged per-tensor-FP8 prefill wrapper "
+        "(MXFP8AttentionSM120Wrapper.run; plan() amortizes the host-side "
+        "padding layout and LPT work-list build across layers)."
+    ),
+    axes={
+        "total_q": Var(),
+        "total_kv": Var(),
+        "num_qo_heads": Var(),
+        "num_kv_heads": Var(),
+        "head_dim": Const(),
+    },
+    inputs={
+        "q": Tensor(["total_q", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["total_kv", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["total_kv", "num_kv_heads", "head_dim"]),
+        "sm_scale": Scalar("float"),
+        "q_scale": Scalar("float"),
+        "k_scale": Scalar("float"),
+        "v_scale": Scalar("float"),
+    },
+    outputs={
+        "out": Tensor(["total_q", "num_qo_heads", "head_dim"]),
+        "lse": Tensor(["total_q", "num_qo_heads"]),
+    },
+    constraints=[
+        "num_qo_heads % num_kv_heads == 0",
+        "head_dim == 128",
+    ],
+    tags=["sm120", "mxfp8", "fp8", "ragged"],
+)

@@ -148,6 +148,9 @@ from . import mxfp8_attention_sm120 as mxfp8_attention_sm120
 from .mxfp8_attention_sm120 import (
     mxfp8_attention_sm120_fwd as mxfp8_attention_sm120_fwd,
 )
+from .mxfp8_attention_sm120 import (
+    MXFP8AttentionSM120Wrapper as MXFP8AttentionSM120Wrapper,
+)
 from .norm import (
     fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
 )

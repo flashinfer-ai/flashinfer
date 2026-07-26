@@ -141,6 +141,11 @@ SM120 MXFP8 Attention
 
     mxfp8_attention_sm120_fwd
 
+.. autoclass:: MXFP8AttentionSM120Wrapper
+    :members:
+
+    .. automethod:: __init__
+
 
 flashinfer.mla
 ==============
