@@ -181,6 +181,14 @@ def test_mxfp8_attention_sm120_prefix_append():
     _run_case(3, lens, 8, 8, True, torch.bfloat16)
 
 
+def test_mxfp8_attention_sm120_zero_length_request():
+    """Empty requests (qo_len == 0) interleaved with normal ones must be
+    skipped cleanly by padding/scatter/work-list construction."""
+    _require_sm12x()
+    lens = [(64, 64), (0, 128), (37, 37), (0, 5), (128, 300)]
+    _run_case(4, lens, 8, 2, True, torch.bfloat16)
+
+
 def test_mxfp8_attention_sm120_wrapper_plan_reuse():
     """One plan, two runs with different tensors: both must match the reference."""
     _require_sm12x()

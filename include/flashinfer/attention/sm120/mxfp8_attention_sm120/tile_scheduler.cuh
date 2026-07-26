@@ -4,14 +4,14 @@
  *
  * Modified by the FlashInfer team.
  */
-#ifndef FLASHINFER_ATTENTION_HOPPER_TILE_SCHEDULER_CUH_
-#define FLASHINFER_ATTENTION_HOPPER_TILE_SCHEDULER_CUH_
+#ifndef FLASHINFER_ATTENTION_SM120_MXFP8_TILE_SCHEDULER_CUH_
+#define FLASHINFER_ATTENTION_SM120_MXFP8_TILE_SCHEDULER_CUH_
 
 #include "cutlass/arch/barrier.h"
 #include "cutlass/fast_math.h"
-#include "named_barrier.cuh"
 
 namespace flashinfer {
+namespace mxfp8_attention_sm120 {
 
 struct SingleTileScheduler {
  public:
@@ -273,7 +273,7 @@ struct BatchPrefillPersistentTileScheduler {
               ptr_begin,
               ptr_end};
     } else {
-      return {-1, -1, -1, -1, -1, -1, -1, 0, ptr_begin, ptr_end};
+      return {-1, -1, -1, -1, -1, -1, -1, /*batch_idx=*/-1, /*counter=*/0, ptr_begin, ptr_end};
     }
   }
 
@@ -312,6 +312,7 @@ struct BatchPrefillPersistentTileScheduler {
               -1,
               -1,
               -1,
+              /*batch_idx=*/-1,
               current_work.counter + 1,
               current_work.ptr_begin,
               current_work.ptr_end};
@@ -397,7 +398,7 @@ struct BatchPrefillTileScheduler {
               ptr_begin,
               ptr_end};
     } else {
-      return {-1, -1, -1, -1, -1, -1, -1, 0, ptr_begin, ptr_end};
+      return {-1, -1, -1, -1, -1, -1, -1, /*batch_idx=*/-1, /*counter=*/0, ptr_begin, ptr_end};
     }
   }
 
@@ -434,6 +435,7 @@ struct BatchPrefillTileScheduler {
               -1,
               -1,
               -1,
+              /*batch_idx=*/-1,
               current_work.counter + 1,
               current_work.ptr_begin,
               current_work.ptr_end};
@@ -441,6 +443,7 @@ struct BatchPrefillTileScheduler {
   }
 };
 
+}  // namespace mxfp8_attention_sm120
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_ATTENTION_HOPPER_TILE_SCHEDULER_CUH_
+#endif  // FLASHINFER_ATTENTION_SM120_MXFP8_TILE_SCHEDULER_CUH_

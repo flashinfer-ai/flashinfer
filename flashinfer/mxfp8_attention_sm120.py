@@ -80,6 +80,7 @@ def _build_lpt_work_lists(
     num_qo_heads: int,
     causal: bool,
     num_sm: int,
+    device: torch.device,
 ) -> List[torch.Tensor]:
     """Host LPT (longest-processing-time) assignment of (request, q_head, q_tile)
     work items to persistent CTAs; cost = number of 64-key blocks the tile scans."""
@@ -122,7 +123,7 @@ def _build_lpt_work_lists(
             bi.append(r)
 
     def _to_i32(values: List[int]) -> torch.Tensor:
-        return torch.tensor(values, dtype=torch.int32).cuda(non_blocking=True)
+        return torch.tensor(values, dtype=torch.int32, device=device)
 
     return [
         _to_i32(work_indptr),
@@ -247,6 +248,7 @@ class MXFP8AttentionSM120Wrapper:
                 num_qo_heads,
                 causal,
                 num_sm,
+                device,
             ),
         }
 
@@ -421,8 +423,8 @@ def mxfp8_attention_sm120_fwd(
         This function moves ``qo_indptr``/``kv_indptr`` to the host (one sync)
         on every call.
     """
-    total_q, num_qo_heads, _ = q.shape
-    _, num_kv_heads, _ = k.shape
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
     wrapper = MXFP8AttentionSM120Wrapper()
     wrapper.plan(qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, causal=causal)
     return wrapper.run(

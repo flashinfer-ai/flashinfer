@@ -125,7 +125,7 @@ void run_fwd(TensorView q, TensorView k, TensorView v, TensorView work_indptr,
   p.out_Mnb = nullptr;
   p.out_dbg = nullptr;
 
-  using Sched = flashinfer::BatchPrefillPersistentTileScheduler<int>;
+  using Sched = flashinfer::mxfp8_attention_sm120::BatchPrefillPersistentTileScheduler<int>;
   Sched::Arguments sa;
   sa.work_indptr = reinterpret_cast<int*>(work_indptr.data_ptr());
   sa.head_indices = reinterpret_cast<int*>(head_indices.data_ptr());
@@ -141,15 +141,23 @@ void run_fwd(TensorView q, TensorView k, TensorView v, TensorView work_indptr,
   typename Sched::Params sp = Sched::to_underlying_arguments(sa);
   int smem = int(sizeof(SharedStorage));
 
+  cudaError_t err;
   if (causal) {
-    cudaFuncSetAttribute(s3_kernel<Sched, true, SFSource::kUniformFp8>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    err = cudaFuncSetAttribute(s3_kernel<Sched, true, SFSource::kUniformFp8>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "cudaFuncSetAttribute failed: " << cudaGetErrorString(err);
     s3_kernel<Sched, true, SFSource::kUniformFp8><<<grid, kNThreads, smem, stream>>>(p, sp);
   } else {
-    cudaFuncSetAttribute(s3_kernel<Sched, false, SFSource::kUniformFp8>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    err = cudaFuncSetAttribute(s3_kernel<Sched, false, SFSource::kUniformFp8>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "cudaFuncSetAttribute failed: " << cudaGetErrorString(err);
     s3_kernel<Sched, false, SFSource::kUniformFp8><<<grid, kNThreads, smem, stream>>>(p, sp);
   }
+  err = cudaGetLastError();
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "mxfp8_attention_sm120 launch failed: " << cudaGetErrorString(err);
 }
 
 }  // namespace
@@ -172,6 +180,25 @@ void fwd(TensorView q, TensorView k, TensorView v, TensorView work_indptr, Tenso
   CHECK_INPUT(o);
   CHECK_INPUT(lse);
   CHECK_INPUT(l);
+
+  const auto q_dev = q.device().device_id;
+  auto check_same_device = [&](TensorView t, const char* name) {
+    TVM_FFI_ICHECK(t.device().device_id == q_dev)
+        << name << " must be on the same CUDA device as q (device " << q_dev << ")";
+  };
+  check_same_device(k, "k");
+  check_same_device(v, "v");
+  check_same_device(work_indptr, "work_indptr");
+  check_same_device(head_indices, "head_indices");
+  check_same_device(qo_tile_indices, "qo_tile_indices");
+  check_same_device(qo_indptr, "qo_indptr");
+  check_same_device(kv_indptr, "kv_indptr");
+  check_same_device(qo_lens, "qo_lens");
+  check_same_device(kv_lens, "kv_lens");
+  check_same_device(batch_indices, "batch_indices");
+  check_same_device(o, "o");
+  check_same_device(lse, "lse");
+  check_same_device(l, "l");
 
   CHECK_DIM(3, q);
   CHECK_DIM(3, k);

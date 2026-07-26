@@ -43,8 +43,8 @@ mxfp8_attention_sm120_fwd_trace = TraceTemplate(
         "causal": Scalar("bool"),
     },
     outputs={
-        "out": Tensor(["total_q", "num_qo_heads", "head_dim"]),
-        "lse": Tensor(["total_q", "num_qo_heads"]),
+        "out": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype="bfloat16"),
+        "lse": Tensor(["total_q", "num_qo_heads"], dtype="float32"),
     },
     constraints=[
         "num_qo_heads % num_kv_heads == 0",
@@ -79,8 +79,8 @@ mxfp8_attention_sm120_run_trace = TraceTemplate(
         "v_scale": Scalar("float"),
     },
     outputs={
-        "out": Tensor(["total_q", "num_qo_heads", "head_dim"]),
-        "lse": Tensor(["total_q", "num_qo_heads"]),
+        "out": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype="bfloat16"),
+        "lse": Tensor(["total_q", "num_qo_heads"], dtype="float32"),
     },
     constraints=[
         "num_qo_heads % num_kv_heads == 0",

@@ -18,10 +18,7 @@
 // Warp-specialized producer/consumer with a persistent LPT tile scheduler; see
 // tile_scheduler.cuh for the work-list contract the host launcher must build.
 // clang-format off
-#include <cstdio>
 #include <cmath>
-#include <cstring>
-#include <vector>
 #include <cuda_runtime.h>
 
 #include <cute/tensor.hpp>
@@ -613,9 +610,10 @@ __global__ void __launch_bounds__(kNThreads, 1)
         if constexpr (kLoadSF)
           copy(scSFQ, tscSFQ.partition_S(as_position_independent_swizzle_tensor(sSFQ)),
                tscSFQ.retile_D(tSrSFQ));
-        else
+        else {
           CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tSrSFQ); ++i) tSrSFQ(i) = ElementSF::bitcast(kUniformSFByte);
+          for (int i = 0; i < size(tSrSFQ); ++i) tSrSFQ(i) = ElementSF::bitcast(kUniformSFByte);
+        }
         pipeline_q.consumer_release(rq);
         ++rq;
       }
@@ -647,9 +645,10 @@ __global__ void __launch_bounds__(kNThreads, 1)
             copy(scSFK,
                  tscSFK.partition_S(as_position_independent_swizzle_tensor(sSFK(_, _, stage))),
                  tscSFK.retile_D(tSrSFK));
-          else
+          else {
             CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte);
+            for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte);
+          }
         }
         clear(accS);
         auto tSrSFK_h = subSFK(tSrSFK, hc);  // 64-key SF half for this data block (static h)
@@ -723,10 +722,12 @@ __global__ void __launch_bounds__(kNThreads, 1)
           Tensor gPre = local_tile(mPpre, select<0, 1>(TileShape_MNK{}),
                                    make_coord(q_tile_global, kv_tile_base + nb));
           copy(accS, thr_qk.partition_C(gPre));
-          CUTLASS_PRAGMA_UNROLL
-          for (int mi = 0; mi < kNRow; ++mi) {
-            int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
-            if ((lane % 4) == 0) params.out_Mnb[q * n_block_total + nb] = row_max[mi];
+          if (params.out_Mnb != nullptr) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < kNRow; ++mi) {
+              int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+              if ((lane % 4) == 0) params.out_Mnb[q * n_block_total + nb] = row_max[mi];
+            }
           }
         }
 
@@ -865,9 +866,10 @@ __global__ void __launch_bounds__(kNThreads, 1)
           if constexpr (kLoadSF)
             copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)),
                  tscSFV.retile_D(tOrSFV));
-          else
+          else {
             CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte);
+            for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte);
+          }
           // the ldmatrix drained sV/sSFV into registers -> release EARLY so the producer's
           // V(nb+1) TMA overlaps the rescale/PV work below (the gemm reads registers, not smem).
           pipeline_v.consumer_release(rv);
