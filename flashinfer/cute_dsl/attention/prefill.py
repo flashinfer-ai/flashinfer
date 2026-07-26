@@ -22,6 +22,7 @@ from .roles.correction import CorrectionRole
 from .roles.epilogue import EpilogueRole
 from .roles.loader_tma import LoaderRole
 from .roles.mma import MmaRole
+from .compat import get_current_arch as _get_current_arch
 
 import warnings
 
@@ -84,7 +85,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_k_all: Int32,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         params_in: cute.Tensor | None,
+        lse_in: cute.Tensor | None,
         stream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -98,6 +102,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param cum_seqlen_k: Cumulative KV sequence lengths, or None
         :param scale_softmax_log2: ``log2(e) * sm_scale``
         :param scale_output: Output scaling factor
+        :param window_left: runtime lookback bound (read only when the
+            compile-time ``MaskSpec.has_window_left`` is set)
+        :param window_right: runtime lookahead bound (read only when the
+            compile-time ``MaskSpec.has_window_right`` is set)
         :param params_in: Variant runtime data tensor, or None
         :param stream: CUDA stream
         """
@@ -149,6 +157,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             else None
         )
 
+        # (total_q, h_q) f32 log-sum-exp output, written by the correction
+        # warps (log2 domain, matching the flashinfer LSE convention).
+        mLSE = None
+        if cutlass.const_expr(lse_in is not None):
+            lse_rows = (
+                s_q_all if cutlass.const_expr(cum_seqlen_q is not None) else s_q * b
+            )
+            mLSE = cute.make_tensor(
+                lse_in.iterator,
+                cute.make_layout((lse_rows, h_r * h_k), stride=(h_r * h_k, 1)),
+            )
+
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -173,12 +193,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
-        # check type consistency
+        # check type consistency: Q and K feed the same GEMM operand dtype;
+        # V (and with it P, the PV MMA A-operand) may differ.
         if cutlass.const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if cutlass.const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        self.mainloop = self.mainloop.resolve(self.q_dtype.width)
+        # Stage counts are sized for the wider K/V operand (the shared
+        # K/V smem ring must fit both tiles per slot).
+        self.mainloop = self.mainloop.resolve(
+            max(self.q_dtype.width, self.v_dtype.width)
+        )
 
         self.softmax_role = SoftmaxRole(
             self.config,
@@ -204,6 +227,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
             threads_per_warp=self.schedule.threads_per_warp,
             has_logits_transform=self.has_logits_transform,
+            has_statistics_update=self.fusion.variant.has_statistics_update,
         )
         self.mma_role.set_dtypes(
             self.q_dtype,
@@ -212,7 +236,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.k_major_mode,
             self.v_major_mode,
         )
-        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
+        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype, self.v_dtype)
 
         lp = build_fmha_launch_params(
             self.mainloop,
@@ -232,17 +256,25 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.shared_storage = lp.SharedStorage
 
         smem_bytes = lp.SharedStorage.size_in_bytes()
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        arch = _get_current_arch()
+        smem_capacity = utils.get_smem_capacity_in_bytes(arch)
         if cutlass.const_expr(smem_bytes > smem_capacity):
             head_dim = self.config.mma_tiler[2]
             raise ValueError(
-                f"SharedStorage requires {smem_bytes} bytes but SM100 provides "
+                f"SharedStorage requires {smem_bytes} bytes but {arch} provides "
                 f"{smem_capacity} bytes. Reduce head_dim (currently {head_dim}) "
                 f"or tile size."
             )
 
         self.tma_copy_q_bytes = lp.tma_copy_q_bytes
         self.tma_copy_kv_bytes = lp.tma_copy_kv_bytes
+        # The shared K/V ring's barriers are initialized with K's byte
+        # count; with mixed K/V dtypes the loader re-arms each V slot with
+        # V's byte count (None means uniform: plain acquires).
+        self.loader_role.set_v_tx_bytes(
+            lp.tma_copy_v_bytes if self.k_dtype.width != self.v_dtype.width else None,
+            self.mainloop.kv_stages,
+        )
 
         if cutlass.const_expr(not self.has_logits_transform):
             self.correction_role.set_call_attrs(self.o_dtype, lp.o_layout, lp.epi_tile)
@@ -264,7 +296,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             cum_seqlen_k,
             scale_softmax_log2,
             scale_output,
+            window_left,
+            window_right,
             params,
+            mLSE,
             lp.q_smem_layout_staged,
             lp.k_smem_layout_staged,
             lp.p_tmem_layout_staged,
@@ -329,7 +364,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
-        p_scale = self.config.qk_acc_dtype.width // self.q_dtype.width
+        p_scale = self.config.qk_acc_dtype.width // self.v_dtype.width
         tOrP0 = cute.make_tensor(
             tOrP.iterator + p_scale * self.tmem.p0_offset, tOrP.layout
         )
@@ -370,7 +405,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         params: cute.Tensor | None,
+        mLSE: cute.Tensor | None,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
@@ -431,8 +469,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
+        # V reuses K's smem buffer; recast the element type first so the
+        # MMA descriptor matches v_dtype when K and V dtypes differ.
         sV = cute.make_tensor(
-            cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner),
+            cute.recast_ptr(
+                cute.recast_ptr(sK.iterator, dtype=self.v_dtype),
+                v_smem_layout_staged.inner,
+            ),
             v_smem_layout_staged.outer,
         )
         sO = storage.sO.get_tensor(
@@ -490,9 +533,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 sV,
                 cum_seqlen_q,
                 cum_seqlen_k,
+                window_left,
+                window_right,
                 load_q_producer,
                 load_kv_producer,
                 tile_sched_params,
+                storage.load_kv_mbar_ptr.data_ptr(),
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -515,6 +561,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 mK_kdl.shape[0],
                 cum_seqlen_q,
                 cum_seqlen_k,
+                window_left,
+                window_right,
                 load_q_consumer,
                 load_kv_consumer,
                 mma_s0_producer,
@@ -556,6 +604,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
                 scale_output=scale_output,
+                window_left=window_left,
+                window_right=window_right,
                 qk_thr_mma=qk_thr_mma,
                 pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
@@ -590,6 +640,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cum_seqlen_k=cum_seqlen_k,
                 scale_softmax_log2=scale_softmax_log2,
                 scale_output=scale_output,
+                window_left=window_left,
+                window_right=window_right,
                 qk_thr_mma=qk_thr_mma,
                 pv_thr_mma=pv_thr_mma,
                 tStS=tStS,
@@ -628,6 +680,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     cum_seqlen_k,
                     scale_softmax_log2,
                     scale_output,
+                    window_left,
+                    window_right,
+                    mLSE,
                     s0_corr_consumer,
                     s1_corr_consumer,
                     mma_corr_consumer,

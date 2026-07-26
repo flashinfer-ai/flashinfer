@@ -71,6 +71,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     is_float8,
     is_sm100a_supported,
@@ -3492,8 +3493,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             _sm_scale = (
                 sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
             )
-            # Route compatible calls to faster trtllm CuTe DSL FMHA kernels.
-            self._cute_dsl_use_fmha = variant is None and head_dim_qk == 128
+            # Variant-less head-128 dense/causal plans route to the trtllm
+            # CuTe DSL FMHA kernel (prebuilt artifacts).  Sliding-window
+            # plans use the modular cute-dsl path, which measures faster on
+            # windows (banded masks skip dead work) for every V dtype —
+            # mixed V (e.g. fp8 V with bf16 Q/K) forces the FMHA path onto
+            # JIT compilation, where the modular kernel wins.
+            self._cute_dsl_use_fmha = (
+                variant is None and head_dim_qk == 128 and window_left < 0
+            )
             if self._cute_dsl_use_fmha:
                 q_lens = qo_indptr[1:] - qo_indptr[:-1]
                 k_lens = kv_indptr[1:] - kv_indptr[:-1]
@@ -3509,6 +3517,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "window_left": window_left,
                 }
             else:
+                # The modular kernel requires q and k to share one dtype
+                # (kv_data_type covers both K and V; a V-only mismatch is a
+                # run()-time property served natively).  Reject mismatched
+                # plan dtypes here with a clear error — they would otherwise
+                # surface as an opaque FFI signature mismatch at run().
+                if kv_data_type is not None and q_data_type != kv_data_type:
+                    raise ValueError(
+                        "cute-dsl modular prefill requires q_data_type == "
+                        f"kv_data_type, got {q_data_type} and {kv_data_type}"
+                    )
                 self._cute_dsl_wrapper.plan(
                     qo_indptr,
                     kv_indptr,
@@ -3907,8 +3925,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl backend does not support FP8 scale parameters"
                 )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support NVFP4 packed KV cache "
+                    "(kv_cache_sf)"
+                )
+            # enable_pdl is a launch-latency hint: forwarded on the FMHA
+            # route below; the modular kernel has no PDL support.
             if self._cute_dsl_use_fmha:
-                # Delegate to the trtllm CuTe DSL FMHA kernel (supports LSE).
+                # Delegate dense/causal plans to the trtllm CuTe DSL FMHA
+                # kernel (mixed V dtype included: it JIT-compiles
+                # separate-V-dtype variants).  Windowed plans stay on the
+                # modular path for every V dtype.
                 p = self._cute_dsl_fmha_plan
                 return trtllm_ragged_attention_deepseek(
                     query=q,
@@ -3932,10 +3960,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse=lse,
                     backend="cute-dsl",
                 )
-            # Generic JIT (ALiBi / soft-cap): prefill.py-based wrapper (no LSE).
             if return_lse:
-                raise NotImplementedError(
-                    "cute-dsl backend does not support return_lse with ALiBi / soft-cap"
+                # Standard-path modular kernel computes LSE natively; the
+                # wrapper raises NotImplementedError for attention variants.
+                return self._cute_dsl_wrapper.run(
+                    q, k, v, out=out, return_lse=True, lse=lse
                 )
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
@@ -4845,10 +4874,11 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    if (
-        k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
-    ) and kv_cache_sf is None:
-        raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
+    if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+        if get_compute_capability(query.device) == (10, 7):
+            raise ValueError("KV Cache NVFP4 is not supported on SM107")
+        if kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
     key_block_scales, value_block_scales = (
         _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
         if kv_cache_sf is not None

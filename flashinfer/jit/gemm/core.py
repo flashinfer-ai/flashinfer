@@ -114,7 +114,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "fp4_gemm_cutlass",
@@ -341,7 +341,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -391,7 +391,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -440,7 +440,7 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "mxfp8_gemm_cutlass",
@@ -577,7 +577,7 @@ def gen_gemm_sm100_module() -> JitSpec:
         write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "gemm_sm100",
@@ -763,6 +763,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            "-DTLLM_RUBIN_FEATURES",
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
@@ -938,6 +939,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            "-DTLLM_RUBIN_FEATURES",
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]

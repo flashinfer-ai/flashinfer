@@ -28,9 +28,8 @@ from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
 from ..fusion.mask import (
     apply_mask,
-    get_unmasked_trip_count,
-    get_masked_trip_count,
-    get_kv_start_block_idx,
+    get_stage_peel_segments,
+    get_trip_segments,
 )
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
@@ -61,8 +60,7 @@ class SoftmaxRole:
         self.pv_mma_tiler = config.pv_mma_tiler
         self.pv_acc_dtype = config.pv_acc_dtype
         self.cta_tiler = config.cta_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
         self.num_repeat_kv_heads = config.num_repeat_kv_heads
 
         # From TMEM layout
@@ -90,13 +88,19 @@ class SoftmaxRole:
         # Set later via set_dtypes() / set_call_attrs()
         self.q_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_dtype: Optional[Type[cutlass.Numeric]] = None
+        self.p_dtype: Optional[Type[cutlass.Numeric]] = None
         self.o_layout = None
         self.epi_tile = None
 
-    def set_dtypes(self, q_dtype, o_dtype):
-        """Set tensor-type attributes known only at call time."""
+    def set_dtypes(self, q_dtype, o_dtype, p_dtype=None):
+        """Set tensor-type attributes known only at call time.
+
+        P (the PV MMA A-operand) follows V's dtype, which may differ
+        from Q/K's; defaults to q_dtype for uniform-dtype callers.
+        """
         self.q_dtype = q_dtype
         self.o_dtype = o_dtype
+        self.p_dtype = p_dtype if p_dtype is not None else q_dtype
 
     def set_call_attrs(self, o_layout, epi_tile):
         """Set epilog attributes for transform path (replaces CorrectionRole)."""
@@ -145,7 +149,7 @@ class SoftmaxRole:
         kv_head_idx = qo_head_idx // self.num_repeat_kv_heads
         kv_tile_idx = cS[0][1] // self.qk_mma_tiler[1]
 
-        seqlen_q, seqlen_k, scale_softmax_log2 = value_args
+        seqlen_q, seqlen_k, scale_softmax_log2, window_left, window_right = value_args
         (
             mma_si_consumer,
             si_corr_producer,
@@ -165,6 +169,7 @@ class SoftmaxRole:
             tTMEM_LOADtS,
             tTMEM_STORE_VECtS,
             tTMEM_STOREtS_x4,
+            tTMEM_LOADcS_static,
         ) = tensor_args
 
         if cutlass.const_expr(self.has_statistics_update):
@@ -177,6 +182,12 @@ class SoftmaxRole:
                 scale_softmax_log2,
             )
 
+        # P-store extent keyed on o_dtype, NOT p_dtype: o is 16-bit in every
+        # dtype combo where they differ (fp8 in -> fp16 out), so this always
+        # covers >= P's extent.  With fp8 P the store's upper half is unread
+        # over-provision inside the reserved P region — same behavior as the
+        # uniform-fp8 build and the vendored kernel; the PV MMA reads P
+        # through p_tmem_layout_staged (v_dtype-keyed) only.
         tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS)
         tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((128, 2)))
@@ -196,12 +207,14 @@ class SoftmaxRole:
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             apply_mask(
-                self.mask_type,
-                self.window_left,
+                self.mask_spec,
                 tTMEM_LOADrS,
                 tTMEM_LOADcS,
                 seqlen_k,
                 seqlen_k - seqlen_q,
+                tTMEM_LOADcS_static,
+                window_left,
+                window_right,
             )
 
         frg_cnt = 4
@@ -228,12 +241,14 @@ class SoftmaxRole:
             # for out-of-bounds positions so they get zero softmax weight.
             if need_apply_mask:
                 apply_mask(
-                    self.mask_type,
-                    self.window_left,
+                    self.mask_spec,
                     tTMEM_LOADrS,
                     tTMEM_LOADcS,
                     seqlen_k,
                     seqlen_k - seqlen_q,
+                    tTMEM_LOADcS_static,
+                    window_left,
+                    window_right,
                 )
 
         if cutlass.const_expr(not self.has_logits_transform):
@@ -255,7 +270,7 @@ class SoftmaxRole:
 
         tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         tTMEM_STORErS_x4_e = cute.make_tensor(
-            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
+            cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.p_dtype),
             tTMEM_LOADrS.layout,
         )
 
@@ -276,7 +291,7 @@ class SoftmaxRole:
             for j in range(frg_cnt):
                 self.variant.transform_logits_vec(tTMEM_LOADrS_frg[None, j])
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         elif cutlass.const_expr(self.has_logits_transform):
             if cutlass.const_expr(self.has_params and not self.has_score_mod):
@@ -287,13 +302,13 @@ class SoftmaxRole:
                         tTMEM_LOADrS_frg[k, j],
                     )
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         else:
             for j in range(frg_cnt):
                 exp2_scale(tTMEM_LOADrS_frg[None, j], scale, row_max_safe)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
-                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
+                tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.p_dtype))
 
         if cutlass.const_expr(not self.has_logits_transform):
             if cutlass.const_expr(stage == 0):
@@ -457,6 +472,8 @@ class SoftmaxRole:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
+        window_left: Int32,
+        window_right: Int32,
         qk_thr_mma: cute.ThrMma,
         pv_thr_mma: cute.ThrMma | None,
         tStS: cute.Tensor,
@@ -491,6 +508,8 @@ class SoftmaxRole:
         cS_base = cute.make_identity_tensor(
             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
         )
+        # o_dtype-keyed on purpose (>= P's extent in every combo); see the
+        # comment at step()'s tilePlikeFP32 site.
         tilePlikeFP32 = self.qk_mma_tiler[1] // 32 * self.o_dtype.width
         tScS = qk_thr_mma.partition_C(cS_base)
         tStS_vec_layout = cute.composition(tStS.layout, cute.make_layout((128, 2)))
@@ -518,6 +537,9 @@ class SoftmaxRole:
         )
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
         tTMEM_LOADtS = thr_tmem_load.partition_S(tStSi)
+        # Unshifted identity partition: per-element coordinates with no
+        # dynamic domain offset; apply_mask requires it (see fusion/mask.py).
+        tTMEM_LOADcS_static = thr_tmem_load.partition_D(tScS)
         tmem_store_vec_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(2)),
             self.qk_acc_dtype,
@@ -563,7 +585,13 @@ class SoftmaxRole:
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 row_max = -Float32.inf
                 row_sum = 0.0
-                value_args = (seqlen_q_, seqlen_k_, scale_softmax_log2)
+                value_args = (
+                    seqlen_q_,
+                    seqlen_k_,
+                    scale_softmax_log2,
+                    window_left,
+                    window_right,
+                )
                 atom_args = (
                     qk_thr_mma,
                     tiled_tmem_load,
@@ -577,19 +605,56 @@ class SoftmaxRole:
                     tTMEM_LOADtS,
                     tTMEM_STORE_VECtS,
                     tTMEM_STOREtS_x4,
+                    tTMEM_LOADcS_static,
                 )
 
-                kv_start_offset = (
-                    get_kv_start_block_idx(
-                        self.mask_type,
-                        self.window_left,
+                # Per-stage band iteration (head/tail peel): each 128-row
+                # stage runs exactly its own band's trips — stage 0 the
+                # union's head+main blocks, stage 1 the main+tail blocks
+                # (see fusion/mask.py get_peel_sections).  No dead trips
+                # exist; the s0<->s1 sequence tokens stay balanced because
+                # stage 1 pre-consumes stage 0's `head` tokens and stage 0
+                # post-produces `tail` tokens after its final vec (dummies,
+                # a few instructions each).  Variants with per-step side
+                # effects keep full union lockstep (head = tail = 0).
+                seq_dummy_head = Int32(0)
+                seq_dummy_tail = Int32(0)
+                if cutlass.const_expr(
+                    not self.has_logits_transform and not self.has_statistics_update
+                ):
+                    (
+                        kv_start_block,
+                        masked_left,
+                        unmask_count,
+                        masked_right,
+                        seq_dummy_head,
+                        seq_dummy_tail,
+                    ) = get_stage_peel_segments(
+                        self.mask_spec,
+                        curr_block_coord,
+                        stage,
+                        self.cta_tiler,
+                        seqlen_k_,
+                        seqlen_q_,
+                        window_left,
+                        window_right,
+                    )
+                else:
+                    (
+                        kv_start_block,
+                        masked_left,
+                        unmask_count,
+                        masked_right,
+                    ) = get_trip_segments(
+                        self.mask_spec,
                         curr_block_coord,
                         self.cta_tiler,
                         seqlen_k_,
                         seqlen_q_,
+                        window_left,
+                        window_right,
                     )
-                    * self.qk_mma_tiler[1]
-                )
+                kv_start_offset = kv_start_block * self.qk_mma_tiler[1]
                 logical_offset = (
                     curr_block_coord[0] * self.cta_tiler[0]
                     + stage * self.qk_mma_tiler[0],
@@ -599,17 +664,58 @@ class SoftmaxRole:
                 vec_i_handle = None
                 if cutlass.const_expr(not self.has_logits_transform):
                     vec_i_handle = si_corr_producer.acquire_and_advance()
-                unmask_count = get_unmasked_trip_count(
-                    self.mask_type,
-                    self.window_left,
-                    curr_block_coord,
-                    self.cta_tiler,
-                    seqlen_k_,
-                    seqlen_q_,
-                )
                 batch_coord = curr_block_coord[2][1]
                 head_coord = curr_block_coord[2][0]
-                for i in cutlass.range(0, unmask_count, 1, unroll=1):
+                # Stage 1: consume stage 0's head-trip tokens (it has no
+                # steps of its own for those blocks).
+                if cutlass.const_expr(
+                    stage == 1
+                    and not self.has_logits_transform
+                    and not self.has_statistics_update
+                ):
+                    for _d in cutlass.range(0, seq_dummy_head, 1, unroll=1):
+                        seq_handle = s0_s1_sequence_consumer.wait_and_advance()
+                        seq_handle.release()
+                # Left boundary blocks (window left edge) — masked.
+                for i in cutlass.range(0, masked_left, 1, unroll=1):
+                    cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
+                    iter_args = (
+                        cS_iter,
+                        row_max,
+                        row_sum,
+                        vec_i_handle,
+                        batch_coord,
+                        head_coord,
+                    )
+                    pipeline_args = (
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    )
+                    (
+                        row_max,
+                        row_sum,
+                        vec_i_handle,
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    ) = self.step(
+                        stage,
+                        True,
+                        iter_args,
+                        value_args,
+                        pipeline_args,
+                        atom_args,
+                        tensor_args,
+                        params,
+                    )
+
+                # Interior blocks fully inside the band — no masking.
+                for i in cutlass.range(
+                    masked_left, masked_left + unmask_count, 1, unroll=1
+                ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
                     iter_args = (
                         cS_iter,
@@ -644,17 +750,13 @@ class SoftmaxRole:
                         params,
                     )
 
-                mask_count = get_masked_trip_count(
-                    self.mask_type,
-                    self.window_left,
-                    curr_block_coord,
-                    self.cta_tiler,
-                    seqlen_k_,
-                    seqlen_q_,
-                )
-
+                # Right boundary blocks (causal diagonal, window right edge,
+                # or seqlen_k tail) — masked.
                 for i in cutlass.range(
-                    unmask_count, unmask_count + mask_count, 1, unroll=1
+                    masked_left + unmask_count,
+                    masked_left + unmask_count + masked_right,
+                    1,
+                    unroll=1,
                 ):
                     cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
                     iter_args = (
@@ -689,6 +791,7 @@ class SoftmaxRole:
                         tensor_args,
                         params,
                     )
+
                 si_handle = mma_si_consumer.wait_and_advance()
                 if cutlass.const_expr(not self.has_logits_transform):
                     tTMEM_STORE_VECrS = cute.make_rmem_tensor(
@@ -701,6 +804,16 @@ class SoftmaxRole:
                     )
                     cute.arch.fence_view_async_tmem_store()
                     vec_i_handle.commit()
+                    # Stage 0: produce stage 1's tail-trip tokens (it has no
+                    # steps of its own for those blocks).  After the final
+                    # vec commit so the O0 drain is not gated on stage 1's
+                    # progress.
+                    if cutlass.const_expr(
+                        stage == 0 and not self.has_statistics_update
+                    ):
+                        for _d in cutlass.range(0, seq_dummy_tail, 1, unroll=1):
+                            seq_handle = s0_s1_sequence_producer.acquire_and_advance()
+                            seq_handle.commit()
                     si_corr_producer.acquire()
                     si_handle.release()
                 else:

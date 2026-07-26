@@ -20,7 +20,9 @@ from .core import JitSpec, gen_jit_spec
 from . import env as jit_env
 from .core import (
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
     sm90a_nvcc_flags,
     sm110a_nvcc_flags,
     sm120a_nvcc_flags,
@@ -67,6 +69,13 @@ def gen_fp4_quantization_sm100_module() -> JitSpec:
 
 def gen_fp4_quantization_sm103_module() -> JitSpec:
     return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
+
+
+def gen_fp4_quantization_sm107_module() -> JitSpec:
+    from flashinfer.compilation_context import cutlass_supports_sm107
+
+    nvcc_flags = sm107a_nvcc_flags if cutlass_supports_sm107() else sm100f_nvcc_flags
+    return gen_fp4_quantization_module(nvcc_flags, "107")
 
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
