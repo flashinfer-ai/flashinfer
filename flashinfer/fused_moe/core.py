@@ -1458,6 +1458,7 @@ def get_trtllm_moe_sm100_module():
             moe_inputs: "MoeRunnerInputs",
             tune_max_num_tokens: int = 8192,
             routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+            tune_min_num_tokens: int = 1,
             **kwargs,
         ) -> TuningConfig:
             """Build a TuningConfig for this runner instance.
@@ -1466,6 +1467,7 @@ def get_trtllm_moe_sm100_module():
                 moe_inputs: Input parameters for this call.
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 routing_input_mode: Routing representation used by the launcher.
+                tune_min_num_tokens: Lower bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
 
@@ -1523,7 +1525,9 @@ def get_trtllm_moe_sm100_module():
                     DynamicTensorSpec(
                         input_idx,
                         dim_idx,
-                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        get_hybrid_num_tokens_buckets(
+                            tune_max_num_tokens, tune_min_num_tokens
+                        ),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
                         initializers,
                     ),
@@ -1965,6 +1969,15 @@ def get_trtllm_moe_sm100_module():
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            # Skip the m=1 tuning profile: BF16 dynB GEMM2 candidates hit an
+            # illegal memory access when executed under the sweep's 1-token
+            # profile on sm100f, and the IMA is context-fatal so the sweep
+            # cannot skip past a faulting candidate (issue #4157). Runtime
+            # m=1 maps to the (now untuned) 1 bucket and falls back to the
+            # default tactic, which is stable at 1 token; it is intentionally
+            # NOT remapped to the m=2 bucket, since that would execute a
+            # swept candidate at m=1, the exact faulting scenario.
+            tune_min_num_tokens=2,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )

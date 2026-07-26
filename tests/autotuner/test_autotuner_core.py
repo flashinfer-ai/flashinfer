@@ -1508,3 +1508,74 @@ def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
 
     key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
     assert key_257 != key_small_workspace
+
+
+def test_hybrid_num_tokens_buckets_min_two_drops_only_the_one_bucket():
+    """min_num_tokens=2 must remove exactly the 1-token bucket."""
+    full = get_hybrid_num_tokens_buckets(8192, 1)
+    trimmed = get_hybrid_num_tokens_buckets(8192, 2)
+    assert 1 in full
+    assert 1 not in trimmed
+    assert trimmed == tuple(b for b in full if b != 1)
+
+
+def test_moe_tuning_config_min_num_tokens_two_generates_no_m1_profile():
+    """A MoE tuning config built with tune_min_num_tokens=2 must not produce
+    an m=1 optimization profile.
+
+    trtllm_bf16_moe tunes with tune_min_num_tokens=2 because BF16 dynB GEMM2
+    candidates hit a context-fatal illegal memory access when executed under
+    the sweep's 1-token profile on sm100f (issue #4157).
+    """
+    fn = core_mod.get_trtllm_moe_sm100_module
+    fn.cache_clear()
+    try:
+        mock_module = MagicMock()
+        mock_module.get_library_path.return_value = "/tmp/fake.so"
+        with (
+            patch.object(
+                core_mod,
+                "gen_trtllm_gen_fused_moe_sm100_module",
+                return_value=mock_module,
+            ),
+            patch.object(core_mod, "setup_cubin_loader"),
+        ):
+            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+
+        runner = MoERunner(
+            top_k=8,
+            num_local_experts=256,
+            dtype_act=DtypeTrtllmGen.Bfloat16,
+            dtype_weights=DtypeTrtllmGen.Bfloat16,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=6144,
+            intermediate_size=256,
+            num_experts=256,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=torch.empty((1, 6144)),
+            routing_logits=torch.empty((1, 256)),
+            topk_ids=None,
+            expert_weights=None,
+            hidden_states=torch.empty((1, 6144)),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        config = runner._make_tuning_config(moe_inputs, tune_min_num_tokens=2)
+        profiles = AutoTuner.get()._generate_optimization_profiles(
+            config, moe_inputs.to_list()
+        )
+
+        spec = config.dynamic_tensor_specs[0]
+        token_input, token_dim = spec.input_idx[0], spec.dim_idx[0]
+        opt_tokens = {p.get_opt_shapes()[token_input][token_dim] for p in profiles}
+
+        assert 1 not in opt_tokens, (
+            "tune_min_num_tokens=2 still generated an m=1 profile; the BF16 "
+            "MoE sweep would execute the faulting 1-token candidates."
+        )
+        assert 2 in opt_tokens
+    finally:
+        fn.cache_clear()
