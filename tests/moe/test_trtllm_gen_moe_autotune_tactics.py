@@ -308,6 +308,7 @@ def _enumerate_valid_tactics(
     intermediate_size: int,
     num_experts: int,
     num_tokens: int,
+    num_local_experts: int | None = None,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
     the given problem shape."""
@@ -322,7 +323,8 @@ def _enumerate_valid_tactics(
             top_k,
             hidden_size,
             intermediate_size,
-            num_experts,  # num_local_experts
+            num_experts,
+            num_experts if num_local_experts is None else num_local_experts,
             ActivationType.Swiglu.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
@@ -331,6 +333,27 @@ def _enumerate_valid_tactics(
             False,  # has_gemm1_lora_delta
         )
     )
+
+
+def test_trtllm_fp4_tile_n_enumeration_for_ep():
+    """GLM-5.2 EP8 tunes every supported NVFP4 tile-N value."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    num_experts = 256
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k=8,
+        hidden_size=6144,
+        intermediate_size=2048,
+        num_experts=num_experts,
+        num_tokens=256,
+        num_local_experts=num_experts // 8,
+    )
+
+    assert {tactic[0] for tactic in valid_tactics} == {8, 16, 32, 64, 128, 256}
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
@@ -675,6 +698,7 @@ def _enumerate_fp8_valid_tactics(
             top_k,
             hidden_size,
             intermediate_size,
+            num_experts,
             num_experts,  # num_local_experts
             ActivationType.Swiglu.value,
             cfg["use_shuffled_weight"],
