@@ -86,9 +86,14 @@ def _preprocess_qkv(
                 f"{name} must have shape [batch, num_heads, seq_len, head_dim], "
                 f"got shape={tuple(tensor.shape)}"
             )
-    if q.shape != k.shape or q.shape != v.shape:
+    if k.shape != v.shape:
         raise ValueError(
-            "q, k, and v must have the same shape, "
+            "k and v must have the same shape, "
+            f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
+        )
+    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError(
+            "q, k, and v must have the same batch, sequence length, and head_dim, "
             f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
         )
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -100,7 +105,14 @@ def _preprocess_qkv(
     _check_same_device("k", k, "q", q)
     _check_same_device("v", v, "q", q)
 
-    batch, num_heads, seq_len, head_dim = q.shape
+    batch, num_q_heads, seq_len, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            "num_q_heads must be divisible by num_kv_heads for GQA, "
+            f"got num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}"
+        )
+    q_to_kv_group_size = num_q_heads // num_kv_heads
     if head_dim not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
 
@@ -110,11 +122,13 @@ def _preprocess_qkv(
 
     if per_block_mean:
         num_groups = seq_len // _TOKEN_BLOCK_SIZE
-        q_grouped = q.reshape(batch, num_heads, num_groups, _TOKEN_BLOCK_SIZE, head_dim)
+        q_grouped = q.reshape(
+            batch, num_q_heads, num_groups, _TOKEN_BLOCK_SIZE, head_dim
+        )
         qm = q_grouped.mean(dim=3)
         q = (
             (q_grouped - qm.unsqueeze(3))
-            .reshape(batch, num_heads, seq_len, head_dim)
+            .reshape(batch, num_q_heads, seq_len, head_dim)
             .contiguous()
         )
     else:
@@ -127,10 +141,16 @@ def _preprocess_qkv(
     # broadcasts each row across the 128 rows of the Q tile in smem.
     # Multiply in fp32: a float16 matmul output would overflow at 65504
     # even though the accumulation itself runs in fp32.
-    qk_correction = torch.matmul(
-        qm.to(torch.float32), k.transpose(-2, -1).to(torch.float32)
+    qm_grouped = qm.reshape(
+        batch, num_kv_heads, q_to_kv_group_size, qm.shape[2], head_dim
     )
-    qk_correction = qk_correction.contiguous()
+    qk_correction = torch.matmul(
+        qm_grouped.to(torch.float32),
+        k.transpose(-2, -1).to(torch.float32).unsqueeze(2),
+    )
+    qk_correction = qk_correction.reshape(
+        batch, num_q_heads, qm.shape[2], seq_len
+    ).contiguous()
     return q.contiguous(), k.contiguous(), v.contiguous(), qk_correction
 
 
@@ -153,13 +173,17 @@ def nvfp4_attention_sm120_quantize_qkv(
     r"""Preprocess and quantize dense Q/K/V tensors for SM120 NVFP4 attention.
 
     The input layout is ``[batch, num_heads, seq_len, head_dim]``. Inputs must be
-    contiguous CUDA tensors with the same shape, dtype, and device. The sequence
-    dimension is padded to a multiple of 128 before Q/K/V are quantized.
+    contiguous CUDA tensors with the same dtype and device. ``q`` may have more
+    heads than ``k``/``v`` for GQA, as long as the Q head count is divisible by
+    the KV head count. The sequence dimension is padded to a multiple of 128
+    before Q/K/V are quantized.
 
     Parameters
     ----------
     q, k, v : torch.Tensor
         Dense Q/K/V tensors with dtype ``torch.float16`` or ``torch.bfloat16``.
+        ``q`` has shape ``[batch, num_q_heads, seq_len, head_dim]``; ``k`` and
+        ``v`` have shape ``[batch, num_kv_heads, seq_len, head_dim]``.
     per_block_mean : bool, optional
         Whether to center Q per 128-token block. When ``False``, Q is centered
         once across the full sequence.
@@ -169,27 +193,40 @@ def nvfp4_attention_sm120_quantize_qkv(
     Tuple[torch.Tensor, ...]
         ``q_fp4``, ``k_fp4``, transposed ``v_fp4_t``, scale tensors
         ``q_scale``, ``k_scale``, ``v_scale_t``, and the compact FP32 QK
-        correction with shape ``[batch, num_heads, seq_len / 128, seq_len]``
-        (``[batch, num_heads, 1, seq_len]`` when ``per_block_mean=False``).
+        correction with shape ``[batch, num_q_heads, seq_len / 128, seq_len]``
+        (``[batch, num_q_heads, 1, seq_len]`` when ``per_block_mean=False``).
     """
     q_proc, k_proc, v_proc, qk_correction = _preprocess_qkv(q, k, v, per_block_mean)
-    batch, num_heads, seq_len, head_dim = q_proc.shape
+    batch, num_q_heads, seq_len, head_dim = q_proc.shape
+    num_kv_heads = k_proc.shape[1]
 
     q_fp4 = torch.empty(
-        (batch, num_heads, seq_len, head_dim // 2), device=q.device, dtype=torch.uint8
+        (batch, num_q_heads, seq_len, head_dim // 2),
+        device=q.device,
+        dtype=torch.uint8,
     )
-    k_fp4 = torch.empty_like(q_fp4)
+    k_fp4 = torch.empty(
+        (batch, num_kv_heads, seq_len, head_dim // 2),
+        device=q.device,
+        dtype=torch.uint8,
+    )
     v_fp4_t = torch.empty(
-        (batch, num_heads, head_dim, seq_len // 2), device=q.device, dtype=torch.uint8
+        (batch, num_kv_heads, head_dim, seq_len // 2),
+        device=q.device,
+        dtype=torch.uint8,
     )
     q_scale = torch.empty(
-        (batch, num_heads, seq_len, head_dim // 16),
+        (batch, num_q_heads, seq_len, head_dim // 16),
         device=q.device,
         dtype=torch.float8_e4m3fn,
     )
-    k_scale = torch.empty_like(q_scale)
+    k_scale = torch.empty(
+        (batch, num_kv_heads, seq_len, head_dim // 16),
+        device=q.device,
+        dtype=torch.float8_e4m3fn,
+    )
     v_scale_t = torch.empty(
-        (batch, num_heads, head_dim, seq_len // 16),
+        (batch, num_kv_heads, head_dim, seq_len // 16),
         device=q.device,
         dtype=torch.float8_e4m3fn,
     )
@@ -211,7 +248,7 @@ def _check_inputs(
     v_scale_t: torch.Tensor,
     qk_correction: torch.Tensor,
     per_block_mean: bool,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int, int, int]:
     for name, tensor in (
         ("q_fp4", q_fp4),
         ("k_fp4", k_fp4),
@@ -250,13 +287,23 @@ def _check_inputs(
         raise ValueError(
             "q_fp4 must have shape [batch, num_heads, seq_len, head_dim / 2]"
         )
-    if k_fp4.shape != q_fp4.shape:
-        raise ValueError(
-            f"k_fp4 shape {tuple(k_fp4.shape)} must match q_fp4 {tuple(q_fp4.shape)}"
-        )
-
-    batch, num_heads, seq_len, packed_head_dim = q_fp4.shape
+    batch, num_q_heads, seq_len, packed_head_dim = q_fp4.shape
     head_dim = packed_head_dim * 2
+    if k_fp4.ndim != 4:
+        raise ValueError(
+            "k_fp4 must have shape [batch, num_kv_heads, seq_len, head_dim / 2]"
+        )
+    num_kv_heads = k_fp4.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            "num_q_heads must be divisible by num_kv_heads for GQA, "
+            f"got num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}"
+        )
+    expected_k = (batch, num_kv_heads, seq_len, packed_head_dim)
+    if tuple(k_fp4.shape) != expected_k:
+        raise ValueError(
+            f"k_fp4 shape {tuple(k_fp4.shape)} must be {expected_k}"
+        )
     if head_dim not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
     if seq_len % _TOKEN_BLOCK_SIZE != 0:
@@ -264,21 +311,22 @@ def _check_inputs(
     if head_dim % 16 != 0:
         raise ValueError(f"head_dim must be divisible by 16, got {head_dim}")
 
-    expected_v = (batch, num_heads, head_dim, seq_len // 2)
+    expected_v = (batch, num_kv_heads, head_dim, seq_len // 2)
     if tuple(v_fp4_t.shape) != expected_v:
         raise ValueError(f"v_fp4_t shape {tuple(v_fp4_t.shape)} must be {expected_v}")
 
-    expected_sf_qk = (batch, num_heads, seq_len, head_dim // 16)
-    if tuple(q_scale.shape) != expected_sf_qk:
+    expected_sf_q = (batch, num_q_heads, seq_len, head_dim // 16)
+    if tuple(q_scale.shape) != expected_sf_q:
         raise ValueError(
-            f"q_scale shape {tuple(q_scale.shape)} must be {expected_sf_qk}"
+            f"q_scale shape {tuple(q_scale.shape)} must be {expected_sf_q}"
         )
-    if tuple(k_scale.shape) != expected_sf_qk:
+    expected_sf_k = (batch, num_kv_heads, seq_len, head_dim // 16)
+    if tuple(k_scale.shape) != expected_sf_k:
         raise ValueError(
-            f"k_scale shape {tuple(k_scale.shape)} must be {expected_sf_qk}"
+            f"k_scale shape {tuple(k_scale.shape)} must be {expected_sf_k}"
         )
 
-    expected_v_scale = (batch, num_heads, head_dim, seq_len // 16)
+    expected_v_scale = (batch, num_kv_heads, head_dim, seq_len // 16)
     if tuple(v_scale_t.shape) != expected_v_scale:
         raise ValueError(
             f"v_scale_t shape {tuple(v_scale_t.shape)} must be {expected_v_scale}"
@@ -287,10 +335,10 @@ def _check_inputs(
     if (
         qk_correction.ndim != 4
         or qk_correction.shape[0] != batch
-        or qk_correction.shape[1] != num_heads
+        or qk_correction.shape[1] != num_q_heads
     ):
         raise ValueError(
-            "qk_correction must have shape [batch, num_heads, seq_len_s, seq_len]"
+            "qk_correction must have shape [batch, num_q_heads, seq_len_s, seq_len]"
         )
     expected_delta_groups = seq_len // _TOKEN_BLOCK_SIZE if per_block_mean else 1
     if qk_correction.shape[2] != expected_delta_groups:
@@ -303,7 +351,7 @@ def _check_inputs(
             f"qk_correction last dimension must be {seq_len}, got {qk_correction.shape[-1]}"
         )
 
-    return batch, num_heads, seq_len, head_dim
+    return batch, num_q_heads, num_kv_heads, seq_len, head_dim
 
 
 @supported_compute_capability([120, 121])
@@ -328,8 +376,9 @@ def nvfp4_attention_sm120_fwd(
 
     The packed tensors should be produced by
     :func:`nvfp4_attention_sm120_quantize_qkv`. ``q_fp4`` and ``k_fp4`` use layout
-    ``[batch, num_heads, seq_len, head_dim / 2]``; ``v_fp4_t`` and ``v_scale_t`` are
-    stored transposed as ``[batch, num_heads, head_dim, packed_seq_len]``.
+    ``[batch, num_q_heads, seq_len, head_dim / 2]``; ``k_fp4`` uses
+    ``num_kv_heads``. ``v_fp4_t`` and ``v_scale_t`` are stored transposed as
+    ``[batch, num_kv_heads, head_dim, packed_seq_len]``.
 
     Parameters
     ----------
@@ -361,7 +410,7 @@ def nvfp4_attention_sm120_fwd(
         Attention output and log-sum-exp tensor.
     """
     per_block_mean = bool(per_block_mean)
-    batch, num_heads, seq_len, head_dim = _check_inputs(
+    batch, num_q_heads, _num_kv_heads, seq_len, head_dim = _check_inputs(
         q_fp4,
         k_fp4,
         v_fp4_t,
@@ -382,16 +431,16 @@ def nvfp4_attention_sm120_fwd(
                 f"out_dtype must be torch.float16 or torch.bfloat16, got {out_dtype}"
             )
         out = torch.empty(
-            (batch, num_heads, seq_len, head_dim),
+            (batch, num_q_heads, seq_len, head_dim),
             device=q_fp4.device,
             dtype=out_dtype,
         )
     else:
         _check_cuda_contiguous("out", out)
         _check_same_device("out", out, "q_fp4", q_fp4)
-        if tuple(out.shape) != (batch, num_heads, seq_len, head_dim):
+        if tuple(out.shape) != (batch, num_q_heads, seq_len, head_dim):
             raise ValueError(
-                f"out shape {tuple(out.shape)} must be {(batch, num_heads, seq_len, head_dim)}"
+                f"out shape {tuple(out.shape)} must be {(batch, num_q_heads, seq_len, head_dim)}"
             )
         if out.dtype not in _SUPPORTED_OUT_DTYPES:
             raise ValueError(
@@ -400,14 +449,14 @@ def nvfp4_attention_sm120_fwd(
 
     if lse is None:
         lse = torch.empty(
-            (batch, num_heads, seq_len), device=q_fp4.device, dtype=torch.float32
+            (batch, num_q_heads, seq_len), device=q_fp4.device, dtype=torch.float32
         )
     else:
         _check_cuda_contiguous("lse", lse)
         _check_same_device("lse", lse, "q_fp4", q_fp4)
-        if tuple(lse.shape) != (batch, num_heads, seq_len):
+        if tuple(lse.shape) != (batch, num_q_heads, seq_len):
             raise ValueError(
-                f"lse shape {tuple(lse.shape)} must be {(batch, num_heads, seq_len)}"
+                f"lse shape {tuple(lse.shape)} must be {(batch, num_q_heads, seq_len)}"
             )
         if lse.dtype != torch.float32:
             raise ValueError(f"lse must have dtype torch.float32, got {lse.dtype}")

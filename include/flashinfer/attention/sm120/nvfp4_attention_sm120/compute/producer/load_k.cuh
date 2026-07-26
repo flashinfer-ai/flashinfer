@@ -78,6 +78,7 @@ struct KLoader {
                                                              SharedStorage& shared_storage,
                                                              int m_block, int bidh, int bidb,
                                                              uint2 cluster_local_block_id) {
+    int const bidkv = bidh / mainloop_params.h_h_k_ratio;
     auto sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
     auto sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
     auto sDS = make_tensor(make_smem_ptr(shared_storage.smem_ds.begin()), SmemLayoutDS{});
@@ -86,9 +87,10 @@ struct KLoader {
     auto mSFK = mainloop_params.tma_load_SFK.get_tma_tensor(shape(mainloop_params.layout_SFK));
     auto mDS = mainloop_params.tma_load_DS.get_tma_tensor(shape(mainloop_params.layout_DS));
 
-    auto gK = local_tile(mK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    auto gK =
+        local_tile(mK(_, _, bidkv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
     auto gSFK =
-        local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+        local_tile(mSFK(_, _, bidkv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
 
     auto gDS = [&] {
       if constexpr (BlockMean) {
