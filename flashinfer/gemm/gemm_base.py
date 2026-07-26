@@ -6697,6 +6697,24 @@ def _check_bmm_fp8_problem_size(
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
     _validate_fp8_output_dtype(dtype)
+    for scale, operand, scale_name, operand_name in (
+        (A_scale, A, "A_scale", "A"),
+        (B_scale, B, "B_scale", "B"),
+    ):
+        if scale.numel() != 1:
+            raise ValueError(
+                f"{scale_name} must contain exactly one tensorwide scale value, "
+                f"but got {scale.numel()} values"
+            )
+        if scale.dtype != torch.float32:
+            raise ValueError(
+                f"{scale_name} must be a float32 tensor, but got {scale.dtype}"
+            )
+        if scale.device != operand.device:
+            raise ValueError(
+                f"{scale_name} must be on the same device as {operand_name}, "
+                f"but got {scale.device} and {operand.device}"
+            )
     return True
 
 
@@ -6760,10 +6778,12 @@ def bmm_fp8(
         Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
 
     A_scale: torch.Tensor
-        Scale tensor for A, float.
+        Tensorwide scale for A. Must contain exactly one float32 value on the
+        same CUDA device as A.
 
     B_scale: torch.Tensor
-        Scale tensor for B, float.
+        Tensorwide scale for B. Must contain exactly one float32 value on the
+        same CUDA device as B.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
@@ -6779,6 +6799,11 @@ def bmm_fp8(
     -------
     out: torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
+
+    Notes
+    -----
+    This API supports tensorwide scaling only. Use
+    :func:`gemm_fp8_nt_groupwise` for groupwise FP8 scaling.
 
     Examples
     --------

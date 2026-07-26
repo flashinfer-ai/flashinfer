@@ -90,6 +90,14 @@ void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorVi
   CHECK_INPUT(mat2);
   CHECK_INPUT(scale_a);
   CHECK_INPUT(scale_b);
+  TVM_FFI_ICHECK_EQ(scale_a.dtype(), dl_float32) << "scale_a must be float32";
+  TVM_FFI_ICHECK_EQ(scale_b.dtype(), dl_float32) << "scale_b must be float32";
+  TVM_FFI_ICHECK_EQ(scale_a.numel(), 1)
+      << "scale_a must contain exactly one tensorwide scale value";
+  TVM_FFI_ICHECK_EQ(scale_b.numel(), 1)
+      << "scale_b must contain exactly one tensorwide scale value";
+  CHECK_DEVICE(scale_a, mat1);
+  CHECK_DEVICE(scale_b, mat2);
 
   int mat2_k_scale = 1;
 
