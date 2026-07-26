@@ -301,9 +301,7 @@ def _check_inputs(
         )
     expected_k = (batch, num_kv_heads, seq_len, packed_head_dim)
     if tuple(k_fp4.shape) != expected_k:
-        raise ValueError(
-            f"k_fp4 shape {tuple(k_fp4.shape)} must be {expected_k}"
-        )
+        raise ValueError(f"k_fp4 shape {tuple(k_fp4.shape)} must be {expected_k}")
     if head_dim not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
     if seq_len % _TOKEN_BLOCK_SIZE != 0:
