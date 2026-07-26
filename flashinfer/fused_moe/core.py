@@ -1470,6 +1470,14 @@ def get_trtllm_moe_sm100_module():
                 tune_min_num_tokens: Lower bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
+            if tune_min_num_tokens > tune_max_num_tokens:
+                # get_hybrid_num_tokens_buckets always emits max_num_tokens as
+                # a bucket, so an out-of-range floor would silently reintroduce
+                # the buckets it was meant to exclude.
+                raise ValueError(
+                    f"tune_min_num_tokens ({tune_min_num_tokens}) must not "
+                    f"exceed tune_max_num_tokens ({tune_max_num_tokens})"
+                )
 
             spec = {
                 "output": autotuner_initializer_empty,

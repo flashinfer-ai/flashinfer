@@ -1577,5 +1577,13 @@ def test_moe_tuning_config_min_num_tokens_two_generates_no_m1_profile():
             "MoE sweep would execute the faulting 1-token candidates."
         )
         assert 2 in opt_tokens
+
+        # Boundary: a floor above the ceiling must be rejected, because
+        # get_hybrid_num_tokens_buckets always emits max_num_tokens as a
+        # bucket -- (1, 2) would silently produce the (1,) bucket again.
+        with pytest.raises(ValueError, match="tune_min_num_tokens"):
+            runner._make_tuning_config(
+                moe_inputs, tune_max_num_tokens=1, tune_min_num_tokens=2
+            )
     finally:
         fn.cache_clear()
