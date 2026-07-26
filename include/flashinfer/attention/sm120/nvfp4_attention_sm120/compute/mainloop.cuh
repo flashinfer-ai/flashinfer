@@ -214,10 +214,22 @@ struct CollectiveMainloopFwd {
     TMA_SFVt tma_load_sfvt = make_tma_copy<uint16_t>(
         GmemTiledCopySF{}, mSFVt, SmemLayoutSFVt{}(_, _, _0{}),
         make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), _1{});
-    return {args.shape_Q, layout_sfq,    args.shape_K, args.unpadded_shape_K,
-            layout_sfk,   args.shape_Vt, layout_sfvt,  layout_ds,
-            tma_load_Q,   tma_load_sfq,  tma_load_K,   tma_load_sfk,
-            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.h_h_k_ratio,
+    return {args.shape_Q,
+            layout_sfq,
+            args.shape_K,
+            args.unpadded_shape_K,
+            layout_sfk,
+            args.shape_Vt,
+            layout_sfvt,
+            layout_ds,
+            tma_load_Q,
+            tma_load_sfq,
+            tma_load_K,
+            tma_load_sfk,
+            tma_load_Vt,
+            tma_load_sfvt,
+            tma_load_ds,
+            args.h_h_k_ratio,
             args.softmax_scale_log2};
   }
 

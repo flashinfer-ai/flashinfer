@@ -87,8 +87,7 @@ struct KLoader {
     auto mSFK = mainloop_params.tma_load_SFK.get_tma_tensor(shape(mainloop_params.layout_SFK));
     auto mDS = mainloop_params.tma_load_DS.get_tma_tensor(shape(mainloop_params.layout_DS));
 
-    auto gK =
-        local_tile(mK(_, _, bidkv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    auto gK = local_tile(mK(_, _, bidkv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
     auto gSFK =
         local_tile(mSFK(_, _, bidkv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
 
