@@ -388,8 +388,8 @@ def cute_dsl_fmha_ragged_prefill(
         The actual threshold = scale_factor / max_kv_len, then converted to log2 domain.
         None or 0 disables skip-softmax.
     skip_rescale_threshold : float
-        Skip-correction threshold: =1 enables skip-correction when row_max is not updated;
-        >1 allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
+        Skip-correction threshold: >0 enables skip-correction when row_max is not updated;
+        it allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
