@@ -374,11 +374,9 @@ _BF16_FP4_TUNING_CONFIG = TuningConfig(
 )
 
 
-def _cudnn_bf16_fp4_runner(tuning_config):
-    """Build a ``CudnnBf16Fp4Runner`` bound to the active tuning config."""
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        tuning_config, spec_idx=0
-    )
+@functools.lru_cache(maxsize=1024)
+def _cudnn_bf16_fp4_runner_for_mapper(m_bucket_mapper):
+    """Build a ``CudnnBf16Fp4Runner`` bound to the given M-bucket mapper."""
 
     class CudnnBf16Fp4Runner(TunableRunner):
         def __init__(self):
@@ -536,6 +534,21 @@ def _cudnn_bf16_fp4_runner(tuning_config):
             return out
 
     return CudnnBf16Fp4Runner()
+
+
+def _cudnn_bf16_fp4_runner(tuning_config):
+    """Return the runner for the currently effective M-bucket mapper.
+
+    Cached per effective mapper rather than per ``tuning_config``: the mapper
+    reflects any thread-local ``autotune(tuning_buckets=..., round_up=...)``
+    override, and a runner built under one bucket scheme must not be reused
+    under another (its override-shape graphs would be keyed on stale
+    ``cache_m`` buckets).
+    """
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        tuning_config, spec_idx=0
+    )
+    return _cudnn_bf16_fp4_runner_for_mapper(m_bucket_mapper)
 
 
 def _prepare_cudnn(
