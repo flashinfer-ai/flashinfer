@@ -3400,6 +3400,47 @@ def gated_delta_rule_mtp_ucache_flush(
     _pools_contig &= _inner_dense(g_cache, "g_cache")
     assert tuple(g_cache.shape) == (_pool, HV, RING_SLOTS)
     assert hist_len.dtype == torch.int32 and hist_len.shape[0] == B
+    if restart_hist_on_flush:
+        # The standalone commit at the end of this call mutates hist_len and
+        # cache_base IN PLACE and must see the caller's own storage across
+        # calls:
+        #  - cache_base=None would slide the base of a throwaway temp (the
+        #    next call re-defaults base to 0 and reads a stale window);
+        #  - a non-contiguous tensor would be silently replaced by its
+        #    .contiguous() copy below, absorbing the commit the same way.
+        if cache_base is None:
+            raise ValueError(
+                "gated_delta_rule_mtp_ucache_flush: restart_hist_on_flush="
+                "True commits ring cursors in place and needs a caller-owned "
+                "cache_base (got None). Keep a persistent int32 [B] tensor "
+                "(zeros initially) across calls, or pass "
+                "restart_hist_on_flush=False and own the cursor commit."
+            )
+        assert hist_len.is_contiguous() and cache_base.is_contiguous(), (
+            "restart_hist_on_flush=True: hist_len and cache_base must be "
+            "contiguous — .contiguous() would copy them and the in-place "
+            "cursor commit would be lost on the caller's tensors."
+        )
+        # Cursor range validation (host sync, so: standalone path only and
+        # never while a CUDA graph is capturing — the 3 eager warmup calls
+        # before any capture validate the same tensors). The ring masks all
+        # addressing with & RING_MASK, so out-of-range cursors corrupt
+        # SILENTLY: hist_len > W_RING breaks the 16-row tile math (the g
+        # anchor for lane hist_len-1 reads 0), and hist_len >= 29 wraps
+        # appends back into the live window — the write-after-read race the
+        # ring exists to remove. The graph-captured serving path passes
+        # restart_hist_on_flush=False and owns these invariants.
+        if not torch.cuda.is_current_stream_capturing():
+            _hl_min, _hl_max = (int(x.item()) for x in hist_len.aminmax())
+            assert 0 <= _hl_min and _hl_max <= W_RING, (
+                f"hist_len out of legal range [0, {W_RING}]: "
+                f"min={_hl_min} max={_hl_max}"
+            )
+            _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
+            assert 0 <= _cb_min and _cb_max < RING_SLOTS, (
+                f"cache_base out of legal range [0, {RING_SLOTS}): "
+                f"min={_cb_min} max={_cb_max}"
+            )
     hist_len = hist_len.contiguous()
     if cache_base is None:
         cache_base = torch.zeros_like(hist_len)

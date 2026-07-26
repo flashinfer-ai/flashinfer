@@ -2523,7 +2523,14 @@ def gated_delta_rule_mtp_ucache(
     assert k_cache.dtype == torch.bfloat16
     _pools_contig &= _inner_dense(k_cache, "k_cache")
     assert tuple(k_cache.shape) == (_pool, HK, 16, K_dim), (
-        f"k_cache must be [pool={_pool}, H={HK}, 16, K={K_dim}]; got {tuple(k_cache.shape)}"
+        f"k_cache must be [pool={_pool}, H={HK}, 16, K={K_dim}]; got "
+        f"{tuple(k_cache.shape)}. NOTE: this verify-only kernel uses the "
+        "LEGACY 16-deep flat ring (history at physical rows [0, hist_len), "
+        "no cache_base) and is NOT ring-format compatible with "
+        "gdn_decode_bf16_wy_ucache_flush (32-slot rotating ring). Do not "
+        "share one ring allocation between the two kernels, and do not pad "
+        "these rings to 32 — history would be read at the wrong physical "
+        "rows whenever the window origin is nonzero."
     )
     assert u_cache.dtype == torch.bfloat16, (
         "v1 supports bf16 u_cache only (f32 is a documented extension point)."

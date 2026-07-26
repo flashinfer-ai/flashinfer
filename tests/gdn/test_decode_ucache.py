@@ -411,10 +411,11 @@ def test_strided_ab_matches_compact():
         return mod.gated_delta_rule_mtp_ucache_flush(
             A_log, a_, dt_bias, q=q_, k=k_, v=v_, b=b_,
             initial_state_source=pool.clone(), initial_state_indices=idx,
-            k_cache=torch.zeros(B, H, W, K, dtype=ring, device=DEV),
-            u_cache=torch.zeros(B, HV, W, V, dtype=ring, device=DEV),
-            g_cache=torch.zeros(B, HV, W, dtype=torch.float32, device=DEV),
+            k_cache=torch.zeros(B, H, RING, K, dtype=ring, device=DEV),
+            u_cache=torch.zeros(B, HV, RING, V, dtype=ring, device=DEV),
+            g_cache=torch.zeros(B, HV, RING, dtype=torch.float32, device=DEV),
             hist_len=torch.zeros(B, dtype=torch.int32, device=DEV),
+            cache_base=torch.zeros(B, dtype=torch.int32, device=DEV),
             scale=SCALE, flush_min=FLUSH_MIN).float()
 
     # pack q/k/v into one wide tensor -> matching token stride (strided-QKV)
@@ -437,3 +438,62 @@ def test_strided_ab_matches_compact():
     assert err < 2e-3, (
         f"strided (chunk-view) a/b must match compact; got max|d|={err:.3e} "
         "(the sb_t=HV bug reads packed b from the wrong rows)")
+
+
+def test_standalone_commit_guards_reject_silent_corruption_patterns():
+    """The standalone-commit path (restart_hist_on_flush=True) mutates the
+    cursors in place, so the wrapper must fail LOUDLY on the calling patterns
+    that would otherwise corrupt silently: a throwaway default base (the
+    commit lands in a temp the caller never sees), a non-contiguous cursor
+    (the commit lands in a .contiguous() copy), and out-of-range cursors
+    (the ring's & RING_MASK addressing keeps bad windows in-bounds, so they
+    would produce well-formed wrong numbers instead of crashes)."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush("bf16")
+    B = 4
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        B, [12, 13, 12, 13], torch.bfloat16, torch.bfloat16, seed=7,
+        ring_dtype=torch.bfloat16, bases=[0, 5, 28, 30])
+    common = dict(q=q, k=k, v=v, b=b, initial_state_source=pool,
+                  initial_state_indices=idx, k_cache=kc, u_cache=uc,
+                  g_cache=gc, scale=SCALE, flush_min=FLUSH_MIN)
+
+    # commit mode without a caller-owned base: was silent corruption after
+    # the first flush (base slid on an internal temp), now a ValueError.
+    with pytest.raises(ValueError, match="caller-owned cache_base"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log, a, dt_bias, hist_len=hl.clone(), cache_base=None,
+            restart_hist_on_flush=True, **common)
+
+    # commit mode with a non-contiguous base: was a lost commit inside a
+    # silent .contiguous() copy, now an assertion.
+    cb_col = torch.zeros(B, 2, dtype=torch.int32, device=DEV)[:, 0]
+    assert not cb_col.is_contiguous()
+    with pytest.raises(AssertionError, match="contiguous"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log, a, dt_bias, hist_len=hl.clone(), cache_base=cb_col,
+            restart_hist_on_flush=True, **common)
+
+    # oversized window: was silent wrong output + corrupted fold (17..28)
+    # or a revived append-into-window race (>= 29), now an assertion.
+    hl_bad = hl.clone(); hl_bad[1] = 17
+    with pytest.raises(AssertionError, match="hist_len out of legal range"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log, a, dt_bias, hist_len=hl_bad, cache_base=cb.clone(),
+            restart_hist_on_flush=True, **common)
+
+    # out-of-range base: masked into range by the kernel, so it would hide a
+    # caller bookkeeping bug forever; now an assertion.
+    cb_bad = cb.clone(); cb_bad[0] = 32
+    with pytest.raises(AssertionError, match="cache_base out of legal range"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log, a, dt_bias, hist_len=hl.clone(), cache_base=cb_bad,
+            restart_hist_on_flush=True, **common)
+
+    # the caller-owned-commit path (vLLM serving) is untouched: cache_base
+    # may be None (read-only base=0), no host sync, no raise.
+    y = mod.gated_delta_rule_mtp_ucache_flush(
+        A_log, a, dt_bias, hist_len=hl.clone(), cache_base=None,
+        restart_hist_on_flush=False, **common)
+    assert y.shape[1] == T
+
