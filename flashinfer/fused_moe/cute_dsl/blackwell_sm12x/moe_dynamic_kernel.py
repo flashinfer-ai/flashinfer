@@ -335,6 +335,43 @@ class MoEDynamicKernel:
     def _get_layoutSFB_TV(self, tiled_mma):
         return self._dense_cls._get_layoutSFB_TV(self, tiled_mma)  # type: ignore[arg-type]
 
+    def _shared_storage_size_bytes(
+        self,
+        a_smem_staged,
+        b_smem_staged,
+        sfa_smem_staged,
+        sfb_smem_staged,
+        epi_smem_staged,
+    ) -> int:
+        def _align_up(value: int, align: int) -> int:
+            return ((value + align - 1) // align) * align
+
+        pipeline_count = 3 if self.is_gated else 2
+        offset = (
+            8 * 4  # ctrl
+            + (self.num_mma_warps + 1) * 32 * 4  # route_phys_rows
+            + (self.num_mma_warps + 1) * 32 * 4  # route_expert_ids
+            + pipeline_count * (self.ab_stage * 2 * 8)  # pipeline arrays
+            + self.tile_shape_mnk[0] * 4  # scatter_tok_cache
+            + self.tile_shape_mnk[0] * 4  # scatter_weight_cache
+        )
+        buffers = [
+            cute.size_in_bytes(self.a_dtype, a_smem_staged),
+            cute.size_in_bytes(self.b_dtype, b_smem_staged),
+            cute.size_in_bytes(self.sf_dtype, sfa_smem_staged),
+            cute.size_in_bytes(self.sf_dtype, sfb_smem_staged),
+            cute.size_in_bytes(cutlass.BFloat16, epi_smem_staged),
+        ]
+        if self.is_gated:
+            buffers.insert(2, cute.size_in_bytes(self.b_dtype, b_smem_staged))
+            buffers.insert(5, cute.size_in_bytes(self.sf_dtype, sfb_smem_staged))
+        offset = _align_up(offset, self.buffer_align_bytes)
+        for idx, size in enumerate(buffers):
+            offset += size
+            if idx + 1 != len(buffers):
+                offset = _align_up(offset, self.buffer_align_bytes)
+        return offset
+
     def _setup_attributes(self, hidden_size: int):
         import cutlass.utils.blackwell_helpers as sm120_utils
 
@@ -399,26 +436,42 @@ class MoEDynamicKernel:
         while self.ab_stage > 1 and k_tile_cnt % self.ab_stage != 0:
             self.ab_stage -= 1
         self.epi_stage = 1
-        (
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.sfa_smem_layout_staged,
-            self.sfb_smem_layout_staged,
-            self.epi_smem_layout_staged,
-        ) = self._dense_cls._make_smem_layouts(
-            self.tile_shape_mnk,
-            self.epi_tile,
-            self.a_dtype,
-            self.a_layout,
-            self.b_dtype,
-            self.b_layout,
-            self.ab_stage,
-            cutlass.BFloat16,
-            self.c_layout,
-            self.epi_stage,
-            self.sf_vec_size,
-            self.tiled_mma,
-        )
+        while True:
+            (
+                self.a_smem_layout_staged,
+                self.b_smem_layout_staged,
+                self.sfa_smem_layout_staged,
+                self.sfb_smem_layout_staged,
+                self.epi_smem_layout_staged,
+            ) = self._dense_cls._make_smem_layouts(
+                self.tile_shape_mnk,
+                self.epi_tile,
+                self.a_dtype,
+                self.a_layout,
+                self.b_dtype,
+                self.b_layout,
+                self.ab_stage,
+                cutlass.BFloat16,
+                self.c_layout,
+                self.epi_stage,
+                self.sf_vec_size,
+                self.tiled_mma,
+            )
+            if (
+                self._shared_storage_size_bytes(
+                    self.a_smem_layout_staged,
+                    self.b_smem_layout_staged,
+                    self.sfa_smem_layout_staged,
+                    self.sfb_smem_layout_staged,
+                    self.epi_smem_layout_staged,
+                )
+                <= self.smem_capacity
+                or self.ab_stage <= 1
+            ):
+                break
+            self.ab_stage -= 1
+            while self.ab_stage > 1 and k_tile_cnt % self.ab_stage != 0:
+                self.ab_stage -= 1
 
     @cute.jit
     def _resident_grid_barrier(
