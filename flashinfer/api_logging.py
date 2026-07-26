@@ -172,6 +172,7 @@ def _install_cuda_graph_dump_autoflush() -> None:
             _logger.error(f"flush_graph_dumps ({reason}) failed: {exc}")
 
     atexit.register(_do_flush, "atexit")
+    _install_cuda_graph_dump_autoflush._atexit_callback = _do_flush  # type: ignore[attr-defined]
 
     # SIGTERM handler that flushes then chains to whatever was previously
     # registered (sglang's launcher installs its own; preserve it).
@@ -192,15 +193,63 @@ def _install_cuda_graph_dump_autoflush() -> None:
 
     with contextlib.suppress(ValueError, OSError):
         signal.signal(signal.SIGTERM, _sigterm_flush)
+        _install_cuda_graph_dump_autoflush._sigterm_handler = _sigterm_flush  # type: ignore[attr-defined]
+        _install_cuda_graph_dump_autoflush._previous_sigterm_handler = (  # type: ignore[attr-defined]
+            _prev_sigterm
+        )
+
+
+def _restore_cuda_graph_dump_autoflush() -> None:
+    """Unregister process hooks installed for level-10 graph dumping.
+
+    Normal applications keep these hooks for the lifetime of the process.
+    Tests that reimport :mod:`flashinfer.api_logging` need an explicit teardown
+    so old module instances do not retain atexit callbacks or SIGTERM handlers.
+    """
+    try:
+        import atexit
+        import signal
+    except Exception:  # pragma: no cover
+        return
+
+    callback = getattr(_install_cuda_graph_dump_autoflush, "_atexit_callback", None)
+    if callback is not None:
+        atexit.unregister(callback)
+
+    sigterm_handler = getattr(
+        _install_cuda_graph_dump_autoflush, "_sigterm_handler", None
+    )
+    previous_sigterm_handler = getattr(
+        _install_cuda_graph_dump_autoflush,
+        "_previous_sigterm_handler",
+        None,
+    )
+    if (
+        sigterm_handler is not None
+        and signal.getsignal(signal.SIGTERM) is sigterm_handler
+    ):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+    for attr in (
+        "_atexit_callback",
+        "_sigterm_handler",
+        "_previous_sigterm_handler",
+        "_done",
+    ):
+        with contextlib.suppress(AttributeError):
+            delattr(_install_cuda_graph_dump_autoflush, attr)
 
 
 def _restore_cuda_graph_hooks() -> None:
-    """Restore CUDA graph methods wrapped by api_logging.
+    """Restore process and CUDA graph hooks installed by api_logging.
 
     Primarily useful when tests reload this module with different environment
     variables in the same process. In normal use these hooks live for the
     process lifetime.
     """
+    _restore_cuda_graph_dump_autoflush()
+
     with contextlib.suppress(Exception):
         graph_cls = torch.cuda.CUDAGraph
         current = graph_cls.replay
