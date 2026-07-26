@@ -3787,7 +3787,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         skip_rescale_threshold : float
             Cute DSL Skip-correction threshold: =1 enables skip-correction when row_max is not updated;
-            >1 allows skipping at new_row_max < X * row_max.
+            >1 allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -4522,7 +4522,7 @@ def trtllm_ragged_attention_deepseek(
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     skip_rescale_threshold : float
         Cute DSL Skip-correction threshold: =1 enables skip-correction when row_max is not updated;
-        >1 allows skipping at new_row_max < X * row_max.
+        >1 allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
     out : Optional[torch.Tensor]
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]

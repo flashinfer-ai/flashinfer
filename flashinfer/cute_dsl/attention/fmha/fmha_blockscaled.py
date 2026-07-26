@@ -240,7 +240,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             - enable_ex2_emulation: Whether to enable exp2 emulation
             - enable_skip_correction: Whether to skip the correction when rowmax is not updated larger than a threshold
             - skip_rescale_threshold: Skip-correction threshold: =1 enables skip-correction when row_max is not updated
-                                      ; >1 allows skipping at new_row_max < X * row_max.
+                                      ; >1 allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
 
         :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
         :type qk_acc_dtype: Type[cutlass.Numeric]
