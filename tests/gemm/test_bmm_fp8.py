@@ -57,6 +57,7 @@ def test_bmm_fp8_rejects_invalid_tensorwide_scale(
         )
 
 
+@pytest.mark.parametrize("scale_name", ["A_scale", "B_scale"])
 @pytest.mark.parametrize(
     ("invalid_scale", "error"),
     [
@@ -75,16 +76,18 @@ def test_bmm_fp8_rejects_invalid_tensorwide_scale(
     ],
 )
 def test_bmm_fp8_cublas_ffi_rejects_invalid_tensorwide_scale(
-    bmm_fp8_inputs, invalid_scale, error
+    bmm_fp8_inputs, scale_name, invalid_scale, error
 ):
     input_fp8, mat2_fp8, valid_scale = bmm_fp8_inputs
+    scales = {"A_scale": valid_scale, "B_scale": valid_scale}
+    scales[scale_name] = invalid_scale()
 
     with pytest.raises(RuntimeError, match=error):
         bmm_fp8(
             input_fp8,
             mat2_fp8,
-            invalid_scale(),
-            valid_scale,
+            scales["A_scale"],
+            scales["B_scale"],
             torch.bfloat16,
             backend="cublas",
             skip_check=True,
