@@ -73,6 +73,9 @@ def fake_buffer_cls():
         ):
             self.num_ranks = num_ranks
             self.num_experts_per_rank = num_experts_per_rank
+            # 0xFF init: every entry starts masked, self unmasked.
+            self.mask = [-1] * num_ranks
+            self.mask[self.rank] = 0
             self.calls.append(
                 (
                     "update_memory_buffers",
@@ -84,9 +87,36 @@ def fake_buffer_cls():
 
         def connect_ranks(self, ranks, activate=True):
             self.calls.append(("connect_ranks", list(ranks)))
+            if activate:
+                for r in ranks:
+                    self.mask[r] = 0  # 0 == unmasked/active in NIXL
 
         def disconnect_ranks(self, ranks):
             self.calls.append(("disconnect_ranks", list(ranks)))
+
+        # --- mask API, faithful to the transport's semantics -------------
+        # The real buffer is 0xFF-memset at allocation, so an untouched entry
+        # reads back as -1, and the kernels test `mask_buffer[r] != 0`.
+
+        def update_mask_buffer(self, rank_to_mask, mask=False):
+            self.mask[rank_to_mask] = 1 if mask else 0
+            self.calls.append(("update_mask", rank_to_mask, mask))
+
+        def query_mask_buffer(self, out):
+            import torch
+
+            assert out.numel() == self.num_ranks, (
+                f"query_mask_buffer wants exactly max_num_ranks ({self.num_ranks}) "
+                f"entries, got {out.numel()}"
+            )
+            out.copy_(torch.tensor(self.mask, dtype=torch.int32, device=out.device))
+            self.calls.append(("query_mask",))
+
+        def clean_mask_buffer(self):
+            # Zeroes ALL capacity entries -- including the never-connected
+            # tail, which it thereby marks ACTIVE.
+            self.mask = [0] * self.num_ranks
+            self.calls.append(("clean_mask",))
 
         def low_latency_dispatch(self, x, topk_idx, max_tokens, num_experts, **kw):
             import torch
@@ -236,6 +266,7 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        FleetAlgoKnobTopologyCapacity,
         FleetParams,
         create_fleet,
     )
@@ -246,7 +277,11 @@ def test_update_topology_diffs_ranks(patched_loader, fake_buffer_cls):
         max_tokens_per_rank=64,
         token_hidden_size=4096,
     )
-    fleet = create_fleet(bootstrap, params, [], backend="nixl_ep")
+    # Capacity must cover the grown world: the transport's per-rank buffers
+    # are sized once, at construction.
+    fleet = create_fleet(
+        bootstrap, params, [FleetAlgoKnobTopologyCapacity(n=8)], backend="nixl_ep"
+    )
 
     # Grow from 4 → 6 ranks: new ranks [4, 5] should appear in connect_ranks.
     fleet.update_topology(BootstrapConfig(world_size=6, rank=0, tcp_store=mock.Mock()))
@@ -426,3 +461,179 @@ def test_missing_store_raises_without_dist(patched_loader, fake_buffer_cls):
         create_fleet(bootstrap, params, [], backend="nixl_ep")
 
     fake_buffer_cls.instances.clear()
+
+
+# ------------------------------------------------------------ fault tolerance
+
+
+def _ft_fleet(world_size=4, capacity=None, **knob_kwargs):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetAlgoKnobFaultTolerance,
+        FleetAlgoKnobTopologyCapacity,
+        FleetParams,
+        create_fleet,
+    )
+
+    knobs = [FleetAlgoKnobFaultTolerance(**knob_kwargs)]
+    if capacity is not None:
+        knobs.append(FleetAlgoKnobTopologyCapacity(n=capacity))
+    return create_fleet(
+        BootstrapConfig(world_size=world_size, rank=0, tcp_store=mock.Mock()),
+        FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=4096),
+        knobs,
+        backend="nixl_ep",
+    )
+
+
+def test_ft_timeout_reaches_buffer_ctor(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    _ft_fleet(timeout_ms=2500)
+    assert fake_buffer_cls.instances[-1].kwargs["timeout_ms"] == 2500
+
+
+def test_ft_zero_timeout_leaves_transport_default(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    _ft_fleet(timeout_ms=0)
+    assert "timeout_ms" not in fake_buffer_cls.instances[-1].kwargs
+
+
+def test_ctor_without_timeout_support_is_actionable(patched_loader, fake_buffer_cls):
+    """An older vendored nixl_ep build has no timeout_ms parameter."""
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep.errors import MoEEpFaultToleranceUnsupportedError
+
+    orig_init = fake_buffer_cls.__init__
+
+    def _no_timeout_init(self, rank=0, low_latency_mode=True, tcp_store_group=None):
+        orig_init(self, rank, low_latency_mode, tcp_store_group)
+
+    with (
+        mock.patch.object(fake_buffer_cls, "__init__", _no_timeout_init),
+        pytest.raises(MoEEpFaultToleranceUnsupportedError, match="timeout_ms"),
+    ):
+        _ft_fleet(timeout_ms=2500)
+
+
+def test_query_active_mask_polarity_and_trim(patched_loader, fake_buffer_cls):
+    """The regression test for NIXL's inverted, capacity-length mask buffer.
+
+    Raw is `nonzero == masked` with a 0xFF init, so an untouched tail entry
+    reads back as -1. `(raw == 0)` is the only correct normalization: a
+    `1 - raw` inversion would return 2 for those tail ranks.
+    """
+    _skip_unless_ep_capable()
+
+    import torch
+
+    fleet = _ft_fleet(world_size=4, capacity=8)
+    buf = fake_buffer_cls.instances[-1]
+    buf.mask = [-1, 0, 0, 0, -1, -1, -1, -1]  # rank 0 dead; tail never connected
+
+    got = fleet.query_active_mask()
+    assert got.tolist() == [0, 1, 1, 1]  # trimmed to world_size, 1 = active
+    assert got.dtype == torch.int32
+    assert got.numel() == 4
+
+
+def test_connect_ranks_leaves_capacity_tail_masked(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    _ft_fleet(world_size=4, capacity=8)
+    buf = fake_buffer_cls.instances[-1]
+    assert buf.mask[:4] == [0, 0, 0, 0]  # live world active
+    assert buf.mask[4:] == [-1, -1, -1, -1]  # tail still masked from the 0xFF init
+
+
+def test_set_active_mask_pushes_only_the_diff(patched_loader, fake_buffer_cls):
+    """Each update_mask_buffer is a kernel launch, so a no-op set must be free."""
+    _skip_unless_ep_capable()
+
+    fleet = _ft_fleet(world_size=4)
+    buf = fake_buffer_cls.instances[-1]
+
+    fleet.set_active_mask([1, 1, 0, 1])
+    updates = [c for c in buf.calls if c[0] == "update_mask"]
+    assert updates == [("update_mask", 2, True)]
+
+    # Applying the identical mask again must issue nothing.
+    fleet.set_active_mask([1, 1, 0, 1])
+    assert [c for c in buf.calls if c[0] == "update_mask"] == updates
+
+    # Un-masking rank 2 pushes exactly one un-mask.
+    fleet.set_active_mask([1, 1, 1, 1])
+    assert [c for c in buf.calls if c[0] == "update_mask"][-1] == (
+        "update_mask",
+        2,
+        False,
+    )
+
+
+def test_set_active_mask_rejects_masking_self(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    fleet = _ft_fleet(world_size=4)
+    with pytest.raises(ValueError, match="cannot mask itself"):
+        fleet.set_active_mask([0, 1, 1, 1])
+
+
+def test_query_fault_diffs_against_applied(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    fleet = _ft_fleet(world_size=4)
+    assert fleet.query_fault() is False
+    # Transport self-masks rank 3 on timeout.
+    fake_buffer_cls.instances[-1].mask[3] = 1
+    assert fleet.query_fault() is True
+
+
+def test_clear_faults_readmit_remasks_the_capacity_tail(
+    patched_loader, fake_buffer_cls
+):
+    """clean_mask_buffer zeroes ALL capacity entries, marking the
+    never-connected tail ACTIVE. Without the re-mask that is a live bug on any
+    fleet sized above its world."""
+    _skip_unless_ep_capable()
+
+    fleet = _ft_fleet(world_size=4, capacity=8)
+    buf = fake_buffer_cls.instances[-1]
+    buf.mask[2] = 1  # a rank died
+
+    fleet.clear_faults(readmit=True)
+
+    assert buf.mask[:4] == [0, 0, 0, 0], "survivors + readmitted rank active"
+    assert buf.mask[4:] == [1, 1, 1, 1], "capacity tail must be re-masked"
+    kinds = [c[0] for c in buf.calls]
+    assert "clean_mask" in kinds
+    assert kinds.index("clean_mask") < len(kinds) - 1  # re-masks come after
+
+
+def test_clear_faults_without_readmit_is_a_noop(patched_loader, fake_buffer_cls):
+    """NIXL has no sticky host error flag to re-arm."""
+    _skip_unless_ep_capable()
+
+    fleet = _ft_fleet(world_size=4)
+    buf = fake_buffer_cls.instances[-1]
+    before = list(buf.calls)
+    fleet.clear_faults()
+    assert buf.calls == before
+
+
+def test_ft_methods_raise_without_the_knob(patched_loader, fake_buffer_cls):
+    _skip_unless_ep_capable()
+
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams, create_fleet
+    from flashinfer.moe_ep.errors import MoEEpFaultToleranceUnsupportedError
+
+    fleet = create_fleet(
+        BootstrapConfig(world_size=4, rank=0, tcp_store=mock.Mock()),
+        FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=4096),
+        [],
+        backend="nixl_ep",
+    )
+    assert fleet.supports_fault_tolerance is False
+    with pytest.raises(MoEEpFaultToleranceUnsupportedError):
+        fleet.query_active_mask()
