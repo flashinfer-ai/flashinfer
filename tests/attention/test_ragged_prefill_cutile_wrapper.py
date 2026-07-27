@@ -13,6 +13,7 @@ flashinfer = pytest.importorskip("flashinfer")
 
 
 def _cutile_available():
+    """True if the cuTile toolchain is importable in this environment."""
     try:
         from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -22,6 +23,7 @@ def _cutile_available():
 
 
 def _is_blackwell():
+    """True if the current GPU is Blackwell (sm100+)."""
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
@@ -35,6 +37,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run(backend, qo_indptr, kv_indptr, q, k, v, nqo, nkv, hd, causal):
+    """Plan and run the ragged-prefill wrapper on `backend` and return its output."""
     ws = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=q.device)
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend=backend)
     w.plan(qo_indptr, kv_indptr, nqo, nkv, hd, causal=causal, q_data_type=q.dtype)
@@ -52,6 +55,7 @@ def _run(backend, qo_indptr, kv_indptr, q, k, v, nqo, nkv, hd, causal):
 )
 @pytest.mark.parametrize("causal", [True, False])
 def test_ragged_prefill_cutile_matches_fa2(seq_lens, nqo, nkv, causal):
+    """cuTile ragged prefill through the wrapper must match the fa2 backend."""
     dev, dt, hd = "cuda", torch.bfloat16, 128
     torch.manual_seed(0)
     qo_indptr = torch.tensor(

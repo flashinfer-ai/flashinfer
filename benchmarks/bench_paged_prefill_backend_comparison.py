@@ -67,6 +67,7 @@ HEAD_DIM = 128  # head_dim_qk == head_dim_vo
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile paged-prefill kernel."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: F401
@@ -79,6 +80,7 @@ def _has_cutile() -> bool:
 
 
 def _has_trtllm() -> bool:
+    """True if the installed flashinfer exposes the trtllm-gen context entry point."""
     try:
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache  # noqa: F401
 
@@ -130,6 +132,7 @@ def _make_inputs(batch: int, seq: int, page: int):
 def _make_execute(
     provider: str, batch: int, seq: int, page: int
 ) -> Callable[[], torch.Tensor]:
+    """Return a zero-arg callable running `provider`'s paged prefill on one shape."""
     (q, k_hnd, v_hnd, k_nhd, v_nhd, block_tables, seq_lens, cum, seq_offset) = (
         _make_inputs(batch, seq, page)
     )
@@ -141,6 +144,7 @@ def _make_execute(
         )
 
         def run():
+            """Run cuTile paged prefill on the NHD cache."""
             return prefill_attention_kv_paged_cutile(
                 q=q,
                 k_cache=k_nhd,
@@ -164,6 +168,7 @@ def _make_execute(
         def run():
             # NOTE: no `causal=` kwarg — the image's INSTALLED flashinfer signature
             # does not accept it (matches sota_bench/bench_prefill_paged_trtllm.py).
+            """Run trtllm-gen paged prefill on the HND cache."""
             return trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=(k_hnd, v_hnd),
@@ -187,6 +192,7 @@ def _make_execute(
 
 
 def _as_output(out) -> torch.Tensor:
+    """Unwrap a provider result that may be an (output, lse) tuple."""
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
@@ -329,6 +335,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
@@ -413,6 +420,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark paged prefill backends (cuTile vs trtllm SOTA)"
     )

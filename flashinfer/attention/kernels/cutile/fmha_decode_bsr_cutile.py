@@ -20,10 +20,12 @@ _AUTOTUNE_DISABLED = os.getenv("FLASHINFER_CUTILE_AUTOTUNE_DISABLED", "0") != "0
 
 
 def _is_power_of_2(n: int) -> bool:
+    """True if `n` is a positive power of two."""
     return n > 0 and (n & (n - 1)) == 0
 
 
 def _next_power_of_2(n: int) -> int:
+    """Smallest power of two >= `n` (at least 1)."""
     if n <= 0:
         return 1
     return 1 << (n - 1).bit_length()
@@ -102,6 +104,7 @@ def _splitk_reduce_kernel(
     NUM_KV_SPLITS_POW2: ConstInt,
     BLOCK_D: ConstInt,
 ):
+    """cuTile kernel: combine the per-split partial attention outputs and LSEs into the final output."""
     batch_id = ct.bid(0)
     head_id = ct.bid(1)
     dtype = attn_out.dtype
@@ -159,6 +162,7 @@ def _splitk_reduce_with_seq_len(
     num_kv_len_per_split,
     attn_out=None,
 ):
+    """Host wrapper for the split-KV reduction; copies through when there is a single split."""
     NUM_KV_SPLITS, B, num_heads, head_dim = attn_splitk_out.shape
 
     if attn_out is None:
@@ -423,6 +427,7 @@ def _decode_attention_kv_paged_kernel(
     LOAD_BLOCK_N: ConstInt,
     NUM_PAGES_PER_BLOCK: ConstInt,
 ):
+    """cuTile kernel: paged GQA decode over a block-sparse (page-table) KV cache."""
     batch_id = ct.bid(0)
     head_block_id = ct.bid(1)
     kv_split_id = ct.bid(2)
@@ -836,6 +841,7 @@ def _decode_mla_kv_paged_kernel(
     NUM_PAGES_PER_BLOCK: ConstInt,
     TRANS_QK: ConstBool,
 ):
+    """cuTile kernel: paged DeepSeek-MLA decode over the compressed latent KV cache."""
     batch_id = ct.bid(0)
     head_block_id = ct.bid(1)
     kv_split_id = ct.bid(2)
@@ -1147,6 +1153,7 @@ def _gqa_decode_autotune_base(
     stride_block_table,
     TRANS_QK,
 ):
+    """Launch one GQA-decode autotune candidate and return its output tensor."""
     configs = _get_gqa_decode_autotune_configs(QUERY_GROUP_SIZE, page_size)
 
     cache_key = (
@@ -1264,6 +1271,7 @@ def fmha_decode_bsr_cutile(
     force_split_kv: bool = False,
     force_persistent: bool = False,
 ):
+    """Paged GQA decode entry point: autotune, launch, and reduce split-KV if used."""
     num_batch = q.shape[0]
     num_qo_heads = q.shape[1]
     head_dim_qk = q.shape[-1]
@@ -1398,6 +1406,7 @@ def fmha_decode_bsr_cutile(
 
 
 def _mla_decode_autotune_configs(trans_qk: bool = False):
+    """Yield the MLA-decode autotune candidates valid for this TRANS_QK setting."""
     for bh in [16, 32]:
         for bn in [16, 32, 64, 128]:
             if trans_qk and bn < 64:
@@ -1433,6 +1442,7 @@ def _mla_decode_autotune_base(
     stride_block_table,
     TRANS_QK,
 ):
+    """Launch one MLA-decode autotune candidate and return its output tensor."""
     mla_cache_key = (
         num_batch,
         num_qo_heads,
@@ -1543,6 +1553,7 @@ def decode_mla_kv_paged_cutile(
     force_split_kv: bool = False,
     force_persistent: bool = False,
 ):
+    """Paged MLA decode entry point: pick TRANS_QK, autotune, launch, and reduce split-KV if used."""
     num_qo_heads = q.shape[1]
     head_dim_qk = q.shape[-1]
     head_dim_rope = q_rope.shape[-1]

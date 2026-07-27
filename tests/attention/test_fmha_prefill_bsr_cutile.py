@@ -19,6 +19,7 @@ _REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 
 
 def _load_module(name, rel_path):
+    """Import a module directly from its path in the repo checkout."""
     path = _REPO / rel_path
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)

@@ -71,6 +71,7 @@ def bsr_attention_ref(
     indices,
     mask_data,
 ):
+    """Dense reference for block-sparse attention, built from the BSR mask."""
     M = q.shape[0]
     N = k.shape[0]
     if HAVE_SCIPY:
@@ -123,6 +124,7 @@ def _bsr_to_dense_torch(
 def test_block_sparse_attention(
     backend, R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
+    """Block-sparse attention must match the dense reference for each backend."""
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
 
