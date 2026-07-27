@@ -597,7 +597,6 @@ class _MLAPlanArguments:
     qk_nope_head_dim: Optional[int] = None
     enable_pdl: Optional[bool] = None
     is_var_seq: Optional[bool] = None
-    cute_dsl_impl: str = "auto"
     use_sinks: bool = False
     _float_workspace_buffer: torch.Tensor = field(repr=False, compare=False)
     _generated_fa_workspace: _MLAGeneratedFaWorkspace = field(repr=False, compare=False)

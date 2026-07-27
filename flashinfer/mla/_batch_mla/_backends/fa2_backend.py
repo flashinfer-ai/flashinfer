@@ -58,17 +58,12 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         args._generated_fa_workspace.raise_if_invalid()
         enable_pdl = args.enable_pdl
         is_var_seq = args.is_var_seq
-        cute_dsl_impl = args.cute_dsl_impl
         use_sinks = args.use_sinks
         qk_nope_head_dim = args.qk_nope_head_dim
         if enable_pdl:
             raise ValueError("enable_pdl is not supported by the fa2 wrapper backend.")
         if is_var_seq is not None:
             raise ValueError("is_var_seq is not supported by the fa2 wrapper backend.")
-        if cute_dsl_impl != "auto":
-            raise ValueError(
-                "cute_dsl_impl is not supported by the fa2 wrapper backend."
-            )
         if use_sinks:
             raise ValueError("use_sinks is not supported by the fa2 wrapper backend.")
         if qk_nope_head_dim is not None:
@@ -189,6 +184,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,

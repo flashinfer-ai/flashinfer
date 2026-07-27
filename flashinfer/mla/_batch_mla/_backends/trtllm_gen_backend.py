@@ -404,8 +404,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         backend.run(
             q_nope=query[..., : self.kv_lora_rank],
             q_pe=query[..., self.kv_lora_rank :],
-            ckv_cache=self.kv_cache.squeeze(1)[..., : self.kv_lora_rank],
-            kpe_cache=self.kv_cache.squeeze(1)[..., self.kv_lora_rank :],
+            kv_cache=self.kv_cache.squeeze(1),
             out=out,
             sinks=(
                 self.sinks[0] if isinstance(self.sinks, (list, tuple)) else self.sinks
@@ -453,8 +452,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         backend.run(
             q_nope=query[..., : self.kv_lora_rank].flatten(0, 1),
             q_pe=query[..., self.kv_lora_rank :].flatten(0, 1),
-            ckv_cache=self.kv_cache.squeeze(1)[..., : self.kv_lora_rank],
-            kpe_cache=self.kv_cache.squeeze(1)[..., self.kv_lora_rank :],
+            kv_cache=self.kv_cache.squeeze(1),
             out=out.flatten(0, 1),
             lse=lse,
             return_lse=self.return_lse,
@@ -478,11 +476,6 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
     @classmethod
     @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
-        cute_dsl_impl = args.cute_dsl_impl
-        if cute_dsl_impl != "auto":
-            raise ValueError(
-                "cute_dsl_impl is not supported by the trtllm-gen backend."
-            )
         if (
             not isinstance(args.page_size, int)
             or isinstance(args.page_size, bool)
@@ -725,6 +718,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -765,11 +759,14 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 "ckv_scale / kpe_scale are only supported with the fa3 backend "
                 "and FP8 kv_data_type."
             )
+        if kv_cache is None:
+            raise ValueError(
+                "TRTLLM-GEN KV cache must be adjacent views or a combined kv_cache."
+            )
         return self.run(
             q_nope=q_nope,
             q_pe=q_pe,
-            ckv_cache=ckv_cache,
-            kpe_cache=kpe_cache,
+            kv_cache=kv_cache,
             out=out,
             lse=lse,
             return_lse=return_lse,
@@ -784,8 +781,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         *,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -859,18 +855,15 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             "q_pe",
         )
         check_shape_dtype_device(
-            ckv_cache,
-            (ckv_cache.shape[0], self._page_size, self._kv_lora_rank),
+            kv_cache,
+            (
+                kv_cache.shape[0],
+                self._page_size,
+                self._kv_lora_rank + self._qk_rope_head_dim,
+            ),
             self._kv_data_type,
             self.device,
-            "ckv_cache",
-        )
-        check_shape_dtype_device(
-            kpe_cache,
-            (ckv_cache.shape[0], self._page_size, self._qk_rope_head_dim),
-            self._kv_data_type,
-            self.device,
-            "kpe_cache",
+            "kv_cache",
         )
 
         if out is None:
@@ -890,7 +883,6 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
                 self._num_heads,
                 self._kv_lora_rank + self._qk_rope_head_dim,
             )
-        kv_cache = _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
         kv_cache = _check_trtllm_gen_mla_shape(
             query,
             kv_cache,

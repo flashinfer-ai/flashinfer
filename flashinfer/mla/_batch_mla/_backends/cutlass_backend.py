@@ -150,7 +150,6 @@ class _BatchMLAPagedAttentionCutlassBackend:
     def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
         enable_pdl = args.enable_pdl
         is_var_seq = args.is_var_seq
-        cute_dsl_impl = args.cute_dsl_impl
         use_sinks = args.use_sinks
         qk_nope_head_dim = args.qk_nope_head_dim
         if enable_pdl:
@@ -160,10 +159,6 @@ class _BatchMLAPagedAttentionCutlassBackend:
         if is_var_seq is not None:
             raise ValueError(
                 "is_var_seq is not supported by the cutlass wrapper backend."
-            )
-        if cute_dsl_impl != "auto":
-            raise ValueError(
-                "cute_dsl_impl is not supported by the cutlass wrapper backend."
             )
         if use_sinks:
             raise ValueError(
@@ -381,6 +376,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -411,8 +407,11 @@ class _BatchMLAPagedAttentionCutlassBackend:
         return self.run(
             q_nope=q_nope,
             q_pe=q_pe,
-            ckv_cache=ckv_cache,
-            kpe_cache=kpe_cache,
+            kv_cache=(
+                _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
+                if kv_cache is None
+                else kv_cache
+            ),
             out=out,
             kv_len=kv_len,
             page_table=page_table,
@@ -428,6 +427,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -474,8 +474,11 @@ class _BatchMLAPagedAttentionCutlassBackend:
         return backend.run(
             q_nope=q_nope,
             q_pe=q_pe,
-            ckv_cache=ckv_cache,
-            kpe_cache=kpe_cache,
+            kv_cache=(
+                _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
+                if kv_cache is None
+                else kv_cache
+            ),
             out=out,
             kv_len=kv_len,
             page_table=page_table,
@@ -487,8 +490,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
         *,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         out: Optional[torch.Tensor],
         kv_len: Optional[torch.Tensor],
         page_table: Optional[torch.Tensor],
@@ -528,15 +530,14 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
         q_nope_pe = _concat_adjacent_views_or_cat(q_nope, q_pe)
-        ckv_kpe_cache = _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
-        _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
+        _check_cutlass_shape(q_nope_pe, kv_cache, kv_len, page_table)
         lse = torch.empty(0, dtype=torch.float32, device=self.device)
         self._cached_module.cutlass_mla_paged_attention(
             self._float_workspace_buffer,
             out,
             lse,
             q_nope_pe,
-            ckv_kpe_cache,
+            kv_cache,
             kv_len,
             page_table,
             output_scale,

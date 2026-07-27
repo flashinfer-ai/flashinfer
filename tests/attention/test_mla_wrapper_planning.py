@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import inspect
 import logging
+import warnings
 from typing import Tuple, Union
 
 import pytest
@@ -17,7 +18,7 @@ from flashinfer.mla._batch_mla import _planning as batch_mla_planning
 from flashinfer.mla._batch_mla import _wrapper as batch_mla_wrapper
 from flashinfer.mla._batch_mla._backends import _fa_common
 from flashinfer.mla._batch_mla._backends import cutlass_backend
-from flashinfer.mla._batch_mla._backends import cute_dsl_backend
+from flashinfer.mla._batch_mla._backends import cute_dsl_monolithic_backend
 from flashinfer.mla._batch_mla._backends import fa2_backend
 from flashinfer.mla._batch_mla._backends import fa3_backend
 from flashinfer.mla._batch_mla._backends import trtllm_gen_backend
@@ -50,6 +51,7 @@ _RUN_FROM_WRAPPER_PARAMETERS = (
     "q_pe",
     "ckv_cache",
     "kpe_cache",
+    "kv_cache",
     "out",
     "lse",
     "return_lse",
@@ -94,6 +96,7 @@ def _run_from_wrapper_kwargs(**overrides):
         q_pe=object(),
         ckv_cache=object(),
         kpe_cache=object(),
+        kv_cache=None,
         out=object(),
         lse=object(),
         return_lse=True,
@@ -151,6 +154,152 @@ def test_selected_backend_run_from_wrapper_receives_complete_superset_once():
     assert result is expected
     assert calls == [expected_kwargs]
     assert wrapper._backend_impl is backend
+
+
+def test_wrapper_combined_kv_cache_forwards_canonical_split_views():
+    calls = []
+
+    class _SelectedBackend:
+        def run_from_wrapper(self, **kwargs):
+            calls.append(kwargs)
+            return torch.empty(0)
+
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa3")
+    wrapper._backend_impl = _SelectedBackend()
+    wrapper._selected_backend = "fa3"
+    q_nope = torch.empty((2, 8, 512), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 16, 576), dtype=torch.bfloat16)
+
+    wrapper.run(q_nope, q_pe, kv_cache=kv_cache)
+
+    assert len(calls) == 1
+    assert calls[0]["ckv_cache"].shape == (4, 16, 512)
+    assert calls[0]["kpe_cache"].shape == (4, 16, 64)
+    assert (
+        calls[0]["ckv_cache"].untyped_storage()._cdata
+        == kv_cache.untyped_storage()._cdata
+    )
+    assert (
+        calls[0]["kpe_cache"].untyped_storage()._cdata
+        == kv_cache.untyped_storage()._cdata
+    )
+    assert calls[0]["kv_cache"] is kv_cache
+
+
+def test_wrapper_combined_q_uses_query_widths_independent_of_kv_widths():
+    calls = []
+
+    class _SelectedBackend:
+        def run_from_wrapper(self, **kwargs):
+            calls.append(kwargs)
+            return torch.empty(0)
+
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(
+        torch.empty(1), backend="trtllm-gen"
+    )
+    wrapper._backend_impl = _SelectedBackend()
+    wrapper._selected_backend = "trtllm-gen"
+    wrapper._query_split_widths = (128, 64)
+    wrapper._kv_split_widths = (512, 64)
+    q = torch.empty((2, 8, 192), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4, 16, 576), dtype=torch.bfloat16)
+
+    wrapper.run(q=q, kv_cache=kv_cache)
+
+    assert calls[0]["q_nope"].shape == (2, 8, 128)
+    assert calls[0]["q_pe"].shape == (2, 8, 64)
+    assert calls[0]["ckv_cache"].shape == (4, 16, 512)
+    assert calls[0]["kpe_cache"].shape == (4, 16, 64)
+    assert calls[0]["kv_cache"] is kv_cache
+
+
+def test_wrapper_accepts_both_combined_forms_only_for_exact_aliases():
+    calls = []
+
+    class _SelectedBackend:
+        def run_from_wrapper(self, **kwargs):
+            calls.append(kwargs)
+            return torch.empty(0)
+
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa3")
+    wrapper._backend_impl = _SelectedBackend()
+    wrapper._selected_backend = "fa3"
+    wrapper._query_split_widths = (512, 64)
+    wrapper._kv_split_widths = (512, 64)
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    q_nope, q_pe = q[..., :512], q[..., 512:]
+    kv_cache = torch.empty((4, 16, 576), dtype=torch.bfloat16)
+    ckv_cache, kpe_cache = kv_cache[..., :512], kv_cache[..., 512:]
+
+    wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, q=q, kv_cache=kv_cache)
+
+    assert len(calls) == 1
+    assert calls[0]["kv_cache"] is kv_cache
+    with pytest.raises(ValueError, match="same views"):
+        wrapper.run(
+            torch.empty_like(q_nope),
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            q=q,
+            kv_cache=kv_cache,
+        )
+    with pytest.raises(ValueError, match="same views"):
+        wrapper.run(
+            q_nope,
+            q_pe,
+            torch.empty_like(ckv_cache),
+            torch.empty_like(kpe_cache),
+            kv_cache=kv_cache,
+        )
+
+
+def test_wrapper_derives_combined_cache_for_combined_layout_backend():
+    calls = []
+
+    class _SelectedBackend:
+        def run_from_wrapper(self, **kwargs):
+            calls.append(kwargs)
+            return torch.empty(0)
+
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(
+        torch.empty(1), backend="trtllm-gen"
+    )
+    wrapper._backend_impl = _SelectedBackend()
+    wrapper._selected_backend = "trtllm-gen"
+    q_nope = torch.empty((2, 8, 512), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+    combined = torch.empty((4, 16, 576), dtype=torch.bfloat16)
+
+    wrapper.run(q_nope, q_pe, combined[..., :512], combined[..., 512:])
+
+    assert (
+        calls[0]["kv_cache"].untyped_storage()._cdata
+        == combined.untyped_storage()._cdata
+    )
+
+
+def test_wrapper_warns_once_for_nonadjacent_cutlass_cache_views():
+    class _SelectedBackend:
+        def run_from_wrapper(self, **kwargs):
+            return torch.empty(0)
+
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
+    wrapper._backend_impl = _SelectedBackend()
+    wrapper._selected_backend = "cutlass"
+    q_nope = torch.empty((2, 8, 512), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
+    ckv_cache = torch.empty((4, 16, 512), dtype=torch.bfloat16)
+    kpe_cache = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+
+    with pytest.warns(FutureWarning, match="Non-adjacent ckv_cache and kpe_cache"):
+        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+    with warnings.catch_warnings(record=True) as warnings_record:
+        warnings.simplefilter("always")
+        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache)
+    assert not warnings_record
 
 
 @pytest.mark.parametrize(
@@ -265,6 +414,7 @@ def _valid_cutlass_run_from_wrapper_kwargs(**overrides):
         return_lse=False,
         profiler_buffer=None,
         return_lse_base_on_e=False,
+        kv_cache=object(),
     )
     kwargs.update(overrides)
     return kwargs
@@ -308,8 +458,7 @@ def test_cutlass_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch):
             for key in (
                 "q_nope",
                 "q_pe",
-                "ckv_cache",
-                "kpe_cache",
+                "kv_cache",
                 "out",
                 "kv_len",
                 "page_table",
@@ -370,8 +519,8 @@ def test_cutlass_run_without_plan_plans_and_runs_narrowly_once():
     calls = []
     q_nope = torch.empty((2, 128, 512), dtype=torch.bfloat16)
     q_pe = torch.empty((2, 128, 64), dtype=torch.bfloat16)
-    ckv_cache = torch.empty((8, 32, 512), dtype=torch.bfloat16)
-    kpe_cache = torch.empty((8, 32, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((8, 32, 576), dtype=torch.bfloat16)
+    ckv_cache, kpe_cache = kv_cache[..., :512], kv_cache[..., 512:]
     expected = object()
 
     class _InspectableBackend(cutlass_backend._BatchMLAPagedAttentionCutlassBackend):
@@ -397,6 +546,7 @@ def test_cutlass_run_without_plan_plans_and_runs_narrowly_once():
         q_pe=q_pe,
         ckv_cache=ckv_cache,
         kpe_cache=kpe_cache,
+        kv_cache=kv_cache,
     )
 
     result = _InspectableBackend.run_unplanned_from_wrapper(workspace, **kwargs)
@@ -422,8 +572,7 @@ def test_cutlass_run_without_plan_plans_and_runs_narrowly_once():
         for key in (
             "q_nope",
             "q_pe",
-            "ckv_cache",
-            "kpe_cache",
+            "kv_cache",
             "out",
             "kv_len",
             "page_table",
@@ -464,6 +613,7 @@ def test_cutlass_wrapper_run_without_plan_delegates_without_persisting(monkeypat
     )
     wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cutlass")
     kwargs = _valid_cutlass_run_from_wrapper_kwargs()
+    kwargs["kv_cache"] = None
     expected_kwargs = dict(kwargs)
 
     result = wrapper.run(
@@ -490,6 +640,7 @@ def _valid_trtllm_gen_run_from_wrapper_kwargs(**overrides):
     kwargs = _run_from_wrapper_kwargs(
         profiler_buffer=None,
         return_lse_base_on_e=False,
+        kv_cache=object(),
     )
     kwargs.update(overrides)
     return kwargs
@@ -520,8 +671,7 @@ def test_trtllm_gen_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch
             for key in (
                 "q_nope",
                 "q_pe",
-                "ckv_cache",
-                "kpe_cache",
+                "kv_cache",
                 "out",
                 "lse",
                 "return_lse",
@@ -565,13 +715,16 @@ def _valid_cute_dsl_run_from_wrapper_kwargs(**overrides):
     kwargs = _run_from_wrapper_kwargs(
         profiler_buffer=None,
         return_lse_base_on_e=False,
+        kv_cache=object(),
     )
     kwargs.update(overrides)
     return kwargs
 
 
 def test_cute_dsl_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch):
-    backend = object.__new__(cute_dsl_backend._BatchMLAPagedAttentionCuteDslBackend)
+    backend = object.__new__(
+        cute_dsl_monolithic_backend._BatchMLAPagedAttentionCuteDslMonolithicBackend
+    )
     calls = []
     expected = object()
     monkeypatch.setattr(
@@ -594,8 +747,7 @@ def test_cute_dsl_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch):
             for key in (
                 "q_nope",
                 "q_pe",
-                "ckv_cache",
-                "kpe_cache",
+                "kv_cache",
                 "out",
                 "lse",
                 "return_lse",
@@ -626,7 +778,9 @@ def test_cute_dsl_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch):
 def test_cute_dsl_run_from_wrapper_rejects_inapplicable_options_before_run(
     monkeypatch, overrides, match
 ):
-    backend = object.__new__(cute_dsl_backend._BatchMLAPagedAttentionCuteDslBackend)
+    backend = object.__new__(
+        cute_dsl_monolithic_backend._BatchMLAPagedAttentionCuteDslMonolithicBackend
+    )
     calls = []
     monkeypatch.setattr(backend, "run", lambda **kwargs: calls.append(kwargs))
 
@@ -642,6 +796,7 @@ def _valid_xqa_run_from_wrapper_kwargs(**overrides):
         return_lse=False,
         profiler_buffer=None,
         return_lse_base_on_e=False,
+        kv_cache=object(),
     )
     kwargs.update(overrides)
     return kwargs
@@ -670,8 +825,7 @@ def test_xqa_run_from_wrapper_forwards_only_narrow_run_inputs(monkeypatch):
             for key in (
                 "q_nope",
                 "q_pe",
-                "ckv_cache",
-                "kpe_cache",
+                "kv_cache",
                 "out",
             )
         }
@@ -729,7 +883,7 @@ def test_xqa_run_from_wrapper_rejects_inapplicable_options_before_run(
             "profiler_buffer is not supported",
         ),
         (
-            cute_dsl_backend._BatchMLAPagedAttentionCuteDslBackend,
+            cute_dsl_monolithic_backend._BatchMLAPagedAttentionCuteDslMonolithicBackend,
             _valid_cute_dsl_run_from_wrapper_kwargs(
                 profiler_buffer=object(), kv_len=object()
             ),
@@ -1187,72 +1341,18 @@ def test_trtllm_gen_plan_from_wrapper_owns_native_dense_adapter(monkeypatch):
     }
 
 
-def test_trtllm_gen_plan_from_wrapper_rejects_inapplicable_options_first(
-    monkeypatch,
-):
-    args = _capture_plan_request(
-        monkeypatch,
-        requested_backend="trtllm-gen",
-        plan_kwargs=_csr_plan_args(cute_dsl_impl="monolithic"),
-    )
-
-    _assert_explicit_dense_plan_rejects_before_construction(
-        args,
-        trtllm_gen_backend._BatchMLAPagedAttentionTrtllmGenBackend,
-        match="cute_dsl_impl is not supported",
-    )
-
-
-def test_cute_dsl_plan_from_wrapper_owns_aligned_dense_adapter(monkeypatch):
-    args = _capture_plan_request(
-        monkeypatch,
-        requested_backend="cute-dsl",
-        plan_kwargs=_csr_plan_args(
-            is_var_seq=True,
-            cute_dsl_impl="modular",
-            use_sinks=True,
-        ),
-    )
-
-    result, backend = _record_explicit_dense_plan_from_wrapper(
-        args,
-        cute_dsl_backend._BatchMLAPagedAttentionCuteDslBackend,
-    )
-    dense = args.dense(table_width_alignment=128 // args.page_size)
-
-    assert dense.block_tables.shape[1] % (128 // args.page_size) == 0
-    assert backend.plan_kwargs == {
-        "cum_seq_lens_q": dense.cum_seq_lens_q,
-        "block_tables": dense.block_tables,
-        "seq_lens": dense.seq_lens,
-        "max_q_len": dense.max_q_len,
-        "num_heads": args.num_heads,
-        "head_dim_ckv": args.head_dim_ckv,
-        "head_dim_kpe": args.head_dim_kpe,
-        "page_size": args.page_size,
-        "causal": args.causal,
-        "sm_scale": args.sm_scale,
-        "q_data_type": args.q_data_type,
-        "kv_data_type": args.kv_data_type,
-        "use_profiler": args.use_profiler,
-        "is_var_seq": args.is_var_seq,
-        "cute_dsl_impl": args.cute_dsl_impl,
-        "use_sinks": args.use_sinks,
-    }
-
-
 def test_cute_dsl_plan_from_wrapper_rejects_inapplicable_options_first(
     monkeypatch,
 ):
     args = _capture_plan_request(
         monkeypatch,
-        requested_backend="cute-dsl",
+        requested_backend="cute-dsl-monolithic",
         plan_kwargs=_csr_plan_args(enable_pdl=True),
     )
 
     _assert_explicit_dense_plan_rejects_before_construction(
         args,
-        cute_dsl_backend._BatchMLAPagedAttentionCuteDslBackend,
+        cute_dsl_monolithic_backend._BatchMLAPagedAttentionCuteDslMonolithicBackend,
         match="enable_pdl is not supported",
     )
 
@@ -1345,6 +1445,69 @@ def test_wrapper_does_not_retain_duplicate_plan_metadata():
 
     assert not hasattr(wrapper, "_csr_plan_metadata")
     assert not hasattr(wrapper, "_dense_plan_metadata")
+
+
+def test_wrapper_plan_surface_removes_cute_dsl_impl():
+    assert (
+        "cute_dsl_impl"
+        not in inspect.signature(mla_core.BatchMLAPagedAttentionWrapper.plan).parameters
+    )
+
+
+@pytest.mark.parametrize(
+    ("use_sinks", "reject_first", "expected_candidates"),
+    (
+        (False, False, ["cute-dsl-monolithic"]),
+        (False, True, ["cute-dsl-monolithic", "cute-dsl-modular"]),
+        (True, False, ["cute-dsl-modular"]),
+    ),
+)
+def test_cute_dsl_family_dispatches_to_concrete_backends(
+    monkeypatch, use_sinks, reject_first, expected_candidates
+):
+    calls = []
+
+    def plan_backend(self, backend, args):
+        calls.append(backend)
+        if reject_first and len(calls) == 1:
+            raise backend_errors._BackendPlanUnsupportedError("unsupported shape")
+        self._selected_backend = backend
+
+    monkeypatch.setattr(
+        batch_mla_core.BatchMLAPagedAttentionWrapper,
+        "_plan_backend",
+        plan_backend,
+    )
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend="cute-dsl")
+
+    wrapper.plan(**_csr_plan_args(use_sinks=use_sinks))
+
+    assert calls == expected_candidates
+    assert wrapper._selected_backend == expected_candidates[-1]
+
+
+@pytest.mark.parametrize("backend", ("cute-dsl-monolithic", "cute-dsl-modular"))
+def test_explicit_cute_dsl_concrete_backend_is_strict(monkeypatch, backend):
+    calls = []
+
+    def reject(self, candidate, args):
+        del args
+        calls.append(candidate)
+        raise backend_errors._BackendPlanUnsupportedError("unsupported shape")
+
+    monkeypatch.setattr(
+        batch_mla_core.BatchMLAPagedAttentionWrapper,
+        "_plan_backend",
+        reject,
+    )
+    wrapper = mla_core.BatchMLAPagedAttentionWrapper(torch.empty(1), backend=backend)
+
+    with pytest.raises(
+        backend_errors._BackendPlanUnsupportedError, match="unsupported shape"
+    ):
+        wrapper.plan(**_csr_plan_args())
+
+    assert calls == [backend]
 
 
 def test_plan_arguments_do_not_expose_result_only_metadata_observers():
@@ -1477,7 +1640,6 @@ def test_plan_request_private_resources_are_not_public_or_repr_fields():
         "qk_nope_head_dim",
         "enable_pdl",
         "is_var_seq",
-        "cute_dsl_impl",
         "use_sinks",
     }
     private_fields = [field for field in fields if field.name.startswith("_")]

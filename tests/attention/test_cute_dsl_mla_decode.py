@@ -2668,7 +2668,7 @@ def test_mla_decode_variable_q_auto_uses_cute_dsl_for_head_gap():
     )
 
 
-def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
+def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_impl):
     skip_if_unsupported()
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -2705,7 +2705,7 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
     return_lse = cute_dsl_impl == "monolithic"
     bmm1_scale, bmm2_scale = 0.2, 1.25
 
-    wrapper = BatchMLAPagedAttentionWrapper(wrapper_workspace, backend="cute-dsl")
+    wrapper = BatchMLAPagedAttentionWrapper(wrapper_workspace, backend=wrapper_backend)
     common_plan = dict(
         num_heads=num_heads,
         head_dim_ckv=kv_lora_rank,
@@ -2716,7 +2716,6 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
         q_data_type=query.dtype,
         kv_data_type=kv_cache.dtype,
         is_var_seq=True,
-        cute_dsl_impl=cute_dsl_impl,
         use_sinks=use_sinks,
     )
     if metadata_form == "dense":
@@ -2764,14 +2763,10 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl):
 
 
 def _run_batch_mla_wrapper_cute_dsl_case(case):
-    rank = case["kv_lora_rank"]
     query = case["query"]
-    kv_cache = case["kv_cache"]
     return case["wrapper"].run(
-        query[..., :rank].flatten(0, 1),
-        query[..., rank:].flatten(0, 1),
-        kv_cache[..., :rank],
-        kv_cache[..., rank:],
+        q=query.flatten(0, 1),
+        kv_cache=case["kv_cache"],
         out=case["wrapper_out"],
         lse=case["wrapper_lse"] if case["return_lse"] else None,
         return_lse=case["return_lse"],
@@ -2812,13 +2807,20 @@ def _functional_batch_mla_cute_dsl_result(case):
 
 
 @pytest.mark.parametrize(
-    ("metadata_form", "cute_dsl_impl"),
-    (("dense", "monolithic"), ("csr", "modular")),
+    ("metadata_form", "wrapper_backend", "cute_dsl_impl"),
+    (
+        ("dense", "cute-dsl-monolithic", "monolithic"),
+        ("csr", "cute-dsl-modular", "modular"),
+        ("dense", "cute-dsl", "monolithic"),
+        ("csr", "cute-dsl", "modular"),
+    ),
 )
 def test_batch_mla_wrapper_cute_dsl_matches_functional_api(
-    metadata_form, cute_dsl_impl
+    metadata_form, wrapper_backend, cute_dsl_impl
 ):
-    case = _batch_mla_wrapper_cute_dsl_case(metadata_form, cute_dsl_impl)
+    case = _batch_mla_wrapper_cute_dsl_case(
+        metadata_form, wrapper_backend, cute_dsl_impl
+    )
     functional = _functional_batch_mla_cute_dsl_result(case)
     wrapped = _run_batch_mla_wrapper_cute_dsl_case(case)
 
@@ -2837,7 +2839,9 @@ def test_batch_mla_wrapper_cute_dsl_matches_functional_api(
 
 @pytest.mark.parametrize("cute_dsl_impl", ("monolithic", "modular"))
 def test_batch_mla_wrapper_cute_dsl_reuses_planned_artifact(cute_dsl_impl):
-    case = _batch_mla_wrapper_cute_dsl_case("dense", cute_dsl_impl)
+    case = _batch_mla_wrapper_cute_dsl_case(
+        "dense", f"cute-dsl-{cute_dsl_impl}", cute_dsl_impl
+    )
 
     from flashinfer.cute_dsl.attention import mla_dispatch
 
@@ -2869,7 +2873,7 @@ def test_batch_mla_wrapper_cute_dsl_reuses_planned_artifact(cute_dsl_impl):
 
 
 def test_batch_mla_wrapper_cute_dsl_cuda_graph_replays():
-    case = _batch_mla_wrapper_cute_dsl_case("dense", "monolithic")
+    case = _batch_mla_wrapper_cute_dsl_case("dense", "cute-dsl", "monolithic")
     functional = _functional_batch_mla_cute_dsl_result(case)
 
     graph = torch.cuda.CUDAGraph()
