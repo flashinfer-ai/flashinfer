@@ -600,7 +600,9 @@ def _prefill_attention_paged_body(
             if BLOCK_N > LOAD_BLOCK_N:
                 boundary_mask = ct.reshape((offs_n < seq_len_kv), (1, BLOCK_N))
                 qk = ct.where(
-                    boundary_mask, qk, ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32)
+                    boundary_mask,
+                    qk,
+                    ct.full((BLOCK_M, BLOCK_N), -1.0e6, dtype=ct.float32),
                 )
 
             qk_max = ct.max(qk, axis=1, keepdims=False)

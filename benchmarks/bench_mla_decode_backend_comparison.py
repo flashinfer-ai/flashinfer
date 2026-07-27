@@ -125,8 +125,9 @@ class _MLAInputs:
         self.kv_lens = torch.full((batch,), s_kv, dtype=torch.int32, device=device)
         # Dense block table [batch, pages_per_batch], int32.
         self.page_table = (
-            torch.arange(batch * pages_per_batch, dtype=torch.int32, device=device)
-            .reshape(batch, pages_per_batch)
+            torch.arange(
+                batch * pages_per_batch, dtype=torch.int32, device=device
+            ).reshape(batch, pages_per_batch)
             % total_pages
         )
 
@@ -354,7 +355,15 @@ def write_csv(
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
-            ["provider", "config", "batch", "s_kv", "page_size", "num_heads", "median_ms"]
+            [
+                "provider",
+                "config",
+                "batch",
+                "s_kv",
+                "page_size",
+                "num_heads",
+                "median_ms",
+            ]
         )
         for provider, d in results.items():
             for (b, s, ps), ms in sorted(d.items()):
@@ -407,7 +416,12 @@ def create_heatmap(
         for j in range(len(s_kv_values)):
             if not np.isnan(mat[i, j]):
                 ax.text(
-                    j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
                     color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
                 )
     ax.set_xlabel("s_kv")
@@ -474,7 +488,12 @@ def main():
         if p != baseline:
             for ps in page_size_values:
                 create_heatmap(
-                    batch_values, s_kv_values, ps, results, p, baseline,
+                    batch_values,
+                    s_kv_values,
+                    ps,
+                    results,
+                    p,
+                    baseline,
                     f"{args.output_prefix}_{p}_vs_{baseline}_p{ps}.png",
                 )
 

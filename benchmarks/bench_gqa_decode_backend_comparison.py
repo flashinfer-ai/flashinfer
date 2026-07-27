@@ -111,9 +111,7 @@ class _GQAInputs:
         self.sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
         # q: [batch, num_qo_heads, head_dim] (one query token per request).
-        self.q = torch.randn(
-            batch, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device=device
-        )
+        self.q = torch.randn(batch, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device=device)
         # NHD KV cache.
         self.k_cache = torch.randn(
             total_pages, page_size, NUM_KV_HEADS, HEAD_DIM, dtype=DTYPE, device=device
@@ -124,8 +122,9 @@ class _GQAInputs:
         self.kv_lens = torch.full((batch,), s_kv, dtype=torch.int32, device=device)
         # Dense block table [batch, pages_per_batch], int32.
         self.page_table = (
-            torch.arange(batch * pages_per_batch, dtype=torch.int32, device=device)
-            .reshape(batch, pages_per_batch)
+            torch.arange(
+                batch * pages_per_batch, dtype=torch.int32, device=device
+            ).reshape(batch, pages_per_batch)
             % total_pages
         )
         # CSR plan state for the paged-KV wrapper (cutile path).
@@ -338,7 +337,15 @@ def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
-            ["provider", "config", "batch", "s_kv", "page_size", "num_heads", "median_ms"]
+            [
+                "provider",
+                "config",
+                "batch",
+                "s_kv",
+                "page_size",
+                "num_heads",
+                "median_ms",
+            ]
         )
         for provider, d in results.items():
             for (b, s, ps), ms in sorted(d.items()):
@@ -391,7 +398,12 @@ def create_heatmap(
         for j in range(len(s_kv_values)):
             if not np.isnan(mat[i, j]):
                 ax.text(
-                    j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
                     color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
                 )
     ax.set_xlabel("s_kv")
@@ -457,7 +469,12 @@ def main():
         if p != baseline:
             for ps in page_size_values:
                 create_heatmap(
-                    batch_values, s_kv_values, ps, results, p, baseline,
+                    batch_values,
+                    s_kv_values,
+                    ps,
+                    results,
+                    p,
+                    baseline,
                     f"{args.output_prefix}_{p}_vs_{baseline}_p{ps}.png",
                 )
 

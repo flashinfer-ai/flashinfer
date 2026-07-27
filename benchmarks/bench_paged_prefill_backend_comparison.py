@@ -117,9 +117,9 @@ def _make_inputs(batch: int, seq: int, page: int):
     k_nhd = k_hnd.transpose(1, 2).contiguous()
     v_nhd = v_hnd.transpose(1, 2).contiguous()
 
-    block_tables = torch.arange(
-        total_pages, dtype=torch.int32, device=DEV
-    ).reshape(batch, ppb)
+    block_tables = torch.arange(total_pages, dtype=torch.int32, device=DEV).reshape(
+        batch, ppb
+    )
     seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=DEV)
     # Exclusive-prefix-sum q offsets; cum[:-1] is the per-request q start row.
     cum = torch.arange(batch + 1, dtype=torch.int32, device=DEV) * seq
@@ -127,7 +127,9 @@ def _make_inputs(batch: int, seq: int, page: int):
     return q, k_hnd, v_hnd, k_nhd, v_nhd, block_tables, seq_lens, cum, seq_offset
 
 
-def _make_execute(provider: str, batch: int, seq: int, page: int) -> Callable[[], torch.Tensor]:
+def _make_execute(
+    provider: str, batch: int, seq: int, page: int
+) -> Callable[[], torch.Tensor]:
     (q, k_hnd, v_hnd, k_nhd, v_nhd, block_tables, seq_lens, cum, seq_offset) = (
         _make_inputs(batch, seq, page)
     )
@@ -200,11 +202,21 @@ def verify_correctness(batch: int, seq: int, page: int, providers: List[str]) ->
         print("  correctness: both providers not importable here -> SKIP")
         return
     try:
-        out_c = _as_output(_make_execute("cutile", batch, seq, page)()).float().reshape(1, -1)
-        out_t = _as_output(_make_execute("trtllm", batch, seq, page)()).float().reshape(1, -1)
+        out_c = (
+            _as_output(_make_execute("cutile", batch, seq, page)())
+            .float()
+            .reshape(1, -1)
+        )
+        out_t = (
+            _as_output(_make_execute("trtllm", batch, seq, page)())
+            .float()
+            .reshape(1, -1)
+        )
         cos = torch.nn.functional.cosine_similarity(out_c, out_t).item()
-        print(f"  correctness @ batch={batch} s_kv={seq} page={page}: cos={cos:.4f} "
-              f"{'OK' if cos > 0.99 else 'CHECK'}")
+        print(
+            f"  correctness @ batch={batch} s_kv={seq} page={page}: cos={cos:.4f} "
+            f"{'OK' if cos > 0.99 else 'CHECK'}"
+        )
     except Exception as e:
         print(f"  correctness: FAILED ({repr(e)[:80]})")
 
@@ -246,8 +258,10 @@ def run_benchmark_sweep(
     ]
     total = len(configs)
 
-    print(f"\nPaged prefill (head_dim={HEAD_DIM}, heads {NUM_QO_HEADS}/{NUM_KV_HEADS}, "
-          f"bf16, causal)")
+    print(
+        f"\nPaged prefill (head_dim={HEAD_DIM}, heads {NUM_QO_HEADS}/{NUM_KV_HEADS}, "
+        f"bf16, causal)"
+    )
     print("=" * (32 + 12 * len(providers)))
     header = f"{'page':>5} {'batch':>6} {'s_kv':>7} |"
     for p in providers:
@@ -283,8 +297,10 @@ def print_summary_table(
             continue
         for page in page_values:
             print(f"\n{'=' * 72}")
-            print(f"Speedup [page={page}]: {p} vs {baseline} "
-                  f"({baseline}_ms / {p}_ms;  >1 = {p} faster)")
+            print(
+                f"Speedup [page={page}]: {p} vs {baseline} "
+                f"({baseline}_ms / {p}_ms;  >1 = {p} faster)"
+            )
             print(f"{'=' * 72}")
             header = "batch\\s_kv".ljust(12)
             for s in s_kv_values:
@@ -316,13 +332,19 @@ def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
-            ["provider", "config", "batch", "s_kv", "page_size", "head_dim", "median_ms"]
+            [
+                "provider",
+                "config",
+                "batch",
+                "s_kv",
+                "page_size",
+                "head_dim",
+                "median_ms",
+            ]
         )
         for provider, d in results.items():
             for (page, batch, seq), ms in sorted(d.items()):
-                w.writerow(
-                    [provider, "paged", batch, seq, page, HEAD_DIM, f"{ms:.6f}"]
-                )
+                w.writerow([provider, "paged", batch, seq, page, HEAD_DIM, f"{ms:.6f}"])
     print(f"\nWrote {path}")
 
 
@@ -369,8 +391,15 @@ def create_heatmap(
     for i in range(len(batch_values)):
         for j in range(len(s_kv_values)):
             if not np.isnan(mat[i, j]):
-                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
-                        color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black")
+                ax.text(
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
+                )
     ax.set_xlabel("s_kv")
     ax.set_ylabel("batch")
     ax.set_title(
@@ -399,7 +428,9 @@ def main():
     parser.add_argument(
         "--output-prefix", type=str, default="paged_prefill_backend_comparison"
     )
-    parser.add_argument("--csv", type=str, default=None, help="Write raw medians to CSV")
+    parser.add_argument(
+        "--csv", type=str, default=None, help="Write raw medians to CSV"
+    )
     args = parser.parse_args()
 
     requested = [p.strip() for p in args.providers.split(",") if p.strip()]
@@ -429,7 +460,12 @@ def main():
         if p != baseline:
             for page in page_values:
                 create_heatmap(
-                    page, batch_values, s_kv_values, results, p, baseline,
+                    page,
+                    batch_values,
+                    s_kv_values,
+                    results,
+                    p,
+                    baseline,
                     f"{args.output_prefix}_{p}_vs_{baseline}_page{page}.png",
                 )
 
