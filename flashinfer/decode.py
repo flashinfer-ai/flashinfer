@@ -2139,6 +2139,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 fmha_decode_bsr_cutile,
             )
 
+            # This branch returns before the shared out / out_dtype handling
+            # below, so honor the planned o_data_type here as well: allocate with
+            # it when the caller passed no out, and otherwise validate the buffer
+            # we were handed rather than letting the kernel write a tensor whose
+            # dtype disagrees with plan().
+            cutile_out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            cutile_out_shape = q.shape[:-1] + (v_cache.shape[-1],)
+            if out is None:
+                out = torch.empty(
+                    cutile_out_shape, dtype=cutile_out_dtype, device=q.device
+                )
+            else:
+                check_shape_dtype_device(
+                    out, cutile_out_shape, cutile_out_dtype, q.device, "out"
+                )
+
             # Both the block table and the device KV-lengths are materialized at
             # plan() time (see the cuTile plan branch), so run() does only
             # device->device ops (no host .item() sync, no CPU->CUDA copy) and is
