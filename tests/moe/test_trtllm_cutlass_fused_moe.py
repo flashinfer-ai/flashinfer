@@ -3377,6 +3377,7 @@ def _run_w4a8_moe_hopper(
     intermediate_size,
     dtype=torch.bfloat16,
     use_autotune=False,
+    use_valid_profile_ids=False,
     use_workspace=False,
 ):
     torch.manual_seed(42)
@@ -3447,6 +3448,21 @@ def _run_w4a8_moe_hopper(
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     flash_output = torch.zeros_like(x)
+    profile_ids = None
+    if use_valid_profile_ids:
+        gemm1_ids, gemm2_ids = fused_moe.get_cutlass_fused_moe_valid_profile_ids(
+            x,
+            fc1_weights_il,
+            fc2_weights_il,
+            dtype,
+            top_k=top_k,
+            use_w4_group_scaling=True,
+            use_packed_weights=True,
+        )
+        assert gemm1_ids
+        assert gemm2_ids
+        profile_ids = [gemm1_ids[0], gemm2_ids[0]]
+
     workspace_buffer = None
     if use_workspace:
         workspace_bytes = fused_moe.cutlass_fused_moe_workspace_size(
@@ -3477,6 +3493,7 @@ def _run_w4a8_moe_hopper(
             use_w4_group_scaling=True,
             output=flash_output,
             use_packed_weights=True,
+            profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
         )
 
@@ -3542,6 +3559,22 @@ def test_moe_w4a8_hopper_correctness(
 )
 def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="W4A8 MoE (Hopper mixed-input) requires SM90",
+)
+def test_moe_w4a8_hopper_valid_profile_ids():
+    _run_w4a8_moe_hopper(
+        4,
+        512,
+        2,
+        2,
+        512,
+        dtype=torch.bfloat16,
+        use_valid_profile_ids=True,
+    )
 
 
 @pytest.mark.skipif(

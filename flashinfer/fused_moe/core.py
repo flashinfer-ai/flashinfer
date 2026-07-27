@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -566,6 +567,75 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 )
             )
 
+    def get_valid_profile_ids(
+        input: torch.Tensor,
+        fc1_expert_weights: torch.Tensor,
+        fc2_expert_weights: torch.Tensor,
+        output_dtype: torch.dtype,
+        *,
+        top_k: int,
+        fc1_expert_biases: Optional[torch.Tensor] = None,
+        fc2_expert_biases: Optional[torch.Tensor] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        cluster_size: int = 1,
+        cluster_rank: int = 0,
+        enable_alltoall: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
+        use_w4_group_scaling: bool = False,
+        use_mxfp8_act_scaling: bool = False,
+        min_latency_mode: bool = False,
+        enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        use_packed_weights: bool = False,
+        use_fused_finalize: bool = True,
+        use_wfp4afp8_humming: bool = False,
+    ) -> Tuple[List[int], List[int]]:
+        """Return stage-filtered profile IDs without running the autotuner."""
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}")
+
+        moe_runner = MoERunner(
+            x_dtype=input.dtype,
+            weight_dtype=fc1_expert_weights.dtype,
+            output_dtype=output_dtype,
+            top_k=top_k,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_packed_weights=use_packed_weights,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
+        inputs = [
+            input,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+        ]
+        profile = OptimizationProfile(shapes=[], tensor_initializers=[])
+
+        moe_runner.gemm_idx_for_tuning = 1
+        gemm1_ids = moe_runner.get_valid_tactics(inputs, profile)
+        moe_runner.gemm_idx_for_tuning = 2
+        gemm2_ids = moe_runner.get_valid_tactics(inputs, profile)
+        return [int(t) for t in gemm1_ids], [int(t) for t in gemm2_ids]
+
     @register_custom_op(
         "flashinfer::cutlass_fused_moe",
         mutates_args=("output", "workspace_buffer"),
@@ -862,11 +932,75 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     # Register the module
     return SimpleNamespace(
         cutlass_fused_moe=cutlass_fused_moe,
+        get_valid_profile_ids=get_valid_profile_ids,
         cutlass_fused_moe_workspace_size=_cutlass_fused_moe_workspace_size,
         interleave_moe_weights_for_sm90_mixed_gemm=(
             module.interleave_moe_weights_for_sm90_mixed_gemm
         ),
     )
+
+
+def get_cutlass_fused_moe_valid_profile_ids(
+    input: torch.Tensor,
+    fc1_expert_weights: torch.Tensor,
+    fc2_expert_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    top_k: int,
+    fc1_expert_biases: Optional[torch.Tensor] = None,
+    fc2_expert_biases: Optional[torch.Tensor] = None,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    cluster_size: int = 1,
+    cluster_rank: int = 0,
+    enable_alltoall: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    min_latency_mode: bool = False,
+    enable_pdl: Optional[bool] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    use_packed_weights: bool = False,
+    use_fused_finalize: bool = True,
+    use_wfp4afp8_humming: bool = False,
+) -> Tuple[List[int], List[int]]:
+    """Enumerate valid CUTLASS fused-MoE profile IDs for both GEMM stages.
+
+    This is a read-only companion to :func:`cutlass_fused_moe`'s
+    ``profile_ids`` override. It applies the same architecture, occupancy, and
+    W4 shape filters as the runtime runner without profiling or mutating the
+    global autotuner cache.
+    """
+    major, minor = get_compute_capability(input.device)
+    device_arch = f"{major * 10 + minor}"
+    with torch.cuda.device(input.device) if input.is_cuda else nullcontext():
+        return get_cutlass_fused_moe_module(device_arch).get_valid_profile_ids(
+            input,
+            fc1_expert_weights,
+            fc2_expert_weights,
+            output_dtype,
+            top_k=top_k,
+            fc1_expert_biases=fc1_expert_biases,
+            fc2_expert_biases=fc2_expert_biases,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=cluster_size,
+            cluster_rank=cluster_rank,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_packed_weights=use_packed_weights,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
 
 
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
