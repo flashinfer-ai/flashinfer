@@ -187,8 +187,10 @@ def verify_correctness(batch: int, seq: int, providers: List[str]) -> None:
         out_c = _as_output(_make_execute("cutile", batch, seq)()).float().reshape(1, -1)
         out_t = _as_output(_make_execute("trtllm", batch, seq)()).float().reshape(1, -1)
         cos = torch.nn.functional.cosine_similarity(out_c, out_t).item()
-        print(f"  correctness @ batch={batch} s_kv={seq}: cos={cos:.4f} "
-              f"{'OK' if cos > 0.99 else 'CHECK'}")
+        print(
+            f"  correctness @ batch={batch} s_kv={seq}: cos={cos:.4f} "
+            f"{'OK' if cos > 0.99 else 'CHECK'}"
+        )
     except Exception as e:
         print(f"  correctness: FAILED ({repr(e)[:80]})")
 
@@ -227,8 +229,10 @@ def run_benchmark_sweep(
     configs = [(b, s) for b in batch_values for s in s_kv_values]
     total = len(configs)
 
-    print(f"\nRagged prefill (DeepSeek hd_qk={HEAD_DIM_QK}/hd_vo={HEAD_DIM_VO}, "
-          f"heads {NUM_QO_HEADS}/{NUM_KV_HEADS}, bf16, causal)")
+    print(
+        f"\nRagged prefill (DeepSeek hd_qk={HEAD_DIM_QK}/hd_vo={HEAD_DIM_VO}, "
+        f"heads {NUM_QO_HEADS}/{NUM_KV_HEADS}, bf16, causal)"
+    )
     print("=" * (26 + 12 * len(providers)))
     header = f"{'batch':>6} {'s_kv':>7} |"
     for p in providers:
@@ -294,7 +298,15 @@ def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int], float]]):
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
-            ["provider", "config", "batch", "s_kv", "page_size", "head_dim", "median_ms"]
+            [
+                "provider",
+                "config",
+                "batch",
+                "s_kv",
+                "page_size",
+                "head_dim",
+                "median_ms",
+            ]
         )
         for provider, d in results.items():
             for (batch, seq), ms in sorted(d.items()):
@@ -354,11 +366,20 @@ def create_heatmap(
     for i in range(len(batch_values)):
         for j in range(len(s_kv_values)):
             if not np.isnan(mat[i, j]):
-                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
-                        color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black")
+                ax.text(
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
+                )
     ax.set_xlabel("s_kv")
     ax.set_ylabel("batch")
-    ax.set_title(f"ragged prefill: {provider} speedup vs {baseline}\n(>1.0 = {provider} faster)")
+    ax.set_title(
+        f"ragged prefill: {provider} speedup vs {baseline}\n(>1.0 = {provider} faster)"
+    )
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
     print(f"Saved heatmap to {output_file}")
@@ -381,7 +402,9 @@ def main():
     parser.add_argument(
         "--output-prefix", type=str, default="ragged_prefill_backend_comparison"
     )
-    parser.add_argument("--csv", type=str, default=None, help="Write raw medians to CSV")
+    parser.add_argument(
+        "--csv", type=str, default=None, help="Write raw medians to CSV"
+    )
     args = parser.parse_args()
 
     requested = [p.strip() for p in args.providers.split(",") if p.strip()]
@@ -407,7 +430,11 @@ def main():
     for p in providers:
         if p != baseline:
             create_heatmap(
-                batch_values, s_kv_values, results, p, baseline,
+                batch_values,
+                s_kv_values,
+                results,
+                p,
+                baseline,
                 f"{args.output_prefix}_{p}_vs_{baseline}.png",
             )
 

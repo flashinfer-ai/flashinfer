@@ -3576,9 +3576,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "(equal-length prefill). For append/chunked prefill with "
                     "kv_len != q_len, use backend='fa2'."
                 )
-            seq_lens_q_host = (qo_indptr_host[1:] - qo_indptr_host[:-1]).to(
-                torch.int32
-            )
+            seq_lens_q_host = (qo_indptr_host[1:] - qo_indptr_host[:-1]).to(torch.int32)
             kv_len_arr_i32 = kv_len_arr.to(torch.int32)
             self._cutile_num_batch = batch_size
             self._cutile_seq_lens_q = seq_lens_q_host.to(
