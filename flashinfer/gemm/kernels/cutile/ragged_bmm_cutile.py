@@ -300,13 +300,13 @@ def _ragged_bmm_swap_ab_kernel(
 
 
 # OPTIMIZED: Expanded search space matching Triton's configurations with extended occupancy range.
-def _ragged_bmm_autotune_configs_standard():
+def _ragged_bmm_autotune_configs_standard(device=None):
     """
     Iterator of autotune configurations for standard (non-swap_ab) kernel.
 
     with extended occupancy range for better workload coverage.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] == 10:
         # SM100 / SM103 - expanded configs
@@ -377,12 +377,12 @@ def _ragged_bmm_autotune_configs_standard():
                     )
 
 
-def _ragged_bmm_autotune_configs_swap_ab():
+def _ragged_bmm_autotune_configs_swap_ab(device=None):
     """
     Iterator of autotune configurations for swap_ab kernel.
     Used when M dimension is small relative to N.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] == 10:
         # SM100 / SM103
@@ -453,11 +453,11 @@ def _ragged_bmm_autotune_configs_swap_ab():
                     )
 
 
-def _get_default_kernel_configs():
+def _get_default_kernel_configs(device=None):
     """
     Get GPU-specific default kernel configs for non-autotune path.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] == 10:
         return {
@@ -579,7 +579,7 @@ def _ragged_bmm_autotune_standard(
     )
     if cache_key not in _ragged_bmm_standard_tune_cache:
         result = exhaustive_search(
-            list(_ragged_bmm_autotune_configs_standard()),
+            list(_ragged_bmm_autotune_configs_standard(a.device)),
             stream,
             grid_fn,
             _ragged_bmm_kernel,
@@ -672,7 +672,7 @@ def _ragged_bmm_autotune_swap_ab(
     )
     if swap_cache_key not in _ragged_bmm_swap_ab_tune_cache:
         result = exhaustive_search(
-            list(_ragged_bmm_autotune_configs_swap_ab()),
+            list(_ragged_bmm_autotune_configs_swap_ab(a.device)),
             stream,
             grid_fn,
             _ragged_bmm_swap_ab_kernel,
@@ -806,7 +806,7 @@ def ragged_bmm(
             )
     else:
         # Use fixed default configs
-        default_configs = _get_default_kernel_configs()
+        default_configs = _get_default_kernel_configs(a.device)
         kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
         BLOCK_M = kernel_configs.get("BLOCK_M")

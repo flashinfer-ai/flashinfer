@@ -151,7 +151,7 @@ def _masked_bmm_kernel(
             )
 
 
-def _masked_bmm_autotune_configs():
+def _masked_bmm_autotune_configs(device=None):
     """
     Iterator of autotune configurations for masked BMM kernel.
 
@@ -163,7 +163,7 @@ def _masked_bmm_autotune_configs():
     - Higher num_ctas can improve L2 cache hit rate via CGA
     - Occupancy affects latency hiding vs register pressure tradeoff
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] == 10:
         # SM100 / SM103
@@ -244,11 +244,11 @@ def _masked_bmm_autotune_configs():
                         )
 
 
-def _get_default_kernel_configs():
+def _get_default_kernel_configs(device=None):
     """
     Get GPU-specific default kernel configs for non-autotune path.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] == 10:
         # SM100 / SM103
@@ -337,7 +337,7 @@ def _masked_bmm_autotune(stream, a, b, c, masked_m, Q, M, N, transpose_a, transp
     cache_key = (Q, M, N, K, transpose_a_int, transpose_b_int, a.dtype, str(a.device))
     if cache_key not in _masked_bmm_tune_cache:
         result = exhaustive_search(
-            list(_masked_bmm_autotune_configs()),
+            list(_masked_bmm_autotune_configs(a.device)),
             stream,
             grid_fn,
             _masked_bmm_kernel,
@@ -429,7 +429,7 @@ def masked_bmm(
             transpose_b,
         )
     else:
-        default_configs = _get_default_kernel_configs()
+        default_configs = _get_default_kernel_configs(a.device)
         kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
         BLOCK_M = kernel_configs.get("BLOCK_M")

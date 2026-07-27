@@ -67,7 +67,8 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
         """cuTile gemm_alpha_beta must match the torch reference, including beta==0."""
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
-        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
+        cc_num = cc_major * 10 + cc_minor
         if not gemm_alpha_beta.is_backend_supported(backend, cc_num):
             pytest.skip(
                 f"gemm_alpha_beta {backend} backend not supported on compute capability {cc_num}."
@@ -93,7 +94,8 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
         output (guards against ``0 * NaN`` in the epilogue)."""
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
-        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
+        cc_num = cc_major * 10 + cc_minor
         if not gemm_alpha_beta.is_backend_supported(backend, cc_num):
             pytest.skip(
                 f"gemm_alpha_beta {backend} backend not supported on compute capability {cc_num}."
