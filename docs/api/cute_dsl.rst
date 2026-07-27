@@ -64,6 +64,18 @@ CuTe-DSL implementations of the batch attention wrappers.
 
     .. automethod:: __init__
 
+.. currentmodule:: flashinfer.cute_dsl.attention.wrappers.batch_decode
+
+.. autoclass:: BatchDecodeCuteDSLWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchDecodePagedCuteDSLWrapper
+    :members:
+
+    .. automethod:: __init__
+
 Block Sparse Attention
 ----------------------
 

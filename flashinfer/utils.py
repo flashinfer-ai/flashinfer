@@ -497,6 +497,28 @@ def is_cutlass_backend_supported(
     return True
 
 
+def _should_use_fmha_v2_sm120(
+    device: torch.device,
+    pos_encoding_mode: int,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """Check if fmha_v2 HMMA kernels should be used for SM12x attention.
+
+    SM12x supports Ampere-compatible HMMA tensor core instructions (sm_mma=80).
+    The fmha_v2 library has SM120 kernel variants that use these instructions
+    and outperform generic FA2 on SM12x.
+    """
+    return (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+    )
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -641,14 +663,20 @@ def is_sm12x_supported(device: torch.device) -> bool:
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
-    In particular, SM120 (Blackwell lite) does NOT support it.
+    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
+    Blackwell) — both must return False, else the kernels silently compile the
+    ~12-instruction software-emulation fallback and stochastic rounding runs
+    ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
+    Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
+    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
     """
     if device is None:
         device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
-    # SM100a and SM110a support cvt.rs; SM120 does not.
-    return major in (10, 11)
+    # Match the CUDA guard exactly: only the arches where cvt.rs actually
+    # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
+    # (major 11) has no `.rs` feature.
+    return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -803,6 +831,11 @@ def round_up(x: int, y: int) -> int:
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(

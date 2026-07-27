@@ -86,7 +86,7 @@ def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12]
+        supported_major_versions=[10]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
@@ -104,7 +104,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -270,7 +270,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
@@ -319,6 +319,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ]
         + nvcc_flags,
         extra_include_paths=[
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",

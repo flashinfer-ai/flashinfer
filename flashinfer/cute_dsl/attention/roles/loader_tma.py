@@ -20,7 +20,7 @@ from cutlass.cute.typing import Int32
 from cutlass.pipeline import PipelineProducer
 
 from ..config import AttentionConfig
-from ..fusion.mask import get_trip_count, get_kv_start_block_idx
+from ..fusion.mask import get_kv_block_range
 from ..scheduler.persistent import (
     FmhaStaticTileScheduler,
     FmhaStaticTileSchedulerParams,
@@ -38,8 +38,45 @@ class LoaderRole:
         self.cta_tiler = config.cta_tiler
         self.qk_mma_tiler = config.qk_mma_tiler
         self.pv_mma_tiler = config.pv_mma_tiler
-        self.mask_type = config.mask_type
-        self.window_left = config.window_left
+        self.mask_spec = config.mask_spec
+        # Populated by set_v_tx_bytes() once dtypes are known at __call__
+        # time.  None means K and V have the same width (plain acquires).
+        self.v_tx_bytes = None
+        self.kv_stages = None
+
+    def set_v_tx_bytes(self, v_tx_bytes, kv_stages) -> None:
+        """Set V's TMA byte count for mixed K/V dtype builds.
+
+        The shared K/V ring's barriers are initialized with K's byte
+        count; when the widths differ, each V acquire must re-arm its
+        slot with V's byte count instead (pass None for uniform builds).
+        """
+        self.v_tx_bytes = v_tx_bytes
+        self.kv_stages = kv_stages
+
+    def _acquire_v(self, load_kv_producer: PipelineProducer, load_kv_mbar_base_ptr):
+        """Acquire a V slot on the shared K/V ring.
+
+        Returns (slot index, barrier pointer for the TMA copy).  With
+        mixed K/V dtypes this bypasses acquire_and_advance() to arm the
+        full barrier with V's byte count — the same scheme as the
+        vendored FMHA kernel's kv_producer_update_tx_acquire_and_advance.
+        Undecorated on purpose: it is inlined at trace time (like the
+        vendored helper) because it handles pipeline participant objects.
+        """
+        if self.v_tx_bytes is None:
+            handle = load_kv_producer.acquire_and_advance()
+            return handle.index, handle.barrier
+        state = load_kv_producer._PipelineProducer__state.clone()
+        cute.arch.mbarrier_wait(
+            load_kv_mbar_base_ptr + self.kv_stages + state.index, state.phase
+        )
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                load_kv_mbar_base_ptr + state.index, self.v_tx_bytes
+            )
+        load_kv_producer.advance()
+        return state.index, load_kv_mbar_base_ptr + state.index
 
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
@@ -157,9 +194,12 @@ class LoaderRole:
         sV: cute.Tensor,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
+        window_left: Int32,
+        window_right: Int32,
         load_q_producer: PipelineProducer,
         load_kv_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
+        load_kv_mbar_base_ptr,
     ):
         """Loader warp orchestration loop (prefill-specific).
 
@@ -266,14 +306,16 @@ class LoaderRole:
                     tma_bar_ptr=q0_handle_producer.barrier,
                 )
                 # K0
-                kv_coord = get_kv_start_block_idx(
-                    self.mask_type,
-                    self.window_left,
+                kv_block_start, kv_block_end = get_kv_block_range(
+                    self.mask_spec,
                     curr_block_coord,
                     self.cta_tiler,
                     seqlen_k,
                     seqlen_q,
+                    window_left,
+                    window_right,
                 )
+                kv_coord = kv_block_start
                 k_handle_producer = load_kv_producer.acquire_and_advance()
                 cute.copy(
                     tma_atom_k,
@@ -291,26 +333,18 @@ class LoaderRole:
                     tma_bar_ptr=q1_handle_producer.barrier,
                 )
                 # V0
-                v_handle_producer = load_kv_producer.acquire_and_advance()
+                v_index, v_bar_ptr = self._acquire_v(
+                    load_kv_producer, load_kv_mbar_base_ptr
+                )
                 cute.copy(
                     tma_atom_v,
                     tVgV[None, kv_coord],
-                    tVsV[None, v_handle_producer.index],
-                    tma_bar_ptr=v_handle_producer.barrier,
+                    tVsV[None, v_index],
+                    tma_bar_ptr=v_bar_ptr,
                 )
                 kv_coord += 1
 
-                seqlen_kv_loop_steps = (
-                    get_trip_count(
-                        self.mask_type,
-                        self.window_left,
-                        curr_block_coord,
-                        self.cta_tiler,
-                        seqlen_k,
-                        seqlen_q,
-                    )
-                    - 1
-                )
+                seqlen_kv_loop_steps = kv_block_end - kv_block_start - 1
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                     # Ki
                     k_handle_producer = load_kv_producer.acquire_and_advance()
@@ -321,12 +355,14 @@ class LoaderRole:
                         tma_bar_ptr=k_handle_producer.barrier,
                     )
                     # Vi
-                    v_handle_producer = load_kv_producer.acquire_and_advance()
+                    v_index, v_bar_ptr = self._acquire_v(
+                        load_kv_producer, load_kv_mbar_base_ptr
+                    )
                     cute.copy(
                         tma_atom_v,
                         tVgV[None, kv_coord],
-                        tVsV[None, v_handle_producer.index],
-                        tma_bar_ptr=v_handle_producer.barrier,
+                        tVsV[None, v_index],
+                        tma_bar_ptr=v_bar_ptr,
                     )
                     kv_coord += 1
 
