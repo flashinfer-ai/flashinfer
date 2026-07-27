@@ -17,6 +17,20 @@ class MoEEpFaultToleranceUnsupportedError(RuntimeError):
     """
 
 
+class MoEEpRankEvictedError(RuntimeError):
+    """This rank was masked out by its peers during mask reconciliation.
+
+    The survivors agreed we are dead — typically because our dispatch stalled
+    long enough for their kernels to time out on us. We cannot apply that
+    decision (a rank cannot mask itself, and both transports reject it), and
+    we must not keep serving as if we were still in the group: our peers are
+    no longer sending us tokens.
+
+    The framework owns the recovery: tear this worker down, or rejoin through
+    a fresh Fleet once the survivors call ``clear_faults(readmit=True)``.
+    """
+
+
 class MoEEpTransportError(RuntimeError):
     """A native transport call returned a non-success status."""
 

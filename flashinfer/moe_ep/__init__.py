@@ -21,6 +21,7 @@ from pathlib import Path
 from .errors import (
     MoEEpFaultToleranceUnsupportedError,
     MoEEpNotBuiltError,
+    MoEEpRankEvictedError,
     MoEEpTransportError,
 )
 from .algo_knobs import (
@@ -139,6 +140,7 @@ __all__ = [
     "MoEEpLayer",
     "MoEEpMegaLayer",
     "MoEEpNotBuiltError",
+    "MoEEpRankEvictedError",
     "MoEEpSplitLayer",
     "MoEEpTransportError",
     "MoEEpTensors",
