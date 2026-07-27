@@ -1,0 +1,32 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from . import env as jit_env
+from .core import JitSpec, gen_jit_spec, sm120a_nvcc_flags
+
+
+def gen_conv3d_nvfp4_activation_module() -> JitSpec:
+    return gen_jit_spec(
+        "conv3d_nvfp4_activation",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "conv3d_nvfp4_activation.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "conv3d_nvfp4_activation_jit_binding.cu",
+        ],
+        extra_cuda_cflags=sm120a_nvcc_flags,
+    )
+
+
+__all__ = ["gen_conv3d_nvfp4_activation_module"]
