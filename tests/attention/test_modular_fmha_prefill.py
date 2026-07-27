@@ -5,7 +5,8 @@
 
 Covers: basic prefill (various q/kv/batch combos, GQA vs MHA, causal),
 variable-length sequences, output transform, logits transform (sigmoid),
-and attention sink.
+attention sink, and band masks (causal sliding window, symmetric window,
+left-bound-only window).
 
 Each unique (mask_type, fusion) combination triggers one JIT compilation
 (~30s). The test matrix is designed to reuse compiled kernels across
@@ -737,6 +738,411 @@ FP16_SHAPE_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+    ],
+)
+def test_attention_prefill_fp8(batch_size, qo_len, kv_len, causal, window_left):
+    """Uniform fp8 (e4m3) inputs on the modular kernel.
+
+    The tolerance reflects fp8's inherent error — P (the softmax weights)
+    is stored in e4m3 for the PV GEMM — and was calibrated against the
+    trtllm CuTe DSL FMHA kernel's fp8 output on identical inputs (both
+    kernels reach max_err ~0.066 vs an f32 reference at these shapes).
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        window_left=window_left,
+    )
+    o = wrapper.run(q, k, v)
+
+    # f32 reference over the dequantized fp8 inputs.
+    o_ref = attention_band_mask_ref(
+        batch_size,
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        SM_SCALE,
+        causal,
+        window_left,
+        window_right=-1,
+    )
+    torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+    ],
+)
+def test_attention_prefill_mixed_v_dtype(
+    batch_size, qo_len, kv_len, causal, window_left
+):
+    """Mixed dtypes: bf16 Q/K with fp8 (e4m3) V on the modular kernel.
+
+    P (the softmax weights) converts to V's dtype for the PV GEMM, so the
+    tolerance matches the uniform-fp8 test's fp8-P calibration.  The same
+    wrapper serves the uniform bf16 kernel first to exercise the per-V-dtype
+    kernel cache, and LSE (a Q@K quantity, independent of V) must match the
+    bf16 reference exactly within f32 tolerance.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v_bf16 = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = v_bf16.to(torch.float8_e4m3fn)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    # Uniform kernel first: the mixed run below must not disturb it.
+    o_uniform = wrapper.run(q, k, v_bf16)
+    o_ref_uniform = attention_band_mask_ref(
+        batch_size, q, k, v_bf16, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o_uniform, o_ref_uniform, rtol=RTOL, atol=ATOL)
+
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+    o_ref = attention_band_mask_ref(
+        batch_size,
+        q.to(torch.float32),
+        k.to(torch.float32),
+        v.to(torch.float32),
+        SM_SCALE,
+        causal,
+        window_left,
+        window_right=-1,
+    )
+    torch.testing.assert_close(o.float(), o_ref.float(), rtol=1e-2, atol=8e-2)
+    lse_ref = _band_mask_lse_ref(batch_size, q, k, causal, window_left, SM_SCALE)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def _band_mask_lse_ref(batch_size, q, k, causal, window_left, sm_scale):
+    """Log2-domain LSE reference over band-masked logits (per uniform batch)."""
+    qo_len = q.shape[0] // batch_size
+    kv_len = k.shape[0] // batch_size
+    group_size = q.shape[1] // k.shape[1]
+    kk = torch.repeat_interleave(k, group_size, dim=1)
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, q.shape[1], -1).float(),
+            kk.view(batch_size, kv_len, q.shape[1], -1).float(),
+        )
+        * sm_scale
+    )
+    qk_offset = kv_len - qo_len
+    q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
+    k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
+    mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    if causal:
+        mask &= k_idx <= q_idx + qk_offset
+    if window_left >= 0:
+        mask &= (q_idx + qk_offset) - k_idx <= window_left
+    logits = logits.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    # (b, h, m) -> (b*m, h), log2 domain
+    lse = torch.logsumexp(logits, dim=-1) * math.log2(math.e)
+    return lse.transpose(1, 2).reshape(batch_size * qo_len, q.shape[1])
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,causal,window_left",
+    [
+        (1, 2048, 2048, True, -1),
+        (1, 2048, 2048, True, 127),
+        (3, 512, 512, False, -1),
+        (1, 128, 512, True, 100),
+    ],
+)
+def test_attention_prefill_lse(batch_size, qo_len, kv_len, causal, window_left):
+    """return_lse on the standard path: log2-domain (total_q, h_q) f32."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    o_plain = wrapper.run(q, k, v)
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    # The LSE variant must not perturb the attention output.
+    torch.testing.assert_close(o, o_plain, rtol=0, atol=0)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+    lse_ref = _band_mask_lse_ref(batch_size, q, k, causal, window_left, SM_SCALE)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("indptr", [[0, 7, 1291, 1547, 3083]])
+def test_attention_prefill_lse_varlen(indptr):
+    """LSE row indexing over a mixed-length ragged batch (causal+window)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+    window_left = 100
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn_like(k)
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        qo_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    for i in range(len(indptr) - 1):
+        lo, hi = indptr[i], indptr[i + 1]
+        o_ref = attention_band_mask_ref(
+            1, q[lo:hi], k[lo:hi], v[lo:hi], SM_SCALE, True, window_left, -1
+        )
+        lse_ref = _band_mask_lse_ref(1, q[lo:hi], k[lo:hi], True, window_left, SM_SCALE)
+        torch.testing.assert_close(o[lo:hi], o_ref, rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(lse[lo:hi], lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_attention_prefill_lse_alibi():
+    """LSE with a score_mod variant (standard path): LSE over ALiBi logits."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    batch_size, qo_len, kv_len = 9, 256, 256
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    alibi_slopes = ALiBiAttention.get_slopes(NUM_QO_HEADS).cuda()
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        variant=ALiBiAttention(alibi_slopes),
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    o_ref = attention_alibi_ref(batch_size, q, k, v, True, SM_SCALE, alibi_slopes)
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+    # LSE over the ALiBi-modified logits (mirrors attention_alibi_ref).
+    kk = torch.repeat_interleave(k, NUM_QO_HEADS // num_kv_heads, dim=1)
+    logits = torch.einsum(
+        "bmhd,bnhd->bhmn",
+        q.view(batch_size, qo_len, NUM_QO_HEADS, HEAD_DIM).float(),
+        kk.view(batch_size, kv_len, NUM_QO_HEADS, HEAD_DIM).float(),
+    )
+    qo_pos = torch.arange(qo_len, device=q.device).view(1, 1, -1, 1)
+    kv_pos = torch.arange(kv_len, device=q.device).view(1, 1, 1, -1)
+    logits = (logits + alibi_slopes.view(1, -1, 1, 1) * (kv_pos - qo_pos)) * SM_SCALE
+    mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+        1
+    ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    lse_ref = (
+        (torch.logsumexp(logits, dim=-1) * math.log2(math.e))
+        .transpose(1, 2)
+        .reshape(batch_size * qo_len, NUM_QO_HEADS)
+    )
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_attention_prefill_lse_sink():
+    """LSE with attention sinks: the sink term is part of the denominator."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    batch_size, qo_len, kv_len = 1, 256, 256
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    sink = torch.randn((NUM_QO_HEADS,), dtype=DTYPE, device="cuda")
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=True,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        variant=AttentionWithSink(sink),
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    o_ref, _ = attention_ref(batch_size, q, k, v, True, SM_SCALE, sink=sink)
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+    # With-sink LSE: log of the actual normalization denominator,
+    # log2(sum_k exp(s_k) + exp(sink)) — attention_ref's lse is sink-less.
+    kk = torch.repeat_interleave(k, NUM_QO_HEADS // num_kv_heads, dim=1)
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len, NUM_QO_HEADS, HEAD_DIM).float(),
+            kk.view(batch_size, kv_len, NUM_QO_HEADS, HEAD_DIM).float(),
+        )
+        * SM_SCALE
+    )
+    mask = torch.arange(kv_len - qo_len, kv_len, device=q.device).unsqueeze(
+        1
+    ) >= torch.arange(0, kv_len, device=q.device).unsqueeze(0)
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    logits_with_sink = torch.cat(
+        [logits, sink.float().view(1, -1, 1, 1).expand(batch_size, -1, qo_len, 1)],
+        dim=-1,
+    )
+    lse_ref = (
+        (torch.logsumexp(logits_with_sink, dim=-1) * math.log2(math.e))
+        .transpose(1, 2)
+        .reshape(batch_size * qo_len, NUM_QO_HEADS)
+    )
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size,qo_len,kv_len", FP16_SHAPE_PARAMS)
 @pytest.mark.parametrize("causal", [False, True])
 def test_attention_prefill_fp16(
@@ -792,18 +1198,23 @@ def test_attention_prefill_fp16(
 # ---------------------------------------------------------------------------
 
 
-def attention_sliding_window_ref(
+def attention_band_mask_ref(
     batch_size,
     q,
     k,
     v,
-    window_left,
     sm_scale,
+    causal,
+    window_left,
+    window_right,
 ):
-    """Reference for symmetric sliding window: |kv_idx - (q_idx + offset)| <= window_left.
+    """Band-mask reference. With offset = kv_len - qo_len (Q right-aligned
+    to KV), row q sees k in::
 
-    When qo_len != kv_len, Q positions are right-aligned to KV: q_idx maps
-    to kv position q_idx + (kv_len - qo_len).
+        max(0, q + offset - window_left) <= k <= q + offset            (causal)
+        max(0, q + offset - window_left) <= k <= q + offset + window_right
+
+    where a window value of -1 means unbounded on that side.
     """
     qo_len = q.shape[0] // batch_size
     kv_len = k.shape[0] // batch_size
@@ -829,7 +1240,14 @@ def attention_sliding_window_ref(
     qk_offset = kv_len - qo_len
     q_idx = torch.arange(qo_len, device=q.device).unsqueeze(1)
     k_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)
-    mask = torch.abs(k_idx - (q_idx + qk_offset)) <= window_left
+    mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+    # Causal is a right bound of 0 (the kernel's own folding); it must come
+    # from the flag because callers pass causal=True with window_right=-1.
+    wr = 0 if causal else window_right
+    if wr >= 0:
+        mask &= k_idx - (q_idx + qk_offset) <= wr
+    if window_left >= 0:
+        mask &= (q_idx + qk_offset) - k_idx <= window_left
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
 
     p = torch.softmax(logits, dim=-1)
@@ -846,29 +1264,7 @@ def attention_sliding_window_ref(
     return o_ref
 
 
-SLIDING_WINDOW_PARAMS = [
-    # (batch, qo_len, kv_len, window_left)
-    (1, 256, 256, 64),
-    (1, 256, 256, 128),
-    (9, 256, 256, 100),
-    (1, 512, 512, 200),
-    # qo_len != kv_len (Q right-aligned to KV, as in append/prefill-with-cache)
-    (1, 128, 256, 64),
-    (1, 128, 512, 100),
-    (1, 256, 512, 128),
-    (3, 128, 384, 80),
-]
-
-
-@pytest.mark.parametrize("batch_size,qo_len,kv_len,window_left", SLIDING_WINDOW_PARAMS)
-def test_attention_prefill_sliding_window(
-    batch_size,
-    qo_len,
-    kv_len,
-    window_left,
-):
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("SM100A is not supported on this device")
+def _run_band_mask_case(batch_size, qo_len, kv_len, causal, window_left, window_right):
     num_kv_heads = 8
 
     torch.manual_seed(42)
@@ -898,14 +1294,242 @@ def test_attention_prefill_sliding_window(
         num_kv_heads,
         HEAD_DIM,
         head_dim_vo=HEAD_DIM,
-        causal=False,
+        causal=causal,
         sm_scale=SM_SCALE,
         q_data_type=DTYPE,
         kv_data_type=DTYPE,
         window_left=window_left,
+        window_right=window_right,
     )
     o = wrapper.run(q, k, v)
-    o_ref = attention_sliding_window_ref(batch_size, q, k, v, window_left, SM_SCALE)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right
+    )
+
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+SLIDING_WINDOW_PARAMS = [
+    # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 64),
+    (1, 256, 256, 128),
+    (9, 256, 256, 100),
+    (1, 512, 512, 200),
+    # qo_len != kv_len (Q right-aligned to KV, as in append/prefill-with-cache)
+    (1, 128, 256, 64),
+    (1, 128, 512, 100),
+    (1, 256, 512, 128),
+    (3, 128, 384, 80),
+]
+
+# Causal sliding window (the serving configuration, e.g. Mistral/Gemma SWA).
+# Window values reuse the symmetric list's to share compiled kernels where
+# possible; includes a non-tile-aligned kv_len to exercise the seqlen_k tail
+# combined with the window left edge.
+CAUSAL_SLIDING_WINDOW_PARAMS = [
+    # (batch, qo_len, kv_len, window_left)
+    (1, 256, 256, 0),  # attend-self-only: exercises the head-borrow path
+    (1, 256, 256, 64),
+    (1, 512, 512, 128),
+    (9, 256, 256, 100),
+    (1, 128, 512, 100),  # qo_len != kv_len
+    (1, 256, 300, 64),  # kv_len not tile-aligned
+]
+
+
+@pytest.mark.parametrize("batch_size,qo_len,kv_len,window_left", SLIDING_WINDOW_PARAMS)
+def test_attention_prefill_sliding_window_symmetric(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Non-causal symmetric window: k in [q+off-w, q+off+w]."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=False,
+        window_left=window_left,
+        window_right=window_left,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,window_left", CAUSAL_SLIDING_WINDOW_PARAMS
+)
+def test_attention_prefill_causal_sliding_window(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Causal + window_left: k in [q+off-w, q+off] (regression: the window
+    used to be silently ignored when causal=True)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=True,
+        window_left=window_left,
+        window_right=-1,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,window_left",
+    [
+        (1, 256, 256, 64),
+        (1, 128, 512, 100),
+    ],
+)
+def test_attention_prefill_left_window_only(
+    batch_size,
+    qo_len,
+    kv_len,
+    window_left,
+):
+    """Non-causal left-bound-only window: k in [q+off-w, kv_len), matching
+    the FlashInfer window_left convention (variants.cuh)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    _run_band_mask_case(
+        batch_size,
+        qo_len,
+        kv_len,
+        causal=False,
+        window_left=window_left,
+        window_right=-1,
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_prefill_sliding_window_top_level_wrapper(causal):
+    """Windowed plans through the public ragged wrapper (backend="cute-dsl").
+
+    Guards the backend routing in flashinfer/prefill.py: windowed plans
+    must reach the modular cute-dsl path.  The trtllm CuTe DSL FMHA route
+    (taken for variant-less head-128 plans) measures slower on sliding
+    windows, and its prebuilt artifact matrix has no windowed variants —
+    a mis-routed windowed plan either JIT-compiles a slower kernel or, on
+    older glue, fails the FFI signature check outright.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    import flashinfer
+
+    batch_size, seq_len, window_left = 1, 512, 128
+    num_kv_heads = 8
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * seq_len, NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * seq_len, num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda"
+    )
+    v = torch.randn_like(k)
+    indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * seq_len
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        backend="cute-dsl",
+    )
+    wrapper.plan(
+        indptr,
+        indptr.clone(),
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        window_left=window_left,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    o = wrapper.run(q, k, v)
+    o_ref = attention_band_mask_ref(
+        batch_size, q, k, v, SM_SCALE, causal, window_left, window_right=-1
+    )
+    torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
+
+
+# Mixed per-sequence lengths: every sequence in a batch gets its own band
+# geometry (kv_start, head/main/tail peel counts, borrow rule) and short
+# sequences exercise the item-skip path — none of which uniform batches
+# cover.  Patterns include a tiny sequence, uneven multi-sequence batches,
+# and non-tile-aligned lengths.
+WINDOW_VARLEN_INDPTR_PARAMS = [
+    [0, 7, 1291, 1547, 3083],  # tiny seq + uneven lengths
+    [0, 1350, 2667, 4003, 5347, 6631, 7919, 9208, 10524],  # 8 uneven seqs
+    [0, 300, 556, 2604],  # non-tile-aligned mix
+]
+
+
+@pytest.mark.parametrize("indptr", WINDOW_VARLEN_INDPTR_PARAMS)
+@pytest.mark.parametrize(
+    "causal,window_left,window_right",
+    [
+        (True, 100, -1),  # causal + sliding window (serving SWA)
+        (False, 64, -1),  # left-bound-only window
+    ],
+)
+def test_attention_prefill_sliding_window_varlen(
+    indptr,
+    causal,
+    window_left,
+    window_right,
+):
+    """Windowed masks over mixed-length ragged batches."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("SM100A is not supported on this device")
+    num_kv_heads = 8
+
+    torch.manual_seed(42)
+    q = torch.randn(indptr[-1], NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+    k = torch.randn(indptr[-1], num_kv_heads, HEAD_DIM, dtype=DTYPE, device="cuda")
+    v = torch.randn_like(k)
+    qo_indptr = torch.tensor(indptr, device="cuda", dtype=torch.int32)
+    kv_indptr = qo_indptr
+
+    wrapper = BatchPrefillCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        NUM_QO_HEADS,
+        num_kv_heads,
+        HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        causal=causal,
+        sm_scale=SM_SCALE,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+        window_right=window_right,
+    )
+    o = wrapper.run(q, k, v)
+
+    # Per-sequence reference: the band mask depends only on each
+    # sequence's own lengths, so apply the uniform-batch reference to
+    # each slice with batch_size=1.
+    o_ref = torch.empty_like(o)
+    for i in range(len(indptr) - 1):
+        lo, hi = indptr[i], indptr[i + 1]
+        o_ref[lo:hi] = attention_band_mask_ref(
+            1,
+            q[lo:hi],
+            k[lo:hi],
+            v[lo:hi],
+            SM_SCALE,
+            causal,
+            window_left,
+            window_right,
+        )
 
     torch.testing.assert_close(o, o_ref, rtol=RTOL, atol=ATOL)
 

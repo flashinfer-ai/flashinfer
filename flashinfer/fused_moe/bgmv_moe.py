@@ -60,6 +60,8 @@ def bgmv_moe_shrink(
     expert_ids: torch.Tensor,
     lora_indices: torch.Tensor,
     lora_stride: int,
+    *,
+    per_pair_input: bool = False,
 ) -> None:
     """
     MoE LoRA shrink operation: project input through LoRA-A matrices.
@@ -80,10 +82,22 @@ def bgmv_moe_shrink(
         lora_stride: Stride (in elements) between consecutive LoRA adapters
             in the weight tensor. For layout [max_loras, num_experts, rank, feat],
             this is num_experts * rank * feat.
+        per_pair_input: If False (default, FC1), the input row is the token, so a
+            token's hidden row is reused across its k pairs (``x`` is ``[num_tokens, feat_in]``).
+            If True (FC2), the input row is the pair itself, i.e. ``x`` is a per-pair
+            ``[num_pairs, feat_in]`` buffer (e.g. the gathered post-activation). The
+            ``lora_indices``/skip lookup still uses ``sorted_token_ids[pair]``.
     """
     mod = _get_bgmv_moe_module()
     mod.bgmv_moe_shrink(
-        y, x, w_ptr, sorted_token_ids, expert_ids, lora_indices, lora_stride
+        y,
+        x,
+        w_ptr,
+        sorted_token_ids,
+        expert_ids,
+        lora_indices,
+        lora_stride,
+        per_pair_input,
     )
 
 
@@ -99,24 +113,39 @@ def bgmv_moe_expand(
     slice_start_loc: torch.Tensor,
     output_slices: List[int],
     lora_stride: int,
+    *,
+    finalize: bool = True,
 ) -> None:
     """
-    MoE LoRA expand operation: project through LoRA-B matrices with routing weights.
+    MoE LoRA expand operation: project through LoRA-B matrices.
 
-    For each (token, expert) pair, computes:
-        y[token, col_offset:col_offset+feat] += topk_weight * (x[slice, pair, :] @ lora_b[expert, lora_id, :, :])
+    With ``finalize=True`` (default), for each (token, expert) pair computes the
+    routing-weighted combine into a per-token row:
+        y[token, col_offset:col_offset+feat] += topk_weight * (x[slice, pair, :] @ lora_b[expert, lora_id])
+    (``y`` is ``[num_tokens, total_feat_out]`` and must be zero-initialized).
+
+    With ``finalize=False`` (FC1 LoRA delta), writes a per-pair, UNWEIGHTED result with a
+    plain store — no ``topk_weight``, no cross-expert combine:
+        y[pair, col_offset:col_offset+feat] = (x[slice, pair, :] @ lora_b[expert, lora_id])
+    (``y`` is ``[num_pairs, total_feat_out]``). Skipped pairs (lora_id < 0) early-return, so
+    ``y`` MUST be zero-initialized by the caller (``torch.zeros``) to define those rows.
+    ``topk_weights`` is ignored in this mode but must still be a valid ``[num_pairs]`` float32
+    tensor.
 
     Args:
-        y: Output tensor [num_tokens, total_feat_out]. Float32 accumulation buffer.
+        y: Output buffer (zero-initialized). ``[num_tokens, total_feat_out]`` (finalize) or
+            ``[num_pairs, total_feat_out]`` (no-finalize). Float32.
         x: Shrink output [num_slices, num_pairs, rank].
         w_ptr: Pointer table [num_slices, num_experts] of int64.
         sorted_token_ids: Token indices for each pair [num_pairs].
         expert_ids: Expert indices for each pair [num_pairs].
-        topk_weights: Routing weights for each pair [num_pairs]. Float32.
+        topk_weights: Routing weights for each pair [num_pairs]. Float32. (Ignored when
+            ``finalize=False``.)
         lora_indices: LoRA adapter ID for each token [num_tokens].
         slice_start_loc: Column offset for each slice [num_slices]. Int64.
         output_slices: Output feature dimension for each slice.
         lora_stride: Stride between LoRA adapters in weight tensor.
+        finalize: Combine + weight per token (True) vs per-pair unweighted store (False).
     """
     mod = _get_bgmv_moe_module()
     mod.bgmv_moe_expand(
@@ -130,6 +159,7 @@ def bgmv_moe_expand(
         slice_start_loc,
         output_slices[0],
         lora_stride,
+        finalize,
     )
 
 

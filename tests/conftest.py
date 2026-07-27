@@ -176,9 +176,9 @@ def pytest_collection_modifyitems(config, items):
     """Skip moe_ep tests on hosts that lack the requisite env / GPUs / arch."""
     nvep_built = False
     try:
-        from flashinfer.moe_ep import available_backends
+        from importlib import import_module
 
-        nvep_built = bool(available_backends())
+        nvep_built = bool(import_module("flashinfer.moe_ep").available_backends())
     except ImportError:
         pass
 
@@ -200,6 +200,15 @@ def pytest_collection_modifyitems(config, items):
         for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):
             if mk in item.keywords and ngpu < req:
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
+            elif mk in item.keywords and "WORLD_SIZE" not in os.environ:
+                # Multi-rank tests must be launched via torchrun (see
+                # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
+                # (e.g. CI unit-test sweeps) they would hang on dist init.
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="requires torchrun launch (WORLD_SIZE unset)"
+                    )
+                )
         if "arch_blackwell" in item.keywords and cc < (10, 0):
             item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
 

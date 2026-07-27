@@ -27,6 +27,7 @@ from ..trace.templates.quantize import (
     nvfp4_kv_dequantize_paged_trace,
     nvfp4_kv_quantize_trace,
     nvfp4_quantize_trace,
+    silu_and_mul_nvfp4_quantize_trace,
 )
 from ..jit import JitSpec
 from ..jit import env as jit_env
@@ -739,6 +740,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_vec_size: int = 16,
         ufp8_type: int = 1,
         is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
     ) -> torch.Tensor:
         """Convert E2M1 format tensor and UFP8 scale factors to float tensor.
 
@@ -752,6 +754,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
             ufp8_type (int, optional): UFP8 scale factor type (0 for UE8M0, 1 for E4M3). Defaults to 1.
             is_sf_swizzled_layout (bool, optional): Whether scale factors use swizzled layout. Defaults to True.
+            is_sf_8x4_layout (bool, optional): Whether swizzled scale factors use the 8x4 layout. Defaults to False.
 
         Returns:
             torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
@@ -769,6 +772,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             sf_vec_size,
             ufp8_type,
             is_sf_swizzled_layout,
+            is_sf_8x4_layout,
         )
         return out
 
@@ -780,6 +784,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_vec_size: int = 16,
         ufp8_type: int = 1,
         is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
     ) -> torch.Tensor:
         return e2m1_tensor.new_empty(
             [e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2], dtype=torch.float32
@@ -795,6 +800,88 @@ def get_fp4_quantization_module(backend: str = "100"):
         nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
+    )
+
+
+@flashinfer_api(trace=silu_and_mul_nvfp4_quantize_trace)
+def silu_and_mul_nvfp4_quantize(
+    input: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_vec_size: int = 16,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
+
+    Computes ``silu(input[..., :K]) * input[..., K:]`` before quantization.
+    Requires CuTe-DSL and an SM100+ GPU.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Contiguous fp16/bf16 tensor of shape ``[..., 2K]``. Leading dimensions
+        are flattened into M.
+    global_scale : torch.Tensor
+        Float32 scale of shape ``[1]``, typically
+        ``(448 * 6) / silu_and_mul(input).abs().max()``.
+    sf_vec_size : int
+        Scale vector size. Only 16 is supported.
+    is_sf_swizzled_layout : bool
+        Use a swizzled scale layout. Defaults to True.
+    is_sf_8x4_layout : bool
+        Use the 8x4 rather than 128x4 swizzled layout.
+    enable_pdl : bool, optional
+        Enable Programmatic Dependent Launch. Auto-detected when None.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Packed FP4 values of shape ``[M, K/2]`` and their scale factors.
+    """
+    if sf_vec_size != 16:
+        raise NotImplementedError(
+            "sf_vec_size can only be 16 for silu_and_mul_nvfp4_quantize"
+        )
+    assert input.is_contiguous(), "input must be row-major contiguous"
+    assert input.shape[-1] % 2 == 0, (
+        "the last dimension must be even (gate and up concatenated)"
+    )
+    k = input.shape[-1] // 2
+    assert k % sf_vec_size == 0
+
+    # Reject pre-Blackwell GPUs before CuTe-DSL compilation.
+    major, minor = get_compute_capability(input.device)
+    if major < 10:
+        raise RuntimeError(
+            "silu_and_mul_nvfp4_quantize requires a Blackwell GPU (SM100+, compute "
+            f"capability >= 10.0); got SM{major}{minor}."
+        )
+
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise RuntimeError(
+            "silu_and_mul_nvfp4_quantize requires the CuTe-DSL backend, which is not "
+            "available. Please install the required dependencies."
+        )
+    # Qualify NVFP4 layout constants to distinguish them from MXFP4 constants.
+    from .kernels import nvfp4_quantize as _nvfp4_kernels
+
+    if not is_sf_swizzled_layout:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_LINEAR
+    elif is_sf_8x4_layout:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_8x4
+    else:
+        sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
+
+    global_scale = global_scale.to(device=input.device, dtype=torch.float32)
+    # The helper returns scales in the final layout-specific 2D shape.
+    return _nvfp4_kernels.silu_and_mul_nvfp4_quantize_cute_dsl(
+        input,
+        global_scale,
+        sf_layout=sf_layout,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1010,22 +1097,19 @@ def _fp4_quantize_cute_dsl(
         )
 
     if sf_vec_size == 16 and not sf_use_ue8m0:
-        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts
-        from .kernels.nvfp4_quantize import (
-            SF_LAYOUT_128x4,
-            SF_LAYOUT_8x4,
-            SF_LAYOUT_LINEAR,
-            nvfp4_quantize_cute_dsl,
-        )
+        # NVFP4 path: E4M3 scale factors, sf_vec_size=16, all layouts. Import the
+        # module (not the SF_LAYOUT_* names) so they are not redefined against the
+        # MXFP4 branch below.
+        from .kernels import nvfp4_quantize as _nvfp4_kernels
 
         if not is_sf_swizzled_layout:
-            sf_layout = SF_LAYOUT_LINEAR
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_LINEAR
         elif is_sf_8x4_layout:
-            sf_layout = SF_LAYOUT_8x4
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_8x4
         else:
-            sf_layout = SF_LAYOUT_128x4
+            sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
 
-        return nvfp4_quantize_cute_dsl(
+        return _nvfp4_kernels.nvfp4_quantize_cute_dsl(
             input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
         )
 
@@ -1111,6 +1195,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     sf_vec_size: int = 16,
     ufp8_type: int = 1,
     is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
 ) -> torch.Tensor:
     r"""Dequantize an E2M1 tensor with UFP8 scales back to float32.
 
@@ -1135,6 +1220,10 @@ def e2m1_and_ufp8sf_scale_to_float(
     is_sf_swizzled_layout : bool
         Whether the scale factors are stored in the swizzled layout.
         Defaults to ``True``.
+    is_sf_8x4_layout : bool
+        Whether swizzled scale factors use the 8x4 layout instead of the
+        default 128x4 layout.  Must be ``False`` when
+        ``is_sf_swizzled_layout=False``.  Defaults to ``False``.
 
     Returns
     -------
@@ -1166,6 +1255,7 @@ def e2m1_and_ufp8sf_scale_to_float(
         sf_vec_size,
         ufp8_type,
         is_sf_swizzled_layout,
+        is_sf_8x4_layout,
     )
 
 
@@ -1352,9 +1442,11 @@ def nvfp4_quantize(
             }
             a_fp4, a_sf, per_token_scale = nvfp4_quantize_per_token_cute_dsl(
                 a.cuda(),
-                a_global_sf.cuda()
-                if isinstance(a_global_sf, torch.Tensor)
-                else a_global_sf,
+                (
+                    a_global_sf.cuda()
+                    if isinstance(a_global_sf, torch.Tensor)
+                    else a_global_sf
+                ),
                 sf_layout=_sf_layout_map[sf_layout],
                 enable_pdl=enable_pdl,
             )
@@ -1444,6 +1536,7 @@ def mxfp4_quantize(
     a: torch.Tensor,
     backend: str = "cuda",
     enable_pdl: Optional[bool] = None,
+    sfLayout: SfLayout = SfLayout.layout_128x4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MXFP4 format.
 
@@ -1460,6 +1553,10 @@ def mxfp4_quantize(
         Whether to enable Programmatic Dependent Launch.  Only used when
         ``backend == "cute-dsl"``.  Auto-detected from device capability
         when ``None``.
+    sfLayout : SfLayout
+        Scale-factor layout.  Defaults to ``SfLayout.layout_128x4``.
+        Supported layouts are ``layout_128x4``, ``layout_8x4``, and
+        ``layout_linear``.
 
     Returns
     -------
@@ -1475,6 +1572,7 @@ def mxfp4_quantize(
     stable API.  It may change or be removed in future versions without
     notice.  Use at your own risk for production workloads.
     """
+    sfLayout = SfLayout(sfLayout)
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
 
@@ -1483,19 +1581,44 @@ def mxfp4_quantize(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install the required dependencies."
             )
-        from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
+        from .kernels.mxfp4_quantize import (
+            SF_LAYOUT_128x4,
+            SF_LAYOUT_8x4,
+            SF_LAYOUT_LINEAR,
+            mxfp4_quantize_cute_dsl,
+        )
 
-        return mxfp4_quantize_cute_dsl(a, enable_pdl=enable_pdl)
+        _sf_layout_map = {
+            SfLayout.layout_128x4: SF_LAYOUT_128x4,
+            SfLayout.layout_8x4: SF_LAYOUT_8x4,
+            SfLayout.layout_linear: SF_LAYOUT_LINEAR,
+        }
+
+        return mxfp4_quantize_cute_dsl(
+            a, sf_layout=_sf_layout_map[sfLayout], enable_pdl=enable_pdl
+        )
     elif backend == "cuda":
-        a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
-        a_fp4, a_sf = fp4_quantize(a.cuda(), a_global_sf.cuda(), 32, True, True)
+        is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
+        is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
+        a_fp4, a_sf = fp4_quantize(
+            a.cuda(),
+            global_scale=None,
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+        )
         return a_fp4, a_sf
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
 
 
 @flashinfer_api
-def mxfp4_dequantize(a_fp4, a_sf):
+def mxfp4_dequantize(
+    a_fp4,
+    a_sf,
+    sfLayout: SfLayout = SfLayout.layout_128x4,
+):
     r"""Dequantize MXFP4 packed weights back to float32.
 
     Parameters
@@ -1504,23 +1627,25 @@ def mxfp4_dequantize(a_fp4, a_sf):
         Quantized tensor of shape ``[M, K/2]`` with dtype ``uint8``
         (``FLOAT4_E2M1X2``).
     a_sf : torch.Tensor
-        UE8M0 scale-factor tensor (``uint8``); shape depends on the
-        layout and ``sf_vec_size`` (this entry point assumes the
-        swizzled buffer produced by :func:`mxfp4_quantize` with
-        ``sf_vec_size = 32``).
+        UE8M0 scale-factor tensor (``uint8``); shape depends on ``sfLayout``.
+    sfLayout : SfLayout
+        Scale-factor layout used by ``a_sf``.  Defaults to
+        ``SfLayout.layout_128x4``.
 
     Returns
     -------
     torch.Tensor
         Dequantized tensor of shape ``[M, K]`` with dtype ``float32``.
     """
+    sfLayout = SfLayout(sfLayout)
     return e2m1_and_ufp8sf_scale_to_float(
         a_fp4.cpu().view(torch.uint8),
         a_sf.cpu().view(torch.uint8).reshape(-1),
         torch.tensor([1.0], device=a_fp4.device),
-        32,
-        0,
-        True,
+        sf_vec_size=32,
+        ufp8_type=0,
+        is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
+        is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
     )
 
 

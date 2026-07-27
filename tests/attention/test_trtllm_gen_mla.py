@@ -9,14 +9,16 @@ from flashinfer.mla import (
     supported_mla_layer_dimensions,
     smaller_mla_dimensions,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+)
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_trtllm_gen_fmha_workspace_buffer = None
 workspace_size = 128 * 1024 * 1024
 
-# Generation-mode workspace prefix: 8192 batches * 256 heads * 4 bytes/int32 counter slab.
-TRTLLM_GEN_COUNTER_BYTES = 8192 * 256 * 4
 # Guard region we zero past the softmax slab so we can detect OOB writes.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 
@@ -24,7 +26,7 @@ TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
 def trtllm_gen_workspace_softmax_end_bytes_decode(
     num_qo_heads: int, batch_size: int, max_q_len: int
 ) -> int:
-    """End offset of the softmax slab in the generation-mode workspace [counter|softmax|scratch].
+    """End offset of the softmax slab in the generation-mode workspace [softmax|scratch].
 
     The C++ launcher allocates ``sizeof(float2) * softmax_slots`` bytes, i.e. 8 bytes per
     slot, where ``softmax_slots = num_qo_heads * batch_size * round_up(max_q_len, 256)``.
@@ -33,7 +35,7 @@ def trtllm_gen_workspace_softmax_end_bytes_decode(
     softmax_slab = (
         8 * num_qo_heads * batch_size * rounded_max_q_len
     )  # sizeof(float2) == 8
-    return TRTLLM_GEN_COUNTER_BYTES + softmax_slab
+    return softmax_slab
 
 
 def generate_sparse_indices(
@@ -424,12 +426,9 @@ def trtllm_batch_decode_mla(
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    # trtllm-gen requires zero-initialized workspace (counter region);
-    # re-zero each time since other backends (e.g. cute-dsl) may share and dirty it.
-    global_trtllm_gen_fmha_workspace_buffer.zero_()
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
@@ -438,11 +437,10 @@ def trtllm_batch_decode_mla(
 
     def maybe_get_lse_guard_end(softmax_end: int) -> int | None:
         # The C++ launcher carves the workspace as
-        #     [counter (8 MB) | softmax_slab | guard (1 MB) | scratch],
+        #     [softmax_slab | guard (1 MB) | scratch],
         # where ``softmax_slab = 8 * num_heads * batch * round_up(max_q_len, 256)``
-        # bytes. ``softmax_end`` already includes the counter prefix, so the LSE
-        # guard subcheck is only meaningful when ``softmax_end + 1 MB`` still fits
-        # in the test workspace. For the largest parametrized shapes
+        # bytes. The LSE guard subcheck is only meaningful when
+        # ``softmax_end + 1 MB`` still fits in the test workspace. For the largest parametrized shapes
         # (e.g. batch=1024 * num_heads=128 * q_len=2 -> softmax_slab > 256 MB)
         # the slab alone overruns the 128 MB workspace; in that case we skip
         # the LSE subcheck and only exercise the output path (which does not
@@ -525,10 +523,6 @@ def trtllm_batch_decode_mla(
         )
     else:
         output = output_and_lse
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    if backend == "trtllm-gen":
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -796,7 +790,7 @@ def trtllm_batch_decode_mla_sparse(
             workspace_size, dtype=torch.int8, device=device
         )
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
@@ -847,9 +841,6 @@ def trtllm_batch_decode_mla_sparse(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
     )
-
-    # Check workspace buffer is zeroed
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # For now, just check that output has correct shape and no NaNs
     assert output.shape == expected_shape, (
@@ -1102,6 +1093,32 @@ def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     )
 
 
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
+def test_trtllm_batch_decode_mla_native_block_table_width(
+    uses_shared_paged_kv_idx: bool,
+):
+    page_size = 32
+    max_seq_len = 1025
+    block_table_width = (max_seq_len + page_size - 1) // page_size
+    assert block_table_width == 33
+    assert block_table_width % (128 // page_size) != 0
+
+    trtllm_batch_decode_mla(
+        supported_mla_layer_dimensions[0],
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=page_size,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=max_seq_len,
+        skips_softmax=False,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+
+
 @pytest.mark.parametrize("q_len_per_request", [1, 2, 4])
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_trtllm_batch_decode_mla_preallocated_out(
@@ -1153,7 +1170,7 @@ def test_trtllm_batch_decode_mla_preallocated_out(
 
     global global_trtllm_gen_fmha_workspace_buffer
     if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+        global_trtllm_gen_fmha_workspace_buffer = torch.empty(
             workspace_size,
             dtype=torch.int8,
             device=device,
@@ -1161,6 +1178,10 @@ def test_trtllm_batch_decode_mla_preallocated_out(
     workspace = global_trtllm_gen_fmha_workspace_buffer
 
     bmm1_scale = 1.0 / (head_dim_qk**0.5)
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_heads, get_device_sm_count(torch.device(device))
+    )
+    counter_buffer = torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
 
     # out=None should work
     result_none = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -1176,9 +1197,11 @@ def test_trtllm_batch_decode_mla_preallocated_out(
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
         backend="trtllm-gen",
+        multi_ctas_kv_counter_buffer=counter_buffer,
     )
     expected_shape = (batch_size, q_len_per_request, num_heads, kv_lora_rank)
     assert result_none.shape == expected_shape
+    assert torch.count_nonzero(counter_buffer).item() == 0
 
     # out=pre-allocated should also work (this was the bug)
     out = torch.empty(expected_shape, dtype=torch.bfloat16, device=device)
@@ -1196,9 +1219,82 @@ def test_trtllm_batch_decode_mla_preallocated_out(
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
         backend="trtllm-gen",
+        multi_ctas_kv_counter_buffer=counter_buffer,
     )
     assert result_pre.data_ptr() == out.data_ptr(), (
         "Expected kernel to write into provided out tensor"
     )
     assert result_pre.shape == expected_shape
+    assert torch.count_nonzero(counter_buffer).item() == 0
     torch.testing.assert_close(result_none, result_pre, rtol=1e-3, atol=1e-3)
+
+    # Buffer validation is shape-independent, so cover it once rather than for
+    # every entry in the preallocated-output matrix.
+    if batch_size == 1 and q_len_per_request == 1:
+        with pytest.raises(
+            ValueError, match="multi_ctas_kv_counter_buffer is too small"
+        ):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=counter_buffer[:4],
+            )
+
+        strided_counter_buffer = torch.zeros(
+            counter_bytes * 2, dtype=torch.uint8, device=device
+        )[::2]
+        assert strided_counter_buffer.numel() == counter_bytes
+        assert not strided_counter_buffer.is_contiguous()
+        with pytest.raises(
+            ValueError, match="multi_ctas_kv_counter_buffer must be contiguous"
+        ):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=strided_counter_buffer,
+            )
+
+        offset_counter_buffer = torch.zeros(
+            counter_bytes + 1, dtype=torch.uint8, device=device
+        )[1:]
+        assert offset_counter_buffer.is_contiguous()
+        assert offset_counter_buffer.data_ptr() % 16 != 0
+        with pytest.raises(
+            ValueError,
+            match="multi_ctas_kv_counter_buffer must be 16-byte aligned",
+        ):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+                multi_ctas_kv_counter_buffer=offset_counter_buffer,
+            )

@@ -25,6 +25,11 @@ from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@functools.cache
 def _get_module(
     state_dtype: torch.dtype,
     input_dtype: torch.dtype,
@@ -38,6 +43,7 @@ def _get_module(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
 ):
@@ -54,6 +60,7 @@ def _get_module(
         npredicted,
         max_window,
         heads_per_group,
+        num_groups,
         philox_rounds,
         enable_pdl,
     ).build_and_load()
@@ -64,11 +71,14 @@ def _get_module(
     mutates_args=(
         "state",
         "out",
-        "old_x",
-        "old_B",
-        "old_dt",
-        "old_cumAdt",
+        "x_cache",
+        "B_cache",
+        "dt_cache",
         "state_scale",
+        # Two-kernel scratch — the precompute writes them.
+        "cb_scaled",
+        "cumAdt_vec",
+        "cb_old",
     ),
 )
 def _checkpointing_ssu(
@@ -79,11 +89,10 @@ def _checkpointing_ssu(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     D: Optional[torch.Tensor],
     z: Optional[torch.Tensor],
@@ -95,6 +104,10 @@ def _checkpointing_ssu(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    cb_scaled: Optional[torch.Tensor],
+    cumAdt_vec: Optional[torch.Tensor],
+    cb_old: Optional[torch.Tensor],
+    precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -108,6 +121,7 @@ def _checkpointing_ssu(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     module = _get_module(
@@ -123,6 +137,7 @@ def _checkpointing_ssu(
         npredicted,
         max_window,
         heads_per_group,
+        num_groups,
         philox_rounds,
         enable_pdl,
     )
@@ -134,11 +149,10 @@ def _checkpointing_ssu(
         B,
         C,
         out,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         prev_num_accepted_tokens,
         D,
         z,
@@ -150,6 +164,10 @@ def _checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        cb_scaled,
+        cumAdt_vec,
+        cb_old,
+        precompute_heads_per_cta,
     )
 
 
@@ -162,11 +180,10 @@ def _checkpointing_ssu_fake(
     B: torch.Tensor,
     C: torch.Tensor,
     out: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     D: Optional[torch.Tensor],
     z: Optional[torch.Tensor],
@@ -178,6 +195,10 @@ def _checkpointing_ssu_fake(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    cb_scaled: Optional[torch.Tensor],
+    cumAdt_vec: Optional[torch.Tensor],
+    cb_old: Optional[torch.Tensor],
+    precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -191,6 +212,7 @@ def _checkpointing_ssu_fake(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
@@ -199,11 +221,10 @@ def _checkpointing_ssu_fake(
 @flashinfer_api
 def checkpointing_ssu(
     state: torch.Tensor,
-    old_x: torch.Tensor,
-    old_B: torch.Tensor,
-    old_dt: torch.Tensor,
-    old_cumAdt: torch.Tensor,
-    cache_buf_idx: torch.Tensor,
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    ring_start: torch.Tensor,
     prev_num_accepted_tokens: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -224,6 +245,11 @@ def checkpointing_ssu(
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
     enable_pdl: bool = False,
+    cb_scaled: Optional[torch.Tensor] = None,
+    cumAdt_vec: Optional[torch.Tensor] = None,
+    cb_old: Optional[torch.Tensor] = None,
+    precompute_heads_per_cta: int = 0,
+    algorithm: str = "auto",
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -231,16 +257,19 @@ def checkpointing_ssu(
     ----------
     state : torch.Tensor
         SSM state, shape (state_cache_size, nheads, dim, dstate). Updated in-place.
-    old_x : torch.Tensor
-        Cached x from previous step, shape (state_cache_size, T, nheads, dim). Single-buffered.
-    old_B : torch.Tensor
-        Cached B, shape (state_cache_size, 2, T, ngroups, dstate). Double-buffered.
-    old_dt : torch.Tensor
-        Cached processed dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
-    old_cumAdt : torch.Tensor
-        Cached cumulative A*dt, shape (state_cache_size, 2, nheads, T). Double-buffered, f32.
-    cache_buf_idx : torch.Tensor
-        Which buffer to read (0 or 1), shape (state_cache_size,), int32.
+    x_cache : torch.Tensor
+        Ring of cached x, shape (state_cache_size, nheads, RING_BUFFER_LEN, dim).
+        RING_BUFFER_LEN is implicit (= size(2)); the LOGICAL replay window is
+        max_window = RING_BUFFER_LEN - T (flush rule pnat + 2T > RING_BUFFER_LEN).
+    B_cache : torch.Tensor
+        Ring of cached B, shape (state_cache_size, ngroups, RING_BUFFER_LEN, dstate).
+    dt_cache : torch.Tensor
+        Ring of cached processed dt, shape (state_cache_size, nheads,
+        RING_BUFFER_LEN), f32.  Replay decays are recomputed from it (no
+        cumAdt is cached — prefix sums are not ring-shift-invariant).
+    ring_start : torch.Tensor
+        Ring head per slot (oldest live row), shape (state_cache_size,), int32.
+        The HOST owns bookkeeping: advance by the replayed count on flush.
     prev_num_accepted_tokens : torch.Tensor
         Number of old tokens to replay, shape (state_cache_size,), int32.
     x : torch.Tensor
@@ -277,21 +306,20 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
-    cu_seqlens : Optional[torch.Tensor]
-        Cumulative sequence lengths with shape ``(N + 1,)``, dtype
-        ``torch.int32``, on the same CUDA device as ``x`` (the kernel
-        asserts both). When provided, the new-token inputs (``x``, ``dt``,
-        ``B``, ``C``, ``out``, optionally ``z``) are interpreted in varlen
-        layout where tokens are packed along the **time** axis with batch
-        fixed to 1 — i.e. ``x`` is 4-D with shape
-        ``(1, total_tokens, nheads, dim)`` — instead of the default
-        ``(batch, T, ...)`` layout.
-    max_seqlen : Optional[int]
-        Maximum sequence length present in ``cu_seqlens``, used by the kernel
-        to size its per-sequence work tiles. Only meaningful in varlen mode
-        (``cu_seqlens is not None``); falls back to ``max_window`` when
-        omitted (wider smem than strictly needed but always safe). Must be
-        ``None`` in non-varlen mode (the JIT key is taken from ``x.size(1)``).
+    precompute_heads_per_cta : int
+        Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
+        launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
+        snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
+    algorithm : str
+        Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
+        ``"auto"`` runs the two-kernel split iff the scratch quartet is provided AND
+        ``batch * nheads >= sm_count``.  The crossover collapses in
+        ``batch * nheads`` across nheads (measured at TP 8/4/2) and state widths:
+        the monolith wins <= 128 work-units and the split wins from 256 on a
+        148-SM B200 (mixed-PNAT + conv1d/PDL bench; ties take the split).
+        ``"two-kernel"`` forces the split (scratch quartet required); ``"monolith"``
+        forces the monolith (scratch ignored).  Benches/tests that must pin the
+        path should force it.
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
@@ -299,23 +327,32 @@ def checkpointing_ssu(
         the upstream (e.g. conv1d) and signal the downstream kernel.
         Caller's responsibility: upstream/downstream kernels must also be
         PDL-paired for the wait/signal to have effect.  Defaults to False.
+    cb_scaled : Optional[torch.Tensor]
+        Pre-allocated input-dtype (same as ``x``) scratch for the precomputed
+        new-token CB matrix, fragment-native layout
+        (batch, nheads, WARP_SIZE, MMA_FRAG_SIZE) — each (batch, head)'s CB is
+        one m16n8k16 MMA A-fragment stored as [warp lane, register].  Providing
+        it (together with ``cumAdt_vec`` / ``cb_old``) makes the
+        **two-kernel** (precompute + main) path available — ``algorithm`` decides
+        whether it runs; leaving all four ``None`` always runs the monolithic
+        kernel.  Caller-allocated so the path is CUDA-graph-safe (no in-wrapper
+        allocation, like ``out``).
+    cumAdt_vec : Optional[torch.Tensor]
+        Pre-allocated fp32 scratch for the per-head raw cumAdt vector, shape
+        (batch, nheads, T_pad); the main kernel exponentiates it on the fly to
+        get the decay/β factor.  Must be provided iff ``cb_scaled`` is.
+    cb_old : Optional[torch.Tensor]
+        Pre-allocated input-dtype (same as ``x``) scratch for the precomputed
+        old-token CB matrix, fragment-native layout
+        (batch, nheads, WARP_SIZE, K_old // 2) where
+        K_old = next_multiple_of_8(max_window) — the m16n8k{K_old} MMA
+        A-fragment consumed on the no-write (replay) path, stored as
+        [warp lane, register].  Must be provided iff ``cb_scaled`` is.
 
     Returns
     -------
     out : torch.Tensor
         Output tensor, shape (batch, T, nheads, dim).
-
-    Notes
-    -----
-    **In-place updates.** The custom op declares ``mutates_args =
-    ("state", "out", "old_x", "old_B", "old_dt", "old_cumAdt",
-    "state_scale")`` — the four ``old_*`` cache tensors are double-buffered
-    and the kernel writes the *current* step's x / B / dt / cumulative-A·dt
-    back into the slot selected by ``cache_buf_idx`` so the next call can
-    replay them. ``state_scale`` is also written when ``state`` is
-    quantized (int8 / fp8_e4m3fn): the kernel computes new per-block
-    decode scales and stores them here for the caller to dequantize
-    against on read-back.
     """
     # Validate quantized state ↔ state_scale combo.
     # int8 and fp8_e4m3fn use a per-(cache, head, dim) decode-scale tensor
@@ -376,13 +413,12 @@ def checkpointing_ssu(
     # Extract JIT specialization keys
     dim = state.size(2)
     dstate = state.size(3)
-    max_window = old_x.size(1)
     # Varlen: inputs are packed (1, total_tokens, ...) — `x.size(1)` is no
     # longer a JIT key (it varies per call).  The caller must promise an
     # upper bound on every cu_seqlens[i+1] - cu_seqlens[i] via `max_seqlen`,
-    # which becomes the JIT-stamped NPREDICTED.  Default (when omitted) is
-    # max_window — wider smem than strictly needed when actual seq_lens are
-    # small, but always safe.
+    # which becomes the JIT-stamped NPREDICTED.  REQUIRED under the ring
+    # contract: RING_BUFFER_LEN = max_window + NPREDICTED, so without an
+    # explicit T the split of the ring row count is underdetermined.
     if cu_seqlens is not None:
         assert x.dim() == 4 and x.size(0) == 1, (
             f"varlen mode: x must be (1, total_tokens, nheads, dim), got shape {tuple(x.shape)}"
@@ -392,13 +428,26 @@ def checkpointing_ssu(
             f"{tuple(cu_seqlens.shape)} dtype {cu_seqlens.dtype}"
         )
         assert cu_seqlens.is_cuda, "cu_seqlens must be a CUDA tensor"
-        npredicted = max_seqlen if max_seqlen is not None else max_window
+        # The persistent main's meta ring packs (bos << 8 | seq_len) into one
+        # int32 (kernel_checkpointing_ssu_main.cuh meta_cu), capping the packed
+        # token offset at 2^23 - 1.
+        assert x.size(1) < (1 << 23), (
+            f"varlen total_tokens={x.size(1)} exceeds the packed meta_cu bos "
+            f"capacity (must be < {1 << 23})"
+        )
+        assert max_seqlen is not None, (
+            "varlen mode requires max_seqlen under the ring contract "
+            "(RING_BUFFER_LEN = max_window + max_seqlen is otherwise ambiguous)"
+        )
+        npredicted = max_seqlen
     else:
         assert max_seqlen is None, (
             "max_seqlen is only valid with cu_seqlens (varlen mode); for "
             "non-varlen the JIT key is taken from x.size(1)"
         )
         npredicted = x.size(1)
+    # LOGICAL replay window from the implicit ring length (ReplaySSM contract).
+    max_window = x_cache.size(2) - npredicted
     assert max_window <= 16, (
         f"checkpointing_ssu supports at most 16 cache tokens (max_window), got {max_window}"
     )
@@ -406,16 +455,71 @@ def checkpointing_ssu(
         f"npredicted ({npredicted}) must be <= max_window ({max_window})"
     )
 
+    # ── Monolith vs two-kernel split (auto unless forced) ──
+    # The split is AVAILABLE iff the caller provides the scratch quartet —
+    # graph-safe, the caller pre-allocates like `out` (no wrapper allocation).
+    # All three or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both
+    # paths; cb_old (C6) is consumed on the no-write path, which the wrapper
+    # can't predict per-slot.  (Old decay is recomputed in-registers by the
+    # main from the dt ring — no scratch carries it.)
+    # The launcher routes on params.cb_scaled != nullptr.
+    scratch_provided = cb_scaled is not None
+    if scratch_provided != (cumAdt_vec is not None) or scratch_provided != (
+        cb_old is not None
+    ):
+        raise ValueError(
+            "cb_scaled, cumAdt_vec, and cb_old must be provided together "
+            f"(they make the two-kernel path available); got "
+            f"cb_scaled set={cb_scaled is not None}, "
+            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
+        )
+    batch = cu_seqlens.numel() - 1 if cu_seqlens is not None else x.size(0)
+    nheads = state.size(1)
+    assert algorithm in ("auto", "monolith", "two-kernel"), (
+        f"algorithm must be one of 'auto', 'monolith', 'two-kernel'; got {algorithm!r}"
+    )
+    if algorithm == "auto":
+        # Crossover collapses in batch*nheads across nheads∈{16,32,64} (TP 8/4/2)
+        # and state widths {2,4} B once the main runs its stg1/cps16 default:
+        # monolith wins ≤128 work-units, the split wins from 256 (mixed-PNAT bench
+        # with conv1d+PDL — the production shape; B200, 148 SMs; see
+        # .plans/ssu_persistent_main.md).  Threshold 1 unit/SM splits the gap;
+        # ties take the split.
+        two_kernel = scratch_provided and batch * nheads >= _sm_count(state.device)
+    else:
+        two_kernel = algorithm == "two-kernel"
+        if two_kernel and not scratch_provided:
+            raise ValueError(
+                "algorithm='two-kernel' requires the cb_scaled/cumAdt_vec/cb_old/"
+                "scratch trio (got none) — allocate them or use "
+                "'auto'/'monolith'"
+            )
+    if not two_kernel:
+        cb_scaled = cumAdt_vec = cb_old = None
+
     # ── d_split selection (v12 §59) ──
-    # Auto-heuristic: pick the largest pow2 ∈ {1, 2} that keeps total CTA
-    # count <= SMs * occupancy_estimate.  occupancy_estimate=2 matches the
-    # PAD_TOKENS path's CTAs/SM (see v10.7).  d_split=4 is deferred to
-    # v12.x (needs warp-count restructure for output MMA).
+    # Auto-heuristic, measured on B200 (mixed-batch bench): d_split=2 pays
+    # only when BOTH hold —
+    #   (a) f32 state: the per-CTA state load (dim/d_split × dstate × 4 B) is
+    #       the small-batch latency pole; halving it cut mixed b1 13 %
+    #       (5.73 → 4.99 µs) and won through b64.  2-byte state is half as
+    #       long already — splitting only buys duplicated B/C/x traffic and
+    #       idle output-MMA warps (bf16 regressed at every batch size).
+    #   (b) the d_split=1 grid (batch × nheads CTAs) underfills the GPU.
+    #       Crossover measured between b64 (win) and b128 (loss) at
+    #       nheads=16 on 148 SMs → threshold 8 × SM count.
+    # d_split=4 is deferred to v12.x (needs warp-count restructure for
+    # output MMA).
     if d_split is None:
-        # Auto-heuristic still clamped to 1 — re-enable as a separate
-        # tuning change once the benchmarking is in place.  The override
-        # knob is open and exercised by the d_split=2 correctness tests.
         d_split = 1
+        if (
+            not two_kernel  # monolith only — 2k main measured worse at DS=2 (ncu v30)
+            and state.dtype == torch.float32
+            and dim % 2 == 0
+            and dim // 2 >= 32
+            and batch * nheads <= 8 * _sm_count(state.device)
+        ):
+            d_split = 2
     assert d_split in (1, 2), (
         f"d_split must be in {{1, 2}} for v12 (d_split=4 deferred), got {d_split}"
     )
@@ -434,7 +538,6 @@ def checkpointing_ssu(
     # exactly one specialization instead of seven — ~7x faster per JIT.
     # The kernel asserts `params.nheads / params.ngroups == HEADS_PER_GROUP`
     # before launch.
-    nheads = state.size(1)
     ngroups = B.size(-2)
     assert nheads % ngroups == 0, (
         f"nheads ({nheads}) must be divisible by ngroups ({ngroups})"
@@ -462,11 +565,10 @@ def checkpointing_ssu(
         B,
         C,
         out,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         prev_num_accepted_tokens,
         D,
         z,
@@ -478,6 +580,10 @@ def checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        cb_scaled,
+        cumAdt_vec,
+        cb_old,
+        precompute_heads_per_cta,
         enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,
@@ -491,5 +597,6 @@ def checkpointing_ssu(
         npredicted=npredicted,
         max_window=max_window,
         heads_per_group=heads_per_group,
+        num_groups=ngroups,
     )
     return out

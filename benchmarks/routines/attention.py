@@ -24,7 +24,11 @@ except OSError as e:
 from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import (
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    is_sm12x_supported,
+)
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -571,6 +575,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    gqa_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        gqa_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -699,6 +711,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 mask=speculative_mask,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -2466,6 +2479,14 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    mla_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        mla_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
@@ -2575,6 +2596,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm2_scale=1.0,
                 backend="trtllm-gen",
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=mla_multi_ctas_kv_counter_buffer,
                 **mla_api_extra_kwargs,
             ).squeeze(1)
         elif backend == "auto":

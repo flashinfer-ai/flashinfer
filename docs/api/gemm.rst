@@ -24,6 +24,16 @@ FP4 GEMM
 
     mm_fp4
 
+SVDQuant NVFP4 GEMM (SM100)
+---------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_nvfp4_svdquant
+    nvfp4_quantize_smooth
+    svdquant_linear
+
 BF16 x FP4 GEMM (W4A16)
 -----------------------
 
@@ -56,6 +66,18 @@ FP8 GEMM
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+
+Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
+
+.. currentmodule:: flashinfer.trtllm_low_latency_gemm
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_low_latency_gemm_weights
+
+.. currentmodule:: flashinfer.gemm
+
 
 Mixed Precision GEMM (fp8 x fp4)
 --------------------------------
