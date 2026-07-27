@@ -160,13 +160,13 @@ class _Inputs:
 # --------------------------------------------------------------------------- #
 def _torch_reference(inp: _Inputs) -> Tuple[torch.Tensor, torch.Tensor]:
     """Eager PyTorch-native RoPE + fp8 cast; used as the correctness reference."""
-    q_out_f16, k_out_f16 = inp.rope_ref.forward_native(
-        inp.pos_ids, inp.q_in, inp.k_in
-    )
+    q_out_f16, k_out_f16 = inp.rope_ref.forward_native(inp.pos_ids, inp.q_in, inp.k_in)
     return q_out_f16.to(QUANT_DTYPE), k_out_f16.to(QUANT_DTYPE)
 
 
-def _make_execute(provider: str, inp: _Inputs) -> Callable[[], Tuple[torch.Tensor, ...]]:
+def _make_execute(
+    provider: str, inp: _Inputs
+) -> Callable[[], Tuple[torch.Tensor, ...]]:
     """Return a zero-arg callable that runs `provider`'s op and returns its outputs.
 
     For the fused kernels the returned tuple is
@@ -323,7 +323,6 @@ def run_benchmark_sweep(
     """Return {provider: {num_tokens: median_ms}}."""
     results: Dict[str, Dict[int, float]] = {p: {} for p in providers}
     total = len(num_tokens_values)
-    current = 0
 
     print(f"\nBenchmarking rope_quantize_fp8  config={config_name}  bf16->fp8_e4m3")
     print("=" * (20 + 12 * len(providers)))
@@ -333,8 +332,7 @@ def run_benchmark_sweep(
     print(header)
     print("-" * (20 + 12 * len(providers)))
 
-    for ntok in num_tokens_values:
-        current += 1
+    for current, ntok in enumerate(num_tokens_values, start=1):
         row = f"{ntok:>6} |"
         for p in providers:
             ms = bench_one(config_name, ntok, p)
@@ -437,7 +435,12 @@ def create_heatmap(
         for j in range(len(num_tokens_values)):
             if not np.isnan(mat[i, j]):
                 ax.text(
-                    j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
                     color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
                 )
     ax.set_xlabel("num_tokens")
@@ -477,7 +480,9 @@ def main():
     parser.add_argument(
         "--output-prefix", type=str, default="rope_quantize_fp8_backend_comparison"
     )
-    parser.add_argument("--csv", type=str, default=None, help="Write raw medians to CSV")
+    parser.add_argument(
+        "--csv", type=str, default=None, help="Write raw medians to CSV"
+    )
     args = parser.parse_args()
 
     requested = [p.strip() for p in args.providers.split(",") if p.strip()]
