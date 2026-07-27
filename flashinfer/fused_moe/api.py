@@ -399,7 +399,7 @@ class TrtllmBf16Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
