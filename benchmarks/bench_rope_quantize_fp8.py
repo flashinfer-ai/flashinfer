@@ -197,6 +197,7 @@ def benchmark_config(config_name, num_tokens, provider, enable_pdl=False):
         k_nope_out = torch.empty_like(k_nope, dtype=quant_dtype)
 
         def execute():
+            """Run one fused RoPE+fp8-quant call, starting the CUDA profiler on the ncu warmup iteration."""
             nonlocal run_idx
             run_idx += 1
 

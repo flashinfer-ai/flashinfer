@@ -171,6 +171,7 @@ def _per_token_group_quant_8bit_colmajor_kernel(
 
 
 def _ceil_align(x: int, align: int) -> int:
+    """Round `x` up to the next multiple of `align`."""
     return (x + align - 1) // align * align
 
 

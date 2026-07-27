@@ -55,6 +55,7 @@ EPS = 1e-10
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile quantization backend."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.quantization import per_token_group_quant_8bit  # noqa: F401
@@ -65,6 +66,7 @@ def _has_cutile() -> bool:
 
 
 def _has_sgl() -> bool:
+    """True if SGLang's sgl_kernel quantizer is importable."""
     try:
         from sgl_kernel import sgl_per_token_group_quant_8bit  # noqa: F401
 
@@ -74,6 +76,7 @@ def _has_sgl() -> bool:
 
 
 def _has_triton() -> bool:
+    """True if SGLang's Triton quantizer is importable."""
     try:
         from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: F401
             per_token_group_quant_8bit as _sgl_triton_quant,
@@ -99,6 +102,7 @@ _AVAIL = {
 def _torch_reference(
     x: torch.Tensor, group_size: int, dst_dtype: torch.dtype, eps: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch per-token-group quantization; the correctness reference."""
     if dst_dtype == torch.int8:
         qmin, qmax = -128.0, 127.0
     else:
@@ -122,10 +126,12 @@ def _make_execute(
     dst_dtype: torch.dtype,
     eps: float,
 ) -> Callable[[], Tuple[torch.Tensor, torch.Tensor]]:
+    """Return a zero-arg callable running `provider`'s quantizer on `x`."""
     if provider == "cutile":
         from flashinfer.quantization import per_token_group_quant_8bit
 
         def run():
+            """Run the cuTile per-token-group quantizer."""
             return per_token_group_quant_8bit(
                 x, group_size, eps=eps, dst_dtype=dst_dtype, backend="cutile"
             )
@@ -146,6 +152,7 @@ def _make_execute(
         )
 
         def run():
+            """Run sgl_kernel's per-token-group quantizer into preallocated outputs."""
             sgl_per_token_group_quant_8bit(
                 x, x_q, x_s, group_size, eps, qmin, qmax, False, enable_v2=False
             )
@@ -157,11 +164,13 @@ def _make_execute(
         )
 
         def run():
+            """Run SGLang's Triton per-token-group quantizer."""
             return sgl_triton_quant(x, group_size, dst_dtype, eps=eps)
 
     elif provider == "torch":
 
         def run():
+            """Run the pure-PyTorch reference quantizer."""
             return _torch_reference(x, group_size, dst_dtype, eps)
 
     else:
@@ -303,6 +312,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int], float]]):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(["provider", "num_tokens", "hidden_dim", "median_ms"])
@@ -375,6 +385,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark per_token_group_quant_8bit backends"
     )

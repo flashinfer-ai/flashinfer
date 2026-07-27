@@ -28,6 +28,7 @@ _rope_quantize_fp8_tune_cache: dict = {}
 
 
 def _default_tokens_per_block(num_tokens: int) -> int:
+    """Heuristic tokens-per-block used when autotuning is disabled."""
     if num_tokens <= 4:
         return 1
     if num_tokens <= 32:
@@ -38,6 +39,7 @@ def _default_tokens_per_block(num_tokens: int) -> int:
 
 
 def _rope_quantize_fp8_cutile_configs(num_tokens: int):
+    """Return the autotune candidates for this token count (one default config if autotune is off)."""
     candidates = [tpb for tpb in (1, 4, 8, 16, 32) if tpb <= max(32, num_tokens)]
     if _AUTOTUNE_DISABLED:
         default_tpb = _default_tokens_per_block(num_tokens)
@@ -71,6 +73,7 @@ def _cutile_autotune_rope_quantize_fp8(
     no_rope_dim,
     total_blocks_y,
 ):
+    """Launch one fused RoPE+fp8 autotune candidate."""
     cache_key = (
         num_tokens,
         num_qo_heads,
@@ -147,6 +150,7 @@ def _cutile_autotune_rope_quantize_fp8(
 
 
 def _load_rope_factors(pos_ids, cos_sin_cache, token_block, TOKENS_PER_BLOCK, HALF_DIM):
+    """Gather the cos/sin RoPE factors for one token block from the cache."""
     pos_tile = ct.load(
         pos_ids, index=token_block, shape=TOKENS_PER_BLOCK, padding_mode=PAD_ZERO
     )
@@ -160,6 +164,7 @@ def _load_rope_factors(pos_ids, cos_sin_cache, token_block, TOKENS_PER_BLOCK, HA
 def _apply_rope_interleave_batched(
     x_tile, cos, sin, out_dtype, quant_scale, TOKENS_PER_BLOCK, HALF_DIM
 ):
+    """Apply interleaved RoPE to a token tile and scale it into the output dtype."""
     x_3d = ct.reshape(ct.astype(x_tile, ct.float32), (TOKENS_PER_BLOCK, HALF_DIM, 2))
     x_even = ct.reshape(
         ct.extract(x_3d, index=(0, 0, 0), shape=(TOKENS_PER_BLOCK, HALF_DIM, 1)),
@@ -183,6 +188,7 @@ def _apply_rope_interleave_batched(
 
 
 def _quantize_batched_tile(x_tile, out_dtype, quant_scale):
+    """Scale and cast a tile that needs no rotation (the no-RoPE half)."""
     return ct.astype(ct.astype(x_tile, ct.float32) * quant_scale, out_dtype)
 
 
@@ -207,6 +213,7 @@ def _rope_quantize_fp8_kernel(
     NO_ROPE_DIM: ConstInt,
     TOKENS_PER_BLOCK: ConstInt,
 ):
+    """cuTile kernel: fused RoPE + fp8 quantization over one block of tokens."""
     pid_x = ct.bid(0)
     pid_y = ct.bid(1)
 
