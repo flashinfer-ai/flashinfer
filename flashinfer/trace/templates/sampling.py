@@ -1019,6 +1019,7 @@ def _top_k_page_table_transform_reference(
     tie_break: int = 0,
     dsa_graph_safe: bool = False,
     row_starts=None,
+    page_table_row_starts=None,
     **_unused,
 ) -> torch.Tensor:
     """Reference for top_k_page_table_transform: per-row top-k selection on
@@ -1033,10 +1034,18 @@ def _top_k_page_table_transform_reference(
         if L <= 0:
             continue
         b = int(row_to_batch[i].item()) if row_to_batch is not None else i
-        row = input[i, :L].to(torch.float32)
+        row_start = int(row_starts[i].item()) if row_starts is not None else 0
+        page_table_row_start = (
+            int(page_table_row_starts[i].item())
+            if page_table_row_starts is not None
+            else row_start
+        )
+        row = input[i, row_start : row_start + L].to(torch.float32)
         kk = min(int(k), L)
         _, idx = torch.topk(row, kk, sorted=True)
-        out[i, :kk] = src_page_table[b, idx.to(torch.long)].to(torch.int32)
+        out[i, :kk] = src_page_table[b, page_table_row_start + idx.to(torch.long)].to(
+            torch.int32
+        )
     return out
 
 
@@ -1070,9 +1079,9 @@ top_k_page_table_transform_trace = TraceTemplate(
     name_prefix="top_k_page_table_transform",
     description=(
         "Fused per-row top-k selection plus page-table translation. For "
-        "each row i: pick top-k indices over input[i, :lengths[i]] and "
-        "translate them via src_page_table[row_to_batch[i]] to produce "
-        "per-row page-id sequences for sparse attention."
+        "each row i: pick top-k indices from the score window starting at "
+        "row_starts[i] and translate them from the page-table window starting "
+        "at page_table_row_starts[i] to produce per-row page-id sequences."
     ),
     axes={
         "num_rows": Var(),
@@ -1090,6 +1099,8 @@ top_k_page_table_transform_trace = TraceTemplate(
         "lengths": Tensor(["num_rows"], dtype="int32"),
         "k": Scalar("int32"),
         "row_to_batch": Tensor(["num_rows"], dtype="int32", optional=True),
+        "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
+        "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
     },
     outputs={
         "indices": Tensor(["num_rows", "k"], dtype="int32"),
