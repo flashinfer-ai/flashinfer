@@ -28,10 +28,11 @@ Output:  o [B,T,HV,V]
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and
 compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 
-The host wrapper makes one architecture decision. Single-token workloads with
-at least 128 sequence-heads use the latency-efficient one-warp kernel. Smaller
-single-token grids and all multi-token workloads use the grouped-CTA kernel,
-which amortizes token preprocessing across its V-column tile.
+The host wrapper makes one architecture decision. D128 single-token workloads
+below 1,920 sequence-heads use the latency-efficient one-warp kernel; larger
+grids use grouped-CTA. D64 retains its minimum-grid policy. All multi-token
+workloads use grouped-CTA, which amortizes token preprocessing across its
+V-column tile.
 """
 
 import functools
@@ -57,9 +58,19 @@ import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead kernel dispat
 DOT_REDUCTION_TREE = 0
 DOT_REDUCTION_DUAL_ACCUM = 1
 
-# This threshold applies to both D64 and D128. Sequence-heads express available
-# one-warp grid parallelism without a head-dimension or benchmark-row table.
-ONE_WARP_MIN_SEQUENCE_HEADS = 128
+# B300 measurements across Kimi K3 local head counts show D128 one-warp winning
+# through 1,536 sequence-heads and grouped-CTA winning from 1,920 onward. Keep
+# the existing D64 policy until it has an equivalent crossover sweep.
+D128_GROUPED_MIN_SEQUENCE_HEADS = 1920
+D64_ONE_WARP_MIN_SEQUENCE_HEADS = 128
+
+
+def _use_one_warp(head_dim: int, num_tokens: int, sequence_heads: int) -> bool:
+    if num_tokens != 1:
+        return False
+    if head_dim == 128:
+        return sequence_heads < D128_GROUPED_MIN_SEQUENCE_HEADS
+    return sequence_heads >= D64_ONE_WARP_MIN_SEQUENCE_HEADS
 
 
 # ==============================================================================
@@ -1386,7 +1397,7 @@ def run_recurrent_kda(
         N = cu_seqlens.shape[0] - 1
         grid_seqs = N
         sequence_heads = grid_seqs * HV
-        use_one_warp = NUM_TOKENS == 1 and sequence_heads >= ONE_WARP_MIN_SEQUENCE_HEADS
+        use_one_warp = _use_one_warp(K, NUM_TOKENS, sequence_heads)
         if initial_state_indices is not None and initial_state_indices.shape[0] < N:
             raise ValueError(
                 "initial_state_indices must contain one entry per sequence, "
@@ -1451,7 +1462,7 @@ def run_recurrent_kda(
             )
         grid_seqs = B
         sequence_heads = grid_seqs * HV
-        use_one_warp = sequence_heads >= ONE_WARP_MIN_SEQUENCE_HEADS
+        use_one_warp = _use_one_warp(K, 1, sequence_heads)
         cu_seqlens_i32 = None
         ssi = None
         copy_back_indices = None
