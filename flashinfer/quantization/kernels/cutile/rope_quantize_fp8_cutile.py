@@ -6,6 +6,7 @@
 
 import math
 import os
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Optional
 from typing import Tuple
@@ -24,7 +25,11 @@ PAD_ZERO = ct.PaddingMode.ZERO
 _AUTOTUNE_DISABLED = os.getenv("FLASHINFER_CUTILE_AUTOTUNE_DISABLED", "0") != "0"
 
 # Module-level tune cache: (num_tokens, num_qo_heads, num_kv_heads, rope_dim, no_rope_dim, q_dtype, out_dtype, device) -> (best_cfg, tuned_kernel)
-_rope_quantize_fp8_tune_cache: dict = {}
+# Bounded LRU, like the hinted-kernel cache in cutile_common: num_tokens is part
+# of the key, so a server sweeping many token counts would otherwise grow this
+# dict (and the tuned kernels it pins) without limit.
+_ROPE_QUANTIZE_FP8_TUNE_CACHE_MAX = 128
+_rope_quantize_fp8_tune_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
 
 
 def _default_tokens_per_block(num_tokens: int) -> int:
@@ -121,6 +126,10 @@ def _cutile_autotune_rope_quantize_fp8(
             best_cfg,
             _rope_quantize_fp8_kernel.replace_hints(occupancy=best_cfg.occupancy),
         )
+        if len(_rope_quantize_fp8_tune_cache) > _ROPE_QUANTIZE_FP8_TUNE_CACHE_MAX:
+            _rope_quantize_fp8_tune_cache.popitem(last=False)
+    else:
+        _rope_quantize_fp8_tune_cache.move_to_end(cache_key)
     best_cfg, tuned_kernel = _rope_quantize_fp8_tune_cache[cache_key]
     ct.launch(
         stream,

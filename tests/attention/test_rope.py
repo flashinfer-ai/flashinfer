@@ -1730,6 +1730,56 @@ def test_mla_rope_quantize(
     )
 
 
+@pytest.mark.parametrize("unsupported", ["neox", "multi_head_key", "bad_backend"])
+def test_rope_quantize_fp8_cutile_rejects_unsupported(unsupported):
+    """The cuTile dispatch guards must raise, not fall through to CUDA or the kernel.
+
+    The parametrized test above only *skips* NeoX / GQA / MHA for the cuTile
+    backend, so without this the documented contract is never exercised.
+    """
+    from flashinfer.cutile.cutile_common import is_cuda_tile_available
+
+    if not is_cuda_tile_available():
+        pytest.skip("cuda.tile not available")
+
+    device, dt = "cuda:0", torch.bfloat16
+    num_tokens, rope_dim, no_rope_dim, num_qo_heads = 4, 64, 512, 8
+    kv_heads = 2
+
+    q_rope = torch.randn(num_tokens, num_qo_heads, rope_dim, dtype=dt, device=device)
+    q_nope = torch.randn(num_tokens, num_qo_heads, no_rope_dim, dtype=dt, device=device)
+    # 2D key = the supported MLA layout; 3D key = the rejected GQA/MHA layout.
+    k_rope_2d = torch.randn(num_tokens, rope_dim, dtype=dt, device=device)
+    k_nope_2d = torch.randn(num_tokens, no_rope_dim, dtype=dt, device=device)
+    k_rope_3d = torch.randn(num_tokens, kv_heads, rope_dim, dtype=dt, device=device)
+    k_nope_3d = torch.randn(num_tokens, kv_heads, no_rope_dim, dtype=dt, device=device)
+    cos_sin_cache = torch.randn(
+        num_tokens, rope_dim, dtype=torch.float32, device=device
+    )
+    pos_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    k_rope = k_rope_3d if unsupported == "multi_head_key" else k_rope_2d
+    k_nope = k_nope_3d if unsupported == "multi_head_key" else k_nope_2d
+
+    kwargs = dict(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=pos_ids,
+        quant_scale_q=1.0,
+        quant_scale_kv=1.0,
+        is_neox=(unsupported == "neox"),
+        backend="cuitle" if unsupported == "bad_backend" else "cutile",
+    )
+    # A misspelled backend must be rejected outright rather than silently
+    # running the CUDA path.
+    expected = ValueError if unsupported == "bad_backend" else NotImplementedError
+    with pytest.raises(expected):
+        flashinfer.rope.rope_quantize_fp8(**kwargs)
+
+
 if __name__ == "__main__":
     # test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
     # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
