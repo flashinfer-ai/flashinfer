@@ -1352,9 +1352,16 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
 
         initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
         if packed:
+            # Packed routing stores the expert ID in the high 16 bits and a
+            # deterministic BF16 routing weight of 1.0 in the low 16 bits.
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
             assert torch.all((initialized >> 16) < 128)
-            assert torch.all((initialized & 0xFFFF) == 0x3F80)
+            assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
         else:
+            # Unpacked routing contains plain expert IDs, not packed bitfields.
             assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()

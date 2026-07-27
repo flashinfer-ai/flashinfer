@@ -757,17 +757,34 @@ class TestActivationPackValidation:
     @pytest.mark.parametrize(
         ("ids_transform", "weights_transform", "match"),
         [
-            (lambda x: x.long(), lambda x: x.to(torch.bfloat16), "int32"),
-            (lambda x: x, lambda x: x.half(), "bfloat16"),
-            (lambda x: x[:, :1], lambda x: x.to(torch.bfloat16), "matching"),
-            (
+            pytest.param(
+                lambda x: x.long(),
+                lambda x: x.to(torch.bfloat16),
+                "int32",
+                id="int64-ids",
+            ),
+            pytest.param(
+                lambda x: x,
+                lambda x: x.half(),
+                "bfloat16",
+                id="fp16-weights",
+            ),
+            pytest.param(
+                lambda x: x[:, :1],
+                lambda x: x.to(torch.bfloat16),
+                "matching",
+                id="mismatched-shapes",
+            ),
+            pytest.param(
                 lambda x: x,
                 lambda x: x.to(torch.bfloat16)[:, :1].expand_as(x),
                 "contiguous",
+                id="noncontiguous-weights",
             ),
         ],
     )
     def test_unpacked_contract_rejected(self, ids_transform, weights_transform, match):
+        """Reject invalid unpacked dtypes, shapes, and layouts before launch."""
         from flashinfer.fused_moe.core import RoutingInputMode
 
         x, sf, ids, w, _ = _pack_tensors()
