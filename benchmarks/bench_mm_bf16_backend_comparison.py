@@ -54,7 +54,9 @@ def get_cc() -> int:
 
 def _make_inputs(m: int, n: int, k: int):
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).transpose(-2, -1)  # (k, n) col-major
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )  # (k, n) col-major
     return a, b
 
 
@@ -74,7 +76,9 @@ def provider_available(provider: str, m: int = 256, n: int = 256, k: int = 256) 
         torch.cuda.synchronize()
         return True
     except Exception as e:
-        print(f"  {provider:>9}: UNAVAILABLE ({type(e).__name__}: {str(e).splitlines()[0][:120]})")
+        print(
+            f"  {provider:>9}: UNAVAILABLE ({type(e).__name__}: {str(e).splitlines()[0][:120]})"
+        )
         return False
 
 
@@ -121,7 +125,7 @@ def run_benchmark_sweep(
         header += f" {p:>9}"
     print(header)
     print("-" * (26 + 11 * len(providers)))
-    for (m, n, k) in shapes:
+    for m, n, k in shapes:
         row = f"{m:>6} {n:>6} {k:>6} |"
         for p in providers:
             ms = bench_one(m, n, k, p)
@@ -149,7 +153,7 @@ def print_summary_table(
     print(header)
     print("-" * (20 + 10 * len(others)))
     geo = {p: [] for p in others}
-    for (m, n, k) in shapes:
+    for m, n, k in shapes:
         row = f"{f'{m},{n},{k}':>18} |"
         bt = results[baseline].get((m, n, k), float("nan"))
         for p in others:
@@ -177,14 +181,16 @@ def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
         w.writerow(["provider", "m", "n", "k", "median_ms", "tflops"])
         for provider, d in results.items():
             for (m, n, k), ms in sorted(d.items()):
-                tf = (2.0 * m * n * k / (ms * 1e-3) / 1e12) if ms == ms and ms > 0 else float("nan")
+                tf = (
+                    (2.0 * m * n * k / (ms * 1e-3) / 1e12)
+                    if ms == ms and ms > 0
+                    else float("nan")
+                )
                 w.writerow([provider, m, n, k, f"{ms:.6f}", f"{tf:.2f}"])
     print(f"\nWrote {path}")
 
 
-def create_heatmap(
-    shapes, results, provider, baseline, output_file
-):
+def create_heatmap(shapes, results, provider, baseline, output_file):
     try:
         import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
@@ -203,15 +209,25 @@ def create_heatmap(
         return
     fig, ax = plt.subplots(figsize=(max(6, 0.5 * len(shapes)), 2.4))
     arr = np.array(vals).reshape(1, -1)
-    norm = mcolors.TwoSlopeNorm(vmin=min(0.5, np.nanmin(arr)), vcenter=1.0, vmax=max(1.5, np.nanmax(arr)))
+    norm = mcolors.TwoSlopeNorm(
+        vmin=min(0.5, np.nanmin(arr)), vcenter=1.0, vmax=max(1.5, np.nanmax(arr))
+    )
     im = ax.imshow(arr, cmap="RdYlGn", norm=norm, aspect="auto")
-    ax.set_yticks([0]); ax.set_yticklabels([f"{provider}/{baseline}"])
+    ax.set_yticks([0])
+    ax.set_yticklabels([f"{provider}/{baseline}"])
     ax.set_xticks(np.arange(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
     for j, v in enumerate(vals):
         if not np.isnan(v):
-            ax.text(j, 0, f"{v:.2f}", ha="center", va="center", fontsize=8,
-                    color="white" if v < 0.7 or v > 1.5 else "black")
+            ax.text(
+                j,
+                0,
+                f"{v:.2f}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="white" if v < 0.7 or v > 1.5 else "black",
+            )
     ax.figure.colorbar(im, ax=ax, shrink=0.8)
     ax.set_title(f"mm_bf16: {provider} speedup vs {baseline} (>1 = {provider} faster)")
     plt.tight_layout()
@@ -224,13 +240,17 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark mm_bf16 backends")
     parser.add_argument("--providers", type=str, default=",".join(ALL_PROVIDERS))
     parser.add_argument("--baseline", type=str, default="cutlass")
-    parser.add_argument("--output-prefix", type=str, default="mm_bf16_backend_comparison")
+    parser.add_argument(
+        "--output-prefix", type=str, default="mm_bf16_backend_comparison"
+    )
     parser.add_argument("--csv", type=str, default=None)
     args = parser.parse_args()
 
     cc = get_cc()
     print(f"GPU Compute Capability: SM{cc}")
-    requested = [p.strip() for p in args.providers.split(",") if p.strip() in ALL_PROVIDERS]
+    requested = [
+        p.strip() for p in args.providers.split(",") if p.strip() in ALL_PROVIDERS
+    ]
     available = [p for p in requested if provider_available(p)]
     if not available:
         print("No available providers; nothing to benchmark.")
@@ -242,7 +262,7 @@ def main():
     shapes: List[Tuple[int, int, int]] = []
     for mnk in (1024, 2048, 4096, 8192):
         shapes.append((mnk, mnk, mnk))
-    for (n, k) in ((4096, 4096), (8192, 8192)):
+    for n, k in ((4096, 4096), (8192, 8192)):
         for m in (16, 64, 256, 512, 2048):
             shapes.append((m, n, k))
 
@@ -259,8 +279,13 @@ def main():
         write_csv(args.csv, results)
     for p in available:
         if p != baseline:
-            create_heatmap(shapes, results, p, baseline,
-                           f"{args.output_prefix}_{p}_vs_{baseline}.png")
+            create_heatmap(
+                shapes,
+                results,
+                p,
+                baseline,
+                f"{args.output_prefix}_{p}_vs_{baseline}.png",
+            )
 
     print("\n" + "=" * 78)
     print("BENCHMARK COMPLETE")
