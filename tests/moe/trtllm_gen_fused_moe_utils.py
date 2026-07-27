@@ -490,8 +490,22 @@ class FP4Moe(Moe):
         gemm1_scales_fp4_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
-        gemm1_bias_shuffled = [] if args.gemm1_bias is not None else None
-        gemm2_bias_shuffled = [] if args.gemm2_bias is not None else None
+        gemm1_bias_for_kernel = args.gemm1_bias
+        gemm2_bias_for_kernel = args.gemm2_bias
+        if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
+            # TRTLLM-gen adds FP4 bias before applying dequantization scales.
+            if gemm1_bias_for_kernel is not None:
+                gemm1_scale_ab = (1.0 / args.gemm1_scales_global) * (
+                    1.0 / args.hidden_states_scale_global
+                )
+                gemm1_bias_for_kernel = gemm1_bias_for_kernel / gemm1_scale_ab[:, None]
+            if gemm2_bias_for_kernel is not None:
+                gemm2_scale_ab = (1.0 / args_dequant.c_global_sf) * (
+                    1.0 / args.gemm2_scales_global
+                )
+                gemm2_bias_for_kernel = gemm2_bias_for_kernel / gemm2_scale_ab[:, None]
+        gemm1_bias_shuffled = [] if gemm1_bias_for_kernel is not None else None
+        gemm2_bias_shuffled = [] if gemm2_bias_for_kernel is not None else None
         for i in range(num_experts):
             # Calculate the permute indices for the following:
             # 1. Reorder rows of W1 and scales for fused gated activation
@@ -529,12 +543,12 @@ class FP4Moe(Moe):
             if gemm1_bias_shuffled is not None:
                 permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
                     self._cache_permute_indices,
-                    args.gemm1_bias[i].reshape(-1, 1),
+                    gemm1_bias_for_kernel[i].reshape(-1, 1),
                     epilogue_tile_m,
                     is_gated_act_gemm=is_gated_activation(args.activation_type),
                 )
                 gemm1_bias_shuffled.append(
-                    args.gemm1_bias[i]
+                    gemm1_bias_for_kernel[i]
                     .reshape(-1, 1)[permute_bias_indices.to(args.gemm1_bias.device)]
                     .contiguous()
                 )
@@ -569,11 +583,11 @@ class FP4Moe(Moe):
             if gemm2_bias_shuffled is not None:
                 permute_bias_indices = get_w2_permute_indices_with_cache(
                     self._cache_permute_indices,
-                    args.gemm2_bias[i].reshape(-1, 1),
+                    gemm2_bias_for_kernel[i].reshape(-1, 1),
                     epilogue_tile_m,
                 )
                 gemm2_bias_shuffled.append(
-                    args.gemm2_bias[i]
+                    gemm2_bias_for_kernel[i]
                     .reshape(-1, 1)[permute_bias_indices.to(args.gemm2_bias.device)]
                     .contiguous()
                 )

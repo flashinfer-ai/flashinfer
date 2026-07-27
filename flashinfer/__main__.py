@@ -90,6 +90,25 @@ except Exception:
     found_nvcc = False
 
 
+@cli.command("collect-env")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
+def collect_env_cmd(as_json):
+    """Dump a full environment report for bug reports.
+
+    Covers versions (flashinfer/torch/vllm/sglang/cudnn/...), GPU and driver
+    properties, and loaded-vs-installed GPU library disambiguation. Paste the
+    output into GitHub issues.
+    """
+    from .collect_env import collect_env_info, format_report
+    import json as json_mod
+
+    report = collect_env_info()
+    if as_json:
+        click.echo(json_mod.dumps(report, indent=2))
+    else:
+        click.echo(format_report(report))
+
+
 @cli.command("show-config")
 def show_config_cmd():
     """Show configuration"""

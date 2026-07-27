@@ -40,6 +40,7 @@ Utility Functions
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
     fused_topk_deepseek
+    hash_topk
 
 The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
 scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted

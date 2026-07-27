@@ -888,6 +888,32 @@ def cvt_f32x2_to_half2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def cvt_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack two float32 values into the low and high bfloat16 lanes, respectively."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 h0, h1;
+                cvt.rn.bf16.f32 h0, $1;
+                cvt.rn.bf16.f32 h1, $2;
+                mov.b32 $0, {h0, h1};
+            }
+            """,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert FP8 E4M3 to float32 AND compute reciprocal."""
     return Float32(

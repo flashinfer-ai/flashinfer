@@ -38,6 +38,7 @@ from ..trace.templates.norm import (
     fused_rmsnorm_silu_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
+    layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
     rmsnorm_trace,
@@ -528,6 +529,55 @@ def _layernorm_fake(
 ) -> torch.Tensor:
     b, k = input.shape
     return input.new_empty([b, k])
+
+
+@flashinfer_api(trace=layernorm_quant_trace)
+@register_custom_op("flashinfer::layernorm_quant", mutates_args=("out",))
+def layernorm_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    gemma: torch.Tensor,
+    beta: torch.Tensor,
+    scale: Union[float, torch.Tensor],
+    eps: float = 1e-6,
+) -> None:
+    r"""Layer normalization + fp8 quantization.
+
+    ``out[i] = (((input[i] - E[input]) / sqrt(Var[input] + eps)) * gemma[i] + beta[i]) / scale``
+
+    Parameters
+    ----------
+    out: torch.Tensor
+        The output tensor, shape (batch_size, hidden_size). Need to be contiguous.
+        The output is quantized to the dtype of this tensor, which must be
+        float8_e4m3fn or float8_e5m2.
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size). Need to be bfloat16 and contiguous.
+    gemma: torch.Tensor
+        Gemma tensor, shape (hidden_size,). Need to be float32.
+    beta: torch.Tensor
+        Beta tensor, shape (hidden_size,). Need to be float32.
+    scale: torch.Tensor
+        Scale factor for quantization, shape (1,). The normalized output is
+        divided by this scale before the fp8 cast.
+    eps: float
+        Epsilon for numerical stability.
+    """
+    scale = _normalize_scale_tensor(scale, input)
+    # No CuTe-DSL layernorm quant kernel yet; always use the CUDA JIT module.
+    get_norm_module().layernorm_quant(out, input, gemma, beta, scale, eps)
+
+
+@register_fake_op("flashinfer::layernorm_quant")
+def _layernorm_quant_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    gemma: torch.Tensor,
+    beta: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    pass
 
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
@@ -1741,6 +1791,7 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "layernorm",
+    "layernorm_quant",
     "fused_rmsnorm_silu",
     # Fused DIT LayerNorm (diffusion transformer)
     "fused_dit_gate_residual_layernorm_gamma_beta",

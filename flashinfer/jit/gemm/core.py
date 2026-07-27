@@ -114,10 +114,59 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
     return gen_jit_spec(
         "fp4_gemm_cutlass",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+    )
+
+
+def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
+    gen_directory = (
+        jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_nvfp4_svdquant"
+    )
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "nvfp4_svdquant_gemm_cutlass_sm100.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nvfp4_smooth_quantize_sm100.cu",
+    ]
+
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "nvfp4_svdquant_gemm_cutlass_sm100.jinja"
+    ) as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        # One TU per kernel shape (27 runtime tactics = 8 shapes x dynamic clusters).
+        config_list = [
+            "Tactic1Sm128x256x128Config",
+            "Tactic2Sm256x256x128Config",
+            "Tactic1Sm128x128x128Config",
+            "Tactic2Sm256x192x128Config",
+            "Tactic1Sm128x64x128Config",
+            "Tactic1Sm128x128x256Config",
+            "Tactic2Sm256x128x256Config",
+            "Tactic2Sm256x256x256Config",
+        ]
+        for config in config_list:
+            dest_path = gen_directory / f"nvfp4_svdquant_gemm_cutlass_{config}.cu"
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(config=config)
+            write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
+    return gen_jit_spec(
+        "nvfp4_svdquant_gemm_cutlass",
         source_paths,
         extra_cuda_cflags=nvcc_flags
         + [
@@ -157,32 +206,37 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
-    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.jinja") as f:
-        kernel_inst_templ = jinja2.Template(f.read())
-        dtype_list = ["__nv_bfloat16", "half"]
-        cta_m_n_k_list = [
-            (128, 64, 128),
-            (128, 256, 128),
-            (128, 128, 256),
-            (128, 256, 256),
-        ]
-        for cta_m, cta_n, cta_k in cta_m_n_k_list:
-            for dtype in dtype_list:
-                dest_path = (
-                    gen_directory
-                    / f"fp4_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
-                )
-                source_paths.append(dest_path)
-                source = kernel_inst_templ.render(
-                    type=dtype,
-                    cta_m=cta_m,
-                    cta_n=cta_n,
-                    cta_k=cta_k,
-                )
-                write_if_different(dest_path, source)
+    dtype_list = ["__nv_bfloat16", "half"]
+    generic_cta_m_n_k_list = [
+        (128, 64, 128),
+        (128, 256, 128),
+        (128, 128, 256),
+        (128, 256, 256),
+    ]
+    generic_templates = [
+        ("fp4_gemm_cutlass.jinja", ""),
+        ("fp4_gemm_cutlass_sm103_generic_store256.jinja", "_store256"),
+    ]
+    for template_name, file_suffix in generic_templates:
+        with open(jit_env.FLASHINFER_CSRC_DIR / template_name) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+            for cta_m, cta_n, cta_k in generic_cta_m_n_k_list:
+                for dtype in dtype_list:
+                    dest_path = (
+                        gen_directory
+                        / f"fp4_gemm_cutlass{file_suffix}_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                    )
+                    source_paths.append(dest_path)
+                    source = kernel_inst_templ.render(
+                        type=dtype,
+                        cta_m=cta_m,
+                        cta_n=cta_n,
+                        cta_k=cta_k,
+                    )
+                    write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
     return gen_jit_spec(
         "fp4_gemm_cutlass_sm103",
@@ -287,7 +341,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
 
     return gen_jit_spec(
@@ -337,7 +391,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
 
     return gen_jit_spec(
@@ -521,7 +575,7 @@ def gen_gemm_sm100_module() -> JitSpec:
         write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10]
     )
     return gen_jit_spec(
         "gemm_sm100",
@@ -690,7 +744,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         )
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "gemm"
@@ -712,6 +766,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
@@ -864,7 +919,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         )
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "gemm"
@@ -886,6 +941,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],

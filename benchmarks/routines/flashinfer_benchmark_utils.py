@@ -241,6 +241,7 @@ benchmark_apis = {
         "gemma_fused_add_rmsnorm",
         "rmsnorm_quant",
         "fused_add_rmsnorm_quant",
+        "layernorm_quant",
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
         "fused_rmsnorm_silu",
@@ -627,6 +628,17 @@ routine_cc_to_supported_backends = {
         "10.3": ["cute-dsl"],
         "12.0": ["cute-dsl"],
         "12.1": ["cute-dsl"],
+    },
+    "layernorm_quant": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {
