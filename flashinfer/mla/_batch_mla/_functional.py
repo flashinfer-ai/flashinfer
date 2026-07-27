@@ -27,6 +27,7 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
+    is_in_profile_measurement,
     make_bucket_mapper,
 )
 from flashinfer.trace.templates.attention import (
@@ -37,15 +38,20 @@ from flashinfer.utils import (
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     check_shape_dtype_device,
     device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     log2e,
+    next_positive_power_of_2,
 )
 
-from ._backends.cute_dsl_backend import (
-    CuteDslMlaDecodeRunner,
-    _BatchMLAPagedAttentionCuteDslBackend,
-    _cute_dsl_incompatibility_reason,
-    _cute_dsl_max_supported_batch,
+from ._backends._cute_dsl_common import (
+    _BatchMLAPagedAttentionCuteDslBackendBase,
+)
+from ._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from ._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
 
 from ._backends.cutlass_backend import (
@@ -80,6 +86,310 @@ supported_mla_head_dimensions = [
     deepseek_mla_dimensions,
     smaller_mla_dimensions,
 ]
+
+
+def _cute_dsl_max_supported_batch(
+    workspace_bytes: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_active_blocks: int,
+    candidate_max: int,
+) -> int:
+    """Largest batch the caller's workspace can support for CuTe DSL MLA."""
+    from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+        _get_split_kv_and_workspace_size,
+    )
+
+    lo, hi = 1, max(1, candidate_max)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        _, workspace_size = _get_split_kv_and_workspace_size(
+            mid, q_len, num_heads, kv_lora_rank, max_active_blocks
+        )
+        if workspace_size <= workspace_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _cute_dsl_incompatibility_reason(
+    query: torch.Tensor,
+    out_dtype: torch.dtype,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[List[torch.Tensor]],
+    sparse_mla_top_k: int,
+    skip_softmax_threshold_scale_factor: Optional[float],
+    uses_shared_paged_kv_idx: bool,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    page_size: int,
+    is_var_seq: bool,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+    cute_dsl_impl: str = "auto",
+) -> Optional[str]:
+    """Return ``None`` when CuTe DSL can implement the functional request."""
+    del return_lse, lse
+    cc = get_compute_capability(query.device)
+    if cc[0] < 10:
+        return (
+            "cute-dsl backend (MLA decode kernel) requires SM100+, "
+            f"got SM{cc[0]}{cc[1]}"
+        )
+    if isinstance(bmm1_scale, torch.Tensor):
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support tensor "
+            "bmm1_scale, please pass a float value"
+        )
+    if isinstance(bmm2_scale, torch.Tensor):
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support tensor "
+            "bmm2_scale, please pass a float value"
+        )
+    if isinstance(sinks, (list, tuple)) and len(sinks) != 1:
+        return (
+            "cute-dsl backend (MLA decode kernel) expects sinks to be a "
+            f"single tensor or a length-1 list/tuple; got len={len(sinks)}"
+        )
+    if sparse_mla_top_k > 0:
+        return "cute-dsl backend (MLA decode kernel) does not support sparse_mla_top_k"
+    if skip_softmax_threshold_scale_factor is not None:
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support "
+            "skip_softmax_threshold_scale_factor"
+        )
+    if not uses_shared_paged_kv_idx:
+        return (
+            "cute-dsl backend (MLA decode kernel) does not support separate KV "
+            "page indices (uses_shared_paged_kv_idx=False)"
+        )
+
+    _, q_len, num_heads, _ = query.shape
+    try:
+        from flashinfer.cute_dsl.attention.mla_dispatch import _resolve_impl
+
+        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
+    except (ValueError, ImportError) as error:
+        return f"cute-dsl backend (MLA decode kernel): {error}"
+
+    try:
+        if resolved_impl == "monolithic":
+            from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+                _check_can_implement,
+            )
+        else:
+            from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+                _check_can_implement,
+            )
+
+        _check_can_implement(
+            torch_dtype=query.dtype,
+            torch_out_dtype=out_dtype,
+            page_size=page_size,
+            num_heads=num_heads,
+            seq_len_q=q_len,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            is_persistent=not is_var_seq,
+            is_var_seq=is_var_seq,
+            is_var_split_kv=False,
+        )
+    except (ValueError, ImportError) as error:
+        return (
+            "cute-dsl backend (MLA decode kernel) cannot implement this "
+            f"configuration: {error}"
+        )
+    return None
+
+
+def _resolve_cute_dsl_backend_type(
+    requested: str, *, use_sinks: bool
+) -> type[_BatchMLAPagedAttentionCuteDslBackendBase]:
+    """Resolve the functional API selector to a concrete backend class."""
+    from flashinfer.cute_dsl.attention.mla_dispatch import _resolve_impl
+
+    resolved = _resolve_impl(
+        requested=requested,
+        kwargs={"sinks": object() if use_sinks else None},
+    )
+    return {
+        "monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+        "modular": _BatchMLAPagedAttentionCuteDslModularBackend,
+    }[resolved]
+
+
+class CuteDslMlaDecodeRunner(TunableRunner):
+    """Functional autotuner adapter over the concrete CuTe DSL backends."""
+
+    def __init__(
+        self,
+        *,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        max_seq_len: int,
+        softmax_scale: float,
+        output_scale: float,
+        out_dtype: torch.dtype,
+        enable_pdl: bool,
+        is_var_seq: bool,
+        uses_shared_paged_kv_idx: bool,
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        sinks: Optional[torch.Tensor],
+        cute_dsl_impl: str,
+    ):
+        self.kv_cache = kv_cache
+        self.workspace_buffer = workspace_buffer
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.page_size = kv_cache.shape[-2]
+        self.max_seq_len = max_seq_len
+        self.softmax_scale = softmax_scale
+        self.output_scale = output_scale
+        self.out_dtype = out_dtype
+        self.enable_pdl = enable_pdl
+        self.is_var_seq = is_var_seq
+        self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+        self.lse = lse
+        self.return_lse = return_lse
+        self.sinks = sinks
+        self.cute_dsl_impl = cute_dsl_impl
+        self._prepared_backend: Optional[_BatchMLAPagedAttentionCuteDslBackendBase] = (
+            None
+        )
+
+    def _plan_backend(
+        self,
+        *,
+        query: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> _BatchMLAPagedAttentionCuteDslBackendBase:
+        batch_size, q_len, num_heads, _ = query.shape
+        cum_seq_lens_q = torch.arange(
+            batch_size + 1, device=query.device, dtype=torch.int32
+        ).mul_(q_len)
+        backend_type = _resolve_cute_dsl_backend_type(
+            self.cute_dsl_impl,
+            use_sinks=self.sinks is not None,
+        )
+        backend = backend_type(self.workspace_buffer)
+        backend.plan(
+            cum_seq_lens_q=cum_seq_lens_q,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=q_len,
+            num_heads=num_heads,
+            head_dim_ckv=self.kv_lora_rank,
+            head_dim_kpe=self.qk_rope_head_dim,
+            page_size=self.page_size,
+            causal=False,
+            sm_scale=self.softmax_scale,
+            q_data_type=query.dtype,
+            kv_data_type=self.kv_cache.dtype,
+            use_profiler=False,
+            is_var_seq=self.is_var_seq,
+            use_sinks=self.sinks is not None,
+            enable_pdl=self.enable_pdl,
+        )
+        return backend
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def get_valid_tactics(self, inputs, profile) -> List[int]:
+        del profile
+        from flashinfer.cute_dsl.attention.wrappers.batch_mla import (
+            _get_split_kv_and_workspace_size,
+        )
+        from flashinfer.cute_dsl.utils import get_num_sm
+
+        query = inputs[0]
+        batch_size, q_len, num_heads, _ = query.shape
+        _, workspace_size = _get_split_kv_and_workspace_size(
+            batch_size,
+            q_len,
+            num_heads,
+            self.kv_lora_rank,
+            get_num_sm(query.device),
+        )
+        workspace_bytes = (
+            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+        )
+        if workspace_size > workspace_bytes:
+            return []
+        return [-1]
+
+    def get_cache_key_extras(self, inputs):
+        query, _, _, out = inputs
+        sinks_key = (
+            None if self.sinks is None else (tuple(self.sinks.shape), self.sinks.dtype)
+        )
+        return (
+            query.dtype,
+            self.kv_cache.dtype,
+            out.dtype,
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.page_size,
+            next_positive_power_of_2(self.max_seq_len),
+            self.is_var_seq,
+            self.uses_shared_paged_kv_idx,
+            self.enable_pdl,
+            sinks_key,
+            self.cute_dsl_impl,
+        )
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
+    ):
+        del tactic, kwargs
+        query, block_tables, seq_lens, out = inputs
+        if do_preparation:
+            # The profile's cold-L2 input batches are clones of these tensors.
+            # They share shapes and metadata values, but not object identity.
+            # Retain the plan so graph capture never performs planning work.
+            self._prepared_backend = self._plan_backend(
+                query=query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+            )
+            backend = self._prepared_backend
+        elif is_in_profile_measurement():
+            if self._prepared_backend is None:
+                raise RuntimeError(
+                    "CuTe DSL autotuner launch was not prepared before profiling."
+                )
+            backend = self._prepared_backend
+        else:
+            backend = self._plan_backend(
+                query=query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+            )
+        return backend.run(
+            q_nope=query[..., : self.kv_lora_rank].flatten(0, 1),
+            q_pe=query[..., self.kv_lora_rank :].flatten(0, 1),
+            kv_cache=self.kv_cache.squeeze(1),
+            out=out.flatten(0, 1),
+            lse=self.lse,
+            return_lse=self.return_lse,
+            sinks=self.sinks,
+            bmm1_scale=self.softmax_scale,
+            bmm2_scale=self.output_scale,
+        )
 
 
 def _compute_mla_decode_buckets(
@@ -954,8 +1264,7 @@ def _run_mla_decode_planned_dense_backend(
         result = trtllm_gen_backend.run(
             q_nope=query_flat[..., :kv_lora_rank],
             q_pe=query_flat[..., kv_lora_rank:],
-            ckv_cache=kv_cache.squeeze(1)[..., :kv_lora_rank],
-            kpe_cache=kv_cache.squeeze(1)[..., kv_lora_rank:],
+            kv_cache=kv_cache.squeeze(1),
             out=out.flatten(0, 1) if out.ndim == 4 else out,
             lse=lse,
             return_lse=return_lse,
@@ -966,7 +1275,11 @@ def _run_mla_decode_planned_dense_backend(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
     else:
-        cute_dsl_backend = _BatchMLAPagedAttentionCuteDslBackend(workspace_buffer)
+        cute_dsl_backend_type = _resolve_cute_dsl_backend_type(
+            cute_dsl_impl,
+            use_sinks=sink is not None,
+        )
+        cute_dsl_backend = cute_dsl_backend_type(workspace_buffer)
         cute_dsl_backend.plan(
             cum_seq_lens_q=cum_seq_lens_q,
             block_tables=block_tables,
@@ -982,15 +1295,13 @@ def _run_mla_decode_planned_dense_backend(
             kv_data_type=kv_cache.dtype,
             use_profiler=False,
             is_var_seq=is_var_seq,
-            cute_dsl_impl=cute_dsl_impl,
             use_sinks=sink is not None,
             enable_pdl=enable_pdl,
         )
         result = cute_dsl_backend.run(
             q_nope=query_flat[..., :kv_lora_rank],
             q_pe=query_flat[..., kv_lora_rank:],
-            ckv_cache=kv_cache.squeeze(1)[..., :kv_lora_rank],
-            kpe_cache=kv_cache.squeeze(1)[..., kv_lora_rank:],
+            kv_cache=kv_cache.squeeze(1),
             out=out.flatten(0, 1) if out.ndim == 4 else out,
             lse=lse,
             return_lse=return_lse,
@@ -1092,8 +1403,7 @@ def _run_mla_decode_xqa(
     backend_out = backend_impl.run(
         q_nope=query[..., :kv_lora_rank].squeeze(1),
         q_pe=query[..., kv_lora_rank:].squeeze(1),
-        ckv_cache=kv_cache[..., :kv_lora_rank],
-        kpe_cache=kv_cache[..., kv_lora_rank:],
+        kv_cache=kv_cache,
         out=None if out is None else out.squeeze(1),
         lse=lse,
         return_lse=return_lse,

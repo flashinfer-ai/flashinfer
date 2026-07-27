@@ -30,14 +30,24 @@ from flashinfer.utils import (
     get_compute_capability,
 )
 
-from ._backends.cute_dsl_backend import (
-    _BatchMLAPagedAttentionCuteDslBackend,
+from ._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from ._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
 
 # Private imports plus assignments preserve the Batch MLA core's compatibility surface.
 from ._backends.cutlass_backend import (
     _BatchMLAPagedAttentionCutlassBackend,
     get_mla_module as _get_mla_module,
+)
+from ._backends._layout import (
+    _adjacent_last_dim_view,
+    _split_combined_kv_cache,
+    _split_combined_query,
+    _split_query_views_match_combined,
+    _split_views_match_combined,
 )
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
@@ -63,7 +73,8 @@ _WRAPPER_BACKEND_TYPES = {
     "fa3": _BatchMLAPagedAttentionFa3Backend,
     "cutlass": _BatchMLAPagedAttentionCutlassBackend,
     "trtllm-gen": _BatchMLAPagedAttentionTrtllmGenBackend,
-    "cute-dsl": _BatchMLAPagedAttentionCuteDslBackend,
+    "cute-dsl-monolithic": _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+    "cute-dsl-modular": _BatchMLAPagedAttentionCuteDslModularBackend,
     "xqa": _BatchMLAPagedAttentionXqaBackend,
 }
 
@@ -205,7 +216,7 @@ class BatchMLAPagedAttentionWrapper:
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
-            An initial ``cutlass``, ``trtllm-gen``, ``cute-dsl``, or ``xqa`` plan may
+            An initial ``cutlass``, ``trtllm-gen``, CuTe DSL, or ``xqa`` plan may
             be captured and replayed, but replanning those dense backends is rejected
             because they do not accept caller-reserved metadata buffers for
             pointer-stable replacement.
@@ -226,7 +237,8 @@ class BatchMLAPagedAttentionWrapper:
             dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
         backend : str
             One of ``"auto"``, ``"fa2"``, ``"fa3"``, ``"cutlass"``,
-            ``"trtllm-gen"``, ``"cute-dsl"``, or ``"xqa"``. Default ``"auto"``.
+            ``"trtllm-gen"``, ``"cute-dsl"``, ``"cute-dsl-monolithic"``,
+            ``"cute-dsl-modular"``, or ``"xqa"``. Default ``"auto"``.
 
             ``"auto"`` first tries ``"fa3"`` on SM90a, else ``"fa2"``, then
             falls back to ``"cutlass"`` when the preferred backend reports the
@@ -237,10 +249,11 @@ class BatchMLAPagedAttentionWrapper:
             slower than the fa2 fallback for decode shapes.
 
             ``"cutlass"`` uses the SM100/SM110 CUTLASS MLA decode kernel. Only
-            ``float_workspace_buffer`` is required at construction. Public
-            ``q_nope``/``q_pe`` and ``ckv_cache``/``kpe_cache`` inputs stay split
-            and are concatenated internally. ``kv_len`` and ``page_table`` may
-            be captured by ``plan()`` and omitted from ``run()``; planned
+            ``float_workspace_buffer`` is required at construction. Pass the
+            combined ``kv_cache`` input, or adjacent ``ckv_cache``/``kpe_cache``
+            views, to avoid a run-time copy. Non-adjacent split caches remain a
+            deprecated compatibility path for CUTLASS only. ``kv_len`` and
+            ``page_table`` may be captured by ``plan()`` and omitted from ``run()``; planned
             metadata takes precedence over cheap-verified aliases supplied at
             run time. Deprecated: an explicitly requested CUTLASS backend may
             also run without a preceding ``plan()`` when both metadata tensors
@@ -251,8 +264,13 @@ class BatchMLAPagedAttentionWrapper:
             ``"trtllm-gen"`` uses the dense TRTLLM-GEN MLA decode path. It is
             explicit-only initially and is not considered by ``backend="auto"``.
 
-            ``"cute-dsl"`` uses the Blackwell CuTe DSL MLA decode path. It is
-            explicit-only and is never considered by ``backend="auto"``.
+            ``"cute-dsl"`` is the Blackwell CuTe DSL family selector. Without
+            sinks it tries the monolithic backend first and falls back to the
+            modular backend only when the monolithic plan reports the shape as
+            unsupported. With sinks it selects the modular backend directly.
+            Use ``"cute-dsl-monolithic"`` or ``"cute-dsl-modular"`` for strict
+            implementation selection. CuTe DSL is never considered by
+            ``backend="auto"``.
 
             ``"xqa"`` uses the SM120/SM121 XQA MLA decode path. It is
             explicit-only and is never considered by ``backend="auto"``. Its
@@ -265,15 +283,21 @@ class BatchMLAPagedAttentionWrapper:
             "cutlass",
             "trtllm-gen",
             "cute-dsl",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
             "xqa",
         ):
             raise ValueError(
                 "backend must be one of 'auto', 'fa2', 'fa3', 'cutlass', "
-                f"'trtllm-gen', 'cute-dsl', or 'xqa', got {backend!r}"
+                "'trtllm-gen', 'cute-dsl', 'cute-dsl-monolithic', "
+                f"'cute-dsl-modular', or 'xqa', got {backend!r}"
             )
         self._backend = backend
         self._selected_backend: Optional[str] = None
         self._backend_impl: Optional[object] = None
+        self._query_split_widths: Optional[tuple[int, int]] = None
+        self._kv_split_widths: Optional[tuple[int, int]] = None
+        self._warned_nonadjacent_cutlass_cache = False
 
         self.device = float_workspace_buffer.device
         self._float_workspace_buffer = float_workspace_buffer
@@ -288,7 +312,8 @@ class BatchMLAPagedAttentionWrapper:
         if self._use_cuda_graph and self._selected_backend in (
             "cutlass",
             "trtllm-gen",
-            "cute-dsl",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
             "xqa",
         ):
             raise ValueError(
@@ -304,6 +329,11 @@ class BatchMLAPagedAttentionWrapper:
         )
         result = backend_type.plan_from_wrapper(args)
         self._backend_impl, self._selected_backend = result.backend_impl, backend
+        self._query_split_widths = (
+            args.qk_nope_head_dim or args.head_dim_ckv,
+            args.head_dim_kpe,
+        )
+        self._kv_split_widths = (args.head_dim_ckv, args.head_dim_kpe)
         logger.info(
             "BatchMLAPagedAttentionWrapper requested backend '%s' selected backend '%s'",
             self._backend,
@@ -337,7 +367,6 @@ class BatchMLAPagedAttentionWrapper:
         qk_nope_head_dim: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         is_var_seq: Optional[bool] = None,
-        cute_dsl_impl: str = "auto",
         use_sinks: bool = False,
     ) -> None: ...
 
@@ -363,7 +392,6 @@ class BatchMLAPagedAttentionWrapper:
         qk_nope_head_dim: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         is_var_seq: Optional[bool] = None,
-        cute_dsl_impl: str = "auto",
         use_sinks: bool = False,
     ) -> None: ...
 
@@ -393,7 +421,6 @@ class BatchMLAPagedAttentionWrapper:
         qk_nope_head_dim: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         is_var_seq: Optional[bool] = None,
-        cute_dsl_impl: str = "auto",
         use_sinks: bool = False,
     ) -> None: ...
 
@@ -421,7 +448,6 @@ class BatchMLAPagedAttentionWrapper:
         qk_nope_head_dim: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         is_var_seq: Optional[bool] = None,
-        cute_dsl_impl: str = "auto",
         use_sinks: bool = False,
     ) -> None:
         r"""Plan from one or two equivalent canonical metadata forms.
@@ -448,11 +474,14 @@ class BatchMLAPagedAttentionWrapper:
         treated as omitted. In particular, ``max_q_len=None`` derives the value
         from the supplied query metadata.
 
-        For ``backend="cute-dsl"``, ``cute_dsl_impl`` selects ``"auto"``,
-        ``"monolithic"``, or ``"modular"``.  ``use_sinks=True`` plans the
-        modular sink-capable kernel, and ``is_var_seq`` must match whether the
-        planned KV ``seq_lens`` vary.  Query lengths must remain uniform.  CuTe
-        DSL is explicit-only and is never an automatic-backend candidate.
+        For ``backend="cute-dsl"``, ``use_sinks=True`` selects the modular
+        sink-capable backend. Without sinks, the wrapper tries the monolithic
+        backend first and falls back to modular only for an unsupported plan.
+        Select ``backend="cute-dsl-monolithic"`` or
+        ``backend="cute-dsl-modular"`` to disable that family fallback.
+        ``is_var_seq`` must match whether the planned KV ``seq_lens`` vary.
+        Query lengths must remain uniform. CuTe DSL is explicit-only and is
+        never an automatic-backend candidate.
 
         """
         self._reject_unsafe_cuda_graph_replan()
@@ -495,7 +524,6 @@ class BatchMLAPagedAttentionWrapper:
             qk_nope_head_dim=qk_nope_head_dim,
             enable_pdl=enable_pdl,
             is_var_seq=is_var_seq,
-            cute_dsl_impl=cute_dsl_impl,
             use_sinks=use_sinks,
             _float_workspace_buffer=self._float_workspace_buffer,
             _generated_fa_workspace=self._generated_fa_workspace,
@@ -505,6 +533,36 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
         )
+        if self._backend == "cute-dsl":
+            candidates = (
+                ["cute-dsl-modular"]
+                if use_sinks
+                else ["cute-dsl-monolithic", "cute-dsl-modular"]
+            )
+            rejections = []
+            last_rejection = None
+            for candidate in candidates:
+                try:
+                    self._plan_backend(candidate, plan_args)
+                except _BackendPlanUnsupportedError as err:
+                    last_rejection = err
+                    rejections.append((candidate, str(err)))
+                    logger.debug(
+                        "BatchMLAPagedAttentionWrapper CuTe DSL family rejected "
+                        "backend '%s': %s",
+                        candidate,
+                        err,
+                    )
+                    continue
+                return
+            rejection_summary = "; ".join(
+                f"{candidate}: {reason}" for candidate, reason in rejections
+            )
+            raise _BackendPlanUnsupportedError(
+                "backend='cute-dsl' rejected all family candidates: "
+                f"{rejection_summary}"
+            ) from last_rejection
+
         if self._backend != "auto":
             self._plan_backend(self._backend, plan_args)
             return
@@ -553,10 +611,10 @@ class BatchMLAPagedAttentionWrapper:
     @overload
     def run(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        q_nope: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        ckv_cache: Optional[torch.Tensor] = None,
+        kpe_cache: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
@@ -566,6 +624,8 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         *,
+        q: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -579,10 +639,10 @@ class BatchMLAPagedAttentionWrapper:
     @overload
     def run(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        q_nope: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        ckv_cache: Optional[torch.Tensor] = None,
+        kpe_cache: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
@@ -592,6 +652,8 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         *,
+        q: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -603,10 +665,10 @@ class BatchMLAPagedAttentionWrapper:
     @flashinfer_api(trace=mla_paged_decode_trace)
     def run(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        q_nope: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
+        ckv_cache: Optional[torch.Tensor] = None,
+        kpe_cache: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -616,6 +678,8 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
         *,
+        q: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
         ckv_scale: Optional[float] = None,
         kpe_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -636,16 +700,31 @@ class BatchMLAPagedAttentionWrapper:
 
         Parameters
         ----------
-        q_nope : torch.Tensor
-            The query tensor without rope, shape: ``[batch_size, num_heads, head_dim_ckv]``.
-        q_pe : torch.Tensor
-            The rope part of the query tensor, shape: ``[batch_size, num_heads, head_dim_kpe]``.
-        ckv_cache : torch.Tensor
+        q_nope : Optional[torch.Tensor]
+            The query tensor without rope, shape:
+            ``[batch_size, num_heads, qk_nope_head_dim]``.
+            Provide together with ``q_pe``, or omit both and provide ``q``.
+        q_pe : Optional[torch.Tensor]
+            The rope part of the query tensor, shape:
+            ``[batch_size, num_heads, head_dim_kpe]``.
+        q : Optional[torch.Tensor]
+            Combined query tensor with last dimension
+            ``qk_nope_head_dim + head_dim_kpe``. The wrapper lowers it to
+            zero-copy canonical ``q_nope`` and ``q_pe`` views. This form
+            requires a preceding ``plan()`` call so the split widths are known.
+        ckv_cache : Optional[torch.Tensor]
             The compressed kv-cache tensor (without rope), shape: ``[num_pages, page_size, head_dim_ckv]``.
-            ``head_dim_ckv`` is 512 in DeepSeek v2/v3 models.
-        kpe_cache : torch.Tensor
+            ``head_dim_ckv`` is 512 in DeepSeek v2/v3 models. Provide together
+            with ``kpe_cache``, or omit both and provide ``kv_cache``.
+        kpe_cache : Optional[torch.Tensor]
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
-            ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
+            ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models. When ``kv_cache``
+            is also supplied, both split tensors must be its exact canonical views.
+        kv_cache : Optional[torch.Tensor]
+            Combined KV cache, shape: ``[num_pages, page_size, head_dim_ckv + head_dim_kpe]``.
+            The wrapper lowers it to zero-copy canonical ``ckv_cache`` and
+            ``kpe_cache`` views. Supplying it with split caches is allowed only
+            when those splits are exactly those views.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
             When ``o_scale`` is provided, this should be an FP8 tensor.
@@ -686,9 +765,9 @@ class BatchMLAPagedAttentionWrapper:
             ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
             usage rules as ``ckv_scale``.
         sinks : Optional[torch.Tensor]
-            Per-head float32 attention sinks.  For ``backend="cute-dsl"``,
-            sinks must be planned with ``use_sinks=True`` and use the modular
-            implementation.
+            Per-head float32 attention sinks. For the CuTe DSL family, sinks
+            must be planned with ``use_sinks=True`` and use
+            ``backend="cute-dsl"`` or ``backend="cute-dsl-modular"``.
         bmm1_scale : Optional[float]
             Finite run-time attention-logit scale override for CuTe DSL or
             XQA. If omitted, the ``sm_scale`` captured by ``plan()`` is used.
@@ -706,11 +785,103 @@ class BatchMLAPagedAttentionWrapper:
         metadata before ``run()`` instead. This compatibility path will be
         removed in a future release.
 
+        Non-adjacent split cache tensors are also deprecated for CUTLASS and
+        trigger a warning because they require a full concatenation at every
+        run. TRTLLM-GEN, CuTe DSL, and XQA reject them; FA2 and FA3 continue to
+        accept independent split tensors.
+
+        Non-adjacent split query tensors remain accepted. Their fallback copy
+        is bounded by the active query size, unlike a paged KV-cache copy.
+
         Notes
         -----
         The CuTe DSL monolithic implementation supports LSE output; the
         modular implementation does not. XQA does not support LSE output.
         """
+        if q is not None:
+            if (q_nope is None) != (q_pe is None):
+                raise ValueError("provide either q or both q_nope and q_pe.")
+            query_widths = self._query_split_widths
+            if query_widths is None:
+                raise ValueError("combined q requires plan() before run().")
+            q_nope_width, q_pe_width = query_widths
+            if q_nope is not None and not _split_query_views_match_combined(
+                q,
+                q_nope,
+                q_pe,
+                q_nope_width=q_nope_width,
+                q_pe_width=q_pe_width,
+            ):
+                raise ValueError("q_nope and q_pe must be the same views as q.")
+            q_nope, q_pe = _split_combined_query(
+                q,
+                q_nope_width=q_nope_width,
+                q_pe_width=q_pe_width,
+            )
+        elif q_nope is None or q_pe is None:
+            raise ValueError("provide either q or both q_nope and q_pe.")
+
+        if kv_cache is not None:
+            if (ckv_cache is None) != (kpe_cache is None):
+                raise ValueError(
+                    "provide either kv_cache or both ckv_cache and kpe_cache."
+                )
+            kv_widths = self._kv_split_widths
+            if kv_widths is None:
+                kv_widths = (q_nope.shape[-1], q_pe.shape[-1])
+            ckv_width, kpe_width = kv_widths
+            if ckv_cache is not None and not _split_views_match_combined(
+                kv_cache,
+                ckv_cache,
+                kpe_cache,
+                ckv_width=ckv_width,
+                kpe_width=kpe_width,
+            ):
+                raise ValueError(
+                    "ckv_cache and kpe_cache must be the same views as kv_cache."
+                )
+            ckv_cache, kpe_cache = _split_combined_kv_cache(
+                kv_cache,
+                ckv_width=ckv_width,
+                kpe_width=kpe_width,
+            )
+        elif ckv_cache is None or kpe_cache is None:
+            raise ValueError("provide either kv_cache or both ckv_cache and kpe_cache.")
+
+        selected_backend = self._selected_backend or self._backend
+        backend_kv_cache = kv_cache
+        if (
+            backend_kv_cache is None
+            and selected_backend
+            in (
+                "cutlass",
+                "trtllm-gen",
+                "cute-dsl",
+                "cute-dsl-monolithic",
+                "cute-dsl-modular",
+                "xqa",
+            )
+            and isinstance(ckv_cache, torch.Tensor)
+            and isinstance(kpe_cache, torch.Tensor)
+        ):
+            backend_kv_cache = _adjacent_last_dim_view(ckv_cache, kpe_cache)
+        if (
+            selected_backend == "cutlass"
+            and not self._warned_nonadjacent_cutlass_cache
+            and isinstance(ckv_cache, torch.Tensor)
+            and isinstance(kpe_cache, torch.Tensor)
+            and backend_kv_cache is None
+        ):
+            warnings.warn(
+                "Non-adjacent ckv_cache and kpe_cache for CUTLASS are "
+                "concatenated on every run. Pass kv_cache or adjacent split views "
+                "to avoid the copy. This compatibility path is deprecated and will "
+                "be removed in a future release.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self._warned_nonadjacent_cutlass_cache = True
+
         has_fused_scale = bmm1_scale is not None or bmm2_scale is not None
         has_per_tensor_scale = ckv_scale is not None or kpe_scale is not None
         if has_fused_scale and has_per_tensor_scale:
@@ -739,6 +910,7 @@ class BatchMLAPagedAttentionWrapper:
                 q_pe=q_pe,
                 ckv_cache=ckv_cache,
                 kpe_cache=kpe_cache,
+                kv_cache=backend_kv_cache,
                 out=out,
                 lse=lse,
                 return_lse=return_lse,
@@ -762,6 +934,7 @@ class BatchMLAPagedAttentionWrapper:
                 q_pe=q_pe,
                 ckv_cache=ckv_cache,
                 kpe_cache=kpe_cache,
+                kv_cache=backend_kv_cache,
                 out=out,
                 lse=lse,
                 return_lse=return_lse,

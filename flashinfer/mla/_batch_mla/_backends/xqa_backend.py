@@ -106,10 +106,6 @@ class _BatchMLAPagedAttentionXqaBackend:
             )
         if args.is_var_seq is not None:
             raise ValueError("is_var_seq is not supported by the XQA wrapper backend.")
-        if args.cute_dsl_impl != "auto":
-            raise ValueError(
-                "cute_dsl_impl is not supported by the XQA wrapper backend."
-            )
         if args.use_sinks:
             raise ValueError("use_sinks is not supported by the XQA wrapper backend.")
         if (
@@ -334,6 +330,7 @@ class _BatchMLAPagedAttentionXqaBackend:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -384,11 +381,14 @@ class _BatchMLAPagedAttentionXqaBackend:
                     f"XQA MLA wrapper expects {name} to be a finite Python float, "
                     f"got {scale!r}."
                 )
+        if kv_cache is None:
+            raise ValueError(
+                "XQA KV cache must be adjacent views or a combined kv_cache."
+            )
         return self.run(
             q_nope=q_nope,
             q_pe=q_pe,
-            ckv_cache=ckv_cache,
-            kpe_cache=kpe_cache,
+            kv_cache=kv_cache,
             out=out,
             lse=None,
             return_lse=False,
@@ -401,8 +401,7 @@ class _BatchMLAPagedAttentionXqaBackend:
         *,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -430,18 +429,15 @@ class _BatchMLAPagedAttentionXqaBackend:
             "q_pe",
         )
         check_shape_dtype_device(
-            ckv_cache,
-            (ckv_cache.shape[0], self._page_size, self._kv_lora_rank),
+            kv_cache,
+            (
+                kv_cache.shape[0],
+                self._page_size,
+                self._kv_lora_rank + self._qk_rope_head_dim,
+            ),
             self._kv_dtype,
             self.device,
-            "ckv_cache",
-        )
-        check_shape_dtype_device(
-            kpe_cache,
-            (ckv_cache.shape[0], self._page_size, self._qk_rope_head_dim),
-            self._kv_dtype,
-            self.device,
-            "kpe_cache",
+            "kv_cache",
         )
         if out is None:
             out = torch.empty(
@@ -466,7 +462,7 @@ class _BatchMLAPagedAttentionXqaBackend:
             self._num_heads,
             self._kv_lora_rank + self._qk_rope_head_dim,
         )
-        kv_cache = _concat_adjacent_views_or_cat(ckv_cache, kpe_cache).unsqueeze(2)
+        kv_cache = kv_cache.unsqueeze(2)
         resolved_bmm1_scale = self._bmm1_scale if bmm1_scale is None else bmm1_scale
         resolved_bmm2_scale = self._bmm2_scale if bmm2_scale is None else bmm2_scale
         _validate_xqa_mla_scales(

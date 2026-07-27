@@ -18,9 +18,11 @@ _REQUIRED_MODULES = {
     "_batch_mla/_planning.py",
     "_batch_mla/_wrapper.py",
     "_batch_mla/_backends/__init__.py",
+    "_batch_mla/_backends/_cute_dsl_common.py",
     "_batch_mla/_backends/_fa_common.py",
     "_batch_mla/_backends/_layout.py",
-    "_batch_mla/_backends/cute_dsl_backend.py",
+    "_batch_mla/_backends/cute_dsl_modular_backend.py",
+    "_batch_mla/_backends/cute_dsl_monolithic_backend.py",
     "_batch_mla/_backends/cutlass_backend.py",
     "_batch_mla/_backends/fa2_backend.py",
     "_batch_mla/_backends/fa3_backend.py",
@@ -36,6 +38,7 @@ _LEGACY_MODULES = {
     "_batch_mla/_backends.py",
     "_planning/__init__.py",
     "_planning/batch_mla.py",
+    "_batch_mla/_backends/cute_dsl_backend.py",
     "_backends/__init__.py",
     "_backends/batch_mla/__init__.py",
     "_backends/batch_mla/cute_dsl_backend.py",
@@ -68,6 +71,9 @@ _OWNED_SYMBOLS = {
         "_BatchMLAGeneratedFaMechanics",
     ),
     "flashinfer.mla._batch_mla._backends._layout": ("_concat_adjacent_views_or_cat",),
+    "flashinfer.mla._batch_mla._backends._cute_dsl_common": (
+        "_BatchMLAPagedAttentionCuteDslBackendBase",
+    ),
     "flashinfer.mla._batch_mla._backends.fa2_backend": (
         "_BatchMLAPagedAttentionFa2Backend",
     ),
@@ -82,10 +88,16 @@ _OWNED_SYMBOLS = {
         "_BatchMLAPagedAttentionTrtllmGenBackend",
         "TrtllmGenMlaDecodeRunner",
     ),
-    "flashinfer.mla._batch_mla._backends.cute_dsl_backend": (
-        "_BatchMLAPagedAttentionCuteDslBackend",
+    "flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend": (
+        "_BatchMLAPagedAttentionCuteDslMonolithicBackend",
+    ),
+    "flashinfer.mla._batch_mla._backends.cute_dsl_modular_backend": (
+        "_BatchMLAPagedAttentionCuteDslModularBackend",
+    ),
+    "flashinfer.mla._batch_mla._functional": (
         "CuteDslMlaDecodeRunner",
         "_cute_dsl_max_supported_batch",
+        "_resolve_cute_dsl_backend_type",
     ),
     "flashinfer.mla._batch_mla._backends.xqa_backend": (
         "_BatchMLAPagedAttentionXqaBackend",
