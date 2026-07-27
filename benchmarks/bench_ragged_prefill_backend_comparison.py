@@ -64,6 +64,7 @@ HEAD_DIM_VO = 128
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile ragged-prefill backend."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.attention.kernels.cutile.fmha_prefill_bsr_cutile import (  # noqa: F401
@@ -77,6 +78,7 @@ def _has_cutile() -> bool:
 
 
 def _has_trtllm() -> bool:
+    """True if the installed flashinfer exposes the trtllm-gen DeepSeek ragged entry point."""
     try:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
 
@@ -96,6 +98,7 @@ _AVAIL = {
 # Input generation + per-provider callables
 # --------------------------------------------------------------------------- #
 def _make_inputs(batch: int, seq: int):
+    """Build the packed ragged q/k/v and the shared prefix-sum offsets for one shape."""
     torch.manual_seed(0)
     total = batch * seq
     q = torch.randn(total, NUM_QO_HEADS, HEAD_DIM_QK, dtype=DT, device=DEV)
@@ -108,6 +111,7 @@ def _make_inputs(batch: int, seq: int):
 
 
 def _make_execute(provider: str, batch: int, seq: int) -> Callable[[], torch.Tensor]:
+    """Return a zero-arg callable running `provider`'s ragged prefill on one shape."""
     q, k, v, seq_lens, cum = _make_inputs(batch, seq)
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 
@@ -132,6 +136,7 @@ def _make_execute(provider: str, batch: int, seq: int) -> Callable[[], torch.Ten
         )
 
         def run():
+            """Run cuTile ragged prefill through the planned wrapper."""
             return wrapper.run(q, k, v)
 
     elif provider == "trtllm":
@@ -142,6 +147,7 @@ def _make_execute(provider: str, batch: int, seq: int) -> Callable[[], torch.Ten
         ws = torch.zeros(ws_sz, dtype=torch.int8, device=DEV)
 
         def run():
+            """Run trtllm-gen DeepSeek ragged prefill."""
             return trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -169,6 +175,7 @@ def _make_execute(provider: str, batch: int, seq: int) -> Callable[[], torch.Ten
 
 
 def _as_output(out) -> torch.Tensor:
+    """Unwrap a provider result that may be an (output, lse) tuple."""
     return out[0] if isinstance(out, (list, tuple)) else out
 
 
@@ -295,6 +302,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int], float]]):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
@@ -387,6 +395,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark ragged prefill backends (cuTile vs trtllm SOTA)"
     )

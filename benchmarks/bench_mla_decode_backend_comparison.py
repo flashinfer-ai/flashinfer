@@ -62,6 +62,7 @@ DTYPE = torch.bfloat16
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile paged-MLA decode backend."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.mla import BatchMLAPagedAttentionWrapper  # noqa: F401
@@ -72,6 +73,7 @@ def _has_cutile() -> bool:
 
 
 def _has_trtllm() -> bool:
+    """True if the installed flashinfer exposes the trtllm-gen MLA decode entry point."""
     try:
         from flashinfer.decode import (  # noqa: F401
             trtllm_batch_decode_with_kv_cache_mla,
@@ -96,6 +98,7 @@ class _MLAInputs:
     """Raw tensors shared by both providers (identical values -> comparable outputs)."""
 
     def __init__(self, batch: int, s_kv: int, page_size: int, num_heads: int, device):
+        """Build the paged-MLA tensors for one (batch, s_kv, page_size, num_heads) case."""
         torch.manual_seed(0)
         pages_per_batch = math.ceil(s_kv / page_size)
         total_pages = max(batch * pages_per_batch + 8, 64)
@@ -136,6 +139,7 @@ class _MLAInputs:
 # Per-provider callables
 # --------------------------------------------------------------------------- #
 def _make_execute(provider: str, inp: _MLAInputs) -> Callable[[], torch.Tensor]:
+    """Return a zero-arg callable running `provider`'s MLA decode on `inp`."""
     device = inp.q_nope.device
 
     if provider == "cutile":
@@ -171,6 +175,7 @@ def _make_execute(provider: str, inp: _MLAInputs) -> Callable[[], torch.Tensor]:
         )
 
         def run():
+            """Run cuTile paged MLA decode through the planned wrapper."""
             return wrapper.run(
                 inp.q_nope,
                 inp.q_pe,
@@ -191,6 +196,7 @@ def _make_execute(provider: str, inp: _MLAInputs) -> Callable[[], torch.Tensor]:
         mla_kv = torch.cat([inp.ckv, inp.kpe], dim=-1).unsqueeze(1).contiguous()
 
         def run():
+            """Run trtllm-gen paged MLA decode on the concatenated [ckv|kpe] cache."""
             return trtllm_batch_decode_with_kv_cache_mla(
                 query=mla_query,
                 kv_cache=mla_kv,
@@ -352,6 +358,7 @@ def write_csv(
     results: Dict[str, Dict[Tuple[int, int, int], float]],
     num_heads: int,
 ):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
@@ -437,6 +444,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark MLA decode: cuTile vs trtllm-gen SOTA"
     )

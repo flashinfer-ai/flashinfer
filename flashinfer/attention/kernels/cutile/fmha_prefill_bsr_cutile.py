@@ -33,6 +33,7 @@ _MAX_LOAD_PAGES = 8
 
 
 def _get_prefill_autotune_configs(page_size=None):
+    """Return the prefill autotune candidates valid for this arch and page size."""
     configs = [
         SimpleNamespace(BLOCK_M=128, BLOCK_N=32, occupancy=1, num_ctas=1),
         SimpleNamespace(BLOCK_M=128, BLOCK_N=64, occupancy=1, num_ctas=1),
@@ -345,6 +346,7 @@ def _load_page_wrapper_prefill(
     dim3_offset=0,
     LATENCY=3,
 ):
+    """Load one BLOCK_N tile of a paged cache, translating `curr_n` into (page, token)."""
     NUM_PAGES = BLOCK_N // LOAD_BLOCK_N
     page = curr_n // PAGE_SIZE
     token = curr_n % PAGE_SIZE
@@ -391,6 +393,7 @@ def _prefill_attention_paged_body(
     LOAD_BLOCK_N: ConstInt,
 ):
     # Load sequence info
+    """Shared per-tile paged-prefill body (online softmax over the KV blocks of one query tile)."""
     seq_start_idx_tile = ct.gather(batch_offsets, (batch_id,), padding_value=0)
     seq_start_index = seq_start_idx_tile.item()
 
@@ -690,6 +693,7 @@ def _prefill_attention_paged_kernel(
     IS_CAUSAL: ConstBool,
     LOAD_BLOCK_N: ConstInt,
 ):
+    """cuTile kernel: paged prefill, one CTA per (batch, head, query-block)."""
     batch_id = ct.bid(0)
     head_id = ct.bid(1)
     seq_block_id = ct.bid(2)
@@ -752,6 +756,7 @@ def _prefill_attention_paged_lpt_kernel(
     NUM_HB_QUOTIENT: ConstInt,
     NUM_HB_REMAINDER: ConstInt,
 ):
+    """cuTile kernel: paged prefill with longest-processing-time scheduling over a persistent grid."""
     tile_idx = ct.bid(0)
     NUM_BLOCKS = (MAX_SEQ_LEN + BLOCK_M - 1) // BLOCK_M
     l2_major_blocks = SWIZZLE * NUM_BLOCKS
@@ -826,6 +831,7 @@ def _prefill_attention_ragged_body(
     IS_CAUSAL: ConstBool,
 ):
     # Load sequence info
+    """Shared per-tile ragged-prefill body (online softmax over the KV blocks of one query tile)."""
     seq_start_idx_tile = ct.gather(batch_offsets, (batch_id,), padding_value=0)
     seq_start_index = seq_start_idx_tile.item()
 
@@ -1148,6 +1154,7 @@ def _prefill_attention_ragged_lpt_kernel(
     NUM_HB_QUOTIENT: ConstInt,
     NUM_HB_REMAINDER: ConstInt,
 ):
+    """cuTile kernel: ragged prefill with longest-processing-time scheduling over a persistent grid."""
     tile_idx = ct.bid(0)
     NUM_BLOCKS = (MAX_SEQ_LEN + BLOCK_M - 1) // BLOCK_M
     l2_major_blocks = SWIZZLE * NUM_BLOCKS

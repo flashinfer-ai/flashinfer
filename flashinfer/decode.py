@@ -1425,6 +1425,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
     ) -> None:
+        """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )

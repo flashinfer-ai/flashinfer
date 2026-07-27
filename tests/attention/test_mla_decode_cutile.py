@@ -17,6 +17,7 @@ if not is_cuda_tile_available():
 
 @pytest.fixture(autouse=True)
 def _require_blackwell():
+    """Skip the test unless running on datacenter Blackwell (sm100+)."""
     major, _ = get_compute_capability(torch.device("cuda"))
     if major < 10:
         pytest.skip("cuTile MLA decode requires SM100+ (Blackwell)")
@@ -55,6 +56,7 @@ def _torch_mla_decode_ref(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_heads", [16, 32])
 def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_heads):
+    """cuTile paged MLA decode must match the torch reference across the shape sweep."""
     device = torch.device("cuda")
     torch.manual_seed(42)
     dtype = torch.bfloat16
