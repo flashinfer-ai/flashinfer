@@ -28,11 +28,10 @@ Output:  o [B,T,HV,V]
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and
 compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 
-The host wrapper makes one architecture decision. D128 single-token workloads
-below 1,920 sequence-heads use the latency-efficient one-warp kernel; larger
-grids use grouped-CTA. D64 retains its minimum-grid policy. All multi-token
-workloads use grouped-CTA, which amortizes token preprocessing across its
-V-column tile.
+The host wrapper makes one architecture decision. Single-token workloads below a
+head-dimension-specific sequence-head cutoff use the latency-efficient one-warp
+kernel; larger grids use grouped-CTA. All multi-token workloads use grouped-CTA,
+which amortizes token preprocessing across its V-column tile.
 """
 
 import functools
@@ -58,19 +57,22 @@ import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead kernel dispat
 DOT_REDUCTION_TREE = 0
 DOT_REDUCTION_DUAL_ACCUM = 1
 
-# B300 measurements across Kimi K3 local head counts show D128 one-warp winning
-# through 1,536 sequence-heads and grouped-CTA winning from 1,920 onward. Keep
-# the existing D64 policy until it has an equivalent crossover sweep.
+# B300 crossover sweeps: D128 grouped-CTA wins from 1,920 sequence-heads; D64 from
+# 7,680. Below each cutoff, single-token decode stays on one-warp.
 D128_GROUPED_MIN_SEQUENCE_HEADS = 1920
-D64_ONE_WARP_MIN_SEQUENCE_HEADS = 128
+D64_GROUPED_MIN_SEQUENCE_HEADS = 7680
+
+
+def _grouped_min_sequence_heads(head_dim: int) -> int:
+    if head_dim == 128:
+        return D128_GROUPED_MIN_SEQUENCE_HEADS
+    return D64_GROUPED_MIN_SEQUENCE_HEADS
 
 
 def _use_one_warp(head_dim: int, num_tokens: int, sequence_heads: int) -> bool:
     if num_tokens != 1:
         return False
-    if head_dim == 128:
-        return sequence_heads < D128_GROUPED_MIN_SEQUENCE_HEADS
-    return sequence_heads >= D64_ONE_WARP_MIN_SEQUENCE_HEADS
+    return sequence_heads < _grouped_min_sequence_heads(head_dim)
 
 
 # ==============================================================================

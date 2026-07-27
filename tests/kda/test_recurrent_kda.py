@@ -1227,8 +1227,12 @@ def test_spec_decode_separate_source_and_beta_logits(D):
         pytest.param(128, 1, 1920, False, id="D128-T1-cutoff"),
         pytest.param(128, 1, 3072, False, id="D128-T1-large-grid"),
         pytest.param(128, 3, 96, False, id="D128-spec-decode"),
-        pytest.param(64, 1, 127, False, id="D64-small-grid"),
-        pytest.param(64, 1, 128, True, id="D64-existing-cutoff"),
+        pytest.param(64, 1, 8, True, id="D64-T1-small-grid"),
+        pytest.param(64, 1, 1536, True, id="D64-T1-last-measured-one-warp-win"),
+        pytest.param(64, 1, 7679, True, id="D64-T1-cutoff-minus-one"),
+        pytest.param(64, 1, 7680, False, id="D64-T1-cutoff"),
+        pytest.param(64, 1, 12288, False, id="D64-T1-large-grid"),
+        pytest.param(64, 3, 96, False, id="D64-spec-decode"),
     ],
 )
 def test_backend_selection(D, num_tokens, sequence_heads, expected):
