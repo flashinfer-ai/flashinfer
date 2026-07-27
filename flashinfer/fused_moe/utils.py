@@ -362,3 +362,60 @@ def get_b12x_activation_name(activation_type: ActivationType) -> str:
     if activation_type is ActivationType.Relu2:
         return "relu2"
     raise ValueError(f"Unsupported b12x activation type {activation_type!r}.")
+
+
+def make_balanced_local_topk_ids(
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    local_expert_offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Route every token's ``top_k`` slots evenly across this rank's *local*
+    expert shard ``[local_expert_offset, local_expert_offset + num_local_experts)``.
+
+    Unlike :func:`make_random_topk_ids`, this routing is **EP/DP-aware**,
+    **deterministic** and **balanced**, which matters for autotuning an
+    expert-parallel MoE:
+
+    * **EP/DP-aware** -- only local experts receive tokens, so the per-expert
+      ``M`` profiled during autotuning equals the real post-all-to-all local
+      work ``num_tokens * top_k / num_local_experts`` instead of the
+      ``ep_size``x-smaller value produced by routing uniformly over *all*
+      (global) experts while the kernel only computes the local shard.
+    * **deterministic & balanced** -- round-robin assignment gives every local
+      expert an (almost) identical token count with zero run-to-run variance.
+      Every EP rank therefore profiles the *same* representative problem and
+      converges on the *same* tactic, avoiding the per-rank tactic divergence
+      that random routing causes (different ranks otherwise pick different
+      tile/stage cubins for an identical runtime shape).
+
+    Args:
+        num_tokens: Number of tokens (rows).
+        top_k: Experts selected per token.
+        num_local_experts: Number of experts owned by this rank.
+        local_expert_offset: Global id of this rank's first local expert.
+        device: Device for the returned tensor.
+
+    Returns:
+        A ``[num_tokens, top_k]`` int32 tensor of **global** expert ids, all
+        within the local shard.  The ``top_k`` ids within a row are distinct as
+        long as ``top_k <= num_local_experts`` (the usual case).
+    """
+    if num_tokens == 0 or num_local_experts == 0 or top_k == 0:
+        return torch.zeros(num_tokens, top_k, dtype=torch.int32, device=device)
+
+    if top_k > num_local_experts:
+        raise ValueError(
+            f"top_k ({top_k}) cannot exceed num_local_experts "
+            f"({num_local_experts}) for balanced local routing: the round-robin "
+            f"assignment would wrap and emit duplicate expert ids within a row, "
+            f"which MoE routing/sort kernels require to be distinct."
+        )
+
+    # Round-robin assignment over the local shard. The ``top_k`` consecutive
+    # values within a row are distinct mod ``num_local_experts`` whenever
+    # ``top_k <= num_local_experts``; the aggregate per-expert count differs by
+    # at most one across local experts (perfectly balanced).
+    flat = torch.arange(num_tokens * top_k, device=device) % num_local_experts
+    return (flat.view(num_tokens, top_k) + local_expert_offset).to(torch.int32)
