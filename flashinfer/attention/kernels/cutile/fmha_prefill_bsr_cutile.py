@@ -5,6 +5,7 @@
 # cuda.tile API, with two-stage causal masking and boundary-masked multi-page loads.
 
 import math
+import os
 from types import SimpleNamespace
 from typing import Optional
 from typing import TypeAlias
@@ -13,6 +14,9 @@ import cuda.tile as ct
 import torch
 from cuda.tile import RoundingMode as RMd
 from cuda.tile.tune import exhaustive_search
+
+# Set FLASHINFER_CUTILE_AUTOTUNE_DISABLED=1 to skip exhaustive search
+_AUTOTUNE_DISABLED = os.getenv("FLASHINFER_CUTILE_AUTOTUNE_DISABLED", "0") != "0"
 
 # Module-level tune caches for prefill kernels
 _prefill_paged_lpt_tune_cache: dict = {}
@@ -69,6 +73,13 @@ def _get_prefill_autotune_configs(page_size=None):
             if cfg.BLOCK_N // page_size > _MAX_LOAD_PAGES:
                 continue
         yield cfg
+        if _AUTOTUNE_DISABLED:
+            # Honor FLASHINFER_CUTILE_AUTOTUNE_DISABLED (as the decode kernels
+            # already do): emit only the first page-compatible candidate so the
+            # exhaustive search below degenerates to a single launch instead of
+            # a full sweep. Filtering stays identical, so the chosen config is
+            # always valid for this page_size.
+            return
 
 
 def _load_page_prefill(

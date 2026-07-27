@@ -131,6 +131,13 @@ def _splitk_reduce_kernel(
         valid_mask, weights, ct.zeros((NUM_KV_SPLITS_POW2,), dtype=ct.float32)
     )
     weights_sum = ct.sum(weights)
+    # An empty sequence (seq_len == 0 -> actual_num_splits == 0) masks every
+    # split off, so weights_sum would be 0 and this division would write NaN to
+    # the output. Clamp the denominator: every weight is already 0, so the
+    # reduction below yields 0 (attention over no keys). For any nonempty
+    # sequence the max-lse split contributes exp2(0) == 1, so weights_sum >= 1
+    # and the clamp is inert.
+    weights_sum = ct.maximum(weights_sum, 1e-30)
     weights = weights / weights_sum
 
     # attn_splitk_out has NUM_KV_SPLITS (<= POW2) splits on axis 0; only lse is
