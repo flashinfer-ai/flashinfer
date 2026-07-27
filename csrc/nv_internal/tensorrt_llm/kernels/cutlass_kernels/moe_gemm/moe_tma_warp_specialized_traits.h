@@ -21,7 +21,7 @@
 #include "cutlass_extensions/epilogue_helpers.h"
 
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -34,10 +34,10 @@ template <typename T, typename WeightType,
 constexpr bool isValidSM120MOESpecialisation() {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
 #if defined(ENABLE_FP4)
-  return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
+  return ((cutlass::platform::is_same<T, Fp4Type>::value &&
            cutlass::platform::is_same<T, WeightType>::value) ||
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) &&
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)) &&
          cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
   return false;
@@ -57,7 +57,7 @@ constexpr bool isValidBlackwellMOESpecialisation() {
   return (cutlass::platform::is_same<T, WeightType>::value ||
 #if defined(ENABLE_FP4)
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)
 #else
           false
 #endif
@@ -83,12 +83,11 @@ constexpr bool isValidHopperMOESpecialisation() {
           (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value &&
            cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
 #ifdef ENABLE_FP4
-          || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value &&
-              !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+          || cutlass::platform::is_same<Fp4Type, WeightType>::value
 #endif
-              )
+          )
 #ifdef ENABLE_FP4
-         && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
+         && !cutlass::platform::is_same<T, Fp4Type>::value
 #endif
          && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
@@ -115,7 +114,7 @@ template <typename T, typename WeightType,
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidAmpereMOESpecialisation() {
 #ifdef ENABLE_FP4
-  return !std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>;
+  return !std::is_same_v<T, Fp4Type> && !std::is_same_v<WeightType, Fp4Type>;
 #else
   return true;  // Default to true
 #endif

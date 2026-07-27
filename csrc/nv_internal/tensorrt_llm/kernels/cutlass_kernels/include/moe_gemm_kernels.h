@@ -18,6 +18,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -32,7 +33,7 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -215,6 +216,9 @@ struct TmaWarpSpecializedGroupedGemmInput {
 
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
+  uint8_t* precomputed_scheduler_workspace = nullptr;
+  size_t precomputed_scheduler_workspace_size = 0;
+  int64_t precomputed_scheduler_total_routed_tokens = 0;
 
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
@@ -224,7 +228,9 @@ struct TmaWarpSpecializedGroupedGemmInput {
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
   void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace,
-                          size_t gemm_workspace_size, FpXBlockScalingType scaling_type);
+                          size_t gemm_workspace_size, void* precomputed_scheduler_workspace,
+                          size_t precomputed_scheduler_workspace_size,
+                          FpXBlockScalingType scaling_type);
 
   bool isValid() const { return stride_act != nullptr && ptr_act != nullptr; }
 
@@ -241,22 +247,31 @@ constexpr bool isGatedActivation(ActivationType activation_type) {
          activation_type == ActivationType::GegluTanh;
 }
 
+enum class Sm90Wfp4Afp8ScaleMode : uint8_t {
+  // Native SM100+ FP8 x FP4 paths leave this SM90-only mode disabled.
+  kDisabled = 0,
+  kHummingPreMmaE8M0,
+  kPostMmaFp8Act,
+  kPostMmaMxfp8Act,
+};
+
 template <typename T,                          /*The type used for activations/scales/compute*/
           typename WeightType,                 /* The type for the MoE weights */
           typename OutputType,                 /* The output type for the GEMM */
           typename ScaleBiasType = OutputType, /* The type for the scales/bias */
-          bool IsMXFPX = false>
+          bool IsMXFPX = false,
+          Sm90Wfp4Afp8ScaleMode Sm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
-  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, Fp4Type> &&
                                       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
   static constexpr bool use_wfp4a16 =
-      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+      std::is_same_v<WeightType, Fp4Type> && std::is_same_v<T, half>;
 #endif
 #else
   static constexpr bool use_wfp4a16 = false;
@@ -266,7 +281,7 @@ class MoeGemmRunner {
       (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
       !std::is_same_v<WeightType, cutlass::uint4b_t>
 #if defined(ENABLE_FP4)
-      && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+      && !std::is_same_v<WeightType, Fp4Type>
 #endif
       ;
   static constexpr bool use_w4afp8 =
@@ -275,18 +290,25 @@ class MoeGemmRunner {
   static constexpr bool use_fp8 = false;
   static constexpr bool use_w4afp8 = false;
 #endif
-  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
-
-  static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
-
 #if defined(ENABLE_FP4)
-  static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
+  static constexpr bool use_fp4 = std::is_same_v<T, Fp4Type>;
   static constexpr bool use_wfp4afp8 =
-      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, Fp4Type>;
 #else
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
 #endif
+  static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
+  static constexpr bool use_sm90_wfp4afp8 =
+      use_wfp4afp8 && Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled;
+  static constexpr bool use_sm90_humming_pre_mma =
+      use_sm90_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+  static_assert(Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kDisabled || use_wfp4afp8,
+                "Sm90Wfp4Afp8ScaleMode is only valid for FP8 activation x FP4 weight.");
+  static_assert(!use_sm90_wfp4afp8 || !IsMXFPX,
+                "FP8 activation x FP4 weight uses Sm90Wfp4Afp8ScaleMode, not generic IsMXFPX.");
+
+  static constexpr bool use_sm90_mixed_input_gemm = use_w4afp8 || use_wfp4a16 || use_sm90_wfp4afp8;
 
   void moeGemmBiasAct(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                       TmaWarpSpecializedGroupedGemmInput hopper_inputs);

@@ -252,7 +252,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         2: token_selected_experts (num_tokens, top_k) - expert assignments
         3: token_final_scales (num_tokens, top_k) - routing weights
         4-10: weight tensors (fixed size, don't depend on num_tokens)
-        11: moe_output (num_tokens, hidden_size) - output buffer
+        11: moe_output, or per_token_scale when per-token activation is enabled
+        12: moe_output when per-token activation is enabled
 
     Args:
         forward_impl: The actual MoE implementation function.
@@ -262,6 +263,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         local_expert_offset: Starting expert index for this partition.
         use_fused_finalize: Whether to use fused finalize (default: True).
         output_dtype: Output data type (default: torch.bfloat16).
+        use_per_token_activation: Whether inputs include per-token row scales
+            for GEMM1.
     """
 
     def __init__(
@@ -278,6 +281,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        use_per_token_activation: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
@@ -293,6 +297,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_per_token_activation = use_per_token_activation
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -308,8 +313,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3, 11),
-                    dim_idx=(0, 0, 0, 0, 0),
+                    input_idx=(0, 1, 2, 3, 11)
+                    + ((12,) if use_per_token_activation else ()),
+                    dim_idx=(0,) * (6 if use_per_token_activation else 5),
                     # Bare callables: autotuner adapts the bucket set to
                     # the actual input dim (matches the
                     # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
@@ -360,7 +366,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                             ),
                             dim=-1,
                         ).to(torch.float32),
-                        # 11: moe_output — output buffer
+                        *(
+                            [
+                                lambda shapes, dtype, device: torch.ones(
+                                    shapes, dtype=torch.float32, device=device
+                                )
+                            ]
+                            if use_per_token_activation
+                            else []
+                        ),
                         lambda shapes, dtype, device: torch.empty(
                             shapes, dtype=dtype, device=device
                         ),
@@ -388,6 +402,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.use_per_token_activation,
             )
         )
 
@@ -447,7 +462,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         sf_dtype = cutlass.Float8E4M3FN
         sf_vec_size = 16
 
-        gemm1_c_dtype = cutlass.Float4E2M1FN
+        if self.use_per_token_activation:
+            if self.output_dtype == torch.float16:
+                gemm1_c_dtype = cutlass.Float16
+            elif self.output_dtype == torch.bfloat16:
+                gemm1_c_dtype = cutlass.BFloat16
+            else:
+                return []
+        else:
+            gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
 
         token_final_scales = inputs[3]
@@ -536,7 +559,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             inputs: List of input tensors:
                 [x, x_sf, token_selected_experts, token_final_scales,
                  w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                 w2_weight, w2_weight_sf, w2_alpha, moe_output (optional)]
+                 w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
+                 moe_output (optional)]
             tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
@@ -566,7 +590,16 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             *optional_inputs,
         ) = inputs
 
-        moe_output = optional_inputs[0] if optional_inputs else None
+        if self.use_per_token_activation:
+            if not optional_inputs:
+                raise ValueError(
+                    "per_token_scale is required when use_per_token_activation=True"
+                )
+            per_token_scale = optional_inputs[0]
+            moe_output = optional_inputs[1] if len(optional_inputs) > 1 else None
+        else:
+            per_token_scale = None
+            moe_output = optional_inputs[0] if optional_inputs else None
 
         # Call the implementation with tactic parameters
         return self.forward_impl(
@@ -593,6 +626,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             output_dtype=self.output_dtype,
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
+            per_token_scale=per_token_scale,
             enable_pdl=self.enable_pdl,
             activation_type=int(self.activation_type),
             swiglu_alpha=self.swiglu_alpha,

@@ -37,25 +37,29 @@ struct LSEWriter {
   using ShapeLSE = cute::Shape<int32_t, int32_t, int32_t>;
   using StrideLSE = cute::Stride<_1, int64_t, int64_t>;
 
+  // Writes the LSE rows owned by one consumer thread. tiled_mma must be the
+  // per-warp-group PV mma whose accumulator softmax_fused reduced over, and
+  // row_offset the first sequence position of this warp group's sub-tile
+  // (m_block * kBlockM + wg_id * kBlockMPerWG).
   template <typename SoftmaxFused, typename TiledMma, typename Shape, typename Stride>
   __device__ __forceinline__ static void write_lse(float* ptr_LSE, Shape const& shape_LSE,
                                                    Stride const& stride_LSE,
                                                    SoftmaxFused const& softmax_fused,
                                                    float softmax_scale_log2,
                                                    TiledMma const& tiled_mma, int thread_idx,
-                                                   int m_block, int bidh, int bidb) {
+                                                   int row_offset, int bidh, int bidb) {
     Tensor mLSE = make_tensor(make_gmem_ptr(ptr_LSE), shape_LSE, stride_LSE);
-    Tensor gLSE =
-        local_tile(mLSE(_, bidh, bidb), cute::Shape<cute::Int<kBlockM>>{}, make_coord(m_block));
 
     auto const& row_max = softmax_fused.row_max;
     auto const& row_sum = softmax_fused.row_sum;
 
-    Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
+    Tensor caccO =
+        cute::make_identity_tensor(cute::Shape<Int<Traits::kBlockMPerWG>, Int<kHeadDim>>{});
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor taccOcO = thread_mma.partition_C(caccO);
 
-    static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
+    // acc fragment atom is (AtomN, AtomM) = (8, 2) for the 16x32 mma
+    static_assert(decltype(size<0, 0>(taccOcO))::value % 8 == 0);
     static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
 
     Tensor taccOcO_row = taccOcO(make_coord(_0{}, _), _, _0{});
@@ -67,76 +71,25 @@ struct LSEWriter {
 
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
-        const int row = get<0>(taccOcO_row(mi));
+        const int row = row_offset + get<0>(taccOcO_row(mi));
 
-        if (row < get<0>(shape_LSE) - m_block * kBlockM) {
+        if (row < get<0>(shape_LSE)) {
           float max_scaled = row_max(mi) * softmax_scale_log2 / log2_e;
           float sum = row_sum(mi);
 
-          float lse = (sum == 0.f || sum != sum) ? INFINITY : (max_scaled + logf(sum));
+          // row_sum carries the 2^-fp8_scalexfp4_scale_log2 factor the
+          // softmax bakes into every exp for the FP4 P quantization;
+          // remove it so lse is the plain ln-sum-exp of the scaled scores.
+          float lse =
+              (sum == 0.f || sum != sum)
+                  ? INFINITY
+                  : (max_scaled + logf(sum) + SoftmaxFused::fp8_scalexfp4_scale_log2 * ln_2);
 
-          gLSE(row) = lse;
+          mLSE(row, bidh, bidb) = lse;
         }
       }
     }
   }
-
-  template <typename ShapeO, typename Stride>
-  __device__ __forceinline__ static void write_lse_infinity(float* ptr_LSE, ShapeO const& shape_O,
-                                                            Stride const& stride_LSE,
-                                                            int thread_idx, int m_block, int bidh,
-                                                            int bidb) {
-    auto shape_LSE = select<0, 2, 3>(shape_O);
-
-    Tensor mLSE = make_tensor(make_gmem_ptr(ptr_LSE), shape_LSE, stride_LSE);
-    Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
-
-    static_assert(kBlockM <= NumMmaThreads);
-
-    if (thread_idx < get<0>(shape_LSE) - m_block * kBlockM) {
-      gLSE(thread_idx) = INFINITY;
-    }
-  }
-
-  template <typename ShapeO, typename ShapeLSE, typename Stride, typename SoftmaxFused,
-            typename TiledMma>
-  __device__ __forceinline__ static void run(float* ptr_LSE, ShapeO const& shape_O,
-                                             ShapeLSE const& shape_LSE, Stride const& stride_LSE,
-                                             SoftmaxFused const& softmax_fused,
-                                             float softmax_scale_log2, TiledMma const& tiled_mma,
-                                             int thread_idx, int m_block, int bidh, int bidb,
-                                             bool is_valid_block) {
-    if (is_valid_block) {
-      write_lse(ptr_LSE, shape_LSE, stride_LSE, softmax_fused, softmax_scale_log2, tiled_mma,
-                thread_idx, m_block, bidh, bidb);
-    } else {
-      write_lse_infinity(ptr_LSE, shape_O, stride_LSE, thread_idx, m_block, bidh, bidb);
-    }
-  }
 };
-
-__device__ __forceinline__ float compute_lse_log2(float row_max, float row_sum,
-                                                  float softmax_scale_log2) {
-  constexpr float log2_e = 1.44269504088896340736f;
-
-  if (row_sum == 0.f || row_sum != row_sum) {
-    return INFINITY;
-  }
-
-  float max_scaled = row_max * softmax_scale_log2;
-  float lse_log2 = max_scaled + log2f(row_sum);
-
-  return lse_log2;
-}
-
-__device__ __forceinline__ float log2_to_ln(float x_log2) {
-  constexpr float ln_2 = 0.69314718055994530942f;
-  return x_log2 * ln_2;
-}
-
-__device__ __forceinline__ float ln_to_log2(float x_ln) {
-  constexpr float log2_e = 1.44269504088896340736f;
-  return x_ln * log2_e;
-}
 
 }  // namespace nvfp4_attention

@@ -95,7 +95,7 @@ def gen_xqa_module(
 
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]
+        supported_major_versions=[9, 10, 12]
     )
     sm_nvcc_flags = nvcc_flags
 

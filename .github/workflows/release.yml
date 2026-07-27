@@ -356,12 +356,6 @@ jobs:
           name: flashinfer-python-dist
           path: dist-python/
 
-      - name: Download flashinfer-cubin artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist-cubin/
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -375,7 +369,7 @@ jobs:
       - name: Check packages with twine
         run: |
           echo "Running twine check..."
-          twine check dist-python/* dist-cubin/*
+          twine check dist-python/*
           echo "✓ Package validation passed"
 
       - name: Upload flashinfer-python to PyPI
@@ -386,15 +380,6 @@ jobs:
           echo "Uploading flashinfer (sdist and wheel) to PyPI..."
           twine upload --verbose --non-interactive dist-python/*
           echo "✓ Successfully uploaded flashinfer to PyPI"
-
-      - name: Upload flashinfer-cubin to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Uploading flashinfer-cubin wheel to PyPI..."
-          twine upload --verbose --non-interactive dist-cubin/*.whl
-          echo "✓ Successfully uploaded flashinfer-cubin to PyPI"
 
   update-wheel-index:
     needs: [setup, create-release]

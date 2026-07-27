@@ -119,10 +119,10 @@ void trtllm_paged_attention_launcher(
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
     int64_t sparse_mla_top_k, void* sliding_window_kv_pool, int* sparse_mla_top_k_lens,
     bool has_sliding_window_kv_pool, float skip_softmax_threshold_scale_factor, bool skips_softmax,
-    bool uses_shared_paged_kv_idx, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
-    int64_t k_sf_stride_heads, int64_t k_sf_stride_batch, int64_t v_sf_stride_heads,
-    int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens, int64_t lse_stride_heads,
-    cudaStream_t stream) {
+    bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
+    bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
+    int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
+    int64_t lse_stride_heads, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -191,6 +191,24 @@ void trtllm_paged_attention_launcher(
   runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
+
+  // Block-sparse attention: per-KV-head page tables ([numHeadsKv, batchSize, maxNumPagesPerSeq])
+  // and sequence lengths ([numHeadsKv, batchSize]). Runtime flag of the generation-phase
+  // paged-KV kernels; the sparse pages must be packed densely at the front of each row.
+  runner_params.mUseBlockSparseAttention = enable_block_sparse_attention;
+  if (enable_block_sparse_attention) {
+    TVM_FFI_CHECK(mode == TllmPagedAttentionMode::ForGen,
+                  "block-sparse attention only supports the generation (decode) phase");
+    TVM_FFI_CHECK(window_left == -1, "block-sparse attention does not support sliding window");
+    TVM_FFI_CHECK(sparse_mla_top_k <= 0,
+                  "block-sparse attention cannot be combined with sparse MLA");
+    TVM_FFI_CHECK(!skips_softmax,
+                  "block-sparse attention does not support skipping softmax when possible");
+    // TODO: the kernels also support the non-shared (TRT-LLM) paged-KV index layout with shape
+    // [numHeadsKv, batchSize, 2, maxNumPagesPerSeq]; expose it when needed.
+    TVM_FFI_CHECK(uses_shared_paged_kv_idx,
+                  "block-sparse attention currently requires the shared paged-KV index layout");
+  }
 
   // The sparse MLA parameters.
   runner_params.mSparseMlaType =
@@ -323,7 +341,7 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads) {
+    int64_t lse_stride_heads, bool enable_block_sparse_attention) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -437,6 +455,26 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
+  if (enable_block_sparse_attention) {
+    // Block-sparse attention uses per-KV-head page tables and sequence lengths. The kernel
+    // indexes both with head-major flat offsets, so the tensors must be contiguous.
+    TVM_FFI_ICHECK_EQ(seq_lens.ndim(), 2)
+        << "block-sparse attention expects seq_lens of shape [num_kv_heads, batch_size]";
+    TVM_FFI_ICHECK_EQ(seq_lens.size(0), num_kv_heads)
+        << "block-sparse seq_lens dim 0 must be num_kv_heads";
+    TVM_FFI_ICHECK_EQ(seq_lens.size(1), batch_size)
+        << "block-sparse seq_lens dim 1 must be batch_size";
+    TVM_FFI_ICHECK_EQ(block_tables.ndim(), 3)
+        << "block-sparse attention expects block_tables of shape [num_kv_heads, batch_size, "
+           "max_num_pages_per_seq]";
+    TVM_FFI_ICHECK_EQ(block_tables.size(0), num_kv_heads)
+        << "block-sparse block_tables dim 0 must be num_kv_heads";
+    TVM_FFI_ICHECK_EQ(block_tables.size(1), batch_size)
+        << "block-sparse block_tables dim 1 must be batch_size";
+    TVM_FFI_ICHECK(seq_lens.IsContiguous()) << "block-sparse seq_lens must be contiguous";
+    TVM_FFI_ICHECK(block_tables.IsContiguous()) << "block-sparse block_tables must be contiguous";
+  }
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), multi_ctas_kv_counter_buffer.data_ptr(),
@@ -452,8 +490,9 @@ void trtllm_paged_attention_decode(
       sparse_mla_top_k, /*sliding_window_kv_pool=*/nullptr,
       /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
-      sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
-      v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads, stream);
+      enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
+      k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
+      lse_stride_tokens, lse_stride_heads, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -591,8 +630,9 @@ void trtllm_paged_attention_context(
       sum_seq_q, /*sparse_mla_top_k=*/0, /*sliding_window_kv_pool=*/nullptr,
       /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
-      sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
-      v_sf_stride_batch, is_causal, lse_stride_tokens, lse_stride_heads, stream);
+      /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
+      k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
+      lse_stride_tokens, lse_stride_heads, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -936,7 +976,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*window_left=*/127, sum_seq_q, sparse_mla_top_k, sliding_window_kv_cache.data_ptr(),
       static_cast<int*>(sparse_mla_top_k_lens.data_ptr()), /*has_sliding_window_kv_pool=*/true,
       /*skip_softmax_threshold_scale_factor=*/0.0f, /*skips_softmax=*/false,
-      /*uses_shared_paged_kv_idx=*/true, sm_count, enable_pdl, workspace_size,
+      /*uses_shared_paged_kv_idx=*/true, /*enable_block_sparse_attention=*/false, sm_count,
+      enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
       /*lse_stride_heads=*/0, stream);

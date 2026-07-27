@@ -16,17 +16,24 @@
 
 #pragma once
 
-#include "kernel_impl.cuh"
-#include "scheduler.cuh"
-#include "utils.cuh"
+// clang-format off
+#include <cuda_runtime.h>
 
-namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
+#include <cute/config.hpp>
+
+#include <cutlass/device_kernel.h>
+
+#include "kernel_impl.cuh"
+// clang-format on
+
+namespace flashinfer::gemm::mxfp8_cute_sm120 {
+namespace sm120_blockscaled {
 
 inline int get_num_sms() {
-  int device = 0;
-  CUTE_CHECK_ERROR(cudaGetDevice(&device));
-  int num_sms = 0;
-  CUTE_CHECK_ERROR(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+  int device;
+  cudaGetDevice(&device);
+  int num_sms;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
   return num_sms;
 }
 
@@ -131,4 +138,5 @@ void launch_masked_gemm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }
 
-}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled
+}  // namespace sm120_blockscaled
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120

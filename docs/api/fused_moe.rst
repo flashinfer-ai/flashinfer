@@ -16,6 +16,18 @@ Types and Enums
     RoutingMethodType
     WeightLayout
 
+Shared activation helpers live in :mod:`flashinfer.tllm_enums` and are used by
+both the TRT-LLM and CuteDSL MoE paths.
+
+.. currentmodule:: flashinfer.tllm_enums
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_gated_activation
+
+.. currentmodule:: flashinfer.fused_moe
+
 Utility Functions
 -----------------
 
@@ -26,7 +38,13 @@ Utility Functions
     reorder_rows_for_gated_act_gemm
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
+    preprocess_moe_weights_for_sm90_mixed_gemm_humming
     fused_topk_deepseek
+    hash_topk
+
+The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
+scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted
+from `Humming <https://github.com/inclusionAI/humming>`_.
 
 Multi-LoRA MoE (BGMV)
 ---------------------
@@ -40,6 +58,8 @@ top of a Mixture-of-Experts layer (shrink + expand).
     bgmv_moe
     bgmv_moe_shrink
     bgmv_moe_expand
+    bgmv_moe_gemm1_lora_delta
+    bgmv_moe_gemm2_lora_delta
 
 CUTLASS Fused MoE
 -----------------

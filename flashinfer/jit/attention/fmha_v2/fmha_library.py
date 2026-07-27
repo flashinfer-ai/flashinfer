@@ -264,15 +264,16 @@ def generate_kernel_spec(
                 spec["kv_loop_step"] = 64
         elif dtype == "e4m3":
             if head_size <= 64:
-                # D<=64: smem = 8 + 64 + 64 + 16 = ~152KB with KV_BUF=4
-                # Deep pipeline hides FP8 V transpose latency (dma.h:598-672)
-                spec["kv_tile_buffers"] = 4
-            if head_size <= 128:
-                # D<=128: smem = 16 + 64 + 64 + 32 = ~176KB with KV_BUF=2
-                # Note: STEP_KV=256 causes BMM2_K_GROUPS=2 (kernel_traits.h:241)
-                # and V transpose unroll drops to 1 (dma.h:102), but fewer KV
-                # loop iterations outweighs per-iteration overhead for long seqs
                 spec["kv_loop_step"] = 256
+                spec["kv_tile_buffers"] = 4
+            elif head_size <= 128:
+                # STEP_KV=256: the wide KV tile amortizes per-tile barrier/V-transpose overhead,
+                # and the two compute warpgroups' softmax overlaps the other group's BMM1 GMMA
+                # (ordered-mbarrier in compute.h). q_tile_buffers=1 (256-wide smem leaves no room
+                # for Q double-buffering).
+                spec["kv_loop_step"] = 256
+                spec["kv_tile_buffers"] = 2
+                spec["q_tile_buffers"] = 1
             else:
                 # D=256 (FP8 pads head_size>128 to 256 due to 128-byte alignment):
                 # base smem = 32 + 64 + 64 + 32 = ~192KB with KV_BUF=2.

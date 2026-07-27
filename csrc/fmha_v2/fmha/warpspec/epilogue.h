@@ -274,7 +274,10 @@ struct Softmax_base {
     constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
     bool skip = may_skip;
 
-// Row-wise max of current tile.
+    // Row-wise max of current tile.
+    // The FP8 specialization (Softmax<Hopper_qgmma_e4m3_fp32_traits>) uses a 4-way
+    // split-accumulator reduction to expose ILP, but the 16-bit softmax is already hidden behind
+    // the other warpgroup's HGMMA, so there is no latency to recover
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
       local_max_[mi] = elt_[mi][0];
@@ -751,21 +754,20 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
     bool skip = may_skip;
 
-// Row-wise max of current tile.
+// Row-wise max of current tile: 4-way tree reduction splits the single-accumulator serial
+// dependency chain into 4 independent chains, so the pipeline can issue other chains'
+// instructions while waiting for one chain's FMNMX result.
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      local_max_[mi] = elt_[mi][0];
+      float pmax[4] = {elt_[mi][0], elt_[mi][1], elt_[mi][2], elt_[mi][3]};
 #pragma unroll
-      for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
+      for (int ni = 4; ni < Mma_tile_p::CORES_N * 2; ni++) {
+        pmax[ni & 3] = fmaxf(pmax[ni & 3], elt_[mi][ni]);
       }
+      local_max_[mi] = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
-      // AND(&) the CORES_M results, then `skip` means whether to skip
-      // the CORES_M(=2) rows
       if constexpr (may_skip) {
-        // AND(&) the CORES_M results, then `skip` means whether to skip
-        // the CORES_M(=2) rows
         if constexpr (!EXP2F_OPTIMIZATION) {
           skip &= expf(local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
         } else {
@@ -804,50 +806,53 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       }
     }
 
-// Softmax Exp.
-#pragma unroll
-    for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+    // Fused softmax-exp + row-sum with row-interleaved scheduling: compute exp for all rows
+    // before accumulating the sum, so the MUFU.EX2 results of one row fill the pipeline while
+    // another row's results are consumed.
+    {
+      float masked_max[Mma_tile_p::CORES_M];
+      float psum[Mma_tile_p::CORES_M][4];
 #pragma unroll
       for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-        // The equation exp2(scale * x - max) * q_scale_s
-        // equals to:   exp2(scale * x - max) * exp2(log2(q_scale_s))
-        // equals to:   exp2(scale * x - (max - log2(q_scale_s)))
-        //                   ^^^^^   ^   ^^^^^^^^^^^^^^^^^^^^^^^
-        // So instead of per-accumulator muls, we can do per-row subs which saves FP cycles.
-        // As we scale the softmax output early, before doing the local_sum, we have to unscale
-        // the local_sum afterwards.
-        float& p0 = elt_[mi][2 * ni + 0];
-        float& p1 = elt_[mi][2 * ni + 1];
-
-        // When all elts of the tile are -FLT_MAX, we have to make sure
-        //  expf generates 0 for all values instead of 1.
         if constexpr (!EXP2F_OPTIMIZATION) {
-          float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                 ? local_max_[mi] - logf(q_scale_s_)
-                                 : 0.f;
-          p0 = expf(p0 - masked_max);
-          p1 = expf(p1 - masked_max);
+          masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                               ? local_max_[mi] - logf(q_scale_s_)
+                               : 0.f;
         } else {
-          // Use exp2f optimization for cases without alibi.
-          float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                 ? local_max_[mi] * scale - log2f(q_scale_s_)
-                                 : 0.f;
-          p0 = custom_exp2f(p0, scale, masked_max);
-          p1 = custom_exp2f(p1, scale, masked_max);
+          masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                               ? local_max_[mi] * scale - log2f(q_scale_s_)
+                               : 0.f;
+        }
+        psum[mi][0] = psum[mi][1] = psum[mi][2] = psum[mi][3] = 0.f;
+      }
+#pragma unroll
+      for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+        // Exp all rows for this ni
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          float& p0 = elt_[mi][2 * ni + 0];
+          float& p1 = elt_[mi][2 * ni + 1];
+          if constexpr (!EXP2F_OPTIMIZATION) {
+            p0 = expf(p0 - masked_max[mi]);
+            p1 = expf(p1 - masked_max[mi]);
+          } else {
+            p0 = custom_exp2f(p0, scale, masked_max[mi]);
+            p1 = custom_exp2f(p1, scale, masked_max[mi]);
+          }
+        }
+        // Sum all rows for this ni
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          psum[mi][(2 * ni + 0) & 3] += elt_[mi][2 * ni + 0];
+          psum[mi][(2 * ni + 1) & 3] += elt_[mi][2 * ni + 1];
         }
       }
-    }
-
-// Row-wise sum of current tile.
 #pragma unroll
-    for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      local_sum_[mi] = elt_[mi][0];
-#pragma unroll
-      for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        local_sum_[mi] += elt_[mi][ni];
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+        local_sum_[mi] = (psum[mi][0] + psum[mi][1]) + (psum[mi][2] + psum[mi][3]);
+        local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
+        local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 2);
       }
-      local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
-      local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 2);
     }
 
     // Initialize or update the global sum and max.

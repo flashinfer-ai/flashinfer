@@ -744,7 +744,7 @@ class DenseGemmKernel:
         tCc: cute.Tensor,
         row_limit: Int32,
     ) -> cute.Tensor:
-        tPred = cute.make_fragment(
+        tPred = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tCc, mode=[0, 1]),
@@ -796,7 +796,7 @@ class DenseGemmKernel:
         tC: cute.Tensor,
         row_limit: Int32,
     ) -> None:
-        tP = cute.make_fragment(cute.make_layout(tS.shape), cutlass.Boolean)
+        tP = cute.make_rmem_tensor(cute.make_layout(tS.shape), cutlass.Boolean)
         for i in cutlass.range_constexpr(cute.size(tP)):
             tP[i] = cute.elem_less(tC[i][0][0][0], row_limit)
         for rest_m in cutlass.range_constexpr(cute.size(tS.shape[1])):

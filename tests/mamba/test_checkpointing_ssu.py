@@ -3,7 +3,7 @@
 
 """
 Tests for the CUDA checkpointing_ssu kernel.
-Validates against the Triton checkpointing_state_update reference.
+Validates against the Triton replay_selective_state_update reference.
 """
 
 import pytest
@@ -15,12 +15,23 @@ from einops import repeat
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.utils import is_cvt_rs_supported
 
-# Import Triton reference.  `replay_selective_state_update` is a backwards-compat
-# alias for `checkpointing_state_update` kept inside the same module.
-from .triton_reference.checkpointing_state_update import (
-    _get_sm_version,
-    checkpointing_state_update,
-    replay_selective_state_update,
+# Triton reference: the standalone TMA persistent kernel only (the old 4D
+# `checkpointing_state_update` and its merged non-TMA replay copy were removed
+# 2026-07-10 — the TMA impls carry all reference coverage, incl. varlen).
+from .triton_reference.replay_selective_state_update import (
+    get_sm_version as _get_sm_version,
+)
+
+# Faithful TMA-optimized standalone persistent kernel (the merged copy above
+# dropped TMA + tuning).  Imported as `replay_persistent`; it requires explicit
+# n_writes / replay_work_items and a mode.  No varlen support (yet).
+from .triton_reference.replay_selective_state_update import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    replay_selective_state_update as replay_persistent,
 )
 from .triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
@@ -36,8 +47,219 @@ _CONFIGS = [
 ]
 
 
+def _make_ring_caches(
+    cache_size,
+    nheads,
+    ngroups,
+    head_dim,
+    d_state,
+    max_window,
+    T,
+    dtype,
+    device,
+    ring_start=None,
+):
+    """Ring caches per the ReplaySSM contract: RING_BUFFER_LEN = max_window + T
+    rows, head-major.  Rows are garbage-filled — kernels must only read the
+    ``[start, start+prev_k)`` window — except dt, which is kept positive
+    (softplus output in production) so recomputed decays stay <= 1 and
+    comparisons keep tight tolerances.
+
+    ``ring_start`` defaults to a random per-slot start so every test exercises
+    ring wraparound; pass an explicit tensor to pin it.
+    """
+    ring_len = max_window + T
+    if ring_start is None:
+        ring_start = torch.randint(
+            0, ring_len, (cache_size,), device=device, dtype=torch.int32
+        )
+    x_cache = torch.randn(
+        cache_size, nheads, ring_len, head_dim, device=device, dtype=dtype
+    )
+    B_cache = torch.randn(
+        cache_size, ngroups, ring_len, d_state, device=device, dtype=dtype
+    )
+    dt_cache = torch.randn(
+        cache_size, nheads, ring_len, device=device, dtype=torch.float32
+    ).abs()
+    return x_cache, B_cache, dt_cache, ring_start
+
+
+def _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x_tok, B_tok, dt_proc):
+    """Write a T-token history into slot's ring rows [start, start+T) mod L.
+
+    ``x_tok`` (T, nheads, dim), ``B_tok`` (T, ngroups, d_state) and ``dt_proc``
+    (T, nheads) are token-major as produced by the test; the ring caches are
+    head-major, hence the permutes.
+    """
+    ring_len = x_cache.shape[2]
+    T = x_tok.shape[0]
+    rows = (
+        (int(ring_start[slot]) + torch.arange(T, device=x_cache.device)) % ring_len
+    ).long()
+    x_cache[slot][:, rows] = x_tok.permute(1, 0, 2)
+    B_cache[slot][:, rows] = B_tok.permute(1, 0, 2)
+    dt_cache[slot][:, rows] = dt_proc.permute(1, 0).float()
+
+
+# Triton replay configs tested for non-varlen + varlen: the faithful TMA
+# standalone in its two modes (the merged non-TMA copy was removed with the
+# old 4D kernel, 2026-07-10).
+_TRITON_IMPLS = ["tma_pd", "tma_pm"]
+
+# fragA-native cb_scaled layout for the two-kernel CUDA path (.plans/ssu_split.md):
+# per (batch, head), one PackedAligned<bf16> per lane = WARP_SIZE lanes ×
+# MMA_FRAG_SIZE bf16 (the mma.m16n8k16 A fragment, 16 B/lane).
+WARP_SIZE = 32
+MMA_FRAG_SIZE = 8
+
+
+def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
+    """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
+
+    Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
+    Forces algorithm="two-kernel": test batches sit below the wrapper's auto
+    threshold (batch*nheads >= sm_count) and would silently run the monolith."""
+    k_old = ((max_window + 7) // 8) * 8
+    return dict(
+        cb_scaled=torch.empty(
+            batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+        ),
+        cumAdt_vec=torch.empty(batch, nheads, 16, device=device, dtype=torch.float32),
+        cb_old=torch.empty(
+            batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+        ),
+        algorithm="two-kernel",
+    )
+
+
+def _make_replay_work_items(
+    prev_tokens, seq_len, max_window, batch, state_batch_indices
+):
+    """Build (n_writes, replay_work_items) for the standalone persistent kernel,
+    write-first sorted — mirrors mamba2_metadata._prepare_replay_work_items.
+
+    ``seq_len`` is the per-step new-token count used in the write decision
+    ``(pnat + seq_len) > max_window``: a scalar for non-varlen, or a (batch,)
+    tensor of per-sequence lengths (indexed by decode-batch position) for varlen.
+    persistent_dynamic ignores the ordering at runtime; persistent_main relies
+    on the n_writes split (write slots first).  The buf column is vestigial
+    under the ring contract and stays 0.
+    """
+    device = prev_tokens.device
+    position_in_decode_batch = torch.arange(batch, device=device, dtype=torch.int32)
+    if state_batch_indices is not None:
+        cache_slot = state_batch_indices[:batch].to(torch.int32)
+    else:
+        cache_slot = position_in_decode_batch
+    cache_slot_long = cache_slot.to(torch.long)
+    pnat = prev_tokens[cache_slot_long].to(torch.int32)
+    write_mask = (pnat + seq_len) > max_window
+    n_writes = write_mask.sum().to(torch.int32).reshape(1)
+    order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
+    work = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    work[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = position_in_decode_batch[order]
+    work[:, REPLAY_WORK_CACHE_SLOT] = cache_slot[order]
+    work[:, REPLAY_WORK_PNAT] = pnat[order]
+    work[:, REPLAY_WORK_CACHE_BUF_IDX] = 0
+    return n_writes, work.contiguous()
+
+
+def _call_replay(
+    impl,
+    *,
+    state,
+    x_cache,
+    B_cache,
+    dt_cache,
+    ring_start,
+    prev_tokens,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    max_window,
+    batch,
+    work_seq_len,
+    state_batch_indices=None,
+    D=None,
+    dt_bias=None,
+    dt_softplus=True,
+    state_scales=None,
+    rand_seed=None,
+    philox_rounds=0,
+    cu_seqlens=None,
+    max_seqlen=None,
+):
+    """Dispatch one replay call to a test config (see ``_TRITON_IMPLS``):
+      ``tma_pd``/``tma_pm`` → the TMA standalone ``replay_persistent`` in
+        persistent_dynamic / persistent_main.
+
+    The ring caches are mutated in place (appended rows).
+    ``work_seq_len`` is the new-token count for the persistent_main work-item
+    sort (scalar non-varlen, or a (batch,) per-sequence tensor for varlen).
+    For varlen pass ``cu_seqlens`` + ``max_seqlen``.
+    """
+    common = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        state_batch_indices=state_batch_indices,
+        state_scales=state_scales,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
+    )
+    if cu_seqlens is not None:
+        common.update(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    mode = "persistent_dynamic" if impl == "tma_pd" else "persistent_main"
+    n_writes, replay_work_items = _make_replay_work_items(
+        prev_tokens,
+        work_seq_len,
+        max_window,
+        batch,
+        state_batch_indices,
+    )
+    replay_persistent(
+        state,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
+        prev_tokens,
+        n_writes=n_writes,
+        replay_work_items=replay_work_items,
+        mode=mode,
+        **common,
+    )
+
+
+def _assert_ring_cache_matches(cache_cuda, cache_ref, name, rtol=0, atol=0):
+    """Compare a CUDA ring-cache postcondition against the Triton reference's.
+
+    Both sides start from identical clones and share the ring layout, so the
+    whole tensor must match: appended rows because both kernels wrote the same
+    tokens at ``(start + pnat + i) % L``, every other row because neither side
+    may touch it.  x/B appends are raw input copies (bit-exact); dt rows go
+    through the f32 softplus pipeline, so callers pass a small tolerance."""
+    torch.testing.assert_close(
+        cache_cuda.float(),
+        cache_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        msg=f"{name} ring-cache postcondition mismatch",
+    )
+
+
 def _run_checkpointing_ssu_case(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
+    impl, nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
     """
     For each k in 0..T, run both CUDA and Triton incremental kernels with
@@ -81,32 +303,24 @@ def _run_checkpointing_ssu_case(
     B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
     C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)  # noqa: F841
 
-    # Compute processed dt and cumAdt for step 1 (to build cache)
+    # Compute processed dt for step 1 (to build cache; cumAdt is recomputed
+    # from cached dt by both kernels under the ring contract)
     dt1_proc = dt1_base.float() + dt_bias_base.float()[None, None, :]
     dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
-    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    # Build cache tensors
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    # Build ring caches (max_window == NPREDICTED == T for this test family)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
-    # Fill caches
     slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots] = x1
 
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     for i, slot in enumerate(slot_indices):
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf] = B1[i]
-        old_dt[slot, buf] = dt1_proc[i].permute(1, 0)  # (T, nheads) → (nheads, T)
-        old_cumAdt[slot, buf] = cumAdt1[i].permute(1, 0)
+        _seed_ring(
+            x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1_proc[i]
+        )
 
     # Test each replay count k
     for k in range(T + 1):
@@ -125,24 +339,27 @@ def _run_checkpointing_ssu_case(
         ref_state = state0.clone()
         ref_prev = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        replay_selective_state_update(
-            ref_state,
-            old_x.clone(),
-            old_B.clone(),
-            old_dt.clone(),
-            old_cumAdt.clone(),
-            cache_buf_idx.clone(),
-            ref_prev,
+        _call_replay(
+            impl,
+            state=ref_state,
+            x_cache=x_cache.clone(),
+            B_cache=B_cache.clone(),
+            dt_cache=dt_cache.clone(),
+            ring_start=ring_start,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
+            max_window=T,
+            batch=batch,
+            work_seq_len=T,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
         )
 
         # --- CUDA kernel ---
@@ -154,11 +371,10 @@ def _run_checkpointing_ssu_case(
             kernel_kwargs["d_split"] = d_split
         checkpointing_ssu(
             test_state,
-            old_x.clone(),
-            old_B.clone(),
-            old_dt.clone(),
-            old_cumAdt.clone(),
-            cache_buf_idx.clone(),
+            x_cache.clone(),
+            B_cache.clone(),
+            dt_cache.clone(),
+            ring_start.clone(),
             test_prev,
             x=x2,
             dt=dt2,
@@ -214,7 +430,8 @@ def _run_checkpointing_ssu_case(
 # `D_SPLIT` template specialization, so this is a runtime-dispatch check.
 
 
-def test_checkpointing_ssu_d_split2():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_d_split2(impl):
     """v12 §59 smoke — D_SPLIT=2 path dispatches and runs.  Both
     ``d_split={1,2}`` specializations are baked into the same JIT .so via
     the public dispatcher's switch; this test verifies the d_split=2 grid
@@ -222,6 +439,7 @@ def test_checkpointing_ssu_d_split2():
     coverage is provided by the d_split=1 tests sharing the same .so."""
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     _run_checkpointing_ssu_case(
+        impl,
         nheads,
         head_dim,
         d_state,
@@ -233,7 +451,8 @@ def test_checkpointing_ssu_d_split2():
     )
 
 
-def test_checkpointing_ssu_heads_per_group():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_heads_per_group(impl):
     """Smoke test the multi-group code path (group_idx != 0 for some heads).
 
     The two ``_CONFIGS`` entries both have HEADS_PER_GROUP = nheads/ngroups
@@ -248,6 +467,7 @@ def test_checkpointing_ssu_heads_per_group():
     both `group_idx = 0` and `group_idx = 1` paths in the same launch."""
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 2  # HPG = 8
     _run_checkpointing_ssu_case(
+        impl,
         nheads,
         head_dim,
         d_state,
@@ -256,6 +476,591 @@ def test_checkpointing_ssu_heads_per_group():
         paged_cache=True,
         T=16,
     )
+
+
+def test_two_kernel_matches_monolithic():
+    """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
+    must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
+    the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
+    batch = 2
+    cache_size = batch  # non-paged
+    # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
+    # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
+    # nowrite(prev_k>0 — exercises the dt-ring tail scan), k=T=6 write.
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    # Step-1 inputs → buffered ("old") cache.
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = dt1_base.float() + dt_bias[:, 0].float()[None, None, :]
+    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
+
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+    for slot in range(cache_size):
+        _seed_ring(
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            slot,
+            x1[slot],
+            B1[slot],
+            dt1_proc[slot],
+        )
+
+    def _run(k, *, two_kernel, enable_pdl=False):
+        torch.manual_seed(k + 100)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        kw = {}
+        if two_kernel:
+            # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
+            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; cumAdt_vec is
+            # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
+            T_pad = 16  # next_multiple_of<MMA::M=16>(T) for T <= 16
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            # cb_old (C6, no-write): m16n8k{K_old} fragA, K_old =
+            # next_multiple_of<MMA::K_SMALL=8>(max_window); REGS = K_old/2.
+            k_old = ((max_window + 7) // 8) * 8
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+            )
+            kw["algorithm"] = "two-kernel"
+        checkpointing_ssu(
+            st,
+            xc,
+            bc,
+            dtc,
+            ring_start.clone(),
+            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            enable_pdl=enable_pdl,
+            **kw,
+        )
+        return out, st, xc, bc, dtc
+
+    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
+    for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
+        ref = _run(k, two_kernel=False)
+        test = _run(k, two_kernel=True)
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
+            )
+        # Same split, but with the real precompute→main PDL chain active
+        # (precompute fires cudaTriggerProgrammaticLaunchCompletion, main
+        # gdc_waits).  Exercises the trigger's memory-ordering contract — the
+        # main must still see every cb_scaled/cumAdt_vec/cb_old the precompute
+        # wrote.  Must match the monolithic ref bit-for-bit.
+        test_pdl = _run(k, two_kernel=True, enable_pdl=True)
+        for name, r, t in zip(names, ref, test_pdl, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
+            )
+
+
+def test_two_kernel_d_split2():
+    """Two-kernel split with d_split=2 must match d_split=1 bit-for-bit.
+
+    d_split=2 halves D_PER_CTA (64→32), doubling the CTA count for better
+    utilisation at small batch.  Exercises the two-kernel dispatcher routing
+    through launchCheckpointingSsuImpl with D_SPLIT=2 in the main grid."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 8
+    batch = 2
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = dt1_base.float() + dt_bias[:, 0].float()[None, None, :]
+    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
+
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+    for slot in range(cache_size):
+        _seed_ring(
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            slot,
+            x1[slot],
+            B1[slot],
+            dt1_proc[slot],
+        )
+
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(k, *, d_split):
+        torch.manual_seed(k + 100)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        checkpointing_ssu(
+            st,
+            xc,
+            bc,
+            dtc,
+            ring_start.clone(),
+            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            d_split=d_split,
+            cb_scaled=torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+            ),
+            cumAdt_vec=torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            ),
+            cb_old=torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+            ),
+            algorithm="two-kernel",
+        )
+        return out, st, xc, bc, dtc
+
+    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
+    for k in (0, 2, T):
+        ref = _run(k, d_split=1)
+        test = _run(k, d_split=2)
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
+            )
+
+
+def test_persistent_main_matches_monolithic(monkeypatch):
+    """Persistent main: with FLASHINFER_SSU_MAIN_CTA_PER_SM=1 the main grid is
+    undersized so that ``work_units > occupancy·NUM_SMS`` — the grid genuinely
+    can't hold all work-units at once, so each CTA must grid-stride over several.
+    Output (+ all caches) must match the monolithic reference bit-exact on BOTH
+    the no-write (prev_k=0,8) and write (prev_k=12) paths at production
+    max_window=16."""
+    monkeypatch.setenv("FLASHINFER_SSU_MAIN_CTA_PER_SM", "1")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 16  # production window
+
+    # Size batch so work_units = batch·nheads exceeds occupancy·NUM_SMS (main is
+    # __maxnreg__(64) → 8 blocks/SM).  At CTA_PER_SM=1 the grid is NUM_SMS CTAs, so
+    # each grid-strides ≥ occupancy× — the loop is genuinely exercised.
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    occupancy = 8
+    batch = max(2, (occupancy * num_sms) // nheads + 1)
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    # Random full ring: prev_k>T slots read genuinely-distinct history rows.
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(k, *, two_kernel):
+        torch.manual_seed(k + 300)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        kw = {}
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+            )
+            kw["algorithm"] = "two-kernel"
+        checkpointing_ssu(
+            st,
+            xc,
+            bc,
+            dtc,
+            ring_start.clone(),
+            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, xc, bc, dtc
+
+    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
+    # k=0/8 no-write (prev_k+T ≤ 16); k=12 write (12+6=18 > 16).
+    for k in (0, 8, 12):
+        ref = _run(k, two_kernel=False)
+        test = _run(k, two_kernel=True)
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (persistent)"
+            )
+
+
+def test_two_kernel_meta_ring_refill(monkeypatch):
+    """Meta-ring REFILL path: with FLASHINFER_SSU_MAIN_CTA_PER_SM=1 the main grid is
+    NUM_SMS CTAs and batch is sized so each CTA grid-strides over ~64 work-units —
+    crossing the meta-window refills at tile 30 and 60 (META_RING=32, STAGES=2) with
+    ring-slot wraparound.  prev_num_accepted is randomized per slot so write and
+    no-write units interleave inside every 32-unit window, and (NUM_SMS not being a
+    multiple of nheads) the head also varies per unit.  Must match the monolithic
+    reference."""
+    monkeypatch.setenv("FLASHINFER_SSU_MAIN_CTA_PER_SM", "1")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 16
+
+    # units/CTA = batch·nheads / NUM_SMS ≈ 64 > 2·(META_RING−STAGES) ⇒ ≥ 2 refills.
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    batch = (64 * num_sms) // nheads + 1
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    # Random full ring: prev_k>T slots read genuinely-distinct history rows.
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+
+    # Mixed per-slot pnat ∈ [0, max_window]: rows with pnat+T > max_window checkpoint,
+    # the rest replay — interleaved inside every meta window.
+    torch.manual_seed(7)
+    prev_mixed = torch.randint(
+        0, max_window + 1, (cache_size,), device=device, dtype=torch.int32
+    )
+    assert (prev_mixed + T > max_window).any() and (prev_mixed + T <= max_window).any()
+
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(*, two_kernel):
+        torch.manual_seed(300)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        kw = {}
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+            )
+            kw["algorithm"] = "two-kernel"
+        checkpointing_ssu(
+            st,
+            xc,
+            bc,
+            dtc,
+            ring_start.clone(),
+            prev_mixed.clone(),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, xc, bc, dtc
+
+    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
+    ref = _run(two_kernel=False)
+    test = _run(two_kernel=True)
+    for name, r, t in zip(names, ref, test, strict=True):
+        torch.testing.assert_close(
+            t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch (meta-ring refill)"
+        )
+
+
+def _run_two_kernel_state_dtype_case(
+    state_dtype, philox_rounds, batch=2, k_cases=(0, 2, 12)
+):
+    """Two-kernel path vs the monolithic reference with a non-bf16 STATE dtype
+    (bf16 activations).  The window is filled with CONSISTENT rows (softplus
+    dt, true cumsum): the write path replays rows beyond T, and inconsistent
+    random rows push |state| past f16 max (65504) into inf/NaN.
+
+    ``k_cases`` entries are uniform pnat ints or the string "mixed" (per-slot
+    random pnat straddling the write threshold — exercises the main's
+    write-first slot visiting order)."""
+    device = "cuda"
+    act_dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 16
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=act_dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(
+        torch.randn(nheads, device=device, dtype=act_dtype), "h -> h p", p=head_dim
+    )
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+    x_fill = torch.randn(
+        batch, max_window, nheads, head_dim, device=device, dtype=act_dtype
+    )
+    dt_fill = torch.randn(batch, max_window, nheads, device=device, dtype=act_dtype)
+    B_fill = torch.randn(
+        batch, max_window, ngroups, d_state, device=device, dtype=act_dtype
+    )
+    dt_fill_proc = dt_fill.float() + dt_bias[:, 0].float()[None, None, :]
+    dt_fill_proc = torch.where(
+        dt_fill_proc > 20.0, dt_fill_proc, torch.log1p(torch.exp(dt_fill_proc))
+    )
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, act_dtype, device
+    )
+    for slot in range(cache_size):
+        _seed_ring(
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            slot,
+            x_fill[slot],
+            B_fill[slot],
+            dt_fill_proc[slot],
+        )
+
+    rand_seed = torch.tensor([1234], device=device, dtype=torch.int64)
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(k, *, two_kernel):
+        torch.manual_seed((int(k.sum().item()) if torch.is_tensor(k) else k) + 100)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=act_dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=act_dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=act_dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=act_dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=act_dtype)
+        xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        kw = {}
+        if philox_rounds > 0:
+            kw["philox_rounds"] = philox_rounds
+            kw["rand_seed"] = rand_seed
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=act_dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
+            )
+            kw["algorithm"] = "two-kernel"
+        checkpointing_ssu(
+            st,
+            xc,
+            bc,
+            dtc,
+            ring_start.clone(),
+            k.clone()
+            if torch.is_tensor(k)
+            else torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, xc, bc, dtc
+
+    names = ("out", "state", "x_cache", "B_cache", "dt_cache")
+    # k=0/2 no-write; k=12 write (12+6 > 16) — replays 12 rows incl. rows ≥ T;
+    # "mixed" = per-slot random pnat with ~40% writes (slot_order visiting path).
+    for k in k_cases:
+        if isinstance(k, str):
+            torch.manual_seed(1234)
+            kv = torch.randint(0, 8, (cache_size,), device=device, dtype=torch.int32)
+            kv[torch.rand(cache_size, device=device) < 0.4] = 12
+            k_arg, k_label = kv, "mixed"
+        else:
+            k_arg, k_label = k, k
+        ref = _run(k_arg, two_kernel=False)
+        test = _run(k_arg, two_kernel=True)
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t,
+                r,
+                rtol=2e-2,
+                atol=5e-1,
+                msg=f"{name} mismatch at k={k_label} ({state_dtype} state, philox={philox_rounds})",
+            )
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_two_kernel_f16_state(philox_rounds):
+    """f16 STATE + bf16 activations on the two-kernel path vs the monolithic
+    reference.  The operand-swap OUT.1 LDSMs the state under a bf16-typed view;
+    the real element type must be recovered in-registers
+    (convert_frag<state_t>) — reinterpreting f16 bits as bf16 silently corrupts
+    the output (caught 2026-07-02).  philox_rounds=5 exercises the SR state
+    store (shared store code + same seed ⇒ the two paths bit-match)."""
+    if philox_rounds > 0 and not is_cvt_rs_supported():
+        pytest.skip("fp16 Philox SR requires HW cvt.rs (sm_100a+)")
+    _run_two_kernel_state_dtype_case(torch.float16, philox_rounds)
+
+
+def test_two_kernel_f32_state():
+    """f32 STATE + bf16 activations on the two-kernel path vs the monolithic
+    reference — the wide-A path: OUT.1 loads the state as k-adjacent float2
+    pairs via LDS.64 and narrows to bf16 in registers (no ldmatrix exists for
+    32-bit elements feeding a 16-bit MMA), the f32 smem ring uses the
+    M=3-floored Swizzle<3,3,3>, and the launcher accepts 4-byte state on the
+    split.  philox SR is meaningless for f32 (stores from f32 registers are
+    exact) — RN only."""
+    _run_two_kernel_state_dtype_case(torch.float32, 0)
+
+
+def test_two_kernel_f32_mixed_batch():
+    """Mixed write/no-write batch (per-slot pnat, ~40% writes) on the f32
+    two-kernel path vs the monolithic reference.  batch=64 gives the persistent
+    main a genuinely interleaved grid-stride deal — exercises the write-first
+    slot visiting order (build_slot_order + remap_seq): the monolith is
+    visit-order independent, so any remap/partition/pad bug shows as a
+    mismatch."""
+    _run_two_kernel_state_dtype_case(torch.float32, 0, batch=64, k_cases=("mixed",))
 
 
 def test_checkpointing_ssu_pdl_bf16():
@@ -284,13 +1089,9 @@ def test_checkpointing_ssu_pdl_bf16():
         cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
     )
 
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
     prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -314,11 +1115,10 @@ def test_checkpointing_ssu_pdl_bf16():
     out_off = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_off,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=out_off,
         enable_pdl=False,
@@ -329,11 +1129,10 @@ def test_checkpointing_ssu_pdl_bf16():
     out_on = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_on,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=out_on,
         enable_pdl=True,
@@ -387,13 +1186,9 @@ def test_checkpointing_ssu_pdl_fp8_philox5():
     )
     state0, state0_scales = _quantize_state(state0_fp32, state_dtype, quant_max)
 
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
     prev_tokens = torch.full((cache_size,), T // 2, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -421,11 +1216,10 @@ def test_checkpointing_ssu_pdl_fp8_philox5():
     out_off = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_off,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=out_off,
         state_scale=scale_off,
@@ -438,11 +1232,10 @@ def test_checkpointing_ssu_pdl_fp8_philox5():
     out_on = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_on,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=out_on,
         state_scale=scale_on,
@@ -490,8 +1283,9 @@ def test_checkpointing_ssu_pdl_fp8_philox5():
     [(4, 8), (10, 16)],
     ids=["np4w8", "np10w16"],
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_max_window_gt_npredicted(
-    state_dtype, paged_cache, npredicted, max_window
+    impl, state_dtype, paged_cache, npredicted, max_window
 ):
     # Only one _CONFIGS entry — both share (head_dim, d_state, HPG=16) so
     # the JIT key is identical; the other config doesn't add coverage.
@@ -532,45 +1326,36 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
         cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
-    # Step-1 inputs (x1/B1/dt1) populate the cache at slots [0, npredicted)
-    # of the active buffer.  old_dt / old_cumAdt MUST be consistent
-    # with these (real softplus / cumsum), not arbitrary random — otherwise
-    # the replay's `coeff = exp(total - old_cumAdt) * old_dt` produces
-    # nonsensical scaling that drives the post-replay state into magnitudes
-    # where fp16's ULP can't keep up with Triton's fp32-register precision.
-    # Slots [npredicted, max_window) keep their `torch.randn` init (never
-    # read by replay since prev_k <= npredicted in this test).
+    # Step-1 inputs (x1/B1/dt1) populate the ring rows [start, start+npredicted).
+    # dt MUST be consistent with these (real softplus), not arbitrary random —
+    # otherwise the replay's recomputed `coeff = exp(total - cumAdt) * dt`
+    # produces nonsensical scaling that drives the post-replay state into
+    # magnitudes where fp16's ULP can't keep up with Triton's fp32-register
+    # precision.  Rows beyond prev_k keep their random init (never read).
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
-    # Populate the active buffer's [0:npredicted) with step-1 consistent data.
+    ring_len = x_cache.shape[2]
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
-    slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots, :npredicted] = x1
     for i, slot in enumerate(slot_indices):
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf, :npredicted] = B1[i]
-        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T  # (T, nheads) → (nheads, T)
-        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1_proc[i]
+        )
 
     for prev_k in range(0, npredicted + 1):
         torch.manual_seed(prev_k + 200)
@@ -595,29 +1380,30 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = old_x.clone()
-        old_B_ref = old_B.clone()
-        old_dt_ref = old_dt.clone()
-        old_dA_ref = old_dA_cumsum.clone()
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            ref_prev,
+        x_ref = x_cache.clone()
+        B_ref = B_cache.clone()
+        dt_ref = dt_cache.clone()
+        _call_replay(
+            impl,
+            state=ref_state,
+            x_cache=x_ref,
+            B_cache=B_ref,
+            dt_cache=dt_ref,
+            ring_start=ring_start,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=npredicted,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            write_checkpoint=must_checkpoint,
         )
 
         # ── CUDA kernel ──
@@ -626,17 +1412,15 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
         test_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_test = old_x.clone()
-        old_B_test = old_B.clone()
-        old_dt_test = old_dt.clone()
-        old_dA_test = old_dA_cumsum.clone()
+        x_test = x_cache.clone()
+        B_test = B_cache.clone()
+        dt_test = dt_cache.clone()
         checkpointing_ssu(
             test_state,
-            old_x_test,
-            old_B_test,
-            old_dt_test,
-            old_dA_test,
-            cache_buf_idx.clone(),
+            x_test,
+            B_test,
+            dt_test,
+            ring_start.clone(),
             test_prev,
             x=x2,
             dt=dt2,
@@ -665,35 +1449,35 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
             atol=5e-1,
             msg=f"state mismatch at prev_k={prev_k} (must_checkpoint={must_checkpoint})",
         )
-        # Cache writes — both kernels should land at the same slot/offset.
-        torch.testing.assert_close(
-            old_x_test,
-            old_x_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_x mismatch at prev_k={prev_k}",
+        # Cache writes — both kernels append at the same ring rows and must
+        # leave every other row untouched.
+        _assert_ring_cache_matches(x_test, x_ref, f"x_cache (prev_k={prev_k})")
+        _assert_ring_cache_matches(B_test, B_ref, f"B_cache (prev_k={prev_k})")
+        _assert_ring_cache_matches(
+            dt_test, dt_ref, f"dt_cache (prev_k={prev_k})", rtol=1e-4, atol=1e-4
         )
-        torch.testing.assert_close(
-            old_B_test,
-            old_B_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_B mismatch at prev_k={prev_k}",
+
+        # Appended dt rows must hold the softplus-processed step-2 dt at
+        # (start + prev_k + i) % L — verify against the analytical value.
+        dt2_proc_f32 = F.softplus(
+            dt2_base.float() + dt_bias_base.float()[None, None, :]
         )
-        torch.testing.assert_close(
-            old_dt_test,
-            old_dt_ref,
-            rtol=1e-4,
-            atol=1e-4,
-            msg=f"old_dt mismatch at prev_k={prev_k}",
-        )
-        torch.testing.assert_close(
-            old_dA_test,
-            old_dA_ref,
-            rtol=1e-4,
-            atol=1e-4,
-            msg=f"old_dA mismatch at prev_k={prev_k}",
-        )
+        for batch_idx, slot in enumerate(slot_indices):
+            rows = (
+                (
+                    int(ring_start[slot])
+                    + prev_k
+                    + torch.arange(npredicted, device=device)
+                )
+                % ring_len
+            ).long()
+            torch.testing.assert_close(
+                dt_ref[slot][:, rows],
+                dt2_proc_f32[batch_idx].T,
+                rtol=1e-4,
+                atol=1e-4,
+                msg=f"Triton appended dt mismatch at prev_k={prev_k} slot={slot}",
+            )
 
 
 # Philox SR + must_checkpoint=False: verify the kernel correctly skips the
@@ -703,7 +1487,7 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 # elided.  Strongest signal: state remains byte-identical to state0.
 @pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
@@ -712,8 +1496,18 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 )
 # (4, 8) gives must_checkpoint = (prev_k + 4 > 8) = False for prev_k ∈ [0, 4].
 @pytest.mark.parametrize("npredicted,max_window", [(4, 8)], ids=["np4w8"])
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
 def test_checkpointing_ssu_philox_no_checkpoint(
-    nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
+    impl,
+    nheads,
+    head_dim,
+    d_state,
+    ngroups,
+    paged_cache,
+    npredicted,
+    max_window,
+    two_kernel,
 ):
     """Verify Philox SR path skips state HBM write when must_checkpoint=False.
 
@@ -748,41 +1542,35 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
-    # Step-1 inputs populate the active buffer's [0, npredicted) with
-    # consistent (real softplus/cumsum) data — same precision strategy as
-    # test_checkpointing_ssu_max_window_gt_npredicted.  Slots
-    # [npredicted, max_window) keep their `randn` init (never read by replay
-    # since prev_k <= npredicted).
+    # Step-1 inputs populate the ring rows [start, start+npredicted) with
+    # consistent (real softplus) data — same precision strategy as
+    # test_checkpointing_ssu_max_window_gt_npredicted.  Rows beyond prev_k
+    # keep their random init (never read by replay since prev_k <= npredicted).
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     slots_idx = state_batch_indices if paged_cache else slice(None)
-    old_x[slots_idx, :npredicted] = x1
+    ring_len = x_cache.shape[2]
     for i, slot in enumerate(slot_indices):
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf, :npredicted] = B1[i]
-        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
-        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1_proc[i]
+        )
 
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
 
@@ -817,29 +1605,32 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = old_x.clone()
-        old_B_ref = old_B.clone()
-        old_dt_ref = old_dt.clone()
-        old_dA_ref = old_dA_cumsum.clone()
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            ref_prev,
+        x_ref = x_cache.clone()
+        B_ref = B_cache.clone()
+        dt_ref = dt_cache.clone()
+        _call_replay(
+            impl,
+            state=ref_state,
+            x_cache=x_ref,
+            B_cache=B_ref,
+            dt_cache=dt_ref,
+            ring_start=ring_start,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=npredicted,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            write_checkpoint=False,
+            rand_seed=rand_seed,
+            philox_rounds=10,
         )
 
         # ── CUDA kernel with Philox enabled ──
@@ -848,17 +1639,15 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         test_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_test = old_x.clone()
-        old_B_test = old_B.clone()
-        old_dt_test = old_dt.clone()
-        old_dA_test = old_dA_cumsum.clone()
+        x_test = x_cache.clone()
+        B_test = B_cache.clone()
+        dt_test = dt_cache.clone()
         checkpointing_ssu(
             test_state,
-            old_x_test,
-            old_B_test,
-            old_dt_test,
-            old_dA_test,
-            cache_buf_idx.clone(),
+            x_test,
+            B_test,
+            dt_test,
+            ring_start.clone(),
             test_prev,
             x=x2,
             dt=dt2,
@@ -872,6 +1661,11 @@ def test_checkpointing_ssu_philox_no_checkpoint(
             state_batch_indices=state_batch_indices,
             rand_seed=rand_seed,
             philox_rounds=10,
+            **(
+                _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+                if two_kernel
+                else {}
+            ),
         )
 
         # KEY assertion: state HBM byte-identical to state0.  Kernel must
@@ -897,37 +1691,35 @@ def test_checkpointing_ssu_philox_no_checkpoint(
             msg=f"out mismatch at prev_k={prev_k}",
         )
 
-        # Cache writes happen unconditionally; only target buffer/offset
-        # depends on must_checkpoint.  Should match Triton ref bit-exactly
-        # for old_x/old_B and to fp32 tolerance for old_dt/old_dA_cumsum.
-        torch.testing.assert_close(
-            old_x_test,
-            old_x_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_x mismatch at prev_k={prev_k}",
+        # Cache writes happen unconditionally: appends land at the same ring
+        # rows on both sides — bit-exact for x/B, fp32 tolerance for dt.
+        _assert_ring_cache_matches(x_test, x_ref, f"x_cache (prev_k={prev_k})")
+        _assert_ring_cache_matches(B_test, B_ref, f"B_cache (prev_k={prev_k})")
+        _assert_ring_cache_matches(
+            dt_test, dt_ref, f"dt_cache (prev_k={prev_k})", rtol=1e-4, atol=1e-4
         )
-        torch.testing.assert_close(
-            old_B_test,
-            old_B_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_B mismatch at prev_k={prev_k}",
+
+        # Appended dt rows must hold the softplus-processed step-2 dt at
+        # (start + prev_k + i) % L — verify against the analytical value.
+        dt2_proc_f32 = F.softplus(
+            dt2_base.float() + dt_bias_base.float()[None, None, :]
         )
-        torch.testing.assert_close(
-            old_dt_test,
-            old_dt_ref,
-            rtol=1e-4,
-            atol=1e-4,
-            msg=f"old_dt mismatch at prev_k={prev_k}",
-        )
-        torch.testing.assert_close(
-            old_dA_test,
-            old_dA_ref,
-            rtol=1e-4,
-            atol=1e-4,
-            msg=f"old_dA mismatch at prev_k={prev_k}",
-        )
+        for batch_idx, slot in enumerate(slot_indices):
+            rows = (
+                (
+                    int(ring_start[slot])
+                    + prev_k
+                    + torch.arange(npredicted, device=device)
+                )
+                % ring_len
+            ).long()
+            torch.testing.assert_close(
+                dt_ref[slot][:, rows],
+                dt2_proc_f32[batch_idx].T,
+                rtol=1e-4,
+                atol=1e-4,
+                msg=f"Triton appended dt mismatch at prev_k={prev_k} slot={slot}",
+            )
 
 
 # Philox SR + must_checkpoint=True under MAX_WINDOW > NPREDICTED: rounds out
@@ -938,7 +1730,7 @@ def test_checkpointing_ssu_philox_no_checkpoint(
 # capacity.
 @pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 # 4-tuple subset of the 16-element cartesian (was: 4 (np,mw,pk) × 2 paged ×
@@ -958,12 +1750,16 @@ def test_checkpointing_ssu_philox_no_checkpoint(
     ],
     ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk14", "np14w16_pk3"],
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
 def test_checkpointing_ssu_philox_with_checkpoint(
+    impl,
     npredicted,
     max_window,
     prev_k,
     paged_cache,
     _cfg_idx,
+    two_kernel,
 ):
     """Verify Philox SR path correctly writes state HBM when must_checkpoint=True
     in the non-degenerate MAX_WINDOW > NPREDICTED regime.
@@ -1010,39 +1806,33 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
-    # Step-1 inputs populate the active buffer's [0, npredicted) with
-    # consistent (real softplus/cumsum) data — same precision strategy as
+    # Step-1 inputs populate the ring rows [start, start+npredicted) with
+    # consistent (real softplus) data — same precision strategy as
     # test_checkpointing_ssu_max_window_gt_npredicted.
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     slots_idx = state_batch_indices if paged_cache else slice(None)
-    old_x[slots_idx, :npredicted] = x1
     for i, slot in enumerate(slot_indices):
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf, :npredicted] = B1[i]
-        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
-        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1_proc[i]
+        )
 
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
     torch.manual_seed(prev_k + 200)
@@ -1059,29 +1849,32 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     ref_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
-    old_x_ref = old_x.clone()
-    old_B_ref = old_B.clone()
-    old_dt_ref = old_dt.clone()
-    old_dA_ref = old_dA_cumsum.clone()
-    replay_selective_state_update(
-        ref_state,
-        old_x_ref,
-        old_B_ref,
-        old_dt_ref,
-        old_dA_ref,
-        cache_buf_idx.clone(),
-        ref_prev,
+    x_ref = x_cache.clone()
+    B_ref = B_cache.clone()
+    dt_ref = dt_cache.clone()
+    _call_replay(
+        impl,
+        state=ref_state,
+        x_cache=x_ref,
+        B_cache=B_ref,
+        dt_cache=dt_ref,
+        ring_start=ring_start,
+        prev_tokens=ref_prev,
         x=x2,
         dt=dt2,
         A=A,
         B=B2,
         C=C2,
         out=ref_out,
+        max_window=max_window,
+        batch=batch,
+        work_seq_len=npredicted,
+        state_batch_indices=state_batch_indices,
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=state_batch_indices,
-        write_checkpoint=True,
+        rand_seed=rand_seed,
+        philox_rounds=10,
     )
 
     # ── CUDA kernel with Philox enabled ──
@@ -1090,17 +1883,15 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     test_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
-    old_x_test = old_x.clone()
-    old_B_test = old_B.clone()
-    old_dt_test = old_dt.clone()
-    old_dA_test = old_dA_cumsum.clone()
+    x_test = x_cache.clone()
+    B_test = B_cache.clone()
+    dt_test = dt_cache.clone()
     checkpointing_ssu(
         test_state,
-        old_x_test,
-        old_B_test,
-        old_dt_test,
-        old_dA_test,
-        cache_buf_idx.clone(),
+        x_test,
+        B_test,
+        dt_test,
+        ring_start.clone(),
         test_prev,
         x=x2,
         dt=dt2,
@@ -1114,6 +1905,11 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         state_batch_indices=state_batch_indices,
         rand_seed=rand_seed,
         philox_rounds=10,
+        **(
+            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # Sanity guard: the kernel must have written state HBM (gate not inverted).
@@ -1141,27 +1937,12 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         msg=f"out mismatch (prev_k={prev_k}, np={npredicted}, mw={max_window})",
     )
 
-    # Cache writes happen unconditionally; only target buffer/offset depends
-    # on must_checkpoint.
-    torch.testing.assert_close(
-        old_x_test, old_x_ref, rtol=0, atol=0, msg=f"old_x mismatch (prev_k={prev_k})"
-    )
-    torch.testing.assert_close(
-        old_B_test, old_B_ref, rtol=0, atol=0, msg=f"old_B mismatch (prev_k={prev_k})"
-    )
-    torch.testing.assert_close(
-        old_dt_test,
-        old_dt_ref,
-        rtol=1e-4,
-        atol=1e-4,
-        msg=f"old_dt mismatch (prev_k={prev_k})",
-    )
-    torch.testing.assert_close(
-        old_dA_test,
-        old_dA_ref,
-        rtol=1e-4,
-        atol=1e-4,
-        msg=f"old_dA mismatch (prev_k={prev_k})",
+    # Cache writes happen unconditionally: appends land at the same ring rows
+    # on both sides regardless of must_checkpoint.
+    _assert_ring_cache_matches(x_test, x_ref, f"x_cache (prev_k={prev_k})")
+    _assert_ring_cache_matches(B_test, B_ref, f"B_cache (prev_k={prev_k})")
+    _assert_ring_cache_matches(
+        dt_test, dt_ref, f"dt_cache (prev_k={prev_k})", rtol=1e-4, atol=1e-4
     )
 
 
@@ -1201,8 +1982,8 @@ def test_checkpointing_ssu_int8_rn_parity(
 ):
     """int8 + RN parity vs fp32 selective_state_update reference.
 
-    Builds physically realistic cache tensors (old_dt, old_cumAdt
-    derived from A_base and softplus(dt+bias)), then validates the CUDA
+    Builds physically realistic ring caches (dt derived from softplus(dt+bias),
+    decays recomputed in-kernel), then validates the CUDA
     kernel's output and dequantized state against the fp32 recurrence.
     """
     batch = 2
@@ -1267,27 +2048,25 @@ def test_checkpointing_ssu_int8_rn_parity(
         disable_state_update=True,
     )
 
-    # Build physically realistic cache tensors.
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.zeros(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-
-    old_x[slots, :T] = x1
+    # Build physically realistic ring caches (max_window == NPREDICTED == T).
     dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
-
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     for i, slot_val in enumerate(slot_indices):
-        buf = cache_buf_idx[slot_val].item()
-        old_B[slot_val, buf, :T] = B1[i]
-        old_dt[slot_val, buf, :, :T] = dt1_processed[i].T
-        old_cumAdt[slot_val, buf, :, :T] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            slot_val,
+            x1[i],
+            B1[i],
+            dt1_processed[i],
+        )
 
     # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
     k = T // 2
@@ -1338,11 +2117,10 @@ def test_checkpointing_ssu_int8_rn_parity(
     test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         test_state,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=test_out,
         state_scale=test_scale,
@@ -1469,27 +2247,25 @@ def test_checkpointing_ssu_fp8_rn_parity(
         disable_state_update=True,
     )
 
-    # Build physically realistic cache tensors.
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.zeros(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.zeros(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-
-    old_x[slots, :T] = x1
+    # Build physically realistic ring caches (max_window == NPREDICTED == T).
     dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
-
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     for i, slot_val in enumerate(slot_indices):
-        buf = cache_buf_idx[slot_val].item()
-        old_B[slot_val, buf, :T] = B1[i]
-        old_dt[slot_val, buf, :, :T] = dt1_processed[i].T
-        old_cumAdt[slot_val, buf, :, :T] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            slot_val,
+            x1[i],
+            B1[i],
+            dt1_processed[i],
+        )
 
     # prev_k = T//2 with NPREDICTED == MAX_WINDOW == T → must_checkpoint=True
     k = T // 2
@@ -1540,11 +2316,10 @@ def test_checkpointing_ssu_fp8_rn_parity(
     test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         test_state,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens.clone(),
         out=test_out,
         state_scale=test_scale,
@@ -1620,14 +2395,10 @@ def test_checkpointing_ssu_int8_smoke():
         + 0.01
     )  # positive fp32 in (0.01, 0.11)
 
-    # Cache tensors.
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    # Ring caches (random contents; positive dt keeps recomputed decays finite).
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     # Inputs.
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -1645,11 +2416,10 @@ def test_checkpointing_ssu_int8_smoke():
 
     checkpointing_ssu(
         state,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         prev_tokens,
         x=x,
         dt=dt,
@@ -1691,8 +2461,9 @@ def test_checkpointing_ssu_int8_smoke():
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("with_philox", [False, True], ids=["no_philox", "philox"])
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_mixed_checkpoint_batch(
-    nheads, head_dim, d_state, ngroups, paged_cache, with_philox
+    impl, nheads, head_dim, d_state, ngroups, paged_cache, with_philox
 ):
     """Verify CUDA kernel handles a batch with mixed must_checkpoint values.
 
@@ -1704,7 +2475,7 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
     """
     if with_philox and not is_cvt_rs_supported():
         pytest.skip(
-            "Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+            "Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
             "not SM120a / consumer Blackwell)"
         )
 
@@ -1754,33 +2525,28 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
         cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
-    # Step-1 inputs populate each used slot's active-buffer [0, npredicted).
+    # Step-1 inputs populate each used slot's ring rows [start, start+npredicted).
     x1 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, npredicted, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, npredicted, ngroups, d_state, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
+    ring_len = x_cache.shape[2]
     for i, slot in enumerate(slot_per_batch):
-        old_x[slot, :npredicted] = x1[i]
-        buf = cache_buf_idx[slot].item()
-        old_B[slot, buf, :npredicted] = B1[i]
-        old_dt[slot, buf, :, :npredicted] = dt1_proc[i].T
-        old_dA_cumsum[slot, buf, :, :npredicted] = dA_cumsum1[i].T
+        _seed_ring(
+            x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1_proc[i]
+        )
 
     torch.manual_seed(7)
     x2 = torch.randn(batch, npredicted, nheads, head_dim, device=device, dtype=dtype)
@@ -1802,60 +2568,58 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
         dict(rand_seed=rand_seed, philox_rounds=10) if with_philox else dict()
     )
 
-    # ── Triton reference: two launches on disjoint sub-batches ──
+    # ── Triton reference: single full-batch launch ──
     #
-    # Each sub-launch passes the full state/cache tensors and the full
-    # prev_per_slot vector — Triton only touches the slots referenced by
-    # its sliced state_batch_indices, so the two launches' writes don't
-    # alias.  write_checkpoint is the constexpr that differs per sub-launch.
+    # The persistent path derives the per-slot write decision at runtime from
+    # (prev_per_slot + npredicted) > max_window, so a single launch handles
+    # the mixed [F, F, T, T] batch natively (no need for the old two-launch
+    # WRITE_CHECKPOINT-constexpr split).
     ref_state = state0.clone()
-    old_x_ref = old_x.clone()
-    old_B_ref = old_B.clone()
-    old_dt_ref = old_dt.clone()
-    old_dA_ref = old_dA_cumsum.clone()
+    x_ref = x_cache.clone()
+    B_ref = B_cache.clone()
+    dt_ref = dt_cache.clone()
     ref_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
 
-    for sub_idx, sub_write in [(false_idx, False), (true_idx, True)]:
-        sub_slice = slice(sub_idx[0], sub_idx[-1] + 1)  # contiguous range
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            prev_per_slot.clone(),
-            x=x2[sub_slice],
-            dt=dt2[sub_slice],
-            A=A,
-            B=B2[sub_slice],
-            C=C2[sub_slice],
-            out=ref_out[sub_slice],
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            state_batch_indices=state_batch_indices_full[sub_slice],
-            write_checkpoint=sub_write,
-        )
+    _call_replay(
+        impl,
+        state=ref_state,
+        x_cache=x_ref,
+        B_cache=B_ref,
+        dt_cache=dt_ref,
+        ring_start=ring_start,
+        prev_tokens=prev_per_slot,
+        x=x2,
+        dt=dt2,
+        A=A,
+        B=B2,
+        C=C2,
+        out=ref_out,
+        max_window=max_window,
+        batch=batch,
+        work_seq_len=npredicted,
+        state_batch_indices=state_batch_indices_full,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        **philox_kwargs,
+    )
 
     # ── CUDA kernel: single launch with full per-batch prev_k ──
     test_state = state0.clone()
-    old_x_test = old_x.clone()
-    old_B_test = old_B.clone()
-    old_dt_test = old_dt.clone()
-    old_dA_test = old_dA_cumsum.clone()
+    x_test = x_cache.clone()
+    B_test = B_cache.clone()
+    dt_test = dt_cache.clone()
     test_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
     checkpointing_ssu(
         test_state,
-        old_x_test,
-        old_B_test,
-        old_dt_test,
-        old_dA_test,
-        cache_buf_idx.clone(),
+        x_test,
+        B_test,
+        dt_test,
+        ring_start.clone(),
         prev_per_slot.clone(),
         x=x2,
         dt=dt2,
@@ -1906,25 +2670,35 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
         test_out, ref_out, rtol=2e-2, atol=5e-1, msg="out mismatch"
     )
 
-    # Cache writes happen unconditionally; only target buffer/offset depends
-    # on per-batch must_checkpoint.
-    torch.testing.assert_close(
-        old_x_test, old_x_ref, rtol=0, atol=0, msg="old_x mismatch"
-    )
-    torch.testing.assert_close(
-        old_B_test, old_B_ref, rtol=0, atol=0, msg="old_B mismatch"
-    )
-    torch.testing.assert_close(
-        old_dt_test, old_dt_ref, rtol=1e-4, atol=1e-4, msg="old_dt mismatch"
-    )
-    torch.testing.assert_close(
-        old_dA_test, old_dA_ref, rtol=1e-4, atol=1e-4, msg="old_dA mismatch"
-    )
+    # Cache writes happen unconditionally: appends land at the same ring rows
+    # on both sides regardless of the per-batch gate.
+    _assert_ring_cache_matches(x_test, x_ref, "x_cache")
+    _assert_ring_cache_matches(B_test, B_ref, "B_cache")
+    _assert_ring_cache_matches(dt_test, dt_ref, "dt_cache", rtol=1e-4, atol=1e-4)
+
+    # Appended dt rows must hold the softplus-processed step-2 dt at
+    # (start + prev_k + i) % L — verify per slot against the analytical value.
+    dt2_proc_f32 = F.softplus(dt2_base.float() + dt_bias_base.float()[None, None, :])
+    for batch_idx, slot in enumerate(slot_per_batch):
+        prev_k = prev_k_per_batch[batch_idx]
+        rows = (
+            (int(ring_start[slot]) + prev_k + torch.arange(npredicted, device=device))
+            % ring_len
+        ).long()
+        torch.testing.assert_close(
+            dt_ref[slot][:, rows],
+            dt2_proc_f32[batch_idx].T,
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"Triton appended dt mismatch at batch_idx={batch_idx} slot={slot} prev_k={prev_k}",
+        )
 
 
-def test_checkpointing_ssu_contiguous():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_contiguous(impl):
     """Smoke test for the contiguous-cache path (TP=8, bf16 state, mtp=16)."""
     _run_checkpointing_ssu_case(
+        impl,
         nheads=16,
         head_dim=64,
         d_state=128,
@@ -1955,11 +2729,9 @@ def test_checkpointing_ssu_rejects_large_T(T):
     state = torch.randn(
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        batch, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
     prev_tokens = torch.full((batch,), T // 2, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -1975,11 +2747,10 @@ def test_checkpointing_ssu_rejects_large_T(T):
     with pytest.raises(AssertionError, match="at most 16 cache tokens"):
         checkpointing_ssu(
             state,
-            old_x,
-            old_B,
-            old_dt,
-            old_cumAdt,
-            cache_buf_idx,
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
             prev_tokens,
             x=x,
             dt=dt,
@@ -1998,7 +2769,10 @@ def test_checkpointing_ssu_rejects_large_T(T):
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_philox(
+    nheads, head_dim, d_state, ngroups, paged_cache, T, two_kernel
+):
     """
     Verify that Philox stochastic rounding produces correct results.
 
@@ -2033,14 +2807,10 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
         cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
-    # Cache tensors
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    # Ring caches (random contents; positive dt keeps recomputed decays finite)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     # New token inputs
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -2062,17 +2832,19 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
         dt_softplus=True,
         state_batch_indices=state_batch_indices,
     )
+    if two_kernel:
+        # Window == T in this test; the scratch reroutes both runs to the split.
+        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, dtype, device))
 
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_nornd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_nornd,
         **common_kwargs,
@@ -2084,11 +2856,10 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rnd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rnd,
         rand_seed=rand_seed,
@@ -2153,11 +2924,9 @@ def test_philox_rounding_unbiased():
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
 
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        batch, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2183,11 +2952,10 @@ def test_philox_rounding_unbiased():
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_fp32,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_fp32,
         **common_kwargs,
@@ -2199,11 +2967,10 @@ def test_philox_rounding_unbiased():
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rnd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rnd,
         rand_seed=rand_seed,
@@ -2276,13 +3043,9 @@ def test_checkpointing_ssu_int8_philox(
     )
     state0, state0_scales = _quantize_state_int8(state0_fp32)
 
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2310,11 +3073,10 @@ def test_checkpointing_ssu_int8_philox(
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_nornd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_nornd,
         state_scale=scale_nornd,
@@ -2328,11 +3090,10 @@ def test_checkpointing_ssu_int8_philox(
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rnd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rnd,
         state_scale=scale_rnd,
@@ -2393,11 +3154,9 @@ def test_checkpointing_ssu_int8_philox_unbiased():
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
 
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        batch, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2423,11 +3182,10 @@ def test_checkpointing_ssu_int8_philox_unbiased():
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_fp32,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_fp32,
         **common_kwargs,
@@ -2439,11 +3197,10 @@ def test_checkpointing_ssu_int8_philox_unbiased():
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rounded,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rounded,
         state_scale=scales_rounded,
@@ -2507,13 +3264,9 @@ def test_checkpointing_ssu_int8_philox_npredicted1():
 
     # max_window = T = 1: cache holds at most 1 old token per slot.  prev_k=0
     # below (no replay) → must_checkpoint = (0 + 1 > 1) = False → no-write path.
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2541,11 +3294,10 @@ def test_checkpointing_ssu_int8_philox_npredicted1():
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_nornd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_nornd,
         state_scale=scale_nornd,
@@ -2559,11 +3311,10 @@ def test_checkpointing_ssu_int8_philox_npredicted1():
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rnd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rnd,
         state_scale=scale_rnd,
@@ -2648,13 +3399,9 @@ def test_checkpointing_ssu_fp8_philox(
     )
     state0, state0_scales = _quantize_state(state0_fp32, state_dtype, quant_max)
 
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2682,11 +3429,10 @@ def test_checkpointing_ssu_fp8_philox(
     out_nornd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_nornd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_nornd,
         state_scale=scale_nornd,
@@ -2700,11 +3446,10 @@ def test_checkpointing_ssu_fp8_philox(
     out_rnd = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rnd,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rnd,
         state_scale=scale_rnd,
@@ -2778,11 +3523,9 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
 
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    old_cumAdt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        batch, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -2808,11 +3551,10 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_fp32,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_fp32,
         **common_kwargs,
@@ -2824,11 +3566,10 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_ssu(
         state_rounded,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_cumAdt.clone(),
-        cache_buf_idx.clone(),
+        x_cache.clone(),
+        B_cache.clone(),
+        dt_cache.clone(),
+        ring_start.clone(),
         prev_tokens,
         out=out_rounded,
         state_scale=scales_rounded,
@@ -2884,7 +3625,7 @@ def test_checkpointing_ssu_fp8_philox_unbiased():
 # which require sm >= 100.
 _skip_pre_sm100 = pytest.mark.skipif(
     not is_cvt_rs_supported(),
-    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM110a only — "
+    reason="Philox stochastic rounding requires cvt.rs PTX (SM100a/SM103a only — "
     "not SM120a / consumer Blackwell)",
 )
 
@@ -2924,7 +3665,7 @@ def _dequantize_state(state_quant: torch.Tensor, decode_scale: torch.Tensor):
 
 def _maybe_skip_dtype(state_dtype, use_sr):
     """Skip on insufficient SM.  fp8 e4m3fn (any) needs SM 89+; fp16/fp8 SR
-    uses cvt.rs PTX which only exists on SM100a/SM110a (datacenter Blackwell);
+    uses cvt.rs PTX which only exists on SM100a/SM103a (datacenter Blackwell);
     int8/int16 (RN or SR) runs anywhere."""
     if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
         pytest.skip("fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)")
@@ -2935,7 +3676,7 @@ def _maybe_skip_dtype(state_dtype, use_sr):
     ):
         pytest.skip(
             f"{state_dtype} stochastic rounding requires cvt.rs PTX "
-            f"(SM100a/SM110a only — not SM120a / consumer Blackwell)"
+            f"(SM100a/SM103a only — not SM120a / consumer Blackwell)"
         )
 
 
@@ -2984,8 +3725,9 @@ _STATE_UPDATE_CASES = [
 @pytest.mark.parametrize(
     "state_dtype,paged_cache,T,write_checkpoint,_cfg_idx", _STATE_UPDATE_CASES
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_state_update(
-    state_dtype, paged_cache, T, write_checkpoint, _cfg_idx
+    impl, state_dtype, paged_cache, T, write_checkpoint, _cfg_idx
 ):
     nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
@@ -3089,49 +3831,24 @@ def test_checkpointing_state_update(
         disable_state_update=True,
     )
 
-    # Build cache tensors for the replay kernel.
-    # old_x: (cache, max_window, nheads, dim) bf16 — single-buffered
-    # old_B: (cache, 2, max_window, ngroups, dstate) bf16 — double-buffered
-    # old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
-    # old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
-    # cache_buf_idx: random 0s and 1s to verify indexing correctness
-    old_x = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
-    )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
-
-    # Fill each slot's active buffer (= cache_buf_idx) with step 1's data at
-    # positions [0:T).  Positions [T:max_window) stay as torch.randn garbage —
-    # they're outside the test's PNAT range, kernel doesn't read them.
-    # The OTHER (inactive) buffer has random garbage to catch indexing bugs.
+    # Build ring caches for the replay kernel (head-major, L = max_window + T).
+    # Ring rows outside the seeded window keep their random init — they're
+    # outside the test's PNAT range so the kernel must not read them, and the
+    # untouched-rows postcondition below catches any stray write.
     slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots, :T] = x1
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+    ring_len = x_cache.shape[2]
 
-    # Compute processed dt and dA_cumsum for step 1
+    # Compute processed dt for step 1 (cumAdt is recomputed from cached dt)
     dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
-    # Write to each slot's active buffer based on its cache_buf_idx
     slot_indices = (
         state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     )
     for i, slot in enumerate(slot_indices):
-        buf = cache_buf_idx[slot].item()
-        batch_idx = i  # maps slot back to the batch index
-        old_B[slot, buf, :T] = B1[batch_idx]
-        old_dt[slot, buf, :, :T] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
-        old_dA_cumsum[slot, buf, :, :T] = dA_cumsum1[
-            batch_idx
-        ].T  # (T, nheads) → (nheads, T)
+        _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x1[i], B1[i], dt1[i])
 
     # Main loop: test each k (number of old tokens replayed).  For
     # write_checkpoint=False, the kernel writes new tokens at [k:k+T) of the
@@ -3173,33 +3890,38 @@ def test_checkpointing_state_update(
         test_state = state0.clone()
         test_scales = state0_scales.clone() if is_quantized else None
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+        # The persistent-dynamic path decides write-vs-append per slot at
+        # runtime: is_w = (prev_k + T) > max_window.  prev_k = k is uniform here,
+        # so is_w is uniform.  The old forced `write_checkpoint` constexpr is
+        # moot on the dynamic path — expectations below follow is_w.
+        is_w = (k + T) > max_window
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        old_x_w = old_x.clone()
-        old_B_w = old_B.clone()
-        old_dt_w = old_dt.clone()
-        old_dA_cumsum_w = old_dA_cumsum.clone()
-        # cache_buf_idx stays at its random values — each slot reads from its own buffer
+        x_w = x_cache.clone()
+        B_w = B_cache.clone()
+        dt_w = dt_cache.clone()
 
-        checkpointing_state_update(
-            test_state,
-            old_x_w,
-            old_B_w,
-            old_dt_w,
-            old_dA_cumsum_w,
-            cache_buf_idx.clone(),
-            prev_tokens,
+        _call_replay(
+            impl,
+            state=test_state,
+            x_cache=x_w,
+            B_cache=B_w,
+            dt_cache=dt_w,
+            ring_start=ring_start,
+            prev_tokens=prev_tokens,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=test_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=T,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
             state_scales=test_scales,
-            write_checkpoint=write_checkpoint,
         )
 
         out_atol = (
@@ -3228,7 +3950,7 @@ def test_checkpointing_state_update(
         #   False → kernel skips the HBM store; state must be UNCHANGED
         #           from the input (state0; for quant, scales also unchanged).
         if is_quantized:
-            if write_checkpoint:
+            if is_w:
                 expected_fp32 = (
                     ref_input_state[slots]
                     if k == 0
@@ -3259,7 +3981,7 @@ def test_checkpointing_state_update(
                 assert torch.equal(test_state[slots], state0[slots])
                 assert torch.equal(test_scales[slots], state0_scales[slots])
         else:
-            if write_checkpoint:
+            if is_w:
                 expected_state = (
                     state0[slots]
                     if k == 0
@@ -3271,81 +3993,54 @@ def test_checkpointing_state_update(
                 test_state[slots],
                 expected_state,
                 rtol=2e-2,
-                atol=1.0 if write_checkpoint else 0.0,
-                msg=f"State mismatch at k={k} (write_checkpoint={write_checkpoint})",
+                atol=1.0 if is_w else 0.0,
+                msg=f"State mismatch at k={k} (is_w={is_w})",
             )
 
-        # --- Cache postconditions ---
+        # --- Cache postconditions (ring contract) ---
+        # Appends land at rows (start + k + i) % L on BOTH branches (the host
+        # advances ring_start on flush, not the kernel); every other ring row
+        # must be byte-identical to the pre-call cache.
         dt2_proc = F.softplus(dt2_base.float() + dt_bias_base.float()[None, None, :])
-        dA_cumsum2 = torch.cumsum(A_base.float()[None, None, :] * dt2_proc, dim=1)
-        write_offset = 0 if write_checkpoint else k
 
         for batch_idx, slot in enumerate(slot_indices):
-            active = cache_buf_idx[slot].item()
-            wb = (1 - active) if write_checkpoint else active
+            rows_new = (
+                (int(ring_start[slot]) + k + torch.arange(T, device=device)) % ring_len
+            ).long()
+            keep = torch.ones(ring_len, dtype=torch.bool, device=device)
+            keep[rows_new] = False
 
-            # --- old_x (single-buffered): write at [write_offset : +T) of slot ---
+            # --- x_cache: appended tokens bit-exact, rest untouched ---
             torch.testing.assert_close(
-                old_x_w[slot, write_offset : write_offset + T],
-                x2[batch_idx],
-                rtol=0,
-                atol=0,
-            )
-            if write_offset > 0:
-                torch.testing.assert_close(
-                    old_x_w[slot, :write_offset],
-                    old_x[slot, :write_offset],
-                    rtol=0,
-                    atol=0,
-                )
-            if write_offset + T < max_window:
-                torch.testing.assert_close(
-                    old_x_w[slot, write_offset + T :],
-                    old_x[slot, write_offset + T :],
-                    rtol=0,
-                    atol=0,
-                )
-
-            # --- old_B (double-buffered): write at write_buf, [write_offset:+T) ---
-            torch.testing.assert_close(
-                old_B_w[slot, wb, write_offset : write_offset + T],
-                B2[batch_idx],
+                x_w[slot][:, rows_new],
+                x2[batch_idx].permute(1, 0, 2),
                 rtol=0,
                 atol=0,
             )
             torch.testing.assert_close(
-                old_B_w[slot, 1 - wb],
-                old_B[slot, 1 - wb],
+                x_w[slot][:, keep], x_cache[slot][:, keep], rtol=0, atol=0
+            )
+
+            # --- B_cache ---
+            torch.testing.assert_close(
+                B_w[slot][:, rows_new],
+                B2[batch_idx].permute(1, 0, 2),
                 rtol=0,
                 atol=0,
             )
-
-            # --- old_dt (double-buffered, fp32, layout (heads, T)): ---
             torch.testing.assert_close(
-                old_dt_w[slot, wb, :, write_offset : write_offset + T],
+                B_w[slot][:, keep], B_cache[slot][:, keep], rtol=0, atol=0
+            )
+
+            # --- dt_cache: appended rows hold softplus-processed step-2 dt ---
+            torch.testing.assert_close(
+                dt_w[slot][:, rows_new],
                 dt2_proc[batch_idx].T,
                 rtol=1e-4,
                 atol=1e-4,
             )
             torch.testing.assert_close(
-                old_dt_w[slot, 1 - wb],
-                old_dt[slot, 1 - wb],
-                rtol=0,
-                atol=0,
-            )
-
-            # --- old_dA_cumsum (double-buffered, fp32, layout (heads, T)): ---
-            torch.testing.assert_close(
-                old_dA_cumsum_w[slot, wb, :, write_offset : write_offset + T],
-                dA_cumsum2[batch_idx].T,
-                rtol=1e-4,
-                atol=1e-4,
-            )
-            torch.testing.assert_close(
-                old_dA_cumsum_w[slot, 1 - wb],
-                old_dA_cumsum[slot, 1 - wb],
-                rtol=0,
-                atol=0,
+                dt_w[slot][:, keep], dt_cache[slot][:, keep], rtol=0, atol=0
             )
 
 
@@ -3372,7 +4067,8 @@ _STATE_UPDATE_PHILOX_CASES = [
 @pytest.mark.parametrize(
     "state_dtype,paged_cache,T,_cfg_idx", _STATE_UPDATE_PHILOX_CASES
 )
-def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_state_update_philox(impl, state_dtype, paged_cache, T, _cfg_idx):
     nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
     Verify that Philox stochastic rounding produces correct results across
@@ -3415,13 +4111,9 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
         )
         state0_scales = None
 
-    old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_dA_cumsum = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, T, T, dtype, device
     )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -3446,15 +4138,18 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_no_round = state0.clone()
     scales_no_round = state0_scales.clone() if is_quantized else None
     out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
-        state_no_round,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_no_round,
+        x_cache=x_cache.clone(),
+        B_cache=B_cache.clone(),
+        dt_cache=dt_cache.clone(),
+        ring_start=ring_start,
+        prev_tokens=prev_tokens,
         out=out_no_round,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         state_scales=scales_no_round,
         **common_kwargs,
     )
@@ -3463,15 +4158,18 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_rounded = state0.clone()
     scales_rounded = state0_scales.clone() if is_quantized else None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
-        state_rounded,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_rounded,
+        x_cache=x_cache.clone(),
+        B_cache=B_cache.clone(),
+        dt_cache=dt_cache.clone(),
+        ring_start=ring_start,
+        prev_tokens=prev_tokens,
         out=out_rounded,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         rand_seed=rand_seed,
         philox_rounds=10,
         state_scales=scales_rounded,
@@ -3526,7 +4224,8 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
     ids=["fp16", "int8", "int16", "fp8"],
 )
-def test_checkpointing_philox_rounding_unbiased(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_philox_rounding_unbiased(impl, state_dtype):
     """Verify Philox SR is statistically unbiased (mean residual ≈ 0).
 
     Renamed from the upstream `test_philox_rounding_unbiased` to disambiguate
@@ -3554,11 +4253,9 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
         batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
 
-    old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    old_dA_cumsum = torch.randn(batch, 2, nheads, T, device=device, dtype=torch.float32)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        batch, nheads, ngroups, head_dim, d_state, T, T, dtype, device
+    )
 
     x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
@@ -3581,15 +4278,18 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 
     state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
-        state_fp32,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_fp32,
+        x_cache=x_cache.clone(),
+        B_cache=B_cache.clone(),
+        dt_cache=dt_cache.clone(),
+        ring_start=ring_start,
+        prev_tokens=prev_tokens,
         out=out_fp32,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         **common_kwargs,
     )
 
@@ -3602,15 +4302,18 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
         state_rounded = state0_fp32.to(state_dtype)
         scales_rounded = None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
-        state_rounded,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_rounded,
+        x_cache=x_cache.clone(),
+        B_cache=B_cache.clone(),
+        dt_cache=dt_cache.clone(),
+        ring_start=ring_start,
+        prev_tokens=prev_tokens,
         out=out_rounded,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         rand_seed=rand_seed,
         philox_rounds=10,
         state_scales=scales_rounded,
@@ -3657,8 +4360,8 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 #     are not part of the contract — the non-varlen reference produces zeros
 #     from the padded zero inputs there, the varlen mode never writes them)
 #   - state[cache_slot_i]                               (after replay/checkpoint)
-#   - old_x / old_B / old_dt / old_cumAdt          (over [0:seq_len_i]
-#     of the written T-range, again ignoring the trailing padding rows)
+#   - x_cache / B_cache / dt_cache                 (over the seq_len_i
+#     appended ring rows, ignoring the trailing padding rows)
 #
 # Constraint for the comparison to be meaningful: `must_checkpoint` must agree
 # between the varlen call (uses seq_len) and the per-batch padded call (uses
@@ -3734,30 +4437,20 @@ def _setup_varlen_inputs(
         state0 = state0_fp32.to(state_dtype)
         state0_scale = None
 
-    # Cache tensors.  `npredicted` (cache T-dim) == `max_window` here for
-    # simplicity — varlen doesn't change the cache T-dim semantics.
-    old_x = torch.randn(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    # Ring caches: L = max_window + npredicted.  Random contents suffice —
+    # the builder's positive dt keeps recomputed decays bounded, and the
+    # varlen-vs-padded comparison is exact between two runs sharing the cache.
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    # old_dt / old_cumAdt need physically-realistic values for the
-    # replay paths — derive from a step-1 pass.
-    dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
-    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
-    old_dt = torch.zeros(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_cumAdt = torch.zeros(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-    for i in range(cache_size):
-        buf = cache_buf_idx[i].item()
-        old_dt[i, buf] = dt1_proc[i].T
-        old_cumAdt[i, buf] = dA_cumsum1[i].T
 
     prev_tokens = torch.tensor(prev_ks, device=device, dtype=torch.int32)
 
@@ -3791,11 +4484,10 @@ def _setup_varlen_inputs(
         dt_bias=dt_bias,
         state0=state0,
         state0_scale=state0_scale,
-        old_x=old_x,
-        old_B=old_B,
-        old_dt=old_dt,
-        old_cumAdt=old_cumAdt,
-        cache_buf_idx=cache_buf_idx,
+        x_cache=x_cache,
+        B_cache=B_cache,
+        dt_cache=dt_cache,
+        ring_start=ring_start,
         prev_tokens=prev_tokens,
         x_list=x_list,
         dt_base_list=dt_base_list,
@@ -3835,9 +4527,16 @@ def _run_varlen_and_compare(
     state_dtype,
     dtype=torch.bfloat16,
     use_z=False,
+    two_kernel=False,
 ):
     """Shared body: run the kernel in varlen mode and per-batch padded
-    non-varlen mode, then compare slices."""
+    non-varlen mode, then compare slices.
+
+    ``two_kernel=True`` routes the VARLEN call through the two-kernel split
+    (forced via the scratch's algorithm="two-kernel" — batch*nheads here is
+    far below the auto threshold); the padded reference stays monolithic.
+    This is the only coverage of the 2k main's varlen meta path (seq_len /
+    bos batched through fill_meta's ring)."""
     device = "cuda"
     s = _setup_varlen_inputs(
         seq_lens=seq_lens,
@@ -3876,18 +4575,16 @@ def _run_varlen_and_compare(
 
     state_varlen = s["state0"].clone()
     state_scale_varlen = s["state0_scale"].clone() if s["is_quantized"] else None
-    old_x_varlen = s["old_x"].clone()
-    old_B_varlen = s["old_B"].clone()
-    old_dt_varlen = s["old_dt"].clone()
-    old_cumAdt_varlen = s["old_cumAdt"].clone()
+    x_varlen = s["x_cache"].clone()
+    B_varlen = s["B_cache"].clone()
+    dt_varlen = s["dt_cache"].clone()
 
     checkpointing_ssu(
         state_varlen,
-        old_x_varlen,
-        old_B_varlen,
-        old_dt_varlen,
-        old_cumAdt_varlen,
-        s["cache_buf_idx"].clone(),
+        x_varlen,
+        B_varlen,
+        dt_varlen,
+        s["ring_start"].clone(),
         s["prev_tokens"].clone(),
         x=x_packed,
         dt=dt_packed,
@@ -3902,6 +4599,12 @@ def _run_varlen_and_compare(
         state_batch_indices=None,
         state_scale=state_scale_varlen,
         cu_seqlens=cu_seqlens,
+        max_seqlen=npredicted,
+        **(
+            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # ── 2. Per-batch padded reference (non-varlen) ──
@@ -3928,24 +4631,21 @@ def _run_varlen_and_compare(
         # Reference cache state: snapshot of pre-call cache, restricted to slot i.
         state_ref = s["state0"].clone()
         state_scale_ref = s["state0_scale"].clone() if s["is_quantized"] else None
-        # cache_buf_idx / prev_tokens: only slot i is consumed by this call.
-        cbi = s["cache_buf_idx"].clone()
+        # ring_start / prev_tokens: only slot i is consumed by this call.
         pt = s["prev_tokens"].clone()
-        old_x_ref = s["old_x"].clone()
-        old_B_ref = s["old_B"].clone()
-        old_dt_ref = s["old_dt"].clone()
-        old_cumAdt_ref = s["old_cumAdt"].clone()
+        x_ref = s["x_cache"].clone()
+        B_ref = s["B_cache"].clone()
+        dt_ref = s["dt_cache"].clone()
 
         # Run with a single-batch input pointing at slot i.
         state_batch_indices_i = torch.tensor([i], device=device, dtype=torch.int32)
 
         checkpointing_ssu(
             state_ref,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_cumAdt_ref,
-            cbi,
+            x_ref,
+            B_ref,
+            dt_ref,
+            s["ring_start"].clone(),
             pt,
             x=x_i,
             dt=dt_i,
@@ -3992,45 +4692,34 @@ def _run_varlen_and_compare(
                 msg=f"varlen vs padded state mismatch at batch={i}",
             )
 
-        # Cache writes: kernel writes T-rows starting at write_offset.  Both
-        # modes agree on write_offset because (by construction) must_checkpoint
-        # matches.  Compare the [write_offset : write_offset + sl] slice.
-        must_ckpt = prev_ks[i] + sl > max_window
-        write_offset = 0 if must_ckpt else prev_ks[i]
-        buf_read = int(s["cache_buf_idx"][i].item())
-        buf_write = 1 - buf_read if must_ckpt else buf_read
-
-        # old_x: (cache, T, nheads, dim) — single-buffered.
+        # Cache writes: both modes append at ring rows (start + pnat + j) % L.
+        # Varlen appends sl rows, the padded reference appends npredicted rows
+        # (sl real + zero padding) — compare the sl rows they share.
+        ring_len = s["x_cache"].shape[2]
+        rows = (
+            (int(s["ring_start"][i]) + prev_ks[i] + torch.arange(sl, device=device))
+            % ring_len
+        ).long()
         torch.testing.assert_close(
-            old_x_varlen[i, write_offset : write_offset + sl],
-            old_x_ref[i, write_offset : write_offset + sl],
+            x_varlen[i][:, rows],
+            x_ref[i][:, rows],
             rtol=0,
             atol=0,
-            msg=f"varlen vs padded old_x mismatch at batch={i}",
+            msg=f"varlen vs padded x_cache mismatch at batch={i}",
         )
-        # old_B: (cache, 2, T, ngroups, dstate) — double-buffered.
         torch.testing.assert_close(
-            old_B_varlen[i, buf_write, write_offset : write_offset + sl],
-            old_B_ref[i, buf_write, write_offset : write_offset + sl],
+            B_varlen[i][:, rows],
+            B_ref[i][:, rows],
             rtol=0,
             atol=0,
-            msg=f"varlen vs padded old_B mismatch at batch={i}",
+            msg=f"varlen vs padded B_cache mismatch at batch={i}",
         )
-        # old_dt: (cache, 2, nheads, T) — double-buffered.
         torch.testing.assert_close(
-            old_dt_varlen[i, buf_write, :, write_offset : write_offset + sl],
-            old_dt_ref[i, buf_write, :, write_offset : write_offset + sl],
+            dt_varlen[i][:, rows],
+            dt_ref[i][:, rows],
             rtol=0,
             atol=0,
-            msg=f"varlen vs padded old_dt mismatch at batch={i}",
-        )
-        # old_cumAdt: same shape as old_dt.
-        torch.testing.assert_close(
-            old_cumAdt_varlen[i, buf_write, :, write_offset : write_offset + sl],
-            old_cumAdt_ref[i, buf_write, :, write_offset : write_offset + sl],
-            rtol=0,
-            atol=0,
-            msg=f"varlen vs padded old_cumAdt mismatch at batch={i}",
+            msg=f"varlen vs padded dt_cache mismatch at batch={i}",
         )
 
 
@@ -4041,12 +4730,15 @@ def _run_varlen_and_compare(
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype, two_kernel):
     """Mixed seq_lens, prev_k chosen so that prev_k + NPREDICTED <= MAX_WINDOW
     for every batch (no-checkpoint regime).  Tests that the varlen masking
     of T-rows >= seq_len matches the non-varlen reference where those rows
     contain zero-padded inputs (which compute_CB_scaled / matmul should
     zero-propagate)."""
+    if two_kernel and state_dtype in (torch.int8, torch.float8_e4m3fn):
+        pytest.skip("two-kernel split takes 2/4-byte state only")
     npredicted = 4
     max_window = 16
     seq_lens = [3, 1, 4, 2, 4]  # < NPREDICTED for some batches
@@ -4057,14 +4749,18 @@ def test_checkpointing_ssu_varlen_mixed_no_checkpoint(state_dtype):
         npredicted=npredicted,
         max_window=max_window,
         state_dtype=state_dtype,
+        two_kernel=two_kernel,
     )
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype, two_kernel):
     """Mixed seq_lens, prev_k large enough that prev_k + min(seq_lens) > MAX_WINDOW
     — forces every batch (varlen and non-varlen) to checkpoint.  Exercises
     the replay + state-write path under varlen indexing."""
+    if two_kernel and state_dtype in (torch.int8, torch.float8_e4m3fn):
+        pytest.skip("two-kernel split takes 2/4-byte state only")
     npredicted = 8
     max_window = 16
     seq_lens = [3, 5, 8, 6, 7]
@@ -4076,10 +4772,12 @@ def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
         npredicted=npredicted,
         max_window=max_window,
         state_dtype=state_dtype,
+        two_kernel=two_kernel,
     )
 
 
 def _run_varlen_cuda_vs_triton(
+    impl,
     *,
     seq_lens,
     prev_ks,
@@ -4140,19 +4838,17 @@ def _run_varlen_cuda_vs_triton(
     # --- CUDA varlen ---
     state_cuda = s["state0"].clone()
     state_scale_cuda = s["state0_scale"].clone() if s["is_quantized"] else None
-    old_x_cuda = s["old_x"].clone()
-    old_B_cuda = s["old_B"].clone()
-    old_dt_cuda = s["old_dt"].clone()
-    old_cumAdt_cuda = s["old_cumAdt"].clone()
+    x_cuda = s["x_cache"].clone()
+    B_cuda = s["B_cache"].clone()
+    dt_cuda = s["dt_cache"].clone()
     out_cuda = torch.zeros_like(x_packed)
 
     checkpointing_ssu(
         state_cuda,
-        old_x_cuda,
-        old_B_cuda,
-        old_dt_cuda,
-        old_cumAdt_cuda,
-        s["cache_buf_idx"].clone(),
+        x_cuda,
+        B_cuda,
+        dt_cuda,
+        s["ring_start"].clone(),
         s["prev_tokens"].clone(),
         x=x_packed,
         dt=dt_packed,
@@ -4165,36 +4861,43 @@ def _run_varlen_cuda_vs_triton(
         dt_softplus=True,
         state_scale=state_scale_cuda,
         cu_seqlens=cu_seqlens,
+        max_seqlen=npredicted,
     )
 
     # --- Triton varlen ---
     state_tri = s["state0"].clone()
     state_scale_tri = s["state0_scale"].clone() if s["is_quantized"] else None
-    old_x_tri = s["old_x"].clone()
-    old_B_tri = s["old_B"].clone()
-    old_dt_tri = s["old_dt"].clone()
-    old_cumAdt_tri = s["old_cumAdt"].clone()
+    x_tri = s["x_cache"].clone()
+    B_tri = s["B_cache"].clone()
+    dt_tri = s["dt_cache"].clone()
     out_tri = torch.zeros_like(x_packed)
 
-    checkpointing_state_update(
-        state_tri,
-        old_x_tri,
-        old_B_tri,
-        old_dt_tri,
-        old_cumAdt_tri,
-        s["cache_buf_idx"].clone(),
-        s["prev_tokens"].clone(),
+    # Per-slot real sequence lengths for the persistent_main work-item sort
+    # (so write items are ordered by the actual per-sequence length, not
+    # NPREDICTED).  (batch,) int32 derived from the packed cu_seqlens.
+    seq_lens_t = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+
+    _call_replay(
+        impl,
+        state=state_tri,
+        x_cache=x_tri,
+        B_cache=B_tri,
+        dt_cache=dt_tri,
+        ring_start=s["ring_start"],
+        prev_tokens=s["prev_tokens"].clone(),
         x=x_packed,
         dt=dt_packed,
         A=s["A"],
         B=B_packed,
         C=C_packed,
         out=out_tri,
+        max_window=max_window,
+        batch=len(seq_lens),
+        work_seq_len=seq_lens_t,
         D=s["D"],
         dt_bias=s["dt_bias"],
         dt_softplus=True,
         state_scales=state_scale_tri,
-        write_checkpoint=write_checkpoint,
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted,
     )
@@ -4237,7 +4940,8 @@ def _run_varlen_cuda_vs_triton(
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(impl, state_dtype):
     """CUDA vs Triton (independent reference) — pure-Branch-B varlen.
 
     Constraint on test config: the Triton kernel caps prev_k <= NPREDICTED
@@ -4246,6 +4950,7 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
     is acceptable to both kernels.
     """
     _run_varlen_cuda_vs_triton(
+        impl,
         seq_lens=[3, 1, 4, 2, 4],
         prev_ks=[0, 5, 10, 12, 8],  # all prev_k + max(seq_len)=4 <= 16
         npredicted=16,
@@ -4256,9 +4961,11 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(impl, state_dtype):
     """CUDA vs Triton (independent reference) — pure-Branch-A varlen."""
     _run_varlen_cuda_vs_triton(
+        impl,
         seq_lens=[3, 5, 8, 6, 7],
         prev_ks=[14, 15, 16, 14, 15],
         npredicted=16,
@@ -4282,7 +4989,7 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(state_dtype):
 #      (same computation, same data — only the gmem layout differs).
 #
 # Tensors covered: x, dt (tie_hdim preserved), B, C, z, output, plus the
-# cache-side old_x / old_B / old_dt / old_cumAdt.  Each gets a different
+# cache-side x_cache / B_cache / dt_cache.  Each gets a different
 # padding pattern so we exercise a mix of stride changes.
 
 
@@ -4320,7 +5027,7 @@ def _pad_inner(t, pad, dim):
 def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     """Run the kernel on tensors with non-default (padded) strides and
     compare to a contiguous-clone reference.  Exercises stride plumbing
-    for x / dt / B / C / z / out / old_x / old_B / old_dt / old_cumAdt.
+    for x / dt / B / C / z / out / x_cache / B_cache / dt_cache.
     """
     device = "cuda"
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
@@ -4361,28 +5068,18 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         state0 = state0_fp32.to(state_dtype)
         state0_scale = None
 
-    # Cache tensors: realistic dt_proc / cumAdt from a step-1 pass (so
-    # replay sees consistent values).
-    dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
-    dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
-
-    old_x_contig = torch.randn(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    # Ring caches (builder dt is positive — recomputed decays stay bounded).
+    x_contig_c, B_contig_c, dt_contig_c, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B_contig = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt_contig = torch.zeros(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_ca_contig = torch.zeros(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-    for i in range(cache_size):
-        old_dt_contig[i, 0] = dt1_proc[i].T
-        old_ca_contig[i, 0] = dA_cumsum1[i].T
 
     prev_tokens = torch.tensor([2, 4, 6, 3], device=device, dtype=torch.int32)[:batch]
 
@@ -4433,18 +5130,16 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     # ── Run 1: contiguous golden ──
     state_ref = state0.clone()
     state_scale_ref = state0_scale.clone() if is_quantized else None
-    old_x_ref = old_x_contig.clone()
-    old_B_ref = old_B_contig.clone()
-    old_dt_ref = old_dt_contig.clone()
-    old_ca_ref = old_ca_contig.clone()
+    x_ref = x_contig_c.clone()
+    B_ref = B_contig_c.clone()
+    dt_ref = dt_contig_c.clone()
     out_ref = torch.zeros_like(x_contig)
     checkpointing_ssu(
         state_ref,
-        old_x_ref,
-        old_B_ref,
-        old_dt_ref,
-        old_ca_ref,
-        cache_buf_idx.clone(),
+        x_ref,
+        B_ref,
+        dt_ref,
+        ring_start.clone(),
         prev_tokens.clone(),
         x=x_contig,
         dt=dt_contig,
@@ -4471,15 +5166,11 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     # the padded stride on dims 0/1 while keeping stride(3) == 0 (tie_hdim).
     dt_base_nc = _pad_outer(dt_base_contig, pad=7)
     dt_nc = repeat(dt_base_nc, "b t h -> b t h p", p=head_dim)
-    # Cache tensors: pad an interior dim to vary the cache-side strides.
-    old_x_nc_storage = _pad_inner(old_x_contig, pad=2, dim=1)
-    old_x_nc = old_x_nc_storage  # already shaped (cache, max_window, nheads, dim)
-    old_B_nc_storage = _pad_inner(old_B_contig, pad=2, dim=2)
-    old_B_nc = old_B_nc_storage
-    old_dt_nc_storage = _pad_inner(old_dt_contig, pad=4, dim=2)
-    old_dt_nc = old_dt_nc_storage
-    old_ca_nc_storage = _pad_inner(old_ca_contig, pad=3, dim=2)
-    old_ca_nc = old_ca_nc_storage
+    # Cache tensors: pad the ring-pos axis (dim 2) so the slot/head strides
+    # differ from the natural packed layout.
+    x_cache_nc = _pad_inner(x_contig_c, pad=2, dim=2)
+    B_cache_nc = _pad_inner(B_contig_c, pad=2, dim=2)
+    dt_cache_nc = _pad_inner(dt_contig_c, pad=4, dim=2)
 
     # Sanity: assert that the padded views actually have non-default outer
     # strides — `_pad_outer` pads dim 1, which makes stride(0) > the
@@ -4492,38 +5183,29 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         f"dt_nc stride(0) didn't change: {dt_nc.stride()} == {dt_contig.stride()}"
     )
     assert dt_nc.stride(3) == 0, f"dt tie_hdim broken: stride(3)={dt_nc.stride(3)}"
-    assert old_x_nc.stride(0) != old_x_contig.stride(0), (
-        f"old_x stride(0) didn't change: {old_x_nc.stride()} == {old_x_contig.stride()}"
+    assert x_cache_nc.stride(1) != x_contig_c.stride(1), (
+        f"x_cache stride(1) didn't change: {x_cache_nc.stride()} == {x_contig_c.stride()}"
     )
-    assert old_B_nc.stride(1) != old_B_contig.stride(1), (
-        f"old_B stride(1) didn't change: {old_B_nc.stride()} == {old_B_contig.stride()}"
+    assert B_cache_nc.stride(1) != B_contig_c.stride(1), (
+        f"B_cache stride(1) didn't change: {B_cache_nc.stride()} == {B_contig_c.stride()}"
     )
-    assert old_dt_nc.stride(1) != old_dt_contig.stride(1), (
-        f"old_dt stride(1) didn't change: {old_dt_nc.stride()} == {old_dt_contig.stride()}"
+    assert dt_cache_nc.stride(1) != dt_contig_c.stride(1), (
+        f"dt_cache stride(1) didn't change: {dt_cache_nc.stride()} == {dt_contig_c.stride()}"
     )
 
     state_test = state0.clone()
     state_scale_test = state0_scale.clone() if is_quantized else None
-    # Cache writes: we need contiguous storage tensors with the same data so
-    # the kernel can write into them and we can compare back.  Use the _nc
-    # views directly — they alias the padded storage so written rows persist
-    # in the padded buffer.  Compare via .contiguous() at the end.
-    cbi_test = cache_buf_idx.clone()
+    # Cache writes: the _nc views alias the padded storage so written rows
+    # persist there.  Compare via .contiguous() at the end.  (The views
+    # already hold the contig data — _pad_inner copies it.)
     pt_test = prev_tokens.clone()
-    # Copy contig data into the nc views before the call (initial state of
-    # the cache).
-    old_x_nc.copy_(old_x_contig)
-    old_B_nc.copy_(old_B_contig)
-    old_dt_nc.copy_(old_dt_contig)
-    old_ca_nc.copy_(old_ca_contig)
 
     checkpointing_ssu(
         state_test,
-        old_x_nc,
-        old_B_nc,
-        old_dt_nc,
-        old_ca_nc,
-        cbi_test,
+        x_cache_nc,
+        B_cache_nc,
+        dt_cache_nc,
+        ring_start.clone(),
         pt_test,
         x=x_nc,
         dt=dt_nc,
@@ -4566,32 +5248,25 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         )
 
     torch.testing.assert_close(
-        old_x_nc.contiguous(),
-        old_x_ref,
+        x_cache_nc.contiguous(),
+        x_ref,
         rtol=0,
         atol=0,
-        msg=f"old_x mismatch (varlen={varlen})",
+        msg=f"x_cache mismatch (varlen={varlen})",
     )
     torch.testing.assert_close(
-        old_B_nc.contiguous(),
-        old_B_ref,
+        B_cache_nc.contiguous(),
+        B_ref,
         rtol=0,
         atol=0,
-        msg=f"old_B mismatch (varlen={varlen})",
+        msg=f"B_cache mismatch (varlen={varlen})",
     )
     torch.testing.assert_close(
-        old_dt_nc.contiguous(),
-        old_dt_ref,
+        dt_cache_nc.contiguous(),
+        dt_ref,
         rtol=0,
         atol=0,
-        msg=f"old_dt mismatch (varlen={varlen})",
-    )
-    torch.testing.assert_close(
-        old_ca_nc.contiguous(),
-        old_ca_ref,
-        rtol=0,
-        atol=0,
-        msg=f"old_cumAdt mismatch (varlen={varlen})",
+        msg=f"dt_cache mismatch (varlen={varlen})",
     )
 
 
@@ -4684,35 +5359,28 @@ def test_checkpointing_ssu_determinism_across_launches(
         state0 = state_fp32.to(state_dtype)
         state_scale0 = None
 
-    # Step-1 cache fill — `old_dt`/`old_cumAdt` must be self-consistent so the
-    # replay branch doesn't trip on physically-nonsensical values.
+    # Step-1 cache fill — cached dt must be self-consistent so the replay
+    # branch doesn't trip on physically-nonsensical values.
     x1 = torch.randn(batch, max_window, nheads, head_dim, device=device, dtype=dtype)
     dt1_base = torch.randn(batch, max_window, nheads, device=device, dtype=dtype)
     B1 = torch.randn(batch, max_window, ngroups, d_state, device=device, dtype=dtype)
     dt1_proc = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
-    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x0 = torch.zeros(
-        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    x_cache0, B_cache0, dt_cache0, ring_start0 = _make_ring_caches(
+        cache_size,
+        nheads,
+        ngroups,
+        head_dim,
+        d_state,
+        max_window,
+        npredicted,
+        dtype,
+        device,
     )
-    old_B0 = torch.randn(
-        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
-    )
-    old_dt0 = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    old_cumAdt0 = torch.randn(
-        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    cache_buf_idx0 = torch.randint(
-        0, 2, (cache_size,), device=device, dtype=torch.int32
-    )
-    old_x0[:] = x1
     for i in range(cache_size):
-        buf = cache_buf_idx0[i].item()
-        old_B0[i, buf] = B1[i]
-        old_dt0[i, buf] = dt1_proc[i].permute(1, 0)
-        old_cumAdt0[i, buf] = cumAdt1[i].permute(1, 0)
+        _seed_ring(
+            x_cache0, B_cache0, dt_cache0, ring_start0, i, x1[i], B1[i], dt1_proc[i]
+        )
 
     # New-token inputs (deterministic w.r.t. prev_k).
     torch.manual_seed(prev_k + 100)
@@ -4734,11 +5402,10 @@ def test_checkpointing_ssu_determinism_across_launches(
         )
         checkpointing_ssu(
             state_w,
-            old_x0.clone(),
-            old_B0.clone(),
-            old_dt0.clone(),
-            old_cumAdt0.clone(),
-            cache_buf_idx0.clone(),
+            x_cache0.clone(),
+            B_cache0.clone(),
+            dt_cache0.clone(),
+            ring_start0.clone(),
             prev,
             x=x2,
             dt=dt2,
@@ -4768,4 +5435,114 @@ def test_checkpointing_ssu_determinism_across_launches(
         assert len(scale_hashes) == 1, (
             f"[{tag}] state_scale non-deterministic across 5 launches "
             f"(got {len(scale_hashes)} unique hashes)"
+        )
+
+
+def test_checkpointing_ssu_continuous_dA_cumsum_multistep():
+    """5-step no-write test: verifies output correctness across consecutive no-write steps.
+
+    Uses `selective_state_update_triton` (running-state SSM) as the ground truth,
+    since `checkpointing_state_update` only supports prev_k <= T.  The CUDA
+    checkpointing kernel must produce the same output as the running SSM at each
+    step: it starts from the initial state in HBM (never updated on no-write) and
+    replays buffered tokens, recomputing the decay factors from the cached dt
+    ring rows (cumAdt = A * inclusive-scan(dt) over [start, start+prev_k)).
+
+    A recompute that mis-handled multi-step appends (e.g. scanning from the
+    wrong ring row) would produce wrong total decays from step 3 (prev_k=6)
+    onward — catastrophically wrong output (~40 error vs atol=0.5).
+    """
+    # T=3, max_window=16: 5 no-write steps with prev_k = 0, 3, 6, 9, 12.
+    # A wrong dt-ring scan would manifest at step 3 (prev_k=6), causing
+    # catastrophically wrong decay of step-1 tokens (~40 output error vs atol=0.5).
+    T = 3
+    max_window = 16
+    nheads, head_dim, d_state, ngroups = _CONFIGS[0]
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+
+    # CUDA ring caches (chained between steps: each step appends T rows and
+    # the next replays them; garbage rows beyond prev_k are never read)
+    x_cache_t, B_cache_t, dt_cache_t, ring_start_t = _make_ring_caches(
+        cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
+    )
+    test_state = state0.clone()
+
+    # Reference: selective_state_update_triton maintains running SSM state.
+    # Each step updates ref_state in place, giving the same output as the
+    # checkpointing kernel's replay.
+    ref_state = state0.clone().to(torch.float32)
+
+    num_steps = 5
+    for step in range(num_steps):
+        prev_k = step * T
+        assert prev_k + T <= max_window, "all steps must be no-write"
+
+        torch.manual_seed(step + 100)
+        x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+        dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+        B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+        prev_test = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+
+        # Ground truth: running-state SSM (selective_state_update_triton updates
+        # ref_state in place, correctly accumulating each step's contribution).
+        selective_state_update(
+            ref_state,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            out=ref_out,
+        )
+
+        # CUDA checkpointing kernel (no-write path: state HBM not updated).
+        checkpointing_ssu(
+            test_state,
+            x_cache_t,
+            B_cache_t,
+            dt_cache_t,
+            ring_start_t,
+            prev_test,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            out=test_out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+        )
+
+        torch.testing.assert_close(
+            test_out,
+            ref_out,
+            rtol=2e-2,
+            atol=5e-1,
+            msg=f"output mismatch at step {step + 1} (prev_k={prev_k})",
         )

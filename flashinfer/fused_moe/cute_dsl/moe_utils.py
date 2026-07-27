@@ -237,6 +237,7 @@ def moe_unpermute(
     num_tokens: int,
     top_k: int,
     enable_pdl: bool = False,
+    input_is_expanded: bool = False,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -258,6 +259,8 @@ def moe_unpermute(
         top_k: Number of experts per token.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
+        input_is_expanded: Whether input rows use expanded (token, top-k slot)
+            order instead of expert-permuted order.
 
     Note:
         Output is the weighted sum of expert contributions:
@@ -289,7 +292,9 @@ def moe_unpermute(
         num_tokens,
         hidden_size,
         top_k,
+        input_is_expanded,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 

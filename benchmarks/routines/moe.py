@@ -2555,14 +2555,20 @@ def testUnifiedNvfp4Moe(args):
     # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
     # for the Pack (runner re-applies unsqueeze in pack_inputs).
     x_sf = cute_dsl_data["x_sf"].squeeze(-1)
+    # The local-only proxy generates ids in [0, local_num_experts); the runners
+    # expect GLOBAL ids (the kernel maps them to the local shard via the
+    # separately passed local_expert_offset), so lift the pack ids to global.
+    # The reference oracle below keeps the LOCAL ids: it indexes the local
+    # weight slices directly.
+    local_topk_ids = cute_dsl_data["token_selected_experts"]
     act_pack = MoEActivationPack(
         hidden_states_q=cute_dsl_data["x"],
         hidden_states_scale=x_sf,
-        selected_experts=cute_dsl_data["token_selected_experts"],
-        final_scales=cute_dsl_data["token_final_scales"],
+        topk_ids=local_topk_ids + local_expert_offset,
+        topk_weights=cute_dsl_data["token_final_scales"],
     )
 
-    num_active_experts = int(act_pack.selected_experts.unique().numel())
+    num_active_experts = int(local_topk_ids.unique().numel())
 
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
@@ -2572,7 +2578,10 @@ def testUnifiedNvfp4Moe(args):
     config = MoEConfig(
         routing=RoutingConfig(
             num_experts=num_experts,
-            top_k=top_k,
+            # top_k must match the pack's column count: the tensors above were
+            # generated with routing_top_k (clamped to local_num_experts for
+            # the local-only EP proxy), not the raw CLI top_k.
+            top_k=routing_top_k,
             n_group=args.n_group,
             topk_group=args.topk_group,
             routed_scaling_factor=args.routed_scaling_factor,
@@ -2610,11 +2619,11 @@ def testUnifiedNvfp4Moe(args):
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
             gemm1_weights=w1_bf16.float().to(device),
             gemm2_weights=w2_bf16.float().to(device),
-            token_selected_experts=act_pack.selected_experts,
-            token_final_scales=act_pack.final_scales,
+            token_selected_experts=local_topk_ids,
+            token_final_scales=act_pack.topk_weights,
             num_tokens=num_tokens,
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=routing_top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=cute_dsl_data["fc2_input_scale"],

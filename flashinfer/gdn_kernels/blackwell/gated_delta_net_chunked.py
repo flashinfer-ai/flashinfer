@@ -387,6 +387,7 @@ class GatedDeltaNetChunkedKernel:
         cu_seqlens: cute.Tensor,
         s_in: Optional[cute.Tensor],
         s_out: Optional[cute.Tensor],
+        s_indices: Optional[cute.Tensor],
         s_checkpoints: Optional[cute.Tensor],
         cu_checkpoints: Optional[cute.Tensor],
         checkpoint_every_n_tokens: cutlass.Int32,
@@ -810,6 +811,7 @@ class GatedDeltaNetChunkedKernel:
             cu_seqlens,
             s_in,
             s_out,
+            s_indices,
             s_checkpoints,
             cu_checkpoints,
             checkpoint_every_n_tokens,
@@ -869,6 +871,9 @@ class GatedDeltaNetChunkedKernel:
         mS_init: Optional[cute.Tensor],
         # final state output (fp32) to GMEM; None if not stored
         mS_out: Optional[cute.Tensor],
+        # optional (num_seqs,) int32 indirection into the state pool rows; None
+        # means identity (row == batch_idx), preserving legacy behavior
+        mS_indices: Optional[cute.Tensor],
         mS_checkpoints: Optional[cute.Tensor],
         cu_checkpoints: Optional[cute.Tensor],
         checkpoint_every_n_tokens: cutlass.Int32,
@@ -1247,6 +1252,7 @@ class GatedDeltaNetChunkedKernel:
                         kv_acc_producer = self._load_initial_state(
                             tidx,
                             mS_init,
+                            mS_indices,
                             head_idx,
                             batch_idx,
                             tmem_ptr,
@@ -1340,6 +1346,7 @@ class GatedDeltaNetChunkedKernel:
                         kv_acc_consumer = self._store_final_state(
                             tidx,
                             mS_out,
+                            mS_indices,
                             head_idx,
                             batch_idx,
                             tmem_ptr,
@@ -2938,6 +2945,7 @@ class GatedDeltaNetChunkedKernel:
         self,
         tidx,
         mS_init,
+        mS_indices,
         head_idx,
         batch_idx,
         tmem_ptr,
@@ -2976,8 +2984,15 @@ class GatedDeltaNetChunkedKernel:
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.state_dtype)
 
+        # Optional indexed (pool) access: read the recurrent-state row by an
+        # indirection index instead of the sequence-order batch_idx. Loaded
+        # once per work tile (per (batch_idx, head_idx)) as an Int32 scalar.
+        if cutlass.const_expr(mS_indices is not None):
+            state_row = mS_indices[batch_idx]
+        else:
+            state_row = batch_idx
         gS_init = cute.flat_divide(
-            mS_init[None, None, head_idx, batch_idx],
+            mS_init[None, None, head_idx, state_row],
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
         )[None, None, 0, 0]
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
@@ -3017,6 +3032,7 @@ class GatedDeltaNetChunkedKernel:
         tidx,
         # full output-state GMEM tensor (DK, DV, (h_r, h_qv), B) fp32
         mS_out,
+        mS_indices,
         head_idx,
         batch_idx,
         tmem_ptr,
@@ -3066,6 +3082,15 @@ class GatedDeltaNetChunkedKernel:
         # Wait for last GEMM-7 to finish
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
 
+        # Optional indexed (pool) access: write the recurrent-state row by an
+        # indirection index instead of the sequence-order batch_idx. Loaded
+        # once per work tile (per (batch_idx, head_idx)) as an Int32 scalar and
+        # reused across the sub loop below.
+        if cutlass.const_expr(mS_indices is not None):
+            state_row = mS_indices[batch_idx]
+        else:
+            state_row = batch_idx
+
         for sub in cutlass.range(tTR_rState.shape[2]):
             # Read state TMEM -> fp32 registers
             cute.copy(
@@ -3097,7 +3122,7 @@ class GatedDeltaNetChunkedKernel:
                     )
             if cutlass.const_expr(self.store_final_state):
                 gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, batch_idx],
+                    mS_out[None, None, head_idx, state_row],
                     (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
                 )[None, None, 0, 0]
                 tRG_tCgState = thr_state_t2r.partition_D(gS_out)

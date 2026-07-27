@@ -2390,6 +2390,76 @@ def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
 
 
 # ==============================================================================
+# BF16 state MTP: bank-conflict-eliminated no-prepack OUTPUT-ONLY variant (v18)
+# ==============================================================================
+# Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
+# `gdn_decode_bf16_state_mtp` symbol to the v18 output-only kernel
+# (gdn_decode_bf16_wy_output_only.gated_delta_rule_mtp), which consumes H0 in its
+# natural (pool, HV, V, K) bf16 layout with no prepack. This is the OUTPUT-ONLY
+# path: state is frozen (disable_state_update=True) and intermediate caching is
+# unsupported, so only cache_intermediate_states=False is exercised. The kernel
+# requires SM90+ (TMA + mbarrier; validated on H200 and B200). Grid mirrors
+# the PR's output-only test.
+
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_wy_output_only import (
+        gated_delta_rule_mtp as gdn_decode_bf16_wy_output_only_mtp,
+    )
+
+    GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = True
+except (ImportError, RuntimeError):
+    GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = False
+
+
+@pytest.mark.parametrize("cache_intermediate_states", [False])
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 32)],
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
+    monkeypatch,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    seq_len: int,
+    cache_intermediate_states: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    if not GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE:
+        pytest.skip("gdn_decode_bf16_wy_output_only kernel not available")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("gdn_decode_bf16_wy_output_only requires SM90 (Hopper) or later")
+    # Swap the module-level kernel symbol that _test_gdn_decode_bf16_state_mtp_kernel
+    # looks up at call time. monkeypatch auto-restores after the test. The v18
+    # signature is call-compatible (output-only subset), so no partial is needed.
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "gdn_decode_bf16_state_mtp",
+        gdn_decode_bf16_wy_output_only_mtp,
+    )
+    scale_val = 1.0 / math.sqrt(head_size)
+    _test_gdn_decode_bf16_state_mtp_kernel(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        seq_len,
+        scale_val,
+        cache_intermediate_states,
+        seed,
+    )
+
+
+# ==============================================================================
 # BF16 state recovery: per-request variable K (accepted_steps)
 # ==============================================================================
 # State-recovery mode (disable_output=True, disable_state_update=False) with

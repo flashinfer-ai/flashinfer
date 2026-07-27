@@ -117,6 +117,7 @@ def chunk_gated_delta_rule(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -146,11 +147,15 @@ def chunk_gated_delta_rule(
         Scale factor for the attention scores.  Defaults to
         ``1 / sqrt(head_size)`` when ``None``.
     initial_state : torch.Tensor, optional
-        Initial KV state of shape
+        Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32 on SM90/SM120.  The SM100 path also accepts bfloat16,
         float16, float8_e4m3fn, and float8_e5m2.  Starts from zero state
-        when ``None``.
+        when ``None``.  When ``state_indices`` is given (SM100/SM103 only),
+        this is instead the state **pool** ``[N_pool, num_sab_heads,
+        head_size, head_size]`` and sequence ``i`` reads its initial state
+        from row ``state_indices[i]``; the pool may be non-compact (padded
+        first-dimension stride, inner ``[H, V, K]`` block contiguous).
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -169,11 +174,16 @@ def chunk_gated_delta_rule(
         max(num_q_heads, num_v_heads)``.  Allocated automatically when
         ``None``.
     output_state : torch.Tensor, optional
-        Pre-allocated output state tensor of shape ``[num_seqs,
-        num_sab_heads, head_size, head_size]``.  Must be float32 on
-        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
+        Pre-allocated output state tensor. Packed, sequence-ordered shape
+        ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be float32
+        on SM90/SM120.  The SM100 path also accepts bfloat16, float16,
         float8_e4m3fn, and float8_e5m2.  Required when
-        ``output_final_state=True``.
+        ``output_final_state=True``.  When ``state_indices`` is given it is
+        instead the output state **pool** ``[N_pool, ...]`` and sequence
+        ``i``'s final state is written to row ``state_indices[i]`` (in place
+        when ``output_state is initial_state``); it must be provided by the
+        caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
+        buffer would be indexed out of bounds by the pool slot ids).
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
         num_sab_heads, head_size, head_size]``.  Must be float32 on
@@ -194,6 +204,23 @@ def chunk_gated_delta_rule(
         low-parallelism heuristics match. ``"auto"`` enables conservative
         routing, ``True`` requires CP support, and ``False`` disables CP.
         Default: ``"auto"``.
+    state_indices : torch.Tensor, optional
+        Int32 tensor of shape ``[num_seqs]`` (SM100/SM103 only). When provided,
+        ``initial_state`` and ``output_state`` are treated as a state pool whose
+        first dimension is indexed by these slot ids rather than laid out in
+        sequence order: sequence ``i`` reads its initial state from row
+        ``state_indices[i]`` and writes its final state back to the same row
+        (in place when ``output_state is initial_state``). This lets callers
+        that keep a paged/indexed state pool avoid gathering the active rows
+        into a packed buffer and scattering the result back. The pool may be
+        non-compact (padded first-dimension stride). ``None`` (default) keeps
+        the packed, sequence-ordered layout.
+
+        The ids **must be unique**: as with any indexed scatter, two sequences
+        sharing a slot id would concurrently write the same pool row across
+        work tiles, leaving that row's final state nondeterministic. Uniqueness
+        is a caller precondition (not checked at launch, to avoid a per-call
+        host sync); the caller's slot allocator is expected to guarantee it.
 
 
     Returns
@@ -202,7 +229,10 @@ def chunk_gated_delta_rule(
         When ``output_final_state=False``, the output tensor of shape
         ``[total_seq_len, num_o_heads, head_size]``.  Otherwise a tuple
         ``(output, final_state)`` where ``final_state`` has shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]``.
+        ``[num_seqs, num_sab_heads, head_size, head_size]`` — or, when
+        ``state_indices`` is given, the state pool ``[N_pool, ...]`` itself
+        (i.e. ``output_state``), whose rows named by ``state_indices`` now
+        hold the updated final states.
 
     Notes
     -----
@@ -312,7 +342,28 @@ def chunk_gated_delta_rule(
     cp_heuristic_matches = _arch_major in (9, 12) and should_use_cp_host(
         num_seqs * num_sab_heads, _sm_count, _device_name
     )
-    if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
+    will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
+    if state_indices is not None:
+        # Indexed state-pool I/O is only implemented in the SM100/SM103 non-CP
+        # CuTe-DSL kernel. Reject it on every other dispatch path (SM90, SM120,
+        # or CP) rather than silently ignoring it and reading/writing the state
+        # in packed, sequence-ordered layout.
+        if _arch_major != 10 or will_use_cp:
+            raise NotImplementedError(
+                "state_indices is only supported on the SM100/SM103 GDN prefill "
+                f"kernel (non-CP); got compute-capability major {_arch_major}, "
+                f"use_cp={use_cp!r}."
+            )
+        # The kernel writes each final state to output_state[state_indices[i]],
+        # so a compact [num_seqs, ...] auto-allocation would be indexed out of
+        # bounds by arbitrary pool slot ids. Require the caller to pass the pool.
+        if output_final_state and output_state is None:
+            raise ValueError(
+                "state_indices requires an explicit output_state pool sized like "
+                "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
+                "compact [num_seqs, ...] tensor that would be indexed out of bounds."
+            )
+    if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
             q=q,
@@ -433,6 +484,7 @@ def chunk_gated_delta_rule(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             cu_checkpoints=_cu_checkpoints,
             output_checkpoints=state_checkpoints,
+            state_indices=state_indices,
         )
     elif _arch_major == 12:
         # SM120 Blackwell path (CuTe DSL kernel)

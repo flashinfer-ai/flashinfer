@@ -37,6 +37,7 @@ from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
+    bgmv_moe_gemm1_lora_delta,
     convert_to_block_layout,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
@@ -489,8 +490,22 @@ class FP4Moe(Moe):
         gemm1_scales_fp4_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
-        gemm1_bias_shuffled = [] if args.gemm1_bias is not None else None
-        gemm2_bias_shuffled = [] if args.gemm2_bias is not None else None
+        gemm1_bias_for_kernel = args.gemm1_bias
+        gemm2_bias_for_kernel = args.gemm2_bias
+        if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
+            # TRTLLM-gen adds FP4 bias before applying dequantization scales.
+            if gemm1_bias_for_kernel is not None:
+                gemm1_scale_ab = (1.0 / args.gemm1_scales_global) * (
+                    1.0 / args.hidden_states_scale_global
+                )
+                gemm1_bias_for_kernel = gemm1_bias_for_kernel / gemm1_scale_ab[:, None]
+            if gemm2_bias_for_kernel is not None:
+                gemm2_scale_ab = (1.0 / args_dequant.c_global_sf) * (
+                    1.0 / args.gemm2_scales_global
+                )
+                gemm2_bias_for_kernel = gemm2_bias_for_kernel / gemm2_scale_ab[:, None]
+        gemm1_bias_shuffled = [] if gemm1_bias_for_kernel is not None else None
+        gemm2_bias_shuffled = [] if gemm2_bias_for_kernel is not None else None
         for i in range(num_experts):
             # Calculate the permute indices for the following:
             # 1. Reorder rows of W1 and scales for fused gated activation
@@ -528,12 +543,12 @@ class FP4Moe(Moe):
             if gemm1_bias_shuffled is not None:
                 permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
                     self._cache_permute_indices,
-                    args.gemm1_bias[i].reshape(-1, 1),
+                    gemm1_bias_for_kernel[i].reshape(-1, 1),
                     epilogue_tile_m,
                     is_gated_act_gemm=is_gated_activation(args.activation_type),
                 )
                 gemm1_bias_shuffled.append(
-                    args.gemm1_bias[i]
+                    gemm1_bias_for_kernel[i]
                     .reshape(-1, 1)[permute_bias_indices.to(args.gemm1_bias.device)]
                     .contiguous()
                 )
@@ -568,11 +583,11 @@ class FP4Moe(Moe):
             if gemm2_bias_shuffled is not None:
                 permute_bias_indices = get_w2_permute_indices_with_cache(
                     self._cache_permute_indices,
-                    args.gemm2_bias[i].reshape(-1, 1),
+                    gemm2_bias_for_kernel[i].reshape(-1, 1),
                     epilogue_tile_m,
                 )
                 gemm2_bias_shuffled.append(
-                    args.gemm2_bias[i]
+                    gemm2_bias_for_kernel[i]
                     .reshape(-1, 1)[permute_bias_indices.to(args.gemm2_bias.device)]
                     .contiguous()
                 )
@@ -3292,10 +3307,16 @@ def run_moe_test(
     norm_topk_prob=True,
     check_reference=True,
     check_intermediate_output=False,
+    gemm1_lora_args=None,
     verify_unfinalized_weight_dtype=False,
 ):
-    """Common test logic for all routing methods."""
-    if gemm1_lora_delta is not None:
+    """Common test logic for all routing methods.
+
+    ``gemm1_lora_args``: optional dict of LoRA inputs (``w_ptr_a``, ``lora_stride_a``,
+    ``w_ptr_b``, ``lora_stride_b``, ``lora_ids``, ``rank``, optional ``scale``) used to
+    build the real FC1 delta internally against the generated hidden states/routing.
+    """
+    if gemm1_lora_delta is not None or gemm1_lora_args is not None:
         check_intermediate_output = True
 
     skip_checks(
@@ -3428,6 +3449,22 @@ def run_moe_test(
     else:
         raise NotImplementedError(
             f"Routing method {routing_method_type} not implemented"
+        )
+
+    # Build the real FC1 LoRA delta from the generated hidden states + routing.
+    if gemm1_lora_delta is None and gemm1_lora_args is not None:
+        gemm1_lora_delta = bgmv_moe_gemm1_lora_delta(
+            hidden_states,
+            gemm1_lora_args["w_ptr_a"],
+            gemm1_lora_args["lora_stride_a"],
+            gemm1_lora_args["w_ptr_b"],
+            gemm1_lora_args["lora_stride_b"],
+            permute_info["topKIndices"].to(torch.int64),
+            gemm1_lora_args["lora_ids"],
+            gemm1_lora_args["rank"],
+            intermediate_size,
+            scale=gemm1_lora_args.get("scale", 1.0),
+            out_dtype=torch.bfloat16,
         )
 
     # 1. Quantize weights offline
