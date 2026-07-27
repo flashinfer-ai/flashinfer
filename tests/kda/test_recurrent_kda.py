@@ -312,6 +312,9 @@ def test_recurrent_kda_vs_fla(
             (7, 32, 128, 0.5, 0.5, True, True, False, torch.bfloat16),
             (7, 32, 128, 0.5, 0.5, True, True, True, torch.bfloat16),
             (4, 32, 128, 0.5, 0.5, False, True, True, torch.bfloat16),
+            (1, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
+            (4, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
+            (32, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
         ]
     ],
 )
