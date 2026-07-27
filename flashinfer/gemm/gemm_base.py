@@ -75,7 +75,6 @@ from ..utils import (
     backend_requirement,
     supported_compute_capability,
 )
-from ..jit.core import logger as jit_logger
 from ..jit.gemm import gen_gemm_sm90_module
 from ..jit.gemm import gen_gemm_module
 from ..jit.gemm import gen_gemm_sm100_module
@@ -2936,24 +2935,22 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         )
 
 
-def _warn_mxfp8_gemm_strides(a: torch.Tensor, b: torch.Tensor, backend: str) -> None:
+def _check_mxfp8_gemm_strides(a: torch.Tensor, b: torch.Tensor, backend: str) -> None:
     if a.stride(-1) != 1:
-        jit_logger.warning_once(
+        raise ValueError(
             f"{backend} mxfp8 GEMM expects A to be row-major [batch, m, k] "
-            f"(K contiguous); got a.stride()={tuple(a.stride())}. The result "
-            "is most likely wrong, please check accuracy."
+            f"(K contiguous); got a.stride()={tuple(a.stride())}."
         )
     if b.stride(-2) != 1:
-        jit_logger.warning_once(
+        raise ValueError(
             f"{backend} mxfp8 GEMM expects B to be column-major [batch, k, n] "
             f"(K contiguous); got b.stride()={tuple(b.stride())}. Quantize the "
             "contiguous [b, n, k] weight and pass the transpose of the "
-            "quantized tensor, e.g. B = mxfp8_quantize(weight)[0].transpose(-2, -1). "
-            "The result is most likely wrong, please check accuracy."
+            "quantized tensor, e.g. B = mxfp8_quantize(weight)[0].transpose(-2, -1)."
         )
 
 
-def _warn_cudnn_bmm_mxfp8_scale_len(
+def _check_cudnn_bmm_mxfp8_scale_len(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -2966,11 +2963,10 @@ def _warn_cudnn_bmm_mxfp8_scale_len(
     for name, scale, rows, k in scale_specs:
         expected_len = _mxfp8_swizzled_scale_len(rows, k, SfLayout.layout_128x4)
         if scale.numel() != expected_len:
-            jit_logger.warning_once(
+            raise ValueError(
                 f"cuDNN bmm_mxfp8 expects {name} to contain {expected_len} "
                 "elements in the F8_128x4 swizzled layout for the operand "
-                f"shape, but got {scale.numel()}. This can cause out-of-bounds "
-                "scale reads and NaN results. Quantize with "
+                f"shape, but got {scale.numel()}. Quantize with "
                 "mxfp8_quantize(..., is_sf_swizzled_layout=True)."
             )
 
@@ -2985,7 +2981,7 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_buffer,
     tactic=-1,
 ):
-    _warn_mxfp8_gemm_strides(a, b, "cuDNN")
+    _check_mxfp8_gemm_strides(a, b, "cuDNN")
 
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -4564,8 +4560,7 @@ def _cutlass_gemm_mxfp8_requirement(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
-    # CUTLASS reads scales as 1D 128x4-swizzled atoms only.
-    # SM12x rejects other layouts (pre-existing); elsewhere warn but keep old callers running.
+    # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
         # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
         if use_8x4_sf_layout:
@@ -4576,10 +4571,10 @@ def _cutlass_gemm_mxfp8_requirement(
         if a.shape[1] % 32 != 0 or b.shape[1] % 32 != 0:
             return False
     elif use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
-        jit_logger.warning_once(
-            "cutlass mm_mxfp8 reads block scales as 1D 128x4-swizzled; the "
-            "provided scale layout (8x4 or 2D linear) is misinterpreted by the "
-            "kernel. The result is most likely wrong, please check accuracy."
+        raise ValueError(
+            "cutlass mm_mxfp8 requires 1D 128x4-swizzled block scales; the "
+            "provided scale layout (8x4 or 2D linear) is not supported. "
+            "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
         )
     return True
 
@@ -4601,10 +4596,10 @@ def _trtllm_gemm_mxfp8_requirement(
         return False
     # trtllm-gen cubins read both scales as swizzled 1D, never linear.
     if a_descale.ndim != 1 or b_descale.ndim != 1:
-        jit_logger.warning_once(
-            "trtllm mm_mxfp8 reads a_descale and b_descale as swizzled 1D "
-            "buffers; a 2D linear scale is misinterpreted. The result is most "
-            "likely wrong, please check accuracy."
+        raise ValueError(
+            "trtllm mm_mxfp8 requires a_descale and b_descale to be 1D swizzled "
+            "buffers; 2D linear scales are not supported. "
+            "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
         )
     k, n = b.shape
     if k % 256 != 0:
@@ -5187,9 +5182,7 @@ def mm_mxfp8(
         layout else 128) and K_padded = round_up(k // 32, 4). Produced by
         ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``. The 8x4 layout
         (``use_8x4_sf_layout=True``) is only consumed by the trtllm backend.
-        2D linear scales are misinterpreted by every backend: SM12x CUTLASS
-        rejects them; the other backends emit a warning and produce results
-        that are most likely wrong.
+        2D linear scales are not supported by any backend and raise ValueError.
 
     b_descale: torch.Tensor
         Block scale tensor for B, uint8 (fp8 e8m0), 1D swizzled 128x4 layout:
@@ -5219,8 +5212,7 @@ def mm_mxfp8(
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
         - The ``"cutlass"`` backend only supports 1D swizzled scales
           (``SfLayout.layout_128x4``); the kernel has no linear-scale path.
-          Passing 2D linear scales raises an error on SM12x and emits a
-          warning (with most likely wrong results) elsewhere. Use
+          Passing 2D linear scales raises ValueError. Use
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
@@ -9065,6 +9057,12 @@ def _check_bmm_mxfp8_problem_size(
             f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        raise ValueError(
+            "bmm_mxfp8 requires 1D swizzled scale tensors "
+            "(produced by mxfp8_quantize(..., is_sf_swizzled_layout=True)); "
+            f"got A_scale.ndim={A_scale.ndim}, B_scale.ndim={B_scale.ndim}."
+        )
     _validate_mxfp8_output_dtype(dtype)
     return True
 
@@ -9186,7 +9184,7 @@ def bmm_mxfp8(
         resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
 
     if resolved_backend == "cutlass":
-        _warn_mxfp8_gemm_strides(A, B, "CUTLASS")
+        _check_mxfp8_gemm_strides(A, B, "CUTLASS")
         # SM120/121 CUTLASS path.
         # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
         # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
@@ -9201,7 +9199,7 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
-        _warn_cudnn_bmm_mxfp8_scale_len(A, B, A_scale, B_scale)
+        _check_cudnn_bmm_mxfp8_scale_len(A, B, A_scale, B_scale)
         mxfp8_gemm_sm100(
             A,
             B,

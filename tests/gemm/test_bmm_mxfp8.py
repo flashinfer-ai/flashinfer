@@ -27,12 +27,6 @@ def test_bmm_mxfp8(
         pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
     if backend == "cutlass" and compute_capability[0] != 12:
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
-    if not is_sf_swizzled_layout:
-        pytest.skip(
-            "bmm_mxfp8 backends read scale factors in the F8_128x4 swizzled "
-            "layout; linear-layout scales would be misinterpreted."
-        )
-
     torch.manual_seed(42)
 
     # Create inputs and quantize them to MXFP8 format
@@ -54,11 +48,22 @@ def test_bmm_mxfp8(
 
     assert weight_mxfp8.numel() == (weight_scale.numel() * 32)
 
-    # Compute reference result
-    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
-
     # Create output tensor
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
+
+    if not is_sf_swizzled_layout:
+        # mxfp8_quantize always returns 1D scales for 3D inputs regardless of
+        # is_sf_swizzled_layout, so the API cannot distinguish swizzled from
+        # non-swizzled layouts by shape alone. Passing the wrong layout produces
+        # silently incorrect results; there is no way to enforce this at the API
+        # level without out-of-band metadata.
+        pytest.skip(
+            "bmm_mxfp8 cannot detect non-swizzled 1D scales from shape alone; "
+            "layout validation is not possible for 3D inputs."
+        )
+
+    # Compute reference result
+    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -94,67 +99,45 @@ def test_bmm_mxfp8(
     )
 
 
-def test_bmm_mxfp8_warns_for_row_major_weight(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    messages: list[str] = []
-    monkeypatch.setattr(gemm_base.jit_logger, "warning_once", messages.append)
-
+def test_bmm_mxfp8_raises_for_row_major_weight():
     a = torch.empty((1, 2, 32), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 32, 2), dtype=torch.float8_e4m3fn)
-    gemm_base._warn_mxfp8_gemm_strides(  # pyright: ignore[reportPrivateUsage]
-        a,
-        b,
-        "CUTLASS",
-    )
-
-    assert len(messages) == 1
-    assert "CUTLASS" in messages[0]
-    assert "B to be column-major" in messages[0]
+    with pytest.raises(ValueError, match="CUTLASS.*B to be column-major"):
+        gemm_base._check_mxfp8_gemm_strides(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            "CUTLASS",
+        )
 
 
-def test_bmm_mxfp8_cudnn_warns_for_scale_length_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    messages: list[str] = []
-    monkeypatch.setattr(gemm_base.jit_logger, "warning_once", messages.append)
-
+def test_bmm_mxfp8_cudnn_raises_for_scale_length_mismatch():
     a = torch.empty((1, 200, 256), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 256, 200), dtype=torch.float8_e4m3fn)
     linear_a_scale = torch.empty((1600,), dtype=torch.uint8)
     linear_b_scale = torch.empty((1600,), dtype=torch.uint8)
 
-    gemm_base._warn_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
-        a,
-        b,
-        linear_a_scale,
-        linear_b_scale,
-    )
-
-    assert len(messages) == 2
-    assert "A_scale to contain 2048 elements" in messages[0]
-    assert "B_scale to contain 2048 elements" in messages[1]
-    assert all("out-of-bounds scale reads and NaN results" in msg for msg in messages)
+    with pytest.raises(ValueError, match="A_scale to contain 2048 elements"):
+        gemm_base._check_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            linear_a_scale,
+            linear_b_scale,
+        )
 
 
-def test_bmm_mxfp8_cudnn_scale_length_check_has_aligned_size_blind_spot(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    messages: list[str] = []
-    monkeypatch.setattr(gemm_base.jit_logger, "warning_once", messages.append)
-
+def test_bmm_mxfp8_cudnn_scale_length_check_has_aligned_size_blind_spot():
     a = torch.empty((1, 128, 256), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 256, 128), dtype=torch.float8_e4m3fn)
     indistinguishable_scale = torch.empty((1024,), dtype=torch.uint8)
 
-    gemm_base._warn_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
+    # Scale has the right element count for the expected swizzled layout,
+    # so the check passes even if the data is not actually swizzled.
+    gemm_base._check_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
         a,
         b,
         indistinguishable_scale,
         indistinguishable_scale,
     )
-
-    assert not messages
 
 
 @pytest.mark.parametrize("m", [130, 200, 257, 384, 1000])
