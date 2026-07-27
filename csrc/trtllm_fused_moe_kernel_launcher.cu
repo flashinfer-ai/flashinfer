@@ -1871,10 +1871,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
       // Keep tactic enumeration aligned with the public BMM artifact.
-      bool const supports_tile_n_192 =
-          (dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
-          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3);
-      if (supports_tile_n_192) {
+      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
       tiles.push_back(256);
