@@ -178,14 +178,18 @@ from .fmha_resources import (
 )
 from .fmha_tasks import (
     PackedContextWorkQueue,
+    create_correction_epilogue_task_staged_head_dim,
     create_correction_task,
     create_epilogue_task,
     create_load_task,
+    create_load_task_staged_head_dim,
     create_mma_task,
+    create_mma_task_staged_head_dim,
     create_padding_task,
     create_page_offsets_task,
     create_scheduler_task,
     create_softmax_task,
+    create_softmax_task_staged_head_dim,
 )
 
 
@@ -835,7 +839,7 @@ def build_context_task_manager(
     smem_o_1_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
         num_stages=1,
         producer_group=correction_group,
-        consumer_group=epilogue_group,
+        consumer_group=(correction_group if cfg.staged_head_dim else epilogue_group),
         cta_layout_vmnk=cluster_shape_vmnk,
     )
     # S0-S1 sequence barrier: PipelineAsync, 1 stage.
@@ -1042,6 +1046,7 @@ def build_context_task_manager(
     )
 
     single_qkv_instance = cfg.single_qkv_instance
+    staged_o_fast_path = single_qkv_instance and cfg.staged_head_dim
     tmem_sp1: TmemSPResource | None = None
     tmem_vec1: TmemStatsResource | None = None
     smem_o_1: SmemOResource | None = None
@@ -1094,6 +1099,21 @@ def build_context_task_manager(
             pipeline_config=tmem_stats_done_1_pipeline_cfg,
             name="tmem_stats_done_1",
         )
+    elif staged_o_fast_path:
+        smem_o_1 = SmemOResource(
+            pipeline_config=smem_o_1_pipeline_cfg,
+            cfg=cfg,
+            stage_idx=1,
+            tmem_vec_resource=tmem_vec0,
+            name="smem_o_1",
+        )
+        gmem_o_1 = GmemOResource(
+            tma_o_desc=tma_o_desc,
+            cum_seqlen_q=cum_seqlen_q,
+            cfg=cfg,
+            stage_idx=1,
+            name="gmem_o_1",
+        )
 
     tmem_o_kwargs = tmem_o_extra_kwargs or {}
     tmem_o = TmemOResource(
@@ -1102,7 +1122,7 @@ def build_context_task_manager(
         tmem_o0_offset=cfg.tmem_o0_offset,
         tmem_o1_offset=cfg.tmem_o1_offset,
         tmem_vec0_resource=tmem_vec0,
-        tmem_vec1_resource=tmem_vec1,
+        tmem_vec1_resource=tmem_vec0 if staged_o_fast_path else tmem_vec1,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -1132,42 +1152,77 @@ def build_context_task_manager(
         # The non-split single-instance schedule performs every QK/PV pair
         # inside its loop; it has no separate HEAD QK or TAIL PV iteration.
         mma_domain_kwargs = domain_n_kwargs
-    load_task = create_load_task(
-        gmem_qkv,
-        smem_q,
-        smem_kv,
-        work_queue,
-        smem_page_offsets_kv=smem_page_offsets_kv,
-        smem_page_offsets_v=smem_page_offsets_v,
-        debug_print=debug_print,
-        **domain_n_kwargs,
-    )
-    mma_task = create_mma_task(
-        smem_q,
-        smem_kv,
-        tmem_sp0,
-        tmem_sp1,
-        tmem_p0,
-        tmem_o,
-        tmem_stats_done_0,
-        tmem_stats_done_1,
-        work_queue,
-        debug_print=debug_print,
-        **mma_domain_kwargs,
-    )
+    if cfg.staged_head_dim:
+        if tmem_p0 is None:
+            raise ValueError("staged-head-dim scheduling requires a P handoff")
+        load_task = create_load_task_staged_head_dim(
+            gmem_qkv,
+            smem_q,
+            smem_kv,
+            work_queue,
+            debug_print=debug_print,
+            **domain_n_minus_1_kwargs,
+        )
+        mma_task = create_mma_task_staged_head_dim(
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_o,
+            tmem_stats_done_0,
+            tmem_p0,
+            work_queue,
+            debug_print=debug_print,
+            **domain_n_minus_1_kwargs,
+        )
+    else:
+        load_task = create_load_task(
+            gmem_qkv,
+            smem_q,
+            smem_kv,
+            work_queue,
+            smem_page_offsets_kv=smem_page_offsets_kv,
+            smem_page_offsets_v=smem_page_offsets_v,
+            debug_print=debug_print,
+            **domain_n_kwargs,
+        )
+        mma_task = create_mma_task(
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_sp1,
+            tmem_p0,
+            tmem_o,
+            tmem_stats_done_0,
+            tmem_stats_done_1,
+            work_queue,
+            debug_print=debug_print,
+            **mma_domain_kwargs,
+        )
 
     # Causal query-paired moves masked/invalid K iterations from LOOP to TAIL
     # with no runtime branch. SP resources derive mask selection from cfg.
-    softmax0_task = create_softmax_task(
-        0,
-        tmem_sp0,
-        tmem_vec0,
-        tmem_p0,
-        s0s1_seq,
-        work_queue,
-        debug_print=debug_print,
-        **softmax0_domain_kwargs,
-    )
+    if cfg.staged_head_dim:
+        if tmem_p0 is None:
+            raise ValueError("staged-head-dim softmax requires a P handoff")
+        softmax0_task = create_softmax_task_staged_head_dim(
+            tmem_sp0,
+            tmem_vec0,
+            tmem_p0,
+            work_queue,
+            debug_print=debug_print,
+            **softmax0_domain_kwargs,
+        )
+    else:
+        softmax0_task = create_softmax_task(
+            0,
+            tmem_sp0,
+            tmem_vec0,
+            tmem_p0,
+            s0s1_seq,
+            work_queue,
+            debug_print=debug_print,
+            **softmax0_domain_kwargs,
+        )
     softmax1_task: Task | None = None
     if not single_qkv_instance:
         if tmem_sp1 is None or tmem_vec1 is None:
@@ -1182,20 +1237,36 @@ def build_context_task_manager(
             debug_print=debug_print,
             **softmax1_domain_kwargs,
         )
-    correction_task = create_correction_task(
-        tmem_vec0,
-        tmem_vec1,
-        tmem_o,
-        smem_o_0,
-        smem_o_1,
-        gmem_o_0,
-        gmem_o_1,
-        tmem_stats_done_0,
-        tmem_stats_done_1,
-        work_queue,
-        debug_print=debug_print,
-        **domain_n_minus_1_kwargs,
-    )
+    if cfg.staged_head_dim:
+        if smem_o_1 is None or gmem_o_1 is None:
+            raise ValueError("staged-head-dim output requires two O resources")
+        correction_task = create_correction_epilogue_task_staged_head_dim(
+            tmem_vec0,
+            tmem_o,
+            smem_o_0,
+            smem_o_1,
+            gmem_o_0,
+            gmem_o_1,
+            tmem_stats_done_0,
+            work_queue,
+            debug_print=debug_print,
+            **domain_n_minus_1_kwargs,
+        )
+    else:
+        correction_task = create_correction_task(
+            tmem_vec0,
+            tmem_vec1,
+            tmem_o,
+            smem_o_0,
+            smem_o_1,
+            gmem_o_0,
+            gmem_o_1,
+            tmem_stats_done_0,
+            tmem_stats_done_1,
+            work_queue,
+            debug_print=debug_print,
+            **domain_n_minus_1_kwargs,
+        )
     epilogue_task: Task | None = None
     freed_epilogue_task: Task | None = None
     if cfg.fuse_epilogue_into_correction:
@@ -1269,7 +1340,11 @@ def build_context_task_manager(
         task_list.append(scheduler_task)
     task_list.append(auxiliary_task)
 
-    if single_qkv_instance:
+    if cfg.staged_head_dim:
+        if tmem_p0 is None:
+            raise ValueError("staged-head-dim resource graph requires P handoff")
+        tmem_o_dependencies = scheduler_deps(tmem_sp0, tmem_p0)
+    elif single_qkv_instance:
         tmem_o_source = tmem_p0 if tmem_p0 is not None else tmem_sp0
         tmem_o_dependencies = scheduler_deps(tmem_o_source)
     else:
@@ -1303,6 +1378,15 @@ def build_context_task_manager(
         resource_dependency_graph[tmem_stats_done_0] = [tmem_vec0]
     if tmem_p0 is not None:
         resource_dependency_graph[tmem_p0] = scheduler_deps(tmem_sp0)
+    if staged_o_fast_path:
+        if smem_o_1 is None or gmem_o_1 is None:
+            raise ValueError("staged-output resource graph requires O stage 1")
+        resource_dependency_graph.update(
+            {
+                smem_o_1: scheduler_deps(tmem_vec0, tmem_o),
+                gmem_o_1: scheduler_deps(smem_o_1),
+            }
+        )
     if not single_qkv_instance:
         resource_dependency_graph.update(
             {
@@ -1365,7 +1449,20 @@ def build_context_task_manager(
         add_smem_resource(tmem_stats_done_1)
     if work_queue is not None and work_queue.pipeline_config is not None:
         add_smem_resource(work_queue)
-    if single_qkv_instance:
+    if staged_o_fast_path:
+        if smem_o_1 is None or gmem_o_1 is None:
+            raise ValueError("staged-output allocator requires O stage 1")
+        add_smem_resource(smem_o_0)
+        add_smem_resource(smem_o_1)
+        add_smem_resource(gmem_o_0)
+        add_smem_resource(gmem_o_1)
+        smem_allocator.add_alias_group(
+            [
+                [smem_o_0._alloc, smem_o_1._alloc],
+                [gmem_o_0._alloc, gmem_o_1._alloc],
+            ]
+        )
+    elif single_qkv_instance:
         add_smem_resource(smem_o_0)
         add_smem_resource(gmem_o_0)
         smem_allocator.add_alias_group(
@@ -1473,7 +1570,11 @@ def build_context_task_manager(
         exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
     )
 
-    if single_qkv_instance:
+    if staged_o_fast_path:
+        if smem_o_1 is None:
+            raise ValueError("staged-output TMEM resources require O stage 1")
+        tmem_resources = [tmem_sp0, tmem_vec0, tmem_o, smem_o_0, smem_o_1]
+    elif single_qkv_instance:
         tmem_resources = [tmem_sp0, tmem_vec0, tmem_o, smem_o_0]
     else:
         tmem_resources = [
@@ -1525,7 +1626,9 @@ def _context_pipeline_stage_counts(
         "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
         "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
         "tmem_o": cfg.mma_corr_stage,
-        "smem_o": cfg.num_qkv_instances,
+        "smem_o": (
+            cfg.num_head_dim_stages if cfg.staged_head_dim else cfg.num_qkv_instances
+        ),
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
@@ -1619,6 +1722,15 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
     """Set topology- and capacity-derived context pipeline stage counts."""
     cfg.q_stage = cfg.num_qkv_instances
     cfg.kv_stage = 3
+    if cfg.staged_head_dim:
+        cfg.q_stage = 1
+        cfg.kv_stage = 2 * cfg.num_head_dim_stages
+        cfg.has_tmem_p_pipeline = True
+        cfg.stage_scoped_tmem_stats = True
+        cfg.mma_softmax_stage = 2
+        cfg.softmax_corr_stage = 1
+        cfg.mma_corr_stage = 1
+        return
     cfg.has_tmem_p_pipeline = _should_use_tmem_p_pipeline(cfg)
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
@@ -1698,6 +1810,7 @@ def _configure_early_tile_sum_policy(
 
 def _configure_smem_shapes(cfg: FmhaConfig) -> None:
     """Derive per-stage SMEM element counts from the configured tile shapes."""
+    q_head_dim = cfg.head_dim if cfg.staged_head_dim else cfg.qk_mma_tiler[2]
     kv_head_dim = (
         cfg.head_dim_per_stage_kv if cfg.stage_kv_by_head_dim else cfg.qk_mma_tiler[2]
     )
@@ -1706,7 +1819,7 @@ def _configure_smem_shapes(cfg: FmhaConfig) -> None:
     )
     cfg.sQ_shape = (
         cfg.q_stage,
-        cfg.qk_mma_tiler[0] * cfg.qk_mma_tiler[2],
+        cfg.qk_mma_tiler[0] * q_head_dim,
     )
     cfg.sK_shape = (
         cfg.kv_stage,
@@ -1717,14 +1830,20 @@ def _configure_smem_shapes(cfg: FmhaConfig) -> None:
 
 def _validate_tmem_columns(cfg: FmhaConfig) -> None:
     """Reject tile shapes that exceed the selected context TMEM layout."""
-    sp_tmem_cols = cfg.num_qkv_instances * cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage
     o_tmem_cols = cfg.epi_tile[1]
-    stats_tmem_cols = 0
-    if cfg.single_qkv_instance and not cfg.stage_scoped_tmem_stats:
-        stats_tmem_cols = cfg.tmem_stats_cols
-    required_tmem_cols = (
-        sp_tmem_cols + cfg.num_qkv_instances * o_tmem_cols + stats_tmem_cols
-    )
+    if cfg.staged_head_dim:
+        sp_tmem_cols = cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage
+        required_tmem_cols = sp_tmem_cols + cfg.num_head_dim_stages * cfg.epi_tile[1]
+    else:
+        sp_tmem_cols = (
+            cfg.num_qkv_instances * cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage
+        )
+        stats_tmem_cols = 0
+        if cfg.single_qkv_instance and not cfg.stage_scoped_tmem_stats:
+            stats_tmem_cols = cfg.tmem_stats_cols
+        required_tmem_cols = (
+            sp_tmem_cols + cfg.num_qkv_instances * o_tmem_cols + stats_tmem_cols
+        )
     if required_tmem_cols > cfg.tmem_alloc_cols:
         raise ValueError(
             f"head dimension {o_tmem_cols} requires {required_tmem_cols} "
@@ -1735,6 +1854,13 @@ def _validate_tmem_columns(cfg: FmhaConfig) -> None:
 
 def _configure_single_instance_tmem_layout(cfg: FmhaConfig) -> None:
     """Select the one-S/P, one-O TMEM layout used for d>128 context FMHA."""
+    if cfg.staged_head_dim:
+        cfg.tmem_s0_offset = 0
+        cfg.tmem_p0_offset = cfg.tmem_x_load_s
+        cfg.tmem_vec0_offset = 0
+        cfg.tmem_o0_offset = cfg.mma_softmax_stage * cfg.qk_mma_tiler[1]
+        cfg.tmem_o1_offset = cfg.tmem_o0_offset + cfg.head_dim_per_stage_kv
+        return
     cfg.tmem_o0_offset = 0
     cfg.tmem_s0_offset = cfg.epi_tile[1]
     cfg.tmem_p0_offset = cfg.tmem_s0_offset + cfg.tmem_x_load_s
@@ -1780,6 +1906,94 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
     # Match TRT-LLM-GEN's d>128 policy: K, V, and O are staged as 128-wide
     # head-dimension slices so the K/V pipeline can run deeper without
     # exceeding Blackwell's SMEM budget.
+
+
+def _configure_staged_head_dim_tilers(
+    cfg: FmhaConfig,
+    *,
+    mma_tiler_mn: tuple[int, int],
+    d: int,
+) -> None:
+    """Configure the explicit full-Q, split-D schedule for D256."""
+    if d != 256:
+        raise ValueError(f"staged-head-dim FMHA requires D=256, got D={d}")
+    cfg.staged_head_dim = True
+    cfg.num_qkv_instances = 1
+    cfg.head_dim = d
+    cfg.head_dim_per_stage_kv = 128
+    cfg.num_head_dim_stages = d // cfg.head_dim_per_stage_kv
+    cfg.num_head_dim_stages_k = cfg.num_head_dim_stages
+    cfg.num_head_dim_stages_v = cfg.num_head_dim_stages
+    cfg.num_o_head_dim_stages = cfg.num_head_dim_stages
+    cfg.stage_kv_by_head_dim = True
+    cfg.stage_o_by_head_dim = True
+
+    mma_tiler = (*mma_tiler_mn, cfg.head_dim_per_stage_kv)
+    cfg.qk_mma_tiler = mma_tiler
+    cfg.pv_mma_tiler = (mma_tiler[0], cfg.head_dim_per_stage_kv, mma_tiler[1])
+    cfg.epi_tile = cfg.pv_mma_tiler[:2]
+
+    cfg.softmax0_warp_ids = (0, 1, 2, 3)
+    cfg.softmax1_warp_ids = ()
+    cfg.correction_warp_ids = (4, 5, 6, 7)
+    cfg.mma_warp_id = 8
+    cfg.load_warp_id = 11
+    # Fused output frees warp 9 for scheduler/padding participation.
+    cfg.epilogue_warp_id = 9
+    cfg.empty_warp_id = 10
+    cfg.block_warps = 12
+    cfg.num_regs_softmax = 200
+    cfg.num_regs_correction = 128
+    cfg.num_regs_other = 32
+
+
+def _configure_staged_head_dim_tma_copy_metadata(
+    cfg: FmhaConfig,
+    *,
+    q_dtype: type,
+    k_dtype: type,
+    o_dtype: type,
+) -> None:
+    """Derive full-Q and 128-wide K/V/O TMA copy granularities."""
+    kv_tma_bits = cfg.qk_mma_tiler[2] * k_dtype.width
+    if kv_tma_bits % 1024 != 0:
+        raise ValueError(
+            "FMHA TS requires a 128-byte aligned K/V inner dimension, "
+            f"got {kv_tma_bits // 8} bytes"
+        )
+    cfg.tma_copy_qkv_iters = kv_tma_bits // 1024
+    cfg.tma_copy_kv_iters = cfg.tma_copy_qkv_iters
+
+    q_tma_bits = cfg.head_dim * q_dtype.width
+    if q_tma_bits % 1024 != 0:
+        raise ValueError(
+            "FMHA TS requires a 128-byte aligned Q inner dimension, "
+            f"got {q_tma_bits // 8} bytes"
+        )
+    cfg.tma_copy_q_iters = q_tma_bits // 1024
+    cfg.q_tile_m = cfg.qk_mma_tiler[0]
+    cfg.tma_copy_q_granu_inner = cfg.head_dim // cfg.tma_copy_q_iters
+    cfg.tma_copy_q_elements = cfg.sQ_shape[1]
+    cfg.tma_copy_q_granu_elems = cfg.tma_copy_q_elements // cfg.tma_copy_q_iters
+    cfg.tma_copy_q_bytes = cfg.tma_copy_q_elements * q_dtype.width // 8
+
+    cfg.seq_tile_n = cfg.qk_mma_tiler[1]
+    cfg.kv_tile_n = cfg.qk_mma_tiler[1]
+    cfg.tma_copy_kv_granu_inner = cfg.qk_mma_tiler[2] // cfg.tma_copy_qkv_iters
+    cfg.tma_copy_kv_stage_iters = (
+        cfg.head_dim_per_stage_kv // cfg.tma_copy_kv_granu_inner
+    )
+    cfg.tma_copy_kv_elements = cfg.sK_shape[1]
+    cfg.tma_copy_kv_granu_elems = (
+        cfg.tma_copy_kv_elements // cfg.tma_copy_kv_stage_iters
+    )
+    cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
+
+    cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
+    cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
+    cfg.tma_copy_o_stage_iters = cfg.head_dim_per_stage_kv // cfg.tma_copy_o_granu_inner
+    cfg.tma_copy_o_elements = cfg.epi_tile[0] * cfg.head_dim_per_stage_kv
+    cfg.tma_copy_o_granu_elems = cfg.tma_copy_o_elements // cfg.tma_copy_o_stage_iters
 
 
 def _configure_head_paired_tilers(
@@ -2236,6 +2450,10 @@ class FmhaTs:
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
         Enable skip-correction for softmax rescaling (default: True).
+    enable_staged_head_dim : bool, optional
+        Enable the explicit full-Q, split-D schedule for eligible D256
+        specializations (default: True). The public context planner disables
+        it on architectures where the generic schedule is faster.
     causal_single_kv_tile : bool, optional
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
@@ -2258,6 +2476,7 @@ class FmhaTs:
         window_size_left: int = 0,
         h_r: int = 1,
         enable_skip_correction: bool = True,
+        enable_staged_head_dim: bool = True,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
         max_num_pages_per_seq_kv: int = 1,
@@ -2349,6 +2568,46 @@ class FmhaTs:
         balance_causal_workload = balance_causal_workload or (
             is_causal and is_clc_dynamic and not cfg.single_qkv_instance
         )
+
+        # Keep paged D256 on MR2's page-window-aware schedule. The explicit
+        # staged path below uses a K-ahead/V-delayed producer and is selected
+        # only where K/V coordinates are contiguous.
+        if (
+            enable_staged_head_dim
+            and d == 256
+            and q_dtype.width == 8
+            and k_dtype.width == 8
+            and v_dtype.width == 8
+            and not head_paired
+            and not use_paged_kv
+        ):
+            cfg.stats_via_smem = False
+            cfg.fuse_epilogue_into_correction = True
+            _configure_staged_head_dim_tilers(
+                cfg,
+                mma_tiler_mn=mma_tiler_mn,
+                d=d,
+            )
+            _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+            _configure_single_instance_tmem_layout(cfg)
+            _configure_smem_shapes(cfg)
+            _validate_tmem_columns(cfg)
+            _configure_staged_head_dim_tma_copy_metadata(
+                cfg,
+                q_dtype=q_dtype,
+                k_dtype=k_dtype,
+                o_dtype=o_dtype,
+            )
+            _configure_common_launch_flags(
+                cfg,
+                d=d,
+                h_r=h_r,
+                is_causal=is_causal,
+                balance_causal_workload=balance_causal_workload,
+                window_size_left=window_size_left,
+            )
+            _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
+            return
 
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
@@ -2488,7 +2747,7 @@ class FmhaTs:
             if cutlass.const_expr(cfg.use_paged_kv)
             else cuda.TensorMapL2Promotion.none
         )
-        if cutlass.const_expr(cfg.head_paired):
+        if cutlass.const_expr(cfg.head_paired or cfg.staged_head_dim):
             inner_dim_size = cfg.qk_mma_tiler[2] * cfg.q_dtype.width // 8
             tma_qkv_swizzle = cuda.TensorMapSwizzle.none
             if cutlass.const_expr(inner_dim_size % 128 == 0):
