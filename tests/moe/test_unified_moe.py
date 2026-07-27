@@ -270,10 +270,14 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert TrtllmBf16Config.supported(100)
+        assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
         assert not TrtllmFp8BlockConfig.supported(107)
         assert TrtllmBf16Config.supported(107)
+        assert not TrtllmBf16Config.supported(110)
         assert not TrtllmBf16Config.supported(120)
+        assert not TrtllmBf16Config.supported(121)
         assert not TrtllmFp8BlockConfig.supported(110)
         assert not TrtllmFp8BlockConfig.supported(120)
         assert TrtllmFp8PerTensorConfig.supported(100)
@@ -643,6 +647,17 @@ class TestMoERunnerSupport:
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
         runner.config = cfg
         with pytest.raises(NotImplementedError, match="do_finalize=True"):
+            runner.check_support()
+
+    def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
+        import flashinfer.utils as utils
+
+        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=QuantVariant.BF16))
+        runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
+        runner.config = cfg
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (12, 0))
+        with pytest.raises(NotImplementedError, match="SM100/SM103"):
             runner.check_support()
 
     def test_moe_runner_quant_support_check(self):
@@ -1833,7 +1848,7 @@ class TestTrtllmEPOffset:
 class TestTrtllmFromLogitsPackingContract:
     """FromLogits buffer allocation must follow the kernel's output contract.
 
-    The fp4 routing kernel writes bf16 expert weights regardless of the logits
+    TRTLLM routing kernels write bf16 expert weights regardless of the logits
     dtype; allocating ``expert_weights`` with ``routing_logits.dtype`` (fp32
     DeepSeekV3 logits) mislabels the kernel-filled buffer, so an unfinalized
     read interprets bf16 bits as fp32 garbage (gh #3595 — same bug previously
@@ -1896,6 +1911,77 @@ class TestTrtllmFromLogitsPackingContract:
         assert (
             runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
         )
+
+    def _make_bf16_from_logits_inputs(self, logits_dtype):
+        from flashinfer.fused_moe.core import MoeRunnerInputs
+
+        act, weights, config, _ = _make_bf16_packs_and_config(
+            16,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            max_tokens=16,
+        )
+        logits = torch.randn(
+            16, 8, dtype=logits_dtype, device=act.hidden_states_q.device
+        )
+        logits_act = MoEActivationPack(
+            hidden_states_q=act.hidden_states_q,
+            hidden_states_scale=None,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits,
+        )
+        runner = TrtllmBf16RoutedRunner(config, device=logits.device)
+        inputs = runner.pack_inputs(logits_act, weights)
+        return runner, inputs, MoeRunnerInputs.from_list(inputs), logits
+
+    @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    def test_bf16_expert_weights_buffer_is_bf16(self, logits_dtype):
+        runner, _, moe_inputs, logits = self._make_bf16_from_logits_inputs(logits_dtype)
+        assert moe_inputs.routing_logits is logits
+        assert moe_inputs.topk_ids.dtype == torch.int32
+        assert moe_inputs.expert_weights.dtype == torch.bfloat16
+        assert (
+            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+        )
+
+    @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    def test_bf16_cuda_graph_replay_matches_eager(self, logits_dtype):
+        runner, inputs, _, _ = self._make_bf16_from_logits_inputs(logits_dtype)
+        for _ in range(3):
+            runner.forward(inputs, tactic=-1)
+        torch.cuda.synchronize()
+        eager = runner.forward(inputs, tactic=-1).clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = runner.forward(inputs, tactic=-1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(captured, eager)
+
+    def test_bf16_from_logits_ep_rejected(self):
+        act, weights, config, _ = _make_bf16_packs_and_config(
+            16,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            local_num_experts=4,
+            local_expert_offset=4,
+            max_tokens=16,
+        )
+        logits_act = MoEActivationPack(
+            hidden_states_q=act.hidden_states_q,
+            hidden_states_scale=None,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=torch.randn(16, 8, device=act.hidden_states_q.device),
+        )
+        runner = TrtllmBf16RoutedRunner(config, device=act.hidden_states_q.device)
+        with pytest.raises(NotImplementedError, match="all experts to be local"):
+            runner.pack_inputs(logits_act, weights)
 
 
 # 6. prepare_trtllm_bf16_weights input contract

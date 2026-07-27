@@ -757,8 +757,8 @@ class MoEActivationPack:
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
       back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
-      block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches a logits
-      pack only to capable backends (see each runner's ``supported_routing_modes``).
+      BF16, block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches
+      a logits pack only to capable backends (see each runner's ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
