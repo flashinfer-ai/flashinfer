@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
+# mypy: disable-error-code="assignment, attr-defined, misc"
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
