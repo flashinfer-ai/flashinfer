@@ -13,10 +13,13 @@ from flashinfer.utils import get_compute_capability
 
 
 class Test_FlashInfer_Matmul_Alpha_Beta:
+    """Correctness tests for gemm_alpha_beta on the cuTile backend."""
+
     @staticmethod
     def reference(
         a, b, c, trans_a=False, trans_b=True, alpha=1.0, beta=0.0, dtype=torch.bfloat16
     ):
+        """torch.addmm reference for alpha*A@B + beta*C."""
         if trans_a:
             a = a.t()
         if trans_b:
@@ -27,6 +30,7 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
 
     @staticmethod
     def prepare_data(m, n, k, trans_a, trans_b, dtype):
+        """Build A, B and C for one (m, n, k, transpose, dtype) case."""
         device = torch.device("cuda")
 
         a_size = m * k
@@ -60,6 +64,7 @@ class Test_FlashInfer_Matmul_Alpha_Beta:
     def test_op(
         self, m, n, k, dtype, out_dtype, trans_a, trans_b, alpha, beta, backend
     ):
+        """cuTile gemm_alpha_beta must match the torch reference, including beta==0."""
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
         cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10

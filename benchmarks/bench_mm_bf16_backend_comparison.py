@@ -48,11 +48,13 @@ ALL_PROVIDERS = ["cutile", "cutlass", "cublaslt", "cudnn", "tgv", "tinygemm", "t
 
 
 def get_cc() -> int:
+    """Compute capability of the current device as a two-digit int (e.g. 100 for sm100)."""
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
 
 def _make_inputs(m: int, n: int, k: int):
+    """Build a row-major A and a column-major B for one (m, n, k) case."""
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).transpose(
         -2, -1
@@ -61,6 +63,7 @@ def _make_inputs(m: int, n: int, k: int):
 
 
 def _run_backend(a, b, provider: str):
+    """Dispatch one GEMM through `provider` and return the result."""
     if provider == "torch":
         return torch.matmul(a, b)
     return flashinfer.mm_bf16(a, b, backend=provider)
@@ -117,6 +120,7 @@ def bench_one(m: int, n: int, k: int, provider: str) -> float:
 def run_benchmark_sweep(
     shapes: List[Tuple[int, int, int]], providers: List[str]
 ) -> Dict[str, Dict[Tuple[int, int, int], float]]:
+    """Benchmark every provider over `shapes`; returns {provider: {(m,n,k): median_ms}}."""
     results: Dict[str, Dict[Tuple[int, int, int], float]] = {p: {} for p in providers}
     print(f"\nBenchmarking mm_bf16 (C = A@B, bf16)  providers={providers}")
     print("=" * (26 + 11 * len(providers)))
@@ -141,6 +145,7 @@ def print_summary_table(
     providers: List[str],
     baseline: str,
 ):
+    """Print the per-shape and geomean speedup of each provider vs `baseline`."""
     if baseline not in results:
         return
     print(f"\n{'=' * 78}")
@@ -176,6 +181,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
+    """Write the raw per-provider medians and derived TFLOP/s to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(["provider", "m", "n", "k", "median_ms", "tflops"])
@@ -191,6 +197,7 @@ def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
 
 
 def create_heatmap(shapes, results, provider, baseline, output_file):
+    """Save a heatmap of `provider` speedup vs `baseline` across the shape sweep."""
     try:
         import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
@@ -237,6 +244,7 @@ def create_heatmap(shapes, results, provider, baseline, output_file):
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(description="Benchmark mm_bf16 backends")
     parser.add_argument("--providers", type=str, default=",".join(ALL_PROVIDERS))
     parser.add_argument("--baseline", type=str, default="cutlass")

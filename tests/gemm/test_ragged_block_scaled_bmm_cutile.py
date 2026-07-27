@@ -13,6 +13,8 @@ from flashinfer.utils import get_compute_capability
 
 
 class Test_FlashInfer_RaggedBlockScaledBMM:
+    """Correctness tests for ragged_block_scaled_bmm on the cuTile backend."""
+
     @staticmethod
     def create_ragged_m_segments(num_groups, m, ELEM_PER_BYTE_A, alignment=16):
         """Create non-even M segments for ragged BMM.
@@ -176,6 +178,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         out_dtype=torch.bfloat16,
         use_aligned_segments=False,
     ):
+        """Build the ragged FP8 A/B, their block scales and the segment offsets."""
         Q = num_groups
         assert not trans_a and trans_b, "Only NT layout is supported"
         device = torch.device("cuda")
@@ -268,6 +271,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):
+        """cuTile ragged_block_scaled_bmm must match the native groupwise FP8 GEMM."""
         if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
 

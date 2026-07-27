@@ -367,6 +367,7 @@ def _w8a8_autotune_and_launch(
     )
 
     def build_args(cfg):
+        """Kernel arguments for one autotune candidate."""
         head = (A, B, C, As, Bs, M, N, K, block_n, block_k)
         tail = (
             cfg.BLOCK_SIZE_M,

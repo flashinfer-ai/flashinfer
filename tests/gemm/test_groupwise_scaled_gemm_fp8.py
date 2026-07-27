@@ -217,6 +217,7 @@ def test_fp8_groupwise_group_gemm(
     out_dtype,
     backend,
 ):
+    """Grouped FP8 groupwise GEMM must match the reference across group sizes and scale modes."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if group_size > 1 and compute_capability[0] in [
         12,

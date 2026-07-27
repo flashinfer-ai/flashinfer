@@ -389,6 +389,7 @@ def gemm_alpha_beta(
     # aliased A/B input. A/B sharing storage with each other is read-only and
     # safe (e.g. a Gram matrix A @ A.T), so it is allowed.
     def _overlaps(x, y):
+        """True if two CUDA tensors share the same underlying storage."""
         return (
             x.device.type == "cuda"
             and y.device.type == "cuda"
@@ -416,12 +417,14 @@ def gemm_alpha_beta(
     if use_autotune:
         # Use exhaustive_search for automatic configuration selection
         def grid_fn(cfg):
+            """Grid for one autotune candidate: the persistent program count."""
             num_programs = _compute_grid_and_programs(
                 M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy
             )[3]
             return (num_programs, 1, 1)
 
         def args_fn(cfg):
+            """Kernel arguments for a tuning launch (C is cloned so tuning cannot corrupt it)."""
             return (
                 a,
                 b,
@@ -439,6 +442,7 @@ def gemm_alpha_beta(
             )
 
         def launch_args_fn(cfg):
+            """Kernel arguments for the final launch (writes the real C)."""
             return (
                 a,
                 b,
@@ -456,6 +460,7 @@ def gemm_alpha_beta(
             )
 
         def hints_fn(cfg):
+            """Launch hints (CTA count and occupancy) for one autotune candidate."""
             return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
         stream = torch.cuda.current_stream(a.device)
