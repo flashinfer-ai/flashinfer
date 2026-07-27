@@ -343,13 +343,20 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
         variant = self.config.quant.variant
-        if variant in (QuantVariant.MXFP4, QuantVariant.W4A16):
+        if variant in (
+            QuantVariant.NVFP4,
+            QuantVariant.MXFP4,
+            QuantVariant.W4A16,
+        ):
             from ..utils import get_compute_capability
 
+            # TODO: Route NVFP4 on SM120/SM121 to B12x once default dispatch can
+            # materialize the required b12x weight view. Until then, fail here
+            # instead of admitting TRTLLM sm100f kernels that crash at launch.
             compute_capability = get_compute_capability(self.device)
             supported = (
                 compute_capability in ((10, 0), (10, 3))
-                if variant is QuantVariant.MXFP4
+                if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
                 else compute_capability == (10, 0)
             )
             if not supported:

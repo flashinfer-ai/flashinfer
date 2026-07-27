@@ -59,6 +59,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _xfail_w4a16_sm103(variant: QuantVariant) -> None:
+    if variant is QuantVariant.W4A16 and get_compute_capability(
+        torch.device("cuda")
+    ) == (10, 3):
+        pytest.xfail("TRTLLM MXFP4×BF16 is currently disabled on SM103")
+
+
 def _expected_mxfp4_weight_view(w1_bf16, w2_bf16):
     """Independent composition of the TRTLLM shuffled-MajorK MXFP4 layout."""
     num_experts, gemm1_rows, hidden_size = w1_bf16.shape
@@ -218,10 +225,7 @@ def _make_runtime_case(
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
 def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
-    if variant is QuantVariant.W4A16 and get_compute_capability(
-        torch.device("cuda")
-    ) == (10, 3):
-        pytest.xfail("TRTLLM MXFP4×BF16 is currently disabled on SM103")
+    _xfail_w4a16_sm103(variant)
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -331,6 +335,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
 def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantVariant):
+    _xfail_w4a16_sm103(variant)
     act, weights, config = _make_runtime_case(variant)
     logits = torch.randn(
         act.num_tokens,
@@ -361,6 +366,7 @@ def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantVariant):
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
 def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantVariant):
+    _xfail_w4a16_sm103(variant)
     baseline_act, baseline_weights, baseline_config = _make_runtime_case(
         variant,
         global_experts=4,
@@ -380,6 +386,7 @@ def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantVariant):
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
 def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantVariant):
+    _xfail_w4a16_sm103(variant)
     act, weights, config = _make_runtime_case(variant)
     with autotune(True):
         layer = MoELayer(config)
@@ -423,7 +430,9 @@ def test_trtllm_mxfp4_rejects_unaligned_weights(
 @pytest.mark.parametrize(
     "variant,compute_capability,supported",
     [
-        (QuantVariant.NVFP4, (12, 0), True),
+        (QuantVariant.NVFP4, (10, 0), True),
+        (QuantVariant.NVFP4, (10, 3), True),
+        (QuantVariant.NVFP4, (12, 0), False),
         (QuantVariant.MXFP4, (10, 0), True),
         (QuantVariant.MXFP4, (10, 3), True),
         (QuantVariant.MXFP4, (12, 0), False),
