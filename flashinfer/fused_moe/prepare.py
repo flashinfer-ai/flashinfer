@@ -461,10 +461,14 @@ def prepare_trtllm_fp4_weights(
         )
     is_mxfp4 = variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
     sf_vec_size = 32 if is_mxfp4 else 16
-    if hidden_size % sf_vec_size != 0 or intermediate_size % sf_vec_size != 0:
+    required_alignment = 128 if is_mxfp4 else sf_vec_size
+    if (
+        hidden_size % required_alignment != 0
+        or intermediate_size % required_alignment != 0
+    ):
         raise ValueError(
             f"{variant.name} requires hidden_size and intermediate_size divisible "
-            f"by {sf_vec_size}."
+            f"by {required_alignment}."
         )
 
     if device is None:

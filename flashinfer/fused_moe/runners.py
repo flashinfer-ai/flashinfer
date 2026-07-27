@@ -328,6 +328,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
+    # PR #4104 adds UnpackedPrecomputed to this same adapter. Whichever change
+    # lands second must preserve these variant branches while merging that mode.
     supported_quant_variants = (
         QuantVariant.NVFP4,
         QuantVariant.MXFP4,
@@ -340,13 +342,20 @@ class TrtllmFp4RoutedRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
-        if self.config.quant.variant is QuantVariant.W4A16:
+        variant = self.config.quant.variant
+        if variant in (QuantVariant.MXFP4, QuantVariant.W4A16):
             from ..utils import get_compute_capability
 
-            if get_compute_capability(self.device) == (10, 3):
+            compute_capability = get_compute_capability(self.device)
+            supported = (
+                compute_capability in ((10, 0), (10, 3))
+                if variant is QuantVariant.MXFP4
+                else compute_capability == (10, 0)
+            )
+            if not supported:
                 raise NotImplementedError(
-                    "TRTLLM MXFP4×BF16/W4A16 is disabled on SM103 pending "
-                    "resolution of the existing flat-kernel regression."
+                    f"TRTLLM {variant.name} is unsupported on "
+                    f"SM{compute_capability[0]}{compute_capability[1]}."
                 )
 
     def __init__(self, config: MoEConfig, device: torch.device):

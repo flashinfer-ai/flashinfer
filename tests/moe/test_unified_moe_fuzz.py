@@ -758,8 +758,8 @@ _DTYPE = {
         reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.MXFP4),
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.15,
-        rtol=0.85,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
     ),
     QuantVariant.W4A16: DTypeHandler(
         variant=QuantVariant.W4A16,
@@ -774,8 +774,8 @@ _DTYPE = {
         reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.W4A16),
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.15,
-        rtol=0.85,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
     ),
     # MXINT4 adds one entry when its runner is wired upstream.
 }
