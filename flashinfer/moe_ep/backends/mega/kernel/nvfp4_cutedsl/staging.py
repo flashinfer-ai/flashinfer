@@ -24,9 +24,9 @@ def stage_mega_moe_inputs(
     from .....kernel_src.cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
-        nvfp4_quantize_per_block_16,
         round_up,
     )
+    from flashinfer.quantization.fp4_quantization import fp4_quantize
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
@@ -36,8 +36,16 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    activation_fp32 = hidden_states.to(torch.float32)
-    q, sf = nvfp4_quantize_per_block_16(activation_fp32, norm_const)
+    global_scale = torch.full(
+        (1,), float(norm_const), dtype=torch.float32, device=hidden_states.device
+    )
+    q, sf = fp4_quantize(
+        hidden_states,
+        global_scale=global_scale,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
@@ -47,9 +55,9 @@ def stage_mega_moe_inputs(
             f"{hidden_sf_cols_padded}."
         )
 
-    x_nvfp4[:num_tokens].copy_(q)
+    x_nvfp4[:num_tokens].view(torch.uint8).copy_(q)
     x_sf[:num_tokens].zero_()
-    x_sf[:num_tokens, :hidden_sf_cols].copy_(sf)
+    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf)
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
 

@@ -31,9 +31,9 @@ def stage_mega_moe_inputs(
     from .....kernel_src.cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
-        mxfp8_quantize_per_block_32,
         round_up,
     )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
@@ -43,9 +43,12 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    data_dtype = _mxfp8_data_dtype(kind)
-    activation_fp32 = hidden_states.to(torch.float32)
-    q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
+    q, sf = mxfp8_quantize(
+        hidden_states,
+        is_sf_swizzled_layout=False,
+        alignment=32,
+        backend="cuda",
+    )
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
@@ -57,7 +60,11 @@ def stage_mega_moe_inputs(
 
     x_fp8[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
     x_sf[:num_tokens].zero_()
-    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
+    # fused mxfp8_quantize returns SF as a 1-D flat (num_tokens*hidden/32,) uint8 tensor
+    # (linear layout) — reshape to [num_tokens, hidden_sf_cols] before copying.
+    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(
+        sf.view(torch.uint8).reshape(num_tokens, hidden_sf_cols)
+    )
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
 
