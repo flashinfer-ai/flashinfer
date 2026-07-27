@@ -1135,6 +1135,19 @@ def _device_contract_body(rank, world_size, group, mode):
 def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs, have {torch.cuda.device_count()}")
+
+    import os
+    import sys
+
+    # spawn starts fresh interpreters that need to re-import this module by its
+    # dotted name; ensure the repo root is on sys.path so 'tests.comm' is
+    # findable (bare `pytest` does not add it, unlike `python -m pytest`).
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     ctx = std_mp.get_context("spawn")
     q = ctx.Queue()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

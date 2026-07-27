@@ -117,6 +117,18 @@ def get_open_port() -> int:
 def multi_process_parallel(
     world_size: int, test_target: Any, target_args: tuple = ()
 ) -> None:
+    import os
+    import sys
+
+    # spawn starts fresh interpreters that need to re-import this module by its
+    # dotted name; ensure the repo root is on sys.path so 'tests.comm' is
+    # findable (bare `pytest` does not add it, unlike `python -m pytest`).
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     mp.set_start_method("spawn", force=True)
     procs = []
     port = get_open_port()

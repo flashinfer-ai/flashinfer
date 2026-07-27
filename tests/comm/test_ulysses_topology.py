@@ -341,6 +341,18 @@ def _run_resolve_case(backends, patch=None, marker_path=None, timeout=120):
     not a pass condition), and that all ranks produced the *identical*
     outcome. Returns that single common outcome.
     """
+    import os
+    import sys
+
+    # spawn starts fresh interpreters that need to re-import this module by its
+    # dotted name; ensure the repo root is on sys.path so 'tests.comm' is
+    # findable (bare `pytest` does not add it, unlike `python -m pytest`).
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     world_size = len(backends)
     ctx = std_mp.get_context("spawn")
     q = ctx.Queue()
