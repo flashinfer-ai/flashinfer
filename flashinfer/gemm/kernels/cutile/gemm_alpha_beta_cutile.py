@@ -193,12 +193,12 @@ def _gemm_alpha_beta_kernel(
             )
 
 
-def _gemm_alpha_beta_autotune_configs():
+def _gemm_alpha_beta_autotune_configs(device=None):
     """
     Iterator of autotune configurations for gemm_alpha_beta kernel.
     Returns configurations optimized for different GPU architectures.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability[0] >= 10:
         # EPILOGUE_SUBTILE=1 only validated on SM100; disable on SM12x to avoid correctness issues
@@ -265,11 +265,11 @@ def _gemm_alpha_beta_autotune_configs():
                     )
 
 
-def _get_default_kernel_configs():
+def _get_default_kernel_configs(device=None):
     """
     Get GPU-specific default kernel configs for non-autotune path.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
 
     if gpu_capability == (10, 0):
         # Blackwell SM100 - aggressive config with epilogue subtiling
@@ -315,9 +315,11 @@ def _get_default_kernel_configs():
         }
 
 
-def _compute_grid_and_programs(M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy):
+def _compute_grid_and_programs(
+    M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, device=None
+):
     """Helper to compute grid size and number of programs."""
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
     if num_sms is not None:
         NUM_SMS = min(NUM_SMS, num_sms)
 
@@ -415,20 +417,36 @@ def gemm_alpha_beta(
         use_autotune = False
 
     if use_autotune:
+        # One scratch buffer reused by every tuning candidate, so tuning neither
+        # writes the caller's C nor allocates an M x N tensor per candidate. With
+        # beta != 0 the kernel READS C, so the scratch is refreshed from C for
+        # each candidate to keep the tuning input stable; with beta == 0 C is
+        # write-only, so its stale contents are irrelevant and the copy is skipped.
+        c_scratch = torch.empty_like(c)
+
         # Use exhaustive_search for automatic configuration selection
         def grid_fn(cfg):
             """Grid for one autotune candidate: the persistent program count."""
             num_programs = _compute_grid_and_programs(
-                M, N, cfg.BLOCK_M, cfg.BLOCK_N, num_sms, cfg.num_ctas, cfg.occupancy
+                M,
+                N,
+                cfg.BLOCK_M,
+                cfg.BLOCK_N,
+                num_sms,
+                cfg.num_ctas,
+                cfg.occupancy,
+                a.device,
             )[3]
             return (num_programs, 1, 1)
 
         def args_fn(cfg):
-            """Kernel arguments for a tuning launch (C is cloned so tuning cannot corrupt it)."""
+            """Kernel arguments for a tuning launch (writes the reused scratch, not C)."""
+            if has_beta_int:
+                c_scratch.copy_(c)
             return (
                 a,
                 b,
-                c.clone(),  # Clone for tuning to avoid corrupting C
+                c_scratch,  # Scratch for tuning, so the caller's C is untouched
                 float(alpha),
                 float(beta),
                 transpose_a_int,
@@ -478,7 +496,7 @@ def gemm_alpha_beta(
         cached = _gemm_alpha_beta_tune_cache.get(cache_key)
         if cached is None:
             result = exhaustive_search(
-                list(_gemm_alpha_beta_autotune_configs()),
+                list(_gemm_alpha_beta_autotune_configs(a.device)),
                 stream,
                 grid_fn,
                 _gemm_alpha_beta_kernel,
@@ -502,7 +520,7 @@ def gemm_alpha_beta(
 
     else:
         # Fallback to non-autotune path
-        default_configs = _get_default_kernel_configs()
+        default_configs = _get_default_kernel_configs(a.device)
         kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
         BLOCK_M = kernel_configs.get("BLOCK_M")
@@ -514,7 +532,7 @@ def gemm_alpha_beta(
         epilogue_subtile = kernel_configs.get("EPILOGUE_SUBTILE", 0)
 
         num_programs = _compute_grid_and_programs(
-            M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy
+            M, N, BLOCK_M, BLOCK_N, num_sms, num_ctas, occupancy, a.device
         )[3]
 
         # 1D grid for persistent scheduling

@@ -16,7 +16,8 @@ def _skip_if_backend_unavailable(backend):
     """Skip when the cuTile toolchain or this compute capability is unsupported."""
     if backend == "cutile" and not is_cuda_tile_available():
         pytest.skip("cuda.tile not available")
-    cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+    cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
+    cc_num = cc_major * 10 + cc_minor
     if not ragged_bmm.is_backend_supported(backend, cc_num):
         pytest.skip(
             f"ragged_bmm {backend} backend not supported on compute capability {cc_num}."
@@ -223,7 +224,10 @@ class Test_FlashInfer_RaggedBMM:
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_dtypes(self, num_groups, m, n, k, dtype, backend):
         """cuTile ragged_bmm must match the reference for bf16 and fp8 inputs."""
-        if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
+        if (
+            get_compute_capability(torch.device("cuda:0"))[0] == 8
+            and "float8" in dtype.__repr__()
+        ):
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
         _skip_if_backend_unavailable(backend)
 
@@ -236,17 +240,18 @@ class Test_FlashInfer_RaggedBMM:
             num_groups, m, n, k, trans_a, trans_b, dtype
         )
 
-        call = lambda: ragged_bmm(
-            a,
-            b,
-            segment_offsets,
-            max_m,
-            None,
-            transpose_a=trans_a,
-            transpose_b=trans_b,
-            out_dtype=out_dtype,
-            backend=backend,
-        )
+        def call():
+            return ragged_bmm(
+                a,
+                b,
+                segment_offsets,
+                max_m,
+                None,
+                transpose_a=trans_a,
+                transpose_b=trans_b,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
 
         # ragged_bmm supports float16 / bfloat16 inputs only; anything else must
         # be rejected with a clear error rather than silently miscomputing.

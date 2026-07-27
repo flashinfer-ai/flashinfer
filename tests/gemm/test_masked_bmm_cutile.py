@@ -141,7 +141,8 @@ class Test_FlashInfer_MaskedBMM:
         """cuTile masked_bmm must match the torch reference over the shape sweep."""
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
-        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
+        cc_num = cc_major * 10 + cc_minor
         if not masked_bmm.is_backend_supported(backend, cc_num):
             pytest.skip(
                 f"masked_bmm {backend} backend not supported on compute capability {cc_num}."

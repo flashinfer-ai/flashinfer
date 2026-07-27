@@ -195,7 +195,7 @@ def _ragged_block_scaled_bmm_kernel(
 
 
 def _get_default_kernel_configs(
-    total_m, Q, VEC_SIZE, segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT
+    total_m, Q, VEC_SIZE, segment_alignment=_DEFAULT_SEGMENT_ALIGNMENT, device=None
 ):
     """
     Get GPU-specific default kernel configs for non-autotune path.
@@ -204,7 +204,7 @@ def _get_default_kernel_configs(
     fast path (BLOCK_M=256) is only selected when the caller guarantees
     256-aligned segments, otherwise it falls back to the 128 config.
     """
-    gpu_capability = torch.cuda.get_device_capability()
+    gpu_capability = torch.cuda.get_device_capability(device)
     is_large_m = _is_large_m(total_m, Q)
 
     if gpu_capability in [(12, 0), (12, 1)]:
@@ -326,6 +326,10 @@ def ragged_block_scaled_bmm(
             raise ValueError(f"out.dtype {out.dtype} != out_dtype {out_dtype}")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+        # The launch is bound to a.device, so an out on another GPU would be
+        # written by a kernel running on the wrong device.
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}; got {out.device}")
         c = out
     else:
         c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
@@ -334,10 +338,14 @@ def ragged_block_scaled_bmm(
     # kernel always reads its grid bound from a device tensor (defense-in-depth).
     if max_m_device is None:
         max_m_device = torch.tensor([max_m], dtype=torch.int32, device=a.device)
+    elif max_m_device.device != a.device:
+        raise ValueError(
+            f"max_m_device must be on {a.device}; got {max_m_device.device}"
+        )
 
     # Get kernel configs
     default_configs = _get_default_kernel_configs(
-        total_m, Q, VEC_SIZE, segment_alignment
+        total_m, Q, VEC_SIZE, segment_alignment, a.device
     )
     kernel_configs = {**default_configs, **(kwargs.get("kernel_configs") or {})}
 
@@ -355,6 +363,19 @@ def ragged_block_scaled_bmm(
         raise ValueError(
             f"BLOCK_M ({BLOCK_M}) must divide segment_alignment ({segment_alignment}); "
             "align m_indptr segments to a multiple of BLOCK_M or pass a smaller BLOCK_M."
+        )
+
+    # The kernel indexes the b_scale N axis as `n_offset // BLOCK_K`, so it is
+    # only correct when the N-scale granularity equals BLOCK_K. b_scale is
+    # [Q, rnb, rkb], hence the N granularity is N // rnb. A mismatch (e.g. a
+    # 256-wide N granularity with BLOCK_K=128) would apply one column group's
+    # scale to another and silently produce wrong numbers, so reject it.
+    n_scale_granularity = N // rnb
+    if n_scale_granularity != BLOCK_K:
+        raise ValueError(
+            f"b_scale N granularity ({n_scale_granularity} = N {N} // {rnb}) must equal "
+            f"BLOCK_K ({BLOCK_K}); this kernel indexes b_scale on N by BLOCK_K. Use a "
+            "b_scale whose N and K granularities match, or the gather kernel."
         )
 
     # Calculate grid size for persistent scheduling. Use total_m (a guaranteed

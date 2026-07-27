@@ -272,12 +272,16 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):
         """cuTile ragged_block_scaled_bmm must match the native groupwise FP8 GEMM."""
-        if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
+        if (
+            get_compute_capability(torch.device("cuda:0"))[0] == 8
+            and "float8" in dtype.__repr__()
+        ):
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
 
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
-        cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
+        cc_major, cc_minor = get_compute_capability(torch.device("cuda:0"))
+        cc_num = cc_major * 10 + cc_minor
         if not ragged_block_scaled_bmm.is_backend_supported(backend, cc_num):
             pytest.skip(
                 f"ragged_block_scaled_bmm {backend} backend not supported on compute capability {cc_num}."
