@@ -43,7 +43,7 @@ import argparse
 import csv as _csv
 import numpy as np
 import torch
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -108,7 +108,9 @@ def _torch_reference(
     amax = x_.abs().amax(dim=-1, keepdim=True).clamp(min=eps)
     x_s = amax / qmax
     x_q = (x_ / x_s).clamp(qmin, qmax)
-    x_q = (x_q.round() if dst_dtype == torch.int8 else x_q).to(dst_dtype).reshape(x.shape)
+    x_q = (
+        (x_q.round() if dst_dtype == torch.int8 else x_q).to(dst_dtype).reshape(x.shape)
+    )
     x_s = x_s.reshape(x.shape[:-1] + (x.shape[-1] // group_size,))
     return x_q, x_s
 
@@ -235,7 +237,9 @@ def run_benchmark_sweep(
     total = len(num_tokens_values) * len(hidden_values)
     current = 0
 
-    print(f"\nBenchmarking per_token_group_quant_8bit  gs={group_size}  bf16->{dst_dtype}")
+    print(
+        f"\nBenchmarking per_token_group_quant_8bit  gs={group_size}  bf16->{dst_dtype}"
+    )
     print("=" * (30 + 12 * len(providers)))
     header = f"{'ntok':>6} {'hidden':>7} |"
     for p in providers:
@@ -334,7 +338,9 @@ def create_heatmap(
                 mat[i, j] = bt / pt
     if np.all(np.isnan(mat)):
         return
-    fig, ax = plt.subplots(figsize=(max(6, 1.5 * len(hidden_values)), max(5, 0.5 * len(num_tokens_values))))
+    fig, ax = plt.subplots(
+        figsize=(max(6, 1.5 * len(hidden_values)), max(5, 0.5 * len(num_tokens_values)))
+    )
     norm = mcolors.TwoSlopeNorm(
         vmin=min(0.5, np.nanmin(mat)), vcenter=1.0, vmax=max(1.5, np.nanmax(mat))
     )
@@ -348,11 +354,20 @@ def create_heatmap(
     for i in range(len(num_tokens_values)):
         for j in range(len(hidden_values)):
             if not np.isnan(mat[i, j]):
-                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center", fontsize=8,
-                        color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black")
+                ax.text(
+                    j,
+                    i,
+                    f"{mat[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if mat[i, j] < 0.7 or mat[i, j] > 1.5 else "black",
+                )
     ax.set_xlabel("hidden_dim")
     ax.set_ylabel("num_tokens")
-    ax.set_title(f"per_token_group_quant_8bit: {provider} speedup vs {baseline}\n(>1.0 = {provider} faster)")
+    ax.set_title(
+        f"per_token_group_quant_8bit: {provider} speedup vs {baseline}\n(>1.0 = {provider} faster)"
+    )
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches="tight")
     print(f"Saved heatmap to {output_file}")
@@ -371,9 +386,15 @@ def main():
         default=",".join(ALL_PROVIDERS),
         help=f"Comma-separated subset of {ALL_PROVIDERS}",
     )
-    parser.add_argument("--baseline", type=str, default="sgl", help="Speedup baseline provider")
-    parser.add_argument("--output-prefix", type=str, default="per_token_group_quant_8bit")
-    parser.add_argument("--csv", type=str, default=None, help="Write raw medians to CSV")
+    parser.add_argument(
+        "--baseline", type=str, default="sgl", help="Speedup baseline provider"
+    )
+    parser.add_argument(
+        "--output-prefix", type=str, default="per_token_group_quant_8bit"
+    )
+    parser.add_argument(
+        "--csv", type=str, default=None, help="Write raw medians to CSV"
+    )
     args = parser.parse_args()
 
     dst_dtype = torch.float8_e4m3fn if args.dst_dtype == "fp8_e4m3" else torch.int8
@@ -404,7 +425,11 @@ def main():
     for p in providers:
         if p != baseline:
             create_heatmap(
-                num_tokens_values, hidden_values, results, p, baseline,
+                num_tokens_values,
+                hidden_values,
+                results,
+                p,
+                baseline,
                 f"{args.output_prefix}_{p}_vs_{baseline}_{args.dst_dtype}.png",
             )
 
