@@ -292,12 +292,14 @@ def _get_default_kernel_configs():
 
 
 def _masked_bmm_autotune(stream, a, b, c, masked_m, Q, M, N, transpose_a, transpose_b):
+    """Autotuned launch for the masked BMM kernel."""
     NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
 
     transpose_a_int = 1 if transpose_a else 0
     transpose_b_int = 1 if transpose_b else 0
 
     def args_fn(cfg):
+        """Kernel arguments for one autotune candidate."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         BK = cfg.BLOCK_K
@@ -317,6 +319,7 @@ def _masked_bmm_autotune(stream, a, b, c, masked_m, Q, M, N, transpose_a, transp
         )
 
     def grid_fn(cfg):
+        """Grid for one autotune candidate: the persistent program count."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         num_pid_m = ct.cdiv(M, BM)
@@ -327,6 +330,7 @@ def _masked_bmm_autotune(stream, a, b, c, masked_m, Q, M, N, transpose_a, transp
         return (num_programs, 1, 1)
 
     def hints_fn(cfg):
+        """Launch hints (CTA count and occupancy) for one autotune candidate."""
         return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
     K = a.shape[1] if transpose_a else a.shape[2]
