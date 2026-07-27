@@ -311,8 +311,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
       ``(GLOBAL expert_id << 16) | bf16(weight)`` (the kernel maps global ids to the
       local shard via the separately passed ``local_expert_offset``).
     * **unpacked pre-routed** (``RoutingInputMode.UnpackedPrecomputed``): the
-      pack carries plain int32 ids plus BF16 weights, which are forwarded as
-      separate kernel inputs without packed-id construction.
+      pack carries plain int32 ids plus BF16 or FP32 weights, which are
+      forwarded as separate kernel inputs without packed-id construction.
     * **in-kernel** (``RoutingInputMode.FromLogits``): the pack carries
       ``routing_logits`` (+ optional ``routing_bias``); the kernel computes the top-k
       selection per ``RoutingConfig.method`` and writes ``topk_ids`` / ``topk_weights``
@@ -431,7 +431,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         Routing mode is read from ``act.routing_input_mode``: ``FromLogits`` drives
         in-kernel routing from ``act.routing_logits``; ``PackedPrecomputed`` packs the
         pre-routed ``act.topk_ids`` / ``act.topk_weights``; and
-        ``UnpackedPrecomputed`` forwards int32 ids plus BF16 weights directly.
+        ``UnpackedPrecomputed`` forwards int32 ids plus BF16 or FP32 weights directly.
 
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
         on the config this runner was built with.  ``topk_ids`` carries
