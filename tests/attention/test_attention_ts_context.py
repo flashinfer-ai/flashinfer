@@ -789,10 +789,11 @@ def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe
     assert cfg.stage_kv_by_head_dim is True
     assert cfg.has_tmem_p_pipeline is True
     assert cfg.kv_stage >= cadence_stages
-    # Persistent D256 must keep correction statistics in the compact SMEM
-    # ring. Sharing its S/P TMEM columns is racy when producer latency varies
-    # across work tiles (most visibly for causal paged KV).
-    assert cfg.stats_via_smem is True
+    expected_staged = input_dtype == Float8E4M3FN and not use_paged_kv
+    assert cfg.staged_head_dim is expected_staged
+    # The generic persistent topology keeps correction statistics in SMEM.
+    # The staged topology uses a dedicated TMEM handoff instead.
+    assert cfg.stats_via_smem is not expected_staged
     assert cfg.mma_corr_stage == 1
     assert cfg.stages_page_offsets_in_smem is use_paged_kv
 
@@ -805,6 +806,89 @@ def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe
         assert cfg.page_table_window_entries % pages_per_tile == 0
     else:
         assert cfg.page_offset_pipeline_stage_counts == ()
+
+
+@pytest.mark.parametrize(
+    "output_dtype",
+    (Float8E4M3FN, BFloat16, Float16),
+    ids=("fp8", "bf16", "fp16"),
+)
+def test_attention_ts_context_d256_contiguous_uses_explicit_staged_schedule(
+    output_dtype,
+):
+    """Contiguous D256 lowers to the full-Q, two-slice task topology."""
+
+    cfg = FmhaTs(
+        in_dtype=Float8E4M3FN,
+        out_dtype=output_dtype,
+        d=256,
+        is_persistent=True,
+        use_paged_kv=False,
+    ).cfg
+
+    assert cfg.staged_head_dim is True
+    assert cfg.qk_mma_tiler == (128, 128, 128)
+    assert cfg.pv_mma_tiler == (128, 128, 128)
+    assert cfg.sQ_shape == (1, 128 * 256)
+    assert cfg.sK_shape == (4, 128 * 128)
+    assert cfg.num_head_dim_stages == 2
+    assert cfg.kv_stage == 4
+    assert cfg.mma_softmax_stage == 2
+    assert cfg.softmax_corr_stage == 1
+    assert cfg.mma_corr_stage == 1
+    assert (cfg.tmem_s0_offset, cfg.tmem_p0_offset) == (0, 32)
+    assert (cfg.tmem_o0_offset, cfg.tmem_o1_offset) == (256, 384)
+    assert cfg.softmax0_warp_ids == (0, 1, 2, 3)
+    assert cfg.correction_warp_ids == (4, 5, 6, 7)
+    assert (cfg.mma_warp_id, cfg.epilogue_warp_id, cfg.empty_warp_id) == (8, 9, 10)
+    assert cfg.load_warp_id == 11
+    assert (cfg.num_regs_softmax, cfg.num_regs_correction, cfg.num_regs_other) == (
+        200,
+        128,
+        32,
+    )
+
+
+@pytest.mark.parametrize("is_clc_dynamic", (False, True), ids=("static", "clc"))
+def test_attention_ts_context_d256_staged_task_graph_is_safe(
+    is_clc_dynamic: bool,
+):
+    """The explicit D256 schedule validates with static and CLC queues."""
+
+    cfg = FmhaTs(
+        in_dtype=Float8E4M3FN,
+        out_dtype=Float8E4M3FN,
+        d=256,
+        is_persistent=True,
+        is_clc_dynamic=is_clc_dynamic,
+    ).cfg
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        task_manager, _, _, _, work_queue, _ = build_fmha_task_manager(
+            cfg,
+            tile_sched_params=None,
+            tma_q_desc=None,
+            tma_k_desc=None,
+            tma_v_desc=None,
+            tma_o_desc=None,
+            cum_seqlen_q=None,
+            cum_seqlen_k=None,
+            num_kv_tiles=4,
+            is_persistent=True,
+            is_clc_dynamic=is_clc_dynamic,
+            exhaustive_deadlock_race_check=True,
+        )
+
+    tasks = {task.name: task for task in task_manager.tasks}
+    assert tasks["SoftmaxTaskStagedD"].warp_idx == 0
+    assert tasks["CorrectionEpilogueTaskStagedD"].warp_idx == 4
+    assert tasks["MmaTaskStagedD"].warp_idx == 8
+    assert tasks["LoadTaskStagedD"].warp_idx == 11
+    assert tasks["PaddingTask"].warp_idx == 10
+    scheduler_name = "SchedulerTask" if is_clc_dynamic else "EpiloguePaddingTask"
+    assert tasks[scheduler_name].warp_idx == 9
+    assert work_queue is not None
 
 
 @pytest.mark.parametrize(
@@ -870,6 +954,22 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    (
+        pytest.param((10, 0), False, id="sm100"),
+        pytest.param((10, 3), True, id="sm103"),
+    ),
+)
+def test_attention_ts_context_staged_d256_policy_is_arch_specific(
+    capability: tuple[int, int],
+    expected: bool,
+):
+    """The explicit schedule avoids its measured SM100 scoreboard regression."""
+
+    assert context_module._use_staged_d256_schedule(capability) is expected
 
 
 @pytest.mark.parametrize(
@@ -2107,6 +2207,53 @@ def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
     for _ in range(2):
         output = wrapper.run(case.q, case.k, case.v)
         _assert_context_correct(output, case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize(
+    ("q_length", "kv_length", "num_qo_heads", "seed"),
+    (
+        pytest.param(129, 257, 8, 2026072701, id="partial-tail"),
+        pytest.param(512, 512, 32, 2026072702, id="target-shape"),
+    ),
+)
+def test_attention_ts_context_d256_fp8_fixed_dense_runtime(
+    q_length: int,
+    kv_length: int,
+    num_qo_heads: int,
+    seed: int,
+):
+    """The explicit D256 schedule matches an E4M3-quantized output oracle."""
+
+    case = _make_context_case(
+        q_lengths=(q_length,),
+        k_lengths=(kv_length,),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=2,
+        head_dim=256,
+        qkv_dtype=_FP8,
+        packed=False,
+        mask_type="dense",
+        output_dtype=_FP8,
+        device="cuda",
+        seed=seed,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    policy = dict(wrapper._policy)
+    assert policy["scheduler"] == "static_persistent"
+    capability = torch.cuda.get_device_capability(case.q.device)
+    expected_schedule = "staged" if capability == (10, 3) else "generic"
+    assert policy["head_dim_schedule"] == expected_schedule
+
+    output = wrapper.run(case.q, case.k, case.v)
+    expected = _context_reference(case).to(_FP8).float()
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(output.float(), expected, rtol=5e-2, atol=2.5e-1)
+    denominator = torch.linalg.vector_norm(expected).clamp_min(1e-6)
+    relative_l2 = torch.linalg.vector_norm(output.float() - expected) / denominator
+    assert float(relative_l2) <= 1e-1
 
 
 @pytest.mark.arch_blackwell
