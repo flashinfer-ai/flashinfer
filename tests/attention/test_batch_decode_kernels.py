@@ -126,6 +126,7 @@ def test_batch_decode_with_paged_kv_cache(
 ):
     # cuTile decode backend capability bounds (mirror the NotImplemented guards
     # in BatchDecodeWithPagedKVCacheWrapper.run for backend=="cutile").
+    """Paged decode must match the reference across backends, layouts and dtypes."""
     if backend == "cutile":
         if kv_layout != "NHD":
             pytest.skip("cuTile decode requires kv_layout='NHD'.")

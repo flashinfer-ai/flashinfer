@@ -61,6 +61,7 @@ DTYPE = torch.bfloat16
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile paged-decode backend."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.decode import (  # noqa: F401
@@ -73,6 +74,7 @@ def _has_cutile() -> bool:
 
 
 def _has_trtllm() -> bool:
+    """True if the installed flashinfer exposes the trtllm-gen decode entry point."""
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
 
@@ -99,6 +101,7 @@ class _GQAInputs:
     """
 
     def __init__(self, batch: int, s_kv: int, page_size: int, device):
+        """Build the paged-GQA tensors for one (batch, s_kv, page_size) case."""
         torch.manual_seed(0)
         pages_per_batch = math.ceil(s_kv / page_size)
         total_pages = max(batch * pages_per_batch + 8, 64)
@@ -143,6 +146,7 @@ class _GQAInputs:
 # Per-provider callables
 # --------------------------------------------------------------------------- #
 def _make_execute(provider: str, inp: _GQAInputs) -> Callable[[], torch.Tensor]:
+    """Return a zero-arg callable running `provider`'s GQA decode on `inp`."""
     device = inp.q.device
 
     if provider == "cutile":
@@ -169,6 +173,7 @@ def _make_execute(provider: str, inp: _GQAInputs) -> Callable[[], torch.Tensor]:
         )
 
         def run():
+            """Run cuTile paged GQA decode through the planned wrapper."""
             return wrapper.run(inp.q, (inp.k_cache, inp.v_cache))
 
     elif provider == "trtllm":
@@ -182,6 +187,7 @@ def _make_execute(provider: str, inp: _GQAInputs) -> Callable[[], torch.Tensor]:
         v_hnd = inp.v_cache.transpose(1, 2).contiguous()
 
         def run():
+            """Run trtllm-gen paged GQA decode on the HND cache view."""
             return trtllm_batch_decode_with_kv_cache(
                 query=inp.q,
                 kv_cache=(k_hnd, v_hnd),
@@ -334,6 +340,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, results: Dict[str, Dict[Tuple[int, int, int], float]]):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(
@@ -419,6 +426,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep the shapes, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark GQA decode: cuTile vs trtllm-gen SOTA"
     )
