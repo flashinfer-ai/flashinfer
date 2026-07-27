@@ -6,6 +6,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Iterable
 
 from .models import base_function_for_nodeid, source_file_for_nodeid
@@ -62,6 +63,15 @@ class EstimateBook:
         }
         self._overhead_profiles = frozenset(
             estimate.profile for estimate in self.overheads
+        )
+        overhead_seconds = [
+            estimate.process_startup_seconds + estimate.source_warmup_seconds
+            for estimate in self.overheads
+        ]
+        # Each row predicts one source file, so sample_count must not bias the
+        # default toward a few heavily sampled files.
+        self._default_overhead_seconds = (
+            median(overhead_seconds) if overhead_seconds else 0.0
         )
         self._function: dict[tuple[str, str], list[float]] = defaultdict(list)
         self._source: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -205,11 +215,12 @@ class EstimateBook:
                 if source == source_file and other_profile in fallback_profiles
             ]
             if not alternatives:
-                return 0
-            seconds = max(
-                item.process_startup_seconds + item.source_warmup_seconds
-                for item in alternatives
-            )
+                seconds = self._default_overhead_seconds
+            else:
+                seconds = max(
+                    item.process_startup_seconds + item.source_warmup_seconds
+                    for item in alternatives
+                )
         else:
             seconds = exact.process_startup_seconds + exact.source_warmup_seconds
         return max(0, round(seconds * 1000))

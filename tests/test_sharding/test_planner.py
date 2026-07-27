@@ -160,6 +160,31 @@ def test_unknown_profile_prefers_b300_overhead_fallbacks() -> None:
     assert book.overhead_ms(source_file, "new-profile") == 8000
 
 
+def test_missing_source_overhead_uses_overall_median() -> None:
+    book = EstimateBook(
+        overheads=[
+            OverheadEstimate("current", "tests/test_a.py", 1.0, 2.0, 1),
+            OverheadEstimate("current", "tests/test_b.py", 2.0, 5.0, 10),
+            OverheadEstimate("current", "tests/test_c.py", 8.0, 12.0, 100),
+            OverheadEstimate("other", "tests/test_d.py", 50.0, 50.0, 1),
+        ]
+    )
+
+    assert book.overhead_ms("tests/test_new.py", "current") == 13500
+
+
+def test_missing_profile_overhead_uses_overall_median() -> None:
+    book = EstimateBook(
+        overheads=[
+            OverheadEstimate("sm103-cuda12", "tests/test_a.py", 1.0, 3.0, 1),
+            OverheadEstimate("sm103-cuda13", "tests/test_b.py", 4.0, 6.0, 1),
+            OverheadEstimate("unrelated-profile", "tests/test_c.py", 50.0, 50.0, 1),
+        ]
+    )
+
+    assert book.overhead_ms("tests/test_new.py", "new-profile") == 10000
+
+
 def test_b300_preference_only_applies_when_target_profile_is_absent() -> None:
     requested_node = "tests/test_x.py::test_case[requested]"
     book = EstimateBook(

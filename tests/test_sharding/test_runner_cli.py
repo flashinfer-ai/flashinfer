@@ -440,7 +440,7 @@ def test_fails():
     assert summary["capacity"]["estimated_makespan_ms"] > 0
     assert not list((tmp_path / "junit").glob("unit-*.xml"))
     batch_xml = sorted((tmp_path / "junit").glob("units/*/batches/batch-*.xml"))
-    assert len(batch_xml) == 2
+    assert len(batch_xml) == 1
     assert all(ET.parse(path).getroot().tag == "testsuites" for path in batch_xml)
     assert not (tmp_path / "junit" / ".state").exists()
 
@@ -635,10 +635,8 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
 ) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
-    (suite / "test_sample.py").write_text(
-        "def test_one(): pass\ndef test_two(): pass\n",
-        encoding="utf-8",
-    )
+    (suite / "test_one.py").write_text("def test_one(): pass\n", encoding="utf-8")
+    (suite / "test_two.py").write_text("def test_two(): pass\n", encoding="utf-8")
     partial = _run(
         tmp_path,
         "run",
