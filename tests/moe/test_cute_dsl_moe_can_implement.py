@@ -1,10 +1,9 @@
-"""Directed host-side checks for the gh #3957 can_implement N-tile guards.
+"""Directed host-side checks for the gh #3957 N-tail handling.
 
-The CuteDSL MoE epilogues store full CTA-tile rows with no column predicate
-(finalize: raw-pointer ``cp.reduce.async.bulk`` scatter; gemm1: unpredicated
-SFC ``autovec_copy``), so ``can_implement`` must reject any tactic whose
-N-tiling leaves a partial CTA tile or a cluster-padding CTA along N.
-These are pure classmethod checks -- no GPU work.
+The finalize epilogue limits its bulk transfer to the remaining output columns,
+including for cluster-padding CTAs. The gemm1 SFC store is still unpredicated,
+so only gemm1 must reject configurations that leave a partial N tile. These are
+pure classmethod checks -- no GPU work.
 """
 
 import pytest
@@ -59,29 +58,26 @@ def _gemm1_ok(n, mma_tiler_mn, cluster_shape_mn):
 @pytest.mark.parametrize(
     "n,mma,cluster,expect",
     [
-        # The observed gh #3957 combo: 1 N-tile but 2 CTAs/cluster along N ->
-        # the padding CTA bulk-reduces one full tile past the output columns.
-        (256, (128, 256), (1, 2), False),
+        # A padding CTA has no remaining columns and skips its row transfer.
+        (256, (128, 256), (1, 2), True),
         # 2 exact tiles / cluster_n=2 -> exact cluster tiling: fine.
         (512, (128, 256), (1, 2), True),
-        # Partial N-tile (384 = 1.5 tiles): the second CTA writes columns
-        # 256..511 of a 384-wide output. Must reject even though
-        # ceil_div(384,256)=2 divides cluster_n=2 (the draft guard's miss).
-        (384, (128, 256), (1, 2), False),
-        # Same partial tile without any cluster: still an overrun.
-        (384, (128, 256), (1, 1), False),
+        # A partial tile transfers only columns 256..383.
+        (384, (128, 256), (1, 2), True),
+        # The same tail handling applies without an N cluster.
+        (384, (128, 256), (1, 1), True),
         # 3 exact 128-tiles, no cluster: fine.
         (384, (128, 128), (1, 1), True),
     ],
 )
-def test_finalize_n_tiling_guard(n, mma, cluster, expect):
+def test_finalize_n_tiling(n, mma, cluster, expect):
     assert _finalize_ok(n, mma, cluster) is expect
 
 
 @pytest.mark.parametrize(
     "n,mma,expect",
     [
-        # Partial N-tile under mma_n=256: the unpredicated SFC store overruns.
+        # The scale-factor store requires exact tiling under mma_n=256.
         (384, (128, 256), False),
         # Exact tiling: fine.
         (512, (128, 256), True),
