@@ -57,8 +57,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
-  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107)) ||
-      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107))) {
+  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103)) ||
+      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103))) {
     return true;
   }
   return false;
@@ -67,8 +67,6 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
 constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
   if (gpuSM == kSM_103) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
-  } else if (gpuSM == kSM_107) {
-    return kernelSM == kSM_100f || kernelSM == kSM_107;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
@@ -119,70 +117,12 @@ class TllmGenFmhaKernel {
         mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
-        mSM(smArch),
-        mMaxDeviceSmemSize(queryMaxDeviceSmemSize(smArch)) {}
-
-  static constexpr unsigned int kSmemOptInThreshold = 48 * 1024;
-  static constexpr unsigned int kRubinLegacySmemCap = 228 * 1024;
-  static constexpr unsigned int kStaticSmemReserve = 1024;
-
-  static bool isRubinOversized(unsigned int sm, unsigned int sharedMemBytes) {
-    return sm == kSM_107 && (sharedMemBytes + kStaticSmemReserve > kRubinLegacySmemCap);
-  }
-
-  void setupKernelSmem(CUfunction func, KernelMeta const& kernelMeta) const {
-#if CUDA_VERSION >= 13030
-    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
-      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
-                                    CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
-      return;
-    }
-#endif
-    if (kernelMeta.mSharedMemBytes >= kSmemOptInThreshold) {
-      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                    kernelMeta.mSharedMemBytes));
-    }
-  }
-
-  void appendOversizedSmemLaunchAttr(CUlaunchAttribute* launch_attribute,
-                                     CUlaunchConfig& launch_config,
-                                     KernelMeta const& kernelMeta) const {
-#if CUDA_VERSION >= 13030
-    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
-      IKL_LOG_DEBUG(
-          "TRTLLM-Gen launch info: using oversized shared memory for kernel %s (smem=%u bytes)",
-          kernelMeta.mFuncName, kernelMeta.mSharedMemBytes);
-      launch_attribute[launch_config.numAttrs].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
-      launch_attribute[launch_config.numAttrs].value.sharedMemoryMode =
-          CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
-      launch_config.numAttrs += 1;
-    }
-#endif
-  }
-
-  static unsigned int queryMaxDeviceSmemSize(unsigned int smArch) {
-    CUdevice device;
-    cuErrCheck(cuCtxGetDevice(&device));
-    int smem_bytes = 0;
-#if CUDA_VERSION >= 13030
-    if (smArch == kSM_107) {
-      cuErrCheck(cuDeviceGetAttribute(
-          &smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
-      return static_cast<unsigned int>(smem_bytes);
-    }
-#endif
-    cuErrCheck(cuDeviceGetAttribute(&smem_bytes,
-                                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
-    return static_cast<unsigned int>(smem_bytes);
-  }
+        mSM(smArch) {}
 
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
-      if (kernelMeta.mSharedMemBytes + kStaticSmemReserve > mMaxDeviceSmemSize) {
-        continue;
-      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -338,7 +278,7 @@ class TllmGenFmhaKernel {
     kernelParams.mLogNumEltsPerSageAttnBlkV = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkV);
 
     void* kernelParamsList[] = {&kernelParams};
-    CUlaunchAttribute launch_attribute[4] = {};
+    CUlaunchAttribute launch_attribute[3];
     CUlaunchConfig launch_config;
     buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
 
@@ -425,7 +365,6 @@ class TllmGenFmhaKernel {
     launch_attribute[2].value.programmaticStreamSerializationAllowed = params.enable_pdl;
     launch_config.attrs = launch_attribute;
     launch_config.numAttrs = 3;
-    appendOversizedSmemLaunchAttr(launch_attribute, launch_config, kernelMeta);
   }
 
   // Enable non-portable cluster sizes when clusterDimX exceeds the portable limit of 8.
@@ -1087,7 +1026,11 @@ class TllmGenFmhaKernel {
       funcInfo.mMetaInfoIndex = metaIndex;
       cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
 
-      setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
+      if (kernelMeta.mSharedMemBytes >= 48 * 1024) {
+        cuErrCheck(cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                      kernelMeta.mSharedMemBytes));
+      }
 
       // Cache the loaded function.
       mFunctions[hashId] = funcInfo;
@@ -1108,7 +1051,6 @@ class TllmGenFmhaKernel {
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
-  unsigned int mMaxDeviceSmemSize;
   mutable std::unordered_map<std::string, CUmodule> mModules;
 
   mutable std::unordered_map<uint64_t, unsigned int> mKernelMetaMap;
