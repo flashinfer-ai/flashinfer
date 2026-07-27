@@ -1218,22 +1218,25 @@ def test_spec_decode_separate_source_and_beta_logits(D):
     assert torch.equal(source_backing, source_backing_before)
 
 
+_BACKEND_SELECTION_CASES = [
+    (128, 1, 1, True, "D128-T1-small-grid"),
+    (128, 1, 1536, True, "D128-T1-last-measured-one-warp-win"),
+    (128, 1, 1919, True, "D128-T1-cutoff-minus-one"),
+    (128, 1, 1920, False, "D128-T1-cutoff"),
+    (128, 1, 3072, False, "D128-T1-large-grid"),
+    (128, 3, 96, False, "D128-spec-decode"),
+    (64, 1, 8, True, "D64-T1-small-grid"),
+    (64, 1, 1536, True, "D64-T1-last-measured-one-warp-win"),
+    (64, 1, 7679, True, "D64-T1-cutoff-minus-one"),
+    (64, 1, 7680, False, "D64-T1-cutoff"),
+    (64, 1, 12288, False, "D64-T1-large-grid"),
+    (64, 3, 96, False, "D64-spec-decode"),
+]
+
+
 @pytest.mark.parametrize(
     ("D", "num_tokens", "sequence_heads", "expected"),
-    [
-        pytest.param(128, 1, 1, True, id="D128-T1-small-grid"),
-        pytest.param(128, 1, 1536, True, id="D128-T1-last-measured-one-warp-win"),
-        pytest.param(128, 1, 1919, True, id="D128-T1-cutoff-minus-one"),
-        pytest.param(128, 1, 1920, False, id="D128-T1-cutoff"),
-        pytest.param(128, 1, 3072, False, id="D128-T1-large-grid"),
-        pytest.param(128, 3, 96, False, id="D128-spec-decode"),
-        pytest.param(64, 1, 8, True, id="D64-T1-small-grid"),
-        pytest.param(64, 1, 1536, True, id="D64-T1-last-measured-one-warp-win"),
-        pytest.param(64, 1, 7679, True, id="D64-T1-cutoff-minus-one"),
-        pytest.param(64, 1, 7680, False, id="D64-T1-cutoff"),
-        pytest.param(64, 1, 12288, False, id="D64-T1-large-grid"),
-        pytest.param(64, 3, 96, False, id="D64-spec-decode"),
-    ],
+    [pytest.param(*case[:-1], id=case[-1]) for case in _BACKEND_SELECTION_CASES],
 )
 def test_backend_selection(D, num_tokens, sequence_heads, expected):
     assert (

@@ -57,22 +57,13 @@ import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead kernel dispat
 DOT_REDUCTION_TREE = 0
 DOT_REDUCTION_DUAL_ACCUM = 1
 
-# B300 crossover sweeps: D128 grouped-CTA wins from 1,920 sequence-heads; D64 from
-# 7,680. Below each cutoff, single-token decode stays on one-warp.
-D128_GROUPED_MIN_SEQUENCE_HEADS = 1920
-D64_GROUPED_MIN_SEQUENCE_HEADS = 7680
-
-
-def _grouped_min_sequence_heads(head_dim: int) -> int:
-    if head_dim == 128:
-        return D128_GROUPED_MIN_SEQUENCE_HEADS
-    return D64_GROUPED_MIN_SEQUENCE_HEADS
+# B300 crossover sweeps: grouped-CTA wins from these sequence-head cutoffs.
+# Single-token decode below each cutoff stays on one-warp.
+GROUPED_MIN_SEQUENCE_HEADS = {64: 7680, 128: 1920}
 
 
 def _use_one_warp(head_dim: int, num_tokens: int, sequence_heads: int) -> bool:
-    if num_tokens != 1:
-        return False
-    return sequence_heads < _grouped_min_sequence_heads(head_dim)
+    return num_tokens == 1 and sequence_heads < GROUPED_MIN_SEQUENCE_HEADS[head_dim]
 
 
 # ==============================================================================
@@ -1464,7 +1455,7 @@ def run_recurrent_kda(
             )
         grid_seqs = B
         sequence_heads = grid_seqs * HV
-        use_one_warp = _use_one_warp(K, 1, sequence_heads)
+        use_one_warp = _use_one_warp(K, NUM_TOKENS, sequence_heads)
         cu_seqlens_i32 = None
         ssi = None
         copy_back_indices = None
