@@ -1023,12 +1023,13 @@ def _top_k_page_table_transform_reference(
     **_unused,
 ) -> torch.Tensor:
     """Reference for top_k_page_table_transform: per-row top-k selection on
-    the leading ``lengths[i]`` valid entries, then translate the selected
-    indices through ``src_page_table[row_to_batch[i]]``. Used in sparse
-    attention's second stage to produce per-row page-id sequences.
+    the score window starting at ``row_starts[i]``, then translate the selected
+    local indices from the page-table window starting at
+    ``page_table_row_starts[i]``. Used in sparse attention's second stage to
+    produce per-row page-id sequences.
     """
     num_rows = input.shape[0]
-    out = torch.zeros(num_rows, int(k), dtype=torch.int32, device=input.device)
+    out = torch.full((num_rows, int(k)), -1, dtype=torch.int32, device=input.device)
     for i in range(num_rows):
         L = int(lengths[i].item())
         if L <= 0:

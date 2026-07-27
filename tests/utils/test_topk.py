@@ -679,13 +679,28 @@ def test_top_k_transform_with_row_starts(
         row_starts=row_starts,
         page_table_row_starts=page_table_row_starts,
     )
+    from flashinfer.trace.templates.sampling import (
+        top_k_page_table_transform_trace,
+    )
+
+    trace_ref_page = top_k_page_table_transform_trace.reference(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+    )
 
     ref_ragged = reference_ragged_transform(
         scores, offsets, lengths, k, row_starts=row_starts
     )
     output_page_sorted, _ = torch.sort(output_page, dim=-1)
     ref_page_sorted, _ = torch.sort(ref_page, dim=-1)
+    trace_ref_page_sorted, _ = torch.sort(trace_ref_page, dim=-1)
     assert torch.equal(output_page_sorted, ref_page_sorted)
+    assert torch.equal(trace_ref_page_sorted, ref_page_sorted)
 
     output_ragged_sorted, _ = torch.sort(output_ragged, dim=-1)
     ref_ragged_sorted, _ = torch.sort(ref_ragged, dim=-1)
