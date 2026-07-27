@@ -341,11 +341,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
         variant = self.config.quant.variant
-        if variant in (
-            QuantVariant.NVFP4,
-            QuantVariant.MXFP4,
-            QuantVariant.W4A16,
-        ):
+        if variant in self.supported_quant_variants:
             from ..utils import get_compute_capability
 
             # TODO: Route NVFP4 on SM120/SM121 to B12x once default dispatch can

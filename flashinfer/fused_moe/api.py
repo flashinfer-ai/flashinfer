@@ -254,8 +254,8 @@ class TrtllmFp4Config:
         """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
-        ``variant`` selects NVFP4 or the shared MXFP4 weight format used by
-        MXFP4×MXFP8 and MXFP4×BF16.
+        ``variant`` selects NVFP4, MXFP4×MXFP8, or ``QuantVariant.W4A16``
+        (MXFP4 weights × BF16 activations).
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
         """
         from .prepare import prepare_trtllm_fp4_weights
@@ -277,7 +277,10 @@ class TrtllmFp4Config:
         *,
         variant: QuantVariant = QuantVariant.NVFP4,
     ):
-        """Quantize activations for NVFP4, MXFP4×MXFP8, or MXFP4×BF16."""
+        """Prepare activations for NVFP4, MXFP4×MXFP8, or ``QuantVariant.W4A16``.
+
+        W4A16 returns raw BF16 activations without an activation scale.
+        """
         from .prepare import prepare_trtllm_fp4_activations
 
         return prepare_trtllm_fp4_activations(

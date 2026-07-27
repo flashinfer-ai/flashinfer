@@ -436,9 +436,9 @@ def prepare_trtllm_fp4_weights(
     -------
     dict
         Keys expected by ``TrtllmFp4RoutedRunner.pack_inputs``: ``gemm1_weights``,
-        ``gemm1_weights_scale``, ``gemm1_alpha``, ``gemm2_weights``,
-        ``gemm2_weights_scale``, ``output1_scale_scalar``,
-        ``output1_scale_gate_scalar``, ``output2_scale_scalar``.
+        ``gemm1_weights_scale``, ``gemm2_weights``, ``gemm2_weights_scale``,
+        ``output1_scale_scalar``, ``output1_scale_gate_scalar``,
+        ``output2_scale_scalar``, and, for NVFP4 only, ``gemm1_alpha``.
     """
     from ..fp4_quantization import fp4_quantize
     from ..quantization.fp4_quantization import block_scale_interleave
