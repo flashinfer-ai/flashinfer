@@ -117,9 +117,17 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
         if (options.mBiasDtype != mOptions.biasDtype) continue;
       }
-      if (mOptions.usePerTokenScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      bool const usesPerTokenScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfB : options.mUsePerTokenSfA;
+      if (mOptions.usePerTokenScaling && !usesPerTokenScaling) continue;
+      // The MoE pipeline allocates and consumes output scaling factors in the
+      // block format's default dtype. Reject cubins that override that
+      // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
+      // scaling factors into a buffer sized for E4M3 factors.
+      if (tg::dtypeIsBlockFmt(options.mDtypeC)) {
+        if (options.mDtypeSfC != tg::dtypeGetBlockSfType(options.mDtypeC)) continue;
+      } else if (options.mDtypeSfC != Dtype::Void) {
+        continue;
       }
       if (mOptions.usePerChannelScaling) {
         if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
