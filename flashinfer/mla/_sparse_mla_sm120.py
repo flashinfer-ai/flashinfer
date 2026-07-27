@@ -818,11 +818,17 @@ def _get_sparse_mla_decode_dsv3_module(model_type: int):
 
 
 @functools.cache
-def _get_sparse_mla_decode_dsv4_module():
+def _get_sparse_mla_decode_dsv4_module(model_type: int):
     module = gen_sparse_mla_sm120_module().build_and_load()
 
     class SparseMlaDecodeV3Runner(TunableRunner):
         """Tactic = chunks_per_block ∈ [1, num_splits]; ≤0 → C++ heuristic."""
+
+        def __init__(self, model_type: int) -> None:
+            self.model_type = int(model_type)
+
+        def __hash__(self) -> int:
+            return hash((self.__class__.__name__, self.model_type))
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             topk_length = inputs[6] if len(inputs) > 6 else None
@@ -830,7 +836,11 @@ def _get_sparse_mla_decode_dsv4_module():
             extra_indices = inputs[8] if len(inputs) > 8 else None
             extra_topk_length = inputs[9] if len(inputs) > 9 else None
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+            # model_type selects the KV layout (FP8 584 B/token vs NVFP4
+            # 360 B/token), which changes the optimal chunks_per_block at an
+            # otherwise identical shape, so it must key the profiling cache.
             return (
+                self.model_type,
                 topk_length is not None,
                 attn_sink is not None,
                 int(extra_topk),
@@ -861,7 +871,6 @@ def _get_sparse_mla_decode_dsv4_module():
             sm_scale = kwargs["sm_scale"]
             kv_cache = kwargs["kv_cache"]
             extra_kv_cache = kwargs.get("extra_kv_cache")
-            model_type = kwargs.get("model_type", _MODEL_TYPE_DSV4)
             if len(inputs) > 6:
                 (
                     topk_length,
@@ -894,11 +903,14 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_indices,
                 extra_topk_length,
                 cpb_override,
-                int(model_type),
+                self.model_type,
             )
             return output
 
-    return SimpleNamespace(module=module, runner_cls=SparseMlaDecodeV3Runner)
+    return SimpleNamespace(
+        module=module,
+        runner_cls=lambda: SparseMlaDecodeV3Runner(model_type),
+    )
 
 
 def _decode_dsv4_num_token_buckets(*_args, **_kwargs):
@@ -1021,8 +1033,8 @@ def _decode_dsv3_2_runner_singleton(model_type: int):
 
 
 @functools.cache
-def _decode_dsv4_runner_singleton():
-    return _get_sparse_mla_decode_dsv4_module().runner_cls()
+def _decode_dsv4_runner_singleton(model_type: int):
+    return _get_sparse_mla_decode_dsv4_module(model_type).runner_cls()
 
 
 def _decode_dsv3_2_default_cache_path():
@@ -1274,7 +1286,7 @@ def sparse_mla_sm120_decode_dsv4(
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
 
-    runner = _decode_dsv4_runner_singleton()
+    runner = _decode_dsv4_runner_singleton(int(model_type))
     inputs = [
         q,
         indices,
@@ -1288,11 +1300,12 @@ def sparse_mla_sm120_decode_dsv4(
         extra_topk_length,
     ]
 
+    # model_type is bound on the runner (and keys its autotune cache entries),
+    # so it is not passed per-call.
     forward_kwargs = {
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
         "extra_kv_cache": extra_kv_cache,
-        "model_type": int(model_type),
     }
 
     if chunks_per_block is not None:
