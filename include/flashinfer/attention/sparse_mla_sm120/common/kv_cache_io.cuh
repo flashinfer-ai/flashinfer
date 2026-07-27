@@ -122,9 +122,14 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   // NVFP4: gmem nope is packed E2M1 (D_NOPE/2 bytes). TMA-copy the packed bytes
   // into the top of the smem row (offset D_NOPE - COPY_BYTES); the consumer expands
   // them in place to the full D_NOPE fp8 layout after the mbar wake
-  // (nvfp4_expand_rows_warp below). fp8: DST_OFF = 0.
-  constexpr int DST_OFF = KV::D_NOPE - COPY_BYTES;  // 0 fp8 / 224 nvfp4
-  static_assert(DST_OFF % 16 == 0 && COPY_BYTES % 16 == 0, "cp.async.bulk needs 16B alignment");
+  // (nvfp4_expand_rows_warp below). Every other model type bulk-copies a whole
+  // smem row -- the full-width nope for DSV4, nope plus the inline scales for
+  // DSV3_2/GLM_NSA -- so the copy starts at the base of the row.
+  constexpr int DST_OFF = KV::KV_IS_NVFP4 ? (KV::D_NOPE - COPY_BYTES) : 0;  // 224 nvfp4 / 0 else
+  static_assert(DST_OFF >= 0 && DST_OFF % 16 == 0 && COPY_BYTES % 16 == 0,
+                "cp.async.bulk needs a non-negative, 16B-aligned destination offset and size");
+  static_assert(DST_OFF + COPY_BYTES <= SMEM_STRIDE,
+                "bulk copy must land inside the smem row it is addressed to");
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * COPY_BYTES);
 
