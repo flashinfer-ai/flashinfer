@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple, Optional, cast
@@ -2532,6 +2533,168 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
             return result
 
         return _attach_fi_trace(wrapper, f, trace_template=trace)
+
+    if func is None:
+        return decorator
+    return decorator(func)
+
+
+# ---------------------------------------------------------------------------
+# Experimental API and backend gating
+#
+# See flashinfer/experimental/README.md for the full policy governing
+# experimental APIs and backends.
+# ---------------------------------------------------------------------------
+
+_EXPERIMENTAL_ENV_VAR = "FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES"
+
+
+class ExperimentalWarning(UserWarning):
+    """Warning emitted the first time a FlashInfer experimental API is called.
+
+    Experimental APIs and backends provide no compatibility or long-term
+    support guarantees and may change or be removed without deprecation.
+    """
+
+
+def is_experimental_enabled() -> bool:
+    """Return whether experimental features are permitted in this process.
+
+    Experimental features are permitted when the environment variable
+    ``FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES`` is set to ``1``.
+
+    Note that this flag *permits* experimental functionality; it never
+    *selects* it. Stable APIs must still require explicit opt-in (e.g. an
+    explicit ``backend=`` argument) to route to an experimental backend.
+
+    The environment variable is read on every call so the gate can be
+    toggled at runtime (e.g. in tests). The check is a single dict lookup
+    and is not a hot-path concern.
+    """
+    return os.environ.get(_EXPERIMENTAL_ENV_VAR, "0") == "1"
+
+
+def _experimental_disabled_message(
+    feature: str, tracking_issue: Optional[str] = None
+) -> str:
+    msg = (
+        f"'{feature}' is experimental FlashInfer functionality and is disabled "
+        f"by default. Set {_EXPERIMENTAL_ENV_VAR}=1 to enable it. Experimental "
+        f"features provide no compatibility guarantees and may change or be "
+        f"removed without deprecation."
+    )
+    if tracking_issue:
+        msg += f" Tracking issue: {tracking_issue}"
+    return msg
+
+
+def require_experimental(feature: str, tracking_issue: Optional[str] = None) -> None:
+    """Raise ``RuntimeError`` unless experimental features are enabled.
+
+    Use this in the thin core entry point of a *stable* API that exposes an
+    *experimental* backend through explicit selection, before handing off to
+    code under ``flashinfer.experimental``:
+
+    >>> if backend == "experimental_xyz":
+    ...     require_experimental("mm_xyz experimental backend", tracking_issue="...")
+    ...     from flashinfer.experimental import xyz  # deferred import
+    ...     return xyz.run(...)
+
+    Parameters
+    ----------
+    feature : str
+        Human-readable name of the experimental feature, used in the error
+        message.
+    tracking_issue : Optional[str]
+        URL of the tracking issue for this feature, appended to the error
+        message when provided.
+    """
+    if not is_experimental_enabled():
+        raise RuntimeError(_experimental_disabled_message(feature, tracking_issue))
+
+
+def flashinfer_experimental_api(
+    func: Callable = None,
+    *,
+    trace=None,
+    feature: Optional[str] = None,
+    tracking_issue: Optional[str] = None,
+) -> Callable:
+    """Decorator marking a public FlashInfer API as experimental.
+
+    Composes with :func:`flashinfer_api` (the wrapped function keeps API
+    logging, tensor dumping, and ``fi_trace`` support) and additionally:
+
+    - raises ``RuntimeError`` when called without
+      ``FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`` in the environment;
+    - emits an :class:`ExperimentalWarning` once per process on first use;
+    - sets ``is_experimental = True`` on the returned function so tooling can
+      mechanically identify experimental APIs;
+    - prepends an experimental-status warning to the docstring (picked up by
+      Sphinx).
+
+    Experimental APIs live in core (not under ``flashinfer.experimental``)
+    but must keep backend-specific logic under ``flashinfer.experimental``;
+    see ``flashinfer/experimental/README.md`` for the placement rules.
+
+    Parameters
+    ----------
+    trace : Optional[TraceTemplate]
+        Forwarded to :func:`flashinfer_api`. Optional for experimental APIs.
+    feature : Optional[str]
+        Human-readable feature name used in the gate error and warning.
+        Defaults to the function's qualified name.
+    tracking_issue : Optional[str]
+        URL of the feature's tracking issue. Optional in code, but required
+        by policy for merged experimental APIs (see the README); prefer
+        passing it so error messages point users at the feature's status.
+
+    Examples
+    --------
+    >>> @flashinfer_experimental_api(
+    ...     tracking_issue="https://github.com/flashinfer-ai/flashinfer/issues/1234"
+    ... )
+    ... def my_new_op(x, y):
+    ...     ...
+    """
+
+    def decorator(f: Callable) -> Callable:
+        logged = flashinfer_api(f, trace=trace)
+        feature_name = feature if feature is not None else f.__qualname__
+        warned = False
+
+        @functools.wraps(logged)
+        def wrapper(*args, **kwargs):
+            nonlocal warned
+            if not is_experimental_enabled():
+                raise RuntimeError(
+                    _experimental_disabled_message(feature_name, tracking_issue)
+                )
+            if not warned:
+                warned = True
+                warn_msg = (
+                    f"'{feature_name}' is an experimental FlashInfer API: it "
+                    f"provides no compatibility guarantees and may change or be "
+                    f"removed without deprecation."
+                )
+                if tracking_issue:
+                    warn_msg += f" Tracking issue: {tracking_issue}"
+                warnings.warn(warn_msg, ExperimentalWarning, stacklevel=2)
+            return logged(*args, **kwargs)
+
+        wrapper.is_experimental = True  # type: ignore[attr-defined]
+        wrapper.experimental_feature = feature_name  # type: ignore[attr-defined]
+        wrapper.tracking_issue = tracking_issue  # type: ignore[attr-defined]
+        banner = (
+            ".. warning::\n"
+            f"    ``{feature_name}`` is experimental. It requires "
+            f"``{_EXPERIMENTAL_ENV_VAR}=1``, provides no compatibility "
+            f"guarantees, and may change or be removed without deprecation."
+        )
+        wrapper.__doc__ = (
+            banner if logged.__doc__ is None else banner + "\n\n" + logged.__doc__
+        )
+        return wrapper
 
     if func is None:
         return decorator

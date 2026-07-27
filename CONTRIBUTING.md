@@ -39,6 +39,54 @@ Code Contribution Procedure
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
 
+# Experimental APIs and Backends
+
+FlashInfer distinguishes stable functionality (normal review and support
+expectations) from **experimental** functionality intended for fast-moving
+work such as client-GPU (e.g. SM12x) kernels. Two separate concerns:
+
+* an **experimental API** — a public interface that may change or disappear;
+* an **experimental backend** — an implementation not yet ready for stable support.
+
+A stable API may expose an experimental backend through explicit opt-in, and an
+experimental API must be clearly identified and gated.
+
+**Placement:**
+
+* Experimental **APIs** live in core, marked with `@flashinfer_experimental_api`
+  (defined in `flashinfer/api_logging.py`). The core entry point stays thin:
+  signature, shared validation, feature-gate check, explicit backend selection,
+  direct handoff.
+* Experimental **backends** and all backend-specific logic (support checks,
+  heuristics, routing, compilation, caching, kernels) live under
+  `flashinfer/experimental/`.
+
+**Gating:** all experimental behavior requires
+`FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`. The variable *permits*
+experimental functionality; it does not *select* it — stable APIs must never
+silently route to an experimental backend, and automatic routing (dispatch,
+autotuning, trace-apply) considers only stable backends.
+
+**Requirements for every experimental feature:**
+
+* a named owner and a tracking issue (use case, reason for the experimental
+  path, graduation plan and target release — default intent is graduation
+  within four weeks);
+* correctness tests against a reference in `tests/experimental/`, validated on
+  the intended hardware, plus a runnable example;
+* no registration in `flashinfer/aot.py` (experimental features are JIT-only
+  and never ship in pre-built packages).
+
+Experimental features provide no compatibility guarantees and may be removed
+without deprecation. Changes under `flashinfer/experimental/` receive narrower
+review (eligibility, correctness, containment, licensing, obvious risks);
+changes to core — including thin entry points — follow the normal review
+process.
+
+For the full policy (admission criteria, lifecycle reviews, containment rules,
+graduation checklist), see
+[flashinfer/experimental/README.md](flashinfer/experimental/README.md).
+
 # Pull Request Guidelines
 
 * **Use the default PR template.** When opening a PR, fill in the repository's PR template

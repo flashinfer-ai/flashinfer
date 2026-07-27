@@ -33,6 +33,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| Enable experimental APIs/backends | `export FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1` |
 
 ## Quick Start for Development
 
@@ -383,6 +384,18 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
 - **Complex**: `flashinfer/decode.py` - plan-run pattern, advanced workspace
 
+## Experimental Code
+
+Experimental backends live under `flashinfer/experimental/`; experimental
+public APIs live in core marked with `@flashinfer_experimental_api` (defined in
+`flashinfer/api_logging.py`). All experimental behavior is gated behind
+`FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`, is JIT-only (never registered in
+`flashinfer/aot.py`), and is tested under `tests/experimental/`.
+
+→ **When working under `flashinfer/experimental/`, follow
+[`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
+full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/README.md).**
+
 ## Key Architectural Patterns
 
 ### Module Caching
@@ -563,6 +576,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
+| `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES` | unset | `flashinfer/api_logging.py` | `1` permits experimental APIs and backends (see "Experimental Code" below). It permits but never selects: stable APIs still require explicit backend selection to route to an experimental backend. Without it, experimental APIs raise `RuntimeError`. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
