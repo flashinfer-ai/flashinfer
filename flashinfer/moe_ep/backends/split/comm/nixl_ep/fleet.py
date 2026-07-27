@@ -14,7 +14,6 @@ design's Fleet / Handle split by:
 from __future__ import annotations
 
 import contextlib
-import hashlib
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
@@ -31,6 +30,7 @@ from .....algo_knobs import (
     _index_knobs,
 )
 from .....config import FleetParams, QuantType
+from .....core.bootstrap_utils import resolve_rendezvous_store
 from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
 # from .....api_logging import flashinfer_api  # disabled per PR #3453 review
 
@@ -74,66 +74,13 @@ def _load_nixl_ep():
     return nixl_ep
 
 
-# Per-GROUP generation counters namespacing derived rendezvous stores, keyed
-# by the group's sorted global-rank tuple. Fleet creation is collective over
-# the EP group, so each group's counter agrees across its ranks; re-created
-# fleets then never reuse a prior fleet's keys. A single process-wide counter
-# would diverge when a process belongs to several EP subgroups and creates
-# their fleets in a different interleaving than its peers.
-_STORE_GENS: dict = {}
-
-
 def _resolve_store(bootstrap: "BootstrapConfig"):
     """Return the rendezvous store the NIXL ``Buffer`` bootstraps over.
 
-    Resolution order (the NIXL analogue of nccl_ep's ``_resolve_comm``):
-
-    1. ``bootstrap.tcp_store`` set — use it as-is (previous behavior).
-    2. otherwise — derive a ``PrefixStore`` from torch.distributed's default
-       store, so hosts that pass only ``process_group`` (e.g. vLLM's EP group,
-       the same ``BootstrapConfig`` shape the nccl_ep backend consumes) work
-       without constructing a second TCPStore on a sibling port. The prefix is
-       namespaced by the EP group's global ranks plus that group's generation
-       counter so disjoint EP subgroups and re-created fleets never collide on
-       store keys.
+    Thin alias over the shared resolver, which fault tolerance also uses (with
+    ``subsystem="ft"``) since it needs a store on both transports.
     """
-    if bootstrap.tcp_store is not None:
-        return bootstrap.tcp_store
-
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        raise ValueError(
-            "NixlEpFleet needs a rendezvous store: set bootstrap.tcp_store "
-            "(a torch.distributed.TCPStore), or initialize torch.distributed "
-            "so one can be derived from the default store."
-        )
-
-    from .....core.bootstrap_utils import bootstrap_comm_group
-
-    # torch exposes no public accessor for the default store;
-    # _get_default_store has been stable across torch 2.x but is private, so
-    # fail with the explicit-tcp_store escape hatch rather than a raw
-    # AttributeError if it ever moves.
-    try:
-        base_store = dist.distributed_c10d._get_default_store()
-    except (AttributeError, RuntimeError) as e:
-        raise ValueError(
-            "Could not derive a rendezvous store from torch.distributed's "
-            "default store; set bootstrap.tcp_store (a "
-            "torch.distributed.TCPStore) explicitly."
-        ) from e
-
-    ranks = tuple(sorted(dist.get_process_group_ranks(bootstrap_comm_group(bootstrap))))
-    gen = _STORE_GENS.get(ranks, 0)
-    _STORE_GENS[ranks] = gen + 1
-    # Encode the FULL group identity: a min×len-style prefix collides for
-    # overlapping groups like (0,1,2,3) vs (0,2,4,6). Digest the rank tuple
-    # (not hash(), which is per-process randomized) to keep the prefix
-    # bounded for large groups while staying identical across ranks.
-    group_id = hashlib.sha1("-".join(map(str, ranks)).encode()).hexdigest()[:12]
-    prefix = f"flashinfer/moe_ep/nixl_ep/{group_id}/{gen}"
-    return dist.PrefixStore(prefix, base_store)
+    return resolve_rendezvous_store(bootstrap, subsystem="nixl_ep")
 
 
 class NixlEpFleet(Fleet):
