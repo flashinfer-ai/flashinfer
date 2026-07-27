@@ -15,6 +15,7 @@ if not is_cuda_tile_available():
 
 @pytest.fixture(autouse=True)
 def require_sm90():
+    """Skip the module unless running on sm90 or newer."""
     major, minor = get_compute_capability(torch.device("cuda"))
     if major * 10 + minor < 90:
         pytest.skip(f"requires sm90+, got sm{major * 10 + minor}")

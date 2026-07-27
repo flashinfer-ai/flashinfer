@@ -72,6 +72,7 @@ QUANT_DTYPE = torch.float8_e4m3fn
 # Provider availability
 # --------------------------------------------------------------------------- #
 def _has_flashinfer() -> bool:
+    """True if flashinfer's native fused RoPE+fp8 kernel is importable."""
     try:
         import flashinfer  # noqa: F401
         from flashinfer.rope import rope_quantize_fp8  # noqa: F401
@@ -82,6 +83,7 @@ def _has_flashinfer() -> bool:
 
 
 def _has_cutile() -> bool:
+    """True if this checkout can run the cuTile fused RoPE+fp8 backend."""
     try:
         import cuda.tile  # noqa: F401
         from flashinfer.rope import rope_quantize_fp8  # noqa: F401
@@ -119,6 +121,7 @@ class _Inputs:
     """Container for one (config, num_tokens) input set."""
 
     def __init__(self, config_name: str, num_tokens: int, device: str, seed: int):
+        """Build the q/k tensors, position ids and RoPE cache for one (config, num_tokens) case."""
         torch.manual_seed(seed)
         num_qo_heads, num_kv_heads, rope_dim, no_rope_dim = _config_params(config_name)
         total_dim = rope_dim + no_rope_dim
@@ -195,6 +198,7 @@ def _make_execute(
         if provider == "flashinfer":
 
             def run():
+                """Run the native fused CUDA RoPE+fp8 kernel."""
                 flashinfer.rope.rope_quantize_fp8(
                     q_rope=q_rope,
                     k_rope=k_rope,
@@ -216,6 +220,7 @@ def _make_execute(
         else:  # cutile
 
             def run():
+                """Run the cuTile fused RoPE+fp8 kernel."""
                 flashinfer.rope.rope_quantize_fp8(
                     q_rope=q_rope,
                     k_rope=k_rope,
@@ -242,10 +247,12 @@ def _make_execute(
 
         @torch.compile
         def torch_rope_quantize(q_in, k_in, pos_ids):
+            """Compiled PyTorch reference: RoPE followed by an fp8 cast."""
             q_out_f16, k_out_f16 = rope_ref.forward_native(pos_ids, q_in, k_in)
             return q_out_f16.to(QUANT_DTYPE), k_out_f16.to(QUANT_DTYPE)
 
         def run():
+            """Run the compiled PyTorch RoPE+fp8 reference."""
             return torch_rope_quantize(q_in, k_in, pos_ids)
 
     else:
@@ -380,6 +387,7 @@ def print_summary_table(
 
 
 def write_csv(path: str, config_name: str, results: Dict[str, Dict[int, float]]):
+    """Write the raw per-provider medians to `path` as CSV."""
     with open(path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(["provider", "config", "num_tokens", "median_ms"])
@@ -456,6 +464,7 @@ def create_heatmap(
 
 
 def main():
+    """Parse args, sweep num_tokens, and emit table / CSV / heatmap."""
     parser = argparse.ArgumentParser(
         description="Benchmark fused rope_quantize_fp8 backends"
     )
