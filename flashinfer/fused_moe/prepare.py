@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import functools
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -48,6 +48,7 @@ from ..utils import get_compute_capability
 # dims, so the cache is safe to reuse across shapes and calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PERMUTE_CACHE: dict = {}
+_TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE: dict = {}
 
 
 # The E8M0 range clamp and residual-scale factorization are adapted from
@@ -613,7 +614,10 @@ def prepare_trtllm_fp8_block_weights(
     DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
     uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
     Both native views remain in ``MajorK`` layout; the unified runner records
-    the exact variant and passes the corresponding kernel enum.
+    the exact variant and passes the corresponding kernel enum. Shuffled
+    MXFP8 preparation requires ``hidden_size`` and ``intermediate_size`` to be
+    divisible by 128 because the returned scales use TRTLLM's unpadded 128x4
+    physical layout.
     """
     from .api import QuantVariant
 
@@ -645,10 +649,12 @@ def prepare_trtllm_fp8_block_weights(
         w1_q, w1_sf = _deepseek_fp8_quantize_weights(w1_bf16)
         w2_q, w2_sf = _deepseek_fp8_quantize_weights(w2_bf16)
     else:
-        if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             raise ValueError(
-                "MXFP8 requires hidden_size and intermediate_size divisible by 32."
+                "MXFP8 shuffled MajorK preparation requires hidden_size and "
+                "intermediate_size divisible by 128."
             )
+        from ..quantization.fp4_quantization import block_scale_interleave
         from ..quantization.fp8_quantization import mxfp8_quantize
         from .core import (
             _maybe_get_cached_w3_w1_permute_indices,
@@ -673,7 +679,11 @@ def prepare_trtllm_fp8_block_weights(
                 is_gated_act_gemm=True,
             )
             w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w1_sf.append(sf[permute_sf.to(device)])
+            w1_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
 
             q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
             sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
@@ -687,7 +697,11 @@ def prepare_trtllm_fp8_block_weights(
                 num_elts_per_sf=32,
             )
             w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w2_sf.append(sf[permute_sf.to(device)])
+            w2_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
         w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
         w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
 
@@ -727,6 +741,150 @@ def prepare_trtllm_fp8_block_activations(
         "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
         f"got {variant!r}."
     )
+
+
+def _fp8_per_tensor_scale(
+    scale: Union[float, torch.Tensor], *, name: str, device: torch.device
+) -> torch.Tensor:
+    value = torch.as_tensor(scale, dtype=torch.float32, device=device)
+    if value.numel() != 1 or not bool(torch.isfinite(value).all()) or value.item() <= 0:
+        raise ValueError(
+            f"{name} must be one finite positive FP32 value, got {scale!r}."
+        )
+    return value.reshape(())
+
+
+def _quantize_fp8_per_expert(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize each expert tensor with one E4M3 multiplier."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    weights_f32 = weights.float()
+    amax = weights_f32.abs().amax(dim=(-1, -2))
+    # Weight preparation runs once at model load. Fail here instead of silently
+    # sanitizing a corrupted checkpoint or surfacing NaNs much later in inference.
+    # Reuse the required per-expert reduction to avoid another full tensor scan.
+    if not bool(torch.isfinite(amax).all()):
+        raise ValueError(
+            "FP8 per-tensor weight preparation requires finite checkpoint weights."
+        )
+    scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+    quantized = (weights_f32 * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn), scales.to(torch.float32)
+
+
+def prepare_trtllm_fp8_per_tensor_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the TRTLLM per-tensor-FP8 MajorK weight view.
+
+    ``hidden_states_scale_global`` and ``intermediate_scale_global`` are the
+    E4M3 quantization multipliers obtained during PTQ/QAT calibration. Weight
+    multipliers are computed independently for each local expert.
+    """
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            "prepare_trtllm_fp8_per_tensor_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+    input_scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global,
+        name="hidden_states_scale_global",
+        device=device,
+    )
+    intermediate_scale = _fp8_per_tensor_scale(
+        intermediate_scale_global,
+        name="intermediate_scale_global",
+        device=device,
+    )
+    w1_q, w1_scale = _quantize_fp8_per_expert(w1_bf16.to(device).contiguous())
+    w2_q, w2_scale = _quantize_fp8_per_expert(w2_bf16.to(device).contiguous())
+
+    from .core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    w1_shuffled, w2_shuffled = [], []
+    for expert in range(num_local_experts):
+        permute = _maybe_get_cached_w3_w1_permute_indices(
+            _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
+            w1_q[expert].view(torch.uint8),
+            128,
+            is_gated_act_gemm=True,
+        )
+        w1_shuffled.append(
+            w1_q[expert]
+            .view(torch.uint8)[permute.to(device)]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+        permute = get_w2_permute_indices_with_cache(
+            _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
+            w2_q[expert].view(torch.uint8),
+            128,
+        )
+        w2_shuffled.append(
+            w2_q[expert]
+            .view(torch.uint8)[permute.to(device)]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+
+    return {
+        "gemm1_weights": torch.stack(w1_shuffled),
+        "gemm2_weights": torch.stack(w2_shuffled),
+        "output1_scales_scalar": (
+            intermediate_scale / (w1_scale * input_scale)
+        ).contiguous(),
+        "output1_scales_gate_scalar": (1.0 / (w1_scale * input_scale)).contiguous(),
+        "output2_scales_scalar": (1.0 / (intermediate_scale * w2_scale)).contiguous(),
+        # Calibration metadata is retained for callers preparing activations or
+        # constructing an independent reference; the runner ignores these keys.
+        "hidden_states_scale_global": input_scale,
+        "intermediate_scale_global": intermediate_scale,
+    }
+
+
+def prepare_trtllm_fp8_per_tensor_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+) -> Tuple[torch.Tensor, None]:
+    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale."""
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_trtllm_fp8_per_tensor_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global,
+        name="hidden_states_scale_global",
+        device=hidden_states_bf16.device,
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    quantized = (hidden_states_bf16.float() * scale).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn), None
 
 
 def prepare_trtllm_bf16_weights(

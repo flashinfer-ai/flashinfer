@@ -5684,7 +5684,7 @@ def _cutlass_gemm_fp4_requirement(
     b_descale: torch.Tensor,  # unused
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
-    out: Optional[torch.Tensor] = None,  # unused
+    out: Optional[torch.Tensor] = None,
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
@@ -5697,6 +5697,10 @@ def _cutlass_gemm_fp4_requirement(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
+    if out is not None and not out.is_contiguous():
+        raise ValueError(
+            "The CUTLASS FP4 GEMM backend requires a contiguous output tensor."
+        )
     return True
 
 
