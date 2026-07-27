@@ -39,7 +39,7 @@ def _is_trtllm_fp8_arch() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103"
+    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103/107"
 )
 
 HIDDEN = 256

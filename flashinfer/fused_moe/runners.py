@@ -328,8 +328,6 @@ class TrtllmFp4RoutedRunner(MoERunner):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    # PR #4104 adds UnpackedPrecomputed to this same adapter. Whichever change
-    # lands second must preserve these variant branches while merging that mode.
     supported_quant_variants = (
         QuantVariant.NVFP4,
         QuantVariant.MXFP4,
@@ -355,9 +353,9 @@ class TrtllmFp4RoutedRunner(MoERunner):
             # instead of admitting TRTLLM sm100f kernels that crash at launch.
             compute_capability = get_compute_capability(self.device)
             supported = (
-                compute_capability in ((10, 0), (10, 3))
+                compute_capability in ((10, 0), (10, 3), (10, 7))
                 if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
-                else compute_capability == (10, 0)
+                else compute_capability in ((10, 0), (10, 7))
             )
             if not supported:
                 raise NotImplementedError(

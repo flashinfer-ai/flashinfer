@@ -270,10 +270,13 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert TrtllmFp4Config.supported(107)
+        assert TrtllmFp8BlockConfig.supported(107)
         assert not TrtllmFp8BlockConfig.supported(110)
         assert not TrtllmFp8BlockConfig.supported(120)
         assert TrtllmFp8PerTensorConfig.supported(100)
         assert TrtllmFp8PerTensorConfig.supported(103)
+        assert TrtllmFp8PerTensorConfig.supported(107)
         assert not TrtllmFp8PerTensorConfig.supported(90)
         assert not TrtllmFp8PerTensorConfig.supported(120)
 

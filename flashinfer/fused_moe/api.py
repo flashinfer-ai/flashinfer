@@ -235,9 +235,9 @@ class TrtllmFp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # Preserve the existing NVFP4 backend gate. Mixed MXFP4 variants apply
-        # their narrower architecture checks in TrtllmFp4RoutedRunner.
-        return arch >= 100
+        # SM107 support comes from the TRTLLM sm107a cubins added in #4122.
+        # SM12x uses the separate b12x configs/runners.
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
@@ -295,10 +295,10 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # The available TRTLLM block-FP8 BMM cubins are validated only on the
-        # SM100 family. The outer JIT can compile for major 12, but its FP8
-        # kernels currently fail at runtime on SM120/121.
-        return arch in (100, 103)
+        # SM107 support comes from the TRTLLM sm107a cubins added in #4122.
+        # The outer JIT can compile for major 12, but its FP8 kernels currently
+        # fail at runtime on SM120/121.
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
@@ -348,7 +348,7 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103)
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
