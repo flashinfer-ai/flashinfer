@@ -150,10 +150,15 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
         # they're all None when we land here, but the monolithic standalone
         # signature predates these kwargs and would TypeError on them.
         kwargs = {k: v for k, v in kwargs.items() if k not in MODULAR_ONLY_KWARGS}
-        from .monolithic.mla_decode import cute_dsl_mla_decode as _impl
+        from .monolithic.mla_decode import (
+            cute_dsl_mla_decode as _monolithic_impl,
+        )
+
+        return _monolithic_impl(*args, **kwargs)
     else:
         # Symmetrically strip inactive monolithic-only kwargs after the strict
         # resolver has established that none requests a feature.
         kwargs = {k: v for k, v in kwargs.items() if k not in MONOLITHIC_ONLY_KWARGS}
-        from .wrappers.batch_mla import cute_dsl_mla_decode as _impl
-    return _impl(*args, **kwargs)
+        from .wrappers.batch_mla import cute_dsl_mla_decode as _modular_impl
+
+        return _modular_impl(*args, **kwargs)
