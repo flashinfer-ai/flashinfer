@@ -1249,9 +1249,7 @@ _BACKEND_SELECTION_CASES = [
     [pytest.param(*case[:-1], id=case[-1]) for case in _BACKEND_SELECTION_CASES],
 )
 def test_backend_selection(D, num_tokens, sequence_heads, expected):
-    assert (
-        recurrent_kda_module._use_one_warp(D, num_tokens, sequence_heads) is expected
-    )
+    assert recurrent_kda_module._use_one_warp(D, num_tokens, sequence_heads) is expected
 
 
 @pytest.mark.parametrize(
