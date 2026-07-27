@@ -33,7 +33,12 @@ from .....algo_knobs import (
 from .....config import EpAlgorithm, EpLayout, FleetParams
 from .....core.bootstrap_utils import resolve_rendezvous_store
 from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
-from .....core.comm.fault_tolerance import ACTIVE, MASKED, FaultToleranceMixin
+from .....core.comm.fault_tolerance import (
+    ACTIVE,
+    MASKED,
+    FaultToleranceMixin,
+    reject_graph_capture as _reject_graph_capture_impl,
+)
 from ._mask_ffi import mask_ffi
 
 if TYPE_CHECKING:
@@ -323,15 +328,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
 
     @staticmethod
     def _reject_graph_capture(op: str) -> None:
-        import torch
-
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                f"Fleet.{op}() is stream-ordered and must not be captured into "
-                "a CUDA graph: every replay would re-apply whatever mask was "
-                "current at capture time. Call it from the host between graph "
-                "replays."
-            )
+        _reject_graph_capture_impl(op)
 
     def _current_stream(self) -> int:
         if self._stream:
@@ -408,6 +405,15 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     def query_fault(self) -> bool:
         self._require_ft("query_fault")
         # Pinned host flag: no stream, no sync, free to poll every step.
+        #
+        # Guarded against capture precisely BECAUSE it is a host read: it is
+        # not stream work, so it cannot be captured at all. Called inside a
+        # capture region it would return the capture-time value, and the
+        # branch taken on it would be baked into the graph's structure
+        # forever -- a graph that ignores faults because none existed when it
+        # was recorded. That is a quieter failure than the stream-ordered
+        # calls below, which is exactly why it needs the guard.
+        self._reject_graph_capture("query_fault")
         return mask_ffi().get_async_error(self._group)
 
     def set_active_mask(self, mask) -> None:

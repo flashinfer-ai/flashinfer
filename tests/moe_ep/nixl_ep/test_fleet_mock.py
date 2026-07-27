@@ -637,3 +637,20 @@ def test_ft_methods_raise_without_the_knob(patched_loader, fake_buffer_cls):
     assert fleet.supports_fault_tolerance is False
     with pytest.raises(MoEEpFaultToleranceUnsupportedError):
         fleet.query_active_mask()
+
+
+def test_query_fault_rejects_graph_capture(patched_loader, fake_buffer_cls):
+    """Both backends must agree: query_fault is not capturable.
+
+    On nixl it already raised via query_active_mask; on nccl it silently
+    returned the capture-time answer until the guard was added. This pins the
+    shared behaviour.
+    """
+    _skip_unless_ep_capable()
+
+    import torch
+
+    fleet = _ft_fleet(world_size=4)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g), pytest.raises(RuntimeError, match="CUDA-graph capture"):
+        fleet.query_fault()

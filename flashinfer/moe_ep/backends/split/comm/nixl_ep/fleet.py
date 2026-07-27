@@ -33,7 +33,12 @@ from .....algo_knobs import (
 )
 from .....config import FleetParams, QuantType
 from .....core.bootstrap_utils import resolve_rendezvous_store
-from .....core.comm.fault_tolerance import ACTIVE, MASKED, FaultToleranceMixin
+from .....core.comm.fault_tolerance import (
+    ACTIVE,
+    MASKED,
+    FaultToleranceMixin,
+    reject_graph_capture as _reject_graph_capture_impl,
+)
 from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
 # from .....api_logging import flashinfer_api  # disabled per PR #3453 review
 
@@ -243,15 +248,7 @@ class NixlEpFleet(FaultToleranceMixin, Fleet):
 
     @staticmethod
     def _reject_graph_capture(op: str) -> None:
-        import torch
-
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                f"Fleet.{op}() launches a kernel on the current stream and must "
-                "not be captured into a CUDA graph: every replay would re-apply "
-                "whatever mask was current at capture time. Call it from the "
-                "host between graph replays."
-            )
+        _reject_graph_capture_impl(op)
 
     def _ft_raw(self):
         """`[capacity]` int32 scratch for query_mask_buffer.

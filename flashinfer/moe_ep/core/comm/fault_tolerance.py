@@ -36,6 +36,49 @@ MASKED = 0
 _POLL_INTERVAL_S = 0.02
 
 
+# Why each FT entry point refuses CUDA-graph capture. The reasons genuinely
+# differ per call, and the distinction matters: the transports do NOT compact
+# the surviving ranks' data layout, so dispatch/combine inside a captured graph
+# keep honouring the live mask on every replay. Masking is not the problem —
+# baking a *decision* about it into a graph is.
+_CAPTURE_REASONS = {
+    "query_fault": (
+        "it is a host-side read, not stream work, so it cannot be captured at "
+        "all: it would return the capture-time answer and the branch taken on "
+        "it would be frozen into the graph's structure -- a graph that ignores "
+        "faults because none had happened when it was recorded"
+    ),
+    "query_active_mask": (
+        "its result can only be consumed on the host, which needs a sync that "
+        "capture forbids; a captured copy would replay, but the decision made "
+        "from it would not"
+    ),
+    "set_active_mask": (
+        "the rank and value are baked into the captured operation, so every "
+        "replay would re-apply that one mask regardless of who is alive"
+    ),
+    "clear_faults": (
+        "re-admission resets transport state exactly once; replaying that on "
+        "every graph launch is never what you want"
+    ),
+}
+
+
+def reject_graph_capture(op: str) -> None:
+    """Raise if called during CUDA-graph capture, explaining why for ``op``."""
+    import torch
+
+    if not torch.cuda.is_current_stream_capturing():
+        return
+    why = _CAPTURE_REASONS.get(op, "capturing it would freeze fault state")
+    raise RuntimeError(
+        f"Fleet.{op}() must not be called during CUDA-graph capture: {why}. "
+        "Call it from the host between graph replays. Note that dispatch and "
+        "combine themselves ARE safe to capture -- they re-read the mask on "
+        "every replay."
+    )
+
+
 def _local_key(epoch: int, rank: int) -> str:
     return f"ft/gen{epoch}/local/{rank}"
 
@@ -243,4 +286,5 @@ __all__ = [
     "MASKED",
     "FaultToleranceMixin",
     "reconcile_masks_via_store",
+    "reject_graph_capture",
 ]

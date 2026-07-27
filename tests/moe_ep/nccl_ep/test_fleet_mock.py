@@ -444,3 +444,40 @@ def test_ft_buffers_resize_on_update_topology(
     assert fleet.query_active_mask().numel() == 4
     fleet.update_topology(BootstrapConfig(world_size=8, rank=0))
     assert fleet.query_active_mask().numel() == 8
+
+
+def test_query_fault_rejects_graph_capture(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """query_fault() is a HOST read, so capture cannot record it at all.
+
+    Called inside a capture region it would return the capture-time answer and
+    freeze the branch taken on it into the graph forever -- a graph that
+    ignores faults because none had happened when it was recorded. That is
+    quieter than the stream-ordered calls, hence the guard.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    fleet = _ft_fleet()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g), pytest.raises(RuntimeError, match="host-side read"):
+        fleet.query_fault()
+
+
+def test_capture_guard_reason_is_per_operation(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """The rationale differs per call; a single blanket message was wrong."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    fleet = _ft_fleet()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        with pytest.raises(RuntimeError, match="baked into the captured"):
+            fleet.set_active_mask([1, 1, 0, 1])
+        with pytest.raises(RuntimeError, match="consumed on the host"):
+            fleet.query_active_mask()

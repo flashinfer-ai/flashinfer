@@ -81,9 +81,13 @@ class Fleet(ABC):
     def query_fault(self) -> bool:
         """True when a rank has been masked since the last ``clear_faults``.
 
-        Host-side. Free on nccl_ep (a pinned-flag read). Costs one small D2H
-        sync on nixl_ep, which has no host error flag — in a hot per-step loop
-        prefer diffing ``query_active_mask`` on device.
+        Host-side. Cheap on nccl_ep (a pinned-flag read); costs one small D2H
+        sync on nixl_ep, which has no host error flag.
+
+        Must not be called during CUDA-graph capture — *because* it is a host
+        read rather than stream work, it cannot be captured, so it would
+        return the capture-time answer and freeze the branch taken on it into
+        the graph forever.
         """
         self._no_fault_tolerance("query_fault")
 

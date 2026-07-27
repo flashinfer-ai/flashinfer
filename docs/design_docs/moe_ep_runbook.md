@@ -331,21 +331,60 @@ DEGRADED ──peer gone for good──> update_topology(...)      [COLLECTIVE, 
 
 ### Ordering rules (all load-bearing)
 
-1. **Mutate the mask only between iterations.** Both transports read it *live*
-   from the dispatch/combine kernels, so changing it while a collective is in
-   flight is a race that can produce a half-masked dispatch. Retire the
-   iteration's `combine` (and `Handle.complete()` under
+0. **The steady state is read-only.** The transport discovers the fault: its
+   kernel times out on the peer and masks it. The application's job is to
+   *notice* — `query_fault()`, then `query_active_mask()`. `set_active_mask()`
+   is **not** a normal-path call; it exists so that reconciliation can impose an
+   agreed vector once survivors have compared views, and most callers should
+   only reach it indirectly through `reconcile_active_mask()`.
+
+1. **If you do write the mask, write it only between iterations.** Both
+   transports read it *live* from the dispatch/combine kernels, so changing it
+   while a collective is in flight is a race that can produce a half-masked
+   dispatch. Retire the iteration's `combine` (and `Handle.complete()` under
    `HandleAlgoKnobSplitOperation`) first.
+
 2. **All survivors must reconcile in the same iteration slot** — they must pass
    the same `active_mask_epoch`. Make the host's fault poll a synchronous
    decision point.
-3. `clear_faults(readmit=True)` **before** `update_topology`, never after:
-   `ncclEpMaskClean` needs a live handle on the *current* group, which
-   `update_topology` destroys and recreates.
-4. **No FT call may be issued during CUDA-graph capture.** A captured query
-   replays stale offsets; a captured set freezes one mask vector into every
-   replay. All stream-ordered entry points raise on capture. Call them from the
-   host between replays.
+
+3. **`clear_faults(readmit=True)` and `update_topology()` are alternatives, not
+   a sequence.**
+
+   * `clear_faults(readmit=True)` runs `ncclEpMaskClean` on the *same*
+     communicator: it re-admits a rank that was merely delayed.
+   * `update_topology()` destroys the group and builds a **new communicator**
+     (a fresh `ncclComm_t`, unless you adopted one via
+     `BootstrapConfig.nccl_comm`). That is the only way to add or replace a
+     process — matching `nccl_ep.h`, which notes that rank replacement needs
+     `ncclCommGrow` and a new EP group.
+
+   Re-admitting after a rebuild is meaningless (the group it targeted is gone)
+   and before one is wasted work. If you genuinely do both, `MaskClean` must
+   come first, since it needs a live handle on the *current* group.
+
+4. **No FT call may be issued during CUDA-graph capture** — but not for the
+   reason you might expect. Neither transport compacts the surviving ranks'
+   data layout, so **dispatch and combine are safe to capture**: they re-read
+   the mask on every replay, and a rank that fails later is still skipped.
+   Data from a masked rank is simply left in an unknown state with the error
+   flag raised.
+
+   What must not be captured is a *decision about* the fault state:
+
+   * `query_fault()` is a host-side read, not stream work, so it cannot be
+     captured at all. Inside a capture region it returns the capture-time
+     answer, and the branch taken on it is frozen into the graph's structure —
+     a graph that ignores faults forever because none had happened when it was
+     recorded. This is the quietest failure of the three, which is why it is
+     guarded even though it touches no stream.
+   * `set_active_mask()` bakes the rank and value into the captured operation,
+     so every replay re-applies that one mask.
+   * `query_active_mask()` can only be consumed on the host, which needs a sync
+     that capture forbids.
+
+   All four raise on capture with a per-operation explanation. Call them from
+   the host between replays.
 
 ### Backend asymmetries worth knowing
 
@@ -375,7 +414,23 @@ y_degraded[t] = y_healthy[t] * sum(topk_weights[t][k] for k where the owning ran
 This is deliberate. Renormalizing implicitly would add an unconditional kernel
 to every forward for a case that is almost never active, hide a serving-quality
 event the operator must see, and divide by zero for a token whose entire top-k
-landed on dead ranks. To preserve magnitude yourself:
+landed on dead ranks.
+
+**FlashInfer does not re-home the dead rank's experts either.** That is an
+EPLB-style job and belongs to the framework: re-route the routing map away from
+the failed rank, leave the rank masked, and keep serving on a partial mask —
+no `update_topology()` and no new communicator required. The sequence is
+
+```
+query_fault() → reconcile_active_mask() → clear_faults(readmit=False) → keep going
+```
+
+where `clear_faults(readmit=False)` is purely "re-arm fault detection"
+(`ncclEpErrorClear`); it does not touch the mask. FlashInfer's contribution is
+to surface an agreed mask and the formula below; what you do with the routing is
+yours.
+
+To preserve magnitude yourself:
 
 ```python
 alive = fleet.query_active_mask()                       # [world], 1 = active
