@@ -237,6 +237,8 @@ def xqa(
         per draft row, assuming draft tokens occupy consecutive positions at
         the end of the sequence (linear chains, causal or full masks);
         tree-structured drafts are not supported with sliding window.
+        On SM90 with fp8 KV cache, speculative decode with a sliding window
+        runs on the generic kernel rather than the Hopper fp8 kernel.
     kv_layout : str, default="NHD"
         The layout of the KV cache. Can be either ``NHD`` or ``HND``.
     sm_count : Optional[int], default=None
@@ -265,7 +267,8 @@ def xqa(
         tokens this step. When set, ``q`` and ``output`` are packed as
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
-        cumulative offsets. Not supported on the SM90 fp8 MHA path.
+        cumulative offsets. On SM90 with fp8 KV cache, ragged Q runs on the
+        generic kernel rather than the Hopper fp8 kernel.
 
     Note
     ----
@@ -384,6 +387,10 @@ def xqa(
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
+        if use_ragged_q or use_sliding_window:
+            # mha_sm90.cu rejects ragged Q, and its spec-dec sliding-window
+            # path mis-masks full draft masks; use the generic kernel.
+            run_sm90_fp8_mha = False
 
     xqa_module.xqa(
         run_sm90_fp8_mha,
