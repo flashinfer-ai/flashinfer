@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -2761,8 +2762,17 @@ def get_trtllm_moe_sm100_module():
                 topk_weights = torch.empty(
                     num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
                 )
-        if enable_pdl is None:
-            enable_pdl = device_support_pdl(hidden_states.device)
+        # Allow env-var override for debugging / workaround
+        if os.environ.get("FLASHINFER_DISABLE_PDL_MOE") == "1":
+            enable_pdl = False
+        elif enable_pdl is None:
+            # PDL (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION) on
+            # SM100+ can cause the trtllm_fp4_block_scale_moe kernel to hang
+            # when interprocess CUDA events are recorded on the same stream.
+            # Observed on B200 (TP=8, EP=8) with LMCache connector in vLLM MP
+            # mode. Disable by default for the FP4 path as a safety measure;
+            # the FP8 path (trtllm_fp8_block_scale_moe) is not affected.
+            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
