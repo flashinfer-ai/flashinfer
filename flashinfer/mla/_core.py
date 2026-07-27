@@ -1502,11 +1502,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     length for the SWA validity window.
 
     On SM120/SM121, this calls the packed sparse backend. ``swa_kv_cache`` is
-    the required packed uint8 SWA pool with 584 bytes per token. ``sparse_indices``
-    and ``swa_topk_lens`` describe the active SWA segment. To add a compressed
-    segment, pass ``compressed_kv_cache`` as another packed uint8 pool and pass
-    ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
-    path accepts BF16 query tensors and produces BF16 output.
+    the required packed uint8 SWA pool with 584 bytes per token for the FP8
+    layout, or 360 bytes per token when ``kv_scale_format="nvfp4"``.
+    ``sparse_indices`` and ``swa_topk_lens`` describe the active SWA segment.
+    To add a compressed segment, pass ``compressed_kv_cache`` as another packed
+    uint8 pool and pass ``extra_sparse_indices`` with
+    ``extra_sparse_topk_lens``. The SM120/SM121 path accepts BF16 query tensors
+    and produces BF16 output.
 
     With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
@@ -1628,6 +1630,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``False`` for logical flattened token indices or ``True`` for indices
         already adjusted to storage-row offsets. Strided pools require an
         explicit value to prevent accidental double remapping.
+    kv_scale_format : str
+        Packed KV cache layout for SM120/SM121. ``"auto"`` selects the FP8
+        layout (584 bytes per token); ``"nvfp4"`` selects the NVFP4 layout with
+        E2M1 nope and a per-64 UE8M0 scale footer (360 bytes per token).
+        Ignored by the ``trtllm-gen`` path.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
 
