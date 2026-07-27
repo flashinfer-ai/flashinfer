@@ -294,27 +294,30 @@ def test_recurrent_kda_vs_fla(
         "use_qk_l2norm_in_kernel",
         "use_gate_in_kernel",
         "safe_gate",
+        "beta_is_logit",
         "dtype",
     ),
     [
         pytest.param(
             *test,
-            id="B{}-H{}-D{}-scale{}-norm{}-qk_l2{}-gate{}-safe{}-{}".format(*test),
+            id="B{}-H{}-D{}-scale{}-norm{}-qk_l2{}-gate{}-safe{}-blogit{}-{}".format(
+                *test
+            ),
         )
         for test in [
-            (16, 16, 128, 0.1, 1.0, True, False, False, torch.bfloat16),
-            (4, 16, 128, 0.1, 1.0, False, False, False, torch.bfloat16),
-            (32, 8, 64, 1.0, 1.0, True, False, False, torch.bfloat16),
-            (8, 8, 64, 1.0, 1.0, False, True, False, torch.bfloat16),
-            (7, 32, 128, 0.5, 0.5, True, False, False, torch.bfloat16),
-            (16, 16, 128, 0.1, 1.0, True, True, False, torch.bfloat16),
-            (32, 8, 64, 1.0, 1.0, True, True, False, torch.bfloat16),
-            (7, 32, 128, 0.5, 0.5, True, True, False, torch.bfloat16),
-            (7, 32, 128, 0.5, 0.5, True, True, True, torch.bfloat16),
-            (4, 32, 128, 0.5, 0.5, False, True, True, torch.bfloat16),
-            (1, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
-            (4, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
-            (32, 96, 128, 128**-0.5, 1.0, True, True, True, torch.bfloat16),
+            (16, 16, 128, 0.1, 1.0, True, False, False, False, torch.bfloat16),
+            (4, 16, 128, 0.1, 1.0, False, False, False, False, torch.bfloat16),
+            (32, 8, 64, 1.0, 1.0, True, False, False, False, torch.bfloat16),
+            (8, 8, 64, 1.0, 1.0, False, True, False, False, torch.bfloat16),
+            (7, 32, 128, 0.5, 0.5, True, False, False, False, torch.bfloat16),
+            (16, 16, 128, 0.1, 1.0, True, True, False, False, torch.bfloat16),
+            (32, 8, 64, 1.0, 1.0, True, True, False, False, torch.bfloat16),
+            (7, 32, 128, 0.5, 0.5, True, True, False, False, torch.bfloat16),
+            (7, 32, 128, 0.5, 0.5, True, True, True, False, torch.bfloat16),
+            (4, 32, 128, 0.5, 0.5, False, True, True, False, torch.bfloat16),
+            (1, 96, 128, 128**-0.5, 1.0, True, True, True, True, torch.bfloat16),
+            (4, 96, 128, 128**-0.5, 1.0, True, True, True, True, torch.bfloat16),
+            (32, 96, 128, 128**-0.5, 1.0, True, True, True, True, torch.bfloat16),
         ]
     ],
 )
@@ -327,6 +330,7 @@ def test_vllm_decode(
     use_qk_l2norm_in_kernel: bool,
     use_gate_in_kernel: bool,
     safe_gate: bool,
+    beta_is_logit: bool,
     dtype: torch.dtype,
 ):
     """vLLM-style decoding: continuous batching with paged state, Recurrent KDA vs naive."""
@@ -375,7 +379,9 @@ def test_vllm_decode(
         lower_bound = None
         naive_gate_fn = None
 
-    beta = torch.randn(1, total_tokens, H, dtype=dtype, device=device).sigmoid()
+    beta_logits = torch.randn(1, total_tokens, H, dtype=dtype, device=device)
+    beta = beta_logits.sigmoid()
+    beta_kernel = beta_logits if beta_is_logit else beta
 
     cu_seqlens = torch.arange(
         0, total_tokens + 1, step=T, device=device, dtype=torch.long
@@ -423,7 +429,7 @@ def test_vllm_decode(
         k=k,
         v=v,
         g=g,
-        beta=beta,
+        beta=beta_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
         scale=scale,
@@ -432,6 +438,7 @@ def test_vllm_decode(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
+        beta_is_logit=beta_is_logit,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=state_indices,
     )
