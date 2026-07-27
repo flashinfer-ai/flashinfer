@@ -6,8 +6,6 @@
 # Unlike test_fmha_prefill_bsr_cutile.py (which loads the kernel directly), these
 # exercise the full plan()/run() wiring in flashinfer/prefill.py.
 
-import math
-
 import pytest
 import torch
 
