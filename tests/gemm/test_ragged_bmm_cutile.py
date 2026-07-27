@@ -13,6 +13,7 @@ from flashinfer.utils import get_compute_capability
 
 
 def _skip_if_backend_unavailable(backend):
+    """Skip when the cuTile toolchain or this compute capability is unsupported."""
     if backend == "cutile" and not is_cuda_tile_available():
         pytest.skip("cuda.tile not available")
     cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10
@@ -64,6 +65,8 @@ def create_ragged_m_segments(num_groups, m, dtype, align_to=None):
 
 
 class Test_FlashInfer_RaggedBMM:
+    """Correctness tests for ragged_bmm on the cuTile backend."""
+
     @staticmethod
     def reference(a, b, segment_offsets, trans_a=False, trans_b=True, out_dtype=None):
         """Reference for ragged BMM with non-even M segments.
@@ -119,6 +122,7 @@ class Test_FlashInfer_RaggedBMM:
 
     @staticmethod
     def prepare_data(num_groups, m, n, k, trans_a, trans_b, dtype):
+        """Build the ragged A, B and segment offsets for one case."""
         device = torch.device("cuda")
 
         max_m, segment_offsets, actual_total_m = create_ragged_m_segments(
@@ -158,6 +162,7 @@ class Test_FlashInfer_RaggedBMM:
     )
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_shapes(self, trans_a, trans_b, dtype, num_groups, m, n, k, backend):
+        """cuTile ragged_bmm must match the reference across the (m, n, k) sweep."""
         if trans_a or not trans_b:
             pytest.skip("ragged_bmm only supports trans_a=False, trans_b=True")
         _skip_if_backend_unavailable(backend)
@@ -188,6 +193,7 @@ class Test_FlashInfer_RaggedBMM:
     @pytest.mark.parametrize("num_groups", [1, 4, 8])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_num_groups(self, dtype, m, n, k, num_groups, backend):
+        """cuTile ragged_bmm must match the reference across group counts."""
         _skip_if_backend_unavailable(backend)
         torch.manual_seed(0)
         random.seed(0)
@@ -216,6 +222,7 @@ class Test_FlashInfer_RaggedBMM:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_dtypes(self, num_groups, m, n, k, dtype, backend):
+        """cuTile ragged_bmm must match the reference for bf16 and fp8 inputs."""
         if torch.cuda.get_device_capability()[0] == 8 and "float8" in dtype.__repr__():
             pytest.skip("FP8 is not supported on sm80 (Ampere).")
         _skip_if_backend_unavailable(backend)
@@ -258,6 +265,7 @@ class Test_FlashInfer_RaggedBMM:
     @pytest.mark.parametrize("trans_b", [False, True])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op_transpose(self, dtype, num_groups, m, n, k, trans_a, trans_b, backend):
+        """ragged_bmm accepts only trans_a=False / trans_b=True and matches the reference there."""
         if trans_a or not trans_b:
             pytest.skip("ragged_bmm only supports trans_a=False, trans_b=True")
         _skip_if_backend_unavailable(backend)

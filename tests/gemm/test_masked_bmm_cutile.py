@@ -13,6 +13,7 @@ from flashinfer.utils import get_compute_capability
 
 
 def enumerate_m_grouped_masked():
+    """Yield the (num_groups, expected_m_per_group) cases covered by the masked BMM tests."""
     max_m = 4096
 
     cases = [
@@ -46,6 +47,7 @@ def enumerate_m_grouped_masked():
 
 
 def create_masked_m(num_groups, expected_m_per_group, max_m):
+    """Draw random per-group row counts bounded by `max_m`."""
     masked_m = torch.empty((num_groups,), dtype=torch.int32, device="cuda")
     for j in range(num_groups):
         masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
@@ -54,8 +56,11 @@ def create_masked_m(num_groups, expected_m_per_group, max_m):
 
 
 class Test_FlashInfer_MaskedBMM:
+    """Correctness tests for masked_bmm on the cuTile backend."""
+
     @staticmethod
     def reference(a, b, m_mask, trans_a=False, trans_b=False):
+        """torch.bmm reference for the masked batched GEMM."""
         if trans_a:
             a = torch.transpose(a, 1, 2)
         if trans_b:
@@ -66,6 +71,7 @@ class Test_FlashInfer_MaskedBMM:
     def prepare_data(
         num_groups, max_m, expected_m_per_group, n, k, trans_a, trans_b, dtype
     ):
+        """Build the batched A, B and the per-group mask for one case."""
         device = torch.device("cuda")
         q = num_groups
         m = max_m
@@ -132,6 +138,7 @@ class Test_FlashInfer_MaskedBMM:
         trans_b,
         backend,
     ):
+        """cuTile masked_bmm must match the torch reference over the shape sweep."""
         if backend == "cutile" and not is_cuda_tile_available():
             pytest.skip("cuda.tile not available")
         cc_num = get_compute_capability(torch.device("cuda:0"))[0] * 10

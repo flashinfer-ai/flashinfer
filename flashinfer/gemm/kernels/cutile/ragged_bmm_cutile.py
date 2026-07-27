@@ -525,6 +525,7 @@ def _ragged_bmm_autotune_standard(
     transpose_b_int = 1 if transpose_b else 0
 
     def args_fn(cfg):
+        """Kernel arguments for one autotune candidate."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         BK = cfg.BLOCK_K
@@ -548,6 +549,7 @@ def _ragged_bmm_autotune_standard(
         )
 
     def grid_fn(cfg):
+        """Grid for one autotune candidate: the persistent program count."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         # Size the grid from total_m (the true row-count upper bound), not the
@@ -562,6 +564,7 @@ def _ragged_bmm_autotune_standard(
         return (num_programs, 1, 1)
 
     def hints_fn(cfg):
+        """Launch hints (CTA count and occupancy) for one autotune candidate."""
         return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
     cache_key = (
@@ -615,6 +618,7 @@ def _ragged_bmm_autotune_swap_ab(
     transpose_b_int = 1 if transpose_b else 0
 
     def args_fn(cfg):
+        """Kernel arguments for one swap_ab autotune candidate."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         BK = cfg.BLOCK_K
@@ -638,6 +642,7 @@ def _ragged_bmm_autotune_swap_ab(
         )
 
     def grid_fn(cfg):
+        """Grid for one swap_ab autotune candidate: the persistent program count."""
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
         # Size the grid from total_m (the true row-count upper bound), not the
@@ -652,6 +657,7 @@ def _ragged_bmm_autotune_swap_ab(
         return (num_programs, 1, 1)
 
     def hints_fn(cfg):
+        """Launch hints (CTA count and occupancy) for one swap_ab autotune candidate."""
         return {"num_ctas": cfg.num_ctas, "occupancy": cfg.occupancy}
 
     swap_cache_key = (

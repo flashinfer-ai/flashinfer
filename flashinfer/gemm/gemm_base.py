@@ -972,6 +972,7 @@ def _cutile_masked_bmm_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cutile"] = "cutile",
 ):
+    """Validate shapes, dtypes and backend support for the cuTile masked_bmm path."""
     if a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
             "The masked_bmm cuTile backend supports float16 / bfloat16 inputs only; "
@@ -1053,6 +1054,7 @@ def _cutile_gemm_alpha_beta_requirement(
     num_sms: Optional[int] = None,
     backend: Literal["cutile"] = "cutile",
 ):
+    """Validate shapes, dtypes and backend support for the cuTile gemm_alpha_beta path."""
     if a.dtype not in (
         torch.float16,
         torch.bfloat16,
@@ -1130,6 +1132,7 @@ def _cutile_ragged_bmm_requirement(
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutile"] = "cutile",
 ):
+    """Validate shapes, dtypes and backend support for the cuTile ragged_bmm path."""
     if a.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
             "The ragged_bmm cuTile backend supports float16 / bfloat16 inputs only; "
@@ -1216,6 +1219,7 @@ def _cutile_ragged_block_scaled_bmm_requirement(
     segment_alignment: int = 128,
     backend: Literal["cutile"] = "cutile",
 ):
+    """Validate shapes, dtypes and backend support for the cuTile ragged_block_scaled_bmm path."""
     return True
 
 
@@ -8034,6 +8038,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     backend: Literal["trtllm", "cutile"] = "trtllm",
     segment_alignment: int = 1,
 ):
+    """Validate the grouped FP8 groupwise GEMM problem size, scales and layout."""
     if segment_alignment < 1:
         raise ValueError(f"segment_alignment must be >= 1, but got {segment_alignment}")
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
