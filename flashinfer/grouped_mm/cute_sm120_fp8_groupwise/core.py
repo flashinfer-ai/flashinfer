@@ -143,7 +143,8 @@ def moe_gemm_fp8_nt_groupwise(
         The data type of the output tensor. Currently only ``torch.bfloat16`` is supported.
 
     is_gated: bool
-        If ``True``, run fused gate+up SwiGLU: ``b`` packs gate and up projections along N
+        If ``True``, run fused gate+up SwiGLU: ``b`` packs the up projection in columns
+        ``[0, N)`` and the gate projection in ``[N, 2*N)`` along N
         (``b.shape[1] == 2 * out_n``) and the kernel fuses ``SiLU(gate) * up`` so the output
         N is ``b.shape[1] // 2``. Defaults to ``False`` (plain grouped GEMM).
 
@@ -177,8 +178,8 @@ def moe_gemm_fp8_nt_groupwise(
             f"Only out_dtype=torch.bfloat16 is supported; got {out_dtype}"
         )
 
-    # Gated (fused SwiGLU): b packs gate+up along N (b.shape[1] == 2 * out_n); the kernel
-    # fuses SiLU(gate)*up so the output N is halved.
+    # Gated (fused SwiGLU): b packs up in columns [0, N) and gate in [N, 2*N) along N
+    # (b.shape[1] == 2 * out_n); the kernel fuses SiLU(gate)*up so the output N is halved.
     n = b.shape[1]
     out_n = n // 2 if is_gated else n
     if out is None:

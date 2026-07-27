@@ -63,9 +63,10 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   int n = static_cast<int>(b.size(1));
   int k = static_cast<int>(b.size(2));
 
-  // Gated (fused SwiGLU) mode: b packs gate+up along N (b.size(1) == 2 * out_n); the kernel
-  // fuses SiLU(gate)*up so output N is halved. b_scale still spans the full b.size(1) weight
-  // dimension (SFB is over b.size(1)), so only out / runner shape_n use out_n.
+  // Gated (fused SwiGLU) mode: b packs up in columns [0, N) and gate in [N, 2*N) along N
+  // (b.size(1) == 2 * out_n); the kernel fuses SiLU(gate)*up so output N is halved. b_scale
+  // still spans the full b.size(1) weight dimension (SFB is over b.size(1)), so only out /
+  // runner shape_n use out_n.
   bool gated = is_gated != 0;
   if (gated) {
     TVM_FFI_ICHECK_EQ(n % 2, 0)
