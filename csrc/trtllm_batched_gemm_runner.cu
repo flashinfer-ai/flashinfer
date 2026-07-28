@@ -144,9 +144,16 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
+#ifdef TLLM_RUBIN_FEATURES
+      // CudaArch::Sm107a only exists in the Rubin cubin pin's generated
+      // headers (TRTLLM_GEN_BMM_RUBIN). The default pin has no such enumerator,
+      // so this comparison must not be compiled into the non-Rubin module.
+      // sm_version == 107 is unreachable there anyway: the Rubin module is
+      // selected by device compute capability before this runs.
       if (sm_version == 107) {
         if (config.mSm != tg::CudaArch::Sm107a) continue;
       }
+#endif
       if (sm_version == 103) {
         if (config.mSm != tg::CudaArch::Sm103a && config.mSm != tg::CudaArch::Sm100f) continue;
         if (options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
