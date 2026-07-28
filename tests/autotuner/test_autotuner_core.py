@@ -14,6 +14,7 @@ from flashinfer.fused_moe.utils import (
     make_hybrid_bucket_mapper,
 )
 from flashinfer.mla._core import (
+    CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
@@ -1446,3 +1447,34 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
     finally:
         AutoTuner._find_nearest_profile.cache_clear()
         _mla_decode_tuning_config.cache_clear()
+
+
+def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(CuteDslMlaDecodeRunner)
+    runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
+    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner.qk_nope_head_dim = 512
+    runner.kv_lora_rank = 512
+    runner.qk_rope_head_dim = 64
+    runner.page_size = 32
+    runner.max_seq_len = max_seq_len
+    runner.is_var_seq = True
+    runner.uses_shared_paged_kv_idx = True
+    runner.enable_pdl = False
+    runner.sinks = None
+    runner.cute_dsl_impl = "auto"
+    runner._resolved_cute_dsl_impl = "monolithic"
+
+    query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
+    return runner.get_cache_key_extras([query, None, None, out])
+
+
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
+    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
+    assert key_257 != key_385
+
+    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    assert key_257 != key_small_workspace
