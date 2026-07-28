@@ -394,8 +394,6 @@ def testMSASparseAttention(args):
     kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
     total_q, total_kv = bs * s_qo, bs * s_kv
     q = torch.randn(total_q, Hq, 128, device=device, dtype=q_dtype) / 3
-    k = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
-    v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
     q2k = _rand_q2k(bs, s_qo, s_kv, Hkv, args.topk, device)
     if args.kv_layout != "flat":
@@ -403,6 +401,8 @@ def testMSASparseAttention(args):
             bs, s_kv, Hkv, q_dtype, kv_dtype, device, args.kv_layout == "packed"
         )
     else:
+        k = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
+        v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
         k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
     scale = 1.0 / math.sqrt(128)
 
@@ -456,17 +456,16 @@ def testMSASparseDecode(args):
     kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
     total_q, total_kv = bs, bs * s_kv  # one query token per request
     q = torch.randn(total_q, Hq, 128, device=device, dtype=q_dtype) / 3
-    k = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
-    v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
-    cu_k = _cu_seqlens(bs, s_kv, device)
     q2k = _rand_q2k(bs, 1, s_kv, Hkv, args.topk, device)
     if args.kv_layout != "flat":
         k_in, v_in, extra = _paged_kv(
             bs, s_kv, Hkv, q_dtype, kv_dtype, device, args.kv_layout == "packed"
         )
     else:
+        k = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
+        v = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
         k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
-        extra = dict(cu_seqlens_k=cu_k, **extra)
+        extra = dict(cu_seqlens_k=_cu_seqlens(bs, s_kv, device), **extra)
     scale = 1.0 / math.sqrt(128)
 
     def run(_b):
