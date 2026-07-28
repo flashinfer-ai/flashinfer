@@ -179,7 +179,7 @@ For more details, see the [Install from Source documentation](https://docs.flash
 ```bash
 pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps
 pip install flashinfer-python  # Install dependencies from PyPI
-pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly
+pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
 # JIT cache (replace cu129 with your CUDA version)
 pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
 ```
