@@ -519,23 +519,16 @@ def test_mm_mxfp8_scale_1d_tensor_interpretation(m):
     assert torch.isfinite(output).all()
 
 
-def test_trtllm_warns_for_linear_b_descale(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    messages: list[str] = []
-    monkeypatch.setattr(gemm_base.jit_logger, "warning_once", messages.append)
-
+def test_trtllm_raises_for_linear_b_descale():
     a = torch.empty((1, 256), dtype=torch.float8_e4m3fn)
     b = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
     a_descale = torch.empty((1024,), dtype=torch.uint8)
     b_descale = torch.empty((8, 128), dtype=torch.uint8)
 
-    assert gemm_base._trtllm_gemm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
-        a,
-        b,
-        a_descale,
-        b_descale,
-    )
-    assert len(messages) == 1
-    assert "a_descale and b_descale" in messages[0]
-    assert "2D linear scale" in messages[0]
+    with pytest.raises(ValueError, match="2D linear scales are not supported"):
+        gemm_base._trtllm_gemm_mxfp8_requirement(  # pyright: ignore[reportPrivateUsage]
+            a,
+            b,
+            a_descale,
+            b_descale,
+        )
