@@ -27,8 +27,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
                            TensorView expert_weights_up, TensorView expert_scales_up,
                            TensorView expert_weights_down, TensorView expert_scales_down,
                            TensorView activations_out, TensorView scratchpad, int64_t top_k,
-                           int64_t scoring_func, bool renormalize,
-                           ffi::Optional<TensorView> expert_bias, double routed_scaling_factor);
+                           int64_t scoring_func, bool renormalize);
 
 namespace {
 
@@ -63,8 +62,7 @@ static_assert(
 void monomoe_topk(TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,
                   TensorView expert_scales_up, TensorView expert_weights_down,
                   TensorView expert_scales_down, TensorView activations_out, TensorView scratchpad,
-                  int64_t top_k, int64_t scoring_func, bool renormalize,
-                  ffi::Optional<TensorView> expert_bias, double routed_scaling_factor) {
+                  int64_t top_k, int64_t scoring_func, bool renormalize) {
   using Dims = ::monomoe::Dims_BS8_E256_N512_K2048_BlockFP8_WGMMA_TMA;
   const int64_t m = activations_in.ndim() == 2 ? activations_in.size(0) : -1;
 
@@ -87,7 +85,7 @@ void monomoe_topk(TensorView activations_in, TensorView router_logits, TensorVie
 
   monomoe_topk_launcher<Dims>(activations_in, router_logits, expert_weights_up, expert_scales_up,
                               expert_weights_down, expert_scales_down, activations_out, scratchpad,
-                              top_k, scoring_func, renormalize, expert_bias, routed_scaling_factor);
+                              top_k, scoring_func, renormalize);
 }
 
 // Scratchpad size (bytes) for the single Dims variant, sourced from

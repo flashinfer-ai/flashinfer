@@ -35,7 +35,6 @@ __device__ void moe_kernel_topk_impl(
     const W_element* __restrict__ expert_weights_down,
     const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
     uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
-    const float* __restrict__ expert_bias, float routed_scaling_factor,
     MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
     CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
     CUtensorMap const& down_weights_desc, CUtensorMap const& down_activations_desc) {
@@ -125,8 +124,7 @@ __device__ void moe_kernel_topk_impl(
   } else {
     // Calc warps run routing: shmem->expert_count / experts[] drive
     // downstream loop bounds and must always be valid.
-    topK<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size, shmem, expert_bias,
-               routed_scaling_factor);
+    topK<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size, shmem);
     sync_calc_threads<Dims>();
   }
 
@@ -276,8 +274,7 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
     const W_element* __restrict__ expert_weights_down,
     const S_element* __restrict__ expert_scales_down, R_element* __restrict__ activations_out,
     void* __restrict__ scratchpad, size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize, const float* __restrict__ expert_bias,
-    float routed_scaling_factor, __grid_constant__ CUtensorMap const up_weights_desc,
+    ScoringFunc scoring_func, bool renormalize, __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc) {
@@ -308,11 +305,10 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
   // Cross-block ordering is entirely flag/sentinel-based (sites #2 and
   // #3 inside moe_kernel_topk_impl); no software barrier counters remain.
 
-  moe_kernel_topk_impl<Dims>(activations_in, token_count, router_logits, expert_weights_up,
-                             expert_scales_up, expert_weights_down, expert_scales_down,
-                             activations_out, top_k, scoring_func, renormalize, expert_bias,
-                             routed_scaling_factor, spec, shmem, up_weights_desc, activations_desc,
-                             down_weights_desc, down_activations_desc);
+  moe_kernel_topk_impl<Dims>(
+      activations_in, token_count, router_logits, expert_weights_up, expert_scales_up,
+      expert_weights_down, expert_scales_down, activations_out, top_k, scoring_func, renormalize,
+      spec, shmem, up_weights_desc, activations_desc, down_weights_desc, down_activations_desc);
 }
 
 }  // namespace monomoe

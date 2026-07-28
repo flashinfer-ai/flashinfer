@@ -134,8 +134,6 @@ constexpr size_t get_moe_max_scratchpad_size();
  * @param [in] top_k Number of experts to select per token
  * @param [in] scoring_func Scoring function (SIGMOID or SOFTMAX)
  * @param [in] renormalize Whether to renormalize top-K weights to sum to 1
- * @param [in] expert_bias Optional per-expert selection bias [E]
- * @param [in] routed_scaling_factor Scalar folded into every routing weight
  */
 template <typename Dims>
 __global__ extern void moe_kernel_topk(
@@ -144,8 +142,7 @@ __global__ extern void moe_kernel_topk(
     const S_element* __restrict expert_scales_up, const W_element* __restrict expert_weights_down,
     const S_element* __restrict expert_scales_down, R_element* __restrict activations_out,
     void* __restrict__ scratchpad, size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize, const float* __restrict__ expert_bias,
-    float routed_scaling_factor, __grid_constant__ CUtensorMap const up_weights_desc,
+    ScoringFunc scoring_func, bool renormalize, __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc);

@@ -81,29 +81,17 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
  * computed.  softmax + renormalize=False needs the full denominator and
  * falls back to a whole-row softmax.
  *
- * @param expert_bias  Optional per-expert selection bias [NUM_EXPERTS]
- *   (GLM-style noaux_tc routing).  When non-null, winners are ranked by
- *   `sigmoid(logit) + bias[e]` while the routing WEIGHT stays the unbiased
- *   sigmoid (recovered post-selection as `metric - bias`).  Sigmoid scoring
- *   only.  Null => raw-logit ranking.
- * @param routed_scaling_factor  Scalar folded into the shared weight
- *   normalizer (exact — the routed output is linear in the weights).
  */
 template <typename Dims>
 __device__ static __forceinline__ void topK_one_token(
     uint32_t warp_idx, uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
-    const __nv_bfloat16* __restrict__ router_logits, MoE_SHM<Dims>* shmem,
-    const float* __restrict__ expert_bias, float routed_scaling_factor) {
+    const __nv_bfloat16* __restrict__ router_logits, MoE_SHM<Dims>* shmem) {
   static_assert(Dims::BS * Dims::NUM_EXPERTS < UINT32_MAX,
                 "Batch size or number of experts too high for uint32 indices.");
 
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
   uint32_t tid = get_thread<Dims>();
 
-  // Per-thread expert slice: thread t owns experts {t, t+32, t+64, ...}.
-  // NUM_EXPERTS % 32 == 0 keeps the fill loop statically bounded so the
-  // scores[] / expert_id[] arrays stay in registers instead of spilling
-  // to local memory.
   static_assert(Dims::NUM_EXPERTS % 32u == 0u,
                 "topK requires NUM_EXPERTS to be a multiple of 32 so "
                 "every thread owns exactly NUM_EXPERTS/32 experts (keeps the "
@@ -112,19 +100,14 @@ __device__ static __forceinline__ void topK_one_token(
   float scores[MAX_PER_THREAD];
   uint32_t expert_id[MAX_PER_THREAD];
 
-  // Selection metric: raw logit (unbiased — monotone in the activation),
-  // or sigmoid(logit) + bias when expert_bias is set (the bias breaks
-  // monotonicity, so the sigmoid must be materialized for selection).
-  const bool use_bias = (expert_bias != nullptr);
 #pragma unroll
   for (uint32_t i = 0; i < MAX_PER_THREAD; ++i) {
     const uint32_t idx = i * 32u + tid;
     const float logit = (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
-    const float metric = use_bias ? (1.0f / (1.0f + __expf(-logit)) + expert_bias[idx]) : logit;
     // Invalid/padded rows can carry NaN/Inf router scores under CUDA graph
     // replay. Treat them as very low scores, but keep them distinct from the
     // already-selected sentinel (-inf) so top-k still returns unique experts.
-    scores[i] = (isnan(metric) || isinf(metric)) ? -FLT_MAX : metric;
+    scores[i] = (isnan(logit) || isinf(logit)) ? -FLT_MAX : logit;
     expert_id[i] = idx;
   }
 
@@ -144,10 +127,9 @@ __device__ static __forceinline__ void topK_one_token(
       }
       float warp_max = warp_reduce_max_float(max_val);
       uint32_t winning_expert = warp_min_expert_with_max(max_val, warp_max, max_expert);
-      float winning_weight = warp_max * routed_scaling_factor;
       if (tid == 0u) {
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)winning_expert;
-        shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
+        shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = warp_max;
       }
 #pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
@@ -158,9 +140,6 @@ __device__ static __forceinline__ void topK_one_token(
   }
 
   // ── Fast path: softmax+renormalize=True OR sigmoid (any renorm) ────────
-  // Select the top-k on the metric; activations are applied post-selection
-  // to only k values.  The k=0 winner IS the row maximum, so the softmax
-  // numerical-safety shift uses topk_scores[0] — no extra warp reduction.
   float topk_scores[MoE_SHM<Dims>::MAX_TOPK];
   uint32_t topk_experts[MoE_SHM<Dims>::MAX_TOPK];
   constexpr float EXCLUDED_SCORE = -INFINITY;
@@ -184,12 +163,9 @@ __device__ static __forceinline__ void topK_one_token(
     }
   }
 
-  // Convert selected scores → weights + (re)normalize.  All lanes hold
-  // identical topk arrays; thread 0 writes.
   if (tid == 0) {
     if (scoring_func == ScoringFunc::SOFTMAX) {
       // softmax + renormalize=True: weight_k = exp(x_k - max) / sum_topk.
-      // (Biased selection is sigmoid-only, so no bias recovery here.)
       float row_max = topk_scores[0];
       float exp_vals[MoE_SHM<Dims>::MAX_TOPK];
       float sum_exp = 0.0f;
@@ -198,25 +174,19 @@ __device__ static __forceinline__ void topK_one_token(
         sum_exp += exp_vals[k];
       }
       float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 1.0f;
-      inv *= routed_scaling_factor;
       for (uint32_t k = 0; k < top_k; k++) {
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = exp_vals[k] * inv;
       }
     } else {
-      // Sigmoid: weight_k = sigmoid(x_k), optionally renormalized over the
-      // selected set.  Under biased selection the stored metric is
-      // sigmoid + bias, so the unbiased weight is metric - bias — no
-      // second sigmoid.
+      // Sigmoid: weight_k = sigmoid(x_k), optionally renormalized.
       float sig_vals[MoE_SHM<Dims>::MAX_TOPK];
       float sum_sig = 0.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        sig_vals[k] = use_bias ? (topk_scores[k] - expert_bias[topk_experts[k]])
-                               : (1.0f / (1.0f + __expf(-topk_scores[k])));
+        sig_vals[k] = 1.0f / (1.0f + __expf(-topk_scores[k]));
         sum_sig += sig_vals[k];
       }
       float inv = renormalize ? ((sum_sig > 0.0f) ? (1.0f / sum_sig) : 1.0f) : 1.0f;
-      inv *= routed_scaling_factor;
       for (uint32_t k = 0; k < top_k; k++) {
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = sig_vals[k] * inv;
@@ -228,22 +198,16 @@ __device__ static __forceinline__ void topK_one_token(
 /**
  * @brief Top-K driver: maps calc warps onto tokens and runs
  * topK_one_token per (warp, token).
- *
- * BS<=8: each calc warp routes exactly one token (`tok == warp_idx`);
- * padding warps (`warp_idx >= num_tokens`) do nothing.
- *
  */
 template <typename Dims>
 __device__ void topK(uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
                      const __nv_bfloat16* __restrict__ router_logits, uint32_t num_tokens,
-                     MoE_SHM<Dims>* shmem, const float* __restrict__ expert_bias = nullptr,
-                     float routed_scaling_factor = 1.0f) {
+                     MoE_SHM<Dims>* shmem) {
   static_assert(Dims::BS <= 8, "topK supports BS<=8");
 
   const uint32_t warp_idx = get_calc_warp<Dims>();
   if (warp_idx < num_tokens) {
-    topK_one_token<Dims>(warp_idx, top_k, scoring_func, renormalize, router_logits, shmem,
-                         expert_bias, routed_scaling_factor);
+    topK_one_token<Dims>(warp_idx, top_k, scoring_func, renormalize, router_logits, shmem);
   }
 }
 

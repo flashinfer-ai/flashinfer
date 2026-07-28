@@ -28,7 +28,7 @@
 
 /**
  * @brief Host launcher for `moe_kernel_topk<Dims>`, with runtime top_k /
- * scoring_func / renormalize / expert_bias / routed_scaling_factor.
+ * scoring_func / renormalize.
  *
  * Design doc: docs/design_docs/monomoe_kernel.md (section numbers below).
  * Checks the co-residency invariant (§3), zero-inits the scratchpad on first
@@ -41,8 +41,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
                            TensorView expert_weights_up, TensorView expert_scales_up,
                            TensorView expert_weights_down, TensorView expert_scales_down,
                            TensorView activations_out, TensorView scratchpad, int64_t top_k,
-                           int64_t scoring_func, bool renormalize,
-                           ffi::Optional<TensorView> expert_bias, double routed_scaling_factor) {
+                           int64_t scoring_func, bool renormalize) {
   CHECK_INPUT(activations_in);
   CHECK_INPUT(router_logits);
   CHECK_INPUT(expert_weights_up);
@@ -74,26 +73,12 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   auto* activations_out_ptr = static_cast<R_element*>(activations_out.data_ptr());
   char* scratchpad_ptr = reinterpret_cast<char*>(scratchpad.data_ptr());
 
-  // Optional per-expert selection bias (float32 [NUM_EXPERTS]); nullptr =>
-  // raw-logit ranking.
-  const float* expert_bias_ptr = nullptr;
-  if (expert_bias.has_value()) {
-    CHECK_INPUT(expert_bias.value());
-    CHECK_INPUT_TYPE(expert_bias.value(), dl_float32);
-    TVM_FFI_ICHECK(expert_bias.value().ndim() == 1 &&
-                   expert_bias.value().size(0) == Dims::NUM_EXPERTS)
-        << "expert_bias must be 1-D with NUM_EXPERTS (=" << Dims::NUM_EXPERTS
-        << ") elements; the routing kernel reads all NUM_EXPERTS entries.";
-    expert_bias_ptr = static_cast<const float*>(expert_bias.value().data_ptr());
-  }
-
   const uint32_t num_tokens = activations_in.size(0);
   const size_t shmem_size = get_moe_shmem_size<Dims>();
   const size_t scratchpad_size =
       static_cast<size_t>(scratchpad.numel()) * get_element_size(scratchpad);
   const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);
   const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);
-  const float routed_scaling_factor_f = static_cast<float>(routed_scaling_factor);
 
   // TMA descriptors (docs/design_docs/monomoe_kernel.md §5).  Non-TMA variants leave these
   // zero-initialized; the kernel params are always present but only the
@@ -166,9 +151,8 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
                           dim3(Dims::KernelConfig::BLOCK_SIZE, 1, 1), shmem_size, stream>>>(
       activations_in_ptr, num_tokens, router_logits_ptr, expert_weights_up_ptr,
       expert_scales_up_ptr, expert_weights_down_ptr, expert_scales_down_ptr, activations_out_ptr,
-      scratchpad_ptr, scratchpad_size, shmem_size, top_k_u32, sf, renormalize, expert_bias_ptr,
-      routed_scaling_factor_f, up_weights_desc, activations_desc, down_weights_desc,
-      down_activations_desc);
+      scratchpad_ptr, scratchpad_size, shmem_size, top_k_u32, sf, renormalize, up_weights_desc,
+      activations_desc, down_weights_desc, down_activations_desc);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -179,4 +163,4 @@ template void monomoe_topk_launcher<::monomoe::Dims_BS8_E256_N512_K2048_BlockFP8
     TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,
     TensorView expert_scales_up, TensorView expert_weights_down, TensorView expert_scales_down,
     TensorView activations_out, TensorView scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize, ffi::Optional<TensorView> expert_bias, double routed_scaling_factor);
+    bool renormalize);

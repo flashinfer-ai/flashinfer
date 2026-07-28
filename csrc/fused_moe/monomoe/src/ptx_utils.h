@@ -101,7 +101,10 @@ __device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr
 __device__ static __forceinline__ void wgmma_fence() { cute::warpgroup_arrive(); }
 
 /**
- * @brief Close the currently-outstanding WGMMA group and start a new one.
+ * @brief Commit all previously-issued WGMMAs as a single trackable group.
+ *
+ * Subsequent WGMMAs belong to the next group; `wgmma_wait_group<N>()` counts
+ * committed groups that are still in flight.
  */
 __device__ static __forceinline__ void wgmma_commit_group() { cute::warpgroup_commit_batch(); }
 

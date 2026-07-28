@@ -139,7 +139,6 @@ def _run_and_compare(x, logits, weights, N, K, top_k, scratchpad=None):
     topk_w, topk_ids = _routing_softmax_topk(logits, top_k)
     ref = _python_reference_fp8(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids, N, K)
 
-    # mono_moe applies the up-weight TMA interleave internally by default.
     out = mono_moe(
         x,
         logits,
@@ -165,8 +164,7 @@ def _require_monomoe(dev):
         pytest.skip("monomoe unavailable for the E=256/N=512/K=2048 shape")
 
 
-# Single fixed shape (E=256, N=512, K=2048), BS8 kernel: M <= 8 tokens.
-@pytest.mark.parametrize("m", [1, 2, 8])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("top_k", [1, 8])
 def test_monomoe_accuracy(m, top_k):
     E, N, K = 256, 512, 2048
@@ -183,7 +181,7 @@ def test_monomoe_accuracy(m, top_k):
     assert cos > 0.98, f"cosine similarity too low: {cos:.5f}"
 
 
-@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
 def test_monomoe_scratchpad_reuse_no_contamination(m):
     """A scratchpad reused across calls with DIFFERENT inputs must not leak
     state between launches.
@@ -235,6 +233,83 @@ def test_monomoe_scratchpad_reuse_no_contamination(m):
             # the kernel silently returning a stale buffer).
             assert not torch.equal(out_reuse, prev_out)
         prev_out = out_reuse.clone()
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+def test_monomoe_cuda_graph_replay(m):
+    """CUDA graph capture + multi-replay must produce correct results.
+
+    The kernel uses TMA descriptors that bake in buffer addresses at capture
+    time, and the scratchpad's parity double-buffer must self-reset across
+    replays without an explicit cudaMemset.  We capture once, then replay with
+    different input DATA (written into the same pre-allocated buffers) and
+    verify each replay matches the Python reference.
+    """
+    E, N, K = 256, 512, 2048
+    dev = torch.device("cuda")
+    _require_monomoe(dev)
+
+    torch.manual_seed(77)
+    weights = _make_weights(dev, E, N, K)
+    w13_fp8, s13, w2_fp8, s2 = weights
+
+    # Pre-allocate fixed buffers for graph capture.
+    x = torch.randn(m, K, device=dev, dtype=torch.bfloat16)
+    logits = torch.randn(m, E, device=dev, dtype=torch.bfloat16)
+    out = torch.empty(m, K, device=dev, dtype=torch.bfloat16)
+    scratch = alloc_scratchpad(dev)
+
+    # Warmup (required before graph capture).
+    for _ in range(3):
+        mono_moe(
+            x,
+            logits,
+            w13_fp8,
+            s13,
+            w2_fp8,
+            s2,
+            top_k=8,
+            scoring_func="softmax",
+            renormalize=True,
+            out=out,
+            scratchpad=scratch,
+        )
+    torch.cuda.synchronize()
+
+    # Capture.
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        mono_moe(
+            x,
+            logits,
+            w13_fp8,
+            s13,
+            w2_fp8,
+            s2,
+            top_k=8,
+            scoring_func="softmax",
+            renormalize=True,
+            out=out,
+            scratchpad=scratch,
+        )
+    torch.cuda.synchronize()
+
+    # Replay with different inputs each time and verify.
+    for i in range(4):
+        torch.manual_seed(200 + i)
+        x.copy_(torch.randn(m, K, device=dev, dtype=torch.bfloat16))
+        logits.copy_(torch.randn(m, E, device=dev, dtype=torch.bfloat16))
+
+        g.replay()
+        torch.cuda.synchronize()
+
+        # Compute reference for this iteration's inputs.
+        topk_w, topk_ids = _routing_softmax_topk(logits, top_k=8)
+        ref = _python_reference_fp8(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids, N, K)
+        cos = _cosine(out, ref)
+        print(f"\n[monomoe graph] m={m} replay={i}: cos_sim={cos:.5f}")
+        assert cos > 0.98, f"graph replay {i}: cosine similarity too low: {cos:.5f}"
+        assert torch.isfinite(out.float()).all(), f"graph replay {i}: NaN/Inf in output"
 
 
 @pytest.mark.parametrize("scale", [1e-2, 3e-3])
