@@ -33,6 +33,7 @@ import torch
 
 import flashinfer
 
+import quant
 from modeling import FlashInferLLM, PagedKVCache, resolve_checkpoint_dir
 
 DEFAULT_PROMPTS = [
@@ -349,6 +350,18 @@ def main():
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--prefill-backend", default="auto")
     parser.add_argument("--decode-backend", default="auto")
+    parser.add_argument(
+        "--quant",
+        choices=quant.QUANT_MODES,
+        default="bf16",
+        help="Quantize the dense projections on the fly (default: bf16)",
+    )
+    parser.add_argument(
+        "--quant-backend",
+        default="auto",
+        help="FlashInfer GEMM backend for --quant "
+        "(fp8: cublas|cudnn|cutlass|auto, nvfp4: cudnn|cutlass|auto)",
+    )
     args = parser.parse_args()
 
     jit_counter = install_jit_build_counter()
@@ -356,14 +369,22 @@ def main():
     if rank != 0:  # keep stdout single-writer; stderr stays visible
         sys.stdout = open(os.devnull, "w")  # noqa: SIM115 — process-lifetime sink
     device = torch.device("cuda", torch.cuda.current_device())
+    reason = quant.unsupported_reason(args.quant, args.quant_backend, device)
+    if reason:
+        print(f"skipping: {reason}")
+        print("[smoke] quant=skip")
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
+        return
     ckpt_dir = resolve_checkpoint_dir(args.model_id)
 
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
+    qcfg = quant.QuantConfig(args.quant, args.quant_backend)
     t0 = time.perf_counter()
     model = FlashInferLLM.from_pretrained(
-        str(ckpt_dir), device, tp_size=world_size, tp_rank=rank
+        str(ckpt_dir), device, tp_size=world_size, tp_rank=rank, quant=qcfg
     )
     tp_note = f", tep tp=ep={world_size}" if world_size > 1 else ""
     print(
@@ -428,6 +449,14 @@ def main():
         f"(batch={len(prompts)}; includes first-call JIT warmup)"
     )
 
+    qs = qcfg.summary()
+    print(f"[smoke] quant_mode={qs['mode']}")
+    if qs["mode"] != "bf16":
+        # Which backend "auto" resolved to is version-dependent (cuDNN vs
+        # CUTLASS on SM100), so make it visible instead of silent.
+        print(f"[smoke] quant_linears={qs['quantized_linears']}")
+        print(f"[smoke] quant_fallbacks={qs['bf16_fallbacks']}")
+        print(f"[smoke] quant_resolved_backends={qs['resolved_backends']}")
     print(f"[smoke] jit_builds_total={jit_counter['count']}")
     print(f"[smoke] jit_builds_names={','.join(jit_counter['names'])}")
     print(f"[smoke] jit_build_calls={jit_counter['build_calls']}")

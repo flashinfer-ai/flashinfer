@@ -35,8 +35,17 @@ import tempfile
 
 import torch
 
+import quant
 from generate import GenerationEngine, maybe_init_distributed
 from modeling import FlashInferLLM
+
+# Quantized-vs-BF16 gates, per mode: (max rel-L2, min cosine similarity).
+# These bound *quantization* error only — the comparison is against this
+# example's own BF16 logits, not against transformers, so the bf16-vs-eager
+# noise floor does not enter. A plumbing bug (transposed descale, re-swizzled
+# scale blob) lands at cos~0 / rel_l2~1.4, which is what these must separate
+# from honest low-precision error. Re-baseline from hardware before trusting.
+QUANT_GATES = {"fp8": (0.10, 0.99), "nvfp4": (0.45, 0.90)}
 
 # Tiny but kernel-legal shapes: head_dim 64/128 for attention; hidden and
 # (moe_)intermediate must be multiples of 8 for the BF16 cutlass MoE path.
@@ -156,6 +165,98 @@ def check_arch(
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _prefill_logits(ckpt, device, world_size, rank, qcfg, prompts):
+    model = FlashInferLLM.from_pretrained(
+        ckpt, device, tp_size=world_size, tp_rank=rank, quant=qcfg
+    )
+    engine = GenerationEngine(model)
+    out = engine.prefill_logits(prompts).float()
+    del model, engine
+    torch.cuda.empty_cache()
+    return out
+
+
+def check_quant(
+    arch: str, mode: str, backend: str, seed: int, world_size: int, rank: int
+) -> bool:
+    """Compare the quantized path against this example's own BF16 logits.
+
+    Deliberately *not* folded into :func:`check_arch`: that gate measures
+    FlashInfer-vs-transformers, and adding quantization error on top would
+    conflate three error sources. Comparing against our own BF16 output
+    isolates quantization exactly and leaves the existing gate as the anchor.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    rel_tol, cos_bar = QUANT_GATES[mode]
+
+    # A single random GEMM first: this separates "the wrapper is wired wrong"
+    # from "this model is tiny and FP4 is lossy".
+    if rank == 0:
+        cos, bar = quant.self_check(mode, backend, device)
+        status = "ok" if cos >= bar else "WIRED WRONG"
+        print(f"  {mode} gemm self-check: cos={cos:.4f} (bar {bar}) [{status}]")
+        if cos < bar:
+            return False
+
+    tmpdir = ckpt = None
+    if rank == 0:
+        tmpdir = tempfile.mkdtemp()
+        ckpt = build_tiny_checkpoint(arch, tmpdir, seed)
+    if world_size > 1:
+        obj = [ckpt]
+        torch.distributed.broadcast_object_list(obj, src=0)
+        ckpt = obj[0]
+
+    try:
+        g = torch.Generator().manual_seed(seed + 1)
+        # vocab_size is fixed by the tiny fixture; read it off a throwaway load
+        # rather than duplicating the constant here.
+        probe = FlashInferLLM.from_pretrained(ckpt, device, tp_size=1, tp_rank=0)
+        vocab = probe.config.vocab_size
+        del probe
+        torch.cuda.empty_cache()
+        prompts = [
+            torch.randint(0, vocab, (n,), generator=g).tolist() for n in (7, 33, 61)
+        ]
+
+        ref = _prefill_logits(
+            ckpt, device, world_size, rank, quant.QuantConfig(), prompts
+        )
+        qcfg = quant.QuantConfig(mode, backend)
+        got = _prefill_logits(ckpt, device, world_size, rank, qcfg, prompts)
+
+        ok = True
+        if rank == 0:
+            qs = qcfg.summary()
+            print(
+                f"  {mode} on {arch}: {qs['quantized_linears']} quantized linears, "
+                f"{qs['bf16_fallbacks']} bf16 fallbacks, "
+                f"backend={qs['resolved_backends'] or backend}"
+            )
+            if qs["quantized_linears"] == 0:
+                print("  nothing was quantized — shapes all fell back")
+                return False
+            for i, ids in enumerate(prompts):
+                rel = ((got[i] - ref[i]).norm() / ref[i].norm()).item()
+                cos = torch.nn.functional.cosine_similarity(
+                    got[i], ref[i], dim=0
+                ).item()
+                good = rel <= rel_tol and cos >= cos_bar
+                print(
+                    f"  {mode} len={len(ids):>3}: rel_l2={rel:.4f} cos={cos:.4f} "
+                    f"[{'ok' if good else 'MISMATCH'}]"
+                )
+                ok &= good
+        if world_size > 1:
+            flag = torch.tensor([int(ok)], device=device)
+            torch.distributed.broadcast(flag, src=0)
+            ok = bool(flag.item())
+        return ok
+    finally:
+        if rank == 0 and tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arch", choices=["dense", "moe", "all"], default="all")
@@ -166,6 +267,13 @@ def main():
         help="max relative L2 error of last-token logits vs transformers eager",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--quant",
+        choices=("bf16", "fp8", "nvfp4", "all"),
+        default="bf16",
+        help="Also check quantized paths against this example's BF16 logits",
+    )
+    parser.add_argument("--quant-backend", default="auto")
     args = parser.parse_args()
 
     world_size, rank = maybe_init_distributed()
@@ -181,6 +289,23 @@ def main():
         print(f"[smoke] refcheck_{arch}={'pass' if ok else 'fail'}")
         if not ok:
             failed.append(arch)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    qmodes = ["fp8", "nvfp4"] if args.quant == "all" else [args.quant]
+    for qmode in [m for m in qmodes if m != "bf16"]:
+        reason = quant.unsupported_reason(qmode, args.quant_backend, device)
+        if reason:
+            print(f"skipping {qmode}: {reason}")
+            print(f"[smoke] refcheck_quant_{qmode}=skip")
+            continue
+        for arch in archs:
+            print(f"quant check ({mode}): tiny {arch}, {qmode} vs our own bf16")
+            ok = check_quant(
+                arch, qmode, args.quant_backend, args.seed, world_size, rank
+            )
+            print(f"[smoke] refcheck_quant_{qmode}_{arch}={'pass' if ok else 'fail'}")
+            if not ok:
+                failed.append(f"{qmode}/{arch}")
     if world_size > 1:
         torch.distributed.destroy_process_group()
     if failed:

@@ -27,6 +27,8 @@ import torch
 import flashinfer
 import flashinfer.fused_moe  # noqa: F401  (subpackage attribute access)
 
+from quant import QuantConfig
+
 SUPPORTED_MODEL_TYPES = ("llama", "qwen2", "qwen3", "qwen3_moe")
 
 
@@ -172,8 +174,10 @@ class DecoderLayerWeights:
         config: "ModelConfig",
         tp_size: int = 1,
         tp_rank: int = 0,
+        quant: Optional["QuantConfig"] = None,
     ):
         p = f"model.layers.{i}."
+        quant = quant or QuantConfig()
 
         def get(name: str, required: bool = True) -> Optional[torch.Tensor]:
             key = p + name
@@ -190,15 +194,26 @@ class DecoderLayerWeights:
 
         self.input_layernorm = get("input_layernorm.weight")
         self.post_attention_layernorm = get("post_attention_layernorm.weight")
-        # Column-parallel QKV (head-contiguous rows), row-parallel o_proj.
-        self.q_proj = shard(get("self_attn.q_proj.weight"), 0)
-        self.k_proj = shard(get("self_attn.k_proj.weight"), 0)
-        self.v_proj = shard(get("self_attn.v_proj.weight"), 0)
-        self.o_proj = shard(get("self_attn.o_proj.weight"), 1)
         # Qwen2-family checkpoints carry QKV bias; Llama/Qwen3 do not.
-        self.q_bias = shard(get("self_attn.q_proj.bias", required=False), 0)
-        self.k_bias = shard(get("self_attn.k_proj.bias", required=False), 0)
-        self.v_bias = shard(get("self_attn.v_proj.bias", required=False), 0)
+        q_bias = shard(get("self_attn.q_proj.bias", required=False), 0)
+        k_bias = shard(get("self_attn.k_proj.bias", required=False), 0)
+        v_bias = shard(get("self_attn.v_proj.bias", required=False), 0)
+        # Column-parallel QKV (head-contiguous rows), row-parallel o_proj.
+        # quant.linear returns a callable: plain F.linear by default, or an
+        # FP8/NVFP4 GEMM whose weight was quantized here, once, at load time.
+        # Each rank quantizes its own shard, so the scales need no slicing.
+        self.q_proj = quant.linear(
+            shard(get("self_attn.q_proj.weight"), 0), q_bias, "q_proj"
+        )
+        self.k_proj = quant.linear(
+            shard(get("self_attn.k_proj.weight"), 0), k_bias, "k_proj"
+        )
+        self.v_proj = quant.linear(
+            shard(get("self_attn.v_proj.weight"), 0), v_bias, "v_proj"
+        )
+        self.o_proj = quant.linear(
+            shard(get("self_attn.o_proj.weight"), 1), None, "o_proj"
+        )
         # Qwen3 per-head q/k RMSNorm over head_dim: replicated (shape [head_dim]).
         self.q_norm = get("self_attn.q_norm.weight", required=False)
         self.k_norm = get("self_attn.k_norm.weight", required=False)
@@ -206,6 +221,9 @@ class DecoderLayerWeights:
         if self.is_sparse:
             self.gate_proj = self.up_proj = self.down_proj = None
             # Router is replicated; every rank computes the global routing.
+            # Deliberately NOT quantized: top-k selection is discrete, so a
+            # quantization perturbation flips experts and produces a step
+            # change in the logits that no tolerance can call a bug or not.
             self.moe_gate = get("mlp.gate.weight")  # [num_experts, hidden]
             # Expert-parallel: this rank holds experts
             # [tp_rank * E/tp, (tp_rank+1) * E/tp).
@@ -227,9 +245,15 @@ class DecoderLayerWeights:
         else:
             self.moe_gate = self.moe_w31 = self.moe_w2 = None
             # Column-parallel gate/up, row-parallel down.
-            self.gate_proj = shard(get("mlp.gate_proj.weight"), 0)
-            self.up_proj = shard(get("mlp.up_proj.weight"), 0)
-            self.down_proj = shard(get("mlp.down_proj.weight"), 1)
+            self.gate_proj = quant.linear(
+                shard(get("mlp.gate_proj.weight"), 0), None, "gate_proj"
+            )
+            self.up_proj = quant.linear(
+                shard(get("mlp.up_proj.weight"), 0), None, "up_proj"
+            )
+            self.down_proj = quant.linear(
+                shard(get("mlp.down_proj.weight"), 1), None, "down_proj"
+            )
 
 
 class FlashInferLLM:
@@ -248,12 +272,14 @@ class FlashInferLLM:
         dtype: torch.dtype = torch.bfloat16,
         tp_size: int = 1,
         tp_rank: int = 0,
+        quant: Optional[QuantConfig] = None,
     ):
         self.config = config
         self.device = device
         self.dtype = dtype
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.quant = quant or QuantConfig()
         if tp_size > 1:
             if config.num_attention_heads % tp_size:
                 raise ValueError("num_attention_heads must divide by tp_size")
@@ -269,12 +295,19 @@ class FlashInferLLM:
             device=device, dtype=dtype
         )
         self.final_norm = state_dict["model.norm.weight"].to(device=device, dtype=dtype)
+        # lm_head stays BF16: under tie_word_embeddings it is the *same tensor*
+        # as embed_tokens, so quantizing it would corrupt the embedding lookup.
+        # It is also never TP-sharded, and keeping it exact makes the logits
+        # comparison a measurement of the decoder stack rather than the vocab
+        # projection.
         if config.tie_word_embeddings or "lm_head.weight" not in state_dict:
             self.lm_head = self.embed_tokens
         else:
             self.lm_head = state_dict["lm_head.weight"].to(device=device, dtype=dtype)
         self.layers = [
-            DecoderLayerWeights(state_dict, i, device, dtype, config, tp_size, tp_rank)
+            DecoderLayerWeights(
+                state_dict, i, device, dtype, config, tp_size, tp_rank, self.quant
+            )
             for i in range(config.num_hidden_layers)
         ]
 
@@ -292,6 +325,7 @@ class FlashInferLLM:
         dtype: torch.dtype = torch.bfloat16,
         tp_size: int = 1,
         tp_rank: int = 0,
+        quant: Optional[QuantConfig] = None,
     ) -> "FlashInferLLM":
         ckpt_dir = resolve_checkpoint_dir(model_id_or_path)
         with open(ckpt_dir / "config.json") as f:
@@ -299,7 +333,7 @@ class FlashInferLLM:
         # Every rank reads the full state dict and slices its shard — fine
         # for verification-scale models; a real loader would shard reads.
         state_dict = _load_state_dict(ckpt_dir)
-        return cls(config, state_dict, device, dtype, tp_size, tp_rank)
+        return cls(config, state_dict, device, dtype, tp_size, tp_rank, quant)
 
     def _apply_rope(self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor):
         cfg = self.config
@@ -354,9 +388,9 @@ class FlashInferLLM:
                 flashinfer.fused_add_rmsnorm(
                     x, residual, w.input_layernorm, cfg.rms_norm_eps
                 )
-            q = torch.nn.functional.linear(x, w.q_proj, w.q_bias).view(nnz, num_q, hd)
-            k = torch.nn.functional.linear(x, w.k_proj, w.k_bias).view(nnz, num_kv, hd)
-            v = torch.nn.functional.linear(x, w.v_proj, w.v_bias).view(nnz, num_kv, hd)
+            q = w.q_proj(x).view(nnz, num_q, hd)
+            k = w.k_proj(x).view(nnz, num_kv, hd)
+            v = w.v_proj(x).view(nnz, num_kv, hd)
             if w.q_norm is not None:
                 q = flashinfer.rmsnorm(q, w.q_norm, cfg.rms_norm_eps)
                 k = flashinfer.rmsnorm(k, w.k_norm, cfg.rms_norm_eps)
@@ -373,7 +407,7 @@ class FlashInferLLM:
                 kv_layout="NHD",
             )
             attn = attn_wrapper.run(q, kv_cache.layer_view(i))
-            attn = torch.nn.functional.linear(attn.reshape(nnz, num_q * hd), w.o_proj)
+            attn = w.o_proj(attn.reshape(nnz, num_q * hd))
             self._maybe_all_reduce(attn)
             flashinfer.fused_add_rmsnorm(
                 attn, residual, w.post_attention_layernorm, cfg.rms_norm_eps
@@ -405,16 +439,11 @@ class FlashInferLLM:
                 )[0]
                 self._maybe_all_reduce(x)
             else:
-                gate_up = torch.cat(
-                    [
-                        torch.nn.functional.linear(attn, w.gate_proj),
-                        torch.nn.functional.linear(attn, w.up_proj),
-                    ],
-                    dim=-1,
-                )
-                x = torch.nn.functional.linear(
-                    flashinfer.silu_and_mul(gate_up), w.down_proj
-                )
+                # gate and up quantize `attn` twice; a production impl would
+                # fuse them into one (2*I, H) weight and a single GEMM. Kept
+                # separate so the BF16 path stays byte-identical to before.
+                gate_up = torch.cat([w.gate_proj(attn), w.up_proj(attn)], dim=-1)
+                x = w.down_proj(flashinfer.silu_and_mul(gate_up))
                 self._maybe_all_reduce(x)
         # Final residual add + norm, only then project the rows we sample from.
         flashinfer.fused_add_rmsnorm(x, residual, self.final_norm, cfg.rms_norm_eps)

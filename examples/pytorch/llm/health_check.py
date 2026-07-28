@@ -40,6 +40,7 @@ import time
 
 import torch
 
+import quant
 from generate import GenerationEngine, install_jit_build_counter, maybe_init_distributed
 from modeling import FlashInferLLM, resolve_checkpoint_dir
 
@@ -78,6 +79,8 @@ def main():
     parser.add_argument("--autotune", action="store_true")
     parser.add_argument("--json", dest="json_path", help="write metrics JSON here")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--quant", choices=quant.QUANT_MODES, default="bf16")
+    parser.add_argument("--quant-backend", default="auto")
     args = parser.parse_args()
     if not args.model_id and not args.tiny:
         parser.error("pass --model-id or --tiny")
@@ -87,6 +90,14 @@ def main():
     if rank != 0:  # keep stdout single-writer; stderr stays visible
         sys.stdout = open(os.devnull, "w")  # noqa: SIM115 — process-lifetime sink
     device = torch.device("cuda", torch.cuda.current_device())
+
+    reason = quant.unsupported_reason(args.quant, args.quant_backend, device)
+    if reason:
+        print(f"skipping: {reason}")
+        print("[smoke] health=skip")
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
+        return
 
     metrics = {
         "gpu": torch.cuda.get_device_name(device),
@@ -121,11 +132,17 @@ def main():
     try:
         # --- stage 1: load ---
         t0 = time.perf_counter()
+        qcfg = quant.QuantConfig(args.quant, args.quant_backend)
         model = FlashInferLLM.from_pretrained(
-            ckpt, device, tp_size=world_size, tp_rank=rank
+            ckpt, device, tp_size=world_size, tp_rank=rank, quant=qcfg
         )
         engine = GenerationEngine(model)
         metrics["load_seconds"] = round(time.perf_counter() - t0, 3)
+        if args.quant != "bf16":
+            # Two extra elementwise kernels per linear (amax + quantize) mean
+            # tok/s can DROP under --quant at verification-scale shapes. That
+            # is launch overhead, not a kernel regression.
+            metrics["quant"] = qcfg.summary()
 
         g = torch.Generator().manual_seed(args.seed + 1)
         vocab = model.config.vocab_size

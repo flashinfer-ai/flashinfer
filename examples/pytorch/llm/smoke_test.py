@@ -38,6 +38,10 @@ def run_generate(args: argparse.Namespace, label: str) -> Dict:
         str(args.max_tokens),
         "--temperature",
         "0.0",
+        "--quant",
+        args.quant,
+        "--quant-backend",
+        args.quant_backend,
     ]
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
@@ -70,6 +74,8 @@ def run_generate(args: argparse.Namespace, label: str) -> Dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--quant", default="bf16")
+    parser.add_argument("--quant-backend", default="auto")
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument(
         "--timeout",
@@ -82,6 +88,10 @@ def main():
     print(f"smoke test: {args.model_id}, greedy, {args.max_tokens} new tokens")
     first = run_generate(args, "run 1 (warmup, compiles allowed)")
     second = run_generate(args, "run 2 (must be fully cached)")
+
+    if first.get("quant") == "skip":
+        print("PASS (quant mode unsupported here; skipped)")
+        return
 
     failures: List[str] = []
 
