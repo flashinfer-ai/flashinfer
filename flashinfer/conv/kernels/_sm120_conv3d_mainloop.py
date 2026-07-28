@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# mypy: disable-error-code="attr-defined, call-overload"
+# mypy: disable-error-code="call-overload"
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -43,6 +43,8 @@ from __future__ import annotations
 # Preserve the validated CUTLASS DSL loop and register-allocation structure.
 # ruff: noqa: B007, F841
 
+from typing import TYPE_CHECKING, Any
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
@@ -55,6 +57,45 @@ from ._sm120_blockscaled_dispatch import make_ldmatrix_atom
 
 class CompactSfaPingpongMainloop:
     """Device kernel for physical-halo activation and compact C16 scales."""
+
+    if TYPE_CHECKING:
+        a_dtype: Any
+        a_layout: Any
+        ab_stage: int
+        acc_dtype: Any
+        b_dtype: Any
+        b_layout: Any
+        c_dtype: Any
+        c_layout: Any
+        epi_stage: int
+        epi_tile: tuple[int, int]
+        epilog_sync_barrier: Any
+        load_register_requirement: int
+        mixed_mode: bool
+        mma_register_requirement: int
+        num_mma_warps: int
+        num_threads_per_warp: int
+        p3_a_copy_bits: int
+        p3_a_copy_layout: str
+        p3_a_producer_warps: int
+        p3_epilog_sync_barrier_0: Any
+        p3_epilog_sync_barrier_1: Any
+        p3_epilogue_mode: str
+        p3_fuse_alpha: bool
+        p3_fuse_bias: bool
+        p3_n_pair: bool
+        p3_parallel_epilogue: bool
+        sf_dtype: Any
+        sf_vec_size: int
+        shared_storage: Any
+        tile_shape_mnk: tuple[int, int, int]
+        tma_load_warp_id: int
+
+        def advance(self, state: Any, iterations: int) -> Any: ...
+
+        def make_and_init_order_barrier(
+            self, barrier_storage: Any, warp_group_idx: Any
+        ) -> Any: ...
 
     @cute.jit
     def p3_epilog_sync(self, warp_group_idx):
@@ -72,7 +113,6 @@ class CompactSfaPingpongMainloop:
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
         mA_ndhwc: cute.Tensor,
-        mA_index_fm: cute.Tensor,
         mA_zero: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
@@ -120,6 +160,8 @@ class CompactSfaPingpongMainloop:
         assert K_gemm_tile == self.tile_shape_mnk[2]
         assert input_C % K_gemm_tile == 0
         assert K_gemm_tile % (self.sf_vec_size * 4) == 0
+        assert self.tile_shape_mnk == (128, 128, 128)
+        assert self.sf_vec_size == 16
         n_tiles_per_work = 2 if self.p3_n_pair else 1
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -303,7 +345,8 @@ class CompactSfaPingpongMainloop:
                 )
                 sfa_pred = cute.make_rmem_tensor((1,), cutlass.Boolean)
                 a_vec_layout = cute.make_layout((a_copy_elems,), stride=(1,))
-                sf_vec4_layout = cute.make_layout((4,), stride=(1,))
+                sfa_scales_per_chunk = 4
+                sf_vec4_layout = cute.make_layout((sfa_scales_per_chunk,), stride=(1,))
                 output_pq = output_P * output_Q
                 output_zpq = output_Z * output_pq
                 input_hw = input_H * input_W
@@ -313,6 +356,17 @@ class CompactSfaPingpongMainloop:
                 sfa_chunks_per_tile = K_gemm_tile // (self.sf_vec_size * 4)
                 k_tiles_per_filter_position = input_C // K_gemm_tile
                 sfa_stage_stride = cute.cosize(sfa_smem_layout)
+                # SM120's 128x4 scale layout stores each four-column chunk in
+                # 512 elements: 128 rows * 4 scales. Rows are split into four
+                # 32-row quadrants, producing row and quadrant strides 16/4.
+                sfa_rows_per_quadrant = 32
+                sfa_quadrants_per_tile = self.tile_shape_mnk[0] // sfa_rows_per_quadrant
+                sfa_row_stride = sfa_scales_per_chunk * sfa_quadrants_per_tile
+                sfa_quadrant_stride = sfa_scales_per_chunk
+                sfa_chunk_stride = self.tile_shape_mnk[0] * sfa_scales_per_chunk
+                assert sfa_stage_stride == (
+                    self.tile_shape_mnk[0] * self.tile_shape_mnk[2] // self.sf_vec_size
+                )
                 if cutlass.const_expr(self.p3_a_copy_layout == "coalesced"):
                     a_vectors_per_row = K_gemm_tile // a_copy_elems
                     a_rows_per_instruction = (
@@ -346,6 +400,8 @@ class CompactSfaPingpongMainloop:
                             )
                             pre_coal_m_global = cta_m_offset + pre_coal_local_m
                             pre_coal_m_valid = pre_coal_m_global < output_m
+                            # A cp.async is unpredicated, so tail rows read the
+                            # valid row zero while their SFA copy is predicated.
                             pre_coal_m_safe = (
                                 pre_coal_m_global if pre_coal_m_valid else 0
                             )
@@ -365,6 +421,8 @@ class CompactSfaPingpongMainloop:
                         for row_quad in cutlass.range_constexpr(4):
                             m_global = cta_m_offset + lane + 32 * row_quad
                             m_is_valid = m_global < output_m
+                            # Clamp invalid tail rows for the unpredicated A
+                            # cp.async; the corresponding SFA copy is predicated.
                             m_safe = m_global if m_is_valid else 0
                             n_idx = m_safe // output_zpq
                             zpq_rem = m_safe - n_idx * output_zpq
@@ -440,20 +498,22 @@ class CompactSfaPingpongMainloop:
                                 )
 
                                 if a_lane_k < sfa_chunks_per_tile:
-                                    coal_smem_row_base = (coal_local_m % 32) * 16 + (
-                                        coal_local_m // 32
-                                    ) * 4
+                                    coal_smem_row_base = (
+                                        coal_local_m % sfa_rows_per_quadrant
+                                    ) * sfa_row_stride + (
+                                        coal_local_m // sfa_rows_per_quadrant
+                                    ) * sfa_quadrant_stride
                                     coal_sfa_src_elem = cute.assume(
                                         coal_voxel * storage_sf_groups
                                         + channel_group_base
-                                        + a_lane_k * 4,
-                                        divby=4,
+                                        + a_lane_k * sfa_scales_per_chunk,
+                                        divby=sfa_scales_per_chunk,
                                     )
                                     coal_smem_elem = cute.assume(
                                         stage_base
                                         + coal_smem_row_base
-                                        + 512 * a_lane_k,
-                                        divby=4,
+                                        + sfa_chunk_stride * a_lane_k,
+                                        divby=sfa_scales_per_chunk,
                                     )
                                     coal_g_sfa_src = cute.make_tensor(
                                         mSFA_mkl.iterator + coal_sfa_src_elem,
@@ -474,7 +534,10 @@ class CompactSfaPingpongMainloop:
                             for row_quad in cutlass.range_constexpr(4):
                                 voxel = voxel_bases[row_quad] + filter_voxel_offset
                                 row_local_m = lane + 32 * row_quad
-                                smem_row_base = lane * 16 + row_quad * 4
+                                smem_row_base = (
+                                    lane * sfa_row_stride
+                                    + row_quad * sfa_quadrant_stride
+                                )
                                 sfa_pred[0] = row_valid[row_quad]
 
                                 for a_chunk in cutlass.range_constexpr(
@@ -506,9 +569,13 @@ class CompactSfaPingpongMainloop:
                                     src_elem = (
                                         voxel * storage_sf_groups
                                         + channel_group_base
-                                        + chunk * 4
+                                        + chunk * sfa_scales_per_chunk
                                     )
-                                    smem_elem = stage_base + smem_row_base + 512 * chunk
+                                    smem_elem = (
+                                        stage_base
+                                        + smem_row_base
+                                        + sfa_chunk_stride * chunk
+                                    )
                                     g_src = cute.make_tensor(
                                         mSFA_mkl.iterator + src_elem,
                                         sf_vec4_layout,
@@ -917,20 +984,12 @@ class CompactSfaPingpongMainloop:
                                 for elem_idx in cutlass.range_constexpr(
                                     cute.size(tRS_rD_slice)
                                 ):
-                                    if cutlass.const_expr(
-                                        not self.p3_fuse_bias
-                                        and not self.p3_fuse_residual
-                                    ):
+                                    if cutlass.const_expr(not self.p3_fuse_bias):
                                         tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
                                             elem_idx
                                         ]
                                     else:
                                         coord = tRS_cC_slice[elem_idx]
-                                        global_m = (
-                                            consumer_tile_coord_mnl[0]
-                                            * self.tile_shape_mnk[0]
-                                            + coord[0]
-                                        )
                                         global_n = (
                                             consumer_tile_coord_mnl[1]
                                             * self.tile_shape_mnk[1]
@@ -955,37 +1014,11 @@ class CompactSfaPingpongMainloop:
                                                 value = cutlass.Float32(
                                                     value.to(self.c_dtype)
                                                 )
-                                        if cutlass.const_expr(self.p3_fuse_residual):
-                                            output_m = cute.size(mC_mnl, mode=[0])
-                                            if (
-                                                mA_zero[1] != 0.0
-                                                and global_m < output_m
-                                            ):
-                                                output_n = cute.size(mC_mnl, mode=[1])
-                                                residual_offset = (
-                                                    global_m * output_n + global_n
-                                                )
-                                                residual = cute.make_tensor(
-                                                    mA_index_fm.iterator
-                                                    + residual_offset,
-                                                    cute.make_layout(1),
-                                                )
-                                                value = value + cutlass.Float32(
-                                                    residual[0]
-                                                )
-                                            if cutlass.const_expr(
-                                                self.p3_epilogue_mode == "strict"
-                                            ):
-                                                value = cutlass.Float32(
-                                                    value.to(self.c_dtype)
-                                                )
                                         tRS_rD_out_slice[elem_idx] = value.to(
                                             self.c_dtype
                                         )
 
-                        if cutlass.const_expr(
-                            not self.p3_fuse_bias and not self.p3_fuse_residual
-                        ):
+                        if cutlass.const_expr(not self.p3_fuse_bias):
                             epilogue_values = tRS_rD.load()
                             if cutlass.const_expr(self.p3_fuse_alpha):
                                 epilogue_values = epilogue_values * cutlass.Float32(

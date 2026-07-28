@@ -7,14 +7,15 @@ import torch.nn.functional as F
 
 from flashinfer import conv3d_nvfp4, prepare_nvfp4_conv3d_weight
 from flashinfer.conv.nvfp4 import _quantize_nvfp4_conv3d_activation
+from tests.test_helpers.conv import (
+    SM120_CUDA13_SKIP_REASON,
+    is_sm120_cuda13_supported,
+)
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0:2] != (12, 0)
-    or not torch.version.cuda
-    or int(torch.version.cuda.split(".")[0]) < 13,
-    reason="SM120 NVFP4 Conv3d requires SM120 and CUDA 13+",
+    not is_sm120_cuda13_supported(),
+    reason=SM120_CUDA13_SKIP_REASON,
 )
 
 _E2M1_VALUES = (
@@ -380,6 +381,7 @@ def test_conv3d_nvfp4_out_buffer_and_current_stream():
         out=out,
     )
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         result = conv3d_nvfp4(
             input,

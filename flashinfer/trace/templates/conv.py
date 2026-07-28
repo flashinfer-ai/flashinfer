@@ -17,6 +17,69 @@
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
+prepare_nvfp4_conv3d_weight_trace = TraceTemplate(
+    op_type="prepare_nvfp4_conv3d_weight",
+    name_prefix="prepare_nvfp4_conv3d_weight_sm120",
+    description=(
+        "Prepare a BF16 KCTRS Conv3d weight as packed E2M1 data and "
+        "128x4-swizzled E4M3 scales for SM120."
+    ),
+    axes={
+        "output_channels": Const(abbrev="k"),
+        "input_channels": Const(abbrev="c"),
+        "filter_t": Const(abbrev="t"),
+        "filter_r": Const(abbrev="r"),
+        "filter_s": Const(abbrev="s"),
+        "packed_input_channels": Var(),
+        "weight_scale_bytes": Var(),
+        "global_scale_elements": Var(),
+    },
+    inputs={
+        "weight": Tensor(
+            [
+                "output_channels",
+                "input_channels",
+                "filter_t",
+                "filter_r",
+                "filter_s",
+            ]
+        ),
+        "weight_global_scale": Tensor(
+            ["global_scale_elements"],
+            optional=True,
+            dtype="float32",
+        ),
+    },
+    outputs={
+        "packed_weight": Tensor(
+            [
+                "output_channels",
+                "filter_t",
+                "filter_r",
+                "filter_s",
+                "packed_input_channels",
+            ],
+            dtype="uint8",
+        ),
+        "weight_scale": Tensor(["weight_scale_bytes"], dtype="uint8"),
+        "weight_global_scale": Tensor(
+            ["global_scale_elements"],
+            dtype="float32",
+        ),
+    },
+    constraints=[
+        "packed_input_channels * 2 == input_channels",
+        "input_channels % 128 == 0",
+        "output_channels % 128 == 0",
+        "filter_t == 3",
+        "filter_r == 3",
+        "filter_s == 3",
+        "global_scale_elements == 1",
+    ],
+    tags=["sm120", "nvfp4", "weight-preparation", "status:verified"],
+)
+
+
 conv3d_nvfp4_trace = TraceTemplate(
     op_type="conv3d_nvfp4",
     name_prefix="conv3d_nvfp4_sm120",
@@ -106,4 +169,4 @@ conv3d_nvfp4_trace = TraceTemplate(
 )
 
 
-__all__ = ["conv3d_nvfp4_trace"]
+__all__ = ["conv3d_nvfp4_trace", "prepare_nvfp4_conv3d_weight_trace"]

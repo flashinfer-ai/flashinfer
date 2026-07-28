@@ -78,7 +78,7 @@ void nvfp4_conv3d_quantize_activation(TensorView input, TensorView global_scale,
   TVM_FFI_ICHECK_EQ(scale_output.size(3), physical_width);
   TVM_FFI_ICHECK_EQ(scale_output.size(4), scale_groups);
 
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   cudaStream_t stream = get_stream(input.device());
   cudaError_t status = flashinfer::conv3d_nvfp4::launch_activation_quantization(
       static_cast<const __nv_bfloat16*>(input.data_ptr()),

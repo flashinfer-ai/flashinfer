@@ -49,7 +49,6 @@ Dispatch table:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.nvgpu.warp.mma import MXF8F6F4_SUPPORTED_PAIRS
 
 
 # Number of bits to shift the FP4 byte left by before mma.sync.kind::mxf8f6f4.
@@ -182,100 +181,3 @@ def make_sm120_blockscaled_mma_op(a_dtype, b_dtype, acc_dtype, sf_dtype, sf_vec_
         f"sf_vec_size={sf_vec_size}) for SM120 block-scaled GEMM. FP6 mixed pairs "
         f"are not supported; supported mixed pairs are FP4 x FP8 only."
     )
-
-
-def validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles):
-    """Post-argparse validation of (a_dtype, b_dtype, sf_dtype, sf_vec_size, tile_shape_mnk).
-
-    Same-dtype paths use the FP4 / FP8 same-dtype atoms. Mixed-precision FP4 x FP8
-    is permitted only for the four supported pairs. Same-width mixed-FP8 and FP6
-    are explicitly rejected with named diagnostics.
-
-    Tile-K constraints come from the BlockScaled SF SMEM layout
-    (`sm120_make_smem_layout_sfa`), which requires
-    ``tile_K >= sf_vec_size * blk_sf == sf_vec_size * 4``:
-      * sf_vec_size=16 (NVFP4): tile_K must be a multiple of 64
-      * sf_vec_size=32 (MXFP4 / MXFP8 / mixed): tile_K must be a multiple of 128
-    A K=64 SF block cannot be filled at sf_vec_size=32 (only 2 SFs along K
-    fit in the K=128-required basic chunk), so tile_K=64 is rejected for
-    sf_vec_size=32 even though the FP4 same-dtype path otherwise allows it.
-    """
-    tile = tuple(args.tile_shape_mnk)
-    a_dtype = args.a_dtype
-    b_dtype = args.b_dtype
-    # Generic sf_vec_size sanity check applies to every dtype branch below.
-    if args.sf_vec_size not in (16, 32):
-        raise ValueError(f"--sf_vec_size must be 16 or 32, got {args.sf_vec_size}")
-    # Mixed-precision A/B: only the four FP4 x FP8 pairs are allowed.
-    if a_dtype != b_dtype:
-        if (a_dtype, b_dtype) not in MXF8F6F4_SUPPORTED_PAIRS:
-            if a_dtype in _FP8_DTYPES and b_dtype in _FP8_DTYPES:
-                raise ValueError(
-                    f"same-width mixed-FP8 (--a_dtype {a_dtype} --b_dtype {b_dtype}) "
-                    f"is not supported. Supported mixed pairs: FP4 x FP8 only."
-                )
-            raise ValueError(
-                f"unsupported mixed (--a_dtype {a_dtype} --b_dtype {b_dtype}). "
-                f"Supported mixed pairs are FP4 x FP8 only: "
-                f"{sorted(repr(p) for p in MXF8F6F4_SUPPORTED_PAIRS)}. "
-                f"FP6 mixed pairs are not supported."
-            )
-        if args.sf_vec_size != 32:
-            raise ValueError(
-                f"FP4 x FP8 mixed-precision requires --sf_vec_size 32, "
-                f"got {args.sf_vec_size}"
-            )
-        if args.sf_dtype != cutlass.Float8E8M0FNU:
-            raise ValueError(
-                f"FP4 x FP8 mixed-precision requires --sf_dtype Float8E8M0FNU, "
-                f"got --sf_dtype {args.sf_dtype}"
-            )
-        if tile not in fp8_allowed_tiles:
-            raise ValueError(
-                f"tile_shape {tile} is not supported for FP4 x FP8 mixed-precision. "
-                f"Allowed mixed tile shapes: {sorted(fp8_allowed_tiles)}."
-            )
-        return
-    # Same-dtype paths.
-    if a_dtype in _FP8_DTYPES:
-        if args.sf_vec_size != 32:
-            raise ValueError(
-                f"FP8 a_dtype ({a_dtype}) requires --sf_vec_size 32, "
-                f"got {args.sf_vec_size}"
-            )
-        if args.sf_dtype != cutlass.Float8E8M0FNU:
-            raise ValueError(
-                f"FP8 a_dtype + sf_vec_size=32 requires --sf_dtype Float8E8M0FNU, "
-                f"got --sf_dtype {args.sf_dtype}"
-            )
-        if tile not in fp8_allowed_tiles:
-            raise ValueError(
-                f"tile_shape {tile} is not supported for MXFP8. "
-                f"Allowed FP8 tile shapes: {sorted(fp8_allowed_tiles)}."
-            )
-    elif a_dtype == cutlass.Float4E2M1FN:
-        if args.sf_vec_size == 16 and args.sf_dtype != cutlass.Float8E4M3FN:
-            raise ValueError(
-                f"FP4 + --sf_vec_size 16 requires --sf_dtype Float8E4M3FN, "
-                f"got {args.sf_dtype}"
-            )
-        if args.sf_vec_size == 32 and args.sf_dtype != cutlass.Float8E8M0FNU:
-            raise ValueError(
-                f"FP4 + --sf_vec_size 32 requires --sf_dtype Float8E8M0FNU, "
-                f"got {args.sf_dtype}"
-            )
-        if tile not in fp4_allowed_tiles:
-            raise ValueError(
-                f"tile_shape {tile} is not supported for FP4 path. "
-                f"Allowed FP4 tile shapes: {sorted(fp4_allowed_tiles)}."
-            )
-        if args.sf_vec_size == 32 and tile[2] != 128:
-            raise ValueError(
-                f"FP4 + sf_vec_size=32 (MXFP4) requires tile_K=128, "
-                f"got tile_K={tile[2]}."
-            )
-    else:
-        raise ValueError(
-            f"--a_dtype must be Float4E2M1FN, Float8E4M3FN, or Float8E5M2; "
-            f"got {a_dtype}"
-        )

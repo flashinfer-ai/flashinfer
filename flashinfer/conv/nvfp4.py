@@ -16,7 +16,7 @@ limitations under the License.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 from typing import Optional, Tuple
 
 import torch
@@ -24,7 +24,10 @@ import torch
 from ..api_logging import flashinfer_api
 from ..quantization.fp4_quantization import nvfp4_quantize
 from ..tllm_enums import SfLayout
-from ..trace.templates.conv import conv3d_nvfp4_trace
+from ..trace.templates.conv import (
+    conv3d_nvfp4_trace,
+    prepare_nvfp4_conv3d_weight_trace,
+)
 from ..utils import supported_compute_capability
 
 _NVFP4_BLOCK_SIZE = 16
@@ -94,7 +97,7 @@ def _check_logical_weight(weight: torch.Tensor) -> Tuple[int, int, int, int, int
     return out_channels, in_channels, filter_t, filter_r, filter_s
 
 
-@flashinfer_api
+@flashinfer_api(trace=prepare_nvfp4_conv3d_weight_trace)
 def prepare_nvfp4_conv3d_weight(
     weight: torch.Tensor,
     weight_global_scale: Optional[torch.Tensor] = None,
@@ -168,7 +171,7 @@ def prepare_nvfp4_conv3d_weight(
     )
 
 
-@lru_cache(maxsize=1)
+@cache
 def _activation_quantization_module():
     from ..jit.conv3d import gen_conv3d_nvfp4_activation_module
 
@@ -300,9 +303,7 @@ def _check_packed_weight(
             "packed_weight must have shape (K, 3, 3, 3, C // 2); "
             f"got {tuple(packed_weight.shape)}"
         )
-    output_channels, filter_t, filter_r, filter_s, packed_channels = map(
-        int, packed_weight.shape
-    )
+    output_channels = int(packed_weight.shape[0])
     expected_shape = (output_channels, 3, 3, 3, input_channels // 2)
     if tuple(packed_weight.shape) != expected_shape:
         raise ValueError(
@@ -312,15 +313,6 @@ def _check_packed_weight(
     if output_channels % 128 != 0:
         raise ValueError(
             f"packed_weight output channels must be a multiple of 128; got {output_channels}"
-        )
-    if (filter_t, filter_r, filter_s) != (
-        3,
-        3,
-        3,
-    ) or packed_channels * 2 != input_channels:
-        raise ValueError(
-            "packed_weight must have shape (K, 3, 3, 3, C // 2); "
-            f"got {tuple(packed_weight.shape)}"
         )
     if not packed_weight.is_contiguous():
         raise ValueError("packed_weight must be contiguous")
@@ -420,8 +412,10 @@ def _conv3d_nvfp4_custom_op(
     )
     alpha = torch.reciprocal(input_global_scale * weight_global_scale)
     if bias is None:
+        # The no-bias path contains only alpha.
         alpha_and_bias = alpha
     else:
+        # Fused layout: alpha, a reserved zero slot, then K bias values.
         alpha_and_bias = torch.cat(
             (
                 alpha,

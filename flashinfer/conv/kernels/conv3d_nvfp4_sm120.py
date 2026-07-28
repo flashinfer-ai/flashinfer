@@ -84,7 +84,6 @@ class Sm120Nvfp4Conv3dKernel(
         self.p3_parallel_epilogue = parallel_epilogue
         self.p3_fuse_alpha = fuse_alpha
         self.p3_fuse_bias = fuse_bias
-        self.p3_fuse_residual = False
         self.p3_epilogue_mode = epilogue_mode
 
         super().__init__(
@@ -107,7 +106,6 @@ class Sm120Nvfp4Conv3dKernel(
             output_z_override=0,
             output_z_offset=0,
             scale_exactn_fastpath=True,
-            debug_compile_scope="full",
         )
         if self.p3_parallel_epilogue:
             self.p3_epilog_sync_barrier_0 = self.epilog_sync_barrier
@@ -156,6 +154,42 @@ class Sm120Nvfp4Conv3dKernel(
             self.sf_vec_size,
             self.tiled_mma,
         )
+        selected_layouts = (
+            single_n_layouts[0],
+            dual_n_layouts[1],
+            single_n_layouts[2],
+            dual_n_layouts[3],
+            single_n_layouts[4],
+        )
+        selected_dtypes = (
+            self.smem_alloc_a_dtype,
+            self.smem_alloc_b_dtype,
+            self.sf_dtype,
+            self.sf_dtype,
+            self.c_dtype,
+        )
+        # Account for both pipeline barrier arrays, the order barriers, and
+        # each 1024-byte-aligned staging buffer in SharedStorage.
+        required_smem_bytes = (4 * self.ab_stage + 2) * 8
+        for layout, dtype in zip(selected_layouts, selected_dtypes, strict=True):
+            required_smem_bytes = (
+                (required_smem_bytes + self.buffer_align_bytes - 1)
+                // self.buffer_align_bytes
+                * self.buffer_align_bytes
+            )
+            required_smem_bytes += cute.cosize(layout) * dtype.width // 8
+        required_smem_bytes = (
+            (required_smem_bytes + self.buffer_align_bytes - 1)
+            // self.buffer_align_bytes
+            * self.buffer_align_bytes
+        )
+        if required_smem_bytes > self.smem_capacity:
+            raise ValueError(
+                "n-pair Conv3d staging exceeds SM120 shared-memory capacity: "
+                f"requires {required_smem_bytes} bytes, "
+                f"capacity is {self.smem_capacity} bytes"
+            )
+
         self.a_smem_layout_staged = single_n_layouts[0]
         self.b_smem_layout_staged = dual_n_layouts[1]
         self.sfa_smem_layout_staged = single_n_layouts[2]
@@ -230,15 +264,14 @@ class Sm120Nvfp4Conv3dKernel(
         )
 
         self(
-            input_tensor,
-            output,
-            alpha_and_bias,
-            weight_tensor,
-            input_scale_tensor,
-            weight_scale_tensor,
-            output,
-            max_active_clusters,
-            current_stream,
+            a=input_tensor,
+            a_zero=alpha_and_bias,
+            b=weight_tensor,
+            sfa=input_scale_tensor,
+            sfb=weight_scale_tensor,
+            c=output,
+            max_active_clusters=max_active_clusters,
+            stream=current_stream,
         )
 
 

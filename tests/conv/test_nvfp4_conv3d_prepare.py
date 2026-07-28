@@ -5,14 +5,15 @@ import pytest
 import torch
 
 from flashinfer import SfLayout, nvfp4_quantize, prepare_nvfp4_conv3d_weight
+from tests.test_helpers.conv import (
+    SM120_CUDA13_SKIP_REASON,
+    is_sm120_cuda13_supported,
+)
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0:2] != (12, 0)
-    or not torch.version.cuda
-    or int(torch.version.cuda.split(".")[0]) < 13,
-    reason="SM120 NVFP4 Conv3d requires SM120 and CUDA 13+",
+    not is_sm120_cuda13_supported(),
+    reason=SM120_CUDA13_SKIP_REASON,
 )
 
 
@@ -52,6 +53,22 @@ def test_prepare_nvfp4_conv3d_weight_derives_finite_scale():
     assert global_scale.dtype == torch.float32
     assert torch.isfinite(global_scale).all()
     assert (global_scale > 0).all()
+
+
+def test_prepare_nvfp4_conv3d_weight_trace_schema():
+    weight = torch.empty(
+        (128, 128, 3, 3, 3),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    trace = prepare_nvfp4_conv3d_weight.fi_trace(
+        weight=weight,
+        weight_global_scale=None,
+    )
+    assert trace["name"] == "prepare_nvfp4_conv3d_weight_sm120_k128_c128_t3_r3_s3"
+    assert trace["outputs"]["packed_weight"]["dtype"] == "uint8"
+    assert trace["outputs"]["weight_scale"]["dtype"] == "uint8"
+    assert trace["outputs"]["weight_global_scale"]["dtype"] == "float32"
 
 
 @pytest.mark.parametrize(

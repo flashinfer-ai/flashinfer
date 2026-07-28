@@ -7,14 +7,15 @@ import torch.nn.functional as F
 
 from flashinfer import SfLayout, nvfp4_quantize
 from flashinfer.conv.nvfp4 import _quantize_nvfp4_conv3d_activation
+from tests.test_helpers.conv import (
+    SM120_CUDA13_SKIP_REASON,
+    is_sm120_cuda13_supported,
+)
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0:2] != (12, 0)
-    or not torch.version.cuda
-    or int(torch.version.cuda.split(".")[0]) < 13,
-    reason="SM120 NVFP4 Conv3d requires SM120 and CUDA 13+",
+    not is_sm120_cuda13_supported(),
+    reason=SM120_CUDA13_SKIP_REASON,
 )
 
 
@@ -57,18 +58,57 @@ def test_activation_producer_uses_current_stream():
         dtype=torch.bfloat16,
     )
     global_scale = torch.tensor([97.0], device="cuda", dtype=torch.float32)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    packed_out = torch.zeros(
+        (1, 3, 7, 11, 64),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    scale_out = torch.zeros(
+        (1, 3, 7, 11, 8),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+
+    # Warm the JIT module before using an intentionally busy default stream.
+    _quantize_nvfp4_conv3d_activation(
+        input,
+        global_scale,
+        (0, 1, 1),
+        packed_out=packed_out,
+        scale_out=scale_out,
+    )
+    packed_out.zero_()
+    scale_out.zero_()
+    torch.cuda.synchronize()
+
+    # Create the side stream before blocking the default stream; first-use
+    # stream-pool initialization may synchronize the device.
+    side_stream = torch.cuda.Stream()
+    default_stream = torch.cuda.current_stream()
+    torch.cuda._sleep(500_000_000)
+    default_done = torch.cuda.Event()
+    default_done.record(default_stream)
+
+    with torch.cuda.stream(side_stream):
         packed, scales = _quantize_nvfp4_conv3d_activation(
             input,
             global_scale,
             (0, 1, 1),
+            packed_out=packed_out,
+            scale_out=scale_out,
         )
-        event = torch.cuda.Event()
-        event.record()
-    event.synchronize()
-    assert packed.count_nonzero() > 0
-    assert scales.count_nonzero() > 0
+        side_done = torch.cuda.Event()
+        side_done.record()
+    side_done.synchronize()
+
+    # A launch on the default stream would still be blocked behind _sleep.
+    assert not default_done.query()
+    with torch.cuda.stream(side_stream):
+        packed_nonzero = packed.count_nonzero()
+        scales_nonzero = scales.count_nonzero()
+    assert packed_nonzero.item() > 0
+    assert scales_nonzero.item() > 0
+    default_done.synchronize()
 
 
 def test_activation_producer_reuses_output_buffers():

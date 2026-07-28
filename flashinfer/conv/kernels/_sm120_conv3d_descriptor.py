@@ -2,107 +2,17 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # mypy: disable-error-code="assignment, attr-defined, misc"
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import if_generate as _if_generate
 from cutlass.cute.nvgpu import cpasync
-import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from ._sm120_blockscaled_gemm import Sm120BlockScaledGemmKernel
-
-
-@dataclass(frozen=True)
-class PipelineTmaCpAsyncAsyncThread(pipeline.PipelineAsync):
-    """Merged TMA + cp.async pipeline for the SM120 warp-level mainloop.
-
-    This mirrors the synchronization model needed for productized 3x3 Conv3d:
-    A/B/SFB arrive through TMA transaction bytes, while natural SFA arrives via
-    cp.async.mbarrier.arrive.noinc after explicit coordinate-based loads.
-
-    It is a scaffold for the next kernel step; the current production path still
-    uses the inherited SM120 GEMM kernel with TMA-loaded materialized SFA.
-    """
-
-    @staticmethod
-    def create(
-        *,
-        num_stages: int,
-        cpasync_producer_group: pipeline.CooperativeGroup,
-        consumer_group: pipeline.CooperativeGroup,
-        tx_count: int,
-        barrier_storage: cute.Pointer,
-        defer_sync: bool = False,
-        name: str = "",
-    ) -> "PipelineTmaCpAsyncAsyncThread":
-        if not isinstance(barrier_storage, cute.Pointer):
-            raise TypeError(
-                f"Expected barrier_storage to be a cute.Pointer, got {type(barrier_storage)}"
-            )
-
-        producer = (pipeline.PipelineOp.AsyncLoad, cpasync_producer_group)
-        consumer = (pipeline.PipelineOp.AsyncThread, consumer_group)
-
-        sync_object_full = pipeline.PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8),
-            num_stages,
-            producer,
-            tx_count,
-            name=name,
-            phase="full",
-        )
-        sync_object_empty = pipeline.PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages,
-            num_stages,
-            consumer,
-            name=name,
-            phase="empty",
-        )
-
-        if not defer_sync:
-            cute.arch.mbarrier_init_fence()
-            pipeline.agent_sync(pipeline.Agent.ThreadBlock)
-
-        return PipelineTmaCpAsyncAsyncThread(
-            sync_object_full,
-            sync_object_empty,
-            num_stages,
-            None,
-            None,
-        )
-
-    def producer_acquire_tma(
-        self,
-        state: pipeline.PipelineState,
-        try_acquire_token: Optional[cutlass.Boolean] = None,
-        *,
-        expected_tx: Optional[cutlass.Int32] = None,
-    ) -> None:
-        _if_generate(
-            try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
-        )
-        tx = self.sync_object_full.tx_count if expected_tx is None else expected_tx
-        self.sync_object_full.arrive_and_expect_tx(state.index, tx)
-
-    def producer_acquire_cpasync(
-        self,
-        state: pipeline.PipelineState,
-        try_acquire_token: Optional[cutlass.Boolean] = None,
-    ) -> None:
-        _if_generate(
-            try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
-        )
-
-    def producer_commit_cpasync(self, state: pipeline.PipelineState) -> None:
-        self.sync_object_full.arrive_cp_async_mbarrier(state.index)
 
 
 def compute_zpq(
@@ -155,8 +65,34 @@ class Sm120BlockScaledConv3dKernel(Sm120BlockScaledGemmKernel):
         output_z_override: int = 0,
         output_z_offset: int = 0,
         scale_exactn_fastpath: bool = True,
-        debug_compile_scope: str = "full",
     ):
+        valid_modes = {
+            "sfa_layout_mode": {
+                "materialized",
+                "natural_cpasync",
+                "natural_cpasync_inline",
+                "compact_im2col_cpasync_inline",
+                "natural_im2col",
+                "natural_expanded_im2col",
+            },
+            "a_load_mode": {"tma"},
+            "a_copy_layout_mode": {"single", "row", "coalesced"},
+            "sfb_load_mode": {"tma", "cpasync_inline"},
+            "epilogue_store_mode": {"tma"},
+        }
+        selected_modes = {
+            "sfa_layout_mode": sfa_layout_mode,
+            "a_load_mode": a_load_mode,
+            "a_copy_layout_mode": a_copy_layout_mode,
+            "sfb_load_mode": sfb_load_mode,
+            "epilogue_store_mode": epilogue_store_mode,
+        }
+        for name, value in selected_modes.items():
+            if value not in valid_modes[name]:
+                raise ValueError(
+                    f"{name} must be one of {sorted(valid_modes[name])}; got {value!r}"
+                )
+
         super().__init__(acc_dtype, sf_vec_size, tile_shape_mnk, epi_tile)
         self.filter_trs = filter_trs
         self.upper_padding_dhw = upper_padding_dhw
@@ -173,7 +109,6 @@ class Sm120BlockScaledConv3dKernel(Sm120BlockScaledGemmKernel):
         self.output_z_override = output_z_override
         self.output_z_offset = output_z_offset
         self.scale_exactn_fastpath = scale_exactn_fastpath
-        self.debug_compile_scope = debug_compile_scope
         self.sfa_cpasync_warp_start = self.tma_load_warp_id + 1
         self.sfa_cpasync_warp_count = 4
         self.sfa_cpasync_threads = (
@@ -190,7 +125,6 @@ class Sm120BlockScaledConv3dKernel(Sm120BlockScaledGemmKernel):
     def __call__(
         self,
         a: cute.Tensor,
-        a_index: cute.Tensor,
         a_zero: cute.Tensor,
         b: cute.Tensor,
         sfa: cute.Tensor,
@@ -211,8 +145,6 @@ class Sm120BlockScaledConv3dKernel(Sm120BlockScaledGemmKernel):
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         self._setup_attributes()
-        if cutlass.const_expr(self.debug_compile_scope == "call_entry_only"):
-            return
 
         def add_dummy_batch_dimension(tensor):
             new_layout = cute.append(tensor.layout, cute.make_layout(1))
@@ -507,375 +439,12 @@ class Sm120BlockScaledConv3dKernel(Sm120BlockScaledGemmKernel):
 
         self.shared_storage = SharedStorage
         self.threads_per_cta = (self.threads_per_cta + 128) // 128 * 128
-        if cutlass.const_expr(self.debug_compile_scope == "call_setup_only"):
-            return
-        if cutlass.const_expr(self.debug_compile_scope == "raw_signature_probe"):
-            self.conv_raw_signature_probe_kernel(
-                a,
-                a_index,
-                a_zero,
-                b,
-                sfa,
-                sfb,
-                c,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(self.debug_compile_scope == "tma_signature_probe"):
-            self.conv_tma_signature_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                tma_atom_b,
-                tma_tensor_b,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(self.debug_compile_scope == "tma_mma_signature_probe"):
-            self.conv_tma_mma_signature_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                tma_atom_b,
-                tma_tensor_b,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                self.tiled_mma,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(
-            self.debug_compile_scope == "tma_mma_layout_signature_probe"
-        ):
-            self.conv_tma_mma_layout_signature_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                tma_atom_b,
-                tma_tensor_b,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                self.tiled_mma,
-                self.cta_layout_mnk,
-                self.a_smem_layout_staged,
-                self.b_smem_layout_staged,
-                self.sfa_smem_layout_staged,
-                self.sfb_smem_layout_staged,
-                self.epi_smem_layout_staged,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(
-            self.debug_compile_scope == "full_signature_small_body_probe"
-        ):
-            self.conv_full_signature_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                a,
-                a_index,
-                a_zero,
-                tma_atom_b,
-                tma_tensor_b,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                self.tiled_mma,
-                self.cta_layout_mnk,
-                self.a_smem_layout_staged,
-                self.b_smem_layout_staged,
-                self.sfa_smem_layout_staged,
-                self.sfb_smem_layout_staged,
-                self.epi_smem_layout_staged,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(self.debug_compile_scope == "c96_compact_body_probe"):
-            self.conv_c96_compact_body_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                a,
-                a_index,
-                a_zero,
-                tma_atom_b,
-                tma_tensor_b,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                self.tiled_mma,
-                self.cta_layout_mnk,
-                self.a_smem_layout_staged,
-                self.b_smem_layout_staged,
-                self.sfa_smem_layout_staged,
-                self.sfb_smem_layout_staged,
-                self.epi_smem_layout_staged,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
-        if cutlass.const_expr(
-            self.debug_compile_scope
-            in (
-                "c96_compact_producer_loads_probe",
-                "c96_compact_loads_mma_body_probe",
-                "c96_compact_pipeline_loads_mma_probe",
-                "c96_compact_pipeline_kloop_probe",
-                "c96_compact_pipeline_multistage_kloop_probe",
-                "c96_compact_pipeline_cpasync_mbarrier_kloop_probe",
-                "c96_compact_pipeline_cpasync_mbarrier_kloop_nostore_probe",
-                "c96_compact_pipeline_cpasync_mbarrier_kloop_single_consumer_probe",
-                "c96_compact_pipeline_cpasync_mbarrier_kloop_single_consumer_nostore_probe",
-            )
-        ):
-            self.conv_c96_compact_producer_loads_probe_kernel(
-                tma_atom_a,
-                tma_tensor_a,
-                a,
-                a_index,
-                a_zero,
-                tma_atom_b,
-                tma_tensor_b,
-                mB,
-                tma_atom_sfa,
-                tma_tensor_sfa,
-                tma_atom_sfb,
-                tma_tensor_sfb,
-                tma_atom_c,
-                tma_tensor_c,
-                mC,
-                self.tiled_mma,
-                self.cta_layout_mnk,
-                self.a_smem_layout_staged,
-                self.b_smem_layout_staged,
-                self.sfa_smem_layout_staged,
-                self.sfb_smem_layout_staged,
-                self.epi_smem_layout_staged,
-                tile_sched_params,
-                conv_t,
-                conv_r,
-                conv_s,
-                stride_d,
-                stride_h,
-                stride_w,
-                dilation_d,
-                dilation_h,
-                dilation_w,
-                pad_lower_d,
-                pad_lower_h,
-                pad_lower_w,
-                cute.size(a, mode=[1]),
-                cute.size(a, mode=[2]),
-                cute.size(a, mode=[3]),
-                conv_z,
-                conv_p,
-                conv_q,
-                conv_n,
-                conv_c,
-                self.tile_shape_mnk[2],
-            ).launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=[1, 1, 1],
-                stream=stream,
-                max_number_threads=[self.threads_per_cta, 1, 1],
-                min_blocks_per_mp=1,
-            )
-            return
 
         if cutlass.const_expr(self.use_conv_owned_kernel):
             self.conv_kernel(
                 tma_atom_a,
                 tma_tensor_a,
                 a,
-                a_index,
                 a_zero,
                 tma_atom_b,
                 tma_tensor_b,

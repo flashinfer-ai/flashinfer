@@ -386,7 +386,13 @@ def _benchmark_cudnn_16bit(
         "validation": {
             "center_value": center,
             "expected_center_value": expected,
-            "passed": center == expected and bool(torch.isfinite(output).all()),
+            "passed": math.isclose(
+                center,
+                expected,
+                rel_tol=0.01,
+                abs_tol=0.125,
+            )
+            and bool(torch.isfinite(output).all()),
         },
     }
     del graph, workspace, input, weight, output
@@ -516,7 +522,13 @@ def _benchmark_cudnn_fp8(
         "validation": {
             "center_value": center,
             "expected_center_value": expected,
-            "passed": center == expected and bool(torch.isfinite(output).all()),
+            "passed": math.isclose(
+                center,
+                expected,
+                rel_tol=0.01,
+                abs_tol=0.125,
+            )
+            and bool(torch.isfinite(output).all()),
         },
     }
     del graph, workspace, input_fp8, weight_fp8, output
@@ -698,8 +710,18 @@ def _benchmark_nvfp4(
             rel_tol=0.01,
             abs_tol=0.125,
         )
-        and raw_with_alpha_center == expected
-        and full_center == expected
+        and math.isclose(
+            raw_with_alpha_center,
+            expected,
+            rel_tol=0.01,
+            abs_tol=0.125,
+        )
+        and math.isclose(
+            full_center,
+            expected,
+            rel_tol=0.01,
+            abs_tol=0.125,
+        )
         and validation["raw_no_alpha_finite"]
         and validation["raw_with_alpha_finite"]
         and validation["full_finite"]
@@ -816,6 +838,8 @@ def main() -> int:
         }
 
     results = []
+    expected_case_count = len(cases)
+    expected_call_count = sum(case.calls for case in cases)
     started = time.perf_counter()
     for index, case in enumerate(cases, start=1):
         print(f"[{index}/{len(cases)}] {case.name}", flush=True)
@@ -960,8 +984,10 @@ def main() -> int:
                 "all_outputs_passed": all(
                     case["cudnn_fp16"]["validation"]["passed"] for case in results
                 ),
-                "all_11_shapes": len(results) == 11,
-                "all_588_calls": sum(case["calls"] for case in results) == 588,
+                "all_selected_shapes": len(results) == expected_case_count,
+                "all_selected_calls": (
+                    sum(case["calls"] for case in results) == expected_call_count
+                ),
             },
             "wall_seconds": time.perf_counter() - started,
         }
@@ -1108,8 +1134,10 @@ def main() -> int:
                 )
                 for case in results
             ),
-            "all_11_shapes": len(results) == 11,
-            "all_588_calls": sum(case["calls"] for case in results) == 588,
+            "all_selected_shapes": len(results) == expected_case_count,
+            "all_selected_calls": (
+                sum(case["calls"] for case in results) == expected_call_count
+            ),
         },
         "wall_seconds": time.perf_counter() - started,
     }

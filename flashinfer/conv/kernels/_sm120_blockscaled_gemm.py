@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# mypy: disable-error-code="call-overload, misc, return-value"
+# mypy: disable-error-code="call-overload, misc"
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -1280,8 +1280,14 @@ class Sm120BlockScaledGemmKernel:
         epi_stage: int,
         sf_vec_size: int,
         tiled_mma: cute.TiledMma,
-    ) -> tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]:
-        """Create shared memory layouts for A, B, and C tensors.
+    ) -> tuple[
+        cute.ComposedLayout,
+        cute.ComposedLayout,
+        cute.Layout,
+        cute.Layout,
+        cute.ComposedLayout,
+    ]:
+        """Create shared memory layouts for A, B, SFA, SFB, and C tensors.
 
         :param tile_shape_mnk: CTA tile shape (M,N,K)
         :type tile_shape_mnk: Tuple[int, int, int]
@@ -1304,8 +1310,7 @@ class Sm120BlockScaledGemmKernel:
         :param epi_stage: Number of epilogue stages
         :type epi_stage: int
 
-        :return: Tuple of shared memory layouts for A, B, and C
-        :rtype: Tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]
+        :return: Shared memory layouts for A, B, SFA, SFB, and C.
         """
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
@@ -1387,16 +1392,15 @@ class Sm120BlockScaledGemmKernel:
         c: cute.Tensor,
         tile_shape_mnk: tuple[int, int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> tuple[int, int, int]:
-        """Compute grid shape for the output tensor C.
+    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
+        """Compute scheduler parameters and grid shape for output tensor C.
 
         :param c: The output tensor C
         :type c: cute.Tensor
         :param tile_shape_mnk: The shape (M, N, K) of the CTA tile.
         :type tile_shape_mnk: tuple[int, int, int]
 
-        :return: Grid shape for kernel launch.
-        :rtype: tuple[int, int, int]
+        :return: Scheduler parameters and grid shape for kernel launch.
         """
 
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
