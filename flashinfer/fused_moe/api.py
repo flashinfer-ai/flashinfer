@@ -30,9 +30,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, Dict, Optional, Tuple, Union
 
+import torch
 from torch import Tensor
 
-from ..tllm_enums import ActivationType, RoutingMethodType
+from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -60,6 +61,7 @@ class QuantVariant(Enum):
     NVFP4 = 4  # day-1 MVP target
     MXFP4 = 5
     MxInt4 = 6
+    W4A16 = 7
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -272,7 +274,48 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        # The available TRTLLM block-FP8 BMM cubins are validated only on the
+        # SM100 family. The outer JIT can compile for major 12, but its FP8
+        # kernels currently fail at runtime on SM120/121.
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        variant: QuantVariant,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
+
+        ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
+        :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
+        prepared by separate paths. The shuffled MXFP8 view requires both
+        ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
+        scale tensors fit TRTLLM's unpadded 128x4 physical layout.
+        """
+        from .prepare import prepare_trtllm_fp8_block_weights
+
+        return prepare_trtllm_fp8_block_weights(
+            w1_bf16,
+            w2_bf16,
+            variant=variant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, variant: QuantVariant):
+        """Quantize BF16 activations for the selected block-FP8 convention."""
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, variant=variant)
 
     def __repr__(self) -> str:
         return "TrtllmFp8BlockConfig()"
@@ -284,7 +327,43 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 80
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``trtllm_fp8_per_tensor`` MajorK weight view."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_weights
+
+        return prepare_trtllm_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, hidden_states_scale_global):
+        """Quantize BF16 activations with one calibrated E4M3 multiplier."""
+        from .prepare import prepare_trtllm_fp8_per_tensor_activations
+
+        return prepare_trtllm_fp8_per_tensor_activations(
+            hidden_states_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmFp8PerTensorConfig()"
@@ -396,6 +475,90 @@ class CuteDslConfig:
         return "CuteDslConfig()"
 
 
+@dataclass(frozen=True)
+class B12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        device=None,
+    ):
+        """Build the ``b12x_nvfp4`` weight view from canonical bf16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_nvfp4", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_weights`.
+        """
+        from .prepare import prepare_b12x_nvfp4_weights
+        from .utils import get_b12x_activation_name
+
+        return prepare_b12x_nvfp4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=get_b12x_activation_name(activation.type),
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class B12xW4A16Config:
+    """SM120/SM121 CuTe-DSL b12x W4A16 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        source_format: str = "modelopt",
+    ):
+        """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("b12x_w4a16", ...)``.
+        See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
+        """
+        from .prepare import prepare_b12x_w4a16_weights
+        from .utils import get_b12x_activation_name
+
+        return prepare_b12x_w4a16_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=get_b12x_activation_name(activation.type),
+            source_format=source_format,
+        )
+
+    def __repr__(self) -> str:
+        return "B12xW4A16Config()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     TrtllmFp4Config,
@@ -405,6 +568,8 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassConfig,
     CuteDslConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -415,6 +580,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassConfig,
     CuteDslConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
 )
 
 
@@ -505,13 +672,13 @@ class MoEConfig:
 
 
 # ---------------------------------------------------------------------------
-# Activation / weight packs for the autotuned pre-routed path
+# Activation / weight packs for autotuned pre-routed and FromLogits paths
 # ---------------------------------------------------------------------------
 # These are the runner-level inputs used by MoELayer (plan §1).
 #
 # Why two packs instead of one tensor bundle (PR #3093 review G5): the grouping
 # axis is *lifetime/role*, which is invariant across backends —
-#   * MoEActivationPack: per-call transient data (pre-routed activations),
+#   * MoEActivationPack: per-call transient activation/routing data,
 #     rebuilt every forward;
 #   * MoEWeightPack:     long-lived weights, materialized once at load and read
 #     every call, holding one native view *per backend* (the price of
@@ -527,14 +694,164 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — activations (backend-native encoding) + pre-routed indices."""
+    """Per-call backend-native activations plus routing inputs.
 
-    hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4) or [M, H] bf16 (BF16 path)
-    hidden_states_scale: Optional[
-        Tensor
-    ]  # [M, H//16] float8_e4m3fn block scales; None for BF16
-    selected_experts: Tensor  # [M, top_k] int32
-    final_scales: Tensor  # [M, top_k] float32
+    Activation encoding depends on ``QuantConfig.variant``:
+
+    * NVFP4: packed ``uint8 [M, H/2]`` values with
+      ``float8_e4m3fn [M, H/16]`` block scales.
+    * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
+      ``float32 [H/128, M]`` block scales.
+    * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
+      ``uint8 [M, H/32]`` UE8M0 scales.
+    * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;
+      the calibrated scalar is folded into the backend's epilogue scales.
+
+    ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
+
+    * ``PackedPrecomputed`` (default) — **pre-routed**: the caller computes expert
+      selection on the host and passes ``topk_ids`` + ``topk_weights``.
+      The TRTLLM runners normally combine both fields into one packed ``int32``
+      tensor before launch.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
+      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
+      BF16 or FP32 weights directly, avoiding packed-id construction. The
+      launcher consumes the weights in their native dtype.
+    * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
+      methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
+      itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
+      runner allocates internal kernel-filled buffers, and the routing result is not surfaced
+      back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
+      block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches a logits
+      pack only to capable backends (see each runner's ``supported_routing_modes``).
+
+    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
+    keep the field positions of the former ``selected_experts`` / ``final_scales``, so
+    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
+    are keyword-only.
+    """
+
+    # Backend-native activation payload; layouts documented above.
+    hidden_states_q: Tensor
+    # Variant-specific scales documented above; None for BF16/per-tensor FP8.
+    hidden_states_scale: Optional[Tensor]
+    # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
+    topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
+    # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
+    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    topk_weights: Optional[Tensor] = None
+    # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
+    # call site fails loudly instead of silently binding a tensor to the mode.
+    routing_input_mode: RoutingInputMode = field(
+        default=RoutingInputMode.PackedPrecomputed, kw_only=True
+    )
+    routing_logits: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [M, num_experts] float32 or bfloat16
+    routing_bias: Optional[Tensor] = field(
+        default=None, kw_only=True
+    )  # [num_experts] bfloat16 or float32 (independent of logits dtype)
+
+    def __post_init__(self) -> None:
+        """Fail fast on mode/field mismatches at construction time.
+
+        Raises (not asserts) so the checks survive ``python -O``; catching the
+        mismatch here names the offending field instead of a later failure deep
+        in ``pack_inputs`` or a C++ ICHECK.
+        """
+        mode = self.routing_input_mode
+        if mode == RoutingInputMode.FromLogits:
+            if self.routing_logits is None:
+                raise ValueError(
+                    "routing_input_mode=FromLogits requires routing_logits."
+                )
+            if self.topk_ids is not None or self.topk_weights is not None:
+                raise ValueError(
+                    "FromLogits computes topk_ids/topk_weights in-kernel; "
+                    "leave them None."
+                )
+        elif mode == RoutingInputMode.PackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=PackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+        elif mode == RoutingInputMode.UnpackedPrecomputed:
+            if self.topk_ids is None or self.topk_weights is None:
+                raise ValueError(
+                    "routing_input_mode=UnpackedPrecomputed requires "
+                    "topk_ids + topk_weights."
+                )
+            if self.routing_logits is not None or self.routing_bias is not None:
+                raise ValueError(
+                    "routing_logits/routing_bias are only consumed by "
+                    "in-kernel (FromLogits) routing."
+                )
+            if self.topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"topk_ids must be torch.int32 (got {self.topk_ids.dtype}); "
+                    "torch.topk returns int64 — cast before constructing the pack."
+                )
+            if self.topk_weights.dtype not in (torch.bfloat16, torch.float32):
+                raise TypeError(
+                    "UnpackedPrecomputed topk_weights must be torch.bfloat16 "
+                    "or torch.float32 "
+                    f"(got {self.topk_weights.dtype})."
+                )
+            expected = (self.hidden_states_q.shape[0],)
+            if self.topk_ids.ndim != 2 or self.topk_weights.ndim != 2:
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must both be 2-D "
+                    f"[num_tokens, top_k], got {tuple(self.topk_ids.shape)} and "
+                    f"{tuple(self.topk_weights.shape)}."
+                )
+            if (
+                self.topk_ids.shape != self.topk_weights.shape
+                or self.topk_ids.shape[:1] != expected
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must have matching "
+                    f"[num_tokens, top_k] shapes, got {tuple(self.topk_ids.shape)} "
+                    f"and {tuple(self.topk_weights.shape)} for "
+                    f"num_tokens={expected[0]}."
+                )
+            if (
+                not self.topk_ids.is_contiguous()
+                or not self.topk_weights.is_contiguous()
+            ):
+                raise ValueError(
+                    "UnpackedPrecomputed topk_ids/topk_weights must be contiguous."
+                )
+        else:
+            raise ValueError(f"Unsupported routing_input_mode={mode!r}.")
+
+        # All routing tensors must live with the activations; a stray CPU
+        # tensor otherwise surfaces as a cryptic launch/ICHECK failure.
+        dev = self.hidden_states_q.device
+        for name in (
+            "hidden_states_scale",
+            "topk_ids",
+            "topk_weights",
+            "routing_logits",
+            "routing_bias",
+        ):
+            t = getattr(self, name)
+            if t is not None and t.device != dev:
+                raise ValueError(
+                    f"{name} is on {t.device} but hidden_states_q is on {dev}; "
+                    "all pack tensors must be on the same device."
+                )
 
     @property
     def num_tokens(self) -> int:

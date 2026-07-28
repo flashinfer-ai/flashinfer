@@ -42,6 +42,10 @@ BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 ```
 
+To exercise the NIXL-EP tests, drop `BUILD_NIXL_EP=0` (best-effort build) or set
+`BUILD_NIXL_EP=1` (strict — missing build deps abort the install). See
+[Running the NIXL-EP tests](#running-the-nixl-ep-tests).
+
 Build flags (tri-state; unset = on, best-effort): `BUILD_NIXL_EP=0` skips the
 NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
 error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
@@ -67,6 +71,78 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
 now.
+
+### Running the NIXL-EP tests
+
+NIXL-EP is the second split-path transport (`backend="nixl_ep"`), currently
+**low-latency + `EXPERT_MAJOR` only**. Constraints enforced by
+`validate_fleet_params`: `max_tokens_per_rank ≤ 1024`, `token_hidden_size ∈
+{2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}`, torch built for CUDA ≥ 13,
+sm_90+.
+
+**1. Build with NIXL-EP enabled.** Build deps: `meson`, `ninja`, `pkg-config`,
+`nvcc`, UCX (`pkg-config --exists ucx`), `libibverbs-dev`. The build hook
+pre-installs the `nixl-cu13` wheel it links against (`_ensure_nixl_wheel`), so
+no manual NIXL install is needed.
+
+**UCX caveat:** the UCX found via pkg-config must ship the *device API*
+(`ucp/api/device/ucp_device_impl.h`) — NGC images' HPC-X UCX and Ubuntu's apt
+UCX both predate it, and the `flashinfer-ep-pt2605*` images skip this
+provisioning. Follow `docker/Dockerfile.flashinfer-nvep`: install DOCA 3.2
+host packages + GDRCopy, then build UCX `v1.21.x` from source with
+`--enable-experimental-api --with-cuda --with-verbs --with-dm` and put its
+`lib/pkgconfig` first on `PKG_CONFIG_PATH`. Without it, `BUILD_NIXL_EP=1`
+fails compiling `nixl_device.cuh`:
+
+```shell
+BUILD_NIXL_EP=1 pip install --no-cache-dir --no-build-isolation -e .
+
+# Verify the backend actually built (best-effort builds skip it silently):
+python -c "from flashinfer.moe_ep import available_backends; print(available_backends())"
+# expect: [..., 'nixl_ep']
+```
+
+**2. Smoke test** (4 GPUs, single node — fixed shape: 64 tokens, 8 experts,
+hidden 4096, topk 4, bf16, LL):
+
+```shell
+torchrun --nproc_per_node=4 tests/moe_ep/smoke_nixl_ep.py
+# each rank prints: SMOKE_RESULT: nixl_ep OK
+```
+
+**3. Multirank roundtrip + split kernels** (4 GPUs). The `multirank` target
+runs NCCL-EP first, then repeats over NIXL-EP when `have_nixl_ep()` is true:
+
+```shell
+bash tests/moe_ep/run_tests.sh multirank
+```
+
+or NIXL-only, directly:
+
+```shell
+torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_layer_multirank.py -v \
+    -m "nvep and gpu_4" --backend=nixl_ep
+torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_split_kernels.py -v \
+    -m "nvep and gpu_4" --backend=nixl_ep
+```
+
+**4. Host-only mock tests** (no GPU fabric / no NIXL build needed) are part of
+the `unit` target — `tests/moe_ep/nixl_ep/test_fleet_mock.py` stubs the NIXL
+`Buffer` and checks fleet sizing, `update_topology` rank diffs, and combine
+knob validation.
+
+Notes:
+
+- **Rendezvous**: unlike NCCL-EP (which mirrors the torch process group), the
+  NIXL `Buffer` rendezvous needs a `torch.distributed.TCPStore` passed via
+  `BootstrapConfig(tcp_store=...)`. The tests open one themselves on
+  `MASTER_PORT + 1` (sharing torch's port would clash) — see
+  `tests/moe_ep/smoke_nixl_ep.py` for the pattern.
+- `NPROC_SMOKE` / `NPROC_MULTIRANK` (default 4) override the rank count for
+  the `run_tests.sh` targets.
+- UCX/ibverbs are **build-time** deps; the tests set no `NIXL_*`/`UCX_*` env.
+- NIXL-EP coverage today is smoke + multirank + mocked unit tests only; the
+  correctness/mega targets are NCCL-EP-only.
 
 ---
 

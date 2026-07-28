@@ -77,6 +77,7 @@ from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
+    moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -166,6 +167,7 @@ def _moe_core_impl(
     # Options
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
+    use_fused_finalize: bool = True,
     enable_pdl: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -176,9 +178,9 @@ def _moe_core_impl(
 
     This function handles:
     1. moe_sort: Token routing computation
-    2. GEMM1 + SwiGLU: First projection with activation
-    3. Async output zero: Zero output buffer (overlapped with GEMM1)
-    4. GEMM2 + Finalize: Second projection with atomic scatter
+    2. GEMM1 + activation
+    3. GEMM2 with optional atomic finalize
+    4. Routing-weight reduction in deterministic mode
 
     Args:
         x: Input tensor, NVFP4 quantized.
@@ -211,6 +213,8 @@ def _moe_core_impl(
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
             non-gated mode; swiglu_oai is represented as Swiglu with
@@ -222,15 +226,12 @@ def _moe_core_impl(
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
 
-    # Allocate output if not provided.  The caller (wrapper or functional
-    # API) should pass a [:num_tokens] slice of the pre-allocated buffer
-    # when using CUDA graphs.  The buffer is zeroed in Step 3 below.
     if moe_output is None:
         moe_output = torch.empty(
             (num_tokens, hidden_size),
@@ -243,8 +244,8 @@ def _moe_core_impl(
             f"_moe_core_impl (got {moe_output.size(0)}, expected {num_tokens})"
         )
 
-    # Get stream resources if using async memset
-    if use_async_memset:
+    # Fused finalize overlaps output zeroing with GEMM1.
+    if use_async_memset and use_fused_finalize:
         if aux_stream is None or main_event is None or memset_event is None:
             resources = _get_cuda_graph_resources()
             aux_stream = aux_stream or resources["aux_stream"]
@@ -271,8 +272,7 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    # Record event for async memset synchronization
-    if use_async_memset:
+    if use_async_memset and use_fused_finalize:
         main_event.record()
         moe_output.record_stream(aux_stream)
 
@@ -310,7 +310,7 @@ def _moe_core_impl(
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -334,30 +334,26 @@ def _moe_core_impl(
             sf_vec_size=16,
         )
 
-    # Step 3: Zero the active output slice before GEMM2 finalize.
-    # Finalize uses atomic scatter-add into `moe_output`, so it must start
-    # from zero each call. We zero only the active slice, not the full
-    # preallocated buffer.
-    #
-    # `moe_output_memset_inplace` mirrors TRT-LLM's `moe_output_memset_inplace`
-    # Path A (dense cudaMemsetAsync). TRT-LLM's Path B (sparse moeOutputMemset
-    # kernel for the internal-alltoall case) is not exposed here — current
-    # callers of this API handle all-to-all outside this function.
-    #
-    # The wrapper issues cudaMemsetAsync on the current PyTorch CUDA stream,
-    # so the `with torch.cuda.stream(aux_stream):` context below correctly
-    # places the memset on the aux stream for overlap with the main-stream
-    # GEMM1.
-    if use_async_memset:
-        with torch.cuda.stream(aux_stream):
-            main_event.wait()
+    # Atomic finalize requires a zeroed token output. Deterministic finalize
+    # writes each route to a unique expanded row.
+    if use_fused_finalize:
+        if use_async_memset:
+            with torch.cuda.stream(aux_stream):
+                main_event.wait()
+                moe_output_memset_inplace(moe_output)
+                memset_event.record()
+            memset_event.wait()
+        else:
             moe_output_memset_inplace(moe_output)
-            memset_event.record()
-        memset_event.wait()
+        gemm2_output = moe_output
     else:
-        moe_output_memset_inplace(moe_output)
+        gemm2_output = torch.empty(
+            (num_tokens * top_k, hidden_size),
+            dtype=output_dtype,
+            device=x.device,
+        )
 
-    # Step 4: GEMM2 + Finalize
+    # Step 3: GEMM2 with optional atomic finalize
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a=intermediate,
         b=w2_weight,
@@ -369,12 +365,26 @@ def _moe_core_impl(
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
-        out=moe_output,
+        out=gemm2_output,
         a_per_token_scale=intermediate_per_token_scale,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
+        use_fused_finalize=use_fused_finalize,
     )
+
+    # Step 4: Deterministic routing-weight reduction
+    if not use_fused_finalize:
+        moe_unpermute(
+            permuted_input=gemm2_output,
+            output=moe_output,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            topk_scales=token_final_scales,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            input_is_expanded=True,
+            enable_pdl=enable_pdl,
+        )
 
     return moe_output[:num_tokens]
 
@@ -401,6 +411,8 @@ class CuteDslMoEWrapper:
         intermediate_size: Intermediate dimension size.
         use_cuda_graph: Whether the wrapper holds persistent stream/event
             resources for CUDA graph capture.
+        use_fused_finalize: Use atomic fused finalize; otherwise use the
+            deterministic two-stage finalize.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -448,6 +460,7 @@ class CuteDslMoEWrapper:
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        use_fused_finalize: bool = True,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -489,8 +502,11 @@ class CuteDslMoEWrapper:
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
+        use_fused_finalize : bool
+            Use atomic fused finalize; otherwise use the deterministic
+            two-stage finalize. Defaults to ``True``.
         """
-        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -504,11 +520,12 @@ class CuteDslMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
-        self.activation_type = activation_type
+        self.activation_type = activation
         self.gated = gated
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_fused_finalize = use_fused_finalize
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -537,10 +554,10 @@ class CuteDslMoEWrapper:
             top_k=top_k,
             num_local_experts=self.num_local_experts,
             local_expert_offset=local_expert_offset,
-            use_fused_finalize=True,
+            use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -552,10 +569,10 @@ class CuteDslMoEWrapper:
             top_k=top_k,
             num_local_experts=self.num_local_experts,
             local_expert_offset=local_expert_offset,
-            use_fused_finalize=True,
+            use_fused_finalize=use_fused_finalize,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -628,6 +645,7 @@ class CuteDslMoEWrapper:
             memset_event=self._memset_event,
             output_dtype=output_dtype,
             use_async_memset=True,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             activation_type=self.activation_type.value,
             swiglu_alpha=self.swiglu_alpha,
@@ -808,6 +826,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         aux_stream=aux_stream,
         output_dtype=output_dtype,
         use_async_memset=True,
+        use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
         swiglu_alpha=swiglu_alpha,
@@ -891,7 +910,8 @@ def cute_dsl_fused_moe_nvfp4(
     output_dtype : torch.dtype
         Output dtype.  Defaults to ``torch.bfloat16``.
     use_fused_finalize : bool
-        Whether to use the fused finalize path.  Defaults to ``True``.
+        Use atomic fused finalize; otherwise use the deterministic two-stage
+        finalize. Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.
     aux_stream : Optional[torch.cuda.Stream]
@@ -915,7 +935,7 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -942,7 +962,7 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
         enable_pdl=enable_pdl,
-        activation_type=activation_type.value,
+        activation_type=activation.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
@@ -967,7 +987,7 @@ def cute_dsl_fused_moe_nvfp4(
     inputs.append(moe_output)
 
     _, best_tactic = tuner.choose_one(
-        f"CuteDslFusedMoE::run_moe_nvfp4::{activation_type.name}",
+        f"CuteDslFusedMoE::run_moe_nvfp4::{activation.name}",
         [runner],
         runner.tuning_config,
         inputs,

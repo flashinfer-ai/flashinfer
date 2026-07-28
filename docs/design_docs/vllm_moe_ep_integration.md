@@ -118,6 +118,26 @@ The vLLM adapter needed three additions to `flashinfer.moe_ep` ("the 3 gaps"):
 the create_handle metadata step, even though dynamic *buffer sizing* is not (the buffer stays
 sized to `max_recv_tokens_per_rank`). This is what makes the HT compute-view trim feasible.
 
+### 2.1 NIXL-EP transport parity (`nixl-ep` branch)
+
+Closes the gaps that kept the **nixl_ep** transport from serving the same
+Fleet/Handle contract the vLLM adapters consume — the prerequisite for folding
+vLLM's own `nixl_ep` all2all backend into `flashinfer_ep_low_latency`
+(`create_fleet(..., backend="nixl_ep")`):
+
+| File | Change |
+|---|---|
+| `.../split/comm/nixl_ep/fleet.py` | `_resolve_store` — when `BootstrapConfig.tcp_store` is unset, derive a namespaced `PrefixStore` from torch.distributed's default store (GAP 1 analogue: the vLLM manager passes only `process_group`; no sibling-port TCPStore needed). |
+| `.../split/comm/nixl_ep/handle.py` | Surface the library's per-expert recv counts as `DispatchOutput.expert_counts` (previously discarded — the LL adapter needs them for `ExpertTokensMetadata`); surface fp8 dispatch scales as `DispatchOutput.expert_scales` (previously dropped); honor `HandleAlgoKnobUserStream` by redirecting Buffer kernels (NIXL takes no stream arg); fix `num_tokens` to the per-expert row count (was ×`num_local` off vs nccl_ep LL). |
+| `flashinfer/moe_ep/config.py` | `DispatchOutput.expert_scales` (optional). |
+| `flashinfer/moe_ep/modes/split_layer.py` | relax the layer-init `tcp_store` requirement to "store or initialized torch.distributed". |
+
+Still open for full parity with vLLM's in-tree `nixl_ep` backend: async recv
+hooks through the Handle API (DBO overlap), `FleetAlgoKnobAllocator` (NIXL's
+`Buffer` owns its RDMA arena outside torch's pool), and elastic-EP fault
+tolerance (mask query, staged commit). LL/`EXPERT_MAJOR` remains the only
+nixl_ep algorithm — matching vLLM's `nixl_ep`, which is batched/LL-only.
+
 ## 3. Changes — vLLM repo (`feat/flashinfer-ep-all2all`)
 
 Mirrors the existing DeepEP/NVLink backends. New backend names:

@@ -3,13 +3,13 @@
 The NCCL/NIXL EP ``dispatch`` returns an **expert-major, padded** tensor
 ``[num_local_experts, cap, hidden]`` (``cap = max_tokens_per_rank * world_size``),
 whereas the unified compute runners (``flashinfer.fused_moe``) consume a
-**token-major** :class:`MoEActivationPack` (``[M, hidden]`` + ``selected_experts`` /
-``final_scales``).
+**token-major** :class:`MoEActivationPack` (``[M, hidden]`` + ``topk_ids`` /
+``topk_weights``).
 
 Every dispatched row is already assigned to exactly one local expert — the expert is
 the first-dim index, i.e. ``expert = row // cap``.  So we flatten the buffer to
 ``[num_local_experts*cap, hidden]`` and synthesize a **top_k=1, pre-routed** batch with
-``final_scales = 1``.  The real top-k reweight + reduction is owned by EP ``combine``;
+``topk_weights = 1``.  The real top-k reweight + reduction is owned by EP ``combine``;
 the local compute must NOT apply routing weights (that would double-weight).  Running
 the runner with ``do_finalize=True`` at ``top_k=1`` is an identity-order scatter, so the
 output comes back in the same row order and reshapes straight back to the 3D combine
@@ -71,7 +71,7 @@ def build_activation_pack(
     device = flat.device
 
     # Synthesized routing: each row -> its own (single) expert, weight 1.0.
-    # combine() applies the real topk_weights, so final_scales must stay 1 here.
+    # combine() applies the real topk_weights, so topk_weights must stay 1 here.
     row_expert = torch.arange(num_local_experts, device=device, dtype=torch.int32)
     selected_experts = (
         row_expert.repeat_interleave(cap).reshape(m, 1) + local_expert_offset
@@ -227,8 +227,8 @@ def _quantize_and_pack(
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,
         hidden_states_scale=hidden_states_scale,
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
     )
 
 

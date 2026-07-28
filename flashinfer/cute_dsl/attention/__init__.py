@@ -32,7 +32,7 @@ from .mainloop_spec import (
     make_mla_mainloop_spec,
     make_mla_fp8_mainloop_spec,
 )
-from .fusion.mask import MaskType
+from .fusion.mask import MaskSpec
 from .fusion.variant import (
     tanh_approx,
     AttentionVariant,

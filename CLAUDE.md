@@ -18,6 +18,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
 | Run linting | `pre-commit run -a` |
+| Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
@@ -29,6 +30,10 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
+| Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
+| Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
+| Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
 
 ## Quick Start for Development
 
@@ -179,6 +184,15 @@ Install hooks to run on every commit:
 pre-commit install
 ```
 
+## Code Review
+
+When reviewing a diff (as an agent or a human), follow the shared focus areas, kernel-review
+policy, and effort calibration in [`docs/code_review_guidance.md`](docs/code_review_guidance.md).
+Note: unlike human review, agents keep **kernel implementation details in scope** — read the
+kernel logic and report bugs, labeling findings by confidence.
+
+→ **For the complete review rule set, see [`docs/code_review_guidance.md`](docs/code_review_guidance.md)**
+
 ## Architecture: JIT Compilation System
 
 FlashInfer's JIT system has three layers:
@@ -214,6 +228,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
+- CuTe-DSL FP4 MM compilation parallelism can be controlled with `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
@@ -551,14 +566,16 @@ Used by `flashinfer.trace` / `fi_trace`.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
-| `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
+| `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
+| `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
+| `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k algorithm (otherwise the dispatcher chooses based on shape). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
 | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
-| `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
+| `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
 
 ## Development Workflow
 

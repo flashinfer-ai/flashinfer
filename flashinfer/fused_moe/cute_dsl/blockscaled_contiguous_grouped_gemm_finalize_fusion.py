@@ -20,21 +20,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Contiguous Grouped GEMM kernel with Finalize Fusion for MoE workloads on Blackwell GPUs.
+Contiguous Grouped GEMM kernel for MoE GEMM2 workloads on Blackwell GPUs.
 
-This module provides a FlashInfer-style API wrapper around the TensorRT-LLM CuteDSL
-grouped GEMM kernel with fused finalize operation designed for MoE GEMM2 layers:
+This module wraps the TensorRT-LLM CuteDSL grouped GEMM kernel for MoE GEMM2:
 - Input A: (permuted_m, k) - permuted activations from GEMM1
 - Input B: (num_experts, n, k) - expert down projection weights
-- Output C: (seq_len, n) - finalized output with atomic scatter reduction
+- Output C: finalized token rows or unfinalized expanded token/top-k rows
 
 Key features:
 - NVFP4 x NVFP4 grouped GEMM with FP8 scale factors
-- Fused finalize operation in epilogue:
+- Optional fused finalize operation in epilogue:
   a) Map permuted rows to (token_idx, topk_idx) using permuted_idx_to_expanded_idx
   b) Apply router scale: scaled_output = gemm_output * token_final_scales[token_idx, topk_idx]
   c) Scatter-reduce to output: out[token_idx] += scaled_output (atomic add)
-- Eliminates separate moe_unpermute kernel
+- Deterministic mode writes unique expanded rows for a fixed-order moe_unpermute
 - Persistent tile scheduling with per-expert group mapping
 - Warp specialization for overlapped memory and compute
 - Support for SM100 (Blackwell) architecture
@@ -190,6 +189,7 @@ def _get_compiled_finalize_kernel(
     raster_along_m: bool,
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
+    use_fused_finalize: bool = True,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -211,6 +211,7 @@ def _get_compiled_finalize_kernel(
         raster_along_m,
         enable_pdl,
         use_a_per_token_scale,
+        use_fused_finalize,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -222,6 +223,7 @@ def _get_compiled_finalize_kernel(
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
             use_a_per_token_scale=use_a_per_token_scale,
+            use_fused_finalize=use_fused_finalize,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -286,17 +288,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
+    use_fused_finalize: bool = True,
 ) -> torch.Tensor:
-    """Blockscaled Contiguous Grouped GEMM with Finalize Fusion for MoE workloads.
+    """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
-    Performs grouped matrix multiplication with fused finalize (scatter-reduce):
-    out[token_idx] += alpha[group] * (A[row] @ B[group]) * router_scale[token_idx, topk_idx]
-
-    This kernel is designed for Mixture of Experts (MoE) GEMM2 layers where:
-    - Tokens are permuted and contiguously arranged by expert assignment
-    - Each expert has a down projection weight matrix
-    - The finalize operation (unpermute + scale + reduce) is fused into the epilogue
-    - Uses atomic adds for scatter-reduction to handle tokens routed to multiple experts
+    Fused mode applies routing weights and atomically reduces into token rows.
+    Deterministic mode writes expanded rows before routing-weight reduction.
 
     Args:
         a: Input tensor A (permuted activations), shape (permuted_m, k) for FP4 stored as (permuted_m, k//2) uint8
@@ -311,12 +308,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         permuted_idx_to_expanded_idx: Mapping from permuted row to expanded index, shape (permuted_m,), int32
             expanded_idx = token_idx * topk + topk_idx. Invalid rows have -1.
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
-        out: Optional output tensor, shape (seq_len, n). Created if None.
-             This tensor is used for atomic accumulation. If `out` is
-             provided, it must already be zero-initialized by the caller.
-             If `out` is None, this function allocates a zero-initialized
-             output tensor. Passing a non-zeroed `out` buffer will silently
-             produce incorrect results.
+        out: Optional output tensor. Shape is ``(seq_len, n)`` in fused mode
+             and ``(seq_len * topk, n)`` in deterministic mode. In fused mode,
+             a provided buffer must already be zero-initialized.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              NVFP4 quantizer instead of the fused GEMM1 epilogue.
@@ -328,21 +322,18 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        use_fused_finalize: Use atomic fused finalize; otherwise write expanded
+             rows for deterministic reduction. Default: True.
 
     Returns:
-        out: Output tensor, shape (seq_len, n) with dtype out_dtype.
-             Contains the finalized MoE output after scatter-reduce.
+        out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
+             in fused mode and ``(seq_len * topk, n)`` otherwise.
 
     Notes:
-        - The output tensor is modified in-place using atomic adds for scatter-reduction.
-        - When out is provided it is NOT zeroed internally; the caller
-          must ensure the buffer is zeroed before each invocation.
-          In the main CuteDSL MoE path, _moe_core_impl handles this by
-          zeroing the active output slice before GEMM2, typically on an
-          auxiliary stream overlapped with GEMM1.
+        - A caller-provided fused output must be zero-initialized.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
         - Requires SM100 (Blackwell) GPU architecture
-        - The finalize fusion eliminates the need for a separate moe_unpermute kernel
+        - Deterministic mode requires a separate ``moe_unpermute`` call.
 
     Example:
         >>> # Setup for MoE GEMM2 with 8 experts
@@ -447,16 +438,19 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             f"mma_tiler_mn={mma_tiler_mn}, cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    # Create output tensor if not provided (zero-initialized for atomic adds).
-    # If out is provided, the caller is responsible for zeroing it before
-    # this call. The GEMM2 epilogue uses atomic scatter-add
-    # (out[token_idx] += ...), so any non-zero residual would corrupt
-    # results.
+    output_rows = seq_len if use_fused_finalize else seq_len * topk
+
+    # Atomic fused finalize requires zero-initialized output.
     if out is None:
-        out = torch.zeros(
-            (seq_len, n),
+        allocator = torch.zeros if use_fused_finalize else torch.empty
+        out = allocator(
+            (output_rows, n),
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
+        )
+    elif out.shape != (output_rows, n):
+        raise ValueError(
+            f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
         )
 
     # Get SM count
@@ -553,6 +547,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
     )
 

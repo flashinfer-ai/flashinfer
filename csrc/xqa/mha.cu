@@ -465,7 +465,12 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask,
                                           uint32_t rowOffset, uint32_t nbValidCols,
                                           uint32_t qSeqLen, uint32_t actualQSeqLen,
-                                          uint32_t headGrpSize) {
+                                          uint32_t headGrpSize
+#if SLIDING_WINDOW
+                                          ,
+                                          uint32_t tileTokenBeg, int32_t winBegBase
+#endif
+) {
   uint32_t const idxInQuad = laneId() % 4;
   uint32_t const idxQuad = laneId() / 4;
   // Packed mask is aligned with 32 bits (2 uint16_t).
@@ -477,6 +482,11 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
     for (uint32_t i = 0; i < InstAcc::rows; i++) {
       uint32_t const tokenRow =
           min((rowOffset + instM * m + idxQuad + i * 8) / headGrpSize, actualQSeqLen - 1);
+#if SLIDING_WINDOW
+      // Per-row window begin (inclusive); see winBegBase at the call site.
+      // Callers disable window masking with a large negative winBegBase.
+      int32_t const rowWinBeg = winBegBase + int32_t(tokenRow);
+#endif
 #pragma unroll
       for (uint32_t mask_n = 0; mask_n < acc.cols / MMAS_N_PER_MASK; mask_n++) {
         uint32_t const firstCol = instN * mask_n * MMAS_N_PER_MASK + InstAcc::cols * idxInQuad;
@@ -507,7 +517,13 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                 col + actualQSeqLen < nbValidCols
                     ? true
                     : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
+#if SLIDING_WINDOW
+            bool const inWindow = int32_t(tileTokenBeg + col) >= rowWinBeg;
+#else
+            constexpr bool inWindow = true;
+#endif
+            acc(m, n)(i, j) =
+                maskFlag && inWindow && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
           }
         }
       }
@@ -1586,6 +1602,12 @@ CUBIN_EXPORT __global__
   // Same as idxReq * qSeqLen if all sequences all the same.
   // Take different beams as different requests/sequences currently.
   uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
+  // A ragged request may have 0 draft tokens (all rejected). It owns no rows
+  // and min(row, actualQSeqLen - 1) would underflow, so exit before any
+  // barrier/semaphore interaction (uniform across the request's CTAs).
+  if (variableQSeqLen && actualQSeqLen == 0) {
+    return;
+  }
 
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
@@ -1736,7 +1758,19 @@ CUBIN_EXPORT __global__
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+#if SPEC_DEC && !IS_SPEC_DEC_TREE
+  // Linear (non-tree) spec-dec: draft row r sits at position
+  // cacheSeqLen - actualQSeqLen + r, so each row's window begins at
+  // winBegBase + r. Skip whole leading tiles only up to the earliest row
+  // handled by this CTA; applyMaskFromInput masks the per-row edge exactly.
+  int32_t const specDecWinBegBase =
+      int32_t(cacheSeqLen - actualQSeqLen + 1) - int32_t(slidingWinSize);
+  uint32_t const ctaTokenRowBeg = min(idxHeadTokenInGrp / headGrpSize, actualQSeqLen - 1);
+  int32_t const ctaWinBeg = specDecWinBegBase + int32_t(ctaTokenRowBeg);
+  uint32_t const nbTotalSkipTokens = (rtIsReallySliding && ctaWinBeg > 0) ? uint32_t(ctaWinBeg) : 0;
+#else
   uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#endif
 #else
   constexpr bool rtIsReallySliding = false;
   constexpr uint32_t nbTotalSkipTokens = 0;
@@ -2023,11 +2057,31 @@ CUBIN_EXPORT __global__
       // masking
       uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
-      if (seqIter >= nbSeqItersWithoutMask) {
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+      // Tiles below the last row's window begin (cacheSeqLen - slidingWinSize)
+      // need the per-row window edge mask; tiles fully below this CTA's
+      // first-row window begin were already skipped via nbSkipLeadingTiles.
+      bool const needWinEdgeMask =
+          rtIsReallySliding && (ctaTile.x * seqIter < cacheSeqLen - slidingWinSize);
+      int32_t const winBegBase = rtIsReallySliding ? specDecWinBegBase : int32_t(-(1 << 30));
+#else
+      constexpr bool needWinEdgeMask = false;
+#if SLIDING_WINDOW
+      // Tree-structured draft tokens have no row-indexed positions, so only
+      // the tile-granular window skip applies; no per-row edge mask.
+      int32_t const winBegBase = -(1 << 30);
+#endif
+#endif
+      if (seqIter >= nbSeqItersWithoutMask || needWinEdgeMask) {
         uint32_t const nbValidCols =
             (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
         applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen,
-                           headGrpSize);
+                           headGrpSize
+#if SLIDING_WINDOW
+                           ,
+                           warpTileTokenBeg, winBegBase
+#endif
+        );
       }
 #else
       bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
