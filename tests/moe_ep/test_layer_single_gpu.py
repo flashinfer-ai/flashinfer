@@ -333,6 +333,7 @@ def test_split_layer_releases_pack_after_init():
     """MoEEpSplitLayer must not pin the source weight pack past __init__."""
     import gc
     import weakref
+    from unittest import mock
 
     import torch
 
@@ -351,16 +352,19 @@ def test_split_layer_releases_pack_after_init():
 
     pack = dummy_moe_weights(num_local_experts=2, hidden=8)
     ref = weakref.ref(pack)
-    split = MoEEpSplitLayer(
-        bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
-        fleet_params=FleetParams(
-            num_experts=2,
-            max_tokens_per_rank=4,
-            token_hidden_size=8,
-        ),
-        weights=pack,
-        backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
-    )
+    # Arch/CUDA-13 validation is orthogonal to the pack-release contract under
+    # test; mock it so the check still runs on CUDA-12 CI hosts.
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
+        split = MoEEpSplitLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=2,
+                max_tokens_per_rank=4,
+                token_hidden_size=8,
+            ),
+            weights=pack,
+            backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
+        )
     assert split._weights is None
     del pack
     gc.collect()
