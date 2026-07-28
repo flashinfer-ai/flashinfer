@@ -113,21 +113,77 @@ def install_jit_build_counter() -> Dict:
     return counter
 
 
+def sampling_support(x: torch.Tensor, top_k: int, top_p: float):
+    """Reference top-k ∩ nucleus support for temperature-scaled logits ``x``.
+
+    Returns ``(allowed, p_top1)``: a bool mask over the vocabulary of tokens the
+    sampler is permitted to return, and the greedy token's probability under the
+    filtered+renormalized distribution the kernel actually draws from.
+
+    Both boundaries close over ties (``>=`` against a *value*, not a rank), and
+    the ``eps`` slack is applied on the permissive side only — the mask is a
+    superset of what any correct implementation may keep, so a violation is
+    unambiguous. This mirrors ``tests/utils/test_sampling.py``, which builds the
+    same masks with sort/cumsum and asserts membership over many draws.
+
+    The renormalization denominator is the *tie closure* of the top-k, not the
+    k largest entries: if two logits collide exactly at the k-th position the
+    kernel may legitimately keep both, and a narrower denominator would produce
+    rare false failures.
+    """
+    eps = 1e-4
+    vocab = x.shape[-1]
+    k = min(top_k if top_k > 0 else vocab, vocab)
+    values, ids = torch.topk(x, k, dim=-1)  # descending
+    # Tie closure of the top-k, renormalized — the largest set the kernel may keep.
+    probs = torch.softmax(x.masked_fill(x < values[:, -1:], float("-inf")), dim=-1)
+    kept = probs.gather(1, ids)
+    mass_above = torch.cumsum(kept, dim=-1) - kept
+    n_keep = (mass_above < top_p + eps).sum(dim=-1, keepdim=True).clamp(min=1)
+    cutoff = values.gather(1, n_keep - 1)
+    allowed = x >= cutoff
+    kept_mass = torch.cumsum(kept, dim=-1).gather(1, n_keep - 1).clamp(min=1e-20)
+    return allowed, (kept[:, :1] / kept_mass).squeeze(-1)
+
+
 def sample_tokens(
     logits: torch.Tensor,
     temperature: float,
     top_k: int,
     top_p: float,
     generator: Optional[torch.Generator],
+    audit: Optional[Dict] = None,
 ) -> torch.Tensor:
     if temperature <= 0.0:
         return logits.argmax(dim=-1).to(torch.int32)
     logits = logits / temperature
     vocab = logits.shape[-1]
     effective_top_k = top_k if top_k > 0 else vocab
-    return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, effective_top_k, top_p, deterministic=True, generator=generator
     )
+    if audit is not None:
+        _audit_sample(audit, logits, tokens, top_k, top_p)
+    return tokens
+
+
+def _audit_sample(audit: Dict, x: torch.Tensor, tokens: torch.Tensor, top_k, top_p):
+    """Accumulate support-membership evidence for one sampled step."""
+    rows, vocab = x.shape
+    tok = tokens.long()
+    in_range = (tok >= 0) & (tok < vocab)
+    audit["out_of_range"] += int((~in_range).sum())
+    if not bool(in_range.all()):  # keep the gather below safe
+        tok = tok.clamp(0, vocab - 1)
+    allowed, p_top1 = sampling_support(x, top_k, top_p)
+    audit["violations"] += int((~allowed.gather(1, tok[:, None]).squeeze(-1)).sum())
+    audit["draws"] += rows
+    audit["allowed_total"] += int(allowed.sum())
+    # A sampler that has silently degenerated to argmax is still always inside
+    # the support, so membership cannot see it; count divergences from greedy
+    # against how many we should expect from the filtered distribution.
+    audit["divergences"] += int((tok != x.argmax(dim=-1)).sum())
+    audit["expected_divergences"] += float((1.0 - p_top1).sum())
 
 
 class GenerationEngine:
@@ -238,6 +294,7 @@ class GenerationEngine:
         top_p: float = 1.0,
         seed: int = 0,
         jit_counter: Optional[Dict] = None,
+        audit: Optional[Dict] = None,
     ) -> Dict:
         model, cfg, device = self.model, self.model.config, self.model.device
         batch = len(prompt_token_ids)
@@ -257,7 +314,33 @@ class GenerationEngine:
         # ---- Prefill: all prompts in one ragged batch ----
         t_start = time.perf_counter()
         logits = self._prefill(prompt_token_ids, kv)
-        next_tokens = sample_tokens(logits, temperature, top_k, top_p, generator)
+        next_tokens = sample_tokens(logits, temperature, top_k, top_p, generator, audit)
+        if audit is not None and temperature > 0.0:
+            # Hermetic replay: same logits, a freshly seeded generator. Model
+            # independent, so a mismatch is unambiguously the sampler (a
+            # generator state that is not honored, or a deterministic=True that
+            # does not actually pin the reduction order).
+            replay_gen = torch.Generator(device=device)
+            replay_gen.manual_seed(seed)
+            replay = sample_tokens(logits, temperature, top_k, top_p, replay_gen)
+            audit["replay_match"] = int(bool(torch.equal(replay, next_tokens)))
+            # Per-request tensor params take the non-fast-path kernels
+            # (top_k_mask_logits + full-vocab top_p_sampling_from_probs); a
+            # scalar top_k on a large vocab only ever exercises the fast path.
+            x = logits / temperature
+            vocab = x.shape[-1]
+            k_t = torch.full(
+                (x.shape[0],), top_k if top_k > 0 else vocab, device=device
+            )
+            p_t = torch.full((x.shape[0],), top_p, device=device)
+            per_req = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                x, k_t, p_t, deterministic=True, generator=replay_gen
+            )
+            allowed, _ = sampling_support(x, top_k, top_p)
+            tok = per_req.long().clamp(0, vocab - 1)
+            audit["perreq_violations"] = int(
+                (~allowed.gather(1, tok[:, None]).squeeze(-1)).sum()
+            )
         torch.cuda.synchronize()
         t_prefill = time.perf_counter()
 
@@ -304,7 +387,9 @@ class GenerationEngine:
                 kv_last_page_len,
                 last_token_rows=decode_rows,
             )
-            next_tokens = sample_tokens(logits, temperature, top_k, top_p, generator)
+            next_tokens = sample_tokens(
+                logits, temperature, top_k, top_p, generator, audit
+            )
             for i, tok in enumerate(next_tokens.tolist()):
                 if not finished[i]:
                     outputs[i].append(tok)
@@ -347,9 +432,28 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument(
+        "--check-sampling",
+        action="store_true",
+        help="Audit every sampled token against a torch reference support "
+        "(top-k ∩ nucleus). Adds a topk+softmax per step; off by default.",
+    )
     parser.add_argument("--prefill-backend", default="auto")
     parser.add_argument("--decode-backend", default="auto")
     args = parser.parse_args()
+
+    audit = None
+    if args.check_sampling and args.temperature > 0.0:
+        audit = {
+            "violations": 0,
+            "out_of_range": 0,
+            "draws": 0,
+            "allowed_total": 0,
+            "divergences": 0,
+            "expected_divergences": 0.0,
+            "replay_match": -1,
+            "perreq_violations": -1,
+        }
 
     jit_counter = install_jit_build_counter()
     world_size, rank = maybe_init_distributed()
@@ -412,6 +516,7 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         seed=args.seed,
+        audit=audit,
         jit_counter=jit_counter,
     )
 
@@ -428,6 +533,20 @@ def main():
         f"(batch={len(prompts)}; includes first-call JIT warmup)"
     )
 
+    if audit is not None:
+        print(f"[smoke] sample_draws={audit['draws']}")
+        print(f"[smoke] sample_violations={audit['violations']}")
+        print(f"[smoke] sample_out_of_range={audit['out_of_range']}")
+        # Mean admissible set size: guards against a vacuous membership check
+        # (with --top-k 0 --top-p 1.0 the mask is the whole vocab).
+        mean_allowed = audit["allowed_total"] / max(audit["draws"], 1)
+        print(f"[smoke] sample_allowed_mean={mean_allowed:.1f}")
+        print(f"[smoke] sample_divergences={audit['divergences']}")
+        print(
+            f"[smoke] sample_expected_divergences={audit['expected_divergences']:.2f}"
+        )
+        print(f"[smoke] sample_replay_match={audit['replay_match']}")
+        print(f"[smoke] sample_perreq_violations={audit['perreq_violations']}")
     print(f"[smoke] jit_builds_total={jit_counter['count']}")
     print(f"[smoke] jit_builds_names={','.join(jit_counter['names'])}")
     print(f"[smoke] jit_build_calls={jit_counter['build_calls']}")

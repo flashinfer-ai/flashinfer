@@ -123,6 +123,38 @@ after an `autotune(True)` warmup pass. The JSON output is the intended input
 for future performance gates. Host-side timings — for trend and gating, not
 kernel benchmarking.
 
+## Sampling
+
+Greedy decode (`--temperature 0.0`, the default) short-circuits to
+`argmax` and never touches `flashinfer.sampling` at all. To exercise the
+sampling kernels:
+
+```bash
+python generate.py --model-id Qwen/Qwen3-0.6B \
+    --temperature 0.8 --top-k 50 --top-p 0.9 --check-sampling
+```
+
+`--check-sampling` audits **every** sampled token against a plain-torch
+reference support (top-k ∩ nucleus, computed from the same
+temperature-scaled logits, with both boundaries closed over ties). It reports:
+
+| `[smoke]` key | meaning | bar |
+|---|---|---|
+| `sample_violations` | tokens outside the reference support | 0 |
+| `sample_out_of_range` | ids outside `[0, vocab)` | 0 |
+| `sample_allowed_mean` | mean admissible set size — guards against a *vacuous* check | ≤ 2·top_k |
+| `sample_divergences` / `sample_expected_divergences` | observed vs expected departures from greedy | catches a sampler degenerated to argmax |
+| `sample_replay_match` | same logits + freshly seeded generator ⇒ same tokens | 1 |
+| `sample_perreq_violations` | same audit with per-request **tensor** top_k/top_p (a different kernel path) | 0 |
+
+`smoke_test.py` runs a greedy pair *and* a sampling pair, asserting all of the
+above plus seeded cross-process determinism and that the `sampling`/`topk`
+modules are reused from the JIT cache. Pass `--skip-sampling` for greedy only.
+
+Measured on B200 (Qwen3-0.6B, temperature 0.8 / top-k 50 / top-p 0.9): 0
+violations in 72 draws, mean admissible set **4.3** of 151936, and 15 observed
+divergences against 16.58 expected.
+
 ## Requirements
 
 `flashinfer`, `torch`, and — for checkpoint/tokenizer handling only —
