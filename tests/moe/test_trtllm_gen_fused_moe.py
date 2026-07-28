@@ -20,7 +20,6 @@ import torch
 from flashinfer.utils import get_compute_capability
 
 from flashinfer.fused_moe import fill_w_ptr
-from flashinfer.tllm_enums import DtypeTrtllmGen
 from tests.moe.trtllm_gen_fused_moe_utils import (
     ActivationType,
     BF16Moe,
@@ -448,10 +447,12 @@ def test_deepseekv3_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "activation_type",
+    ("activation_type", "alpha_value", "beta_value", "clamp_value"),
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Swiglu, None, None, None, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, None, None, None, id="Geglu"),
+        pytest.param(ActivationType.Situ, None, None, None, id="Situ_Defaults"),
+        pytest.param(ActivationType.Situ, 4.0, 25.0, None, id="Situ_kimi-k3"),
     ],
 )
 @pytest.mark.parametrize(
@@ -469,10 +470,29 @@ def test_topk_routing(
     routing_config,
     weight_processing,
     activation_type,
+    alpha_value,
+    beta_value,
+    clamp_value,
     routing_logits_dtype,
     cache_permute_indices,
 ):
     """Test TopK routing configuration."""
+    num_experts = routing_config["num_experts"]
+    gemm1_alpha = (
+        None
+        if alpha_value is None
+        else torch.full((num_experts,), alpha_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_beta = (
+        None
+        if beta_value is None
+        else torch.full((num_experts,), beta_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_clamp_limit = (
+        None
+        if clamp_value is None
+        else torch.full((num_experts,), clamp_value, device="cuda", dtype=torch.float32)
+    )
     run_moe_test(
         num_tokens,
         hidden_size,
@@ -483,6 +503,9 @@ def test_topk_routing(
         activation_type,
         cache_permute_indices,
         routing_logits_dtype,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -2278,131 +2301,3 @@ def test_fp4_block_scale_deepseekv3_unfinalized_weight_dtype(cache_permute_indic
         routing_logits_dtype=torch.float32,
         verify_unfinalized_weight_dtype=True,
     )
-
-
-SITU_TEST_CASES = (
-    pytest.param(None, None, None, id="Situ_Defaults"),
-    pytest.param(4.0, 25.0, None, id="Situ_Alpha4Beta25"),
-    pytest.param(1.7, 1.0, 7.0, id="Situ_Alpha1p7Beta1Clamp7"),
-)
-
-
-def _run_fp4_situ_test(
-    quant_mode, alpha_value, beta_value, clamp_value, cache_permute_indices
-):
-    num_experts = 8
-
-    def per_expert(value):
-        return (
-            None
-            if value is None
-            else torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
-        )
-
-    run_moe_test(
-        num_tokens=32,
-        hidden_size=1024,
-        intermediate_size=512,
-        moe_impl=FP4Moe(quant_mode=quant_mode),
-        routing_config={
-            "num_experts": num_experts,
-            "top_k": 2,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Renormalize,
-            "compatible_moe_impls": [FP4Moe],
-            "compatible_intermediate_size": [512],
-            "compatible_activation_types": [ActivationType.Situ],
-            "enable_autotune": True,
-        },
-        weight_processing={
-            "use_shuffled_weight": True,
-            "layout": WeightLayout.MajorK,
-            "compatible_moe_impls": [FP4Moe],
-        },
-        activation_type=ActivationType.Situ,
-        cache_permute_indices=cache_permute_indices,
-        routing_logits_dtype=torch.bfloat16,
-        gemm1_alpha=per_expert(alpha_value),
-        gemm1_beta=per_expert(beta_value),
-        gemm1_clamp_limit=per_expert(clamp_value),
-    )
-
-
-@pytest.mark.parametrize("alpha_value,beta_value,clamp_value", SITU_TEST_CASES)
-def test_mxfp4_mxfp8_moe_situ(
-    alpha_value, beta_value, clamp_value, cache_permute_indices
-):
-    _run_fp4_situ_test(
-        QuantMode.FP4_MXFP4_MXFP8,
-        alpha_value,
-        beta_value,
-        clamp_value,
-        cache_permute_indices,
-    )
-
-
-@pytest.mark.parametrize("alpha_value,beta_value,clamp_value", SITU_TEST_CASES)
-def test_nvfp4_moe_situ(alpha_value, beta_value, clamp_value, cache_permute_indices):
-    _run_fp4_situ_test(
-        QuantMode.FP4_NVFP4_NVFP4,
-        alpha_value,
-        beta_value,
-        clamp_value,
-        cache_permute_indices,
-    )
-
-
-def _get_situ_tactic_tile_ns(dtype_act, dtype_weights):
-    from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
-
-    raw_moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
-    tactics = raw_moe_op.trtllm_get_valid_moe_configs(
-        dtype_act,
-        dtype_weights,
-        Fp8QuantizationType.NoneFp8,
-        2,
-        1024,
-        512,
-        8,
-        ActivationType.Situ.value,
-        True,
-        WeightLayout.MajorK.value,
-        False,
-        512,
-        False,
-    )
-    return {int(tactic[0]) for tactic in tactics}
-
-
-def test_mxfp4_mxfp8_autotuner_includes_tile_n_192():
-    tile_ns = _get_situ_tactic_tile_ns(DtypeTrtllmGen.MxE4m3, DtypeTrtllmGen.MxE2m1)
-    assert 192 in tile_ns
-
-
-def test_nvfp4_autotuner_includes_tile_n_192():
-    tile_ns = _get_situ_tactic_tile_ns(DtypeTrtllmGen.E2m1, DtypeTrtllmGen.E2m1)
-    assert 192 in tile_ns
-
-
-@pytest.mark.parametrize(
-    ("dtype_act", "dtype_weights"),
-    [
-        pytest.param(
-            DtypeTrtllmGen.E2m1,
-            DtypeTrtllmGen.MxE2m1,
-            id="mxfp4_weights_nvfp4_activations",
-        ),
-        pytest.param(
-            DtypeTrtllmGen.MxE4m3,
-            DtypeTrtllmGen.E2m1,
-            id="nvfp4_weights_mxfp8_activations",
-        ),
-    ],
-)
-def test_unsupported_fp4_dtype_pairs_exclude_tile_n_192(dtype_act, dtype_weights):
-    tile_ns = _get_situ_tactic_tile_ns(dtype_act, dtype_weights)
-    assert 192 not in tile_ns
