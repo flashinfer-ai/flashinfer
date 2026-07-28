@@ -1938,9 +1938,9 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
 template <typename DType, typename IdType>
 cudaError_t RadixTopKPageTableTransformMultiCTA(
     DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
-    const IdType* row_to_batch, IdType* lengths, const IdType* row_starts, uint32_t num_rows,
-    uint32_t top_k_val, uint32_t max_len, RadixRowState* row_states_buffer, bool deterministic,
-    cudaStream_t stream = 0, const IdType* page_table_row_starts = nullptr) {
+    const IdType* row_to_batch, IdType* lengths, const IdType* row_starts,
+    const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+    RadixRowState* row_states_buffer, bool deterministic, cudaStream_t stream = 0) {
   using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = (row_starts != nullptr) ? 1 : std::gcd(16 / sizeof(DType), max_len);
@@ -1986,14 +1986,24 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(
 
   // Unified kernel parameters
   DType* output_values = nullptr;  // Not used in PageTableTransform mode
-  const IdType* page_starts = page_table_row_starts;
   dim3 nblks(total_ctas);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {
-      &input,         &output_page_table, &output_values,     &src_page_table,     &lengths,
-      &row_starts,    &page_starts,       &row_to_batch,      &src_stride,         &top_k_val,
-      &max_len,       &num_rows,          &row_states_buffer, &det_scratch_buffer, &chunk_size,
-      &ctas_per_group};
+  void* args[] = {&input,
+                  &output_page_table,
+                  &output_values,
+                  &src_page_table,
+                  &lengths,
+                  &row_starts,
+                  &page_table_row_starts,
+                  &row_to_batch,
+                  &src_stride,
+                  &top_k_val,
+                  &max_len,
+                  &num_rows,
+                  &row_states_buffer,
+                  &det_scratch_buffer,
+                  &chunk_size,
+                  &ctas_per_group};
 
 #define LAUNCH_PAGE_TABLE_KERNEL(THREADS, SINGLE_CTA_FLAG, DET_FLAG)                              \
   do {                                                                                            \
@@ -3211,10 +3221,10 @@ cudaError_t LaunchFilteredTopKUnified(DType* input, IdType* output, DType* aux_o
 template <typename DType, typename IdType>
 cudaError_t FilteredTopKPageTableTransform(
     DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
-    const IdType* row_to_batch, IdType* lengths, const IdType* row_starts, uint32_t num_rows,
-    uint32_t top_k_val, uint32_t max_len, bool deterministic = false,
-    TopKTieBreak tie_break = TopKTieBreak::None, cudaStream_t stream = 0,
-    bool dsa_graph_safe = false, const IdType* page_table_row_starts = nullptr) {
+    const IdType* row_to_batch, IdType* lengths, const IdType* row_starts,
+    const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+    bool deterministic = false, TopKTieBreak tie_break = TopKTieBreak::None,
+    cudaStream_t stream = 0, bool dsa_graph_safe = false) {
   DType* aux_output = nullptr;  // Not used for PageTable mode
   return LaunchFilteredTopKUnified<FilteredTopKMode::PageTable, DType, IdType>(
       input, output_page_table, aux_output, src_page_table, src_stride, row_to_batch, lengths,
@@ -3372,8 +3382,8 @@ cudaError_t TopKPageTableTransformDispatch(
                                    dsa_graph_safe)) {
     FLASHINFER_CUDA_CALL((FilteredTopKPageTableTransform<DType, IdType>(
         input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
-        num_rows, top_k_val, max_len, deterministic, tie_break, stream, dsa_graph_safe,
-        page_table_row_starts)));
+        page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break, stream,
+        dsa_graph_safe)));
     if (deterministic) {
       FLASHINFER_CUDA_CALL((LaunchSortTopKByIndex<FilteredTopKMode::PageTable, uint8_t, IdType>(
           output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
@@ -3383,8 +3393,8 @@ cudaError_t TopKPageTableTransformDispatch(
   }
   return RadixTopKPageTableTransformMultiCTA<DType, IdType>(
       input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
-      num_rows, top_k_val, max_len, row_states_buffer, deterministic, stream,
-      page_table_row_starts);
+      page_table_row_starts, num_rows, top_k_val, max_len, row_states_buffer, deterministic,
+      stream);
 }
 
 template <typename DType, typename IdType>
