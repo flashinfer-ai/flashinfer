@@ -13,6 +13,8 @@ Note: The `replay` command is tested in tests/utils/test_logging_replay.py along
 the other logging/replay functionality tests, since it's tightly coupled with that feature.
 """
 
+from types import SimpleNamespace
+
 from .cli_cmd_helpers import (
     _test_cmd_helper,
     _assert_output_contains_all,
@@ -206,6 +208,30 @@ def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
 
     # Verify the cubin directory has been removed
     assert not temp_cubin_dir.exists()
+
+
+def test_module_status_cmd_mocked(monkeypatch):
+    status = SimpleNamespace(
+        name="module_a",
+        status="Compiled",
+        is_compiled=True,
+        sources=["kernel_a.cu", "kernel_b.cu"],
+        needs_device_linking=False,
+    )
+    monkeypatch.setattr(
+        "flashinfer.__main__._ensure_modules_registered", lambda: [status]
+    )
+    monkeypatch.setattr(
+        "flashinfer.__main__.jit_spec_registry.get_stats",
+        lambda: {"total": 1, "compiled": 1, "not_compiled": 0},
+    )
+
+    out = _test_cmd_helper(["module-status"])
+
+    header = next(line for line in out.splitlines() if "Module Name" in line)
+    _assert_output_contains_all(header, "Status", "Sources", "Device Linking")
+    assert "Type" not in header
+    _assert_output_contains_all(out, "module_a", "Compiled", "2", "No")
 
 
 class MockJitSpec:

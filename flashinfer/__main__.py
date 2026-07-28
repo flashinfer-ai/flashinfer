@@ -291,7 +291,7 @@ def module_status_cmd(detailed, filter):
                 ]
             )
 
-        headers = ["Module Name", "Type", "Status", "Sources", "Device Linking"]
+        headers = ["Module Name", "Status", "Sources", "Device Linking"]
         click.echo(tabulate(table_data, headers=headers, tablefmt="github"))
 
     # Show summary statistics
