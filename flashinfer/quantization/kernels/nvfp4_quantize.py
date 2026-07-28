@@ -1038,13 +1038,12 @@ class NVFP4QuantizeTMAKernel:
         global_scale: Union[Float32, cute.Tensor],
         stream,
     ):
-        # 3D global tensor: [padded_M, K/64, 64] so each warp's 64-col
-        # stripe is the contiguous innermost dimension, matching the CUDA
-        # TMA kernel's 3D tensor map.
+        # TMA zero-fills rows beyond the physical input extent while the kernel
+        # visits padded_M rows required by the scale layout.
         gInput = cute.make_tensor(
             mInput.iterator,
             cute.make_layout(
-                (padded_M, self.K // _TMA_COL_TILE, _TMA_COL_TILE),
+                (M, self.K // _TMA_COL_TILE, _TMA_COL_TILE),
                 stride=(self.K, _TMA_COL_TILE, 1),
             ),
         )
@@ -1694,10 +1693,9 @@ def _get_compiled_kernel_nvfp4_tma(
     )
 
     sym_m = cute.sym_int()
-    sym_padded_m = cute.sym_int()
 
     input_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass_dtype, (sym_padded_m, K), stride_order=(1, 0), assumed_align=16
+        cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K // 2), stride_order=(1, 0), assumed_align=16
@@ -1874,20 +1872,13 @@ def nvfp4_quantize_cute_dsl(
             (padded_m + rows_per_block - 1) // rows_per_block, tma_target_grid
         )
 
-        input_padded = input
-        if padded_m > m:
-            input_padded = torch.zeros(
-                padded_m, k, dtype=input.dtype, device=input.device
-            )
-            input_padded[:m, :] = input
-
         fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
         scale_output = torch.empty(
             scale_output_size, dtype=torch.uint8, device=input.device
         )
 
         kernel_fn(
-            input_padded,
+            input,
             fp4_output,
             scale_output,
             m,
