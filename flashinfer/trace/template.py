@@ -734,9 +734,17 @@ class TraceTemplate:
                     if descriptor.dtype_from is not None:
                         ref_param = descriptor.dtype_from
                         ref_t = _get_tensor(kwargs, ref_param)
-                        dtype = (
-                            _dtype_str(ref_t.dtype) if ref_t is not None else "unknown"
-                        )
+                        if ref_t is not None:
+                            dtype = _dtype_str(ref_t.dtype)
+                        else:
+                            # dtype_from may reference an output param that is
+                            # absent when tracing symbolically; fall back to the
+                            # explicit dtype if one is declared.
+                            dtype = (
+                                descriptor.dtype
+                                if descriptor.dtype is not None
+                                else "unknown"
+                            )
                     elif descriptor.dtype is not None:
                         dtype = descriptor.dtype
                     else:

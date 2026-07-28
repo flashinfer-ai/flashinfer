@@ -267,12 +267,16 @@ __device__ void routingPermutation(KernelParams params,
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
 
-  // When MaxNumExperts > NumThreads, each thread handles multiple experts.
+  // When MaxNumExperts > NumThreads, each thread handles multiple experts. Use ceiling division
+  // so non-divisible expert tiers (notably E=896 with 256- or 512-thread cluster blocks) are
+  // represented by a zero-padded tail in the block scan. Every shared-memory/global-memory access
+  // below is guarded by expert < params.mNumExperts, so the padded items exist only in registers
+  // and contribute zero to the scan.
   static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
   static constexpr int ExpertsPerThread =
-      MaxNumExperts <= NumThreads ? 1 : MaxNumExperts / NumThreads;
-  static_assert(MaxNumExperts <= NumThreads || MaxNumExperts % NumThreads == 0,
-                "MaxNumExperts must be <= NumThreads or a multiple of NumThreads");
+      MaxNumExperts <= NumThreads ? 1 : (MaxNumExperts + NumThreads - 1) / NumThreads;
+  static_assert(ExpertsPerThread * NumThreads >= MaxNumExperts,
+                "Thread-local expert slots must cover MaxNumExperts");
 
   static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
   // Number of threads in the cluster.
@@ -968,8 +972,13 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // needed for the exclusive sum of token offsets
   using Scan = cub::BlockScan<int32_t, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage tempStorage;
-  // 64 elements -> 128+ registers. Above that we may start to see spilling to local memory.
-  static constexpr int MaxExpandedIdxPerThread = 64;
+  // Lane-owned high-expert/high-topK tiers use this kernel only while four
+  // expanded indices per thread cover the runtime batch. Keeping the bounded
+  // range explicit lets the compiler scalarize the expert/offset state instead
+  // of spilling the generic 64-entry arrays to local memory.
+  static constexpr int MaxExpandedIdxPerThread =
+      topk::isInHighExpertLaneOwnedTopKRange(MaxNumExperts, KernelParams::MaxNumTopExperts) ? 4
+                                                                                            : 64;
 
   // Initialize grid.
   cg::grid_group grid = cg::this_grid();
