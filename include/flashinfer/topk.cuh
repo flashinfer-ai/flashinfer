@@ -1250,8 +1250,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
           if (chunk_start + i < k) {
             row_output[chunk_start + i] = static_cast<IdType>(chunk_start + i);
-            output_values[row_idx * top_k_val + chunk_start + i] =
-                input[static_cast<size_t>(row_idx) * stride + chunk_start + i];
+            if (output_values != nullptr) {
+              output_values[row_idx * top_k_val + chunk_start + i] =
+                  input[static_cast<size_t>(row_idx) * stride + chunk_start + i];
+            }
           }
         }
         // Clear histogram for next iteration (in case it's k < length)
@@ -1335,11 +1337,17 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
 
     // Stage 2: Collect indices with mode-specific epilogue (single pass)
     if constexpr (MODE == RadixTopKMode::Basic) {
-      DType* row_output_values = output_values + row_idx * top_k_val;
-      collect_indices([&](uint32_t original_idx, OrderedType ordered_val, int pos) {
-        row_output[pos] = static_cast<IdType>(original_idx);
-        row_output_values[pos] = Traits::FromOrdered(ordered_val);
-      });
+      if (output_values != nullptr) {
+        DType* row_output_values = output_values + row_idx * top_k_val;
+        collect_indices([&](uint32_t original_idx, OrderedType ordered_val, int pos) {
+          row_output[pos] = static_cast<IdType>(original_idx);
+          row_output_values[pos] = Traits::FromOrdered(ordered_val);
+        });
+      } else {
+        collect_indices([&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
+          row_output[pos] = static_cast<IdType>(original_idx);
+        });
+      }
     } else if constexpr (MODE == RadixTopKMode::PageTableTransform) {
       uint32_t batch_idx = (row_to_batch != nullptr) ? row_to_batch[row_idx] : row_idx;
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
@@ -2402,7 +2410,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   } else if constexpr (MODE == FilteredTopKMode::Ragged) {
     offset_val = aux_input[bid];
   } else {  // Plain
-    dst_values = aux_output + bid * top_k;
+    dst_values = (aux_output != nullptr) ? aux_output + bid * top_k : nullptr;
   }
 
   // Trivial case: length <= top_k
@@ -2411,10 +2419,10 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
       if constexpr (MODE == FilteredTopKMode::Plain) {
         if (i < length) {
           dst[i] = static_cast<IdType>(i);
-          dst_values[i] = score[i];
+          if (dst_values != nullptr) dst_values[i] = score[i];
         } else {
           dst[i] = static_cast<IdType>(-1);
-          dst_values[i] = DType(0);
+          if (dst_values != nullptr) dst_values[i] = DType(0);
         }
       } else if constexpr (DETERMINISTIC) {
         // Defer the page-table/ragged transform to the lightweight finalizer.
@@ -2908,8 +2916,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     const int idx = s_indices[base];
     if constexpr (MODE == FilteredTopKMode::Plain) {
       dst[base] = static_cast<IdType>(idx);
-      dst_values[base] = score[idx];
-    } else if constexpr (DETERMINISTIC) {
+      if (dst_values != nullptr) dst_values[base] = score[idx];
+    } else if constexpr (DETERMINISTIC) {  // transform in SortTopKByIndexKernel
       dst[base] = static_cast<IdType>(idx);
     } else if constexpr (MODE == FilteredTopKMode::PageTable) {
       dst[base] = src_page_entry[page_table_row_start + idx];

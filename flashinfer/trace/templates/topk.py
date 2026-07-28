@@ -81,9 +81,10 @@ def _top_k_varlen_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.top_k_varlen`` (radix backend, no pre_idx).
+    """Build inputs for ``flashinfer.top_k_varlen`` (radix_cutlass backend, no pre_idx).
 
-    Uses the radix backend so the example runs on any GPU.
+    Uses the ``radix_cutlass`` (masked CUTLASS radix) backend so the example
+    runs on any GPU.
     ``seq_lens`` is randomised in ``[top_k + 1, max_seq_len]`` to guarantee
     that every row has at least ``top_k`` valid entries.
     ``max_seq_len`` is padded to the next multiple of 8 (fp16/bf16 alignment).
@@ -98,7 +99,7 @@ def _top_k_varlen_init(
         "logits": logits,
         "seq_lens": seq_lens,
         "top_k": top_k,
-        "backend": "radix",
+        "backend": "radix_cutlass",
     }
 
 

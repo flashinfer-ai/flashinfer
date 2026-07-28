@@ -15,12 +15,12 @@ from tests.trace.reference_utils import _check
     ],
 )
 def test_top_k_varlen_reference_correctness(shape_kwargs):
-    """flashinfer.top_k_varlen (radix backend) vs reference."""
+    """flashinfer.top_k_varlen (radix_cutlass backend) vs reference."""
     import flashinfer
     from flashinfer.trace.templates.topk import top_k_varlen_trace
 
     inputs = top_k_varlen_trace.init(**shape_kwargs)
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         inputs["logits"],
         inputs["seq_lens"],
         inputs["top_k"],

@@ -150,7 +150,7 @@ def test_basic_decode(dtype, top_k, N, batch_size):
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=42)
     pre_idx_arg = pre_idx if _IS_BLACKWELL else None
 
-    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
 
     assert indices.shape == (batch_size, top_k)
@@ -205,7 +205,7 @@ def test_next_n(dtype, top_k, batch_size):
         num_rows, N, top_k, dtype, seed=7, next_n=next_n
     )
 
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, next_n=next_n
     )
     torch.cuda.synchronize()
@@ -228,7 +228,7 @@ def test_compress_ratio(dtype, top_k):
         batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
     )
 
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, compress_ratio=compress_ratio
     )
     torch.cuda.synchronize()
@@ -276,7 +276,7 @@ def test_large_batch():
     dtype, top_k, N, batch_size = torch.bfloat16, 1024, 65536, 128
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=9)
 
-    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx)
     torch.cuda.synchronize()
 
     _check_correct(indices, logits, seq_lens, top_k)
@@ -294,9 +294,9 @@ def test_repeated_calls():
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=3)
     pre_idx_arg = pre_idx if _IS_BLACKWELL else None
 
-    idx1 = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    idx1, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
-    idx2 = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
+    idx2, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
 
     for row in range(batch_size):
@@ -316,7 +316,7 @@ def test_no_pre_idx_fallback():
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=77)
 
-    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=None)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=None)
     torch.cuda.synchronize()
 
     assert indices.shape == (batch_size, top_k)
@@ -324,20 +324,20 @@ def test_no_pre_idx_fallback():
 
 
 # ---------------------------------------------------------------------------
-# Radix-backend tests (run on any GPU, backend="radix" forced explicitly)
+# Radix-backend tests (run on any GPU, backend="radix_cutlass" forced explicitly)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("top_k", [512, 1024])
-def test_radix_return_values(dtype, top_k):
-    """Radix backend: returned values must equal logits[row, indices]."""
+def test_radix_cutlass_return_values(dtype, top_k):
+    """radix_cutlass backend: returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=13)
 
     indices, values = flashinfer.top_k_varlen(
-        logits, seq_lens, top_k, pre_idx=None, return_values=True, backend="radix"
+        logits, seq_lens, top_k, pre_idx=None, return_values=True, backend="radix_cutlass"
     )
     torch.cuda.synchronize()
 
@@ -354,16 +354,16 @@ def test_radix_return_values(dtype, top_k):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("top_k", [512, 1024])
 @pytest.mark.parametrize("batch_size", [2, 16])
-def test_radix_next_n(dtype, top_k, batch_size):
-    """Radix backend: next_n=2 — two rows share one seq_len entry."""
+def test_radix_cutlass_next_n(dtype, top_k, batch_size):
+    """radix_cutlass backend: next_n=2 — two rows share one seq_len entry."""
     next_n, N = 2, 8192
     if N - next_n + 1 < top_k:
         pytest.skip("N_eff < top_k")
     num_rows = batch_size * next_n
     logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=7, next_n=next_n)
 
-    indices = flashinfer.top_k_varlen(
-        logits, seq_lens, top_k, pre_idx=None, next_n=next_n, backend="radix"
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=None, next_n=next_n, backend="radix_cutlass"
     )
     torch.cuda.synchronize()
 
@@ -373,20 +373,20 @@ def test_radix_next_n(dtype, top_k, batch_size):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("top_k", [512, 1024])
-def test_radix_compress_ratio(dtype, top_k):
-    """Radix backend: compress_ratio=4 — seq_lens in uncompressed-token space."""
+def test_radix_cutlass_compress_ratio(dtype, top_k):
+    """radix_cutlass backend: compress_ratio=4 — seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
     logits, _, seq_lens = _make_inputs(
         batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
     )
 
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
         pre_idx=None,
         compress_ratio=compress_ratio,
-        backend="radix",
+        backend="radix_cutlass",
     )
     torch.cuda.synchronize()
 
@@ -394,8 +394,8 @@ def test_radix_compress_ratio(dtype, top_k):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-def test_radix_preallocated_outputs():
-    """Radix backend: out_indices and out_values are written in-place."""
+def test_radix_cutlass_preallocated_outputs():
+    """radix_cutlass backend: out_indices and out_values are written in-place."""
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=11)
     out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
@@ -409,7 +409,7 @@ def test_radix_preallocated_outputs():
         out_indices=out_i,
         return_values=True,
         out_values=out_v,
-        backend="radix",
+        backend="radix_cutlass",
     )
     torch.cuda.synchronize()
 
@@ -466,7 +466,7 @@ def test_load_balance_modes(load_balance):
     """load_balance=True/False both produce correct GVR top-K on a ragged batch."""
     top_k = 512
     logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
@@ -509,12 +509,12 @@ def test_gvr_row_width_alignment(dtype, align):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-def test_radix_row_width_no_alignment_constraint():
-    """Radix backend accepts any N (no vectorized-load alignment requirement)."""
+def test_radix_cutlass_row_width_no_alignment_constraint():
+    """radix_cutlass backend accepts any N (no vectorized-load alignment requirement)."""
     top_k, batch_size, N_bad = 512, 4, 4097
     logits = torch.randn(batch_size, N_bad, dtype=torch.bfloat16, device="cuda")
     seq_lens = torch.full((batch_size,), N_bad, dtype=torch.int32, device="cuda")
-    indices = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix_cutlass")
     torch.cuda.synchronize()
     assert indices.shape == (batch_size, top_k)
 
@@ -564,7 +564,7 @@ def test_lb_256bit_misaligned_no_crash():
         pre_idx[r, 0] = int(lf[r, : int(seq_lens[r])].argmax().item())
     pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
 
-    indices = flashinfer.top_k_varlen(
+    indices, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=True
     )
     torch.cuda.synchronize()  # would surface a misaligned-address fault
