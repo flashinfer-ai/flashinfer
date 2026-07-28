@@ -757,13 +757,11 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "gemm"
-        / "trtllmGen_gemm_export"
-    )
+    # Per-module export-header root: the Blackwell and Rubin variants must not
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
+    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
@@ -781,6 +779,7 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
@@ -947,13 +946,11 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "gemm"
-        / "trtllmGen_gemm_export"
-    )
+    # Per-module export-header root: the Blackwell and Rubin variants must not
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
+    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
@@ -971,6 +968,7 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
