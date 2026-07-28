@@ -243,16 +243,28 @@ def gen_cutlass_fused_moe_module(
     )
 
 
-def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
-    include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
+    bmm_path = (
+        ArtifactPath.TRTLLM_GEN_BMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_BMM
+    )
+    bmm_checksum = (
+        CheckSumHash.TRTLLM_GEN_BMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_BMM
+    )
+    module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{bmm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
+    checksum_path = f"{bmm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, bmm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -286,7 +298,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     )
 
     return gen_jit_spec(
-        "fused_moe_trtllm_sm100",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
@@ -311,13 +323,13 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
-            "-DTLLM_RUBIN_FEATURES",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[

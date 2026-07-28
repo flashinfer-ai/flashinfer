@@ -7102,9 +7102,15 @@ def gemm_fp8_nt_groupwise(
     return out
 
 
-@functools.cache
 def get_trtllm_gemm_module():
-    mod = gen_trtllm_gen_gemm_module()
+    device = torch.device("cuda", torch.cuda.current_device())
+    enable_rubin = get_compute_capability(device) == (10, 7)
+    return _get_trtllm_gemm_module_impl(enable_rubin)
+
+
+@functools.cache
+def _get_trtllm_gemm_module_impl(enable_rubin: bool):
+    mod = gen_trtllm_gen_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 

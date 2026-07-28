@@ -717,16 +717,28 @@ def gen_gemm_sm120_module() -> JitSpec:
     )
 
 
-def gen_trtllm_gen_gemm_module() -> JitSpec:
+def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
-    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    gemm_path = (
+        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_GEMM
+    )
+    gemm_checksum = (
+        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_GEMM
+    )
+    module_name = "trtllm_gemm_sm107" if enable_rubin else "trtllm_gemm"
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{gemm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum_path = f"{gemm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, gemm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -756,16 +768,16 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
-        "trtllm_gemm",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_gemm_runner.cu",
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
-            "-DTLLM_RUBIN_FEATURES",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
@@ -896,13 +908,27 @@ def gen_gemm_sm90_module() -> JitSpec:
     )
 
 
-def gen_trtllm_low_latency_gemm_module() -> JitSpec:
-    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
+    gemm_path = (
+        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_GEMM
+    )
+    gemm_checksum = (
+        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_GEMM
+    )
+    module_name = (
+        "trtllm_low_latency_gemm_sm107" if enable_rubin else "trtllm_low_latency_gemm"
+    )
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{gemm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum_path = f"{gemm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, gemm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -932,16 +958,16 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
-        "trtllm_low_latency_gemm",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_low_latency_gemm_runner.cu",
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
-            "-DTLLM_RUBIN_FEATURES",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
