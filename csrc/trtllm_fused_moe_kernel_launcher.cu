@@ -532,11 +532,13 @@ class FusedMoeLauncher {
         args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None;
     bool constexpr usePerChannelScalingGemm1 = false;
     bool constexpr usePerChannelScalingGemm2 = false;
+    auto const dtypeGemm1Output = this->mDtypeGemm1Output.value_or(this->mDtypeAct);
 
     // A Runner contains only constructor-derived kernel metadata and config indices. Reuse it on
     // the same host thread instead of rebuilding and filtering the global config table per call.
     std::tuple const runnerKey{static_cast<int64_t>(this->mDtypeAct),
                                static_cast<int64_t>(this->mDtypeWeights),
+                               static_cast<int64_t>(dtypeGemm1Output),
                                args->mUseDeepSeekFp8,
                                static_cast<int32_t>(tile_tokens_dim),
                                static_cast<int64_t>(this->activation_type),
@@ -566,13 +568,12 @@ class FusedMoeLauncher {
                 .first;
       } else {
         runnerIt = runnerCache
-                       .try_emplace(runnerKey, this->mDtypeAct, this->mDtypeWeights,
-                                    this->mDtypeGemm1Output.value_or(this->mDtypeAct),
-                                    args->mUseDeepSeekFp8, static_cast<int32_t>(tile_tokens_dim),
-                                    this->activation_type, this->use_shuffled_weight,
-                                    this->weight_layout, args->gemm1_bias_type,
-                                    usePerTokenScalingGemm1, usePerTokenScalingGemm2,
-                                    usePerChannelScalingGemm1, usePerChannelScalingGemm2)
+                       .try_emplace(
+                           runnerKey, this->mDtypeAct, this->mDtypeWeights, dtypeGemm1Output,
+                           args->mUseDeepSeekFp8, static_cast<int32_t>(tile_tokens_dim),
+                           this->activation_type, this->use_shuffled_weight, this->weight_layout,
+                           args->gemm1_bias_type, usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+                           usePerChannelScalingGemm1, usePerChannelScalingGemm2)
                        .first;
       }
     }
