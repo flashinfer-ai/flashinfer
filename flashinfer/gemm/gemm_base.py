@@ -7476,7 +7476,7 @@ def group_gemm_fp8_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
@@ -7721,7 +7721,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2. 2 is not supported on SM120/121.
@@ -7975,7 +7975,7 @@ def group_gemm_nvfp4_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     alpha: Optional[torch.Tensor] = None, # (batch_size, )
         The alpha tensor, shape ``(batch_size, )``, data type is ``torch.float32``.
