@@ -44,8 +44,13 @@ from modeling import FlashInferLLM
 # example's own BF16 logits, not against transformers, so the bf16-vs-eager
 # noise floor does not enter. A plumbing bug (transposed descale, re-swizzled
 # scale blob) lands at cos~0 / rel_l2~1.4, which is what these must separate
-# from honest low-precision error. Re-baseline from hardware before trusting.
-QUANT_GATES = {"fp8": (0.10, 0.99), "nvfp4": (0.45, 0.90)}
+# from honest low-precision error.
+#
+# Baselined on B200 (sm100a, flashinfer 0.6.16rc3) against the tiny dense
+# fixture: fp8 rel_l2 0.074-0.081 / cos 0.9967-0.9972; nvfp4 rel_l2
+# 0.281-0.346 / cos 0.940-0.960. The bounds below carry ~2x headroom over
+# those, since a deeper or worse-conditioned model accumulates more error.
+QUANT_GATES = {"fp8": (0.20, 0.99), "nvfp4": (0.60, 0.90)}
 
 # Tiny but kernel-legal shapes: head_dim 64/128 for attention; hidden and
 # (moe_)intermediate must be multiples of 8 for the BF16 cutlass MoE path.

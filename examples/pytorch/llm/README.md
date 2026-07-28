@@ -123,6 +123,43 @@ after an `autotune(True)` warmup pass. The JSON output is the intended input
 for future performance gates. Host-side timings — for trend and gating, not
 kernel benchmarking.
 
+## Quantized linear (FP8 / NVFP4)
+
+```bash
+python generate.py --model-id Qwen/Qwen3-0.6B --quant fp8
+python reference_check.py --arch dense --quant all     # numerics gate
+python health_check.py --model-id Qwen/Qwen3-0.6B --quant nvfp4 --autotune
+```
+
+| mode | what | FlashInfer API |
+|------|------|----------------|
+| `bf16` | default, and the numerical reference | `torch.nn.functional.linear` |
+| `fp8` | W8A8 per-tensor e4m3 | `bmm_fp8` |
+| `nvfp4` | W4A4 block-16 e2m1 + e4m3 block scales | `nvfp4_quantize` + `mm_fp4` |
+
+Weights are quantized **on the fly** at load time from a plain BF16
+checkpoint — no pre-quantized weights needed — and activations are quantized
+per forward. Only the dense projections (q/k/v/o, gate/up/down) are
+quantized: the MoE router stays in model dtype (top-k is discrete, so a
+perturbation flips experts), `lm_head` is the same tensor as the embedding
+table under `tie_word_embeddings`, and the MoE expert GEMMs still pass
+`quant_scales=None`.
+
+**Expect quality loss, especially with `nvfp4`.** This is dynamic per-tensor
+scaling with no calibration, SmoothQuant, or rotation — the point is to
+exercise the kernels end to end, not to ship a good quantized model. On
+Qwen3-0.6B, FP8 output is close to BF16 while NVFP4 stays fluent but drifts
+factually. Nothing gates on generated text.
+
+**Expect lower tok/s too.** Each linear adds an amax reduction and a
+quantize kernel, which at verification-scale shapes dominates the GEMM
+saving. That is launch overhead, not a kernel regression.
+
+`--quant-backend` pins the GEMM backend; by default `auto` resolves
+version-dependently (on B200/CUDA 13 we measured `cutlass_sm10x` for FP8 and
+`cudnn` for NVFP4), and the resolved choice is printed as
+`[smoke] quant_resolved_backends` so it is never silent.
+
 ## Requirements
 
 `flashinfer`, `torch`, and — for checkpoint/tokenizer handling only —
