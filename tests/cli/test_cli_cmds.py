@@ -519,6 +519,43 @@ def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):
     )
 
 
+def test_download_kernels_cmd_attempts_jit_cache_after_cubin_failure(monkeypatch):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    recorded = []
+
+    def mock_run(cmd, check=False):
+        recorded.append((cmd, check))
+
+        class Result:
+            returncode = 1 if cmd[-1].startswith("flashinfer-cubin==") else 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["download-kernels", "--cuda-version", "12.9", "--flashinfer-version", "0.4.1"],
+    )
+
+    assert result.exit_code != 0
+    _assert_output_contains_all(
+        result.output,
+        "flashinfer-cubin install failed: pip install failed with exit code 1.",
+        "=== JIT Cache Wheel Install ===",
+        "flashinfer-jit-cache==0.4.1+cu129",
+        "flashinfer-jit-cache installed successfully",
+        "One or more kernel wheel installs failed:",
+    )
+    assert len(recorded) == 2
+    assert recorded[0][0][-1] == "flashinfer-cubin==0.4.1"
+    assert recorded[1][0][-1] == "flashinfer-jit-cache==0.4.1+cu129"
+
+
 class MockJitSpec:
     """Mock JitSpec for testing export-compile-commands."""
 

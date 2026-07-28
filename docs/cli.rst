@@ -161,6 +161,8 @@ environment. This combines ``install-cubin-wheel`` and
 
 ``flashinfer-cubin`` is installed from the flat FlashInfer wheel index, while
 ``flashinfer-jit-cache`` is installed from the CUDA-specific wheel index.
+If one wheel install fails, the command still attempts the other install and
+reports any failures at the end.
 
 Cache Management
 ----------------
