@@ -22,8 +22,10 @@ logic is unit-tested against an injected fake mpi4py communicator.
 import importlib.util
 import multiprocessing as mp
 import os
+import queue
 import shutil
 import tempfile
+import time
 from typing import Any
 
 import pytest
@@ -63,6 +65,9 @@ def _backend_checks(rank: int) -> dict[str, Any]:
     res["sub_type"] = type(sub).__name__
     res["sub_rank"] = sub.Get_rank()
     res["sub_size"] = sub.Get_size()
+    # Collectives must work on the sub-group, not just report the right shape.
+    sub.barrier()
+    res["sub_allgather"] = sub.allgather(rank)
     return res
 
 
@@ -96,14 +101,28 @@ def _run_dist(world_size: int) -> dict[int, dict[str, Any]]:
     try:
         for p in procs:
             p.start()
+        # Drain the queue *before* join: a worker blocks on exit until its queue
+        # feeder thread has flushed, so join-then-read can deadlock. q.empty() is
+        # also unreliable, hence counting results instead of polling it.
+        results: dict[int, dict[str, Any]] = {}
+        deadline = time.monotonic() + _TIMEOUT_S
+        while len(results) < world_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                rank, res = q.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                # Nothing more is coming once every worker is gone; fall through
+                # to the exitcode assert below, which gives the better message.
+                if all(p.exitcode is not None for p in procs):
+                    break
+                continue
+            results[rank] = res
         for p in procs:
-            p.join(timeout=_TIMEOUT_S)
+            p.join(timeout=max(0.0, deadline - time.monotonic()))
         for p in procs:
             assert p.exitcode == 0, f"worker pid={p.pid} exited with {p.exitcode}"
-        results: dict[int, dict[str, Any]] = {}
-        while not q.empty():
-            rank, res = q.get()
-            results[rank] = res
         assert len(results) == world_size, (
             f"expected {world_size} results, got {sorted(results)}"
         )
@@ -137,6 +156,8 @@ def test_torch_dist_backend_collectives(world_size: int) -> None:
         assert res["sub_type"] == "TorchDistBackend"
         assert res["sub_size"] == len(peers)
         assert res["sub_rank"] == peers.index(rank)
+        # Collectives on the sub-group see only the same-parity ranks.
+        assert res["sub_allgather"] == tuple(peers)
 
 
 class _FakeGroup:
@@ -154,6 +175,7 @@ class _FakeDist:
         self._world = world_size
         self._all_info = all_info
         self.created: list[tuple[int, ...]] = []  # sub-groups created, in order
+        self.barriers: list[Any] = []  # groups barriered on, in order
 
     def get_rank(self, group: Any = None) -> int:
         return self._rank if group is None else group.ranks.index(self._rank)
@@ -177,6 +199,9 @@ class _FakeDist:
         self.created.extend(g.ranks for g in subs)
         cur = next((g for g in subs if self._rank in g.ranks), None)
         return cur, subs
+
+    def barrier(self, group: Any = None) -> None:
+        self.barriers.append(group)
 
     def new_group(self, ranks: list[int]) -> Any:
         # Unused by the fixed Split, but recorded so a regression to the buggy
@@ -222,6 +247,10 @@ def test_torch_dist_backend_split_creates_every_subgroup_on_every_rank(
         assert fake.created == expected, f"rank {rank}: {fake.created}"
         # ...and gets back a backend scoped to its own color's sub-group.
         assert sub._group.ranks == expected[rank % 2]  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+        # Split must synchronize on the *parent* group before returning, or a
+        # rank can race ahead and tear down while a peer is still inside the
+        # sub-group rendezvous (gloo then fails connectFullMesh -- see #4193).
+        assert fake.barriers == [None], f"rank {rank}: {fake.barriers}"
 
 
 def test_split_partition_covers_all_colors_ordered_by_key() -> None:
