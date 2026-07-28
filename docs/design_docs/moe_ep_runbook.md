@@ -300,3 +300,183 @@ layer.destroy()
 The raw megakernel config must be wrapped in `MegaConfig` — `MoEEpLayer` routes
 `MegaConfig` → `MoEEpMegaLayer` → `create_mega_kernel(cfg)`, which looks up
 `cfg.kernel_name` in `_MEGA_KERNEL_REGISTRY`.
+
+## Fault tolerance
+
+Enable with `FleetAlgoKnobFaultTolerance()` in `fleet_knobs`. Check support
+first — it needs more than the backend being built:
+
+```python
+from flashinfer.moe_ep import supports_fault_tolerance
+supports_fault_tolerance("nccl_ep")   # needs nccl4py with GroupConfig.enable_mask
+                                      # AND a libnccl_ep exporting ncclEpMask*
+supports_fault_tolerance("nixl_ep")   # true whenever the backend is staged
+```
+
+If `nccl_ep` returns False, upgrade the nccl4py wheel that ships
+`libnccl_ep.so` and confirm it is the one actually loaded
+(`python -m nccl show_versions`). The probe never raises, and the Fleet
+constructor fails with the same diagnosis rather than waiting for a real fault.
+
+### Recovery state machine
+
+```
+HEALTHY ──query_fault()──> FAULT_DETECTED      (local; quiesce in-flight combine/complete)
+   ──reconcile_active_mask()──> RECONCILING     (store-collective, tolerates dead ranks)
+   ──clear_faults(readmit=False)──> DEGRADED    (serving continues; dead ranks' tokens dropped)
+
+DEGRADED ──peer came back──> clear_faults(readmit=True)    [COLLECTIVE, blocking] ──> HEALTHY
+DEGRADED ──peer gone for good──> update_topology(...)      [COLLECTIVE, blocking] ──> HEALTHY
+```
+
+### Ordering rules (all load-bearing)
+
+0. **The steady state is read-only.** The transport discovers the fault: its
+   kernel times out on the peer and masks it. The application's job is to
+   *notice* — `query_fault()`, then `query_active_mask()`. `set_active_mask()`
+   is **not** a normal-path call; it exists so that reconciliation can impose an
+   agreed vector once survivors have compared views, and most callers should
+   only reach it indirectly through `reconcile_active_mask()`.
+
+1. **If you do write the mask, write it only between iterations.** Both
+   transports read it *live* from the dispatch/combine kernels, so changing it
+   while a collective is in flight is a race that can produce a half-masked
+   dispatch. Retire the iteration's `combine` (and `Handle.complete()` under
+   `HandleAlgoKnobSplitOperation`) first.
+
+2. **All survivors must reconcile in the same iteration slot** — they must pass
+   the same `active_mask_epoch`. Make the host's fault poll a synchronous
+   decision point.
+
+3. **`clear_faults(readmit=True)` and `update_topology()` are alternatives, not
+   a sequence.**
+
+   * `clear_faults(readmit=True)` runs `ncclEpMaskClean` on the *same*
+     communicator: it re-admits a rank that was merely delayed.
+   * `update_topology()` destroys the group and builds a **new communicator**
+     (a fresh `ncclComm_t`, unless you adopted one via
+     `BootstrapConfig.nccl_comm`). That is the only way to add or replace a
+     process — matching `nccl_ep.h`, which notes that rank replacement needs
+     `ncclCommGrow` and a new EP group.
+
+   Re-admitting after a rebuild is meaningless (the group it targeted is gone)
+   and before one is wasted work. If you genuinely do both, `MaskClean` must
+   come first, since it needs a live handle on the *current* group.
+
+4. **No FT call may be issued during CUDA-graph capture** — but not for the
+   reason you might expect. Neither transport compacts the surviving ranks'
+   data layout, so **dispatch and combine are safe to capture**: they re-read
+   the mask on every replay, and a rank that fails later is still skipped.
+   Data from a masked rank is simply left in an unknown state with the error
+   flag raised.
+
+   What must not be captured is a *decision about* the fault state:
+
+   * `query_fault()` is a host-side read, not stream work, so it cannot be
+     captured at all. Inside a capture region it returns the capture-time
+     answer, and the branch taken on it is frozen into the graph's structure —
+     a graph that ignores faults forever because none had happened when it was
+     recorded. This is the quietest failure of the three, which is why it is
+     guarded even though it touches no stream.
+   * `set_active_mask()` bakes the rank and value into the captured operation,
+     so every replay re-applies that one mask.
+   * `query_active_mask()` can only be consumed on the host, which needs a sync
+     that capture forbids.
+
+   All four raise on capture with a per-operation explanation. Call them from
+   the host between replays.
+
+### Backend asymmetries worth knowing
+
+* **`nixl_ep` cannot evict a rank from the middle.** `disconnect_ranks`
+  requires the removed ranks to form a *suffix*, so masked-and-degraded is the
+  terminal state for a mid-list failure; only a highest-numbered failure can be
+  shrunk away with `update_topology`.
+* **`nccl_ep` re-admission under `EXPERT_MAJOR` warns.** `ncclEpMaskClean`
+  computes its buffer-reset offsets assuming `RANK_MAJOR`, so re-admission may
+  leave stale bytes in the LL staging buffer. Prefer degraded serving or a full
+  `update_topology` rebuild there. (Degraded serving itself is sound under
+  `EXPERT_MAJOR`.)
+* **Growing past the topology capacity is rejected.** Every per-rank array is
+  sized to the capacity at construction; pass
+  `FleetAlgoKnobTopologyCapacity(n=<max ranks>)` up front.
+
+### Dropped tokens — no renormalization
+
+A masked rank's experts contribute nothing and combine does **not** renormalize
+`topk_weights`. An affected token therefore comes out scaled by the surviving
+weight fraction:
+
+```
+y_degraded[t] = y_healthy[t] * sum(topk_weights[t][k] for k where the owning rank is alive)
+```
+
+This is deliberate. Renormalizing implicitly would add an unconditional kernel
+to every forward for a case that is almost never active, hide a serving-quality
+event the operator must see, and divide by zero for a token whose entire top-k
+landed on dead ranks.
+
+**FlashInfer does not re-home the dead rank's experts either.** That is an
+EPLB-style job and belongs to the framework: re-route the routing map away from
+the failed rank, leave the rank masked, and keep serving on a partial mask —
+no `update_topology()` and no new communicator required. The sequence is
+
+```
+query_fault() → reconcile_active_mask() → clear_faults(readmit=False) → keep going
+```
+
+where `clear_faults(readmit=False)` is purely "re-arm fault detection"
+(`ncclEpErrorClear`); it does not touch the mask. FlashInfer's contribution is
+to surface an agreed mask and the formula below; what you do with the routing is
+yours.
+
+To preserve magnitude yourself:
+
+```python
+alive = fleet.query_active_mask()                       # [world], 1 = active
+owner = torch.arange(num_experts, device=d) // (num_experts // world_size)
+ok = (topk_ids >= 0) & alive[owner[topk_ids.clamp_min(0)]].bool()
+surviving_w = (topk_weights * ok).sum(-1)               # [num_tokens]
+out.div_(surviving_w.clamp_min(1e-6).unsqueeze(-1))     # or drop requests below a threshold
+```
+
+### Being evicted
+
+`reconcile_active_mask()` raises `MoEEpRankEvictedError` when the survivors
+agreed *this* rank is dead — it stalled long enough for their kernels to give
+up on it. It cannot apply that decision (a rank may not mask itself) and must
+not keep serving (its peers stopped sending it tokens). Tear the worker down,
+or rejoin through a fresh Fleet after the survivors call
+`clear_faults(readmit=True)`.
+
+### Running the FT tests
+
+```bash
+bash tests/moe_ep/run_tests.sh ft          # both backends, gated on support
+```
+
+Or directly (needs ≥4 GPUs):
+
+```bash
+# stalled-rank pytest half — every process survives
+torchrun --nproc_per_node=4 -m pytest \
+  tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py -v \
+  -m "nvep and gpu_4" --backend=nccl_ep      # then --backend=nixl_ep
+
+# hard-kill half — a rank really dies, so judge by SMOKE_RESULT count, not exit code
+torchrun --nproc_per_node=4 --max-restarts=0 \
+  tests/moe_ep/smoke_ft_ep.py --backend nixl_ep
+```
+
+The kill half is a script rather than a pytest test on purpose: torchrun
+reports the victim's non-zero exit, which would fail the survivors' pytest
+session even when they behaved correctly. `run_tests.sh ft` counts
+`SMOKE_RESULT:` lines (expects `nproc - 1`) and is **not** part of `run_all`.
+
+The host-only protocol tests need no GPU at all:
+
+```bash
+pytest tests/moe_ep/test_fault_tolerance_reconcile.py \
+       tests/moe_ep/test_fault_tolerance_api.py \
+       tests/moe_ep/nccl_ep/test_mask_ffi.py -q
+```

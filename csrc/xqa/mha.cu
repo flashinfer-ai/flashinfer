@@ -2531,6 +2531,11 @@ CUBIN_EXPORT __global__
             idxCurrSMemVBuf++;
           }
         }  // idxBeam
+#if __CUDA_ARCH__ == 1210
+        // GB10 (sm121): release prior reads of smem.x before signaling the buffer
+        // is consumed, so the gemm0 producer does not overwrite it too early.
+        __threadfence_block();
+#endif
         xBar.consumed.arrive();
       }  // xIter
       flip(xBarProducedParityNext);
@@ -2619,6 +2624,9 @@ CUBIN_EXPORT __global__
     bool reorderOutRows = inputElemSize == 2 && cacheElemSize == 1;
 #endif
     SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
+    // In multi-block mode only the last CTA writes the merged output; the other
+    // sub-sequences only contribute their partials via global scratch below.
+    bool ctaShouldWriteOut = !isMultiBlock;
     if (isMultiBlock) {
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
@@ -2653,6 +2661,12 @@ CUBIN_EXPORT __global__
       copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
           warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
       __syncthreads();
+#if __CUDA_ARCH__ == 1210
+      // GB10 (sm121): device-scope release so the partials just written to global
+      // scratch are visible to the last CTA (a different block) before the
+      // semaphore increment below signals that this sub-sequence is done.
+      __threadfence();
+#endif
       constexpr uint32_t nbTileBuffers = 2;
 
       struct MultiBlockSMem {
@@ -2686,6 +2700,7 @@ CUBIN_EXPORT __global__
 
       // merge if we are the last CTA.
       bool const isLastCta = mbsmem.isLastCta;
+      ctaShouldWriteOut = isLastCta;
       if (isLastCta) {
         MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
         SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
@@ -2774,7 +2789,7 @@ CUBIN_EXPORT __global__
         smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
       }
     }
-    if (warpGrpIdx == 0) {
+    if (ctaShouldWriteOut && warpGrpIdx == 0) {
 #if SPEC_DEC
       copyOutputToGlobalMem(
           warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize, (idxHeadGrp * headGrpSize),
