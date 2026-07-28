@@ -344,9 +344,8 @@ class TrtllmFp4RoutedRunner(MoERunner):
         if variant in self.supported_quant_variants:
             from ..utils import get_compute_capability
 
-            # TODO: Route NVFP4 on SM120/SM121 to B12x once default dispatch can
-            # materialize the required b12x weight view. Until then, fail here
-            # instead of admitting TRTLLM sm100f kernels that crash at launch.
+            # Direct-runner guard: NVFP4/MXFP4 support SM100/SM103. W4A16
+            # remains SM100-only, matching the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
             supported = (
                 compute_capability in ((10, 0), (10, 3))

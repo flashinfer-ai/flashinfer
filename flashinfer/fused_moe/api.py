@@ -52,12 +52,7 @@ from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 
 class QuantVariant(Enum):
-    """Logical quantization variant.
-
-    Physical packing remains backend-specific. In particular, ``W4A16`` means
-    4-bit weights with BF16 activations; callers must prepare weights with the
-    selected backend config because TRTLLM and b12x use incompatible layouts.
-    """
+    """Quantization variant — single knob for dtype + granularity + scale convention."""
 
     BF16 = 0
     FP8PerTensor = 1
@@ -235,8 +230,8 @@ class TrtllmFp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM107 support from #4122 was reverted by #4171. SM12x uses the
-        # separate b12x configs/runners.
+        # Current TRTLLM FP4 cubins are supported only on SM100/SM103.
+        # SM107 support from #4122 was reverted by #4171.
         return arch in (100, 103)
 
     @staticmethod

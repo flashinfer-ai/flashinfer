@@ -1539,8 +1539,8 @@ def test_unified_moe_fuzz(cfg):
             intermediate_size=cfg.intermediate,
             device=dev,
         )
-        # Shared configs need the logical variant to select native dtypes and
-        # scale/layout preparation.
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = handler.variant
         elif BackendCfg is TrtllmFp8PerTensorConfig:
@@ -1809,8 +1809,8 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # Shared configs need the logical variant to select native dtypes and
-        # scale/layout preparation.
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = variant
         weight_pack.prepare_for(
