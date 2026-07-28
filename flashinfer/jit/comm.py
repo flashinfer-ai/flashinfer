@@ -211,6 +211,15 @@ def gen_vllm_comm_module() -> JitSpec:
     )
 
 
+def gen_ulysses_a2a_module() -> JitSpec:
+    return gen_jit_spec(
+        "ulysses_a2a",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_all_to_all.cu",
+        ],
+    )
+
+
 def gen_moe_alltoall_module() -> JitSpec:
     return gen_jit_spec(
         "mnnvl_moe_alltoall",
