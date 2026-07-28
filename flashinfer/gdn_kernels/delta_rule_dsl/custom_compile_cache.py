@@ -2,12 +2,44 @@ import os
 import tempfile
 import warnings
 from collections.abc import Hashable
+from functools import lru_cache
 
 import cutlass.cute as cute
+import torch
 from cutlass.base_dsl.compiler import DumpDir
 
 
 _in_mem_compile_cache: dict = {}
+
+
+@lru_cache(maxsize=8)
+def _sm12x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
+    device = (
+        torch.device(device_type)
+        if device_index is None
+        else torch.device(device_type, device_index)
+    )
+    major, minor = torch.cuda.get_device_capability(device)
+    if major != 12:
+        raise RuntimeError(
+            f"sm12x_gpu_arch requires an SM12x device, got compute capability "
+            f"{major}.{minor}"
+        )
+    return cute.GPUArch(f"sm_{major}{minor}a")
+
+
+def sm12x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
+    """Return the on-device CuteDSL arch for SM12x (``sm_120a`` / ``sm_121a``)."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return _sm12x_gpu_arch_cached(d.type, d.index)
+
+
+def sm12x_compile_options(
+    device: str | torch.device = "cuda",
+) -> tuple[cute.GPUArch]:
+    return (sm12x_gpu_arch(device),)
 
 
 _TMA_CLUSTER_LOAD = (
@@ -83,8 +115,11 @@ def _has_option_value(options, option_type, option_value):
     return False
 
 
-def _needs_sm120a_ptx_check(options):
-    return _has_option_value(options, cute.GPUArch, "sm_120a")
+def _needs_sm12x_ptx_check(options):
+    # Arch-specific SM12x targets share the same cluster-TMA restriction.
+    return _has_option_value(options, cute.GPUArch, "sm_120a") or _has_option_value(
+        options, cute.GPUArch, "sm_121a"
+    )
 
 
 def _ptx_check_compile_options(options, dump_dir):
@@ -111,13 +146,13 @@ def _read_ptx_text(ptx_artifact):
     return ptx_artifact
 
 
-def _sm120a_ptx_check(compiled_fn):
+def _sm12x_ptx_check(compiled_fn):
     ptx = _read_ptx_text(getattr(compiled_fn, "__ptx__", None))
     if not ptx:
-        raise RuntimeError("Unable to inspect generated PTX for the SM120 GDN kernel")
+        raise RuntimeError("Unable to inspect generated PTX for the SM12x GDN kernel")
     if _TMA_CLUSTER_LOAD in ptx:
         raise RuntimeError(
-            "SM120 GDN kernel compilation produced unsupported cluster-scoped TMA loads. "
+            "SM12x GDN kernel compilation produced unsupported cluster-scoped TMA loads. "
             "Install the CUDA 13 CUTLASS DSL compiler with "
             "`pip install --upgrade --force-reinstall 'nvidia-cutlass-dsl[cu13]'`. "
             "See https://github.com/NVIDIA/cutlass/issues/3170."
@@ -129,14 +164,14 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
     compiled_fn = _in_mem_compile_cache.get(cache_key)
 
     if compiled_fn is None:
-        _needs_ptx_check = _needs_sm120a_ptx_check(compile_options)
+        _needs_ptx_check = _needs_sm12x_ptx_check(compile_options)
         if not _needs_ptx_check:
             compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
         else:
             with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
                 compile_options = _ptx_check_compile_options(compile_options, tempdir)
                 compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
-                _sm120a_ptx_check(compiled_fn)
+                _sm12x_ptx_check(compiled_fn)
 
         _in_mem_compile_cache[cache_key] = compiled_fn
 

@@ -337,7 +337,11 @@ def test_dispatch_fp8_surfaces_scales(patched_loader, fake_buffer_cls):
     fake_buffer_cls.instances.clear()
 
 
-def test_user_stream_knob_redirects_dispatch(patched_loader, fake_buffer_cls):
+def test_user_stream_knob_accepted_but_not_redirected(patched_loader, fake_buffer_cls):
+    """The user-stream knob is accepted without error but must NOT wrap the
+    Buffer calls in a foreign stream context: doing so breaks NIXL's async
+    RDMA completion and deadlocks combine. NIXL runs on the current stream.
+    """
     import torch
 
     _skip_unless_ep_capable()
@@ -354,15 +358,19 @@ def test_user_stream_knob_redirects_dispatch(patched_loader, fake_buffer_cls):
     fleet = _make_fleet(create_fleet, BootstrapConfig, FleetParams)
     topk = torch.zeros(64, 4, dtype=torch.int64, device="cuda")
     side_stream = torch.cuda.Stream()
+    # Passing the knob must not raise and must not switch the active stream.
     h = fleet.create_handle(
         HandleParams(topk_ids=topk),
         algo_knobs=[HandleAlgoKnobUserStream(stream=side_stream.cuda_stream)],
     )
     x = torch.randn(64, 4096, dtype=torch.bfloat16, device="cuda")
+    default_stream = torch.cuda.current_stream().cuda_stream
     _ = h.dispatch(DispatchInputParams(x=[x]))
 
     disp = next(c for c in fake_buffer_cls.instances[-1].calls if c[0] == "dispatch")
-    assert disp[3]["stream"] == side_stream.cuda_stream
+    # The Buffer saw the CURRENT stream, not the side stream from the knob.
+    assert disp[3]["stream"] == default_stream
+    assert disp[3]["stream"] != side_stream.cuda_stream
 
     fake_buffer_cls.instances.clear()
 
