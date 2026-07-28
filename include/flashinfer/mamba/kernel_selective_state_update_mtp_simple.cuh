@@ -252,13 +252,15 @@ __device__ __forceinline__ void load_simple(SramT& sram, int lane, int warp,
                                   step * params.dst_state_batch_indices_stride_T]);
       sram.state_dst_slots[step] = (dst_idx == params.pad_slot_id) ? SKIP : dst_idx;
     } else if (params.intermediate_states) {
-      // MTP cache: consecutive step slots within the icache entry
+      // MTP cache: consecutive step slots within the icache entry. Use the
+      // tensor's actual step capacity rather than cache_steps, since callers
+      // may allocate extra step capacity.
       auto const* __restrict__ intermediate_state_indices =
           reinterpret_cast<stateIndex_t const*>(params.intermediate_state_indices);
       auto const icache_idx = intermediate_state_indices
                                   ? static_cast<int64_t>(intermediate_state_indices[seq_idx])
                                   : state_batch;
-      sram.state_dst_slots[step] = icache_idx * params.cache_steps + step;
+      sram.state_dst_slots[step] = icache_idx * params.intermediate_state_steps + step;
     } else {
       // Final-state only: write at last step
       sram.state_dst_slots[step] =
@@ -333,8 +335,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
 
   // Unified state write path: pick destination pointer and stride based on mode.
   // The per-step slot indices are precomputed in sram.state_dst_slots[].
-  // For istate: dst_slot = icache_idx * cache_steps + step, so the flat slot
-  // index works with both state stride (nheads*DIM*DSTATE) and scale stride (nheads*DIM).
+  // For istate, dst_slot uses the buffer's actual step capacity, so the flat
+  // slot index works with both state stride (nheads*DIM*DSTATE) and scale
+  // stride (nheads*DIM).
   auto* __restrict__ write_state_ptr = state_ptr;
   int64_t write_state_stride = params.state_stride_batch;
   [[maybe_unused]] auto* __restrict__ write_scale_ptr =
@@ -491,6 +494,8 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       // Unified state write: use precomputed slot index from sram
       {
         if (dst_slot != simple_horiz::SKIP_WRITE_STATE) {
+          bool const write_main_state =
+              params.intermediate_states && params.update_state && step == seq_len - 1;
           [[maybe_unused]] float encode_scale = 1.f;
           if constexpr (scaleState) {
             encode_scale =
@@ -518,11 +523,20 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
                   e, rand_ints);
             }
             *reinterpret_cast<packed_tile_t*>(&write_state_ptr[dst_base + col0]) = rOut;
+            if (write_main_state) {
+              auto const main_base = state_ptr_offset + (int64_t)dd * DSTATE;
+              *reinterpret_cast<packed_tile_t*>(&state_ptr[main_base + col0]) = rOut;
+            }
           }
           // Write decode scale
           if constexpr (scaleState) {
             if (member == 0) {
-              write_scale_ptr[dst_slot * write_scale_stride + head * DIM + dd] = 1.f / encode_scale;
+              float const decode_scale = 1.f / encode_scale;
+              write_scale_ptr[dst_slot * write_scale_stride + head * DIM + dd] = decode_scale;
+              if (write_main_state) {
+                state_scale_ptr[state_batch * params.state_scale_stride_batch + head * DIM + dd] =
+                    decode_scale;
+              }
             }
           }
         }

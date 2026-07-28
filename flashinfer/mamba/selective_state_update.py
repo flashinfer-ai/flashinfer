@@ -179,12 +179,15 @@ def selective_state_update(
         If True, skip updating the state tensor (useful for speculative decoding verification)
     intermediate_states_buffer : Optional[torch.Tensor]
         Optional buffer for caching intermediate states during speculative decoding
-        with shape (batch, cache_steps, nheads, dim, dstate). Also listed in
-        ``mutates_args`` — the kernel writes intermediate states into it
-        in place.
+        with shape (cache_entries, buffer_steps, nheads, dim, dstate), where
+        ``buffer_steps >= cache_steps``. Also listed in ``mutates_args`` — the
+        kernel writes intermediate states into it in place.
     intermediate_state_indices : Optional[torch.Tensor]
         Optional indices mapping batch elements to intermediate state buffer positions
-        with shape (batch,)
+        with shape (batch,). Values must be in ``[0, cache_entries)``. When
+        omitted, ``state_batch_indices`` (or the batch position) indexes the
+        intermediate buffer directly, so that index space must fit in
+        ``cache_entries``.
     intermediate_state_scales : Optional[torch.Tensor]
         Optional per-block float32 scale tensor matching ``intermediate_states_buffer``.
         When provided alongside an int16 ``intermediate_states_buffer``, the kernel
@@ -215,9 +218,11 @@ def selective_state_update(
         Parent step for each token with shape (batch, T), used for tree
         speculative decoding. At step ``t > 0``, a non-negative value less
         than ``t`` restores the cached intermediate state from that step
-        before applying the recurrence. Requires ``intermediate_states_buffer``
-        and is supported by the "simple" algorithm; "auto" selects it
-        automatically.
+        before applying the recurrence; all other values leave the current
+        state unchanged. Its dtype must match any state or intermediate index
+        tensors. Requires ``intermediate_states_buffer``, ``cache_steps >= T``,
+        and ``intermediate_state_scales`` for scaled state. This is supported
+        by the "simple" algorithm; "auto" selects it automatically.
     algorithm : str
         Algorithm to use: "auto", "simple", "vertical", "horizontal"
 

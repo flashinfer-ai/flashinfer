@@ -501,6 +501,8 @@ void run_selective_state_update_mtp(
 
     auto const& istates = intermediate_states_buffer.value();
     CHECK_DIM(5, istates);
+    FLASHINFER_CHECK(istates.size(0) > 0,
+                     "intermediate_states_buffer must have at least one cache entry");
     FLASHINFER_CHECK(istates.size(1) >= cache_steps,
                      "intermediate_states_buffer.size(1) must be >= cache_steps");
     FLASHINFER_CHECK(istates.size(2) == nheads,
@@ -508,6 +510,13 @@ void run_selective_state_update_mtp(
     FLASHINFER_CHECK(istates.size(3) == dim, "intermediate_states_buffer.size(3) must equal dim");
     FLASHINFER_CHECK(istates.size(4) == dstate,
                      "intermediate_states_buffer.size(4) must equal dstate");
+    if (!intermediate_state_indices.has_value()) {
+      auto const required_cache_entries =
+          state_batch_indices.has_value() ? state_cache_size : batch;
+      FLASHINFER_CHECK(istates.size(0) >= required_cache_entries,
+                       "intermediate_states_buffer.size(0) must be >= ", required_cache_entries,
+                       " when intermediate_state_indices is not provided");
+    }
   }
 
   // Validate that index tensors have consistent dtypes
@@ -640,6 +649,7 @@ void run_selective_state_update_mtp(
   if (intermediate_states_buffer.has_value()) {
     p.intermediate_states = const_cast<void*>(intermediate_states_buffer.value().data_ptr());
     p.intermediate_state_stride_batch = intermediate_states_buffer.value().stride(0);
+    p.intermediate_state_steps = intermediate_states_buffer.value().size(1);
   }
 
   if (intermediate_state_indices.has_value()) {
@@ -650,13 +660,20 @@ void run_selective_state_update_mtp(
     auto const& iscales = intermediate_state_scales.value();
     CHECK_CUDA(iscales);
     CHECK_CONTIGUOUS(iscales);
-    CHECK_DIM(4, iscales);  // (batch, cache_steps, nheads, dim)
+    CHECK_DIM(4, iscales);  // (cache_entries, buffer_steps, nheads, dim)
     FLASHINFER_CHECK(iscales.dtype().code == kDLFloat && iscales.dtype().bits == 32,
                      "intermediate_state_scales must have dtype float32");
-    FLASHINFER_CHECK(iscales.size(0) == batch,
-                     "intermediate_state_scales.size(0) must equal batch");
-    FLASHINFER_CHECK(iscales.size(1) == cache_steps,
-                     "intermediate_state_scales.size(1) must equal cache_steps");
+    FLASHINFER_CHECK(intermediate_states_buffer.has_value(),
+                     "intermediate_states_buffer is required when "
+                     "intermediate_state_scales is provided");
+    auto const& istates = intermediate_states_buffer.value();
+    CHECK_DIM(5, istates);
+    FLASHINFER_CHECK(
+        iscales.size(0) == istates.size(0),
+        "intermediate_state_scales.size(0) must match intermediate_states_buffer.size(0)");
+    FLASHINFER_CHECK(
+        iscales.size(1) == istates.size(1),
+        "intermediate_state_scales.size(1) must match intermediate_states_buffer.size(1)");
     FLASHINFER_CHECK(iscales.size(2) == nheads,
                      "intermediate_state_scales.size(2) must equal nheads");
     FLASHINFER_CHECK(iscales.size(3) == dim, "intermediate_state_scales.size(3) must equal dim");
