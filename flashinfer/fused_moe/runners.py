@@ -349,9 +349,9 @@ class TrtllmFp4RoutedRunner(MoERunner):
             # instead of admitting TRTLLM sm100f kernels that crash at launch.
             compute_capability = get_compute_capability(self.device)
             supported = (
-                compute_capability in ((10, 0), (10, 3), (10, 7))
+                compute_capability in ((10, 0), (10, 3))
                 if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
-                else compute_capability in ((10, 0), (10, 7))
+                else compute_capability == (10, 0)
             )
             if not supported:
                 raise NotImplementedError(

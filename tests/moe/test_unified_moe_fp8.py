@@ -30,16 +30,18 @@ from flashinfer.quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_quantize,
 )
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
 
 def _is_trtllm_fp8_arch() -> bool:
-    return torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))
+    return torch.cuda.is_available() and get_compute_capability(
+        torch.device("cuda")
+    ) in ((10, 0), (10, 3))
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103/107"
+    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103"
 )
 
 HIDDEN = 256

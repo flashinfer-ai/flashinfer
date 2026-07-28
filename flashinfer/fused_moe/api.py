@@ -235,9 +235,9 @@ class TrtllmFp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM107 support comes from the TRTLLM sm107a cubins added in #4122.
-        # SM12x uses the separate b12x configs/runners.
-        return arch in (100, 103, 107)
+        # SM107 support from #4122 was reverted by #4171. SM12x uses the
+        # separate b12x configs/runners.
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
@@ -298,10 +298,10 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM107 support comes from the TRTLLM sm107a cubins added in #4122.
-        # The outer JIT can compile for major 12, but its FP8 kernels currently
-        # fail at runtime on SM120/121.
-        return arch in (100, 103, 107)
+        # SM107 support from #4122 was reverted by #4171. The outer JIT can
+        # compile for major 12, but its FP8 kernels currently fail at runtime
+        # on SM120/121.
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
@@ -351,7 +351,7 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107)
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
@@ -399,7 +399,7 @@ class TrtllmBf16Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107)
+        return arch in (100, 103)
 
     @staticmethod
     def prepare_weights(
