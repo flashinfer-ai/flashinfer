@@ -78,6 +78,7 @@ from .jit.gemm import (
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
@@ -110,6 +111,7 @@ from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
+from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -517,7 +519,7 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
-    if has_sm120:
+    if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:
@@ -528,6 +530,8 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        # DSv4 hash-based MoE routing (SM-portable)
+        jit_specs.append(gen_hash_topk_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -542,6 +546,7 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
@@ -597,8 +602,17 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
@@ -692,9 +706,7 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
-        # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
+        if has_sm80:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -710,7 +722,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )  # type: ignore[call-arg]
                 )
-        if has_sm90 or has_sm100:
+        if has_sm90:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -725,6 +737,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
+        if has_sm90 or has_sm100:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())

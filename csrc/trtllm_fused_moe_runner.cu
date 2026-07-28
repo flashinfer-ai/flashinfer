@@ -773,6 +773,21 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
   return validIndices;
 }
 
+bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                int32_t intermediateSize, int32_t numLocalExperts,
+                                int32_t numTokens) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
+    return false;
+  }
+
+  auto const& config = mPassingConfigs[configIndex];
+  return mPermuteGemm1.isValidConfigIndex(static_cast<int32_t>(config.gemm1Config), topK,
+                                          hiddenSize, intermediateSize, numLocalExperts,
+                                          numTokens) &&
+         mGemm2.isValidConfigIndex(static_cast<int32_t>(config.gemm2Config), topK, hiddenSize,
+                                   intermediateSize, numLocalExperts, numTokens);
+}
+
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t intermediateSize, int32_t numLocalExperts,
                                            int32_t numTokens) const {

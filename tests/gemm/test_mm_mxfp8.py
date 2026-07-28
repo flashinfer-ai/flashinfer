@@ -261,6 +261,28 @@ def test_mm_mxfp8_small_m(m, n, k):
     )
 
 
+@pytest.mark.parametrize(
+    "m,k",
+    [
+        (1, 768),
+        (16, 1536),
+        (32, 2048),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_low_m(m, k):
+    _run_mm_mxfp8(
+        m,
+        256,
+        k,
+        torch.bfloat16,
+        True,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=True,
+        provide_out=True,
+    )
+
+
 def test_mm_mxfp8_invalid_input_dtype():
     _skip_if_unsupported()
     m, n, k = 128, 128, 128

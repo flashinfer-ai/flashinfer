@@ -44,6 +44,10 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
     # Enumerate kernels, emit to generated/ directory
     with working_directory(gen_dir):
         specs: list = []
+        # Standard attention kernels for SM120 (HMMA, Ampere-compatible)
+        enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16")
+        enumerate_hmma_flash_kernels(specs, sm=120, dtype="fp16")
+        # DeepSeek MLA (hdim_qk=192, hdim_vo=128)
         enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16", head_size_v=128)
         enumerate_qmma_flash_kernels(specs, sm=120, dtype="e4m3_fp32", head_sizes=[192])
         enumerate_qmma_flash_kernels(

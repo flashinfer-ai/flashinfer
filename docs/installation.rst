@@ -43,8 +43,9 @@ FlashInfer provides three packages:
 .. code-block:: bash
 
     pip install flashinfer-python
+    # cubin package
     pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
-    # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+    # JIT cache package (replace cu129 with your CUDA version: cu129 or cu130)
     pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
 
 This eliminates compilation and downloading overhead at runtime.

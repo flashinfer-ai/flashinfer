@@ -99,6 +99,17 @@ def alloc_scratchpad(device: torch.device) -> torch.Tensor:
     counters via the ping-pong reset discipline), so callers should allocate
     once and pass the same tensor to every :func:`mono_moe` invocation to avoid
     per-call allocation and the one-time counter zero-init on the C++ side.
+
+    Parameters
+    ----------
+    device : torch.device
+        The CUDA device on which to allocate the scratchpad buffer.
+
+    Returns
+    -------
+    torch.Tensor
+        A 1-D uint8 tensor of get_scratchpad_size_bytes() bytes,
+        zero-initialised and placed on *device*.
     """
     nbytes = get_scratchpad_size_bytes()
     return torch.zeros(nbytes, dtype=torch.uint8, device=device)
@@ -127,6 +138,20 @@ def interleave_for_tma_wgmma_up(w_fp8: torch.Tensor) -> torch.Tensor:
 
     The down-projection weights need no preparation — the raw ``[E, K, N]``
     row-major fp8 tensor is passed straight through.
+
+    Parameters
+    ----------
+    w_fp8 : torch.Tensor
+        FP8 up/gate weight tensor with shape [E, 2*N, K] (row-major).
+        The first N rows per expert are gate weights; the last N are
+        up weights.  N must be a multiple of 64.
+
+    Returns
+    -------
+    torch.Tensor
+        Repacked weight tensor with the same shape and dtype as *w_fp8*,
+        laid out so that a single TMA boxDim=(128, 128) issue covers a
+        complete 128-row x 128-K WGMMA A-tile.
     """
     cached = getattr(w_fp8, "_tma_interleaved_up", None)
     if cached is not None:

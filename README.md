@@ -102,6 +102,7 @@ pip install flashinfer-python
 
 ```bash
 pip install flashinfer-python
+# cubin package
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 # JIT cache (replace cu129 with your CUDA version)
 pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129

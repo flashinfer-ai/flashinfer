@@ -1191,8 +1191,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def load(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1388,8 +1388,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def mma(
         self,
-        tiled_mma_qk: cute.core.ThrMma,
-        tiled_mma_pv: cute.core.ThrMma,
+        tiled_mma_qk: cute.ThrMma,
+        tiled_mma_pv: cute.ThrMma,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1666,7 +1666,7 @@ class FlashAttentionForwardSm100:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -1903,7 +1903,7 @@ class FlashAttentionForwardSm100:
         sm_stats_producer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         softmax: SoftmaxSm100,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -1948,7 +1948,7 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(
+        tSrS_t2r = cute.make_rmem_tensor(
             thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype
         )
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
@@ -1964,7 +1964,7 @@ class FlashAttentionForwardSm100:
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
-        tSrP_r2t_f32 = cute.make_fragment(
+        tSrP_r2t_f32 = cute.make_rmem_tensor(
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape,
             Float32,
         )
@@ -2011,8 +2011,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_loop(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
@@ -2039,30 +2039,6 @@ class FlashAttentionForwardSm100:
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mma_tile_coord_v = thr_mma_qk.thr_idx
-
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tStScale_layout = cute.composition(
-            tStS.layout, cute.make_layout((self.m_block_size, 1))
-        )
-        tStScales = tuple(
-            cute.make_tensor(
-                tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout
-            )
-            for stage in range(self.s_stage)
-        )
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-        tmem_load_v_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype
-        )
-        thr_tmem_load_vec = tcgen05.make_tmem_copy(
-            tmem_load_v_atom, tStScales[0]
-        ).get_slice(tidx)
-
-        [
-            thr_tmem_load_vec.partition_S(tStScales[stage])
-            for stage in range(self.s_stage)
-        ]
-        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
@@ -2117,7 +2093,6 @@ class FlashAttentionForwardSm100:
                 sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
-                cute.make_fragment(tSrScale_t2r_shape, Float32)
                 # q_stage=1 correction loop
                 if const_expr(mBlockNums is not None):
                     block_iter_count = (
@@ -2330,7 +2305,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         scale: Float32,
@@ -2370,9 +2345,8 @@ class FlashAttentionForwardSm100:
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(
                 tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout
             )
@@ -2390,7 +2364,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_epilogue(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         stage: Int32,
@@ -2447,7 +2421,7 @@ class FlashAttentionForwardSm100:
         ):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(
+            tOrO_frg = cute.make_rmem_tensor(
                 tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
@@ -2476,7 +2450,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_epilogue_combine(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO0: cute.Tensor,
         tOtO1: cute.Tensor,
         tidx: Int32,
@@ -2543,8 +2517,8 @@ class FlashAttentionForwardSm100:
             tOtO1_t2r_i = tOtO1_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             frg_shape = tOcO_t2r[None, 0, 0, i].shape
-            tOrO0_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
-            tOrO1_frg = cute.make_fragment(frg_shape, self.pv_acc_dtype)
+            tOrO0_frg = cute.make_rmem_tensor(frg_shape, self.pv_acc_dtype)
+            tOrO1_frg = cute.make_rmem_tensor(frg_shape, self.pv_acc_dtype)
             # When both scales are 0 (empty tile), skip tmem reads to avoid 0*NaN=NaN.
             is_zero_output = scale0 == Float32(0.0) and scale1 == Float32(0.0)
             if not is_zero_output:
