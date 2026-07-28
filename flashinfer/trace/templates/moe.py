@@ -1171,28 +1171,7 @@ def _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
     Each byte stores two 4-bit values (low nibble = first element along the
     last axis). The returned tensor has twice the last-dim size of *packed*.
     """
-    lut = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=packed.device,
-    )
+    lut = torch.tensor(_E2M1_LUT_VALUES, dtype=torch.float32, device=packed.device)
     p = packed.view(torch.uint8).to(torch.int64)
     lo = lut[p & 0x0F]
     hi = lut[(p >> 4) & 0x0F]
@@ -2533,27 +2512,6 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
     )
-
-
-_FP4_TRACE_REFERENCE_DEPENDENCIES = (
-    _unpack_fp4_e2m1,
-    _ue8m0_to_float32,
-    _decode_block_scales,
-    _dequantize_fp4_tensor,
-    _dequantize_fp4_hidden_states,
-    _fp4_moe_run_experts,
-)
-for _fp4_reference in (
-    _trtllm_fp4_block_scale_moe_default_routing_reference,
-    _trtllm_fp4_block_scale_moe_renormalize_routing_reference,
-    _trtllm_fp4_block_scale_moe_ds_routing_reference,
-    _trtllm_fp4_block_scale_moe_llama4_routing_reference,
-    _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
-    _trtllm_fp4_block_scale_moe_topk_routing_reference,
-    _trtllm_fp4_block_scale_routed_moe_reference,
-):
-    _fp4_reference._trace_reference_dependencies = _FP4_TRACE_REFERENCE_DEPENDENCIES
-del _fp4_reference
 
 
 @torch.no_grad()
