@@ -1190,8 +1190,11 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
           static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
           // FP8 per-tensor doesn't use Mn-bias (LoRA) cubins.
           /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
-          true,  // usePerTokenScalingGemm1. always true for per-tensor fp8 due to llama4 routing
-          false, false, false);
+          // Keep tactic enumeration aligned with prepare_moe_common(). The
+          // one-way cubin filter still admits the exported FP8 FC1 kernels
+          // that optionally consume BF16 routing scales.
+          /*usePerTokenScalingGemm1*/ false,
+          /*usePerTokenScalingGemm2*/ false, false, false);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -2225,9 +2228,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           /*weight_layout*/ batchedGemm::gemm::MatrixLayout::MajorK,
           // FP4 MoE getValidConfigs doesn't exercise the Mn-bias (LoRA) cubins.
           /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
-          // NOTE(siyuan): currently FP4 MoE always apply per-token scaling to both FC1 and FC2.
           /*usePerTokenScalingGemm1*/ use_per_token_scaling,
-          /*usePerTokenScalingGemm2*/ use_per_token_scaling, false, false);
+          // Match prepare_moe_common(): only NVFP4 uses the explicit
+          // per-token scale operand for FC2.
+          /*usePerTokenScalingGemm2*/
+          use_per_token_scaling && dtype_act == btg::Dtype::E2m1, false, false);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
