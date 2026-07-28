@@ -17,7 +17,11 @@ from flashinfer.mla._core import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
-from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+from flashinfer.tllm_enums import (
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    RoutingInputMode,
+)
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -1278,9 +1282,16 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     )
 
 
-def test_make_tuning_config_reuses_topk_ids_initializer():
+@pytest.mark.parametrize(
+    ("routing_input_mode", "packed"),
+    [
+        (RoutingInputMode.PackedPrecomputed, True),
+        (RoutingInputMode.UnpackedPrecomputed, False),
+    ],
+)
+def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
     """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls for the same num_experts.
+    same object across calls and matches the launcher's routing representation.
     """
     fn = core_mod.get_trtllm_moe_sm100_module
     fn.cache_clear()
@@ -1318,8 +1329,12 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             per_token_scale=None,
         )
 
-        config_a = runner._make_tuning_config(moe_inputs)
-        config_b = runner._make_tuning_config(moe_inputs)
+        config_a = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
+        config_b = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
 
         spec_a = config_a.dynamic_tensor_specs[0]
         spec_b = config_b.dynamic_tensor_specs[0]
@@ -1333,6 +1348,21 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
             "lru_cache key — a per-call closure reintroduces the memory leak."
         )
+        assert init_a is _moe_topk_ids_init(128, packed=packed)
+
+        initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        if packed:
+            # Packed routing stores the expert ID in the high 16 bits and a
+            # deterministic BF16 routing weight of 1.0 in the low 16 bits.
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            assert torch.all((initialized >> 16) < 128)
+            assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
+        else:
+            # Unpacked routing contains plain expert IDs, not packed bitfields.
+            assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()
 
