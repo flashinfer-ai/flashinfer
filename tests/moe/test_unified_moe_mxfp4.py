@@ -365,6 +365,26 @@ def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantVariant):
 
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_trtllm_mxfp4_unpacked_matches_packed(
+    variant: QuantVariant, weights_dtype: torch.dtype
+):
+    _xfail_w4a16_sm103(variant)
+    packed, weights, config = _make_runtime_case(variant)
+    unpacked = MoEActivationPack(
+        hidden_states_q=packed.hidden_states_q,
+        hidden_states_scale=packed.hidden_states_scale,
+        topk_ids=packed.topk_ids,
+        topk_weights=packed.topk_weights.to(weights_dtype),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    layer = MoELayer(config)
+    expected = layer(packed, weights).clone()
+    actual = layer(unpacked, weights)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
 def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantVariant):
     _xfail_w4a16_sm103(variant)
     baseline_act, baseline_weights, baseline_config = _make_runtime_case(

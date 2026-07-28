@@ -1635,13 +1635,12 @@ class TestTrtllmFp4UnpackedContract:
         weight_pack = MoEWeightPack()
         weight_pack.prepare_for(
             runner.backend_key,
-            {
-                "gemm1_weights": torch.empty(0, device=device),
-                "gemm1_weights_scale": torch.empty(0, device=device),
-                "gemm1_alpha": torch.empty(0, device=device),
-                "gemm2_weights": torch.empty(0, device=device),
-                "gemm2_weights_scale": torch.empty(0, device=device),
-            },
+            _fp4_dummy_weight_view(
+                config.experts.local_num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            ),
         )
 
         moe_inputs = MoeRunnerInputs.from_list(

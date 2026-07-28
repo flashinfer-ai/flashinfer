@@ -1215,6 +1215,29 @@ _CURATED = [
         routing_method=RoutingMethodType.Default,
         routing_input_mode="fromlogits",
     ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "mxfp4",
+        "uniform",
+        900_032,
+        routing_input_mode="unpacked",
+    ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "w4a16",
+        "imbalanced",
+        900_036,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
