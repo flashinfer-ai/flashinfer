@@ -332,7 +332,9 @@ def gated_delta_rule_decode_pretranspose(
             # Kernel wrote directly into the user's buffer.
             output = forward_output
         elif output is None:
-            output = out
+            # The kernel writes bf16 regardless of `q.dtype`; keep the documented
+            # "result follows q.dtype" contract for fp16 callers.
+            output = out if out.dtype == target_dtype else out.to(target_dtype)
         else:
             # User wants a non-bf16 dtype; cast on the way back.
             output.copy_(out.to(target_dtype))

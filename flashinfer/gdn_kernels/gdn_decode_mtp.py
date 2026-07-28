@@ -46,6 +46,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from .dtype_compat import as_bf16
+
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
@@ -2510,6 +2512,7 @@ def _get_compiled_mtp_kernel(
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2535,6 +2538,7 @@ def _get_compiled_mtp_kernel_inline(
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2605,6 +2609,16 @@ def run_mtp_decode(
             initial_state_indices. Negative entries skip the writeback for
             that batch slot (matching the read-side padding skip semantics).
     """
+    # This kernel is bf16-only for q/k/v/a/b and stores the result with
+    # `cutlass.BFloat16(...)`, so any other dtype would be reinterpreted instead of
+    # converted. The public API documents fp16 q/k/v and an arbitrary `output` dtype,
+    # so convert on the way in and copy the bf16 result back on the way out.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    output_writeback = None
+    if output.dtype != torch.bfloat16:
+        output_writeback = output
+        output = torch.empty_like(output, dtype=torch.bfloat16)
+
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
@@ -2623,6 +2637,19 @@ def run_mtp_decode(
     else:
         pool_strides_key = None
 
+    # `from_dlpack` bakes each tensor's dtype into the compiled signature, so a dtype
+    # that varies across calls has to be part of the compile identity or the second
+    # dtype silently reuses the first cubin. q/k/v/a/b/output are pinned to bf16
+    # above, and h0/intermediate/cu_seqlens/scatter indices have asserted dtypes; the
+    # operands below stay polymorphic (`dt_bias` is documented as bf16 or fp32, slot
+    # indices as int32 or int64) because the kernel reads them via indexed scalar
+    # loads, which convert. `h0_out_indices` follows `initial_state_indices`.
+    dtype_key = (
+        A_log.dtype,
+        dt_bias.dtype,
+        initial_state_indices.dtype,
+    )
+
     if use_inline_kernel:
         inline_cache_key = (
             T,
@@ -2639,6 +2666,7 @@ def run_mtp_decode(
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
@@ -2661,6 +2689,7 @@ def run_mtp_decode(
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
@@ -2849,3 +2878,6 @@ def run_mtp_decode(
         ssm_state_indices_arg,
         stream,
     )
+
+    if output_writeback is not None:
+        output_writeback.copy_(output)

@@ -4210,3 +4210,248 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
         **kw,
     )
     torch.testing.assert_close(o_p, o_c, atol=0, rtol=0)
+
+
+# ==============================================================================
+# Operand dtype handling and compile-cache ownership
+# ==============================================================================
+# These decode kernels are bf16-only internally: q/k/v/a/b move through fragments
+# declared `cutlass.BFloat16` and results are stored with `cutlass.BFloat16(...)`,
+# while the public API documents fp16 q/k/v. Their compile caches are also
+# process-global and keyed by hand. The tests below pin three contracts that no
+# other test in this file covers, because every other dtype parametrization here is
+# bf16-only:
+#   1. fp16 operands are converted, not bit-reinterpreted;
+#   2. one operand dtype must not poison another's cache entry at equal geometry;
+#   3. a default-allocated `output` is owned by the caller, not by the cache.
+
+# case -> (seq_len, state dtype). Batch size selects the kernel within a case:
+# B*HV=128 takes the ILP4 path and B*HV=2048 the wide-vector path, so the
+# parametrizations below reach all three BF16-state compile sites plus both
+# FP32-state MTP kernels (inline for B*HV<=128, warp-specialized above).
+_DTYPE_CASES = {
+    "fp32_state_mtp": (2, torch.float32),
+    "bf16_state_t1": (1, torch.bfloat16),
+    "bf16_state_mtp": (2, torch.bfloat16),
+}
+
+
+def _dtype_case_inputs(case, dtype, batch_size, seed=0, dt_bias_dtype=torch.float32):
+    seq_len, state_dtype = _DTYPE_CASES[case]
+    device = torch.device("cuda")
+    H, HV, D = 16, 32, 128
+    torch.manual_seed(seed)
+    return dict(
+        q=torch.randn(batch_size, seq_len, H, D, dtype=dtype, device=device) * 0.1,
+        k=torch.randn(batch_size, seq_len, H, D, dtype=dtype, device=device) * 0.1,
+        v=torch.randn(batch_size, seq_len, HV, D, dtype=dtype, device=device) * 0.1,
+        a=torch.randn(batch_size, seq_len, HV, dtype=dtype, device=device) * 0.1,
+        b=torch.randn(batch_size, seq_len, HV, dtype=dtype, device=device) * 0.1,
+        A_log=torch.randn(HV, dtype=torch.float32, device=device) * 0.1,
+        dt_bias=(torch.randn(HV, dtype=torch.float32, device=device) * 0.1).to(
+            dt_bias_dtype
+        ),
+        state=(
+            torch.randn(batch_size, HV, D, D, dtype=state_dtype, device=device) * 0.01
+        ).contiguous(),
+        scale=1.0 / math.sqrt(D),
+    )
+
+
+def _dtype_case_to(x, dtype):
+    """Re-express the bf16 operands of `x` in `dtype`.
+
+    bf16 -> fp16 is exact for these magnitudes, so a kernel that converts (rather
+    than reinterprets) must return bit-identical results for both versions.
+    """
+    out = dict(x)
+    for name in ("q", "k", "v", "a", "b"):
+        out[name] = x[name].to(dtype)
+    return out
+
+
+def _dtype_case_run(case, x, output=None):
+    common = dict(
+        q=x["q"],
+        k=x["k"],
+        v=x["v"],
+        A_log=x["A_log"],
+        a=x["a"],
+        dt_bias=x["dt_bias"],
+        b=x["b"],
+        scale=x["scale"],
+        use_qk_l2norm=True,
+        output=output,
+    )
+    if case == "fp32_state_mtp":
+        batch_size = x["q"].shape[0]
+        out, _ = gated_delta_rule_mtp(
+            initial_state=x["state"].clone(),
+            initial_state_indices=torch.arange(
+                batch_size, dtype=torch.int32, device=x["q"].device
+            ),
+            disable_state_update=True,
+            **common,
+        )
+    else:
+        out, _ = gated_delta_rule_decode_pretranspose(
+            state=x["state"].clone(), **common
+        )
+    return out
+
+
+def _dtype_case_reference(x):
+    out, _, _ = verify_delta_rule(
+        q=x["q"],
+        k=x["k"],
+        v=x["v"],
+        # Reference takes a K-major [B, HV, K, V] state; the kernels take V-major.
+        state=x["state"].float().transpose(-2, -1).contiguous(),
+        A_log=x["A_log"].float(),
+        a=x["a"],
+        dt_bias=x["dt_bias"].float(),
+        b=x["b"],
+        scale_factor=x["scale"],
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        use_l2_norm=True,
+        cache_intermediate_states=False,
+    )
+    return out
+
+
+@pytest.mark.parametrize("case", list(_DTYPE_CASES))
+@pytest.mark.parametrize("batch_size", [4, 64])
+def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size):
+    """fp16 q/k/v/a/b must be converted to bf16, not bit-reinterpreted.
+
+    The kernels declare their staging fragments bf16, so handing them an fp16
+    descriptor silently produces garbage (output collapsed to ~0 on the FP32-state
+    MTP path, ~100x too large on the BF16-state path).
+    """
+    _skip_if_not_sm90_or_later()
+    x_bf16 = _dtype_case_inputs(case, torch.bfloat16, batch_size)
+    out_bf16 = _dtype_case_run(case, x_bf16)
+    out_fp16 = _dtype_case_run(case, _dtype_case_to(x_bf16, torch.float16))
+
+    ref = _dtype_case_reference(x_bf16)
+    torch.testing.assert_close(out_bf16.float(), ref.float(), atol=3e-4, rtol=3e-2)
+    assert out_fp16.dtype == torch.float16, (
+        f"result should follow q.dtype; got {out_fp16.dtype}"
+    )
+    # bf16 -> fp16 round-trips exactly for these operands, so the kernel must produce
+    # the same result either way. Compare after the return cast, which is lossy for
+    # elements below fp16's smallest normal and is not what this test is about.
+    torch.testing.assert_close(
+        out_fp16, out_bf16.to(out_fp16.dtype), atol=0, rtol=0, check_dtype=False
+    )
+
+
+@pytest.mark.parametrize("case", list(_DTYPE_CASES))
+def test_gdn_decode_compile_cache_survives_dtype_interleaving(case, batch_size=4):
+    """An interleaved fp16 call must not disturb the bf16 specialization.
+
+    The compile caches are process-global; when a key omits an operand dtype the
+    first-compiled variant wins and later calls either fail in TVM-FFI or reuse the
+    wrong cubin.
+    """
+    _skip_if_not_sm90_or_later()
+    x_bf16 = _dtype_case_inputs(case, torch.bfloat16, batch_size)
+    first = _dtype_case_run(case, x_bf16)
+    _dtype_case_run(case, _dtype_case_to(x_bf16, torch.float16))
+    again = _dtype_case_run(case, x_bf16)
+    torch.testing.assert_close(again.float(), first.float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("case", list(_DTYPE_CASES))
+def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
+    """fp32 and bf16 dt_bias are separate specializations of the same geometry.
+
+    The public docstring documents dt_bias as bf16 or float32, and the kernels read
+    it through indexed scalar loads that convert, so both must work in one process
+    regardless of which compiles first.
+    """
+    _skip_if_not_sm90_or_later()
+    for dt_bias_dtype in (torch.float32, torch.bfloat16, torch.float32):
+        x = _dtype_case_inputs(
+            case, torch.bfloat16, batch_size, dt_bias_dtype=dt_bias_dtype
+        )
+        out = _dtype_case_run(case, x)
+        torch.testing.assert_close(
+            out.float(), _dtype_case_reference(x).float(), atol=3e-4, rtol=3e-2
+        )
+
+
+@pytest.mark.parametrize("case", ["bf16_state_t1", "bf16_state_mtp"])
+@pytest.mark.parametrize("batch_size", [4, 64])
+def test_gdn_decode_default_output_is_not_shared(case, batch_size):
+    """With output=None the result must be freshly allocated, not a cached buffer.
+
+    The BF16-state caches used to hand out one per-batch-size buffer, so a second
+    call at the same specialization overwrote the tensor the first call returned.
+    """
+    _skip_if_not_sm90_or_later()
+    first = _dtype_case_run(
+        case, _dtype_case_inputs(case, torch.bfloat16, batch_size, seed=0)
+    )
+    snapshot = first.clone()
+    second = _dtype_case_run(
+        case, _dtype_case_inputs(case, torch.bfloat16, batch_size, seed=1)
+    )
+
+    assert first.data_ptr() != second.data_ptr(), "default outputs share storage"
+    torch.testing.assert_close(first, snapshot, atol=0, rtol=0)
+    # Guard against a vacuous pass: the two calls must really differ.
+    assert not torch.equal(first, second), "inputs failed to produce distinct results"
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32, torch.bfloat16])
+def test_gdn_decode_mtp_honors_non_bf16_output_buffer(out_dtype, batch_size=4):
+    """A caller-supplied `output=` of any dtype must receive the real result.
+
+    The kernel stores bf16, so a non-bf16 buffer needs staging rather than being
+    handed to the kernel directly.
+    """
+    _skip_if_not_sm90_or_later()
+    x = _dtype_case_inputs("fp32_state_mtp", torch.bfloat16, batch_size)
+    B, T, _, D = x["q"].shape
+    HV = x["v"].shape[2]
+    output = torch.zeros(B, T, HV, D, dtype=out_dtype, device=x["q"].device)
+
+    returned = _dtype_case_run("fp32_state_mtp", x, output=output)
+    ref = _dtype_case_reference(x).float()
+    assert returned.dtype == out_dtype
+    torch.testing.assert_close(returned.float(), ref, atol=3e-4, rtol=3e-2)
+    torch.testing.assert_close(output.float(), ref, atol=3e-4, rtol=3e-2)
+
+
+def test_gdn_decode_wy_output_only_fp16_inputs_are_converted(batch_size=4):
+    """The WY output-only kernel is bf16-only too (`io = cutlass.BFloat16`)."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE:
+        pytest.skip("gdn_decode_bf16_wy_output_only kernel not available")
+
+    x = _dtype_case_inputs("bf16_state_mtp", torch.bfloat16, batch_size)
+    indices = torch.arange(batch_size, dtype=torch.int32, device=x["q"].device)
+
+    def run(inputs):
+        return gdn_decode_bf16_wy_output_only_mtp(
+            A_log=x["A_log"],
+            a=inputs["a"],
+            dt_bias=x["dt_bias"],
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            b=inputs["b"],
+            initial_state_source=x["state"],
+            initial_state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+            scale=x["scale"],
+            disable_state_update=True,
+        )
+
+    out_bf16 = run(x)
+    out_fp16 = run(_dtype_case_to(x, torch.float16))
+    torch.testing.assert_close(out_fp16.float(), out_bf16.float(), atol=0, rtol=0)

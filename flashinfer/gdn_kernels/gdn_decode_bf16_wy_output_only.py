@@ -47,6 +47,8 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from .dtype_compat import as_bf16
+
 
 device = torch.device("cuda:0")
 
@@ -2091,6 +2093,12 @@ def gated_delta_rule_mtp(
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
     )
+    # bf16-only kernel: module-level `io = cutlass.BFloat16` types every smem tile and
+    # the MMA atom, so any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}."
+    )
 
     B, T, H, K_dim = q.shape
     HV = v.shape[2]
@@ -2107,6 +2115,11 @@ def gated_delta_rule_mtp(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
+        # Slot indices are read as int32; a wider index tensor would likewise be
+        # reinterpreted instead of converted.
+        assert initial_state_indices.dtype == torch.int32, (
+            f"initial_state_indices must be int32; got {initial_state_indices.dtype}."
+        )
     _io_dtype = q.dtype
     HK = k.shape[2]
 
