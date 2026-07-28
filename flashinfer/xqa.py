@@ -21,7 +21,12 @@ import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.page import xqa_mla_trace, xqa_trace
-from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
+from .jit.xqa import (
+    gen_xqa_module,
+    gen_xqa_module_mla,
+    ragged_q_changes_build,
+    swap_ab_eligible,
+)
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
     get_device_sm_count,
@@ -32,7 +37,6 @@ from .utils import (
 )
 
 
-@functools.cache
 def get_xqa_module(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -43,6 +47,34 @@ def get_xqa_module(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool = False,
+):
+    # Ragged Q must reuse the uniform module unless it changes the compile
+    # flags; a second cache entry would re-register the same torch op.
+    use_ragged_q = use_ragged_q and ragged_q_changes_build(q_seq_len, head_group_ratio)
+    return _get_xqa_module_cached(
+        input_dtype,
+        kv_cache_dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        use_sliding_window,
+        output_dtype,
+        q_seq_len,
+        use_ragged_q,
+    )
+
+
+@functools.cache
+def _get_xqa_module_cached(
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
+    use_sliding_window: bool,
+    output_dtype: torch.dtype,
+    q_seq_len: int,
+    use_ragged_q: bool,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -237,8 +269,6 @@ def xqa(
         per draft row, assuming draft tokens occupy consecutive positions at
         the end of the sequence (linear chains, causal or full masks);
         tree-structured drafts are not supported with sliding window.
-        On SM90 with fp8 KV cache, speculative decode with a sliding window
-        runs on the generic kernel rather than the Hopper fp8 kernel.
     kv_layout : str, default="NHD"
         The layout of the KV cache. Can be either ``NHD`` or ``HND``.
     sm_count : Optional[int], default=None
@@ -267,11 +297,15 @@ def xqa(
         tokens this step. When set, ``q`` and ``output`` are packed as
         ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
         the maximum draft length, and ``mask`` rows are packed by the same
-        cumulative offsets. On SM90 with fp8 KV cache, ragged Q runs on the
-        generic kernel rather than the Hopper fp8 kernel.
+        cumulative offsets.
 
     Note
     ----
+    On SM90 with fp8 KV cache, speculative decode runs on the generic kernel
+    instead of the Hopper fp8 kernel when any of these holds: ragged Q,
+    a positive ``sliding_win_size`` (even one larger than every sequence),
+    or ``q_seq_len * (num_q_heads // num_kv_heads) <= 32``.
+
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0] (or seq_lens.shape[0] with ragged Q)
     - num_q_heads from q.shape[-2]
@@ -367,10 +401,6 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
-    # Ragged Q only changes the build when it suppresses the SPEC_Q_SEQ_LEN
-    # specialization; otherwise reuse the uniform module (a separate cache
-    # entry would re-register the same torch op name and fail).
-    ragged_build = use_ragged_q and q_seq_len * head_group_ratio <= 32
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -380,16 +410,21 @@ def xqa(
         use_sliding_window,
         output.dtype,
         q_seq_len,
-        ragged_build,
+        use_ragged_q,
     )
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
-        if use_ragged_q or use_sliding_window:
-            # mha_sm90.cu rejects ragged Q, and its spec-dec sliding-window
-            # path mis-masks full draft masks; use the generic kernel.
+        if (
+            use_ragged_q
+            or use_sliding_window
+            or swap_ab_eligible(q_seq_len, head_group_ratio)
+        ):
+            # mha_sm90.cu rejects ragged Q and gets full draft masks wrong,
+            # both under sliding windows and in SWAP_AB. Causal masks can't
+            # be exempted without inspecting the device-side mask.
             run_sm90_fp8_mha = False
 
     xqa_module.xqa(

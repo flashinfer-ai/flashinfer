@@ -1070,6 +1070,90 @@ def test_xqa_batch_decode_nvfp4_kv(
     )
 
 
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
+def test_xqa_batch_decode_mask_mode_deterministic(kv_dtype, spec_dec_mask_mode):
+    """Zero Q and K make the softmax uniform, so each output row is exactly
+    the mean of V over the row's visible positions. Draft V values are
+    distinct powers of two, so any deviation from the requested draft mask
+    shifts the output far beyond fp8 noise."""
+    torch.manual_seed(0)
+    batch_size, q_len, page_size, num_kv_heads, head_grp_size = 2, 4, 16, 2, 4
+    head_dim = 128
+    num_qo_heads = num_kv_heads * head_grp_size
+    prefix_lens = [21, 3]
+    seq_lens = torch.tensor([p + q_len for p in prefix_lens], dtype=torch.int32)
+
+    pages_per_seq = (int(seq_lens.max()) + page_size - 1) // page_size
+    num_pages = pages_per_seq * batch_size
+    # kv_cache: [num_pages, 2 (K/V), page_size, num_kv_heads, head_dim] (NHD)
+    kv_cache = torch.zeros(
+        num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=GPU_DEVICE,
+    )
+    for i in range(batch_size):
+        for t in range(int(seq_lens[i])):
+            val = 1.0 if t < prefix_lens[i] else 2.0 ** (t - prefix_lens[i] + 1)
+            kv_cache[i * pages_per_seq + t // page_size, 1, t % page_size] = val
+    if kv_dtype == "fp8":
+        kv_cache = kv_cache.to(torch.float8_e4m3fn)  # all values exact in e4m3
+    page_table = (
+        torch.arange(num_pages, dtype=torch.int32, device=GPU_DEVICE)
+        .reshape(batch_size, pages_per_seq)
+        .contiguous()
+    )
+
+    q = torch.zeros(
+        batch_size * q_len,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=GPU_DEVICE,
+    )
+    out, o_scale = create_output(q, "bf16")
+    workspace_buffer, _ = create_workspace_buffers(GPU_DEVICE)
+    mask = generate_spec_dec_mask(batch_size, q_len, GPU_DEVICE, spec_dec_mask_mode)
+
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        q,
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        int(seq_lens.max()),
+        float(1.0 / (head_dim**0.5)),  # bmm1_scale
+        1.0,  # bmm2_scale
+        -1,  # window_left
+        out=out,
+        kv_layout="NHD",
+        q_len_per_req=q_len,
+        o_scale=o_scale,
+        mask=mask,
+    )
+
+    expected = torch.empty(batch_size, q_len, device=GPU_DEVICE)
+    for i in range(batch_size):
+        for r in range(q_len):
+            n_vis_draft = r + 1 if spec_dec_mask_mode == "causal" else q_len
+            v_sum = prefix_lens[i] + sum(2.0 ** (j + 1) for j in range(n_vis_draft))
+            expected[i, r] = v_sum / (prefix_lens[i] + n_vis_draft)
+    torch.testing.assert_close(
+        output.reshape(batch_size, q_len, num_qo_heads, head_dim).float(),
+        expected[:, :, None, None].expand(-1, -1, num_qo_heads, head_dim),
+        rtol=2e-2,
+        atol=5e-2,
+    )
+
+
 if __name__ == "__main__":
     # Run a simple test case
     test_xqa_batch_decode(
