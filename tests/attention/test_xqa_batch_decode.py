@@ -1076,13 +1076,24 @@ def test_xqa_batch_decode_nvfp4_kv(
 )
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("spec_dec_mask_mode", ["causal", "full"])
-def test_xqa_batch_decode_mask_mode_deterministic(kv_dtype, spec_dec_mask_mode):
+@pytest.mark.parametrize(
+    "num_kv_heads,head_grp_size",
+    [
+        # q_len * head_grp_size <= 32: falls back to the generic kernel on SM90 fp8
+        (2, 4),
+        # q_len * head_grp_size > 32: stays on the SM90 fp8 kernel (mha_sm90.cu)
+        (2, 16),
+    ],
+)
+def test_xqa_batch_decode_mask_mode_deterministic(
+    kv_dtype, spec_dec_mask_mode, num_kv_heads, head_grp_size
+):
     """Zero Q and K make the softmax uniform, so each output row is exactly
     the mean of V over the row's visible positions. Draft V values are
     distinct powers of two, so any deviation from the requested draft mask
     shifts the output far beyond fp8 noise."""
     torch.manual_seed(0)
-    batch_size, q_len, page_size, num_kv_heads, head_grp_size = 2, 4, 16, 2, 4
+    batch_size, q_len, page_size = 2, 4, 16
     head_dim = 128
     num_qo_heads = num_kv_heads * head_grp_size
     prefix_lens = [21, 3]

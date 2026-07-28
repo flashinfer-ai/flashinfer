@@ -303,8 +303,8 @@ def xqa(
     ----
     On SM90 with fp8 KV cache, speculative decode runs on the generic kernel
     instead of the Hopper fp8 kernel when any of these holds: ragged Q,
-    a positive ``sliding_win_size`` (even one larger than every sequence),
-    or ``q_seq_len * (num_q_heads // num_kv_heads) <= 32``.
+    attention sinks, a positive ``sliding_win_size`` (even one larger than
+    every sequence), or ``q_seq_len * (num_q_heads // num_kv_heads) <= 32``.
 
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0] (or seq_lens.shape[0] with ragged Q)
