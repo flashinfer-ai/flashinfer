@@ -2395,9 +2395,9 @@ class Sm100W4A16GroupedGemmKernel:
         if not use_fused_finalize:
             c_stage_count += (
                 smem_capacity
+                - carveout_smem_bytes
                 - load2transform_stage_count * ab_scale_load_bytes_per_stage
                 - transform2mma_stage_count * a_transform_bytes_per_stage
-                - c_bytes
             ) // c_bytes_per_stage
 
         return (
