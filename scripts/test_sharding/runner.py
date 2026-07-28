@@ -30,7 +30,6 @@ from .state import (
     claims_dir,
     collection_fingerprint,
     create_or_join_attempt,
-    fingerprint_paths,
     lease_is_live,
     lease_value,
     list_attempts,
@@ -38,6 +37,7 @@ from .state import (
     load_manifest,
     recover_unit_elapsed,
     sha256_file,
+    source_git_sha_from_env,
     state_lock,
     units_dir,
     verify_manifest,
@@ -332,7 +332,7 @@ def _verify_collection(manifest: dict[str, Any], nodes: list[CollectedNode]) -> 
 def _write_new_manifest(
     *,
     request: ManifestPreparation,
-    repository_fingerprint: str,
+    source_git_sha: str | None,
     nodes: list[CollectedNode],
     manifest: dict[str, Any],
     plan: Plan,
@@ -342,7 +342,7 @@ def _write_new_manifest(
         if concurrent is not None:
             verify_manifest(
                 concurrent,
-                repository_fingerprint=repository_fingerprint,
+                source_git_sha=source_git_sha,
                 test_path=request.selection.test_path,
                 selection=request.selection.to_dict(),
                 planning_options=request.planning.to_dict(),
@@ -370,16 +370,14 @@ def prepare_manifest(
     test_path = selection.test_path
     _validate_selection(selection)
     junit_dir.mkdir(parents=True, exist_ok=True)
-    repository_fingerprint = fingerprint_paths(
-        repo_root, test_path, excluded_roots=(junit_dir,)
-    )
+    source_git_sha = source_git_sha_from_env()
     selection_value = selection.to_dict()
     existing = load_manifest(junit_dir)
     existing_plan: Plan | None = None
     if existing is not None:
         verify_manifest(
             existing,
-            repository_fingerprint=repository_fingerprint,
+            source_git_sha=source_git_sha,
             test_path=test_path,
             selection=selection_value,
             planning_options=planning.to_dict(),
@@ -443,7 +441,7 @@ def prepare_manifest(
         ManifestBuild(
             repo_root=repo_root,
             test_path=test_path,
-            repository_fingerprint=repository_fingerprint,
+            source_git_sha=source_git_sha,
             plan=plan,
             selection=selection_value,
             estimate_files=_estimate_checksums(repo_root),
@@ -451,7 +449,7 @@ def prepare_manifest(
     )
     return _write_new_manifest(
         request=request,
-        repository_fingerprint=repository_fingerprint,
+        source_git_sha=source_git_sha,
         nodes=nodes,
         manifest=manifest,
         plan=plan,

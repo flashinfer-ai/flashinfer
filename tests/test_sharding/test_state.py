@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from scripts.test_sharding.models import Plan, PlanningOptions
 from scripts.test_sharding.state import (
     AttemptSettings,
+    ManifestBuild,
     RunnerStateError,
     active_attempt_collection_timeout,
+    build_manifest,
     create_or_join_attempt,
-    fingerprint_paths,
     recover_unit_elapsed,
+    source_git_sha_from_env,
     state_lock,
+    verify_manifest,
     write_unit_elapsed,
 )
 
@@ -45,74 +49,74 @@ def test_unit_elapsed_recovers_only_the_stale_claim_window(tmp_path: Path) -> No
     assert saved == {"active_started_at": None, "elapsed_seconds": 42.0}
 
 
-def test_repository_fingerprint_ignores_only_timing_refresh_artifacts(
+def _manifest(tmp_path: Path, source_git_sha: str | None) -> dict[str, Any]:
+    test_path = tmp_path / "tests"
+    plan = Plan(options=PlanningOptions(profile="test"), nodes=(), units=())
+    return build_manifest(
+        ManifestBuild(
+            repo_root=tmp_path,
+            test_path=test_path,
+            source_git_sha=source_git_sha,
+            plan=plan,
+            selection={"sanity_test": False},
+            estimate_files={"duration": None, "overhead": None},
+        )
+    )
+
+
+def test_source_git_sha_from_env_normalizes_missing_and_blank_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SOURCE_GIT_SHA", raising=False)
+    assert source_git_sha_from_env() is None
+
+    monkeypatch.setenv("SOURCE_GIT_SHA", "  ")
+    assert source_git_sha_from_env() is None
+
+    monkeypatch.setenv("SOURCE_GIT_SHA", " abc123 \n")
+    assert source_git_sha_from_env() == "abc123"
+
+
+def test_manifest_rejects_different_available_source_git_shas(
     tmp_path: Path,
 ) -> None:
-    repo = tmp_path / "repo"
-    test_dir = repo / "tests"
-    data_dir = test_dir / "data"
-    data_dir.mkdir(parents=True)
-    (test_dir / "test_sample.py").write_text("def test_ok(): pass\n", encoding="utf-8")
-    duration = data_dir / "unit_test_duration_estimates.csv.gz"
-    duration.write_text("first", encoding="utf-8")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "tests@example.com"],
-        check=True,
+    manifest = _manifest(tmp_path, "saved-sha")
+    verify_manifest(
+        manifest,
+        source_git_sha="saved-sha",
+        test_path=tmp_path / "tests",
+        selection={"sanity_test": False},
+        planning_options=PlanningOptions(profile="test").to_dict(),
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Test Runner"],
-        check=True,
+
+    with pytest.raises(RunnerStateError, match="source_git_sha"):
+        verify_manifest(
+            manifest,
+            source_git_sha="current-sha",
+            test_path=tmp_path / "tests",
+            selection={"sanity_test": False},
+            planning_options=PlanningOptions(profile="test").to_dict(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("saved_sha", "current_sha"),
+    [(None, "current-sha"), ("saved-sha", None), (None, None)],
+)
+def test_manifest_assumes_source_matches_when_either_sha_is_unavailable(
+    tmp_path: Path,
+    saved_sha: str | None,
+    current_sha: str | None,
+) -> None:
+    manifest = _manifest(tmp_path, saved_sha)
+
+    verify_manifest(
+        manifest,
+        source_git_sha=current_sha,
+        test_path=tmp_path / "tests",
+        selection={"sanity_test": False},
+        planning_options=PlanningOptions(profile="test").to_dict(),
     )
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
-    initial = fingerprint_paths(repo, test_dir)
-
-    duration.write_text("refreshed", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-qm", "refresh timing"], check=True
-    )
-    assert fingerprint_paths(repo, test_dir) == initial
-
-    (data_dir / "test_fixture.json").write_text("{}\n", encoding="utf-8")
-    assert fingerprint_paths(repo, test_dir) != initial
-    assert fingerprint_paths(repo, test_dir, excluded_roots=(data_dir,)) == initial
-
-
-def test_repository_fingerprint_includes_staged_changes(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    test_dir = repo / "tests"
-    test_dir.mkdir(parents=True)
-    test_file = test_dir / "test_sample.py"
-    original = "def test_ok(): pass\n"
-    test_file.write_text(original, encoding="utf-8")
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "tests@example.com"],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Test Runner"],
-        check=True,
-    )
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
-    initial = fingerprint_paths(repo, test_dir)
-
-    test_file.write_text("def test_ok(): assert False\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", str(test_file)], check=True)
-    assert fingerprint_paths(repo, test_dir) != initial
-
-    subprocess.run(
-        ["git", "-C", str(repo), "restore", "--staged", str(test_file)], check=True
-    )
-    test_file.write_text(original, encoding="utf-8")
-    assert fingerprint_paths(repo, test_dir) == initial
-
-    test_file.unlink()
-    subprocess.run(["git", "-C", str(repo), "add", "--update"], check=True)
-    assert fingerprint_paths(repo, test_dir) != initial
 
 
 def test_collection_timeout_uses_active_attempt_absolute_deadline(

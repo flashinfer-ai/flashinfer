@@ -41,7 +41,7 @@ def test_scanner_reads_authoritative_batch_xml(
     manifest_path.write_text(
         json.dumps(
             {
-                "repository_fingerprint": "run-identity",
+                "source_git_sha": "run-identity",
                 "selection": {"sanity_test": False},
                 "test_path": "tests",
                 "plan": plan.to_dict(),

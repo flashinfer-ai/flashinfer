@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import socket
-import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -22,32 +21,6 @@ class RunnerStateError(RuntimeError):
 
 
 _LOCK_MARKER = "flashinfer-unit-test-runner-lock-v1\n"
-_FINGERPRINT_SCOPE = (
-    "flashinfer",
-    "include",
-    "csrc",
-    "tests",
-    "scripts/task_run_unit_tests.sh",
-    "scripts/setup_test_env.sh",
-    "scripts/test_utils.sh",
-    "scripts/__init__.py",
-    "scripts/unit_test_runner.py",
-    "scripts/test_sharding",
-    "pytest.ini",
-    "pyproject.toml",
-    "requirements.txt",
-    "setup.py",
-    "setup.cfg",
-    "build_backend.py",
-    ":(exclude)tests/data/unit_test_duration_estimates.csv.gz",
-    ":(exclude)tests/data/unit_test_duration_estimates_summary.csv",
-    ":(exclude)tests/data/unit_test_overhead_estimates.csv",
-)
-_TIMING_REFRESH_ARTIFACTS = {
-    "tests/data/unit_test_duration_estimates.csv.gz",
-    "tests/data/unit_test_duration_estimates_summary.csv",
-    "tests/data/unit_test_overhead_estimates.csv",
-}
 
 
 def _publish_runner_lock(lock_path: Path) -> None:
@@ -110,118 +83,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_output(repo_root: Path, *arguments: str) -> bytes:
-    try:
-        result = subprocess.run(
-            ["git", *arguments],
-            cwd=repo_root,
-            check=False,
-            capture_output=True,
-        )
-    except OSError:
-        return b""
-    return result.stdout if result.returncode == 0 else b""
+def _normalize_source_git_sha(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
-def _is_excluded(path: Path, excluded_roots: tuple[Path, ...]) -> bool:
-    resolved = path.resolve()
-    return any(
-        resolved == root or resolved.is_relative_to(root) for root in excluded_roots
-    )
+def source_git_sha_from_env() -> str | None:
+    """Return the optional CI archive identity used to validate resume."""
 
-
-def _external_test_paths(
-    repo_root: Path,
-    test_path: Path,
-    excluded_roots: tuple[Path, ...],
-) -> set[Path]:
-    try:
-        test_path.resolve().relative_to(repo_root.resolve())
-        return set()
-    except ValueError:
-        pass
-    if test_path.is_file():
-        return {test_path}
-    if not test_path.exists():
-        return set()
-    return {
-        path
-        for path in test_path.rglob("*")
-        if path.is_file()
-        and not _is_excluded(path, excluded_roots)
-        and "__pycache__" not in path.parts
-        and path.suffix in {".py", ".ini", ".toml", ".yaml", ".yml"}
-    }
-
-
-def _changed_repository_paths(
-    repo_root: Path,
-    excluded_roots: tuple[Path, ...],
-) -> set[Path]:
-    changed = _git_output(
-        repo_root,
-        "ls-files",
-        "-z",
-        "-m",
-        "-d",
-        "-o",
-        "--exclude-standard",
-        "--",
-        *_FINGERPRINT_SCOPE,
-    )
-    candidates = set()
-    for raw_name in changed.split(b"\0"):
-        if not raw_name:
-            continue
-        path = repo_root / os.fsdecode(raw_name)
-        relative = path.relative_to(repo_root).as_posix()
-        if relative not in _TIMING_REFRESH_ARTIFACTS and not _is_excluded(
-            path, excluded_roots
-        ):
-            candidates.add(path)
-    return candidates
-
-
-def _update_path_digest(digest: Any, repo_root: Path, path: Path) -> None:
-    try:
-        name = path.resolve().relative_to(repo_root.resolve()).as_posix()
-    except ValueError:
-        name = str(path.resolve())
-    digest.update(b"\0")
-    digest.update(name.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(bytes.fromhex(sha256_file(path)) if path.exists() else b"<deleted>")
-
-
-def fingerprint_paths(
-    repo_root: Path,
-    test_path: Path,
-    *,
-    excluded_roots: Sequence[Path] = (),
-) -> str:
-    digest = hashlib.sha256()
-    resolved_exclusions = tuple(path.resolve() for path in excluded_roots)
-    revision = _git_output(
-        repo_root, "rev-list", "-1", "HEAD", "--", *_FINGERPRINT_SCOPE
-    ).strip()
-    digest.update(revision)
-    digest.update(b"\0index\0")
-    digest.update(
-        _git_output(
-            repo_root,
-            "diff",
-            "--cached",
-            "--binary",
-            "--no-ext-diff",
-            "--",
-            *_FINGERPRINT_SCOPE,
-        )
-    )
-    candidates = _external_test_paths(repo_root, test_path, resolved_exclusions)
-    candidates.update(_changed_repository_paths(repo_root, resolved_exclusions))
-    for path in sorted(candidates, key=lambda value: str(value).encode("utf-8")):
-        _update_path_digest(digest, repo_root, path)
-    return digest.hexdigest()
+    return _normalize_source_git_sha(os.environ.get("SOURCE_GIT_SHA"))
 
 
 def collection_fingerprint(plan_or_nodes: Plan | Sequence[CollectedNode]) -> str:
@@ -327,7 +199,7 @@ def write_manifest(junit_dir: Path, manifest: dict[str, Any]) -> None:
 class ManifestBuild:
     repo_root: Path
     test_path: Path
-    repository_fingerprint: str
+    source_git_sha: str | None
     plan: Plan
     selection: dict[str, Any]
     estimate_files: dict[str, str | None]
@@ -342,7 +214,7 @@ def build_manifest(request: ManifestBuild) -> dict[str, Any]:
         "algorithm_version": ALGORITHM_VERSION,
         "created_at": time.time(),
         "repository_root": str(repo_root.resolve()),
-        "repository_fingerprint": request.repository_fingerprint,
+        "source_git_sha": request.source_git_sha,
         "collection_fingerprint": collection_fingerprint(plan),
         "test_path": str(test_path.resolve()),
         "selection": request.selection,
@@ -354,7 +226,7 @@ def build_manifest(request: ManifestBuild) -> dict[str, Any]:
 def verify_manifest(
     manifest: dict[str, Any],
     *,
-    repository_fingerprint: str,
+    source_git_sha: str | None,
     test_path: Path,
     selection: dict[str, Any],
     planning_options: dict[str, Any],
@@ -366,10 +238,6 @@ def verify_manifest(
             manifest.get("algorithm_version"),
             ALGORITHM_VERSION,
         ),
-        "repository_fingerprint": (
-            manifest.get("repository_fingerprint"),
-            repository_fingerprint,
-        ),
         "test_path": (manifest.get("test_path"), str(test_path.resolve())),
         "selection": (manifest.get("selection"), selection),
         "planning_options": (
@@ -380,6 +248,17 @@ def verify_manifest(
     for name, (saved, current) in checks.items():
         if saved != current:
             mismatches.append(f"{name}: saved={saved!r}, current={current!r}")
+    saved_source_git_sha = _normalize_source_git_sha(manifest.get("source_git_sha"))
+    current_source_git_sha = _normalize_source_git_sha(source_git_sha)
+    if (
+        saved_source_git_sha is not None
+        and current_source_git_sha is not None
+        and saved_source_git_sha != current_source_git_sha
+    ):
+        mismatches.append(
+            "source_git_sha: "
+            f"saved={saved_source_git_sha!r}, current={current_source_git_sha!r}"
+        )
     if mismatches:
         raise RunnerStateError(
             "existing run is incompatible; use a different --junit-dir:\n  "

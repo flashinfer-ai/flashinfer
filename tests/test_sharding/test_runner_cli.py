@@ -486,6 +486,42 @@ assert list(attempts.glob("attempt-*/attempt.json")), "attempt was not reserved"
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_manifest_compares_source_git_sha_only_when_both_values_are_available(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+
+    created = _run(
+        tmp_path,
+        "plan",
+        suite,
+        env_override={"SOURCE_GIT_SHA": "source-a"},
+    )
+    mismatch = _run(
+        tmp_path,
+        "plan",
+        suite,
+        env_override={"SOURCE_GIT_SHA": "source-b"},
+    )
+    unavailable = _run(
+        tmp_path,
+        "plan",
+        suite,
+        env_override={"SOURCE_GIT_SHA": ""},
+    )
+
+    assert created.returncode == 0, created.stdout + created.stderr
+    manifest = json.loads(
+        (tmp_path / "junit" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["source_git_sha"] == "source-a"
+    assert mismatch.returncode == 3
+    assert "source_git_sha" in mismatch.stderr
+    assert unavailable.returncode == 0, unavailable.stdout + unavailable.stderr
+
+
 @pytest.mark.parametrize(
     ("policy", "expected_code", "outcome"),
     [("skip", 0, "skipped"), ("fail", 1, "failed")],
