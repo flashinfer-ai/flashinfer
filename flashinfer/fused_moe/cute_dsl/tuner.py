@@ -31,7 +31,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -863,7 +863,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
     def forward(  # type: ignore[override]
         self,
         inputs: List[torch.Tensor],
-        tactic: Tuple = None,  # type: ignore[assignment]
+        tactic: Optional[Tuple] = None,
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
