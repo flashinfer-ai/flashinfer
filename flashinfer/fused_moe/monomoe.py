@@ -249,8 +249,6 @@ def _check_mono_moe_supported(
     top_k: int,
     scoring_func: str = "softmax",
     renormalize: bool = True,
-    expert_bias: Optional[torch.Tensor] = None,
-    routed_scaling_factor: float = 1.0,
     out: Optional[torch.Tensor] = None,
     scratchpad: Optional[torch.Tensor] = None,
     interleave_up: bool = True,
@@ -287,8 +285,6 @@ def mono_moe(
     top_k: int,
     scoring_func: str = "softmax",
     renormalize: bool = True,
-    expert_bias: Optional[torch.Tensor] = None,
-    routed_scaling_factor: float = 1.0,
     out: Optional[torch.Tensor] = None,
     scratchpad: Optional[torch.Tensor] = None,
     interleave_up: bool = True,
@@ -311,11 +307,6 @@ def mono_moe(
         top_k: experts selected per token (1..8).
         scoring_func: ``"sigmoid"`` or ``"softmax"``.
         renormalize: renormalize the top-K weights to sum to 1.
-        expert_bias: optional fp32 per-expert selection bias ``[E]``
-            (GLM-style noaux_tc routing; sigmoid scoring only).  Winners are
-            ranked by ``sigmoid(logit) + bias`` while the routing weight
-            stays the unbiased sigmoid.
-        routed_scaling_factor: scalar folded into every routing weight.
         out: optional bf16 output buffer ``[M, K]``; allocated if omitted.
         scratchpad: optional reusable uint8 scratchpad from
             :func:`alloc_scratchpad`; allocated per-call if omitted.
@@ -341,15 +332,7 @@ def mono_moe(
         expert_weights_down,
         expert_scales_down,
     )
-    E, K = _MONOMOE_E, _MONOMOE_K
-
-    if expert_bias is not None:
-        if scoring_func != "sigmoid":
-            raise ValueError("expert_bias requires scoring_func='sigmoid'")
-        if tuple(expert_bias.shape) != (E,):
-            raise ValueError(
-                f"expert_bias must be [{E}], got {tuple(expert_bias.shape)}"
-            )
+    K = _MONOMOE_K
 
     # The kernel reads the up weights in the interleaved Pair_Layout.
     if interleave_up:
@@ -373,7 +356,5 @@ def mono_moe(
         int(top_k),
         int(sf_map[scoring_func]),
         bool(renormalize),
-        expert_bias,
-        float(routed_scaling_factor),
     )
     return out
