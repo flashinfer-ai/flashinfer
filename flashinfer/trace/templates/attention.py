@@ -2765,16 +2765,6 @@ xqa_batch_decode_trace = TraceTemplate(
         "bmm2_scale": Scalar(
             "float32", optional=True, description="Scale applied after softmax @ V."
         ),
-        "q_cu_seq_lens": Tensor(
-            ["len_indptr"],
-            dtype="int32",
-            optional=True,
-            description=(
-                "Cumulative per-request draft lengths [batch_size + 1] for "
-                "ragged speculative decode; query stays packed as "
-                "[num_tokens, num_heads, head_dim]."
-            ),
-        ),
     },
     outputs={
         "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
