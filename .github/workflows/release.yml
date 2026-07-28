@@ -286,10 +286,25 @@ jobs:
           # Read release notes from file
           NOTES=$(cat ${{ steps.release-notes.outputs.notes_file }})
 
+          # Mark pre-release versions as such, otherwise GitHub reports them as
+          # the repository's "Latest release" and /releases/latest serves them
+          # to users and tooling as if they were stable. PEP 440 pre-release
+          # suffixes only: .postN is a post-release of a stable version and
+          # must stay a full release.
+          VERSION="${{ needs.setup.outputs.version }}"
+          PRERELEASE_FLAG=""
+          if [[ "$VERSION" =~ \.?(rc|a|b|alpha|beta|dev)[0-9]*$ ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "✓ $VERSION is a pre-release; marking it accordingly"
+          else
+            echo "✓ $VERSION is a full release"
+          fi
+
           # Create new release without assets first
           gh release create "$TAG" \
-            --title "Release v${{ needs.setup.outputs.version }}" \
-            --notes "$NOTES"
+            --title "Release v${VERSION}" \
+            --notes "$NOTES" \
+            $PRERELEASE_FLAG
 
       - name: Download flashinfer-python artifact
         uses: actions/download-artifact@v4
