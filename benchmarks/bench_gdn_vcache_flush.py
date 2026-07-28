@@ -33,10 +33,12 @@ def _load(name, path):
     return mod
 
 
-vcf = _load(
+_vcf_mod = _load(
     "vcf",
     os.path.join(REPO, "flashinfer/gdn_kernels/gdn_decode_bf16_wy_vcache_flush.py"),
-).gated_delta_rule_mtp_vcache_flush
+)
+vcf = _vcf_mod.gated_delta_rule_mtp_vcache_flush
+ST_TORCH = _vcf_mod.ST_TORCH  # GDN_VCACHE_STATE_DTYPE: bf16 (default) / fp16
 
 uc = None
 _UC_DIR = os.environ.get("GDN_UCACHE_DIR")
@@ -79,6 +81,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
     ap.add_argument("--flush-pct", type=int, default=33)
+    ap.add_argument(
+        "--base", type=int, default=0,
+        help="ring window origin for all requests (e.g. 28 places the live "
+        "window and appends across the 31->0 wrap)",
+    )
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     dev = "cuda"
@@ -101,32 +108,35 @@ def main():
         b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=dev)
         A_log = torch.randn(HV, dtype=torch.float32, device=dev) * 0.1
         dt_bias = torch.randn(HV, dtype=torch.float32, device=dev) * 0.1
-        S0 = torch.randn(B, HV, V, K, dtype=torch.bfloat16, device=dev) * 0.1
+        S0 = torch.randn(B, HV, V, K, dtype=ST_TORCH, device=dev) * 0.1
         idx = torch.arange(B, dtype=torch.int32, device=dev)
-        kc = torch.randn(B, HK, W, K, dtype=torch.bfloat16, device=dev)
-        vc_ = torch.randn(B, HV, W, V, dtype=torch.bfloat16, device=dev)
-        ac = torch.randn(B, HV, W, dtype=torch.float32, device=dev) * 0.1
-        bc = torch.randn(B, HV, W, dtype=torch.float32, device=dev)
+        kc = torch.randn(B, HK, 32, K, dtype=torch.bfloat16, device=dev)
+        vc_ = torch.randn(B, HV, 32, V, dtype=torch.bfloat16, device=dev)
+        ac = torch.randn(B, HV, 32, dtype=torch.float32, device=dev) * 0.1
+        bc = torch.randn(B, HV, 32, dtype=torch.float32, device=dev)
         hist = torch.full((B,), 8, dtype=torch.int32, device=dev)
         hist[perm[:nfl]] = 12
+        cb = torch.full((B,), args.base, dtype=torch.int32, device=dev)
         kwA = dict(
             A_log=A_log, a=a, dt_bias=dt_bias, q=q, k=k, v=v, b=b,
             initial_state_source=S0.clone(), initial_state_indices=idx,
             k_cache=kc, v_cache=vc_, a_cache=ac, b_cache=bc, hist_len=hist,
+            cache_base=cb,
             flush_min=12, restart_hist_on_flush=False, scale=SCALE,
         )
         tA = _us(lambda **kw: vcf(**kw), kwA)
         row = f"{B:>5} {tA:17.2f}"
         if uc:
-            kcu = torch.zeros(B, HK, 16, K, dtype=torch.bfloat16, device=dev)
-            ucu = torch.zeros(B, HV, 16, V, dtype=torch.bfloat16, device=dev)
-            gcu = torch.zeros(B, HV, 16, dtype=torch.float32, device=dev)
+            kcu = torch.zeros(B, HK, 32, K, dtype=torch.bfloat16, device=dev)
+            ucu = torch.zeros(B, HV, 32, V, dtype=torch.bfloat16, device=dev)
+            gcu = torch.zeros(B, HV, 32, dtype=torch.float32, device=dev)
             hu = torch.full((B,), 8, dtype=torch.int32, device=dev)
             hu[perm[:nfl]] = 13
             kwC = dict(
                 A_log=A_log, a=a, dt_bias=dt_bias, q=q, k=k, v=v, b=b,
                 initial_state_source=S0.clone(), initial_state_indices=idx,
                 k_cache=kcu, u_cache=ucu, g_cache=gcu, hist_len=hu,
+                cache_base=torch.full((B,), args.base, dtype=torch.int32, device=dev),
                 flush_min=13, restart_hist_on_flush=False, scale=SCALE,
             )
             tC = _us(lambda **kw: uc(**kw), kwC)

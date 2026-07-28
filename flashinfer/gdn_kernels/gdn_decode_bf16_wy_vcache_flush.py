@@ -1,18 +1,23 @@
 """CuTeDSL GDN raw-V-cache spec-decode kernel — verify + append + per-request flush.
 
 Raw-v-cache sibling of the u-cache spec-decode kernels (PR #4081): the ring
-caches RAW ``v``/``k`` (bf16, [pool, heads, 16, feat]) plus RAW ``a``/``b``
-(**fp32**, [pool, HV, 16]) instead of the materialized ``u`` — the WY solve
-reconstructs ``u`` on the fly. Flush knobs match #4081: ``hist_len`` (int32[B]
-per-request cursor P), ``flush_min`` (threshold; P >= flush_min folds + ring
-restart), ``restart_hist_on_flush`` (host-side cursor reset). bf16-only.
+caches RAW ``v``/``k`` (bf16, [pool, heads, 32, feat]) plus RAW ``a``/``b``
+(**fp32**, [pool, HV, 32]) instead of the materialized ``u`` — the WY solve
+reconstructs ``u`` on the fly. Ring and flush knobs match #4081: a 32-slot
+Triton-ReplaySSM-compatible circular ring whose live window is
+[cache_base, cache_base+hist_len) mod 32 with appends PAST the window,
+``flush_min`` (threshold; P >= flush_min folds the window into the state),
+and caller-owned cursor commits (``restart_hist_on_flush`` = standalone
+convenience). IO/rings are bf16 (+fp32 a/b); the checkpoint STATE dtype is
+bf16 by default or fp16 via GDN_VCACHE_STATE_DTYPE=fp16 (PR #4081's
+fp16-state mode: higher-fidelity commits at identical bandwidth).
 
 Per CTA (b, hv), the 16-row window [P committed | T draft | zero tail] is
 assembled IN-KERNEL: committed rows stream from the ring caches via cp.async,
 draft rows from the fresh [B, T, ...] tensors, dead-tail rows zero-fill via the
 cp.async src-size operand. Committed a/b are read fp32 (full decay precision).
-Draft v/a/b append to their rings in-kernel (per-hv slices — race-free); the
-shared k ring appends host-side after the launch (see the wrapper comment).
+ALL ring appends (k/v/a/b) happen in-kernel: appends land past every live
+window, so even the shared k ring can never race a sibling CTA's reads.
 Draft outputs are written COMPACTED to [B, T, HV, V]. Fully CUDA-graph-safe.
 
 PREDICTIVE flush model: flush_min, hist_len <= 16 - T so [committed | draft]
@@ -35,9 +40,11 @@ staging); the vN tags in region comments record that lineage's measured
 rationale. K == V == 128, 16-row window only. Requires SM90+.
 """
 
-import torch
 import math
+import os
 import weakref
+
+import torch
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -65,6 +72,54 @@ BK_H = 16  # K-tile for H GEMM (must be a multiple of 16 for mma.k=16)
 EPS = 1e-6
 io = cutlass.BFloat16
 f32 = cutlass.Float32
+# Checkpoint-state (pool) element type: defaults to bf16 (the IO dtype). Set
+# GDN_VCACHE_STATE_DTYPE=fp16 for the MIXED mode (PR #4081 parity): q/k/v
+# inputs, the raw v/k/a/b rings, and the output stay bf16; only the checkpoint
+# is stored fp16 (10 mantissa bits vs bf16's 7 at identical bandwidth).
+# State-touching paths then run at higher fidelity: the H GEMM and the Step-A
+# KH piggyback (B = the state tile) convert their four shared A-fragments
+# bf16->f16 in registers (exact: every bf16 value is f16-representable in
+# range — activations/normed-k never reach f16's 65504 limit) and issue
+# .f16.f16 MMAs; the Step-E fold unpacks fp16 state pairs through f32 FMAs
+# and repacks fp16.
+_ST_ENV = os.environ.get("GDN_VCACHE_STATE_DTYPE", "").strip().lower()
+if _ST_ENV in ("", "bf16", "bfloat16"):
+    state_ty = cutlass.BFloat16
+    ST_TORCH = torch.bfloat16
+    _ST_MIXED = False
+elif _ST_ENV in ("fp16", "float16", "half"):
+    state_ty = cutlass.Float16
+    ST_TORCH = torch.float16
+    _ST_MIXED = True
+else:
+    raise ValueError(
+        f"GDN_VCACHE_STATE_DTYPE={_ST_ENV!r} unsupported: use 'bf16' (default) "
+        "or 'fp16'."
+    )
+if _ST_MIXED:
+    _CVT_ST2_FROM_F32 = "cvt.rn.f16x2.f32"  # pack two f32 -> state pair
+    _CVT_F32_FROM_ST = "cvt.f32.f16"
+    _MMA_H_F32 = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+else:
+    _CVT_ST2_FROM_F32 = "cvt.rn.bf16x2.f32"
+    _CVT_F32_FROM_ST = "cvt.f32.bf16"
+    _MMA_H_F32 = "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+# H-GEMM A-fragment bf16->f16 in-register conversion (mixed mode only):
+# widen each bf16 pair through f32 (shl/and bit tricks — exact) and repack
+# f16x2, for all four shared A fragments. Empty in the bf16 mode.
+_H_A_CVT_ASM = (
+    "{ .reg .b32 _wl, _wh; .reg .f32 _fl, _fh;"
+    " shl.b32 _wl, _a0, 16; and.b32 _wh, _a0, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a0, _fh, _fl;"
+    " shl.b32 _wl, _a1, 16; and.b32 _wh, _a1, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a1, _fh, _fl;"
+    " shl.b32 _wl, _a2, 16; and.b32 _wh, _a2, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a2, _fh, _fl;"
+    " shl.b32 _wl, _a3, 16; and.b32 _wh, _a3, 0xFFFF0000;"
+    " mov.b32 _fl, _wl; mov.b32 _fh, _wh; cvt.rn.f16x2.f32 _a3, _fh, _fl; }"
+    if _ST_MIXED
+    else ""
+)
 WARP = 32
 THREADS = 128
 T_PAD = 16
@@ -73,7 +128,14 @@ T_PAD = 16
 K_HALF = K_DIM // 2  # 64 — v13 half-H streaming (sH = 16 KiB instead of 32 KiB)
 K_PADDED = K_DIM + 8  # 136 — padded row stride for sK / sQ
 V_PADDED = V_DIM_C + 8  # 136 — padded row stride for sV / sH (V rows, K cols)
-W_RING_C = 16  # (vcache) ring-buffer slots per request (== the 16-row window)
+W_RING_C = 16  # max history WINDOW rows (one 16-row MMA tile) — smem/tile constant
+# Physical ring depth (Triton-ReplaySSM-compatible circular ring). The live
+# window is [base, base+P) mod RING_SLOTS with P <= W_RING_C; appends land at
+# (base+P+s) & RING_MASK — always PAST the window, so a flush never overwrites
+# rows any sibling CTA is still reading (the old single-buffer restart race).
+# Cursor commits (base slide / len reset) are CALLER-OWNED, outside the launch.
+RING_SLOTS = 32
+RING_MASK = RING_SLOTS - 1
 # sH layout: (V=128 rows, K_PADDED=136 cols) stored contiguous K-first
 # → row_stride_bytes = K_PADDED * 2 = 272.
 
@@ -714,17 +776,18 @@ def _h_gemm_4v(
         ],
         "{ .reg .b32 _a<4>, _b<2>;"
         " ldmatrix.sync.aligned.x4.m8n8.shared.b16 {_a0,_a1,_a2,_a3}, [$32];"
+        f"{_H_A_CVT_ASM}"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$33];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+        f" {_MMA_H_F32}"
         "   {$0,$1,$2,$3}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$0,$1,$2,$3};"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$34];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+        f" {_MMA_H_F32}"
         "   {$4,$5,$6,$7}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$4,$5,$6,$7};"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$35];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+        f" {_MMA_H_F32}"
         "   {$8,$9,$10,$11}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$8,$9,$10,$11};"
         " ldmatrix.sync.aligned.x2.m8n8.shared.b16 {_b0,_b1}, [$36];"
-        " mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+        f" {_MMA_H_F32}"
         "   {$12,$13,$14,$15}, {_a0,_a1,_a2,_a3}, {_b0,_b1}, {$12,$13,$14,$15}; }",
         "=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,"
         "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
@@ -736,6 +799,46 @@ def _h_gemm_4v(
     return tuple(
         cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [i])) for i in range(16)
     )
+
+
+def _st2_to_f32x2(packed_i32):
+    """Unpack a STATE-dtype pair word into two f32 values (lo, hi).
+    bf16 mode: identical to ``_bf16x2_to_f32x2``; fp16-state mode: cvt.f32.f16.
+    Used only on Step E's H0 reads (the state tile)."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.f32()] * 2),
+        [packed_i32.ir_value()],
+        "{ .reg .b16 _lo, _hi;"
+        " mov.b32 {_lo, _hi}, $2;"
+        f" {_CVT_F32_FROM_ST} $0, _lo;"
+        f" {_CVT_F32_FROM_ST} $1, _hi; }}",
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [0])),
+        cutlass.Float32(llvm.extractvalue(mlir_T.f32(), r, [1])),
+    )
+
+
+def _sts_st2_f32(smem_addr_i32, lo_f32, hi_f32):
+    """STS one STATE-dtype pair packed from two f32 (Step E H0_new STS-back).
+    bf16 mode: identical to ``_sts_bf16x2_f32``; fp16-state: cvt.rn.f16x2.f32."""
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [smem_addr_i32.ir_value(), lo_f32.ir_value(), hi_f32.ir_value()],
+        "{ .reg .b32 _v;"
+        f" {_CVT_ST2_FROM_F32} _v, $3, $2;"
+        " st.shared.b32 [$1], _v; mov.u32 $0, 0; }"
+        "",
+        "=r,r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
 
 
 def _sw128_xor(addr_i32):
@@ -860,6 +963,7 @@ class GdnVcacheFlushKernel:
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
         gP: cute.Tensor,
+        gBase: cute.Tensor,
         gOut: cute.Tensor,
         gKC: cute.Tensor,
         gVC: cute.Tensor,
@@ -908,6 +1012,7 @@ class GdnVcacheFlushKernel:
             gH0,
             gH0idx,
             gP,
+            gBase,
             gOut,
             gKC,
             gVC,
@@ -942,6 +1047,7 @@ class GdnVcacheFlushKernel:
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
         gP: cute.Tensor,
+        gBase: cute.Tensor,
         gOut: cute.Tensor,
         gKC: cute.Tensor,
         gVC: cute.Tensor,
@@ -1048,6 +1154,11 @@ class GdnVcacheFlushKernel:
         _p5_iters = Int32(1)
         if p_val == Int32(0):
             _p5_iters = Int32(0)
+        # Ring window origin (Triton cache_base semantics). All HISTORY ring
+        # row addresses below are (ring_base + logical_row) & RING_MASK;
+        # appends use (ring_base + P_hist + s) & RING_MASK — past the live
+        # window. Smem/logical window rows stay 0..15 (unwrapped).
+        ring_base = gBase.iterator[pid_b]
 
         # v12 EXP3h: hoist γβ LDGs to ABSOLUTE START of kernel (before SMEM setup).
         # Currently they're at line ~638, AFTER lots of SMEM struct definition and
@@ -1067,12 +1178,13 @@ class GdnVcacheFlushKernel:
                 # bf16 round-trip. Draft rows read the fresh bf16 tensors. Rows
                 # >= P_hist + T_D keep 0 (dead-tail; causal prefix-sum isolates
                 # them). a_cache/b_cache layout: [pool, HV, 16] fp32.
-                _abc_off = cache_idx * (HV * Int32(W_RING_C)) + pid_hv * Int32(
-                    W_RING_C
+                _abc_off = cache_idx * (HV * Int32(RING_SLOTS)) + pid_hv * Int32(
+                    RING_SLOTS
                 )
                 if lane_id < P_hist:
-                    _v7e_a_bf16 = gAC.iterator[_abc_off + lane_id]
-                    _v7e_b_bf16 = gBC.iterator[_abc_off + lane_id]
+                    _abc_ring = (ring_base + lane_id) & Int32(RING_MASK)
+                    _v7e_a_bf16 = gAC.iterator[_abc_off + _abc_ring]
+                    _v7e_b_bf16 = gBC.iterator[_abc_off + _abc_ring]
                 if lane_id >= P_hist and lane_id < P_hist + _T_D:
                     _v7e_a_bf16 = gA.iterator[
                         pid_b * sa_b + (lane_id - P_hist) * sa_t + pid_hv * sa_hv
@@ -1102,7 +1214,9 @@ class GdnVcacheFlushKernel:
             # v13 half-H: H tile = V=128 rows × K=64 cols bf16 = 16 KiB.
             # SW128 swizzled, single-buffered. Reused across 2 TMA loads
             # via mbarrier ping-pong. Saves 16 KiB SMEM/CTA vs v12.2.
-            h_buf: cute.struct.Align[cute.struct.MemRange[io, V_DIM_C * K_HALF], 128]
+            h_buf: cute.struct.Align[
+                cute.struct.MemRange[state_ty, V_DIM_C * K_HALF], 128
+            ]
             tmat_bf: cute.struct.Align[cute.struct.MemRange[io, T * BF_PAD], 128]
             gamma: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
             beta: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
@@ -1217,8 +1331,8 @@ class GdnVcacheFlushKernel:
             # (vcache) ring bases. k_cache layout [pool, H, 16, K] bf16: rows of
             # this CTA's k-head i_h start at cache_idx*(H*16*K) + i_h*(16*K).
             _gKC_base = gKC.iterator.toint()
-            _kc_ring_base = cache_idx * (H * Int32(W_RING_C * K_DIM)) + i_h * Int32(
-                W_RING_C * K_DIM
+            _kc_ring_base = cache_idx * (H * Int32(RING_SLOTS * K_DIM)) + (
+                i_h * Int32(RING_SLOTS * K_DIM)
             )
         _sK_i32 = cute.recast_tensor(sK, cutlass.Int32)
         _sQ_i32 = cute.recast_tensor(sQ, cutlass.Int32)
@@ -1245,7 +1359,9 @@ class GdnVcacheFlushKernel:
                 if _kq_row < P_hist:
                     _k_src_base = _gKC_base
                     _k_src_off = (
-                        _kc_ring_base + _kq_row * Int32(K_DIM) + _kq_col_bf16_async
+                        _kc_ring_base
+                        + ((ring_base + _kq_row) & Int32(RING_MASK)) * Int32(K_DIM)
+                        + _kq_col_bf16_async
                     )
                     _k_sz = Int32(16)
                 if _kq_row >= P_hist and _kq_row < P_hist + _T_D:
@@ -1329,26 +1445,18 @@ class GdnVcacheFlushKernel:
                 sBeta.iterator[lane_id] = beta_val
                 sBeta.iterator[T + lane_id] = f32(1.0) / exp_g
             # (vcache) IN-KERNEL a/b ring append: the draft a/b values already
-            # sit in this warp's _v7e regs as fp32 (lane == window row); store
-            # lanes [P_hist, P_hist+T_D) to the fp32 rings at [wbase, wbase+T_D)
-            # (wbase = 0 on flush restart, P_hist on verify). RACE-FREE: the
-            # a/b ring slice is per-(pool,hv) — read and written only by THIS
-            # CTA, and the entry loads are ordered before these stores by the
-            # shuffle_sync data dependence above.
+            # sit in this warp's _v7e regs as fp32 (lane == logical window
+            # row); store lanes [P_hist, P_hist+T_D) to the fp32 rings at
+            # (ring_base + lane) & RING_MASK — past the live window (ring
+            # semantics: appends never overwrite committed rows).
             if const_expr(self._vcache_t_draft > 0):
-                _wb_ab = P_hist
-                if P_hist >= flush_min:
-                    _wb_ab = Int32(0)
-                _abc_st = cache_idx * (HV * Int32(W_RING_C)) + pid_hv * Int32(
-                    W_RING_C
+                _abc_st = cache_idx * (HV * Int32(RING_SLOTS)) + pid_hv * Int32(
+                    RING_SLOTS
                 )
                 if lane_id >= P_hist and lane_id < P_hist + _T_D:
-                    gAC.iterator[
-                        _abc_st + _wb_ab + (lane_id - P_hist)
-                    ] = _v7e_a_bf16
-                    gBC.iterator[
-                        _abc_st + _wb_ab + (lane_id - P_hist)
-                    ] = _v7e_b_bf16
+                    _abw_ring = (ring_base + lane_id) & Int32(RING_MASK)
+                    gAC.iterator[_abc_st + _abw_ring] = _v7e_a_bf16
+                    gBC.iterator[_abc_st + _abw_ring] = _v7e_b_bf16
 
         # ============================================================
         # Wait for K+Q (group 0); H load is now driven by mbarrier (TMA),
@@ -1356,6 +1464,38 @@ class GdnVcacheFlushKernel:
         # ============================================================
         _cp_async_wait_group_0()
         sync_threads()
+
+        # (vcache) IN-KERNEL k ring append, from SMEM: sK holds the RAW
+        # assembled window here (post-wait, PRE-norm — the ring caches raw k;
+        # the L2 norm below scales sK in place). The writer CTA of each
+        # k-head group STGs the draft rows [P_hist, P_hist+T_D) to ring rows
+        # (ring_base + P_hist + s) & RING_MASK — past EVERY sibling CTA's
+        # live window [base, base+P), so the write can never race a
+        # committed-row read (the ring-semantics guarantee that replaced the
+        # old k-append micro-kernel launch). LDS is unconditional (row
+        # wrapped mod T_D keeps the address in [P_hist, P_hist+T_D) ⊂
+        # [0,16)); only the STG is predicated (scalar call — legal in a
+        # runtime if-region, unlike the tuple-unpack LDS).
+        if const_expr(self._vcache_t_draft > 0):
+            _kap_row = (tidx // Int32(K_DIM // 8)) % _T_D
+            _kap_pos = tidx % Int32(K_DIM // 8)
+            _kv0, _kv1, _kv2, _kv3 = _lds_v4_b32(
+                _sK_base_async
+                + (P_hist + _kap_row) * Int32(K_PADDED * 2)
+                + _kap_pos * Int32(16)
+            )
+            _kap_ring = (ring_base + P_hist + _kap_row) & Int32(RING_MASK)
+            if (pid_hv % (HV // H)) == 0 and tidx < Int32(
+                self._vcache_t_draft * (K_DIM // 8)
+            ):
+                _st_global_v4_b32(
+                    _gKC_base,
+                    _kc_ring_base + _kap_ring * Int32(K_DIM) + _kap_pos * Int32(8),
+                    _kv0,
+                    _kv1,
+                    _kv2,
+                    _kv3,
+                )
 
         # L2 norm for K (warps 0,1) and Q (warps 2,3) — t-aware warp skip.
         # At T<=8, warps 1 and 3 (which normalize rows 8..15) are dead-elided.
@@ -1897,8 +2037,8 @@ class GdnVcacheFlushKernel:
         if const_expr(self._vcache_t_draft > 0):
             # (vcache) v ring base. v_cache layout [pool, HV, 16, V] bf16.
             _gVC_base = gVC.iterator.toint()
-            _vc_ring_base = cache_idx * (HV * Int32(W_RING_C * V_DIM_C)) + (
-                pid_hv * Int32(W_RING_C * V_DIM_C)
+            _vc_ring_base = cache_idx * (HV * Int32(RING_SLOTS * V_DIM_C)) + (
+                pid_hv * Int32(RING_SLOTS * V_DIM_C)
             )
         _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
         for i in cutlass.range_constexpr(_v_iters):
@@ -1918,7 +2058,9 @@ class GdnVcacheFlushKernel:
                 if _v_row < P_hist:
                     _v_src_base = _gVC_base
                     _v_src_off = (
-                        _vc_ring_base + _v_row * Int32(V_DIM_C) + _v_col_bf16_async
+                        _vc_ring_base
+                        + ((ring_base + _v_row) & Int32(RING_MASK)) * Int32(V_DIM_C)
+                        + _v_col_bf16_async
                     )
                     _v_sz = Int32(16)
                 if _v_row >= P_hist and _v_row < P_hist + _T_D:
@@ -2260,16 +2402,12 @@ class GdnVcacheFlushKernel:
 
         # (vcache) IN-KERNEL v ring append: the draft v rows are RESIDENT in
         # sV[P_hist : P_hist+T_D) (just waited above); copy them to the v ring
-        # at [wbase, wbase+T_D). RACE-FREE: the v ring slice is per-(pool,hv) —
-        # only this CTA reads it (the cp.async fill above, program-ordered
-        # before these stores). LDS is unconditional (row wrapped mod T_D, so
+        # at (ring_base + P_hist + s) & RING_MASK — PAST the live window
+        # (ring semantics: appends never overwrite committed rows). LDS is unconditional (row wrapped mod T_D, so
         # the address stays in [P_hist, P_hist+T_D) ⊂ [0,16) — reading a valid
         # row twice is harmless); only the STG is gated (tuple-unpack helpers
         # cannot sit inside a runtime if-region).
         if const_expr(self._vcache_t_draft > 0):
-            _wb_v = P_hist
-            if P_hist >= flush_min:
-                _wb_v = Int32(0)
             _vap_row = (tidx // Int32(V_DIM_C // 8)) % _T_D
             _vap_pos = tidx % Int32(V_DIM_C // 8)
             _vap_addr = (
@@ -2279,10 +2417,11 @@ class GdnVcacheFlushKernel:
             )
             _va0, _va1, _va2, _va3 = _lds_v4_b32(_vap_addr)
             _gVC_st = gVC.iterator.toint()
+            _vap_ring = (ring_base + P_hist + _vap_row) & Int32(RING_MASK)
             if tidx < Int32(self._vcache_t_draft * (V_DIM_C // 8)):
                 _st_global_v4_b32(
                     _gVC_st,
-                    _vc_ring_base + (_wb_v + _vap_row) * Int32(V_DIM_C) + (
+                    _vc_ring_base + _vap_ring * Int32(V_DIM_C) + (
                         _vap_pos * Int32(8)
                     ),
                     _va0,
@@ -2544,15 +2683,15 @@ class GdnVcacheFlushKernel:
                             _e_sa8 = _sw128_xor(
                                 _sH_int_p5 + _e_rv8 * _rs_b + _e_kcl * 2
                             )
-                            _h0l0, _h0h0 = _bf16x2_to_f32x2(_lds_b32(_e_sa0))
-                            _h0l8, _h0h8 = _bf16x2_to_f32x2(_lds_b32(_e_sa8))
+                            _h0l0, _h0h0 = _st2_to_f32x2(_lds_b32(_e_sa0))
+                            _h0l8, _h0h8 = _st2_to_f32x2(_lds_b32(_e_sa8))
                             if p_val > Int32(0):  # P=0 CTAs skip the store path
-                                _sts_bf16x2_f32(
+                                _sts_st2_f32(
                                     _e_sa0,
                                     _exp_gp * _h0l0 + _er[_eg * 4 + 0],
                                     _exp_gp * _h0h0 + _er[_eg * 4 + 1],
                                 )
-                                _sts_bf16x2_f32(
+                                _sts_st2_f32(
                                     _e_sa8,
                                     _exp_gp * _h0l8 + _er[_eg * 4 + 2],
                                     _exp_gp * _h0h8 + _er[_eg * 4 + 3],
@@ -2623,92 +2762,6 @@ def _cached_bf16(t):
     return c
 
 
-class GdnVcacheKAppend:
-    """(vcache) k-ring append micro-kernel: copy every request's T_D draft k
-    rows into the k ring at [wbase, wbase+T_D) (wbase = 0 on flush restart,
-    P on verify). A SEPARATE launch, stream-ordered AFTER the main kernel —
-    the k ring is shared by the HV/H sibling CTAs of a request, so an
-    in-main-kernel flush-restart write (rows [0, T_D)) could race a
-    late-scheduled sibling still reading committed rows [0, P); this launch
-    boundary is the grid-wide ordering that makes the restart safe.
-    Grid: one CTA per request; ~T_D*H*K bf16 (16 KB at T=4/H=16/K=128)."""
-
-    def __init__(self, t_draft, h_heads):
-        self._t_draft = int(t_draft)
-        self._h = int(h_heads)
-
-    @cute.experimental.jit
-    def __call__(
-        self,
-        gK: cute.Tensor,
-        gKC: cute.Tensor,
-        gH0idx: cute.Tensor,
-        gHlen: cute.Tensor,
-        flush_min: cutlass.Int32,
-        stream: cuda.CUstream,
-    ):
-        B_val = gHlen.layout.shape[0]
-        self.kernel(gK, gKC, gH0idx, gHlen, flush_min).launch(
-            grid=(1, 1, B_val),
-            block=[THREADS, 1, 1],
-            cluster=(1, 1, 1),
-            stream=stream,
-        )
-
-    @cute.experimental.kernel
-    def kernel(
-        self,
-        gK: cute.Tensor,
-        gKC: cute.Tensor,
-        gH0idx: cute.Tensor,
-        gHlen: cute.Tensor,
-        flush_min: cutlass.Int32,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        _, _, pid_b = cute.arch.block_idx()
-        P_hist = gHlen.iterator[pid_b]
-        cache_idx = gH0idx.iterator[pid_b]
-        _wb = P_hist
-        if P_hist >= flush_min:
-            _wb = Int32(0)
-        T_D = self._t_draft
-        HK = self._h
-        _chunks = HK * T_D * (K_DIM // 8)  # 16-B chunks per request
-        _gK_b = gK.iterator.toint()
-        _gKC_b = gKC.iterator.toint()
-        _src_b = pid_b * Int32(T_D * HK * K_DIM)
-        _dst_b = cache_idx * Int32(HK * W_RING_C * K_DIM)
-        for i in cutlass.range_constexpr((_chunks + THREADS - 1) // THREADS):
-            _c = tidx + i * THREADS
-            # LDG address wraps mod _chunks so the tuple-unpack load can stay
-            # OUTSIDE the runtime guard (DSL region rule); only the STG is
-            # gated. A wrapped re-load reads valid draft bytes — harmless.
-            _cc = _c % Int32(_chunks)
-            _t = _cc // Int32(HK * (K_DIM // 8))
-            _rem = _cc % Int32(HK * (K_DIM // 8))
-            _hh = _rem // Int32(K_DIM // 8)
-            _pos = _rem % Int32(K_DIM // 8)
-            _v0, _v1, _v2, _v3 = _ldg_v4_b32(
-                _gK_b,
-                _src_b + _t * Int32(HK * K_DIM) + _hh * Int32(K_DIM) + (
-                    _pos * Int32(8)
-                ),
-            )
-            if _c < Int32(_chunks):
-                _st_global_v4_b32(
-                    _gKC_b,
-                    _dst_b + _hh * Int32(W_RING_C * K_DIM) + (_wb + _t) * Int32(
-                        K_DIM
-                    ) + _pos * Int32(8),
-                    _v0,
-                    _v1,
-                    _v2,
-                    _v3,
-                )
-
-
-_KAPP_CACHE: dict = {}
-
 
 def gated_delta_rule_mtp_vcache_flush(
     A_log: torch.Tensor,
@@ -2727,6 +2780,7 @@ def gated_delta_rule_mtp_vcache_flush(
     a_cache: Optional[torch.Tensor] = None,
     b_cache: Optional[torch.Tensor] = None,
     hist_len: Optional[torch.Tensor] = None,
+    cache_base: Optional[torch.Tensor] = None,
     flush_min: Optional[int] = None,
     restart_hist_on_flush: bool = True,
     use_qk_l2norm_in_kernel: bool = True,
@@ -2739,14 +2793,21 @@ def gated_delta_rule_mtp_vcache_flush(
     caches RAW ``v/k`` (bf16) plus RAW ``a/b`` (fp32) instead of the materialized
     ``u``, and the WY solve reconstructs ``u`` on the fly. ``q`` is not cached.
 
-    Per request ``b`` with cursor ``P = hist_len[b]`` (filled ring slots):
+    RING SEMANTICS (Triton-ReplaySSM-compatible): the live window of request
+    ``b`` is ``[cache_base[b], cache_base[b]+hist_len[b]) mod 32`` and the T
+    new (raw-k, raw-v, fp32 a, fp32 b) entries are appended at
+    ``(cache_base+hist_len+s) & 31`` — past the window, for flush and verify
+    rows alike, so an append can never overwrite rows a sibling CTA still
+    reads. Cursor commits are CALLER-OWNED (outside the launch): flush rows
+    ``base' = (base+len) & 31, len' = accepted``; verify rows
+    ``len' = len + accepted``. ``restart_hist_on_flush=True`` applies that
+    commit here as a convenience for standalone use (graph-capturable ops).
+
+    Per request ``b`` with window length ``P = hist_len[b]``:
       - ``P <  flush_min``: verify only. Draft outputs come from S0 evolved
-        through the P committed ring rows + the T drafts; state is UNCHANGED;
-        the T drafts are appended to the ring at slots ``[P, P+T)``.
+        through the P committed ring rows + the T drafts; state is UNCHANGED.
       - ``P >= flush_min``: additionally FOLD the committed rows into the state
-        pool at ``initial_state_indices[b]`` (in place, kernel B's WY Phase-5
-        math, unchanged) and RESTART — the T drafts land at slots ``[0, T)`` and
-        this wrapper zeroes ``hist_len`` after the call (``restart_hist_on_flush``).
+        pool at ``initial_state_indices[b]`` (in place, WY Phase-5 math).
 
     PREDICTIVE flush model (differs from #4081's lazy variant): ``flush_min`` and
     ``hist_len`` are capped at ``W_RING - T`` so ``[committed | draft]`` always
@@ -2754,10 +2815,11 @@ def gated_delta_rule_mtp_vcache_flush(
     window (equal to S0' + draft for the draft rows), so no fold-before-output
     path is needed. ``flush_min`` defaults to ``W_RING - T``.
 
-    Ring tensors (zero-initialize at pool allocation):
-      k_cache [pool, H,  16, K] bf16   v_cache [pool, HV, 16, V] bf16
-      a_cache [pool, HV, 16]    f32    b_cache [pool, HV, 16]    f32
-      hist_len [B] int32   filled ring slots P per request (legal [0, W_RING-T])
+    Ring tensors (zero-initialize at pool allocation; RING_SLOTS = 32 deep):
+      k_cache [pool, H,  32, K] bf16   v_cache [pool, HV, 32, V] bf16
+      a_cache [pool, HV, 32]    f32    b_cache [pool, HV, 32]    f32
+      hist_len   [B] int32  live-window length P (legal [0, W_RING-T])
+      cache_base [B] int32  ring window origin (legal [0, 32))
 
     Draft inputs ``q/k/v/a/b`` are ``[B, T, ...]``. Returns ``output`` of shape
     ``[B, T, HV, V]`` (bf16) — the draft-token outputs, written COMPACTED by
@@ -2774,8 +2836,10 @@ def gated_delta_rule_mtp_vcache_flush(
     assert initial_state_source is not None
     assert use_qk_l2norm_in_kernel, "kernel always applies Q/K L2 norm."
     assert softplus_beta == 1.0 and softplus_threshold == 20.0
-    assert initial_state_source.dtype == torch.bfloat16, (
-        f"initial_state_source must be bf16 (pool,HV,V,K); got {initial_state_source.dtype}."
+    assert initial_state_source.dtype == ST_TORCH, (
+        f"initial_state_source must be {ST_TORCH} (pool,HV,V,K) — module STATE "
+        f"dtype (GDN_VCACHE_STATE_DTYPE={_ST_ENV!r}); got "
+        f"{initial_state_source.dtype}."
     )
     assert initial_state_source.is_contiguous(), (
         "initial_state_source must be contiguous — the flush writes it in place."
@@ -2801,10 +2865,10 @@ def gated_delta_rule_mtp_vcache_flush(
         and b_cache is not None and hist_len is not None
     ), "k_cache/v_cache/a_cache/b_cache/hist_len are required."
     pool = initial_state_source.shape[0]
-    assert tuple(k_cache.shape) == (pool, HK, W_RING, K_dim), tuple(k_cache.shape)
-    assert tuple(v_cache.shape) == (pool, HV, W_RING, V_dim), tuple(v_cache.shape)
-    assert tuple(a_cache.shape) == (pool, HV, W_RING), tuple(a_cache.shape)
-    assert tuple(b_cache.shape) == (pool, HV, W_RING), tuple(b_cache.shape)
+    assert tuple(k_cache.shape) == (pool, HK, RING_SLOTS, K_dim), tuple(k_cache.shape)
+    assert tuple(v_cache.shape) == (pool, HV, RING_SLOTS, V_dim), tuple(v_cache.shape)
+    assert tuple(a_cache.shape) == (pool, HV, RING_SLOTS), tuple(a_cache.shape)
+    assert tuple(b_cache.shape) == (pool, HV, RING_SLOTS), tuple(b_cache.shape)
     assert k_cache.dtype == torch.bfloat16 and v_cache.dtype == torch.bfloat16, (
         "k_cache/v_cache must be bf16."
     )
@@ -2840,7 +2904,40 @@ def gated_delta_rule_mtp_vcache_flush(
     v = v.contiguous()
     a = a.contiguous()
     b = b.contiguous()
+    if restart_hist_on_flush:
+        # The standalone commit at the end of this call mutates hist_len and
+        # cache_base IN PLACE and must see the caller's own storage across
+        # calls: cache_base=None would slide the base of a throwaway temp
+        # (the next call re-defaults base to 0 and reads a stale window), and
+        # a non-contiguous tensor would be silently replaced by its
+        # .contiguous() copy below, absorbing the commit the same way.
+        if cache_base is None:
+            raise ValueError(
+                "gated_delta_rule_mtp_vcache_flush: restart_hist_on_flush="
+                "True commits ring cursors in place and needs a caller-owned "
+                "cache_base (got None). Keep a persistent int32 [B] tensor "
+                "(zeros initially) across calls, or pass "
+                "restart_hist_on_flush=False and own the cursor commit."
+            )
+        assert hist_len.is_contiguous() and cache_base.is_contiguous(), (
+            "restart_hist_on_flush=True: hist_len and cache_base must be "
+            "contiguous — .contiguous() would copy them and the in-place "
+            "cursor commit would be lost on the caller's tensors."
+        )
+        # Cursor range validation (host sync: standalone path only, never
+        # while a CUDA graph is capturing). The ring masks all addressing
+        # with & RING_MASK, so out-of-range cursors corrupt SILENTLY.
+        if not torch.cuda.is_current_stream_capturing():
+            _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
+            assert 0 <= _cb_min and _cb_max < RING_SLOTS, (
+                f"cache_base out of legal range [0, {RING_SLOTS}): "
+                f"min={_cb_min} max={_cb_max}"
+            )
     hist_len = hist_len.contiguous()
+    if cache_base is None:
+        cache_base = torch.zeros_like(hist_len)
+    assert cache_base.dtype == torch.int32 and cache_base.shape[0] == B
+    cache_base = cache_base.contiguous()
     assert (
         k_cache.is_contiguous()
         and v_cache.is_contiguous()
@@ -2884,7 +2981,7 @@ def gated_delta_rule_mtp_vcache_flush(
         mk_dyn(q), mk_dyn(k), mk_dyn(v), mk_dyn(a), mk_dyn(b),
         mk(A_logb, 16), mk(dt_biasb, 16),
         mk_dyn(h0), mk_dyn(initial_state_indices),
-        mk_dyn(hist_len),
+        mk_dyn(hist_len), mk_dyn(cache_base),
         mk_dyn(out_c),
         mk_dyn(k_cache), mk_dyn(v_cache), mk_dyn(a_cache), mk_dyn(b_cache),
         scale, int(flush_min), HV, V_dim, H, stream,
@@ -2909,25 +3006,18 @@ def gated_delta_rule_mtp_vcache_flush(
     # sibling hv-CTAs of a request read committed k rows [0, P) while the
     # writer CTA restarts rows [0, T) — no grid-wide sync exists).
     # ------------------------------------------------------------------
-    # v/a/b ring appends happen IN-KERNEL (their ring slices are per-hv —
-    # single-CTA read+write, race-free). The k ring is SHARED by the HV/H
-    # sibling CTAs of each request, so its append runs as a SEPARATE
-    # micro-kernel launch (GdnVcacheKAppend) — the launch boundary is the
-    # grid-wide ordering that makes the flush-restart write (rows [0, T))
-    # safe against siblings still reading committed rows [0, P).
-    kkey = (str(device), T, HK)
-    if kkey not in _KAPP_CACHE:
-        _KAPP_CACHE[kkey] = cute.compile(
-            GdnVcacheKAppend(t_draft=T, h_heads=HK),
-            mk_dyn(k), mk_dyn(k_cache), mk_dyn(initial_state_indices),
-            mk_dyn(hist_len), int(flush_min), stream,
-        )
-    _KAPP_CACHE[kkey](
-        mk_dyn(k), mk_dyn(k_cache), mk_dyn(initial_state_indices),
-        mk_dyn(hist_len), int(flush_min), stream,
-    )
+    # ALL ring appends (k/v/a/b) happen IN-KERNEL: appends land PAST every
+    # request's live window ((base+len+s) & RING_MASK), so even the shared
+    # k ring can never race a sibling CTA's committed-row reads.
+    # Ring cursor commit for STANDALONE use: flush rows slide the base past
+    # the folded window and reset the length (Triton
+    # commit_gdn_replayssm_spec semantics; host-side, graph-capturable).
+    # restart_hist_on_flush=False hands the commit to the caller (a serving
+    # loop sharing one cursor set across N layers must commit once per step).
     if restart_hist_on_flush:
-        hist_len.masked_fill_(hist_len >= flush_min, 0)
+        _flushed = hist_len >= flush_min
+        cache_base.copy_((cache_base + hist_len * _flushed) & RING_MASK)
+        hist_len.masked_fill_(_flushed, 0)
 
     if output is not None and out_c is not output:
         output.copy_(out_c)
@@ -2935,4 +3025,12 @@ def gated_delta_rule_mtp_vcache_flush(
     return out_c
 
 
-__all__ = ["gated_delta_rule_mtp_vcache_flush", "GdnVcacheFlushKernel", "K_DIM", "V_DIM_C"]
+__all__ = [
+    "gated_delta_rule_mtp_vcache_flush",
+    "GdnVcacheFlushKernel",
+    "K_DIM",
+    "V_DIM_C",
+    "W_RING_C",
+    "RING_SLOTS",
+    "RING_MASK",
+]

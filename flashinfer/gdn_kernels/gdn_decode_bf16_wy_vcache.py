@@ -20,6 +20,8 @@ import torch
 
 from .gdn_decode_bf16_wy_vcache_flush import (  # noqa: F401
     K_DIM,
+    RING_MASK,
+    RING_SLOTS,
     V_DIM_C,
     W_RING_C,
     gated_delta_rule_mtp_vcache_flush as _flush_call,
@@ -43,6 +45,7 @@ def gated_delta_rule_mtp_vcache(
     a_cache: Optional[torch.Tensor] = None,
     b_cache: Optional[torch.Tensor] = None,
     hist_len: Optional[torch.Tensor] = None,
+    cache_base: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
@@ -72,6 +75,7 @@ def gated_delta_rule_mtp_vcache(
         a_cache=a_cache,
         b_cache=b_cache,
         hist_len=hist_len,
+        cache_base=cache_base,
         flush_min=W_RING - T + 1,  # never-flush sentinel: pure verify + append
         restart_hist_on_flush=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -80,4 +84,4 @@ def gated_delta_rule_mtp_vcache(
     )
 
 
-__all__ = ["gated_delta_rule_mtp_vcache", "K_DIM", "V_DIM_C", "W_RING_C"]
+__all__ = ["gated_delta_rule_mtp_vcache", "K_DIM", "V_DIM_C", "W_RING_C", "RING_SLOTS", "RING_MASK"]

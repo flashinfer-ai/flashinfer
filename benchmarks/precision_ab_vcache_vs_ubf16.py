@@ -26,10 +26,10 @@ for rn,(sA,sdt,sa,sS) in REG.items():
     agg=[0.0,0.0,0.0]
     for seed in range(5):
         torch.manual_seed(seed);torch.cuda.manual_seed(seed)
-        kc=torch.randn(B,HK,W,K,dtype=torch.bfloat16,device=dev)
-        vc=torch.randn(B,HV,W,V,dtype=torch.bfloat16,device=dev)
-        ac=torch.randn(B,HV,W,dtype=torch.float32,device=dev)*sa
-        bc=torch.randn(B,HV,W,dtype=torch.float32,device=dev)
+        kc=torch.randn(B,HK,32,K,dtype=torch.bfloat16,device=dev)
+        vc=torch.randn(B,HV,32,V,dtype=torch.bfloat16,device=dev)
+        ac=torch.randn(B,HV,32,dtype=torch.float32,device=dev)*sa
+        bc=torch.randn(B,HV,32,dtype=torch.float32,device=dev)
         q=torch.randn(B,T,H,K,dtype=torch.bfloat16,device=dev);k=torch.randn(B,T,HK,K,dtype=torch.bfloat16,device=dev)
         v=torch.randn(B,T,HV,V,dtype=torch.bfloat16,device=dev);a=torch.randn(B,T,HV,dtype=torch.bfloat16,device=dev)*sa
         b=torch.randn(B,T,HV,dtype=torch.bfloat16,device=dev)
