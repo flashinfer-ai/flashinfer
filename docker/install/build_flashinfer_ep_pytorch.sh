@@ -61,7 +61,7 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
     pytest \
     "nvidia-nvshmem-${CU}" \
     filelock \
-    "nvidia-cutlass-dsl[${CU}]==4.5.0"
+    "nvidia-cutlass-dsl[${CU}]>=4.5.2"
 (
     if [ ! -d "${DEEPGEMM_SRC}/.git" ]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "${DEEPGEMM_SRC}"
