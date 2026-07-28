@@ -2617,7 +2617,10 @@ def run_mtp_decode(
     output_writeback = None
     if output.dtype != torch.bfloat16:
         output_writeback = output
-        output = torch.empty_like(output, dtype=torch.bfloat16)
+        # Convert the caller buffer in-place semantics: padding slots (negative
+        # indices) are never written by the kernel, so the writeback must preserve
+        # whatever the caller already put there — not uninitialized scratch.
+        output = output_writeback.to(torch.bfloat16)
 
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)

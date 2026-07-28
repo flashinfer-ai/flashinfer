@@ -4425,6 +4425,62 @@ def test_gdn_decode_mtp_honors_non_bf16_output_buffer(out_dtype, batch_size=4):
     torch.testing.assert_close(output.float(), ref, atol=3e-4, rtol=3e-2)
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
+def test_gdn_decode_mtp_non_bf16_output_preserves_padding_slots(
+    out_dtype, batch_size=4
+):
+    """Non-bf16 `output=` must not clobber padding rows during bf16 staging.
+
+    Negative `initial_state_indices` skip kernel writes; those output rows must
+    remain whatever the caller initialized, not garbage from an empty scratch
+    buffer.
+    """
+    _skip_if_not_sm90_or_later()
+    x = _dtype_case_inputs("fp32_state_mtp", torch.bfloat16, batch_size)
+    B, T, _, D = x["q"].shape
+    HV = x["v"].shape[2]
+    device = x["q"].device
+
+    indices = torch.arange(B, dtype=torch.int32, device=device)
+    indices[-1] = -1
+
+    sentinel = 42.0
+    output = torch.full((B, T, HV, D), sentinel, dtype=out_dtype, device=device)
+
+    returned, _ = gated_delta_rule_mtp(
+        q=x["q"],
+        k=x["k"],
+        v=x["v"],
+        initial_state=x["state"].clone(),
+        initial_state_indices=indices,
+        A_log=x["A_log"],
+        a=x["a"],
+        dt_bias=x["dt_bias"],
+        b=x["b"],
+        scale=x["scale"],
+        disable_state_update=True,
+        use_qk_l2norm=True,
+        output=output,
+    )
+    assert returned.dtype == out_dtype
+    torch.testing.assert_close(returned.float(), output.float(), atol=0, rtol=0)
+
+    padding_rows = indices < 0
+    assert padding_rows.any(), "test needs at least one padding slot"
+    torch.testing.assert_close(
+        output[padding_rows].float(),
+        torch.full_like(output[padding_rows].float(), sentinel),
+        atol=0,
+        rtol=0,
+    )
+
+    valid_rows = ~padding_rows
+    ref = _dtype_case_reference(x).float()
+    torch.testing.assert_close(
+        output[valid_rows].float(), ref[valid_rows], atol=3e-4, rtol=3e-2
+    )
+
+
 def test_gdn_decode_wy_output_only_fp16_inputs_are_converted(batch_size=4):
     """The WY output-only kernel is bf16-only too (`io = cutlass.BFloat16`)."""
     _skip_if_not_sm90_or_later()
