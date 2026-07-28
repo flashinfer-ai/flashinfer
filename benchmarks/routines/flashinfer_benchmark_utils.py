@@ -117,6 +117,11 @@ output_column_dict = {
         "max_len",
         "num_rows",
     ],
+    # top_k_varlen selects top-K KV positions per request; its row width is a
+    # max sequence length, not a vocab size (see routines/topk_varlen.py).
+    "topk_varlen": [
+        "max_seq_len",
+    ],
     "rope": [
         "seq_len",
         "head_dim",
@@ -189,6 +194,7 @@ full_output_columns = (
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
+    + output_column_dict["topk_varlen"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
@@ -271,6 +277,10 @@ benchmark_apis = {
         "top_k",
         "top_k_page_table_transform",
         "top_k_ragged_transform",
+    ],
+    # top_k_varlen is a sparse-attention KV-selection primitive (not vocab
+    # sampling), so it has its own category + routine module (routines/topk_varlen.py).
+    "topk_varlen": [
         "top_k_varlen",
     ],
     "rope": [
