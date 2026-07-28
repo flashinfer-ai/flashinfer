@@ -15,7 +15,7 @@ Use torchrun to benchmark both real expert- and tensor-parallel communication:
 Run Nsight Systems mode directly to capture and report per-kernel breakdowns
 for all four topology/activation combinations:
 
-    python3 benchmarks/bench_cute_dsl_moe_distributed.py \
+    python3 benchmarks/bench_cute_dsl_moe_distributed.py \\
         --mode profile_nsys
 
 Nsight Compute mode uses kernel replay to capture every local compute kernel
@@ -23,7 +23,7 @@ with the full metric set and embeds correlated sources found recursively under
 the FlashInfer repository. It simulates the exact post-communication EP/TP
 shapes in one process; use Nsight Systems mode for real communication:
 
-    python3 benchmarks/bench_cute_dsl_moe_distributed.py \
+    python3 benchmarks/bench_cute_dsl_moe_distributed.py \\
         --mode profile_ncu --profile-iters 1
 
 The workload stages remain available as NVTX ranges. Kernel attribution uses

@@ -240,7 +240,9 @@ def _measure_or_profile(
 
     from flashinfer.testing.utils import get_l2_cache_size
 
-    runner = lambda: run(**input_kwargs)
+    def runner():
+        return run(**input_kwargs)
+
     if use_cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
