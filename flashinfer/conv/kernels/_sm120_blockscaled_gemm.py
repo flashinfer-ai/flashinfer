@@ -527,8 +527,8 @@ class Sm120BlockScaledGemmKernel:
         sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, 0))
         sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, 0))
         tma_copy_bytes = (
-            cute.size_in_bytes(self.a_dtype, a_smem_layout)
-            + cute.size_in_bytes(self.b_dtype, b_smem_layout)
+            cute.size_in_bytes(self.smem_alloc_a_dtype, a_smem_layout)
+            + cute.size_in_bytes(self.smem_alloc_b_dtype, b_smem_layout)
             + cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
             + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         )
