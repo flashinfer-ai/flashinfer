@@ -435,8 +435,8 @@ def msa_sparse_decode_attention(
         ksf_dev = k_scale.reshape(-1).contiguous()
         vsf_dev = v_scale.reshape(-1).contiguous()
     else:
-        # Packed K/V views: the kernel gets the underlying compact 5-D cache
-        # for both arguments and picks the K/V plane itself.
+        # Packed K/V views: the kernel gets the whole packed 5-D cache as
+        # both arguments and picks the K/V plane itself.
         k_pass, v_pass = (k, v) if packed_kv is None else (packed_kv[0], packed_kv[0])
         ksf_dev = _dummy_tensors(dev.index)[1]
         vsf_dev = ksf_dev

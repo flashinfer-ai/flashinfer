@@ -87,9 +87,8 @@ def _fake(dtype, shape, align=16, stride_order=None):
 
 
 def _resolve_packed_kv(k, v, head_dim, *, paged, kv_nvfp4):
-    """Shared wrapper plumbing: detect packed K/V split views (paged,
-    non-NVFP4 only) via :func:`_packed_kv_view`, enforcing contiguity for
-    every other input."""
+    """Detect packed K/V split views (accepted on the paged, non-NVFP4 path
+    only); any other non-contiguous K/V raises."""
     packed = None if kv_nvfp4 or not paged else _packed_kv_view(k, v, head_dim)
     if packed is None and not (k.is_contiguous() and v.is_contiguous()):
         raise ValueError("k/v must be contiguous")
@@ -107,8 +106,8 @@ def _packed_kv_view(k, v, head_dim):
 
     Returns ``None`` when both tensors are plain contiguous, else ``(packed,
     stride_order)``: the storage re-viewed as a 5-D cache with K at plane 0
-    and V at plane 1 of dim 3, plus its dim ranks for ``cute.compile``. The
-    view must be compact, meaning its strides telescope in some dim order (a
+    and V at plane 1 of dim 3, plus the dim order for ``cute.compile``. The
+    views must cover their storage contiguously in some dim order (a
     permuted-contiguous NHD cache qualifies); any other layout raises. The
     geometry is memoized because this runs on the decode hot path."""
     if k.is_contiguous() and v.is_contiguous():
@@ -148,14 +147,12 @@ def _packed_kv_geometry(head_dim, key):
     num_pages, num_kv_heads, page, _ = k_shape
     shape = (num_pages, num_kv_heads, page, 2, head_dim)
     raw = (k_strides[0], k_strides[1], k_strides[2], head_dim, 1)
-    # Sized strides must telescope: the kernel derives addresses from the
-    # compact layout. Size-1 dims carry arbitrary strides, so they rank
-    # outermost (inner they would break the kernel's static alignment proof)
-    # and get rebuilt strides.
     ones = [i for i in range(5) if shape[i] == 1]
     sized = sorted((i for i in range(5) if shape[i] > 1), key=lambda i: raw[i])
     strides = [0] * 5
     expected = 1
+    # The kernel computes addresses as if the cache were contiguous, so the
+    # sized dims' strides must multiply out exactly in some dim order.
     for i in sized:
         if raw[i] != expected:
             raise ValueError(
@@ -164,6 +161,9 @@ def _packed_kv_geometry(head_dim, key):
             )
         strides[i] = expected
         expected *= shape[i]
+    # Size-1 dims arrive with arbitrary strides: rebuild them, and order the
+    # dims outermost so they cannot break the alignment cute.compile proves
+    # for the inner dims.
     for i in ones:
         strides[i] = expected
     rank = [0] * 5
