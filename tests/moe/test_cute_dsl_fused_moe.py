@@ -548,8 +548,9 @@ class TestInputsHelperContract:
 class TestAutotuneReplayMemsetContract:
     @pytest.mark.parametrize("api", ["functional", "wrapper"])
     @pytest.mark.parametrize("is_tuning_mode", [False, True])
-    def test_selected_tactic_disables_async_memset_while_tuning(
-        self, monkeypatch, api, is_tuning_mode
+    @pytest.mark.parametrize("quant_mode", ["w4a4", "w4a16"])
+    def test_selected_tactic_memset_stream_contract(
+        self, monkeypatch, api, is_tuning_mode, quant_mode
     ):
         from flashinfer.fused_moe.cute_dsl import fused_moe
 
@@ -588,15 +589,23 @@ class TestAutotuneReplayMemsetContract:
             "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
             "w2_alpha": torch.ones(1, dtype=torch.float32),
         }
+        if quant_mode == "w4a16":
+            tensors["x"] = torch.empty((2, 16), dtype=torch.bfloat16)
+            tensors["x_sf"] = None
+            tensors["fc2_input_scale"] = None
 
         if api == "functional":
-            monkeypatch.setattr(
-                fused_moe, "CuteDslFusedMoENvfp4Runner", RecordingRunner
+            runner_name = (
+                "CuteDslFusedMoENvfp4Runner"
+                if quant_mode == "w4a4"
+                else "CuteDslFusedMoEW4A16Runner"
             )
+            monkeypatch.setattr(fused_moe, runner_name, RecordingRunner)
             result = fused_moe.cute_dsl_fused_moe_nvfp4(
                 **tensors,
                 num_experts=1,
                 top_k=1,
+                quant_mode=quant_mode,
             )
         else:
             wrapper = fused_moe.CuteDslMoEWrapper(
@@ -605,13 +614,20 @@ class TestAutotuneReplayMemsetContract:
                 hidden_size=16,
                 intermediate_size=16,
                 use_cuda_graph=False,
+                quant_mode=quant_mode,
             )
-            wrapper._runner = RecordingRunner()
-            wrapper._per_token_runner = RecordingRunner()
+            if quant_mode == "w4a4":
+                wrapper._runner = RecordingRunner()
+                wrapper._per_token_runner = RecordingRunner()
+            else:
+                wrapper._w4a16_runner = RecordingRunner()
             result = wrapper.run(**tensors)
 
         assert result.shape == (2, 16)
-        assert calls[-1]["use_async_memset"] is not is_tuning_mode
+        if quant_mode == "w4a4":
+            assert calls[-1]["use_async_memset"] is not is_tuning_mode
+        else:
+            assert "use_async_memset" not in calls[-1]
 
 
 # =============================================================================
