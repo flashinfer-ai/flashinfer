@@ -117,13 +117,21 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
         if (options.mBiasDtype != mOptions.biasDtype) continue;
       }
-      if (mOptions.usePerTokenScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
-      }
+      bool const isNonStandardSfC = (options.mDtypeSfC != Dtype::Void &&
+                                     options.mDtypeSfC != dtypeGetBlockSfType(mOptions.dtypeC));
+      // if use non-standard sfC, force sf layout to linear
+      if (isNonStandardSfC && options.mSfLayoutC != SfLayout::Linear) continue;
       if (mOptions.usePerChannelScaling) {
         if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
         if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      }
+      if (mOptions.usePerTokenScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      } else {
+        // Avoid using the cubins with non-standard dtype sfc.
+        // They should only be selected for the fast per-token scaling case.
+        if (isNonStandardSfC) continue;
       }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
