@@ -28,14 +28,32 @@ test_compress_ratio           — compress_ratio=4 (DSv4 KV compression)
 test_preallocated_outputs     — pre-allocated out_indices / out_values
 test_large_batch              — stress: large batch × long rows
 test_repeated_calls           — same inputs twice → same top-K set
-test_no_pre_idx_fallback      — pre_idx=None always goes to radix path
+test_no_pre_idx_selects_radix — pre_idx=None → a radix backend (never GVR), correct
 test_lb_config_validation     — GvrTopKLBConfig bad args raise at construction
 test_load_balance_modes       — True/False GVR paths correct
 test_gvr_row_width_alignment  — GVR rejects non-vec-aligned N
-test_radix_row_width_no_alignment_constraint  — radix accepts any N
+test_radix_cutlass_*          — masked CUTLASS radix (any GPU) coverage
 test_auto_gvr_knobs_256bit_alignment_gate  — 256-bit gated on 32B N alignment
 test_lb_256bit_misaligned_no_crash  — N=4104 LB regression (latent crash fixed)
 test_auto_gvr_knobs_shape_aware  — auto() picks shape-appropriate launch config
+
+radix (CuTe DSL) backend — Blackwell only
+-----------------------------------------
+test_radix_basic              — single-CTA correctness across dtype/K/batch
+test_radix_multi_cta_regime   — ctas_per_group > 1 (SMEM split + small-batch fan-out;
+                                covers the N=131072 SMEM-overflow regression)
+test_radix_next_n / _compress_ratio / _return_values / _preallocated_outputs
+test_varlen_ragged            — distinct per-row seq_lens (radix + radix_cutlass)
+test_seq_len_equals_top_k     — degenerate seq_len == top_k selects all valid indices
+
+Cross-cutting
+-------------
+test_cuda_graph_radix_multi_cta — capture/replay incl. fresh-data replay (row_states guard)
+test_cuda_graph_gvr           — GVR under CUDA graph
+test_backend_heuristic_priority — auto priority gvr > radix > radix_cutlass
+test_cross_backend_value_consistency — all backends select the same value multiset
+test_unknown_backend_rejected — unregistered / pre-rename backend names rejected
+test_input_validation         — 1-D logits / non-int32 seq_lens rejected
 """
 
 import pytest
@@ -102,15 +120,35 @@ def _make_inputs(num_rows, N, top_k, dtype, seed, next_n=1, compress_ratio=1):
     return logits, pre_idx, seq_lens
 
 
-def _check_correct(indices, logits, seq_lens, top_k, next_n=1, compress_ratio=1):
-    """Every selected value must be >= the k-th largest in its row."""
+def _check_correct(
+    indices,
+    logits,
+    seq_lens,
+    top_k,
+    next_n=1,
+    compress_ratio=1,
+    require_all_checked=False,
+):
+    """Every selected value must be >= the k-th largest in its row.
+
+    With ``require_all_checked=True`` every row must be non-degenerate
+    (``N_eff >= top_k``) and actually verified — this turns the otherwise-silent
+    "skip degenerate row" branch into a hard failure, guarding against a
+    mis-parametrized test that quietly checks nothing.
+    """
     logits_f32 = logits.to(torch.float32)
     seq_lens_host = seq_lens.cpu().tolist()
+    n_checked = 0
     for row in range(indices.shape[0]):
         ofs = row % next_n
         actual_kv_len = int(seq_lens_host[row // next_n]) - next_n + ofs + 1
         N_eff = actual_kv_len // compress_ratio
         if N_eff < top_k:
+            if require_all_checked:
+                raise AssertionError(
+                    f"row={row}: N_eff={N_eff} < top_k={top_k} — degenerate row "
+                    f"not allowed under require_all_checked"
+                )
             continue
         row_logits = logits_f32[row, :N_eff]
         kth_value = torch.topk(row_logits, k=top_k).values[-1].item()
@@ -122,6 +160,37 @@ def _check_correct(indices, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
         assert (sel_vals < kth_value).sum() == 0, (
             f"row={row}: some selected values below kth-rank ({kth_value:.6f})"
         )
+        n_checked += 1
+    if require_all_checked:
+        assert n_checked == indices.shape[0], (
+            f"only {n_checked}/{indices.shape[0]} rows were verified"
+        )
+
+
+def _make_varlen_inputs(seq_len_list, N, dtype, seed):
+    """Ragged batch: per-row seq_lens vary; no pre_idx (radix backends).
+
+    Returns ``(logits[batch, N], seq_lens[batch] int32)`` where
+    ``seq_lens[i] = seq_len_list[i]``.
+    """
+    batch_size = len(seq_len_list)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2.0).to(
+        dtype
+    )
+    seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
+    return logits, seq_lens
+
+
+def _radix_ctas(N, dtype, batch_size):
+    """ctas_per_group the radix (CuTe DSL) backend will use for this shape."""
+    from flashinfer.topk_varlen import _radix_get_chunk_config
+    from flashinfer.utils import get_device_sm_count
+
+    num_sms = get_device_sm_count(torch.device("cuda"))
+    ctas, _chunk = _radix_get_chunk_config(N, dtype, batch_size, num_sms)
+    return ctas
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +224,9 @@ def test_basic_decode(dtype, top_k, N, batch_size):
 
     assert indices.shape == (batch_size, top_k)
     assert indices.dtype == torch.int32
-    if _IS_BLACKWELL:
-        _check_correct(indices, logits, seq_lens, top_k)
+    # Correctness is verifiable on any GPU: Blackwell runs GVR (pre_idx), other
+    # hardware runs the masked radix_cutlass fallback — both produce a valid top-K.
+    _check_correct(indices, logits, seq_lens, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +248,7 @@ def test_return_values(dtype, top_k):
     torch.cuda.synchronize()
 
     assert values.shape == (batch_size, top_k)
+    assert values.dtype == dtype  # auto-allocated values keep the logits dtype
     logits_f32 = logits.float()
     for row in range(batch_size):
         expected = logits_f32[row][indices[row].long()]
@@ -306,13 +377,18 @@ def test_repeated_calls():
 
 
 # ---------------------------------------------------------------------------
-# test_no_pre_idx_fallback
+# test_no_pre_idx_selects_radix
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-def test_no_pre_idx_fallback():
-    """pre_idx=None must always use the radix fallback on any GPU."""
+def test_no_pre_idx_selects_radix():
+    """pre_idx=None resolves auto to a radix backend (never GVR) and is correct.
+
+    On Blackwell auto picks ``radix`` (CuTe DSL); on other hardware it picks
+    ``radix_cutlass`` (masked CUTLASS). GVR requires pre_idx, so it is never
+    selected here.
+    """
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=77)
 
@@ -321,6 +397,9 @@ def test_no_pre_idx_fallback():
 
     assert indices.shape == (batch_size, top_k)
     assert indices.dtype == torch.int32
+    # auto without pre_idx must resolve to a radix backend, never gvr.
+    assert flashinfer.top_k_varlen.suitable_auto_backends[0] in ("radix", "radix_cutlass")
+    _check_correct(indices, logits, seq_lens, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +421,7 @@ def test_radix_cutlass_return_values(dtype, top_k):
     torch.cuda.synchronize()
 
     assert values.shape == (batch_size, top_k)
+    assert values.dtype == dtype  # auto-allocated values keep the logits dtype
     logits_f32 = logits.float()
     for row in range(batch_size):
         expected = logits_f32[row][indices[row].long()]
@@ -582,3 +662,487 @@ def test_auto_gvr_knobs_shape_aware():
     assert num_threads == 1024
     assert knobs["use_256bit_load"] is True  # fp32, N>=16384, 32B-aligned
     assert knobs["min_blocks_per_mp"] <= 1
+
+
+# ---------------------------------------------------------------------------
+# radix (CuTe DSL) backend — Blackwell only
+# ---------------------------------------------------------------------------
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        (torch.bfloat16, 512),
+        (torch.bfloat16, 1024),
+        (torch.float16, 1024),
+        (torch.float32, 2048),
+    ],
+)
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_radix_basic(dtype, top_k, batch_size):
+    """radix (CuTe DSL) single-CTA correctness across dtype/K/batch."""
+    N = 8192  # < max_chunk for all dtypes -> single-CTA
+    logits, seq_lens = _make_varlen_inputs([N] * batch_size, N, dtype, seed=42)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
+    torch.cuda.synchronize()
+    assert indices.shape == (batch_size, top_k)
+    assert indices.dtype == torch.int32
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size",
+    [
+        # SMEM-forced split — the N=131072 shared-memory-overflow regression.
+        (torch.bfloat16, 1024, 131072, 64),
+        # Small-batch fan-out: one row split across many CTAs to fill the machine.
+        (torch.bfloat16, 1024, 65536, 1),
+        # fp32 has a smaller max_chunk (57536), so N=65536 forces a split too.
+        (torch.float32, 2048, 65536, 32),
+        (torch.float32, 2048, 131072, 32),
+    ],
+)
+def test_radix_multi_cta_regime(dtype, top_k, N, batch_size):
+    """radix multi-CTA path (ctas_per_group > 1): SMEM split + small-batch fan-out.
+
+    This is the coverage the perf work most needs: the single-CTA-only path
+    faulted on rows too large for shared memory (N=131072), and the multi-CTA
+    split + global-histogram merge had no committed correctness test.
+    """
+    ctas = _radix_ctas(N, dtype, batch_size)
+    assert ctas > 1, (
+        f"expected multi-CTA, got ctas_per_group={ctas} for N={N} batch={batch_size}"
+    )
+    logits, seq_lens = _make_varlen_inputs([N] * batch_size, N, dtype, seed=101)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_k", [512, 1024])
+def test_radix_next_n(dtype, top_k):
+    """radix backend: next_n=2 (two rows share one seq_len entry)."""
+    next_n, N, batch_size = 2, 8192, 8
+    if N - next_n + 1 < top_k:
+        pytest.skip("N_eff < top_k")
+    num_rows = batch_size * next_n
+    logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=7, next_n=next_n)
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=None, next_n=next_n, backend="radix"
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, next_n=next_n)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("top_k", [512, 1024])
+def test_radix_compress_ratio(top_k):
+    """radix backend: compress_ratio=4 (seq_lens in uncompressed-token space)."""
+    dtype, compress_ratio, N, batch_size = torch.bfloat16, 4, 4096, 8
+    logits, _, seq_lens = _make_inputs(
+        batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
+    )
+    indices, _ = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        compress_ratio=compress_ratio,
+        backend="radix",
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, compress_ratio=compress_ratio)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_radix_return_values(dtype):
+    """radix backend: returned values equal logits[row, indices]."""
+    top_k, N, batch_size = 512, 8192, 4
+    logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=13)
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=None, return_values=True, backend="radix"
+    )
+    torch.cuda.synchronize()
+    assert values.shape == (batch_size, top_k)
+    assert values.dtype == dtype  # auto-allocated values keep the logits dtype
+    lf = logits.float()
+    for row in range(batch_size):
+        expected = lf[row][indices[row].long()]
+        assert torch.allclose(expected, values[row].float(), rtol=1e-3, atol=1e-3), (
+            f"row={row}: values do not match logits[row, indices]"
+        )
+
+
+@requires_blackwell
+def test_radix_preallocated_outputs():
+    """radix backend: out_indices / out_values written in-place."""
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 4
+    logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=11)
+    out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(batch_size, top_k, dtype=dtype, device="cuda")
+    ret_i, ret_v = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        out_indices=out_i,
+        return_values=True,
+        out_values=out_v,
+        backend="radix",
+    )
+    torch.cuda.synchronize()
+    assert ret_i is out_i
+    assert ret_v is out_v
+    _check_correct(out_i, logits, seq_lens, top_k)
+
+
+# ---------------------------------------------------------------------------
+# Variable-length (true varlen) + degenerate seq_len coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+def test_varlen_ragged(backend):
+    """Distinct per-row seq_lens: every row is masked to its own length.
+
+    ``_make_inputs`` uses a uniform length, so this is the primary test of the
+    varlen masking that ``top_k_varlen`` exists for. All rows are >= top_k so
+    ``require_all_checked`` verifies every one.
+    """
+    if backend == "radix" and not _IS_BLACKWELL:
+        pytest.skip("radix (CuTe DSL) requires Blackwell")
+    dtype, top_k, N = torch.bfloat16, 512, 8192
+    seq_len_list = [top_k, top_k + 1, 1024, 2048, 4096, 6000, 8000, N]
+    logits, seq_lens = _make_varlen_inputs(seq_len_list, N, dtype, seed=88)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend=backend)
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+def test_seq_len_equals_top_k(backend):
+    """Degenerate seq_len == top_k: the top-K is exactly all valid indices [0, top_k)."""
+    if backend == "radix" and not _IS_BLACKWELL:
+        pytest.skip("radix (CuTe DSL) requires Blackwell")
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
+    logits, seq_lens = _make_varlen_inputs([top_k] * batch_size, N, dtype, seed=64)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend=backend)
+    torch.cuda.synchronize()
+    for row in range(batch_size):
+        sel = set(int(i) for i in indices[row].cpu().tolist() if i >= 0)
+        assert sel == set(range(top_k)), (
+            f"row={row}: seq_len==top_k must select all [0,{top_k}); got {len(sel)} unique"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph capture / replay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_cuda_graph_radix_multi_cta():
+    """radix multi-CTA under CUDA graph capture/replay.
+
+    Specifically exercises the row_states zero-init + kernel self-reset
+    guardrail: a second replay with *fresh* input data must stay correct, i.e.
+    the inter-CTA arrival counter must not carry stale state across replays.
+    """
+    if not _IS_BLACKWELL:
+        pytest.skip("radix (CuTe DSL) requires Blackwell")
+    dtype, top_k, N, batch_size = torch.bfloat16, 1024, 131072, 8
+    assert _radix_ctas(N, dtype, batch_size) > 1  # ensure the multi-CTA path
+    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2).to(
+        dtype
+    )
+    seq_lens = torch.full((batch_size,), N, dtype=torch.int32, device="cuda")
+    out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, backend="radix", out_indices=out_i
+        )
+
+    # Warmup on a side stream (JIT compile + row_states alloc) before capture,
+    # so capture itself performs no allocation.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, require_all_checked=True)
+
+    # Overwrite the captured input buffer with fresh data and replay again.
+    # Zeroing out_i first means a no-op replay (or stale row_states) would leave
+    # zeros and fail the check — so passing proves the kernel truly re-executes.
+    fresh = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 3).to(
+        dtype
+    )
+    logits.copy_(fresh)
+    out_i.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("load_balance", [False, True])
+def test_cuda_graph_gvr(load_balance):
+    """GVR under CUDA graph capture/replay — both single-CTA and LB paths.
+
+    ``load_balance=True`` is the documented default whose docstring promises
+    CUDA-graph safety; it runs the two-kernel prepare+main path with device-side
+    counters/order_row. A ragged batch (long + short rows) exercises both LB
+    branches. Zeroing ``out_i`` before the second replay proves the kernel
+    re-executes rather than passing on stale warmup output.
+    """
+    top_k = 512
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    batch_size = seq_lens.shape[0]
+    out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            pre_idx=pre_idx,
+            backend="gvr",
+            load_balance=load_balance,
+            out_indices=out_i,
+        )
+
+    # Warmup on a side stream so the first LB allocation (order_row / counters)
+    # happens outside capture.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, require_all_checked=True)
+
+    # Zero the output and replay again on the same inputs: a no-op replay (or a
+    # counter/order_row that carried stale state) would leave zeros and fail.
+    out_i.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, require_all_checked=True)
+
+
+# ---------------------------------------------------------------------------
+# Auto-selection, cross-backend consistency, and input validation
+# ---------------------------------------------------------------------------
+
+
+def test_backend_heuristic_priority():
+    """Auto-selection priority is gvr > radix (CuTe DSL) > radix_cutlass.
+
+    Hardware-independent: exercises the heuristic directly so a regression in
+    the backend ordering (e.g. from a future rename) is caught even off-GPU.
+    """
+    from flashinfer.topk_varlen import _top_k_varlen_heuristic
+
+    assert _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"])[0] == "gvr"
+    assert _top_k_varlen_heuristic(["radix", "radix_cutlass"])[0] == "radix"
+    assert _top_k_varlen_heuristic(["radix_cutlass"])[0] == "radix_cutlass"
+    # order is preserved regardless of the suitable-set ordering
+    assert _top_k_varlen_heuristic(["radix_cutlass", "radix", "gvr"]) == [
+        "gvr",
+        "radix",
+        "radix_cutlass",
+    ]
+
+
+@requires_blackwell
+def test_cross_backend_value_consistency():
+    """radix, radix_cutlass, and gvr select the same top-K *value* multiset.
+
+    Compares sorted selected values (not indices) so ties don't cause spurious
+    failures. fp32 keeps ties rare; any real divergence between backends fails.
+    """
+    dtype, top_k, N, batch_size = torch.float32, 1024, 8192, 8
+    logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=123)
+    idx_r, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
+    idx_c, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix_cutlass")
+    idx_g, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
+    )
+    torch.cuda.synchronize()
+    lf = logits.float()
+    for row in range(batch_size):
+        vr = lf[row][idx_r[row].long()].sort(descending=True).values
+        vc = lf[row][idx_c[row].long()].sort(descending=True).values
+        vg = lf[row][idx_g[row].long()].sort(descending=True).values
+        assert torch.allclose(vr, vc, rtol=1e-4, atol=1e-4), (
+            f"row={row}: radix vs radix_cutlass value multisets differ"
+        )
+        assert torch.allclose(vr, vg, rtol=1e-4, atol=1e-4), (
+            f"row={row}: radix vs gvr value multisets differ"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_unknown_backend_rejected():
+    """Unregistered backend names — including the pre-rename 'radix_cutedsl' — raise.
+
+    Matches the specific rejection error (not a bare Exception) so an unrelated
+    failure — OOM, a missing dependency, an input assertion — cannot satisfy it.
+    """
+    from flashinfer.utils import BackendSupportedError
+
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
+    logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=5)
+    for bad in ("radix_cutedsl", "not_a_backend"):
+        with pytest.raises((BackendSupportedError, ValueError), match=bad):
+            flashinfer.top_k_varlen(logits, seq_lens, top_k, backend=bad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_input_validation():
+    """1-D logits and non-int32 seq_lens are rejected by the up-front asserts."""
+    top_k = 512
+    logits = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
+    seq_lens = torch.full((4,), 4096, dtype=torch.int32, device="cuda")
+    # logits must be 2-D
+    with pytest.raises(AssertionError):
+        flashinfer.top_k_varlen(logits[0], seq_lens[:1], top_k)
+    # seq_lens must be int32
+    with pytest.raises(AssertionError):
+        flashinfer.top_k_varlen(logits, seq_lens.long(), top_k)
+
+
+# ---------------------------------------------------------------------------
+# Coverage hardening (from the critical review): multi-CTA values, LB caps,
+# degenerate short rows, radix_cutlass under CUDA graph.
+# ---------------------------------------------------------------------------
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size",
+    [
+        (torch.bfloat16, 1024, 131072, 64),  # SMEM-split multi-CTA
+        (torch.float32, 2048, 65536, 32),  # fp32 multi-CTA
+    ],
+)
+def test_radix_multi_cta_return_values(dtype, top_k, N, batch_size):
+    """radix return_values on the multi-CTA path: the inter-CTA histogram-merge
+    value-gather is otherwise unverified (single-CTA value tests don't cover it)."""
+    assert _radix_ctas(N, dtype, batch_size) > 1
+    logits, seq_lens = _make_varlen_inputs([N] * batch_size, N, dtype, seed=202)
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="radix", return_values=True
+    )
+    torch.cuda.synchronize()
+    assert values.shape == (batch_size, top_k)
+    assert values.dtype == dtype
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+    lf = logits.float()
+    for row in range(batch_size):
+        expected = lf[row][indices[row].long()]
+        assert torch.allclose(expected, values[row].float(), rtol=1e-3, atol=1e-3), (
+            f"row={row}: multi-CTA values do not match logits[row, indices]"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+def test_seq_len_less_than_top_k(backend):
+    """Rows with seq_len < top_k: every valid index [0, seq_len) is selected.
+
+    The two backends pad the surplus slots differently — ``radix`` writes the
+    ``-1`` sentinel, ``radix_cutlass`` leaves masked-region indices (>= seq_len)
+    — so this asserts the backend-agnostic guarantee (all valid entries chosen,
+    unique, in-range) rather than a specific padding representation.
+    """
+    if backend == "radix" and not _IS_BLACKWELL:
+        pytest.skip("radix (CuTe DSL) requires Blackwell")
+    dtype, top_k, N = torch.bfloat16, 512, 4096
+    seq_len_list = [top_k - 1, top_k // 2, 17, 1]  # all strictly < top_k
+    logits, seq_lens = _make_varlen_inputs(seq_len_list, N, dtype, seed=71)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend=backend)
+    torch.cuda.synchronize()
+    for row, sl in enumerate(seq_len_list):
+        in_range = sorted(i for i in indices[row].cpu().tolist() if 0 <= i < sl)
+        assert in_range == list(range(sl)), (
+            f"{backend} row={row} seq_len={sl}: expected all valid indices "
+            f"[0,{sl}); got {len(in_range)} unique in-range"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_cuda_graph_radix_cutlass(next_n):
+    """radix_cutlass (the non-Blackwell auto default) under CUDA graph replay.
+
+    Also exercises next_n>1 (the repeat_interleave/arange masking branch) under
+    capture. Fresh-data replay proves re-execution.
+    """
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 8
+    num_rows = batch_size * next_n
+    logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=44, next_n=next_n)
+    out_i = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, next_n=next_n, backend="radix_cutlass", out_indices=out_i
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True)
+
+    fresh = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 3).to(dtype)
+    logits.copy_(fresh)
+    out_i.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True)
+
+
+def test_lb_max_batch_size_boundaries():
+    """_lb_max_batch_size rounds up to the next power-of-2 cap in [64, 1024]."""
+    from flashinfer.topk_varlen import _lb_max_batch_size
+
+    assert _lb_max_batch_size(1) == 64
+    assert _lb_max_batch_size(64) == 64
+    assert _lb_max_batch_size(65) == 128
+    assert _lb_max_batch_size(256) == 256
+    assert _lb_max_batch_size(512) == 512
+    assert _lb_max_batch_size(1024) == 1024
+    with pytest.raises(ValueError):
+        _lb_max_batch_size(1025)
