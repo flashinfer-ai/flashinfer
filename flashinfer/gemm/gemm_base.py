@@ -2415,6 +2415,12 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
 def _finalize_cudnn_graph_for_tactic(
     graph, tactic, heur_modes, deselect_eng0: bool = False
 ) -> None:
+    # An integer tactic >= 0 is only ever passed by a runner's get_valid_tactics,
+    # which builds a graph solely to read back the available (engine_id, knobs)
+    # pairs via _cudnn_graph_engine_knob_tactics.  Every other caller passes
+    # either an engine/knob tuple (execute this plan) or -1 (heuristic default).
+    enumeration_only = not _is_cudnn_engine_knob_tactic(tactic) and tactic >= 0
+
     graph.validate()
     graph.build_operation_graph()
 
@@ -2435,6 +2441,17 @@ def _finalize_cudnn_graph_for_tactic(
             graph.deselect_engines(["eng0"])
 
     graph.check_support()
+
+    # check_support() already populates the plan metadata that tactic
+    # enumeration reads, so compiling every plan is wasted work -- unless this
+    # graph is later reused to *execute* those tactics.  That reuse happens only
+    # on the override-shape path (cuDNN >= 9.23.1), where _tactic_for_graph_cache
+    # maps engine/knob tactics back to key 0 and the runtime call lands on this
+    # same lru_cache entry.  Without override-shape, execution rebuilds a
+    # per-tactic graph under its own cache key and these plans are never run.
+    if enumeration_only and not _is_cudnn_override_shape_available():
+        return
+
     if policy is None:
         graph.build_plans()
     else:
