@@ -118,6 +118,10 @@ class Sm100W4A16GroupedGemmKernel:
             or swiglu_limit != DEFAULT_SWIGLU_LIMIT
         )
         self.output_m_factor = 2 if self.gated else 1
+        if self.gated and use_fused_finalize:
+            raise ValueError(
+                "W4A16 fused finalize is only implemented for the non-gated epilogue"
+            )
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
         self.cta_group = (
@@ -318,8 +322,12 @@ class Sm100W4A16GroupedGemmKernel:
                 transform_tidx,
             )
         )
+        num_transform_blocks = cute.size(tAsA_input, mode=[3])
+        assert num_transform_blocks % self.num_transform_warpgroups == 0, (
+            "A blocks must divide evenly across transform warpgroups"
+        )
         blocks_per_transform_group = (
-            cute.size(tAsA_input, mode=[3]) // self.num_transform_warpgroups
+            num_transform_blocks // self.num_transform_warpgroups
         )
         transform_group_tiler = (
             None,
@@ -378,6 +386,9 @@ class Sm100W4A16GroupedGemmKernel:
         transform_tiler_size = min(
             cute.size(cute.coalesce(tAsA_input.layout), mode=[0]),
             self.transform_fragment_size,
+        )
+        assert transform_tiler_size % _NVFP4_SCALE_GRANULARITY_K == 0, (
+            "transform fragment must cover whole NVFP4 scale blocks"
         )
         transform_tiler = cute.make_layout(transform_tiler_size)
         tArA_load = cute.flat_divide(tArA, transform_tiler)
