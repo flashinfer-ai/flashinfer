@@ -274,6 +274,14 @@ def gated_delta_rule_decode_pretranspose(
             f"q must be float16/bfloat16, got {q.dtype}"
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+        assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+            f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+        )
+        if use_pool:
+            assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+                f"initial_state_indices must be int32 or int64, "
+                f"got {initial_state_indices.dtype}"
+            )
         scale_val = K**-0.5 if scale is None else scale
         # The BF16 path is pool-only. When the caller uses non-pool semantics
         # (passes ``state`` instead of ``initial_state``), treat ``state`` as
@@ -395,6 +403,14 @@ def gated_delta_rule_decode_pretranspose(
         f"q must be float16/bfloat16, got {q.dtype}"
     )
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
+    if use_pool:
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"initial_state_indices must be int32 or int64, "
+            f"got {initial_state_indices.dtype}"
+        )
 
     # Set default scale
     if scale is None:
@@ -557,6 +573,9 @@ def gated_delta_rule_decode(
     )
     assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
 
     # Set default scale
     if scale is None:
@@ -764,6 +783,13 @@ def gated_delta_rule_mtp(
         f"initial_state must be float32, got {initial_state.dtype}"
     )
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
+    assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+        f"initial_state_indices must be int32 or int64, "
+        f"got {initial_state_indices.dtype}"
+    )
 
     # Validate output indices shape/dtype
     if output_state_indices is not None:

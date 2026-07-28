@@ -2114,11 +2114,13 @@ def gated_delta_rule_mtp(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
-        # Slot indices are read as int32; a wider index tensor would likewise be
-        # reinterpreted instead of converted.
-        assert initial_state_indices.dtype == torch.int32, (
-            f"initial_state_indices must be int32; got {initial_state_indices.dtype}."
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"initial_state_indices must be int32 or int64; "
+            f"got {initial_state_indices.dtype}."
         )
+        # Kernel loads indices as int32; convert rather than reinterpret.
+        if initial_state_indices.dtype != torch.int32:
+            initial_state_indices = initial_state_indices.to(torch.int32)
     _io_dtype = q.dtype
     HK = k.shape[2]
 
