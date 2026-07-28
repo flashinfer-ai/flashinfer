@@ -16,7 +16,6 @@ limitations under the License.
 
 import ctypes
 import functools
-import os
 import importlib.util
 import warnings
 from typing import Optional, Tuple, Union
@@ -91,15 +90,19 @@ def is_cute_dsl_arch_supported(
                 return True
             except KeyError:
                 continue
-        if native_only:
-            return False
-        family = _family_fallback_arch(major, minor)
-        if family is not None:
-            # Pin the DSL's default compile target before the first kernel
-            # compile; without this the DSL derives the target from the
-            # device and raises KeyError. An explicit user setting wins.
-            os.environ.setdefault("CUTE_DSL_ARCH", family)
-            return True
+        # The device's own architecture is absent from the DSL enum.
+        #
+        # We deliberately do NOT redirect the DSL to a family-conditional
+        # target here (e.g. ``sm_100f`` for an sm_107 device). The DSL captures
+        # its compile target when ``cutlass`` is first imported -- which the
+        # ``Arch`` lookup above has already done -- so setting ``CUTE_DSL_ARCH``
+        # at this point has no effect. Doing so only reports the architecture as
+        # supported and defers the failure to a ``KeyError`` raised from inside
+        # ``cute.compile``, which is exactly what this probe exists to prevent.
+        #
+        # Report unsupported instead and let callers fall back. Users who do
+        # want the DSL on such a device can export ``CUTE_DSL_ARCH=sm_100f``
+        # *before* the process starts, which still works.
         return False
     except Exception:
         # Arch module layout changed or import failed: fall back to
