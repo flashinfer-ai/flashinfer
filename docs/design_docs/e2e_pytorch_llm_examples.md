@@ -176,8 +176,16 @@ This is the actual point of the exercise. Checks, each cheap and scriptable:
   `transformers`, our last-token prefill logits asserted against
   transformers eager within a relative-L2 tolerance. The tiny MoE exercises
   the identical kernel path as Qwen3-30B-A3B, so no large download is needed
-  for functional verification. Remaining: FP8/FP4 weight-quantized linear
-  backends.
+  for functional verification. Quantized linear landed 2026-07-28:
+  `--quant {bf16,fp8,nvfp4}` (`quant.py`) quantizes the dense projections on
+  the fly from a BF16 checkpoint — FP8 W8A8 per-tensor via `bmm_fp8`, NVFP4
+  W4A4 block-16 via `nvfp4_quantize` + `mm_fp4`. B200-measured: FP8 GEMM cos
+  0.9993 / logits rel-L2 0.074–0.081; NVFP4 cos 0.9910 / rel-L2 0.281–0.346;
+  autotuner exercises `fp8_gemm` and `fp4_gemm` tactics. Router, `lm_head`
+  and the MoE expert GEMMs stay BF16 by design (see the example README).
+  Remaining: quantized MoE experts (`quant_scales` is a mode-specific
+  positional list whose fc1 scales must follow the up-above-gate pack order
+  of `moe_w31`).
 - **Phase 3 (in progress):** TEP (TP=EP) multi-GPU — attention
   tensor-parallel, MoE expert-parallel over the same ranks, two NCCL
   allreduces per layer, launched with `torchrun`; `reference_check.py`
