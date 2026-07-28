@@ -374,7 +374,16 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
   int num_sms = sm120_blockscaling::get_num_sms();
   int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
 
-  if (m_per_expert <= 12) {
+  auto tile_count = [&](int tile_m, int tile_n) {
+    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
+    int64_t num_n = (int64_t(shape_n) + tile_n - 1) / tile_n;
+    return int64_t(num_experts) * num_m * num_n;
+  };
+  int64_t swapab_tiles = tile_count(8, 128);
+  int64_t m32_tiles = tile_count(32, 128);
+
+  if (shape_n % 128 == 0 &&
+      (m_per_expert <= 8 || (m32_tiles < num_sms / 2 && swapab_tiles <= num_sms))) {
     sm120_blockscaling::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                       total_rows, shape_n, shape_k, num_experts,
                                                       token_offset, num_sms, stream);
