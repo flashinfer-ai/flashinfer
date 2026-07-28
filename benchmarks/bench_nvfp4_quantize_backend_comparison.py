@@ -92,6 +92,7 @@ def get_cc():
 def _run_nvfp4_quantize(
     x: torch.Tensor,
     global_sf: torch.Tensor,
+    global_sf_cpu: torch.Tensor,
     sf_layout: SfLayout,
     backend: str,
     per_token_activation: bool,
@@ -100,7 +101,7 @@ def _run_nvfp4_quantize(
 
     return nvfp4_quantize(
         x,
-        global_sf,
+        global_sf_cpu if backend == "cuda" else global_sf,
         sfLayout=sf_layout,
         per_token_activation=per_token_activation,
         backend=backend,
@@ -145,15 +146,18 @@ def verify_nvfp4_correctness(
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
+    global_sf_cpu = global_sf.cpu()
 
     try:
         quant_cuda, scale_cuda, per_token_scale_cuda = _split_quantize_result(
-            _run_nvfp4_quantize(x, global_sf, sf_layout, "cuda", per_token_activation),
+            _run_nvfp4_quantize(
+                x, global_sf, global_sf_cpu, sf_layout, "cuda", per_token_activation
+            ),
             per_token_activation,
         )
         quant_cute, scale_cute, per_token_scale_cute = _split_quantize_result(
             _run_nvfp4_quantize(
-                x, global_sf, sf_layout, "cute-dsl", per_token_activation
+                x, global_sf, global_sf_cpu, sf_layout, "cute-dsl", per_token_activation
             ),
             per_token_activation,
         )
@@ -277,9 +281,12 @@ def bench_nvfp4_quantize(
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
+    global_sf_cpu = global_sf.cpu()
 
     def run_kernel():
-        _run_nvfp4_quantize(x, global_sf, sf_layout, backend, per_token_activation)
+        _run_nvfp4_quantize(
+            x, global_sf, global_sf_cpu, sf_layout, backend, per_token_activation
+        )
 
     # Warmup, including any JIT compilation before timing starts.
     run_kernel()

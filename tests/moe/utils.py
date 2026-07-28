@@ -51,10 +51,15 @@ class QuantMode(IntEnum):
 
 @contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
+    original_value_fast_math = os.environ.get(
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", None
+    )
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
     if use_4over6:
+        os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
         os.environ["FLASHINFER_NVFP4_4OVER6"] = "1"
     else:
+        os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = "0"
         os.environ["FLASHINFER_NVFP4_4OVER6"] = "0"
 
     try:
@@ -64,6 +69,12 @@ def nvfp4_4over6_env(use_4over6: bool):
             os.environ.pop("FLASHINFER_NVFP4_4OVER6", None)
         else:
             os.environ["FLASHINFER_NVFP4_4OVER6"] = original_value
+        if original_value_fast_math is None:
+            os.environ.pop("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", None)
+        else:
+            os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = (
+                original_value_fast_math
+            )
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +93,7 @@ def set_nvfp4_4over6_env(request):
     original_values = {name: os.environ.get(name, None) for name in env_names}
 
     use_4over6 = request.getfixturevalue("use_4over6")
-    os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = "1"
+    os.environ["FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"] = "1" if use_4over6 else "0"
     os.environ["FLASHINFER_NVFP4_4OVER6"] = "1" if use_4over6 else "0"
     os.environ["FLASHINFER_NVFP4_4OVER6_ERR_MODE"] = "MAE"
     os.environ["FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH"] = "0"

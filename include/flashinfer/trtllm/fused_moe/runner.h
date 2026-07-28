@@ -390,7 +390,7 @@ struct MoEWorkspace {
   // Gemm1 intermediate outputs:
   int32_t ProjUpTileN{0};
   void* gemm1_output = nullptr;
-  float* gemm1_output_scale = nullptr;
+  void* gemm1_output_scale = nullptr;
 
   // Activation intermediate outputs:
   void* activation_output = nullptr;
@@ -420,6 +420,12 @@ struct MoEConfig {
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
+  Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
+         batchedGemm::trtllm::gen::Dtype dtypeGemm1Output, bool useDeepSeekFp8, int tileTokensDim,
+         ActivationType activationType, bool useShuffledMatrix,
+         batchedGemm::gemm::MatrixLayout weight_layout, batchedGemm::gemm::BiasType gemm1BiasType,
+         bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
          bool useDeepSeekFp8, int tileTokensDim, ActivationType activationType,
          bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
