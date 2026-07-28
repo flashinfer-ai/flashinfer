@@ -2078,12 +2078,10 @@ def _moe_bf16_run_experts(
     if activation_type not in (
         ActivationType.Swiglu,
         ActivationType.Relu2,
-        ActivationType.Situ,
     ):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r}, {ActivationType.Relu2!r}, "
-            f"or {ActivationType.Situ!r}"
+            f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
         )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
@@ -2113,14 +2111,9 @@ def _moe_bf16_run_experts(
             )
             alpha = _moe_expert_param(gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device)
             beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
-            if activation_type == ActivationType.Situ:
-                gate = alpha * torch.tanh(X2 / alpha) * torch.sigmoid(X2)
-                up = limit * torch.tanh(X1 / limit)
-                act = gate * up
-            else:
-                up = torch.clamp(X1, min=-limit, max=limit)
-                gate = torch.clamp(X2, max=limit)
-                act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+            up = torch.clamp(X1, min=-limit, max=limit)
+            gate = torch.clamp(X2, max=limit)
+            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
         expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -3227,15 +3220,14 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             optional=True,
             description=(
                 "GEMM1 activation type: ActivationType.Swiglu for gated "
-                "SwiGLU/OAI, ActivationType.Situ for Kimi-K3 SiTU, or "
-                "ActivationType.Relu2 for non-gated ReLU^2. "
+                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
                 "Determines gemm1_out_size."
             ),
         ),
         "swiglu_alpha": Scalar(
             "float32",
             optional=True,
-            description="SwiGLU sigmoid multiplier or SiTU beta.",
+            description="SwiGLU sigmoid multiplier.",
         ),
         "swiglu_beta": Scalar(
             "float32",
@@ -3245,7 +3237,7 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "swiglu_limit": Scalar(
             "float32",
             optional=True,
-            description="SwiGLU clamp limit or SiTU linear beta.",
+            description="SwiGLU clamp limit.",
         ),
     },
     outputs={

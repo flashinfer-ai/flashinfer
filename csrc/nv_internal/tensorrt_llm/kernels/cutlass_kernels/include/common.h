@@ -30,7 +30,6 @@ enum class ActivationType {
   SwigluStep,
   GegluTanh,
   Identity,
-  Situ,
   InvalidType
 };
 
