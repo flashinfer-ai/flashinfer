@@ -1,8 +1,5 @@
 name: 🚀 Kernel / Feature Request
-description: >
-  Request a kernel, hardware enablement, framework integration, API, or
-  performance improvement. For something broken, wrong, or slower than it
-  used to be, use 🐛 Bug Report instead.
+description: Request a kernel, hardware enablement, framework integration, API, or performance improvement.
 title: "[Feature]: "
 labels: ["feature request"]
 body:

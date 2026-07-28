@@ -52,6 +52,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -127,9 +128,12 @@ class MegaMoENvfp4Config:
                 "num_total_experts must be divisible by world_size "
                 f"({self.num_total_experts} % {self.world_size} != 0)."
             )
-        if self.hidden % 128 != 0 or self.intermediate % 128 != 0:
+        # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
+        # predicated epilogue stores); 64 covers the TMA 16B row alignment and
+        # SF-word packing. 128-misaligned shapes exist (gpt-oss: 2880).
+        if self.hidden % 64 != 0 or self.intermediate % 64 != 0:
             raise ValueError(
-                "hidden and intermediate must be multiples of 128 "
+                "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
             )
         if self.token_back_mode not in (
@@ -242,6 +246,7 @@ class MegaMoENvfp4Frontend:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
         if self._gate_up_clamp == clamp:
             return
+        ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
@@ -257,6 +262,7 @@ class MegaMoENvfp4Frontend:
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
+        ensure_not_capturing("apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
         self._invalidate_compile_cache()
@@ -336,7 +342,9 @@ class MegaMoENvfp4Frontend:
             inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
 
-        if sync:
+        # Zero-break capture gate: a device synchronize would abort stream
+        # capture, so skip it there (the graph replays under stream semantics).
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return mega.launch_output
 
@@ -441,6 +449,7 @@ class MegaMoENvfp4Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
 
         import cutlass
@@ -542,6 +551,7 @@ class MegaMoENvfp4Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
     @staticmethod
@@ -1020,9 +1030,9 @@ def get_symm_buffer_for_mega_moe(
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
     """
-    if hidden % 128 != 0 or intermediate % 128 != 0:
+    if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
-            "MegaMoE requires hidden and intermediate to be multiples of 128."
+            "MegaMoE requires hidden and intermediate to be multiples of 64."
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
@@ -1033,16 +1043,30 @@ def get_symm_buffer_for_mega_moe(
     )
     num_experts_per_rank = num_total_experts // world_size
 
-    from .tuner import default_knobs, with_knobs
+    from .knob_cache import resolve_knobs
+    from .tuner import with_knobs
 
-    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
-    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
-    resolved_knobs = dict(knobs) if knobs is not None else default_knobs(num_max_tokens)
-    if knobs is None and combine_dtype != "bf16":
+    # knobs=None -> pure lookup: offline-tuned cache entry for this session
+    # key when present, else the built-in token-count heuristic.  An explicit
+    # knobs= dict overrides both entirely.
+    if knobs is not None:
+        resolved_knobs, knob_source = dict(knobs), "explicit"
+    else:
+        resolved_knobs, knob_source = resolve_knobs(
+            dtype="nvfp4",
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            combine_dtype=combine_dtype,
+        )
+    if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
         # quantized combine wire is only wired for dispatch-warp token-back;
-        # explicit knobs are the caller's contract and are left untouched (the
-        # config validation rejects incompatible combos).
+        # explicit/cached knobs are the caller's/tuner's contract and are left
+        # untouched (the config validation rejects incompatible combos).
         resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
 
     cfg = MegaMoENvfp4Config(
@@ -1064,6 +1088,12 @@ def get_symm_buffer_for_mega_moe(
         ),
     )
     cfg = with_knobs(cfg, resolved_knobs)
+    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+        # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
+        # the combine accumulation order nondeterministic); cached/heuristic
+        # perf knobs must not flip it. Explicit knobs dicts already bypassed
+        # resolution above and keep full control.
+        cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1133,7 +1163,7 @@ def get_symm_buffer_for_mega_moe(
 
 
 def nvfp4_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoESymmBuffer,
@@ -1143,7 +1173,7 @@ def nvfp4_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Launch the fused CuTeDSL NVFP4 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
     Caller must stage ``symm_buffer.x`` / routing slices before calling.
@@ -1181,13 +1211,14 @@ def nvfp4_mega_moe(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
     if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
-        return
-    if y.shape != (n, symm_buffer.hidden):
-        raise ValueError(
-            f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
-        )
-    if y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16, got {y.dtype}.")
+        return symm_buffer.output_activation[:0] if y is None else None
+    if y is not None:
+        if y.shape != (n, symm_buffer.hidden):
+            raise ValueError(
+                f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
+            )
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be bfloat16, got {y.dtype}.")
 
     fc1_weight, fc1_weight_sf = transformed_l1
     fc2_weight, fc2_weight_sf = transformed_l2
@@ -1219,10 +1250,17 @@ def nvfp4_mega_moe(
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
-    if out is not None:
-        y.copy_(out[:n])
-    if sync:
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+    else:
+        result = None
+        if out is not None:
+            y.copy_(out[:n])
+    if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
+    return result
 
 
 def nvfp4_mega_launch_thunk(

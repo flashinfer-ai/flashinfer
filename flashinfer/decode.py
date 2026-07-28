@@ -3539,12 +3539,14 @@ def xqa_batch_decode_with_kv_cache(
     kv_cache_sf: Union[
         torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]
     ] = None,
+    q_cu_seq_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request,
+        or sum of per-request draft lengths when :attr:`q_cu_seq_lens` is given (ragged Q)
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
@@ -3596,10 +3598,17 @@ def xqa_batch_decode_with_kv_cache(
         output scale factor for fp8 output.
 
     mask : Optional[torch.Tensor] = None
-        causal attention mask for xqa speculative decoding.
+        draft-block attention mask for xqa speculative decoding.
 
     kv_cache_sf : Optional[torch.Tensor] = None
         KV cache scaling factors. Must provide when NVFP4 KV cache is used.
+
+    q_cu_seq_lens : Optional[torch.Tensor] = None
+        cumulative draft lengths [batch_size + 1] (int32, on device) enabling
+        ragged Q: requests may have different draft lengths. When given,
+        query/out stay packed as [total_q_tokens, num_heads, head_dim],
+        q_len_per_req must be the maximum draft length, and mask rows are
+        packed by the same cumulative offsets.
 
     Returns
     -------
@@ -3657,17 +3666,29 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
-    if q_len_per_req > 1:
-        batch_size = query.shape[0] // q_len_per_req
-        query = query.view(batch_size, q_len_per_req, query.shape[1], query.shape[2])
-    query_new = query.unsqueeze(1)
+    if q_cu_seq_lens is not None:
+        # Ragged Q: query stays packed as [total_q_tokens, num_heads, head_dim]
+        # and q_len_per_req is the max draft length across the batch.
+        assert q_len_per_req > 1, (
+            "q_cu_seq_lens requires q_len_per_req to be the max draft length (> 1)"
+        )
+        query_new = query
+        out_shape_ref = query
+    else:
+        if q_len_per_req > 1:
+            batch_size = query.shape[0] // q_len_per_req
+            query = query.view(
+                batch_size, q_len_per_req, query.shape[1], query.shape[2]
+            )
+        query_new = query.unsqueeze(1)
+        out_shape_ref = query
     seq_lens_new = seq_lens.unsqueeze(1)
     sinks_new = sinks.reshape(num_kv_heads, -1) if sinks is not None else None
 
-    # Ensure 4D output for xqa
+    # Ensure 4D output for xqa (packed 3D stays as-is for ragged Q)
     if out is None:
-        out = torch.empty_like(query)
-    out_4d = out.unsqueeze(1)
+        out = torch.empty_like(out_shape_ref)
+    out_new = out if q_cu_seq_lens is not None else out.unsqueeze(1)
 
     xqa(
         query_new,
@@ -3675,7 +3696,7 @@ def xqa_batch_decode_with_kv_cache(
         v_cache,
         block_tables,
         seq_lens_new,
-        out_4d,
+        out_new,
         scratch,
         semaphore,
         num_kv_heads,
@@ -3691,6 +3712,7 @@ def xqa_batch_decode_with_kv_cache(
         enable_pdl=enable_pdl,
         rcp_out_scale=1.0 / o_scale,
         q_seq_len=q_len_per_req,
+        q_cu_seq_lens=q_cu_seq_lens,
         mask=mask,
     )
 

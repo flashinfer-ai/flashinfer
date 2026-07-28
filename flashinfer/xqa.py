@@ -42,8 +42,9 @@ def get_xqa_module(
     use_sliding_window: bool,
     output_dtype: torch.dtype,
     q_seq_len: int,
+    use_ragged_q: bool = False,
 ):
-    module = gen_xqa_module(
+    spec = gen_xqa_module(
         input_dtype,
         kv_cache_dtype,
         page_size,
@@ -52,15 +53,14 @@ def get_xqa_module(
         use_sliding_window,
         output_dtype,
         q_seq_len,
-    ).build_and_load()
-
-    if q_seq_len > 1:
-        use_spec_dec = True
-    else:
-        use_spec_dec = False
+        use_ragged_q,
+    )
+    # Reuse the JIT module URI so the two names can never drift apart.
+    op_name = f"flashinfer::{spec.name}"
+    module = spec.build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
+        op_name,
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -86,6 +86,7 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
     ) -> None:
         module.xqa_wrapper(
@@ -110,15 +111,14 @@ def get_xqa_module(
             1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
             None if isinstance(kv_scale, float) else kv_scale,
             q_seq_len,
+            q_cu_seq_lens,
             mask,
             semaphores,
             workspace_buffer,
             enable_pdl,
         )
 
-    @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}"
-    )
+    @register_fake_op(op_name)
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
         sm_count: int,
@@ -142,6 +142,7 @@ def get_xqa_module(
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
         q_seq_len: int,
+        q_cu_seq_lens: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
     ) -> None:
         pass
@@ -174,6 +175,7 @@ def xqa(
     q_seq_len: int = 1,
     mask: Optional[torch.Tensor] = None,
     *,
+    q_cu_seq_lens: Optional[torch.Tensor] = None,
     k_sf_cache: Optional[torch.Tensor] = None,
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
@@ -231,6 +233,12 @@ def xqa(
         Scale factor for KV cache.
     sliding_win_size : int, default=0
         Sliding window size for attention. If 0, no sliding window is used.
+        With speculative decoding (``q_seq_len > 1``), the window is applied
+        per draft row, assuming draft tokens occupy consecutive positions at
+        the end of the sequence (linear chains, causal or full masks);
+        tree-structured drafts are not supported with sliding window.
+        On SM90 with fp8 KV cache, speculative decode with a sliding window
+        runs on the generic kernel rather than the Hopper fp8 kernel.
     kv_layout : str, default="NHD"
         The layout of the KV cache. Can be either ``NHD`` or ``HND``.
     sm_count : Optional[int], default=None
@@ -243,16 +251,29 @@ def xqa(
         Reciprocal of output scale factor.
     q_seq_len : int, default=1
         Query sequence length. When > 1, enables speculative decoding mode.
+        With ragged Q (``q_cu_seq_lens`` set), this is the maximum draft
+        length across the batch.
     mask : Optional[torch.Tensor], default=None
-        Causal attention mask for speculative decoding mode (when ``q_seq_len > 1``).
-        Shape: ``[batch_size, q_seq_len, mask_size_per_row]`` where
-        ``mask_size_per_row = ((q_seq_len + 31) // 32) * 2``.
+        Draft-block attention mask for speculative decoding mode (when
+        ``q_seq_len > 1``). Shape: ``[batch_size, q_seq_len,
+        mask_size_per_row]`` where ``mask_size_per_row = ((q_seq_len + 31) //
+        32) * 2``, or ``[total_q_tokens, mask_size_per_row]`` with ragged Q,
+        where each request's rows cover its own draft length.
         Data type should be torch.uint16 (bit-packed format, aligned to 32 bits).
+    q_cu_seq_lens : Optional[torch.Tensor], default=None
+        Cumulative draft lengths ``[batch_size + 1]`` (torch.int32 or
+        torch.uint32, on device) enabling ragged Q: requests may have
+        different draft lengths, including 0 for a request with no draft
+        tokens this step. When set, ``q`` and ``output`` are packed as
+        ``[total_q_tokens, num_q_heads, head_dim]``, ``q_seq_len`` must be
+        the maximum draft length, and ``mask`` rows are packed by the same
+        cumulative offsets. On SM90 with fp8 KV cache, ragged Q runs on the
+        generic kernel rather than the Hopper fp8 kernel.
 
     Note
     ----
     The function automatically infers several parameters from tensor shapes:
-    - batch_size from q.shape[0]
+    - batch_size from q.shape[0] (or seq_lens.shape[0] with ragged Q)
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
@@ -266,8 +287,37 @@ def xqa(
 
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
+    use_ragged_q = q_cu_seq_lens is not None
+    if use_ragged_q:
+        assert q_seq_len > 1, "q_cu_seq_lens requires q_seq_len > 1 (the max draft len)"
+        assert q.dim() == 3, (
+            "With q_cu_seq_lens, q must be packed as "
+            f"[total_q_tokens, num_q_heads, head_dim], got {q.dim()}D"
+        )
+        assert q_cu_seq_lens.dtype in (torch.int32, torch.uint32), (
+            "q_cu_seq_lens must be int32 or uint32"
+        )
+        assert q_cu_seq_lens.is_cuda, (
+            "q_cu_seq_lens must be a device tensor; the kernel dereferences its "
+            "pointer on the GPU"
+        )
+        assert q_cu_seq_lens.device == q.device, (
+            f"q_cu_seq_lens must be on {q.device}, got {q_cu_seq_lens.device}"
+        )
+        assert q_cu_seq_lens.dim() == 1 and q_cu_seq_lens.is_contiguous(), (
+            "q_cu_seq_lens must be a contiguous 1-D tensor"
+        )
+        assert q_cu_seq_lens.numel() == seq_lens.shape[0] + 1, (
+            f"q_cu_seq_lens must have batch_size + 1 = {seq_lens.shape[0] + 1} "
+            f"entries, got {q_cu_seq_lens.numel()}"
+        )
+        assert output.shape == q.shape, "Output must match packed ragged q shape"
+        # Not checked (needs a device sync): entries non-decreasing, each
+        # length <= q_seq_len, last entry == q.shape[0]. Violations return
+        # garbage rows rather than raising.
+
     # Infer parameters from tensors
-    batch_size = q.shape[0]
+    batch_size = seq_lens.shape[0] if use_ragged_q else q.shape[0]
     num_q_heads = q.shape[-2]
     head_dim = q.shape[-1]
 
@@ -317,6 +367,10 @@ def xqa(
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
+    # Ragged Q only changes the build when it suppresses the SPEC_Q_SEQ_LEN
+    # specialization; otherwise reuse the uniform module (a separate cache
+    # entry would re-register the same torch op name and fail).
+    ragged_build = use_ragged_q and q_seq_len * head_group_ratio <= 32
     xqa_module = get_xqa_module(
         q.dtype,
         k_cache.dtype,
@@ -326,12 +380,17 @@ def xqa(
         use_sliding_window,
         output.dtype,
         q_seq_len,
+        ragged_build,
     )
 
     if q_seq_len > 1:
         assert mask is not None, "Mask is required for speculative decoding"
         if sinks is not None:
             run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
+        if use_ragged_q or use_sliding_window:
+            # mha_sm90.cu rejects ragged Q, and its spec-dec sliding-window
+            # path mis-masks full draft masks; use the generic kernel.
+            run_sm90_fp8_mha = False
 
     xqa_module.xqa(
         run_sm90_fp8_mha,
@@ -356,6 +415,7 @@ def xqa(
         workspace_buffer,
         enable_pdl,
         q_seq_len,
+        q_cu_seq_lens,
         mask,
     )
 
