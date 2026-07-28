@@ -43,51 +43,34 @@ struct TrtllmGenGemmRunnerOptions {
 
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
                           const gemm::gemm::GemmInterface& interface) {
-  static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO_SM100F =
+  static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_c1x1x1_rM_TN_"
-      "transOut_noShfl_dsFp8_schPd2x2x1x3_sm100f";
-  static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO_SM100F =
+      "transOut_"
+      "noShfl_dsFp8_schPd2x2x1x3_sm100f";
+
+  static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_rM_TN_"
       "transOut_noShfl_dsFp8_schedS_sm100f";
-  static constexpr const char* KERNEL_NAME_LARGE_N_SM100F =
+
+  static constexpr const char* KERNEL_NAME_LARGE_N =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_rM_TN_"
       "transOut_noShfl_dsFp8_schPd2x2x1x3_sm100f";
-  static constexpr const char* KERNEL_NAME_DEFAULT_SM100F =
+
+  static constexpr const char* KERNEL_NAME_DEFAULT =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_c1x1x1_rM_TN_"
       "transOut_noShfl_dsFp8_schedS_sm100f";
-
-  static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO_SM107A =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_c1x1x1_rM_TN_"
-      "transOut_noShfl_dsFp8_schPd2x2x1x3_sm107a";
-  static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO_SM107A =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_rM_TN_"
-      "transOut_noShfl_dsFp8_schedS_sm107a";
-  static constexpr const char* KERNEL_NAME_LARGE_N_SM107A =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_c1x1x1_rM_TN_"
-      "transOut_noShfl_dsFp8_schPd2x2x1x3_sm107a";
-  static constexpr const char* KERNEL_NAME_DEFAULT_SM107A =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_c1x1x1_rM_TN_"
-      "transOut_noShfl_dsFp8_schedS_sm107a";
-
-  bool const is_sm107 = getSMVersion() == 107;
-  const char* const kHighNK =
-      is_sm107 ? KERNEL_NAME_HIGH_N_K_RATIO_SM107A : KERNEL_NAME_HIGH_N_K_RATIO_SM100F;
-  const char* const kLowNK =
-      is_sm107 ? KERNEL_NAME_LOW_N_K_RATIO_SM107A : KERNEL_NAME_LOW_N_K_RATIO_SM100F;
-  const char* const kLargeN = is_sm107 ? KERNEL_NAME_LARGE_N_SM107A : KERNEL_NAME_LARGE_N_SM100F;
-  const char* const kDefault = is_sm107 ? KERNEL_NAME_DEFAULT_SM107A : KERNEL_NAME_DEFAULT_SM100F;
 
   double const n_k_ratio = static_cast<double>(N) / static_cast<double>(K);
 
   std::string kernel_name;
   if (n_k_ratio >= 32) {
-    kernel_name = kHighNK;
+    kernel_name = KERNEL_NAME_HIGH_N_K_RATIO;
   } else if (n_k_ratio <= 2.0) {
-    kernel_name = kLowNK;
+    kernel_name = KERNEL_NAME_LOW_N_K_RATIO;
   } else if (N >= 20000) {
-    kernel_name = kLargeN;
+    kernel_name = KERNEL_NAME_LARGE_N;
   } else {
-    kernel_name = kDefault;
+    kernel_name = KERNEL_NAME_DEFAULT;
   }
 
   auto const& configs = interface.getGemmConfigs();

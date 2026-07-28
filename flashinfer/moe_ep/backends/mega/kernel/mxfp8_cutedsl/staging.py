@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .....core.validation.common import MoEEpConfigError
+
+
+def _use_fused_stage() -> bool:
+    # Bisection escape hatch back to the multi-kernel torch staging path.
+    return os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
 
 
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
@@ -26,11 +33,19 @@ def stage_mega_moe_inputs(
     *,
     kind: str = "mxfp8_e4m3",
 ) -> None:
-    """bf16 ``hidden_states`` → MXFP8 activation + E8M0 block scales."""
+    """bf16 ``hidden_states`` → MXFP8 activation + E8M0 block scales.
+
+    Default path is the fused single-launch ``DataPreprocess`` staging kernel
+    (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
+    falls back to the original torch-composed staging below.
+    """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
     from .....kernel_src.cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
+        fused_quant_stage,
+        fused_quant_stage_supported,
+        note_staged_tokens,
         mxfp8_quantize_per_block_32,
         round_up,
     )
@@ -38,10 +53,25 @@ def stage_mega_moe_inputs(
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
         return
-    if hidden % 128 != 0:
-        raise ValueError("hidden_size must be a multiple of 128.")
+    if hidden % 64 != 0:
+        raise ValueError("hidden_size must be a multiple of 64.")
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
+
+    if _use_fused_stage() and fused_quant_stage_supported(
+        hidden_states, quant_type="mxfp8"
+    ):
+        fused_quant_stage(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_fp8,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            quant_type=kind,
+        )
+        return
 
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
@@ -64,6 +94,7 @@ def stage_mega_moe_inputs(
     capacity = x_fp8.shape[0]
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
+    note_staged_tokens(topk_idx_out, num_tokens)
 
 
 def validate_mxfp8_forward_inputs(

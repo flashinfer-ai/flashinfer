@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -63,7 +63,7 @@ class MoEEpSplitLayer(nn.Module):
         super().__init__()
         self._bootstrap = bootstrap
         self._fleet_params = fleet_params
-        self._weights = weights
+        self._weights: Optional[MoEWeightPack] = weights
         self._fleet_knobs = list(fleet_knobs)
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
@@ -88,6 +88,11 @@ class MoEEpSplitLayer(nn.Module):
 
         if type(self._kernel).requires_weights():
             self._kernel.preprocess_weights(self._weights, fleet_params)
+        # Source pack is only needed for init-time validation and kernel
+        # preprocessing; the kernel retains what it needs. Release it so the
+        # layer does not pin a per-layer weight copy for the model lifetime
+        # (same OOM pattern as the mega path — see MoEEpMegaLayer docstring).
+        self._weights = None
 
         self._fleet: Fleet | None = None
 
