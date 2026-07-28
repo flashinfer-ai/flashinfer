@@ -47,6 +47,14 @@ from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 # Per-descriptor slot stride and alignment of the TMA descriptors held in the
 # tensormap workspace (see TensormapWorkspace below).
+#
+# 64 is intentional, not the CUtensorMap struct size (128 B): the CuTe-DSL
+# ``copy_tma_desc`` lowering copies exactly 8 x i64 = 64 bytes (only the first
+# 64 bytes of the tensormap carry payload), and PTX requires only 64-byte
+# alignment for the descriptor consumed by ``cp.async.bulk.tensor``.  So
+# 64-byte slots neither overlap on write nor under-align.  This matches the
+# internal-release value the vendored source shipped with (the conservative
+# ``= 128`` default it shadowed was never in effect in this tree).
 TensormapDescBytes = 64
 
 

@@ -168,12 +168,14 @@ path) and `fi_dg` run the mxfp4 checkpoint.
   as spin, and decode reads ~4% BELOW native — a config artifact, not a
   kernel property.
 - The headline decode cell reproduces at this branch tip within 0.6%.
-- **2026-07-22: both headline cells reproduce on nvidia-cutlass-dsl 4.5.2**
-  (vLLM 0.25.1's own pin, no force-upgrade — the MR!27 WAR makes 4.5.2 the
-  perf floor): prefill-8k native 45,582 / fi_nvfp4 53,623 = 1.176x; decode-1k
-  native 32,086 / fi_nvfp4 34,263 total tok/s = 1.068x (vllm_e2e RUNS.md
-  runs 41-42, `requick452_*.json`; every cell within 0.7% of the 4.6.1-stack
-  reference).
+- **2026-07-22 revalidation on nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own
+  pin, no force-upgrade — the MR!27 WAR makes 4.5.2 the perf floor): the
+  prefill-8k cell reproduces on the same metric (native 45,582 / fi_nvfp4
+  53,623 tok/s = 1.176x); the decode-1k check was recorded as **total tok/s**
+  (prompt + output: native 32,086 / fi_nvfp4 34,263 = 1.068x), a different
+  metric from the headline's output tok/s — it corroborates the 1.07x speedup
+  ratio rather than the absolute cells (vllm_e2e RUNS.md runs 41-42,
+  `requick452_*.json`).
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 

@@ -157,13 +157,19 @@ end-to-end** suite (`vllm_e2e/`). Clone it beside your flashinfer checkout:
 export ROOT=/path/to            # parent dir; hold both checkouts here
 cd "$ROOT"
 git clone https://github.com/mhoqueanik/moe_ep_benchmark.git
+# pin the revision the published numbers were run with (vllm-pr branch,
+# "Add 2026-07-22 cutlass-dsl 4.5.2 validation results" — scripts + result CSVs)
+git -C moe_ep_benchmark checkout c8aefda
 # $ROOT now has both flashinfer-2/flashinfer-moe_ep and moe_ep_benchmark/
 ```
 
-All numbers below were measured on **4× GB200 (SM100)** at the `4_5_2-perf-fix`
-branch tip on **nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own pin; at 4.6.1
-parity since the MR!27 mainloop WAR — see
-[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md)).
+All numbers below were measured on **4× GB200 (SM100)** at the tip of this
+tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
+(vLLM 0.25.1's own pin) — the measured and supported baseline. 4.6.1 appears
+below only as a parity *reference*: the MR!27 mainloop WAR brings 4.5.2 to
+4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
+unsupported (4.5.0 fails at `cute.compile`) — see
+[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -336,7 +342,11 @@ Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
 - **Two-checkpoint fairness**: `fi_nvfp4` consumes the prequantized NVFP4
   checkpoint directly via the weight-pack path; native and `fi_dg` run the mxfp4
   checkpoint. The GSM8K gate must show both in the same accuracy band before a
-  throughput delta is apples-to-apples.
+  throughput delta is apples-to-apples. **Band definition**: both variants run
+  the identical 200-question set with greedy decoding, and the gate passes when
+  `fi` accuracy ≥ native accuracy − 0.02 (4 questions of 200, ≈2 standard
+  errors of the binomial noise at ~0.97 accuracy). The published 0.975 (`fi`)
+  vs 0.965 (native) passes with `fi` above native.
 - Repeat each cell ≥3× and use medians — prefill-heavy cells showed ±35 %
   cross-restart variance; decode/mixed were stable to ~2 %.
 
@@ -355,10 +365,13 @@ prefill chunks), per-role offline knob caches.
 - `fi_dg` is the same deep_gemm kernel routed through this integration layer —
   parity-or-better shows the layer itself costs nothing under graphs; the nvfp4
   deltas above it are kernel-side.
-- 2026-07-22: both headline cells reproduce on nvidia-cutlass-dsl 4.5.2
-  (vLLM 0.25.1's own pin): prefill-8k native 45,582 / fi_nvfp4 53,623 = 1.176x;
-  decode-1k native 32,086 / fi_nvfp4 34,263 total tok/s = 1.068x (every cell
-  within 0.7 % of the 4.6.1-stack reference).
+- 2026-07-22 revalidation on nvidia-cutlass-dsl 4.5.2 (vLLM 0.25.1's own pin):
+  the prefill-8k cell reproduces on the same metric — native 45,582 / fi_nvfp4
+  53,623 tok/s = 1.176x, within 0.3 % of the headline cells. The decode-1k
+  check was recorded as **total tok/s** (prompt + output: native 32,086 /
+  fi_nvfp4 34,263 = 1.068x), a *different metric* from the headline row's
+  output tok/s — it corroborates the 1.07x speedup ratio, not the absolute
+  output-tok/s cells.
 
 ---
 
