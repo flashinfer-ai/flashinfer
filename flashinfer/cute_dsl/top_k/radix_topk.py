@@ -40,6 +40,7 @@ def float_as_uint32(float_val):
 def half_as_ushort(half_val):
     return llvm.bitcast(cutlass.Uint16.mlir_type, half_val.ir_value())
 
+
 # ---------------------------------------------------------------------------
 # Global-state layout constants
 # ---------------------------------------------------------------------------
@@ -259,7 +260,9 @@ class SinglePassMultiCTARadixTopKKernel:
             if ordered & cutlass.Uint32(0x80000000):
                 bits = ordered
             else:
-                bits = (ordered ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(0x7FFFFFFF)
+                bits = (ordered ^ cutlass.Uint32(0xFFFFFFFF)) & cutlass.Uint32(
+                    0x7FFFFFFF
+                )
             return llvm.bitcast(cutlass.Float32.mlir_type, bits.ir_value())
         else:
             bits = cutlass.Uint16(0)
@@ -276,7 +279,9 @@ class SinglePassMultiCTARadixTopKKernel:
     # Step 1: Load chunk → smem (convert to ordered)
     # ------------------------------------------------------------------
     @cute.jit
-    def load_chunk_to_smem(self, input_row, shared_ordered, chunk_start, actual_chunk_size, tidx):
+    def load_chunk_to_smem(
+        self, input_row, shared_ordered, chunk_start, actual_chunk_size, tidx
+    ):
         """Load valid chunk elements into smem as ordered integers.
 
         Follows the prologue/aligned/tail pattern from filtered_top_k_varlen_util:
@@ -357,7 +362,9 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # --- Part 1: Scalar prologue (before alignment boundary) ---
         for j in range(tidx, prologue_elems, num_threads):
-            shared_ordered[aligned_size + j] = self.to_ordered(input_row[chunk_start + j])
+            shared_ordered[aligned_size + j] = self.to_ordered(
+                input_row[chunk_start + j]
+            )
 
         # --- Part 3: Scalar tail (after last aligned vector) ---
         for j in range(tidx, left_size, num_threads):
@@ -575,9 +582,13 @@ class SinglePassMultiCTARadixTopKKernel:
         found_remaining_k = s_scalars[1]
 
         if cutlass.const_expr(self.dtype == cutlass.Float32):
-            prefix = prefix | cutlass.Uint32(cutlass.Uint32(found_bucket) << cutlass.Uint32(shift))
+            prefix = prefix | cutlass.Uint32(
+                cutlass.Uint32(found_bucket) << cutlass.Uint32(shift)
+            )
         else:
-            prefix = prefix | cutlass.Uint16(cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
+            prefix = prefix | cutlass.Uint16(
+                cutlass.Uint16(found_bucket) << cutlass.Uint16(shift)
+            )
         remaining_k = found_remaining_k
 
         return prefix, remaining_k
@@ -639,7 +650,9 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # Inter-CTA barrier (only thread 0 signals arrival)
         if tidx == 0:
-            red_release_gpu(state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(1))
+            red_release_gpu(
+                state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(1)
+            )
         barrier_phase = barrier_phase + 1
         barrier_inter_cta(
             state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
@@ -662,9 +675,13 @@ class SinglePassMultiCTARadixTopKKernel:
         found_remaining_k = s_scalars[1]
 
         if cutlass.const_expr(self.dtype == cutlass.Float32):
-            prefix = prefix | cutlass.Uint32(cutlass.Uint32(found_bucket) << cutlass.Uint32(shift))
+            prefix = prefix | cutlass.Uint32(
+                cutlass.Uint32(found_bucket) << cutlass.Uint32(shift)
+            )
         else:
-            prefix = prefix | cutlass.Uint16(cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
+            prefix = prefix | cutlass.Uint16(
+                cutlass.Uint16(found_bucket) << cutlass.Uint16(shift)
+            )
         remaining_k = found_remaining_k
 
         return prefix, remaining_k, barrier_phase
@@ -737,7 +754,9 @@ class SinglePassMultiCTARadixTopKKernel:
             if ordered < ordered_pivot:
                 local_pos = atomicAdd(local_histogram.iterator, val_one)
                 pos = local_histogram[1] + local_pos
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + i + prologue_elems
+                )
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, prologue_elems, self.num_threads):
@@ -788,7 +807,9 @@ class SinglePassMultiCTARadixTopKKernel:
             if ordered == ordered_pivot:
                 pos = atomicAdd(output_counter_ptr, val_one)
                 if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + i + prologue_elems
+                    )
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
         # TODO: move prologue region before aligned-region pass so that
@@ -934,7 +955,9 @@ class SinglePassMultiCTARadixTopKKernel:
             ordered = shared_ordered[i]
             if ordered < ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + i + prologue_elems
+                )
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, prologue_elems, self.num_threads):
@@ -961,7 +984,9 @@ class SinglePassMultiCTARadixTopKKernel:
             if ordered == ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
                 if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i + prologue_elems)
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + i + prologue_elems
+                    )
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
         for i in range(tidx, prologue_elems, self.num_threads):
@@ -1154,9 +1179,13 @@ class SinglePassMultiCTARadixTopKKernel:
             if top_k >= length:
                 for i in range(tidx, actual_chunk_size, num_threads):
                     if chunk_start + i < top_k:
-                        output_indices_row[chunk_start + i] = cutlass.Int32(chunk_start + i)
+                        output_indices_row[chunk_start + i] = cutlass.Int32(
+                            chunk_start + i
+                        )
                         if cutlass.const_expr(output_values is not None):
-                            output_values_row[chunk_start + i] = input_row[chunk_start + i]
+                            output_values_row[chunk_start + i] = input_row[
+                                chunk_start + i
+                            ]
                 # Fill remaining slots with -1 (only CTA 0 / single-CTA)
                 if cta_in_group == 0:
                     for i in range(tidx + length, top_k, num_threads):
@@ -1173,12 +1202,17 @@ class SinglePassMultiCTARadixTopKKernel:
                     if cta_in_group == 0:
                         num_rounds_const = cutlass.const_expr(self.num_rounds)
                         next_first_offset = (
-                            ((iter_var + cutlass.Int32(1)) * cutlass.Int32(num_rounds_const))
+                            (
+                                (iter_var + cutlass.Int32(1))
+                                * cutlass.Int32(num_rounds_const)
+                            )
                             % cutlass.Int32(3)
                             * cutlass.Int32(self.radix)
                         )
                         for i in range(tidx, self.radix, num_threads):
-                            state_row[next_first_offset + cutlass.Int32(i)] = cutlass.Int32(0)
+                            state_row[next_first_offset + cutlass.Int32(i)] = (
+                                cutlass.Int32(0)
+                            )
             else:
                 # Step 1: Load chunk to smem as ordered
                 prologue_elems, aligned_size, left_size = self.load_chunk_to_smem(
@@ -1217,7 +1251,8 @@ class SinglePassMultiCTARadixTopKKernel:
                     # Initial inter-CTA barrier for this row.
                     if tidx == 0:
                         red_release_gpu(
-                            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(1)
+                            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                            cutlass.Int32(1),
                         )
                     barrier_phase = barrier_phase + 1
                     barrier_inter_cta(
@@ -1333,7 +1368,9 @@ class SinglePassMultiCTARadixTopKKernel:
 
                     # Step 3: Collect output
                     output_counter_ptr = state_base_ptr + cutlass.Int32(_OUTPUT_COUNTER)
-                    arrival_counter_ptr = state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER)
+                    arrival_counter_ptr = state_base_ptr + cutlass.Int32(
+                        _ARRIVAL_COUNTER
+                    )
 
                     barrier_phase = self.collect_output(
                         shared_ordered,
@@ -1360,7 +1397,9 @@ class SinglePassMultiCTARadixTopKKernel:
                     if tidx == 0:
                         red_release_gpu(arrival_counter_ptr, cutlass.Int32(1))
                     barrier_phase = barrier_phase + 1
-                    barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
+                    barrier_inter_cta(
+                        arrival_counter_ptr, barrier_phase * ctas_per_group, tidx
+                    )
 
             # Advance to next row (round-robin).
             row_idx = row_idx + num_groups
@@ -1376,7 +1415,8 @@ class SinglePassMultiCTARadixTopKKernel:
                     state_row[i] = cutlass.Int32(0)
                 if tidx == 0:
                     st_release_gpu(
-                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER), cutlass.Int32(0)
+                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                        cutlass.Int32(0),
                     )
 
         griddepcontrol_launch_dependents()

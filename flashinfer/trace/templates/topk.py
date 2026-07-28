@@ -35,7 +35,9 @@ def _top_k_varlen_reference(logits, seq_lens, top_k, pre_idx=None, **_unused):
     return indices
 
 
-def _top_k_varlen_check(reference_outputs, actual_outputs, logits=None, seq_lens=None, top_k=None, **_unused):
+def _top_k_varlen_check(
+    reference_outputs, actual_outputs, logits=None, seq_lens=None, top_k=None, **_unused
+):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
 
     Exact set equality is not required because ties at the K-th boundary may be
@@ -48,7 +50,11 @@ def _top_k_varlen_check(reference_outputs, actual_outputs, logits=None, seq_lens
     act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]
     if logits is None or seq_lens is None or top_k is None:
         # Fallback to exact set equality when logits are unavailable.
-        ref = reference_outputs if not isinstance(reference_outputs, list) else reference_outputs[0]
+        ref = (
+            reference_outputs
+            if not isinstance(reference_outputs, list)
+            else reference_outputs[0]
+        )
         if ref.shape != act.shape:
             return False
         for r in range(ref.shape[0]):

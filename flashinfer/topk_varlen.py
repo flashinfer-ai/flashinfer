@@ -335,7 +335,9 @@ def _radix_ordered_elem_size(torch_dtype) -> int:
     return 4 if torch_dtype == torch.float32 else 2
 
 
-def _radix_compute_max_chunk(torch_dtype, num_copy_bits: int = _RADIX_NUM_COPY_BITS) -> int:
+def _radix_compute_max_chunk(
+    torch_dtype, num_copy_bits: int = _RADIX_NUM_COPY_BITS
+) -> int:
     """Largest chunk_size (elements) a single CTA can stage in SMEM, vec-aligned."""
     ordered_elem_size = _radix_ordered_elem_size(torch_dtype)
     dtype_width_bits = 32 if torch_dtype == torch.float32 else 16
@@ -712,7 +714,14 @@ def _run_radix(
     )
 
     compiled = _compile_radix(
-        cute_dtype, top_k, next_n, N, return_output_values, ctas_per_group, chunk_size, num_sms
+        cute_dtype,
+        top_k,
+        next_n,
+        N,
+        return_output_values,
+        ctas_per_group,
+        chunk_size,
+        num_sms,
     )
 
     # row_states holds the global histograms + inter-CTA barrier counters used

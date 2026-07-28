@@ -69,10 +69,9 @@ void radix_topk(TensorView input, TensorView output_indices,
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    c_type* output_values_ptr =
-        maybe_output_values.has_value()
-            ? static_cast<c_type*>(maybe_output_values.value().data_ptr())
-            : nullptr;
+    c_type* output_values_ptr = maybe_output_values.has_value()
+                                    ? static_cast<c_type*>(maybe_output_values.value().data_ptr())
+                                    : nullptr;
     status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         output_values_ptr, batch_size, static_cast<uint32_t>(top_k), d, row_states_ptr,

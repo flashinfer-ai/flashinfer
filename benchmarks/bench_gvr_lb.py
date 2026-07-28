@@ -300,9 +300,7 @@ def run_lb_comparison(dtype, device, args):
     print("-" * len(header))
     if lb_speedups:
         total = len(lb_speedups)
-        print(
-            f"  [1] GVR LB geomean speedup vs GVR-noLB: {geomean(lb_speedups):.3f}x"
-        )
+        print(f"  [1] GVR LB geomean speedup vs GVR-noLB: {geomean(lb_speedups):.3f}x")
         g_gr = geomean(gvr_vs_radix)
         worst = min(gvr_vs_radix)
         gvr_wins = sum(1 for x in gvr_vs_radix if x > 1.0)

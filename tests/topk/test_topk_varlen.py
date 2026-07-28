@@ -398,7 +398,10 @@ def test_no_pre_idx_selects_radix():
     assert indices.shape == (batch_size, top_k)
     assert indices.dtype == torch.int32
     # auto without pre_idx must resolve to a radix backend, never gvr.
-    assert flashinfer.top_k_varlen.suitable_auto_backends[0] in ("radix", "radix_cutlass")
+    assert flashinfer.top_k_varlen.suitable_auto_backends[0] in (
+        "radix",
+        "radix_cutlass",
+    )
     _check_correct(indices, logits, seq_lens, top_k)
 
 
@@ -416,7 +419,12 @@ def test_radix_cutlass_return_values(dtype, top_k):
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=13)
 
     indices, values = flashinfer.top_k_varlen(
-        logits, seq_lens, top_k, pre_idx=None, return_values=True, backend="radix_cutlass"
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        return_values=True,
+        backend="radix_cutlass",
     )
     torch.cuda.synchronize()
 
@@ -594,7 +602,9 @@ def test_radix_cutlass_row_width_no_alignment_constraint():
     top_k, batch_size, N_bad = 512, 4, 4097
     logits = torch.randn(batch_size, N_bad, dtype=torch.bfloat16, device="cuda")
     seq_lens = torch.full((batch_size,), N_bad, dtype=torch.int32, device="cuda")
-    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix_cutlass")
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="radix_cutlass"
+    )
     torch.cuda.synchronize()
     assert indices.shape == (batch_size, top_k)
 
@@ -1103,12 +1113,19 @@ def test_cuda_graph_radix_cutlass(next_n):
     """
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 8
     num_rows = batch_size * next_n
-    logits, _, seq_lens = _make_inputs(num_rows, N, top_k, dtype, seed=44, next_n=next_n)
+    logits, _, seq_lens = _make_inputs(
+        num_rows, N, top_k, dtype, seed=44, next_n=next_n
+    )
     out_i = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
     def call():
         flashinfer.top_k_varlen(
-            logits, seq_lens, top_k, next_n=next_n, backend="radix_cutlass", out_indices=out_i
+            logits,
+            seq_lens,
+            top_k,
+            next_n=next_n,
+            backend="radix_cutlass",
+            out_indices=out_i,
         )
 
     s = torch.cuda.Stream()
@@ -1124,14 +1141,18 @@ def test_cuda_graph_radix_cutlass(next_n):
 
     g.replay()
     torch.cuda.synchronize()
-    _check_correct(out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True)
+    _check_correct(
+        out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True
+    )
 
     fresh = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 3).to(dtype)
     logits.copy_(fresh)
     out_i.zero_()
     g.replay()
     torch.cuda.synchronize()
-    _check_correct(out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True)
+    _check_correct(
+        out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True
+    )
 
 
 def test_lb_max_batch_size_boundaries():
