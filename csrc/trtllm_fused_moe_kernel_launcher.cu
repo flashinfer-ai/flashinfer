@@ -1817,7 +1817,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         gemm2_weights_scale(gemm2_weights_scale),
         gemm2_bias(gemm2_bias),
         topk_ids(topk_ids),
-        topk_weights(topk_weights) {}
+        topk_weights(topk_weights),
+        disableFP4QuantFastMath(tensorrt_llm::common::getEnvDisableFP4QuantFastMath()) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
@@ -2057,7 +2058,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   Optional<Tensor> activation_output_scale;
   TensorView topk_ids;      // [num_tokens, top_k] - pre-computed or output top-k expert indices
   TensorView topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing weights
-  static bool const disableFP4QuantFastMath;
+  bool disableFP4QuantFastMath;
 
  public:
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
@@ -2150,7 +2151,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       // currently FP4 MoE always apply per-token scaling to both FC1 and FC2.
       // when use fast math path, the FC1 will output FP4+FP32 scales; otherwise output BF16, and
       // then quantize to FP4.
-      dtypeGemm1Output = disableFP4QuantFastMath ? btg::Dtype::Bfloat16 : btg::Dtype::E2m1;
+      dtypeGemm1Output = tensorrt_llm::common::getEnvDisableFP4QuantFastMath()
+                             ? btg::Dtype::Bfloat16
+                             : btg::Dtype::E2m1;
     }
 
     for (int32_t tile_N : selected_tile_nums) {
@@ -2177,9 +2180,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     return valid_configs;
   }
 };
-
-bool const FP4BlockScaleLauncher::disableFP4QuantFastMath =
-    tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
 
 Array<Tensor> trtllm_bf16_moe(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
