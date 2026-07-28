@@ -64,9 +64,9 @@ class QuantVariant(Enum):
     DeepSeekFp8 = 2
     MxFp8 = 3
     NVFP4 = 4  # day-1 MVP target
-    MXFP4 = 5  # MXFP4 weights × MXFP8 activations (TRTLLM W4A8)
+    MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
-    W4A16 = 7  # backend-specific 4-bit weights × BF16 activations
+    W4A16 = 7  # backend-specific 4-bit weights x BF16 activations
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -254,8 +254,8 @@ class TrtllmFp4Config:
         """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
-        ``variant`` selects NVFP4, MXFP4×MXFP8, or ``QuantVariant.W4A16``
-        (MXFP4 weights × BF16 activations).
+        ``variant`` selects NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``
+        (MXFP4 weights x BF16 activations).
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
         """
         from .prepare import prepare_trtllm_fp4_weights
@@ -277,7 +277,7 @@ class TrtllmFp4Config:
         *,
         variant: QuantVariant = QuantVariant.NVFP4,
     ):
-        """Prepare activations for NVFP4, MXFP4×MXFP8, or ``QuantVariant.W4A16``.
+        """Prepare activations for NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``.
 
         W4A16 returns raw BF16 activations without an activation scale.
         """
