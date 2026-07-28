@@ -2093,8 +2093,7 @@ def gated_delta_rule_mtp(
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
     )
-    # bf16-only kernel: module-level `io = cutlass.BFloat16` types every smem tile and
-    # the MMA atom, so any other dtype would be reinterpreted, not converted.
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
     q, k, v, a, b = as_bf16(q, k, v, a, b)
     assert output is None or output.dtype == torch.bfloat16, (
         f"output must be bf16; got {output.dtype}."

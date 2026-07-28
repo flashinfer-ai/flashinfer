@@ -2609,17 +2609,12 @@ def run_mtp_decode(
             initial_state_indices. Negative entries skip the writeback for
             that batch slot (matching the read-side padding skip semantics).
     """
-    # This kernel is bf16-only for q/k/v/a/b and stores the result with
-    # `cutlass.BFloat16(...)`, so any other dtype would be reinterpreted instead of
-    # converted. The public API documents fp16 q/k/v and an arbitrary `output` dtype,
-    # so convert on the way in and copy the bf16 result back on the way out.
+    # Kernel is bf16-only for q/k/v/a/b/output; stage non-bf16 caller output for writeback.
     q, k, v, a, b = as_bf16(q, k, v, a, b)
     output_writeback = None
     if output.dtype != torch.bfloat16:
         output_writeback = output
-        # Convert the caller buffer in-place semantics: padding slots (negative
-        # indices) are never written by the kernel, so the writeback must preserve
-        # whatever the caller already put there — not uninitialized scratch.
+        # Keep padding rows (negative indices); do not use empty scratch.
         output = output_writeback.to(torch.bfloat16)
 
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
@@ -2630,23 +2625,13 @@ def run_mtp_decode(
 
     per_token_pool_scatter = ssm_state_indices is not None
 
-    # `cute.compile` bakes h0_source strides into the produced binary. When
-    # `use_pool_indexing=True` callers can legitimately pass 4D pools with
-    # different stride patterns (e.g., differently-paged pools), so we must
-    # include the strides in the cache key. For the flat path strides are
-    # always (V*K, K, 1) and don't need to be keyed.
+    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:
         pool_strides_key = tuple(h0_source.stride())
     else:
         pool_strides_key = None
 
-    # `from_dlpack` bakes each tensor's dtype into the compiled signature, so a dtype
-    # that varies across calls has to be part of the compile identity or the second
-    # dtype silently reuses the first cubin. q/k/v/a/b/output are pinned to bf16
-    # above, and h0/intermediate/cu_seqlens/scatter indices have asserted dtypes; the
-    # operands below stay polymorphic (`dt_bias` is documented as bf16 or fp32, slot
-    # indices as int32 or int64) because the kernel reads them via indexed scalar
-    # loads, which convert. `h0_out_indices` follows `initial_state_indices`.
+    # Polymorphic dtypes baked into the compile signature (q/k/v/a/b/output are pinned).
     dtype_key = (
         A_log.dtype,
         dt_bias.dtype,

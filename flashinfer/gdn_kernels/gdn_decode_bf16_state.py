@@ -2849,17 +2849,7 @@ def _dtype_key(
     dt_bias: torch.Tensor,
     indices: Optional[torch.Tensor],
 ) -> tuple:
-    """Polymorphic operand dtypes that `cute.compile` bakes into the signature.
-
-    A compile cache key that omits them lets the first-compiled dtype win, and
-    TVM-FFI then rejects launches for any other dtype. Only the operands the kernel
-    reads through indexed scalar loads belong here: `dt_bias` is documented as bf16
-    or fp32 and slot indices as int32 or int64, and both convert on load. q/k/v/a/b
-    and `output` are pinned to bf16 by the callers instead, since the kernel
-    reinterprets rather than converts those. `indices` resolves to the int32
-    placeholder used at compile time when absent, so `None` and an explicit int32
-    tensor share one cubin. The pool and intermediate buffer are asserted bf16.
-    """
+    """Dtypes that vary across calls and are baked into the compile signature."""
     return (
         A_log.dtype,
         dt_bias.dtype,
