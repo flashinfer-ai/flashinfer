@@ -62,6 +62,14 @@ def _kernel_name(
     )
 
 
+def _weight_scale_num_bytes(output_channels: int, input_channels: int) -> int:
+    return (
+        ((output_channels + 127) // 128)
+        * (((input_channels * 27 // 16) + 3) // 4)
+        * 512
+    )
+
+
 @cache
 def _get_compiled_kernel(
     input_shape: Tuple[int, int, int, int, int],
@@ -106,9 +114,7 @@ def _get_compiled_kernel(
     )
     with torch.cuda.device(device_index):
         max_active_clusters = get_max_active_clusters(1)
-    weight_scale_bytes = (
-        ((output_channels + 127) // 128) * (((channels * 27 // 16) + 3) // 4) * 512
-    )
+    weight_scale_bytes = _weight_scale_num_bytes(output_channels, channels)
 
     def compile_kernel():
         packed_input = cute.runtime.make_fake_compact_tensor(
@@ -340,9 +346,7 @@ def _validate_runtime_tensors(
             f"output must be contiguous NDHWC with shape {expected_output_shape}; "
             f"got {tuple(output.shape)}"
         )
-    expected_weight_scale_bytes = (
-        ((output_channels + 127) // 128) * (((channels * 27 // 16) + 3) // 4) * 512
-    )
+    expected_weight_scale_bytes = _weight_scale_num_bytes(output_channels, channels)
     if weight_scale.numel() != expected_weight_scale_bytes:
         raise ValueError(
             f"weight_scale must contain {expected_weight_scale_bytes} bytes; "

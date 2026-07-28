@@ -74,6 +74,8 @@ prepare_nvfp4_conv3d_weight_trace = TraceTemplate(
         "filter_t == 3",
         "filter_r == 3",
         "filter_s == 3",
+        "weight_scale_bytes == ((output_channels + 127) // 128) * "
+        "(((input_channels * 27 // 16) + 3) // 4) * 512",
         "global_scale_elements == 1",
     ],
     tags=["sm120", "nvfp4", "weight-preparation", "status:verified"],
@@ -162,6 +164,8 @@ conv3d_nvfp4_trace = TraceTemplate(
         "filter_t == 3",
         "filter_r == 3",
         "filter_s == 3",
+        "weight_scale_bytes == ((output_channels + 127) // 128) * "
+        "(((input_channels * 27 // 16) + 3) // 4) * 512",
         "scale_elements == 1",
         "output_depth == input_depth - 2",
     ],
