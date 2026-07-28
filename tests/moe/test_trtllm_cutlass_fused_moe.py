@@ -213,6 +213,21 @@ def torch_moe_nvfp4(
             up = (a[mask] @ w3_expert.t()).clamp(min=-limit, max=limit)
             return gate * up
 
+    elif activation_type == ActivationType.Situ:
+        assert swiglu_limit is not None, "Situ requires linear beta"
+        situ_beta = 4.0
+        linear_beta = float(swiglu_limit)
+
+        def act(weight, mask):
+            m = weight.shape[0]
+            assert m % 2 == 0
+            w1_expert, w3_expert = weight[m // 2 :, :], weight[: m // 2, :]
+            gate = a[mask] @ w1_expert.t()
+            up = a[mask] @ w3_expert.t()
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            up = linear_beta * torch.tanh(up / linear_beta)
+            return gate * up
+
     elif activation_type == ActivationType.Relu2:
 
         def act(weight, mask):
@@ -350,6 +365,14 @@ def compute_with_experts(
             x1 = F.silu(expert_inputs @ w1_expert.t()).clamp(max=step_limit)
             x2 = (expert_inputs @ w3_expert.t()).clamp(min=-step_limit, max=step_limit)
             inter = x1 * x2
+        elif activation_type == ActivationType.Situ:
+            situ_beta = 4.0 if alpha is None else alpha
+            linear_beta = 25.0 if limit is None else limit
+            x1 = expert_inputs @ w1_expert.t()
+            x2 = expert_inputs @ w3_expert.t()
+            x1 = situ_beta * torch.tanh(x1 / situ_beta) * torch.sigmoid(x1)
+            x2 = linear_beta * torch.tanh(x2 / linear_beta)
+            inter = x1 * x2
         elif alpha is not None and limit is not None and beta is not None:
             # SwiGLUBias
             x1 = expert_inputs @ w1_expert.t()
@@ -391,8 +414,8 @@ EP_TOP_K = [2]
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.SwigluStep],
-    ids=["swiglu", "swiglustep"],
+    [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
+    ids=["swiglu", "swiglustep", "situ"],
 )
 def test_moe(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
@@ -425,6 +448,10 @@ def test_moe(
     )
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    alpha_t = limit_t = None
+    if activation_type == ActivationType.Situ:
+        alpha_t = torch.full((num_experts,), 4.0, dtype=torch.float32, device="cuda")
+        limit_t = torch.full((num_experts,), 25.0, dtype=torch.float32, device="cuda")
     ref_output = compute_with_experts(
         num_experts,
         x,
@@ -432,6 +459,8 @@ def test_moe(
         w2_weight,
         selected_experts,
         routing_weights,
+        alpha=4.0 if activation_type == ActivationType.Situ else None,
+        limit=25.0 if activation_type == ActivationType.Situ else None,
         activation_type=activation_type,
     )
     flash_output = torch.empty_like(ref_output)
@@ -445,6 +474,8 @@ def test_moe(
         output=flash_output,
         quant_scales=None,
         activation_type=activation_type,
+        swiglu_alpha=alpha_t,
+        swiglu_limit=limit_t,
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)

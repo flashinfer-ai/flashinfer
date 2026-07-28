@@ -5,3 +5,9 @@ def test_geglu_tanh_is_gated_activation():
     assert is_gated_activation(ActivationType.GegluTanh)
     assert is_gated_activation(ActivationType.GegluTanh.value)
     assert ActivationType.GegluTanh.is_gated
+
+
+def test_situ_is_gated_activation():
+    assert is_gated_activation(ActivationType.Situ)
+    assert is_gated_activation(ActivationType.Situ.value)
+    assert ActivationType.Situ.is_gated

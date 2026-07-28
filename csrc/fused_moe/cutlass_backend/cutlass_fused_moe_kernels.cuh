@@ -2210,6 +2210,36 @@ struct SwigluStepAdaptor {
   }
 };
 
+// SiTU activation used by Kimi-K3:
+//   beta * tanh(gate / beta) * sigmoid(gate) *
+//   linear_beta * tanh(up / linear_beta)
+// alpha carries beta. limit carries linear_beta; infinity disables up clipping.
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+    auto tanh_array = [](T const& x) {
+      T out;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < T::kElements; ++i) {
+        out[i] = cutlass::epilogue::thread::tanh_opt(x[i]);
+      }
+      return out;
+    };
+    T gate_act = tanh_array(gate / alpha) * alpha * sigmoid(gate);
+    T up_act = linear;
+    if (limit != std::numeric_limits<float>::infinity()) {
+      up_act = tanh_array(linear / limit) * limit;
+    }
+    return gate_act * up_act;
+  }
+};
+
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2293,6 +2323,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2573,7 +2605,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
+                              decltype(nvfp4_4over6_config_tag)>,  // Identity
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>  // Situ
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };

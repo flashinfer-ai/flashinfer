@@ -1063,6 +1063,9 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Sm90Wfp4Af
     case ActivationType::Swiglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
       break;
+    case ActivationType::Situ:
+      runGemm<cutlass_extensions::EpilogueOpDefaultSilu>(inputs, hopper_inputs);
+      break;
     case ActivationType::Geglu:
       runGemm<cutlass_extensions::EpilogueOpDefaultFtGelu>(inputs, hopper_inputs);
       break;
