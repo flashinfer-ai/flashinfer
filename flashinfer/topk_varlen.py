@@ -693,7 +693,9 @@ def _run_radix(
     """CuTe DSL multi-CTA radix top-k: native varlen, no logit masking needed."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
     num_rows, N = logits.shape
-    num_groups_eff = logits.shape[0] // next_n  # number of requests
+    # Note: the row->request mapping (num_rows // next_n) is handled inside the
+    # compiled kernel (row_idx // next_n indexes seq_lens; see radix_topk.py),
+    # so next_n only needs to be forwarded to _compile_radix below.
 
     # Adjust seq_lens for compress_ratio (match _run_radix_cutlass semantics).
     if compress_ratio > 1:

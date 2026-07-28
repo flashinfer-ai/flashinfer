@@ -136,9 +136,10 @@ def run_gvr(logits, seq_lens, top_k, pre_idx, load_balance):
 
 
 def run_radix(logits, seq_lens, top_k):
-    # Radix masked fallback: no pre_idx, runs on any GPU. Masks logits to
-    # seq_lens then calls the shared FlashInfer radix top-K kernel.
-    return flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix")
+    # radix_cutlass = masked CUTLASS radix fallback: no pre_idx, runs on any
+    # GPU. Masks logits to seq_lens then calls the shared FlashInfer radix
+    # top-K kernel. (This is the baseline the "radix" columns below report.)
+    return flashinfer.top_k_varlen(logits, seq_lens, top_k, backend="radix_cutlass")
 
 
 def check_correct(indices, logits, seq_lens, top_k):

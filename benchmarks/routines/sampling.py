@@ -183,8 +183,12 @@ def parse_sampling_args(line, parser):
         required=False,
         nargs="+",
         default=["cuda"],
-        choices=["cuda", "radix", "gvr"],
-        help="Kernel backends to test. Default: cuda. Use 'radix'/'gvr' for top_k_varlen.",
+        choices=["cuda", "radix", "radix_cutlass", "gvr"],
+        help=(
+            "Kernel backends to test. Default: cuda. For top_k_varlen use "
+            "'radix' (CuTe DSL, Blackwell), 'gvr' (Blackwell LB), and/or "
+            "'radix_cutlass' (masked CUTLASS radix, any GPU)."
+        ),
     )
 
     args = parser.parse_args(line)
@@ -1898,14 +1902,16 @@ def testTopKPageTableTransform(args):
 
 
 def testTopKVarlen(args):
-    """Test top_k_varlen with two runners: 'radix' (masked fallback) and 'gvr' (Blackwell GVR LB).
+    """Test top_k_varlen with three runners: 'radix', 'radix_cutlass', and 'gvr'.
 
     Runners
     -------
-    radix  — passes ``pre_idx=None``, forcing the masked-radix fallback on any GPU.
-    gvr    — passes a pre-computed ``pre_idx``, activating the GVR LB kernel on
-             Blackwell (sm_100+).  Filtered out on older hardware by
-             ``filter_backends_by_compute_capability``.
+    radix          — CuTe DSL single-pass multi-CTA radix (Blackwell sm_100+);
+                     ``pre_idx=None``. Filtered out on older hardware.
+    radix_cutlass  — masked CUTLASS radix fallback; ``pre_idx=None``. Runs on any GPU.
+    gvr            — GVR LB kernel; passes a pre-computed ``pre_idx``. Blackwell
+                     (sm_100+) only. Filtering is done by
+                     ``filter_backends_by_compute_capability``.
 
     Reference check compares the *set* of selected indices against ``torch.topk`` applied
     to logits masked to ``seq_lens``.
@@ -1919,9 +1925,11 @@ def testTopKVarlen(args):
         print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
 
     backends = args.backends[:]
-    # Default to both runners when caller passes legacy "cuda"
+    # Default to all runners when caller passes legacy "cuda"; the per-CC
+    # filter below keeps only those valid on the current GPU (radix_cutlass
+    # everywhere, radix/gvr on Blackwell).
     if backends == ["cuda"]:
-        backends = ["radix", "gvr"]
+        backends = ["radix", "gvr", "radix_cutlass"]
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_k = args.top_k
@@ -1951,9 +1959,19 @@ def testTopKVarlen(args):
 
     def run_backend(backend, logits):
         if backend == "radix":
-            return flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=None)
+            # CuTe DSL multi-CTA radix (Blackwell); no pre_idx needed.
+            return flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=None, backend="radix"
+            )
+        elif backend == "radix_cutlass":
+            # Masked CUTLASS radix fallback (any GPU); no pre_idx needed.
+            return flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=None, backend="radix_cutlass"
+            )
         elif backend == "gvr":
-            return flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx)
+            return flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1961,7 +1979,8 @@ def testTopKVarlen(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
+            # top_k_varlen returns (indices, values_or_None); refcheck compares indices.
+            outputs[cur_backend] = run_backend(cur_backend, logits)[0].detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,

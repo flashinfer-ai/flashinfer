@@ -888,15 +888,17 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     "top_k_varlen": {
-        "7.5": ["radix"],
-        "8.0": ["radix"],
-        "8.6": ["radix"],
-        "8.9": ["radix"],
-        "9.0": ["radix"],
-        "10.0": ["radix", "gvr"],
-        "10.3": ["radix", "gvr"],
-        "12.0": ["radix", "gvr"],
-        "12.1": ["radix", "gvr"],
+        # radix = CuTe DSL multi-CTA radix (Blackwell sm_100+); gvr = GVR LB
+        # (Blackwell); radix_cutlass = masked CUTLASS radix fallback (any GPU).
+        "7.5": ["radix_cutlass"],
+        "8.0": ["radix_cutlass"],
+        "8.6": ["radix_cutlass"],
+        "8.9": ["radix_cutlass"],
+        "9.0": ["radix_cutlass"],
+        "10.0": ["radix", "gvr", "radix_cutlass"],
+        "10.3": ["radix", "gvr", "radix_cutlass"],
+        "12.0": ["radix", "gvr", "radix_cutlass"],
+        "12.1": ["radix", "gvr", "radix_cutlass"],
     },
     # ROPE
     "apply_rope": {
