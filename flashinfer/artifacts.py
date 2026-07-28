@@ -225,10 +225,13 @@ def get_checksums(subdirs):
             for line in f:
                 sha256, filename = line.strip().split()
 
-                # Distinguish between all meta info header files
-                if ".h" in filename:
-                    filename = safe_urljoin(subdir, filename)
-                checksums[filename] = sha256
+                # Key every entry by its full path. Bare filenames are not
+                # unique across subdirs: the per-arch pins (e.g. TRTLLM_GEN_BMM
+                # and TRTLLM_GEN_BMM_RUBIN) ship the same sm100f/sm103a kernel
+                # names built from different sources, so a flat dict would let
+                # the subdir processed last silently overwrite the earlier
+                # one's hashes and fail verification for every shared name.
+                checksums[safe_urljoin(subdir, filename)] = sha256
     return checksums
 
 
@@ -306,7 +309,8 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
         for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            yield (safe_urljoin(cubin_dir, name), checksums[name])
+            full_path = safe_urljoin(cubin_dir, name)
+            yield (full_path, checksums[full_path])
         for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
             full_path = safe_urljoin(cubin_dir, name)
             yield (full_path, checksums[full_path])
