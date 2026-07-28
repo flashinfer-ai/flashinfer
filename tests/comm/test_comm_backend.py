@@ -24,6 +24,7 @@ import multiprocessing as mp
 import os
 import queue
 import shutil
+import signal
 import tempfile
 import time
 from typing import Any
@@ -38,6 +39,9 @@ from flashinfer.comm.comm_backend import (
 )
 
 _TIMEOUT_S = 120.0
+# Per-rank output kept in a failure message; enough for a gloo/c10d error plus
+# the traceback that follows it, without burying the report.
+_LOG_TAIL_LINES = 40
 
 
 def _backend_checks(rank: int) -> dict[str, Any]:
@@ -71,7 +75,20 @@ def _backend_checks(rank: int) -> dict[str, Any]:
     return res
 
 
-def _dist_entry(rank: int, world_size: int, store_path: str, q: Any) -> None:
+def _dist_entry(
+    rank: int, world_size: int, store_path: str, q: Any, log_dir: str
+) -> None:
+    # Give this worker its own stdout/stderr file, redirected at the *fd* level:
+    # gloo and c10d log from C++ straight to fd 2, so a Python-level redirect
+    # would miss exactly the messages worth having, and N workers sharing the
+    # parent's stderr interleave into something unattributable. Per-rank files
+    # are what let the parent report which rank died first, and why (#4193).
+    fd = os.open(
+        os.path.join(log_dir, f"rank{rank}.log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    )
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
     # Pin gloo to loopback; otherwise it may pick a real NIC and fail to connect
     # the full mesh between local processes.
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
@@ -87,6 +104,49 @@ def _dist_entry(rank: int, world_size: int, store_path: str, q: Any) -> None:
         dist.destroy_process_group()
 
 
+def _describe_exit(code: int | None) -> str:
+    """Human-readable worker status, naming the signal when one killed it."""
+    if code is None:
+        return "STILL RUNNING (timed out)"
+    if code == 0:
+        return "exited 0"
+    if code < 0:
+        try:
+            return f"KILLED by {signal.Signals(-code).name}"
+        except ValueError:
+            return f"KILLED by signal {-code}"
+    return f"exited {code}"
+
+
+def _worker_report(
+    procs: list[Any],
+    codes: list[int | None],
+    log_dir: str,
+    results: dict[int, dict[str, Any]],
+) -> str:
+    """Per-rank status and captured output, for the assertion messages.
+
+    A worker that dies takes the interesting evidence with it: a signal kill
+    prints no traceback at all, and the old "assert on the first bad exitcode"
+    stopped before it ever looked at the later ranks. So report *every* rank --
+    status, whether it produced a result, and its captured output -- rather than
+    only the first one that tripped the assert.
+    """
+    lines: list[str] = []
+    for rank, (p, code) in enumerate(zip(procs, codes, strict=True)):
+        got = "result received" if rank in results else "NO RESULT"
+        lines.append(f"  rank {rank} (pid {p.pid}): {_describe_exit(code)}, {got}")
+        if code == 0 and rank in results:
+            continue  # healthy rank, its output is noise
+        try:
+            with open(os.path.join(log_dir, f"rank{rank}.log")) as f:
+                tail = f.read().strip().splitlines()[-_LOG_TAIL_LINES:]
+        except OSError as err:  # pragma: no cover - only on a broken worker
+            tail = [f"<could not read rank {rank} log: {err}>"]
+        lines.extend(f"    | {line}" for line in tail or ["<no output>"])
+    return "\n".join(lines)
+
+
 def _run_dist(world_size: int) -> dict[int, dict[str, Any]]:
     # spawn (not fork/forkserver): starts fresh interpreters, so it stays safe
     # even if an MPI test in the same session has already called MPI_Init.
@@ -95,7 +155,7 @@ def _run_dist(world_size: int) -> dict[int, dict[str, Any]]:
     store_path = os.path.join(tmpdir, "store")
     q = ctx.Queue()
     procs = [
-        ctx.Process(target=_dist_entry, args=(r, world_size, store_path, q))
+        ctx.Process(target=_dist_entry, args=(r, world_size, store_path, q, tmpdir))
         for r in range(world_size)
     ]
     try:
@@ -121,11 +181,26 @@ def _run_dist(world_size: int) -> dict[int, dict[str, Any]]:
             results[rank] = res
         for p in procs:
             p.join(timeout=max(0.0, deadline - time.monotonic()))
+        # Snapshot the exit codes *before* cleaning up, so the report describes
+        # how each worker actually ended rather than how we ended it.
+        codes = [p.exitcode for p in procs]
+        # A worker that lost a peer sits in a collective until gloo's own
+        # timeout (30 min by default), which would turn a failure into a CI
+        # hang. Bound it: past the deadline, the survivors get killed and are
+        # reported as timed out.
         for p in procs:
-            assert p.exitcode == 0, f"worker pid={p.pid} exited with {p.exitcode}"
-        assert len(results) == world_size, (
-            f"expected {world_size} results, got {sorted(results)}"
-        )
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+        # Build the report before asserting: the finally below deletes the
+        # directory holding the per-rank logs.
+        bad = [r for r, c in enumerate(codes) if c != 0]
+        if bad or len(results) != world_size:
+            report = _worker_report(procs, codes, tmpdir, results)
+            assert not bad, f"workers {bad} did not exit cleanly:\n{report}"
+            raise AssertionError(
+                f"expected {world_size} results, got {sorted(results)}:\n{report}"
+            )
         return results
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
