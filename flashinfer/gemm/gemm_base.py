@@ -7112,7 +7112,7 @@ def get_trtllm_gemm_module():
 def _get_trtllm_gemm_module_impl(enable_rubin: bool):
     mod = gen_trtllm_gen_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    setup_cubin_loader(str(mod.get_library_path()))
 
     class TrtllmGemmRunner(TunableRunner):
         def __init__(
