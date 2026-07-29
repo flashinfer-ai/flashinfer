@@ -17,7 +17,7 @@ limitations under the License.
 import math
 import pytest
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Optional, Union
 import torch
 from cuda.bindings import runtime
 from torch.nn import functional as F
@@ -212,9 +212,9 @@ class CUDAGraphMoE:
             gemm1_weights=self.static_data["gemm1_weights_fp4_shuffled"],
             gemm1_weights_scale=self.static_data["gemm1_scales_fp4_shuffled"],
             gemm1_bias=self.config["gemm1_bias"],
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_alpha=self.config.get("gemm1_alpha"),
+            gemm1_beta=self.config.get("gemm1_beta"),
+            gemm1_clamp_limit=self.config.get("gemm1_clamp_limit"),
             gemm2_weights=self.static_data["gemm2_weights_fp4_shuffled"],
             gemm2_weights_scale=self.static_data["gemm2_scales_fp4_shuffled"],
             gemm2_bias=self.config["gemm2_bias"],
@@ -620,7 +620,15 @@ class FP4Moe(Moe):
             )
 
         # Calculate scaling factors that depend on weights
-        if is_gated_activation(args.activation_type):
+        if args.activation_type == ActivationType.Situ:
+            # SiTU is nonlinear in both GEMM outputs, so applying the dequantization
+            # factor through scale_c_fc1 would move it inside tanh and change the
+            # activation. The kernel applies scale_gate_fc1 inside the activation;
+            # scale_c_fc1 must contain only the output quantization factor.
+            scale_c_fc1 = torch.full_like(
+                args.gemm1_scales_global, args_dequant.c_global_sf
+            )
+        elif is_gated_activation(args.activation_type):
             scale_c_fc1 = (
                 args_dequant.c_global_sf
                 * (1.0 / args.gemm1_scales_global)
@@ -668,6 +676,18 @@ class FP4Moe(Moe):
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_alpha = kwargs.get("gemm1_alpha")
+        gemm1_beta = kwargs.get("gemm1_beta")
+        gemm1_clamp_limit = kwargs.get("gemm1_clamp_limit")
+        kernel_gemm1_clamp_limit = gemm1_clamp_limit
+        if (
+            gemm1_clamp_limit is not None
+            and self.quant_mode == QuantMode.FP4_NVFP4_NVFP4
+            and activation_type == ActivationType.Situ
+        ):
+            # trtllm-gen clamps the raw accumulator before applying the
+            # dequantization factor carried by scale_gate_fc1.
+            kernel_gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
 
         # Create CUDA graph configuration
         config = {
@@ -684,6 +704,9 @@ class FP4Moe(Moe):
             "gemm1_bias": gemm1_bias,
             "gemm2_bias": gemm2_bias,
             "norm_topk_prob": norm_topk_prob,
+            "gemm1_alpha": gemm1_alpha,
+            "gemm1_beta": gemm1_beta,
+            "gemm1_clamp_limit": kernel_gemm1_clamp_limit,
         }
 
         runtime_args = {
@@ -2491,6 +2514,23 @@ def mxfp8_dequantize_batches(a, a_scales, is_swizzling=True):
 # ====================================================================================
 
 
+def situ_activation_reference(
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    *,
+    alpha: Union[float, torch.Tensor] = 1.0,
+    beta: Union[float, torch.Tensor] = 1.0,
+    clamp_limit: Optional[Union[float, torch.Tensor]] = None,
+) -> torch.Tensor:
+    """Reference for TRTLLM-Gen SiTU v2 (linear x0, gate x1)."""
+    if clamp_limit is not None:
+        x0 = torch.clamp(x0, min=-clamp_limit, max=clamp_limit)
+        x1 = torch.clamp(x1, max=clamp_limit)
+    left = beta * torch.tanh(x0 / beta)
+    right = alpha * torch.tanh(x1 / alpha) * torch.sigmoid(x1)
+    return left * right
+
+
 def run_moe_dequant(args, quant_mode: QuantMode):
     """Common dequantized MoE reference implementation."""
     # Permute
@@ -2562,13 +2602,13 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         (total_num_padded_tokens, args.intermediate_size), float("nan"), device="cuda"
     ).to(torch.float)
 
-    activation_type = args.activation_type
+    activation_type = ActivationType(args.activation_type)
     activation_type_to_func = {
         ActivationType.Swiglu: F.silu,
         ActivationType.Geglu: F.gelu,
         ActivationType.Relu2: lambda x: F.relu(x) ** 2,
     }
-    activation_func = activation_type_to_func[activation_type]
+    activation_func = activation_type_to_func.get(activation_type)
 
     i = 0
     for expert_idx in range(args.num_experts):
@@ -2576,45 +2616,54 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         if my_num_tokens == 0:
             continue
         my_a = gemm1_output[i : i + my_num_tokens]
-        if is_gated_activation(args.activation_type):
-            my_x1 = my_a[:, : args.intermediate_size]
-            my_x2 = my_a[:, args.intermediate_size :]
-            if args.gemm1_clamp_limit is not None:
-                limit = args.gemm1_clamp_limit[expert_idx].to(
-                    device=my_x1.device, dtype=torch.float
+        if is_gated_activation(activation_type):
+            x0 = my_a[:, : args.intermediate_size]
+            x1 = my_a[:, args.intermediate_size :]
+            alpha = (
+                None
+                if args.gemm1_alpha is None
+                else args.gemm1_alpha[expert_idx].to(
+                    device=x1.device, dtype=torch.float
                 )
-                my_x1 = torch.clamp(my_x1, min=-limit, max=limit)
-                my_x2 = torch.clamp(my_x2, max=limit)
-            if (
-                args.gemm1_alpha is not None
-                or args.gemm1_beta is not None
-                or args.gemm1_clamp_limit is not None
-            ):
-                assert int(args.activation_type) == int(ActivationType.Swiglu)
-                alpha = (
-                    1.0
-                    if args.gemm1_alpha is None
-                    else args.gemm1_alpha[expert_idx].to(
-                        device=my_x2.device, dtype=torch.float
-                    )
+            )
+            beta = (
+                None
+                if args.gemm1_beta is None
+                else args.gemm1_beta[expert_idx].to(device=x0.device, dtype=torch.float)
+            )
+            clamp_limit = (
+                None
+                if args.gemm1_clamp_limit is None
+                else args.gemm1_clamp_limit[expert_idx].to(
+                    device=x0.device, dtype=torch.float
                 )
-                beta = (
-                    0.0
-                    if args.gemm1_beta is None
-                    else args.gemm1_beta[expert_idx].to(
-                        device=my_x1.device, dtype=torch.float
-                    )
-                )
-                activation_output[i : i + my_num_tokens] = (
-                    my_x2 * torch.sigmoid(alpha * my_x2) * (my_x1 + beta)
+            )
+            if activation_type == ActivationType.Situ:
+                activation_output[i : i + my_num_tokens] = situ_activation_reference(
+                    x0,
+                    x1,
+                    alpha=1.0 if alpha is None else alpha,
+                    beta=1.0 if beta is None else beta,
+                    clamp_limit=clamp_limit,
                 )
             else:
-                activation_output[i : i + my_num_tokens] = (
-                    activation_func(my_x2) * my_x1
-                )
+                if clamp_limit is not None:
+                    x0 = torch.clamp(x0, min=-clamp_limit, max=clamp_limit)
+                    x1 = torch.clamp(x1, max=clamp_limit)
+                if alpha is not None or beta is not None or clamp_limit is not None:
+                    assert activation_type == ActivationType.Swiglu
+                    alpha = 1.0 if alpha is None else alpha
+                    beta = 0.0 if beta is None else beta
+                    activation_output[i : i + my_num_tokens] = (
+                        x1 * torch.sigmoid(alpha * x1) * (x0 + beta)
+                    )
+                else:
+                    assert activation_func is not None
+                    activation_output[i : i + my_num_tokens] = activation_func(x1) * x0
         else:
-            my_x1 = my_a[:, : args.intermediate_size]
-            activation_output[i : i + my_num_tokens] = activation_func(my_x1)
+            x0 = my_a[:, : args.intermediate_size]
+            assert activation_func is not None
+            activation_output[i : i + my_num_tokens] = activation_func(x0)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -2753,6 +2802,10 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
+        gemm1_alpha=args.gemm1_alpha,
+        gemm1_beta=args.gemm1_beta,
+        gemm1_clamp_limit=args.gemm1_clamp_limit,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
@@ -3591,9 +3644,9 @@ def run_moe_test(
             gemm1_weights=static_data["gemm1_weights_fp4_shuffled"],
             gemm1_weights_scale=static_data["gemm1_scales_fp4_shuffled"],
             gemm1_bias=static_data["gemm1_bias_shuffled"],
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             gemm2_weights=static_data["gemm2_weights_fp4_shuffled"],
             gemm2_weights_scale=static_data["gemm2_scales_fp4_shuffled"],
             gemm2_bias=static_data["gemm2_bias_shuffled"],

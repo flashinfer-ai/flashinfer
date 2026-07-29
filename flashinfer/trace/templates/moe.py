@@ -14,6 +14,7 @@
 
 """TraceTemplates for Mixture-of-Experts operations."""
 
+import math
 import inspect
 
 import torch
@@ -1259,8 +1260,13 @@ def _fp4_moe_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    activation_type=3,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
+    **_unused,
 ):
-    """FP4 dequantize + SwiGLU + GEMM for all routing types.
+    """FP4 dequantize + gated activation + GEMM for all routing types.
 
     ``weights``   : [T, TOP_K] float32 — per-token expert weights (normalised)
     ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
@@ -1292,6 +1298,31 @@ def _fp4_moe_run_experts(
     T = A.shape[0]
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Situ):
+        raise ValueError(
+            "FP4 MoE trace reference supports "
+            f"{ActivationType.Swiglu!r} and {ActivationType.Situ!r}, "
+            f"got {activation_type!r}"
+        )
+    if activation_type == ActivationType.Situ:
+        for name, param in (
+            ("gemm1_alpha", gemm1_alpha),
+            ("gemm1_beta", gemm1_beta),
+            ("gemm1_clamp_limit", gemm1_clamp_limit),
+        ):
+            if param is None:
+                continue
+            if param.shape != (E_local,):
+                raise ValueError(
+                    f"{name} must have shape [{E_local}], got {tuple(param.shape)}"
+                )
+            if param.dtype != torch.float32:
+                raise ValueError(f"{name} must have dtype float32, got {param.dtype}")
+            if param.device != device:
+                raise ValueError(f"{name} must be on {device}, got {param.device}")
+            if not torch.isfinite(param).all() or not (param > 0).all():
+                raise ValueError(f"{name} must contain only finite positive values")
 
     for le in range(E_local):
         ge = local_start + le
@@ -1305,10 +1336,32 @@ def _fp4_moe_run_experts(
         G1 = A_e.matmul(W1[le].t())  # [N, 2*I]
         if gemm1_bias is not None:
             G1 = G1 + gemm1_bias[le].to(torch.float32)
-        # SwiGLU uses the trtllm-gen convention: silu(X2) * X1 with X1 first.
-        X1, X2 = G1[:, :I], G1[:, I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))
-        activated = silu_X2 * X1
+        # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.
+        x0, x1 = G1[:, :I], G1[:, I:]
+        if activation_type == ActivationType.Situ:
+            alpha = (
+                torch.tensor(1.0, dtype=torch.float32, device=device)
+                if gemm1_alpha is None
+                else gemm1_alpha[le]
+            )
+            beta = (
+                torch.tensor(1.0, dtype=torch.float32, device=device)
+                if gemm1_beta is None
+                else gemm1_beta[le]
+            )
+            if gemm1_clamp_limit is not None:
+                limit = gemm1_clamp_limit[le]
+                x0 = torch.clamp(x0, min=-limit, max=limit)
+                x1 = torch.clamp(x1, max=limit)
+            activated = (
+                beta
+                * torch.tanh(x0 / beta)
+                * alpha
+                * torch.tanh(x1 / alpha)
+                * torch.sigmoid(x1)
+            )
+        else:
+            activated = x1 * torch.sigmoid(x1) * x0
         O = activated.matmul(W2[le].t())  # [N, H]
         if gemm2_bias is not None:
             O = O + gemm2_bias[le].to(torch.float32)
@@ -1336,6 +1389,7 @@ def _trtllm_fp4_block_scale_moe_default_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with Default routing (Softmax → TopK)."""
     TOP_K = int(top_k)
@@ -1360,6 +1414,7 @@ def _trtllm_fp4_block_scale_moe_default_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1378,6 +1433,7 @@ def _trtllm_fp4_block_scale_moe_renormalize_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with Renormalize routing (TopK on logits → Softmax)."""
     TOP_K = int(top_k)
@@ -1402,6 +1458,7 @@ def _trtllm_fp4_block_scale_moe_renormalize_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1422,6 +1479,7 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
     topk_group,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with DeepSeek-V3 routing: sigmoid + groups + top_k."""
     TOP_K = int(top_k)
@@ -1474,6 +1532,7 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1492,6 +1551,7 @@ def _trtllm_fp4_block_scale_moe_llama4_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with Llama4 routing (Top1 → Sigmoid). top_k is fixed at 1."""
     E_global = routing_logits.shape[1]
@@ -1515,6 +1575,7 @@ def _trtllm_fp4_block_scale_moe_llama4_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1533,6 +1594,7 @@ def _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with RenormalizeNaive routing (Softmax → TopK → sum-to-1)."""
     TOP_K = int(top_k)
@@ -1559,6 +1621,7 @@ def _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1577,6 +1640,7 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    **activation_kwargs,
 ):
     """FP4 MoE with TopK-only routing (uniform weights)."""
     TOP_K = int(top_k)
@@ -1603,6 +1667,7 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        **activation_kwargs,
     )
 
 
@@ -1633,6 +1698,9 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "num_fp4_intermediate_blocks": Const(
         description="Number of FP4 scale blocks along intermediate_size (intermediate_size // 16 for NvFP4).",
         abbrev="",
+    ),
+    "activation_type": Const(
+        description="Fused activation type; 10 selects SiTU.", abbrev="act"
     ),
 }
 
@@ -1671,17 +1739,17 @@ _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
     ),
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
-        description="Per-expert SwiGLU alpha (float32). Optional.",
+        description="Per-expert SiTU alpha or SwiGLU alpha (float32). Optional.",
         optional=True,
     ),
     "gemm1_beta": Tensor(
         ["num_local_experts"],
-        description="Per-expert SwiGLU beta (float32). Optional.",
+        description="Per-expert SiTU beta or SwiGLU beta (float32). Optional.",
         optional=True,
     ),
     "gemm1_clamp_limit": Tensor(
         ["num_local_experts"],
-        description="Per-expert SwiGLU clamp limit (float32). Optional.",
+        description="Per-expert gated-activation clamp limit (float32). Optional.",
         optional=True,
     ),
     "gemm2_weights": Tensor(
@@ -1721,6 +1789,9 @@ _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
         optional=True,
         description="Scaling factor applied to routing weights. None for some routing methods.",
     ),
+    "activation_type": Scalar(
+        "int32", description="Fused activation type; 10 selects SiTU."
+    ),
 }
 
 _FP4_STANDARD_OUTPUTS = {
@@ -1752,6 +1823,10 @@ def _moe_fp4_block_scale_init(
     num_fp4_intermediate_blocks: int = 0,  # derived
     device: str = "cuda",
     seed: int = 0,
+    activation_type: int = 3,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """Build inputs for ``trtllm_fp4_block_scale_moe`` (any routing variant).
 
@@ -1766,6 +1841,30 @@ def _moe_fp4_block_scale_init(
         on by default for parity with the test).
     Requires SM100+ at runtime; CPU smoke tests skip.
     """
+    activation_type = normalize_activation_type(activation_type)
+    situ_alpha = gemm1_alpha
+    situ_beta = gemm1_beta
+    situ_clamp = gemm1_clamp_limit
+    if activation_type == ActivationType.Situ:
+        materialized: dict[str, torch.Tensor | None] = {}
+        for name, value, default in (
+            ("gemm1_alpha", gemm1_alpha, 1.0),
+            ("gemm1_beta", gemm1_beta, 1.0),
+            ("gemm1_clamp_limit", gemm1_clamp_limit, None),
+        ):
+            if value is None and default is None:
+                materialized[name] = None
+                continue
+            scalar = float(default if value is None else value)
+            if not math.isfinite(scalar) or scalar <= 0:
+                raise ValueError(f"{name} must be finite and positive for SiTU")
+            materialized[name] = torch.full(
+                (num_local_experts,), scalar, dtype=torch.float32, device=device
+            )
+        situ_alpha = materialized["gemm1_alpha"]
+        situ_beta = materialized["gemm1_beta"]
+        situ_clamp = materialized["gemm1_clamp_limit"]
+
     del gemm1_out_size, num_packed_hidden, num_fp4_hidden_blocks
     del num_packed_intermediate, num_fp4_intermediate_blocks
     from flashinfer import fp4_quantize  # noqa: PLC0415
@@ -1856,9 +1955,9 @@ def _moe_fp4_block_scale_init(
         "gemm1_weights": gemm1_weights,
         "gemm1_weights_scale": gemm1_weights_scale,
         "gemm1_bias": None,
-        "gemm1_alpha": None,
-        "gemm1_beta": None,
-        "gemm1_clamp_limit": None,
+        "gemm1_alpha": situ_alpha,
+        "gemm1_beta": situ_beta,
+        "gemm1_clamp_limit": situ_clamp,
         "gemm2_weights": gemm2_weights,
         "gemm2_weights_scale": gemm2_weights_scale,
         "gemm2_bias": None,
@@ -1872,6 +1971,7 @@ def _moe_fp4_block_scale_init(
         "local_num_experts": int(num_local_experts),
         "routed_scaling_factor": None,
         "routing_method_type": int(routing_method_type),
+        "activation_type": int(activation_type),
     }
     if routing_method_type == 2:
         result["n_group"] = int(n_group) if n_group else 8
@@ -2381,6 +2481,10 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    activation_type=3,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids)."""
@@ -2406,6 +2510,10 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
         topk_ids.to(torch.int64),
         local_expert_offset,
         int(num_experts),
+        activation_type=activation_type,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -3018,6 +3126,9 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         ),
         "num_packed_intermediate": Const(abbrev=""),
         "num_fp4_intermediate_blocks": Const(abbrev=""),
+        "activation_type": Const(
+            description="Fused activation type; 10 selects SiTU.", abbrev="act"
+        ),
     },
     inputs={
         "topk_ids": Tensor(
@@ -3043,6 +3154,24 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
             ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
             description="FC1 NvFP4 scale.",
         ),
+        "gemm1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert SiTU alpha or SwiGLU alpha.",
+        ),
+        "gemm1_beta": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert SiTU beta or SwiGLU beta.",
+        ),
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert gated-activation clamp limit.",
+        ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
             description="FC2 NvFP4 weights.",
@@ -3055,6 +3184,9 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         "top_k": Scalar("int32"),
         "local_expert_offset": Scalar("int32"),
         "routed_scaling_factor": Scalar("float32", optional=True),
+        "activation_type": Scalar(
+            "int32", description="Fused activation type; 10 selects SiTU."
+        ),
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:experimental", "backend:trtllm", "quantization:nvfp4"],

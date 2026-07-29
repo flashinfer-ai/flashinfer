@@ -117,9 +117,20 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
         if (options.mBiasDtype != mOptions.biasDtype) continue;
       }
+      bool const usesPerTokenScaling =
+          options.mTransposeMmaOutput ? options.mUsePerTokenSfB : options.mUsePerTokenSfA;
       if (mOptions.usePerTokenScaling) {
-        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
-        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!usesPerTokenScaling) continue;
+        if (options.mPerTokenSfDtype != mOptions.perTokenSfDtype) continue;
+      }
+      // The MoE pipeline allocates and consumes output scaling factors in the
+      // block format's default dtype. Reject cubins that override that
+      // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
+      // scaling factors into a buffer sized for E4M3 factors.
+      if (tg::dtypeIsBlockFmt(options.mDtypeC)) {
+        if (options.mDtypeSfC != tg::dtypeGetBlockSfType(options.mDtypeC)) continue;
+      } else if (options.mDtypeSfC != Dtype::Void) {
+        continue;
       }
       if (mOptions.usePerChannelScaling) {
         if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
@@ -164,6 +175,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
             << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
             << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mPerTokenSfDtype: " << tg::dtypeToString(mOptions.perTokenSfDtype)
             << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }

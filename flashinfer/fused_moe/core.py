@@ -2141,6 +2141,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             activation_type=activation_type,
+            use_per_token_scaling=use_routing_scales_on_input,
             num_experts=num_experts,
         )
 
@@ -4428,10 +4429,17 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, ``float32``.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, ``float32``.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, dtype ``uint8``.
@@ -4490,6 +4498,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
     output : Optional[torch.Tensor]
@@ -4628,10 +4637,17 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, float32.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``alpha=1``.
+
     gemm1_beta : Optional[torch.Tensor]
         ``[num_experts]`` swiglu beta, float32.
+        For SiTU this is ``[local_num_experts]``, finite and positive;
+        ``None`` materializes per-expert ``beta=1``.
     gemm1_clamp_limit : Optional[torch.Tensor]
         ``[num_experts]`` swiglu clamp limit, float32.
+        For SiTU a provided limit is per-local-expert, finite, and positive;
+        it clamps ``x0`` to ``[-limit, limit]`` and ``x1`` from above.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` packed FP4 FC2
         weights, ``uint8``.
@@ -4689,6 +4705,7 @@ def trtllm_fp4_block_scale_routed_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).
+        ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, float32.
     output : Optional[torch.Tensor]
