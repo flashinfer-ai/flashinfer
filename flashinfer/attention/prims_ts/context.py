@@ -1023,6 +1023,7 @@ def _get_compiled_context(
     with torch.cuda.device(device_index):
         capability = torch.cuda.get_device_capability(device_index)
     enable_staged_head_dim = _use_staged_d256_schedule(capability)
+    enable_ldtm_stat = capability == (10, 3)
     # Construct the scheduler-independent topology first. Immutable
     # single-instance domains can use the lower-overhead static persistent
     # queue; paired or live-ragged domains are reconstructed with CLC.
@@ -1045,6 +1046,7 @@ def _get_compiled_context(
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         enable_staged_head_dim=enable_staged_head_dim,
+        enable_ldtm_stat=enable_ldtm_stat,
         causal_single_kv_tile=causal_single_kv_tile,
     )
     with torch.cuda.device(device_index):
@@ -1087,6 +1089,7 @@ def _get_compiled_context(
             h_r=num_qo_heads // num_kv_heads,
             enable_skip_correction=True,
             enable_staged_head_dim=enable_staged_head_dim,
+            enable_ldtm_stat=enable_ldtm_stat,
             causal_single_kv_tile=causal_single_kv_tile,
         )
     elif not is_persistent:
@@ -1104,6 +1107,7 @@ def _get_compiled_context(
             h_r=num_qo_heads // num_kv_heads,
             enable_skip_correction=True,
             enable_staged_head_dim=enable_staged_head_dim,
+            enable_ldtm_stat=enable_ldtm_stat,
             causal_single_kv_tile=causal_single_kv_tile,
         )
     fmha.cfg.has_varlen = packed
@@ -1227,6 +1231,7 @@ def _get_compiled_context(
         ),
         ("pairing", "head" if head_paired else "query"),
         ("head_dim_schedule", "staged" if fmha.cfg.staged_head_dim else "generic"),
+        ("ldtm_stat", fmha.cfg.use_ldtm_stat),
         ("uniform_packed_lengths", uniform_packed_lengths),
         ("causal_single_kv_tile", causal_single_kv_tile),
         ("packed_dense_k_mask", packed_dense_k_mask),

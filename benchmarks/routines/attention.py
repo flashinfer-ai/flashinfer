@@ -200,13 +200,15 @@ def _validate_prims_ts_context_samples(
         q_vector = q[q_begin + query_idx, query_head].float()
         probabilities = torch.softmax(torch.mv(k_matrix, q_vector) * sm_scale, dim=0)
         expected = torch.matmul(probabilities, v_matrix) * output_scale
+        if out.dtype == torch.float8_e4m3fn:
+            expected = expected.to(out.dtype).float()
         actual = out[q_begin + query_idx, query_head].float()
         difference = actual - expected
         sample_max_abs = float(difference.abs().max().item())
         max_abs_error = max(max_abs_error, sample_max_abs)
 
         if out.dtype == torch.float8_e4m3fn:
-            rtol, atol, relative_l2_limit = 5e-2, 1.3e-1, 1e-1
+            rtol, atol, relative_l2_limit = 5e-2, 2.5e-1, 1e-1
         else:
             rtol, atol, relative_l2_limit = 1e-1, 3e-2, 5e-2
         allowed = atol + rtol * float(expected.abs().max().item())

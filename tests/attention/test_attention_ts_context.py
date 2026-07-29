@@ -819,9 +819,11 @@ def test_attention_ts_context_d256_contiguous_uses_explicit_staged_schedule(
         d=256,
         is_persistent=True,
         use_paged_kv=False,
+        enable_ldtm_stat=True,
     ).cfg
 
     assert cfg.staged_head_dim is True
+    assert cfg.use_ldtm_stat is True
     assert cfg.qk_mma_tiler == (128, 128, 128)
     assert cfg.pv_mma_tiler == (128, 128, 128)
     assert cfg.sQ_shape == (1, 128 * 256)
@@ -2241,6 +2243,7 @@ def test_attention_ts_context_d256_fp8_fixed_dense_runtime(
     capability = torch.cuda.get_device_capability(case.q.device)
     expected_schedule = "staged" if capability == (10, 3) else "generic"
     assert policy["head_dim_schedule"] == expected_schedule
+    assert policy["ldtm_stat"] is (capability == (10, 3))
 
     output = wrapper.run(case.q, case.k, case.v)
     expected = _context_reference(case).to(_FP8).float()

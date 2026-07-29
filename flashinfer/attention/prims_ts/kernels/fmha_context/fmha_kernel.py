@@ -2454,6 +2454,9 @@ class FmhaTs:
         Enable the explicit full-Q, split-D schedule for eligible D256
         specializations (default: True). The public context planner disables
         it on architectures where the generic schedule is faster.
+    enable_ldtm_stat : bool, optional
+        Enable the SM103 fused TMEM load and score row-max reduction for the
+        explicit D256 schedule (default: False).
     causal_single_kv_tile : bool, optional
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
@@ -2477,6 +2480,7 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         enable_staged_head_dim: bool = True,
+        enable_ldtm_stat: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
         max_num_pages_per_seq_kv: int = 1,
@@ -2588,6 +2592,7 @@ class FmhaTs:
                 mma_tiler_mn=mma_tiler_mn,
                 d=d,
             )
+            cfg.use_ldtm_stat = enable_ldtm_stat
             _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
             _configure_single_instance_tmem_layout(cfg)
             _configure_smem_shapes(cfg)
