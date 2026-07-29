@@ -16,6 +16,9 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <string>
 
 #include "flashinfer/exception.h"
@@ -32,6 +35,54 @@ static thread_local gemm::gemm::GemmInterface::ModuleCache globalTrtllmGenGemmMo
 }  // namespace
 
 namespace flashinfer {
+
+namespace {
+
+// The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
+// it covers is not knowable at compile time. Encode only the explicit
+// cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
+// what is available: adding an architecture means adding one enum case, not
+// updating a hardcoded SM allowlist. Unknown cubin families are rejected so a
+// newly shipped one fails loudly instead of being silently dispatched onto
+// hardware that cannot run it (see #4107).
+bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
+  using CudaArch = gemm::trtllm::gen::CudaArch;
+  switch (cubinArch) {
+    case CudaArch::Sm100a:
+      return smVersion == 100;
+    case CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case CudaArch::Sm103a:
+      return smVersion == 103;
+    default:
+      return false;
+  }
+}
+
+// SM version of an explicit device, for entry points that take a target
+// device argument. `getSMVersion()` reads the *current* CUDA device, which is
+// not necessarily the device the caller wants to run on. The result is
+// cached per device so the dispatch-path guard does not issue a
+// cudaDeviceGetAttribute call on every run.
+int getSmVersionForDevice(int device) {
+  constexpr int kMaxCachedDevices = 64;
+  // 0 = not queried yet; a real SM version is never 0.
+  static std::array<std::atomic<int>, kMaxCachedDevices> cache{};
+  bool const cacheable = device >= 0 && device < kMaxCachedDevices;
+  if (cacheable) {
+    int const cached = cache[device].load(std::memory_order_relaxed);
+    if (cached != 0) return cached;
+  }
+  int smMajor = 0;
+  int smMinor = 0;
+  CUDACHECK(cudaDeviceGetAttribute(&smMajor, cudaDevAttrComputeCapabilityMajor, device));
+  CUDACHECK(cudaDeviceGetAttribute(&smMinor, cudaDevAttrComputeCapabilityMinor, device));
+  int const sm = smMajor * 10 + smMinor;
+  if (cacheable) cache[device].store(sm, std::memory_order_relaxed);
+  return sm;
+}
+
+}  // namespace
 
 struct TrtllmGenGemmRunnerOptions {
   gemm::trtllm::gen::Dtype eltType;
@@ -93,6 +144,7 @@ class TrtllmGenGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
+    int const sm_version = getSMVersion();
 
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
       auto const options = configs[i].mOptions;
@@ -101,8 +153,27 @@ class TrtllmGenGemmRunner {
           options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
           options.mSfLayoutB == mOptions.sfLayoutB &&
           options.mLayoutA == mOptions.layoutA) {  // FIXME(siyuanf): expose matrix layout to user
+        if (!isArchCompatible(sm_version, configs[i].mSm)) continue;
         mPassingConfigIndices.push_back(i);
       }
+    }
+
+    if (mPassingConfigIndices.empty()) {
+      // Distinguish "this GPU has no compatible cubins at all" from "no cubin
+      // matches these GEMM options". The former is the common failure on
+      // unsupported hardware, and the option dump below would send users
+      // looking in entirely the wrong place.
+      bool anyArchCompatible = false;
+      for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
+        if (isArchCompatible(sm_version, configs[i].mSm)) {
+          anyArchCompatible = true;
+          break;
+        }
+      }
+      std::ostringstream arch_msg;
+      arch_msg << "The trtllm-gen GEMM cubin manifest contains no kernels runnable on sm"
+               << sm_version << "; this backend currently supports sm100 and sm103 only.";
+      FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
     }
 
     FLASHINFER_CHECK(mPassingConfigIndices.size() > 0,
@@ -113,11 +184,23 @@ class TrtllmGenGemmRunner {
                      "mSfLayoutB: ", gemm::trtllm::gen::sfLayoutToString(mOptions.sfLayoutB));
   }
 
+  // Reject tactics outside the filtered config set (e.g. cached or
+  // user-supplied indices for a different device architecture) instead of
+  // silently dispatching a cubin the current GPU cannot run.
+  void checkPassingConfigIndex(int64_t tactic) const {
+    auto const it = std::find(mPassingConfigIndices.begin(), mPassingConfigIndices.end(), tactic);
+    TVM_FFI_ICHECK(it != mPassingConfigIndices.end())
+        << "Tactic " << tactic
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+  }
+
   int64_t getWorkspaceSizeInBytes(int64_t m, int64_t n, int64_t k, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     FLASHINFER_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
                      "Invalid tactic in getWorkspaceSizeInBytes");
+    checkPassingConfigIndex(tactic);
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;
@@ -139,8 +222,20 @@ class TrtllmGenGemmRunner {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
+    checkPassingConfigIndex(tactic);
     auto const& config = configs[tactic];
     TVM_FFI_ICHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB) << "Invalid sf layout in run";
+
+    // mPassingConfigIndices was filtered against the device that was current
+    // when this runner was constructed, but run() takes an explicit target
+    // device. Re-check the selected cubin against that device so a
+    // construction-time/dispatch-time device mismatch fails loudly here
+    // instead of aborting inside the kernel launch.
+    int const deviceSm = getSmVersionForDevice(device_index);
+    TVM_FFI_ICHECK(isArchCompatible(deviceSm, config.mSm))
+        << "The selected trtllm-gen GEMM cubin cannot run on target device " << device_index
+        << " (sm" << deviceSm
+        << "); this runner's config set was filtered for a different device architecture.";
 
     gemm::gemm::GemmData gemmData;
     // Dims

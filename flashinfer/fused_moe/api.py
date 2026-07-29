@@ -434,7 +434,10 @@ class TrtllmMxInt4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
+        # Rides the same trtllm-gen routed batched-GEMM path as the FP4/BF16
+        # backends, so it inherits the same cubin coverage: claiming an arch
+        # without cubins makes the runner abort at dispatch (#4107).
+        return arch in (100, 103)
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"

@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -35,6 +38,65 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+namespace {
+
+// The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
+// it covers is not knowable at compile time. Encode only the explicit
+// cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
+// what is available: adding an architecture means adding one enum case, not
+// updating a hardcoded SM allowlist. Unknown cubin families are rejected so a
+// newly shipped one fails loudly instead of being silently dispatched onto
+// hardware that cannot run it (see #4107).
+bool isArchCompatible(int smVersion, tg::CudaArch cubinArch) {
+  switch (cubinArch) {
+    case tg::CudaArch::Sm100a:
+      return smVersion == 100;
+    case tg::CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case tg::CudaArch::Sm103a:
+      return smVersion == 103;
+    default:
+      return false;
+  }
+}
+
+// SM version of an explicit device, for entry points that take a target
+// device argument. `getSMVersion()` reads the *current* CUDA device, which is
+// not necessarily the device the caller wants to run on. The result is
+// cached per device so the dispatch-path guard does not issue a
+// cudaDeviceGetAttribute call on every run.
+int getSmVersionForDevice(int device) {
+  constexpr int kMaxCachedDevices = 64;
+  // 0 = not queried yet; a real SM version is never 0.
+  static std::array<std::atomic<int>, kMaxCachedDevices> cache{};
+  bool const cacheable = device >= 0 && device < kMaxCachedDevices;
+  if (cacheable) {
+    int const cached = cache[device].load(std::memory_order_relaxed);
+    if (cached != 0) return cached;
+  }
+  int smMajor = 0;
+  int smMinor = 0;
+  CUDACHECK(cudaDeviceGetAttribute(&smMajor, cudaDevAttrComputeCapabilityMajor, device));
+  CUDACHECK(cudaDeviceGetAttribute(&smMinor, cudaDevAttrComputeCapabilityMinor, device));
+  int const sm = smMajor * 10 + smMinor;
+  if (cacheable) cache[device].store(sm, std::memory_order_relaxed);
+  return sm;
+}
+
+void checkPassingConfigIndex(std::vector<int64_t> const& passingConfigIndices,
+                             int32_t configIndex) {
+  auto const it = std::find(passingConfigIndices.begin(), passingConfigIndices.end(), configIndex);
+  if (it == passingConfigIndices.end()) {
+    std::ostringstream msg;
+    msg << "Config index " << configIndex
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+    FLASHINFER_ERROR(msg.str());
+  }
+}
+
+}  // namespace
 
 std::vector<int64_t> prioritizePredefinedConfigs(
     int m, int n, int k, std::vector<int64_t> const& sortedIndices,
@@ -144,13 +206,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
+      if (!isArchCompatible(sm_version, config.mSm)) continue;
       // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
-      if (options.mPatchF2fp && sm_version == 103) {
-        if (config.mSm != tg::CudaArch::Sm103a) continue;
-      }
-      if (options.mPatchF2fp && sm_version == 100) {
-        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
-      }
+      if (options.mPatchF2fp && sm_version == 103 && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
@@ -158,6 +216,24 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         mPassingConfigIndices.push_back(i);
       }
     }
+  }
+
+  if (mPassingConfigIndices.empty()) {
+    // Distinguish "this GPU has no compatible cubins at all" from "no cubin
+    // matches these GEMM options". The former is the common failure on
+    // unsupported hardware, and the option dump below would send users looking
+    // in entirely the wrong place.
+    bool anyArchCompatible = false;
+    for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+      if (isArchCompatible(sm_version, configs[i].mSm)) {
+        anyArchCompatible = true;
+        break;
+      }
+    }
+    std::ostringstream arch_msg;
+    arch_msg << "The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm"
+             << sm_version << "; this backend currently supports sm100 and sm103 only.";
+    FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
   }
 
   std::ostringstream error_msg;
@@ -183,6 +259,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -226,9 +303,25 @@ void TrtllmGenBatchedGemmRunner::run(
   BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
+  auto const numConfigs = bmm.getNumBatchedGemmConfigs();
 
+  FLASHINFER_CHECK(
+      configIndex >= 0 && static_cast<size_t>(configIndex) < static_cast<size_t>(numConfigs),
+      "Config index ", configIndex, " is out of range; the manifest has ", numConfigs, " configs");
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
+
+  // mPassingConfigIndices was filtered against the device that was current
+  // when this runner was constructed, but run() takes an explicit target
+  // device. Re-check the selected cubin against that device so a
+  // construction-time/dispatch-time device mismatch fails loudly here instead
+  // of aborting inside the kernel launch.
+  int const deviceSm = getSmVersionForDevice(device);
+  FLASHINFER_CHECK(isArchCompatible(deviceSm, config.mSm),
+                   "The selected trtllm-gen batched GEMM cubin cannot run on target device ",
+                   device, " (sm", deviceSm,
+                   "); this runner's config set was filtered for a different device architecture.");
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
