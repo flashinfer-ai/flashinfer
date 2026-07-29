@@ -1414,6 +1414,7 @@ def create_dummy_inputs(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -1429,7 +1430,9 @@ def create_dummy_inputs(
     Mirrors ``dummy_fp8_fp4_mega_moe.create_dummy_inputs`` for the NVFP4 path.
     When ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are omitted, random
     per-local-expert values are generated from ``seed`` (see
-    :func:`make_dummy_epilogue_params`).
+    :func:`make_dummy_epilogue_params`).  ``combine_dtype`` is forwarded to
+    :func:`get_symm_buffer_for_mega_moe` so tuning/benchmark sessions exercise
+    the same combine wire the deployment will use.
     """
     if num_tokens < 0 or num_tokens > num_max_tokens:
         raise ValueError(
@@ -1459,6 +1462,7 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
