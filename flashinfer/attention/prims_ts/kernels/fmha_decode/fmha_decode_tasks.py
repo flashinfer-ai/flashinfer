@@ -572,7 +572,7 @@ class DecodeGenTask(Task):
         skip_work_tile: Any = None,
         context: ResourceContext | None = None,
     ) -> None:
-        """Run one ordinary task tile and synchronize attention-sink tails."""
+        """Run one ordinary task tile and synchronize extended shared tails."""
         Task._run_task_body_impl(
             self,
             work_tile,
@@ -582,11 +582,16 @@ class DecodeGenTask(Task):
         if cutlass.const_expr(
             self.cfg is not None
             and self.cfg.use_persistent_scheduler
-            and self.cfg.use_attention_sinks
+            and (
+                self.cfg.use_attention_sinks
+                or self.cfg.tile_size_kv == 256
+            )
         ):
-            # Attention sinks extend the correction tail. Keep all persistent
-            # tasks on the same logical tile so the next load tile cannot reuse
-            # shared scratch before correction/output has drained.
+            # Attention sinks extend correction's tail. KV256 correction also
+            # aliases its spatial-merge scratch with the drained shared-KV
+            # ring. Keep all persistent tasks on the same logical tile so the
+            # next load cannot reuse either scratch region before correction
+            # and output publication have drained.
             if cutlass.const_expr(
                 self.cfg.use_variable_seqlens_q and self.cfg.use_persistent_scheduler
             ):
@@ -647,7 +652,10 @@ class DecodeGenTask(Task):
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
             Task._run_task_body_impl(self, work_tile, None, context=context)
-            if cutlass.const_expr(self.cfg.use_attention_sinks):
+            if cutlass.const_expr(
+                self.cfg.use_attention_sinks
+                or self.cfg.tile_size_kv == 256
+            ):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
             self.dummy = cutlass.Boolean(True)
@@ -856,10 +864,17 @@ def create_load_task(
         for label in ("load_k0", "load_k1"):
             _kv_load(label, FmhaStage.Head)
 
-        # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set
-        # (K0,V0,K1,V1) so the domain matches MMA's 1:1.
+        # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set.
+        # When P aliases the consumed S columns, MMA must consume each V/P pair
+        # before the following same-instance QK overwrites S. Keep the
+        # shared-ring producer order identical to that consumer order.
+        loop_labels = (
+            ("load_v0", "load_k0", "load_v1", "load_k1")
+            if cfg.uses_two_inst_tmem_p
+            else ("load_k0", "load_v0", "load_k1", "load_v1")
+        )
         with domain_loop(0, domain, 1, unroll=1):
-            for label in ("load_k0", "load_v0", "load_k1", "load_v1"):
+            for label in loop_labels:
                 _kv_load(label, FmhaStage.Loop)
 
         # TAIL: after no more future K tiles are needed, load the final two V
@@ -992,8 +1007,13 @@ def create_page_offsets_task(
         _produce_staged_page_offsets(smem_page_offsets, "load_k1", FmhaStage.Head, cfg)
 
         # LOOP: mirror LoadTask's K/V production cadence exactly.
+        loop_labels = (
+            ("load_v0", "load_k0", "load_v1", "load_k1")
+            if cfg.uses_two_inst_tmem_p
+            else ("load_k0", "load_v0", "load_k1", "load_v1")
+        )
         with domain_loop(0, domain, 1, unroll=1):
-            for label in ("load_k0", "load_v0", "load_k1", "load_v1"):
+            for label in loop_labels:
                 _produce_staged_page_offsets(
                     smem_page_offsets, label, FmhaStage.Loop, cfg
                 )
@@ -2131,8 +2151,21 @@ def create_mma_task(
             cfg,
         )
 
-        # LOOP: overlap next K x Q^T waves with P x V waves from the current scores.
+        # LOOP: consume aliased TMEM P before the next same-instance QK
+        # overwrites its S columns. SMEM-P profiles retain their established
+        # K-before-V cadence because P no longer depends on S lifetime.
         with domain_loop(0, domain, 1, unroll=1):
+            if cfg.uses_two_inst_tmem_p:
+                _consume_staged_pv_mma(
+                    smem_kv,
+                    smem_p0,
+                    tmem_o,
+                    "v_desc_0",
+                    "vp_mma_loop",
+                    KV_INST0,
+                    FmhaStage.Loop,
+                    cfg,
+                )
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s0,
@@ -2142,16 +2175,28 @@ def create_mma_task(
                 FmhaStage.Loop,
                 cfg,
             )
-            _consume_staged_pv_mma(
-                smem_kv,
-                smem_p0,
-                tmem_o,
-                "v_desc_0",
-                "vp_mma_loop",
-                KV_INST0,
-                FmhaStage.Loop,
-                cfg,
-            )
+            if not cfg.uses_two_inst_tmem_p:
+                _consume_staged_pv_mma(
+                    smem_kv,
+                    smem_p0,
+                    tmem_o,
+                    "v_desc_0",
+                    "vp_mma_loop",
+                    KV_INST0,
+                    FmhaStage.Loop,
+                    cfg,
+                )
+            if cfg.uses_two_inst_tmem_p:
+                _consume_staged_pv_mma(
+                    smem_kv,
+                    smem_p1,
+                    tmem_o,
+                    "v_desc_1",
+                    "vp_mma_loop",
+                    KV_INST1,
+                    FmhaStage.Loop,
+                    cfg,
+                )
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s1,
@@ -2161,16 +2206,17 @@ def create_mma_task(
                 FmhaStage.Loop,
                 cfg,
             )
-            _consume_staged_pv_mma(
-                smem_kv,
-                smem_p1,
-                tmem_o,
-                "v_desc_1",
-                "vp_mma_loop",
-                KV_INST1,
-                FmhaStage.Loop,
-                cfg,
-            )
+            if not cfg.uses_two_inst_tmem_p:
+                _consume_staged_pv_mma(
+                    smem_kv,
+                    smem_p1,
+                    tmem_o,
+                    "v_desc_1",
+                    "vp_mma_loop",
+                    KV_INST1,
+                    FmhaStage.Loop,
+                    cfg,
+                )
 
         # TAIL: no future K tiles remain, so only the final two BMM2 waves run.
         _consume_staged_pv_mma(

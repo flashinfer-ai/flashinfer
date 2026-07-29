@@ -363,8 +363,10 @@ def _build_decode_gen_schedule(
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
-    use_split_head_dim_kv = cfg.use_keeps_mma_ab and (
-        not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p
+    use_split_head_dim_kv = (
+        cfg.use_keeps_mma_ab
+        and cfg.tile_size_kv != 256
+        and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
     )
     split_head_dim_page_offsets_kv = (
         use_paged_kv and use_split_head_dim_kv and not use_one_inst_qkv
@@ -1294,6 +1296,16 @@ def _build_decode_gen_schedule(
     smem_allocator.add_resource(tmem_corr0)
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
+    if cfg.tile_size_kv == 256:
+        # KV256 tail correction runs only after the shared K/V pipeline has
+        # drained. Reuse that 192-KiB ring for the 68-KiB spatial merge rather
+        # than increasing the CTA footprint beyond SM100 capacity.
+        smem_allocator.add_alias_group(
+            [
+                smem_kv.get_smem_requirements(),
+                tmem_corr1.get_smem_requirements(),
+            ]
+        )
     smem_allocator.add_tmem_ptr(
         SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
     )
@@ -1342,7 +1354,7 @@ def _build_decode_gen_schedule(
     tmem_allocator.compute_layout()
     if cfg.uses_two_inst_tmem_p:
         # Two independent S regions become stats+P regions after Softmax
-        # consumes each QK result.  O starts after both 128-column regions.
+        # consumes each QK result.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
         s1_alloc = tmem_s1.get_tmem_requirements()[0]
         stats0_alloc = tmem_softmax_local0.get_tmem_requirements()[0]
@@ -1350,33 +1362,51 @@ def _build_decode_gen_schedule(
         p0_alloc = smem_p0.get_tmem_requirements()[0]
         p1_alloc = smem_p1.get_tmem_requirements()[0]
         o_alloc = tmem_o.get_tmem_requirements()[0]
-        # Re-state the intended phase offsets after layout so every resource
-        # observes the same S/P alias. Stats remain standalone when the whole
-        # allocation fits; otherwise they share the S/P phase.
-        s0_alloc.offset = 0
-        s1_alloc.offset = cfg.tmem_s_cols
-        p0_alloc.offset = (
-            0 if cfg.keeps_separates_tmem_s_and_stats else cfg.tmem_stats_cols
-        )
-        p1_alloc.offset = cfg.tmem_s_cols + (
-            0 if cfg.keeps_separates_tmem_s_and_stats else cfg.tmem_stats_cols
-        )
-        if cfg.keeps_separates_tmem_s_and_stats:
-            stats0_alloc.offset = 2 * cfg.tmem_s_cols
-            stats1_alloc.offset = 2 * cfg.tmem_s_cols + cfg.tmem_stats_cols
-            o_alloc.offset = 2 * (cfg.tmem_s_cols + cfg.tmem_stats_cols)
+        if cfg.tile_size_kv == 256:
+            # M64N256 keeps O in the low 256 columns and overlays stats+P on
+            # the two consumed S regions in the high half. This preserves the
+            # native datapath's TMEM addressing while sharing the generic
+            # two-instance P allocation and store implementation.
+            o_alloc.offset = 0
+            s0_alloc.offset = 2 * cfg.tmem_o_stage_cols
+            s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols
+            stats0_alloc.offset = s0_alloc.offset
+            stats1_alloc.offset = s1_alloc.offset
+            p0_alloc.offset = s0_alloc.offset + cfg.tmem_stats_cols
+            p1_alloc.offset = s1_alloc.offset + cfg.tmem_stats_cols
         else:
-            stats0_alloc.offset = 0
-            stats1_alloc.offset = cfg.tmem_s_cols
-            o_alloc.offset = 2 * cfg.tmem_s_cols
-        expected_p_cols = cfg.tile_size_kv * cfg.q_dtype_bytes // 4
+            # Re-state the intended phase offsets after layout so every
+            # resource observes the same S/P alias. Stats remain standalone
+            # when the whole allocation fits; otherwise they share S/P.
+            s0_alloc.offset = 0
+            s1_alloc.offset = cfg.tmem_s_cols
+            p0_alloc.offset = (
+                0 if cfg.keeps_separates_tmem_s_and_stats else cfg.tmem_stats_cols
+            )
+            p1_alloc.offset = cfg.tmem_s_cols + (
+                0 if cfg.keeps_separates_tmem_s_and_stats else cfg.tmem_stats_cols
+            )
+            if cfg.keeps_separates_tmem_s_and_stats:
+                stats0_alloc.offset = 2 * cfg.tmem_s_cols
+                stats1_alloc.offset = 2 * cfg.tmem_s_cols + cfg.tmem_stats_cols
+                o_alloc.offset = 2 * (cfg.tmem_s_cols + cfg.tmem_stats_cols)
+            else:
+                stats0_alloc.offset = 0
+                stats1_alloc.offset = cfg.tmem_s_cols
+                o_alloc.offset = 2 * cfg.tmem_s_cols
+        expected_p_cols = cfg.tmem_p_cols_per_inst
         assert p0_alloc.num_columns == p1_alloc.num_columns == expected_p_cols
         assert s0_alloc.offset <= p0_alloc.offset
         assert p0_alloc.offset + expected_p_cols <= s0_alloc.offset + cfg.tmem_s_cols
         assert s1_alloc.offset <= p1_alloc.offset
         assert p1_alloc.offset + expected_p_cols <= s1_alloc.offset + cfg.tmem_s_cols
         assert (
-            o_alloc.offset + cfg.tmem_o_stage_cols * cfg.o_stages == cfg.tmem_total_cols
+            max(
+                s0_alloc.offset + cfg.tmem_s_cols,
+                s1_alloc.offset + cfg.tmem_s_cols,
+                o_alloc.offset + cfg.tmem_o_stage_cols * cfg.o_stages,
+            )
+            == cfg.tmem_total_cols
         )
     if use_one_inst_qkv:
         tmem_s_alloc = tmem_s0.get_tmem_requirements()[0]
@@ -2095,11 +2125,21 @@ def fmha_decode_launch(
     tma_swizzle = cuda.TensorMapSwizzle.s128b
     if cutlass.const_expr(cfg.use_fp8_qkv and cfg.headdim == 64):
         tma_swizzle = cuda.TensorMapSwizzle.s64b
-    tma_kv_tokens = (
-        cfg.num_tokens_per_page
-        if cutlass.const_expr(cfg.use_paged_kv)
-        else cfg.tile_size_kv
-    )
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
+        # A KV64 TensorMap atom lets the shared load resource place each
+        # semantic block directly in its physical slot for both paged and
+        # contiguous layouts.
+        tma_kv_tokens = min(
+            cfg.num_tokens_per_page if cfg.use_paged_kv else cfg.tile_size_kv,
+            64,
+        )
+    else:
+        tma_kv_tokens = (
+            cfg.num_tokens_per_page
+            if cutlass.const_expr(cfg.use_paged_kv)
+            else cfg.tile_size_kv
+        )
     q_box_dims: tuple[object, ...]
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
         # Packed Q is physically [sum_q_tokens, num_heads_q, head_dim]. Flatten

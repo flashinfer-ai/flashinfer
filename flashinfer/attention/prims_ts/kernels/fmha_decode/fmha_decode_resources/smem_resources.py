@@ -72,6 +72,8 @@ from .helpers_kv_tile_idx import (
     _static_split_kv_global_tile_idx,
 )
 
+_KV_TILE_256_K_SLOT_FOR_SEMANTIC_BLOCK = (0, 2, 1, 3)
+
 
 @cute.jit
 def _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
@@ -983,22 +985,21 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         else:
             group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
             offset = self.consumer_work_stage * Int32(32) + group_page_idx
-        if cutlass.const_expr(pages_per_tile == 8):
+        if cutlass.const_expr(pages_per_tile in (8, 16)):
             # Native shared-memory vector loads top out at four Int32 values.
-            # Page-16 tiles therefore consume their eight page IDs as two
-            # independently aligned 16-byte loads from the same cache window.
+            # Wide page-16 tiles therefore consume their IDs as independently
+            # aligned 16-byte loads from the same 32-ID cache window.
             page_ids = cutlass.Array(
                 Int32, pages_per_tile, space=cutlass.AddressSpace.rmem
             )
-            page_ids_lo = self._smem_page_offsets.load(
-                offset, vector_size=4, alignment=16
-            )
-            page_ids_hi = self._smem_page_offsets.load(
-                offset + Int32(4), vector_size=4, alignment=16
-            )
-            for elem_idx in cutlass.range_constexpr(4):
-                page_ids[elem_idx] = page_ids_lo[elem_idx]
-                page_ids[elem_idx + 4] = page_ids_hi[elem_idx]
+            for vector_idx in cutlass.range_constexpr(pages_per_tile // 4):
+                vector = self._smem_page_offsets.load(
+                    offset + Int32(vector_idx * 4),
+                    vector_size=4,
+                    alignment=16,
+                )
+                for elem_idx in cutlass.range_constexpr(4):
+                    page_ids[vector_idx * 4 + elem_idx] = vector[elem_idx]
             return page_ids
         if cutlass.const_expr(pages_per_tile == 4):
             return self._smem_page_offsets.load(offset, vector_size=4, alignment=16)
@@ -1304,6 +1305,11 @@ class SmemKvResource(DecodeGenResourceBase):
                     )
                 )
             v_leading_byte_offset = k_leading_byte_offset
+            if cutlass.const_expr(self.cfg.tile_size_kv == 256):
+                # K spans the complete KV256 row between D64 halves. V is
+                # staged as four semantic KV64 blocks, each with D/64 adjacent
+                # D64 halves, so its MMA-K leading step is one KV64 block.
+                v_leading_byte_offset = Int32(64 * 64 * self.cfg.kv_dtype_bytes)
             if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.headdim == 64):
                 v_leading_byte_offset = Int32(0)
             # Descriptor bases are advanced per stage at consumption time; the
@@ -1465,7 +1471,17 @@ class SmemKvResource(DecodeGenResourceBase):
         head_dim_stage = cfg.head_dim_kv_stage
         head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
 
-        if cutlass.const_expr(cfg.use_paged_kv):
+        if cutlass.const_expr(cfg.tile_size_kv == 256):
+            self._producer_load_kv_tile_256(
+                stage_info,
+                tma_desc,
+                local_tile_idx,
+                logical_h_k_idx,
+                logical_b_idx,
+                kv_kind,
+                cached_page_ids,
+            )
+        elif cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: LoadTask consumes pre-staged page IDs and issues
             # one TMA per page fragment into the current SMEM stage. Grouped
             # cache stages hold 32 page IDs per side; recover the
@@ -1588,6 +1604,94 @@ class SmemKvResource(DecodeGenResourceBase):
                         ),
                         stage_info.barrier,
                     )
+
+    @cute.jit
+    def _producer_load_kv_tile_256(
+        self,
+        stage_info: StageInfo,
+        tma_desc: cutlass.Pointer,
+        local_tile_idx: Int32,
+        logical_h_k_idx: Int32,
+        logical_b_idx: Int32,
+        kv_kind: Constexpr[int],
+        cached_page_ids: cutlass.Array | None,
+    ) -> None:
+        """Stage one KV256 tile in the physical 2x2-datapath layout.
+
+        The public decode TensorMaps expose KV64 (or one smaller page)
+        fragments. K places semantic KV64 blocks in physical order
+        ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent D64
+        halves. This is the only layout difference from the shared KV128 load
+        workflow; runtime tile clamping and page-ID selection remain common.
+        """
+        cfg = self.cfg
+        grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
+        stage_base = self._stage_base(stage_info)
+
+        if prims.elect_sync():
+            # Only the elected TMA issuer needs page IDs. In particular,
+            # page16/KV256 otherwise makes all 32 load-warp lanes repeat four
+            # vector loads for the same 16-entry page fragment.
+            page_ids = cached_page_ids
+            if cutlass.const_expr(cfg.use_paged_kv and cached_page_ids is None):
+                page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+            for semantic_block in cutlass.range_constexpr(4):
+                physical_block = semantic_block
+                if cutlass.const_expr(kv_kind == KV_KIND_K):
+                    physical_block = _KV_TILE_256_K_SLOT_FOR_SEMANTIC_BLOCK[
+                        semantic_block
+                    ]
+                for dim_half in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(kv_kind == KV_KIND_K):
+                        block_base = (
+                            dim_half * cfg.tile_size_kv * 64
+                            + physical_block * 64 * 64
+                        )
+                    else:
+                        block_base = (
+                            semantic_block * cfg.headdim * 64
+                            + dim_half * 64 * 64
+                        )
+
+                    if cutlass.const_expr(cfg.use_paged_kv):
+                        fragment_tokens = min(cfg.num_tokens_per_page, 64)
+                        fragments_per_block = 64 // fragment_tokens
+                        for fragment in cutlass.range_constexpr(
+                            fragments_per_block
+                        ):
+                            token_in_tile = (
+                                semantic_block * 64 + fragment * fragment_tokens
+                            )
+                            logical_page = token_in_tile // cfg.num_tokens_per_page
+                            token_in_page = token_in_tile % cfg.num_tokens_per_page
+                            page_id = Int32(page_ids[logical_page])
+                            smem_offset = (
+                                block_base + fragment * fragment_tokens * 64
+                            )
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                stage_base.subview(smem_offset),
+                                tma_desc,
+                                (
+                                    Int32(dim_half * 64),
+                                    Int32(token_in_page),
+                                    logical_h_k_idx,
+                                    page_id,
+                                ),
+                                stage_info.barrier,
+                            )
+                    else:
+                        tile_offset = grouped_tile_idx * Int32(cfg.tile_size_kv)
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            stage_base.subview(block_base),
+                            tma_desc,
+                            (
+                                Int32(dim_half * 64),
+                                tile_offset + Int32(semantic_block * 64),
+                                logical_h_k_idx,
+                                logical_b_idx,
+                            ),
+                            stage_info.barrier,
+                        )
 
     @producer_work
     @cute.jit

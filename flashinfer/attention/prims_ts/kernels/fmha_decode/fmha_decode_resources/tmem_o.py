@@ -38,6 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ..fmha_decode_constants import KV_INST0
 from ..fmha_decode_config import FmhaDecodeConfig
+from ...tcgen05_compat import tcgen05_mma_ws
 from .helpers_common import (
     Constexpr,
     DecodeGenResourceBase,
@@ -58,6 +59,11 @@ def _pv_mma_operand_contract_for_config(
         cfg.headdim if cfg.head_dim_per_stage_kv == 0 else cfg.head_dim_kv_stage
     )
     if cfg.use_keeps_mma_ab:
+        if cfg.tile_size_kv == 256:
+            # The WS 2x2 PV instruction exposes two spatial D128 partials as
+            # one physical KV256 operation. Correction merges those spatial
+            # halves after the two temporal decode streams are complete.
+            return True, cfg.tile_size_q, cfg.tile_size_kv, 0, 1
         return True, cfg.tile_size_q, active_head_dim, 0, 1
     return False, active_head_dim, cfg.tile_size_q, 1, 0
 
@@ -243,7 +249,12 @@ class TmemOResource(DecodeGenResourceBase):
                 # Accumulate into O after the first K/V tile for this output
                 # stage; the first wave overwrites the TMEM O stage.
                 scale_d = initial_scale_d
-                for ki in cutlass.range_constexpr(cfg.tile_size_kv // _mma_k_step(cfg)):
+                pv_k_steps = cfg.tile_size_kv // _mma_k_step(cfg)
+                if cutlass.const_expr(cfg.tile_size_kv == 256):
+                    # The 2x2 WS datapath consumes two logical K16 slices per
+                    # issue, matching the eight-step physical PV chain.
+                    pv_k_steps //= 2
+                for ki in cutlass.range_constexpr(pv_k_steps):
                     # Keeps computes P x V (A=P, B=V); Swaps computes the
                     # transposed V^T x P^T tile (A=V, B=P).
                     if cutlass.const_expr(cfg.uses_tmem_p):
@@ -261,25 +272,43 @@ class TmemOResource(DecodeGenResourceBase):
                         a_desc, b_desc = p_operand, v_desc
                     else:
                         a_desc, b_desc = v_desc, p_operand
-                    prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
-                        prims.CTAGroup.CTA_1,
-                        tmem_col,
-                        a_desc,
-                        b_desc,
-                        idesc,
-                        scale_d,
-                    )
+                    if cutlass.const_expr(cfg.tile_size_kv == 256):
+                        tcgen05_mma_ws(
+                            _mma_kind_for_qkv(cfg),
+                            tmem_col,
+                            a_desc,
+                            b_desc,
+                            idesc,
+                            scale_d,
+                        )
+                    else:
+                        prims.tcgen05_mma(
+                            _mma_kind_for_qkv(cfg),
+                            prims.CTAGroup.CTA_1,
+                            tmem_col,
+                            a_desc,
+                            b_desc,
+                            idesc,
+                            scale_d,
+                        )
                     scale_d = True
-                    if cutlass.const_expr(
-                        ki + 1 < cfg.tile_size_kv // _mma_k_step(cfg)
-                    ):
+                    if cutlass.const_expr(ki + 1 < pv_k_steps):
                         # Advance V and P descriptors to the next MMA-K
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
-                        v_desc = v_desc + Int32(
-                            (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
-                        )
+                        if cutlass.const_expr(cfg.tile_size_kv == 256):
+                            # V is [KV64 block][D64 half]. Derive the physical
+                            # descriptor step used by the KV256 WS PV chain:
+                            # +128 inside a semantic KV64 block, +2048 at the
+                            # next block boundary.
+                            next_ki = ki + 1
+                            v_desc = v_desc + Int32(
+                                1664 if next_ki % 4 == 0 else 128
+                            )
+                        else:
+                            v_desc = v_desc + Int32(
+                                (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
+                            )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
                                 not cfg.use_fp8_qkv

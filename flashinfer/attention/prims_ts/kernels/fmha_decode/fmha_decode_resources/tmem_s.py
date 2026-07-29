@@ -42,6 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ...tcgen05_compat import tcgen05_mma_ws
 from ...placeholder_helpers import (
     _placeholder_local_array,
     _placeholder_smem_array,
@@ -64,6 +65,7 @@ from .helpers_common import (
     _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
+    _keeps_score_col,
     _keeps_tcgen05_ld,
     _logical_q_group_idx,
     _mma_k_step,
@@ -241,7 +243,7 @@ class TmemSResource(DecodeGenResourceBase):
         """
         cfg = self.cfg
         if cutlass.const_expr(not cfg.use_fp8_qkv and crosses_64b_chunk):
-            k_desc = k_desc + Int32(1018)
+            k_desc = k_desc + Int32(8 * cfg.tile_size_kv - 6)
             if cutlass.const_expr(cfg.tile_size_q >= 16):
                 q_desc = q_desc + Int32(8 * cfg.tile_size_q - 6)
             else:
@@ -545,15 +547,25 @@ class TmemSResource(DecodeGenResourceBase):
                         a_desc, b_desc = q_desc, k_desc
                     else:
                         a_desc, b_desc = k_desc, q_desc
-                    prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
-                        prims.CTAGroup.CTA_1,
-                        tmem_col,
-                        a_desc,
-                        b_desc,
-                        idesc,
-                        scale_d,
-                    )
+                    if cutlass.const_expr(cfg.tile_size_kv == 256):
+                        tcgen05_mma_ws(
+                            _mma_kind_for_qkv(cfg),
+                            tmem_col,
+                            a_desc,
+                            b_desc,
+                            idesc,
+                            scale_d,
+                        )
+                    else:
+                        prims.tcgen05_mma(
+                            _mma_kind_for_qkv(cfg),
+                            prims.CTAGroup.CTA_1,
+                            tmem_col,
+                            a_desc,
+                            b_desc,
+                            idesc,
+                            scale_d,
+                        )
                     scale_d = True
                     if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step(cfg)):
                         k_desc, q_desc = self._advance_qk_descs_after_mma_k(
@@ -689,7 +701,9 @@ class TmemSResource(DecodeGenResourceBase):
             # mathematically redundant upper-bound pass for grouped Q.
             if cutlass.const_expr(not cfg.uses_per_row_causal_mask):
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    token_idx = tile_offset_k + col_base + Int32(reg_idx)
+                    token_idx = tile_offset_k + _keeps_score_col(
+                        cfg, warp_grp_thread_idx, reg_idx, col_base
+                    )
                     if token_idx >= element_mask_end_idx:
                         s_vals[reg_idx] = _neg_max_f32()
                     if cutlass.const_expr(cfg.use_sliding_window_causal):
@@ -709,18 +723,17 @@ class TmemSResource(DecodeGenResourceBase):
                     causal_start = cute.math.max(
                         causal_end - Int32(cfg.attention_window_size), Int32(0)
                     )
-                causal_start_rel = causal_start - tile_offset_k - col_base
-                causal_end_rel = causal_end - tile_offset_k - col_base
+                causal_start_rel = causal_start - tile_offset_k
+                causal_end_rel = causal_end - tile_offset_k
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
+                    score_col = _keeps_score_col(
+                        cfg, warp_grp_thread_idx, reg_idx, col_base
+                    )
                     if cutlass.const_expr(cfg.use_sliding_window_causal):
-                        if (
-                            Int32(reg_idx) < causal_start_rel
-                            or Int32(reg_idx) >= causal_end_rel
-                        ):
+                        if score_col < causal_start_rel:
                             s_vals[reg_idx] = _neg_max_f32()
-                    else:
-                        if Int32(reg_idx) >= causal_end_rel:
-                            s_vals[reg_idx] = _neg_max_f32()
+                    if score_col >= causal_end_rel:
+                        s_vals[reg_idx] = _neg_max_f32()
 
         if cutlass.const_expr(cfg.q_score_rows_need_mask):
             if not _q_row_is_valid_for_seq(
@@ -748,7 +761,9 @@ class TmemSResource(DecodeGenResourceBase):
             cute.math.max(max_chains[2], max_chains[3], ftz=True),
             ftz=True,
         )
-        if cutlass.const_expr(cfg.tile_size_q == 64):
+        if cutlass.const_expr(
+            cfg.tile_size_q == 64 and cfg.tile_size_kv != 256
+        ):
             return cute.math.max(
                 tile_max,
                 Float32(
@@ -957,7 +972,9 @@ class TmemSResource(DecodeGenResourceBase):
         # Tail/uniform-causal/window masks use each register's true logical K
         # column. For q64, the paired lane owns the complementary 64-column half.
         for reg_idx in cutlass.range_constexpr(num_s_regs):
-            token_idx = tile_offset_k + col_base + Int32(reg_idx)
+            token_idx = tile_offset_k + _keeps_score_col(
+                cfg, warp_grp_thread_idx, reg_idx, col_base
+            )
             # The per-row causal pass below subsumes seq_len_kv's upper bound.
             if cutlass.const_expr(not cfg.uses_per_row_causal_mask):
                 if token_idx >= element_mask_end_idx:
@@ -980,7 +997,9 @@ class TmemSResource(DecodeGenResourceBase):
                     causal_end - Int32(cfg.attention_window_size), Int32(0)
                 )
             for reg_idx in cutlass.range_constexpr(num_s_regs):
-                token_idx = tile_offset_k + col_base + Int32(reg_idx)
+                token_idx = tile_offset_k + _keeps_score_col(
+                    cfg, warp_grp_thread_idx, reg_idx, col_base
+                )
                 if token_idx < causal_start or token_idx >= causal_end:
                     s_vals[reg_idx] = _neg_max_f32()
 
@@ -1012,7 +1031,9 @@ class TmemSResource(DecodeGenResourceBase):
             cute.math.max(max_chains[2], max_chains[3], ftz=True),
             ftz=True,
         )
-        if cutlass.const_expr(cfg.tile_size_q == 64):
+        if cutlass.const_expr(
+            cfg.tile_size_q == 64 and cfg.tile_size_kv != 256
+        ):
             tile_max = cute.math.max(
                 tile_max,
                 Float32(

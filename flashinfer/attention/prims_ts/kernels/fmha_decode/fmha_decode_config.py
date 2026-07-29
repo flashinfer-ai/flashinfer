@@ -39,6 +39,7 @@ from .fmha_decode_constants import (
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
     FP16_VALUES_PER_REG,
+    KV_TILE_256_SHARED_FIFO_STAGES,
     MAX_CLUSTER_DIM_X,
     MAX_CLUSTER_PARTIAL_SMEM_BYTES,
     MAX_KV_STAGE_SMEM_KIB,
@@ -85,6 +86,22 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
     (BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
     (Float16, Float16, Float16, 256, 128, 1, 1),
+}
+
+_KV_TILE_256_PHYSICAL_CONFIG: Mapping[str, ConfigValue] = {
+    "tmem_s_cols": 128,
+    "tmem_stats_cols": 32,
+    "tmem_p_cols": 64,
+    "tmem_o_cols": 128,
+    "mma_tile_m_bmm1": 64,
+    "mma_tile_n_bmm1": 256,
+    "mma_tile_m_bmm2": 64,
+    "mma_tile_n_bmm2": 256,
+    "q_stages": 1,
+    "kv_stages": KV_TILE_256_SHARED_FIFO_STAGES,
+    "head_dim_per_stage_kv": 0,
+    "num_insts_kv": 2,
+    "o_stages": 2,
 }
 
 # Public cost-model collection uses the FP8 proxy for every source dtype.  The
@@ -999,6 +1016,21 @@ class FmhaDecodeConfig:
         return regs_per_repeat * q_repeats
 
     @property
+    def tmem_p_cols_per_inst(self) -> int:
+        """Return the TMEM-P columns owned by one K/V instance.
+
+        Two-instance Keeps publishes one packed row per producer lane, with one
+        packed 32-bit register slot per TMEM column. Therefore its footprint is
+        ``num_s_regs_per_thread / values_per_reg == num_packed_p_regs``, rather
+        than a function of the complete logical KV tile width. Q128/KV128 and
+        Q64/KV256 both own 128 BF16 P values per lane and need 64 columns per
+        instance.
+        """
+        if self.uses_two_inst_tmem_p:
+            return self.num_packed_p_regs
+        return self.tmem_p_cols
+
+    @property
     def num_fp8_output_regs(self) -> int:
         """Return packed FP8 output registers owned by each correction lane."""
         return max(
@@ -1017,7 +1049,7 @@ class FmhaDecodeConfig:
     @property
     def keeps_output_f32_regs(self) -> int:
         """Return FP32 O registers owned by one Keeps correction lane."""
-        if self.tile_size_q == 128:
+        if self.tile_size_q == 128 or self.tile_size_kv == 256:
             return self.headdim
         return self.headdim // 2
 
@@ -1304,10 +1336,9 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        Q128 amortizes the TMEM publication and needs the overlay to avoid the
-        larger SMEM-P footprint. Q64's paired-half-warp publication keeps S
-        live longer than its SMEM path, which can release S immediately and
-        overlap the next QK wave.
+        Both Q128/KV128 and Q64/KV256 publish each instance's complete packed
+        P row into the corresponding consumed-S region. The two profiles use
+        different MMA shapes but share the same lifetime and publication ABI.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -1315,8 +1346,10 @@ class FmhaDecodeConfig:
         # S release through TMEM store completion and the P-pipeline commit.
         return (
             self.use_keeps_mma_ab
-            and self.tile_size_q == 128
-            and self.tile_size_kv == 128
+            and (
+                (self.tile_size_q == 128 and self.tile_size_kv == 128)
+                or (self.tile_size_q == 64 and self.tile_size_kv == 256)
+            )
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
             and self.o_stages == 2
@@ -1366,7 +1399,11 @@ class FmhaDecodeConfig:
     def keeps_loop_correction_stage_layout(self) -> tuple[tuple[int, int, int], ...]:
         """Return ``(TMEM offset, half split, chunk count)`` for each O slice."""
         stage_cols = self.head_dim_kv_stage
-        lane_regs_per_stage = stage_cols if self.tile_size_q == 128 else stage_cols // 2
+        lane_regs_per_stage = (
+            stage_cols
+            if self.tile_size_q == 128 or self.tile_size_kv == 256
+            else stage_cols // 2
+        )
         chunk_regs = self.keeps_loop_correction_chunk_regs
         assert stage_cols % 2 == 0
         assert lane_regs_per_stage % chunk_regs == 0
@@ -1486,6 +1523,34 @@ class FmhaDecodeConfig:
     @property
     def supports_grouped_keeps(self) -> bool:
         """Return whether this grouped Keeps profile is enabled."""
+        if self.tile_size_kv == 256:
+            # KV256 reuses the common fixed/packed-Q, page-table, masking,
+            # persistent scheduler, attention-sink, and GMEM split-publisher
+            # semantics. Keeps has no cluster-SMEM publisher at either KV tile
+            # size.
+            if (
+                not self.use_keeps_mma_ab
+                or not self.groups_tokens_heads_q
+                or self.tile_size_q != 64
+                or self.headdim != 128
+                or self.q_dtype != BFloat16
+                or self.kv_dtype != BFloat16
+                or self.out_dtype != BFloat16
+                or self.use_cluster_smem_reduction
+            ):
+                return False
+            direct = not (self.use_split_kv or self.use_separate_reduction_kernel)
+            if direct:
+                return True
+            if not (
+                self.use_split_kv
+                and self.splits_kv > 1
+                and self.max_splits_kv >= self.splits_kv
+            ):
+                return False
+            if self.use_separate_reduction_kernel and self.use_variable_seqlens_q:
+                return self.mask_type == CAUSAL
+            return self.mask_type == DENSE
         if (
             not self.use_keeps_mma_ab
             or not self.groups_tokens_heads_q
@@ -1775,18 +1840,31 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
             _set_if_implicit(cfg, "o_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "tile_size_q", tile_size_q, explicit_fields)
-        _set_if_implicit(cfg, "tmem_s_cols", tile_size_kv, explicit_fields)
-        _set_if_implicit(cfg, "tmem_p_cols", tile_size_kv // 2, explicit_fields)
-        _set_if_implicit(cfg, "tmem_o_cols", cfg.headdim, explicit_fields)
-        _set_if_implicit(cfg, "mma_tile_m_bmm1", tile_size_q, explicit_fields)
-        _set_if_implicit(cfg, "mma_tile_n_bmm1", tile_size_kv, explicit_fields)
-        _set_if_implicit(cfg, "mma_tile_m_bmm2", tile_size_q, explicit_fields)
-        _set_if_implicit(
-            cfg,
-            "mma_tile_n_bmm2",
-            cfg.head_dim_per_stage_kv or cfg.headdim,
-            explicit_fields,
-        )
+        if cfg.tile_size_kv == 256:
+            # One logical KV256 tile exposes two spatial KV128 partials. Route
+            # the complete physical ABI as one qualified profile rather than
+            # accepting incompatible tuning fields and validating them later.
+            for field_name, value in _KV_TILE_256_PHYSICAL_CONFIG.items():
+                setattr(cfg, field_name, value)
+            explicit_fields.difference_update(_KV_TILE_256_PHYSICAL_CONFIG)
+        else:
+            _set_if_implicit(cfg, "tmem_s_cols", tile_size_kv, explicit_fields)
+            _set_if_implicit(
+                cfg,
+                "tmem_p_cols",
+                tile_size_kv // 2,
+                explicit_fields,
+            )
+            _set_if_implicit(cfg, "tmem_o_cols", cfg.headdim, explicit_fields)
+            _set_if_implicit(cfg, "mma_tile_m_bmm1", tile_size_q, explicit_fields)
+            _set_if_implicit(cfg, "mma_tile_n_bmm1", tile_size_kv, explicit_fields)
+            _set_if_implicit(cfg, "mma_tile_m_bmm2", tile_size_q, explicit_fields)
+            _set_if_implicit(
+                cfg,
+                "mma_tile_n_bmm2",
+                cfg.head_dim_per_stage_kv or cfg.headdim,
+                explicit_fields,
+            )
         if cfg.num_insts_kv == 1:
             # One-inst static profiles use a compact 12-warp layout. Persistent
             # profiles keep MMA/scheduler/page-or-padding/load together in WG2
@@ -1798,11 +1876,11 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "load_warp_idx", 11, explicit_fields)
             _set_if_implicit(cfg, "scheduler_warp_idx", 9, explicit_fields)
             _set_if_implicit(cfg, "clc_load_warp_idx", 11, explicit_fields)
-        if cfg.tile_size_q == 128:
+        if cfg.tile_size_q == 128 and cfg.tile_size_kv != 256:
             _set_if_implicit(cfg, "q_stages", 1, explicit_fields)
         _set_if_implicit(cfg, "ordered_softmax_barrier_mode", 1, explicit_fields)
 
-    if "kv_stages" not in explicit_fields:
+    if cfg.tile_size_kv != 256 and "kv_stages" not in explicit_fields:
         cfg.kv_stages = cfg.inferred_kv_stages
 
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
@@ -1810,6 +1888,11 @@ def _finalize_static_decode_config(
     # having to repeat the (... and not use_split_kv) check.
     if cfg.use_split_kv:
         cfg.use_persistent_scheduler = False
+    if cfg.tile_size_kv == 256 and not cfg.supports_grouped_keeps:
+        raise ValueError(
+            "KV256 currently supports only the qualified Q64 BF16/D128 "
+            "grouped Keeps profile"
+        )
 
 
 @dataclass(frozen=True)
@@ -2738,6 +2821,7 @@ def _apply_auto_launch_mode(
         num_heads_kv=num_heads_kv,
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
+        tile_size_kv=cfg.tile_size_kv,
     )
     if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (
         "gmem_reduction"
@@ -3034,6 +3118,13 @@ def _validate_profile_support(
                 f"{cluster_size} is not supported on this device"
             )
     supports_grouped_keeps = cfg.supports_grouped_keeps
+    if cfg.tile_size_kv != 128 and not (
+        cfg.tile_size_kv == 256 and supports_grouped_keeps
+    ):
+        raise ValueError(
+            "wide KeepsMmaAb is enabled only for the qualified BF16/D128 "
+            "KV256 native warp-specialized profile"
+        )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
         if not supports_grouped_keeps:
             raise ValueError(
@@ -3253,8 +3344,10 @@ def validate_paged_kv_staging_config(
             "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
         )
     pages_per_tile = tile_size_kv // num_tokens_per_page
-    if pages_per_tile not in (1, 2, 4, 8):
-        raise ValueError("paged-KV staging supports 1, 2, 4, or 8 pages per KV tile")
+    if pages_per_tile not in (1, 2, 4, 8, 16):
+        raise ValueError(
+            "paged-KV staging supports 1, 2, 4, 8, or 16 pages per KV tile"
+        )
     if page_offsets_num_warps != 1:
         raise ValueError(
             "paged-KV page-offset staging requires exactly one producer warp"

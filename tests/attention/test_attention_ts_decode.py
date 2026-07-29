@@ -1025,7 +1025,7 @@ def _assert_auto_policy(
     assert policy.get("source", "auto") == "auto"
     assert policy["mma_variant"] in ("swaps_mma_ab", "keeps_mma_ab")
     assert policy["tile_size_q"] in (8, 16, 32, 64, 128)
-    assert policy["tile_size_kv"] == 128
+    assert policy["tile_size_kv"] in (128, 256)
     assert isinstance(policy["groups_tokens_heads_q"], bool)
     assert policy["query_layout"] == policy["output_layout"]
     splits_kv = int(policy["splits_kv"])
@@ -1043,6 +1043,7 @@ def _assert_auto_policy(
 
     if (
         torch.cuda.get_device_capability(device) == (10, 0)
+        and policy["tile_size_kv"] == 128
         and _single_cta_wave_capacity(device) == 148
     ):
         for key, expected in expected_b200.items():
@@ -2907,6 +2908,47 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
         max_kv_len=max(case_kwargs["kv_lens"]),
         exercise_all_paths=exercise_all_paths,
     )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("num_qo_heads", "num_kv_heads"),
+    (
+        pytest.param(32, 32, id="mha"),
+        pytest.param(64, 8, id="gqa"),
+    ),
+)
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+def test_attention_ts_decode_q64_kv256_auto_launch(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    mask_type: str,
+):
+    """Exercise the KV256 policy through the standard public decode path."""
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("KV256 auto launch currently targets SM100")
+    case = _make_decode_case(
+        kv_lens=(1024,),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        seq_len_q=64,
+        page_size=16,
+        qkv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cache_form="combined",
+        mask_type=mask_type,
+        device="cuda",
+        seed=20260729,
+    )
+
+    policy = _exercise_auto_case(case)
+
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["tile_size_q"] == 64
+    assert policy["tile_size_kv"] == 256
 
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")

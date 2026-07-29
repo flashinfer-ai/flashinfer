@@ -140,6 +140,10 @@ def _keeps_q64_col_base(lane_idx: Int32, half_cols: int) -> Int32:
 @cute.jit
 def _keeps_row_idx(cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32):
     """Map a correction lane to the logical output row it owns."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        # KV256's 2x2 datapath exposes two spatial KV128 partials for each
+        # logical Q row. Threads [0, 64) and [64, 128) therefore share rows.
+        return warp_grp_thread_idx & Int32(63)
     if cutlass.const_expr(cfg.tile_size_q == 128):
         return warp_grp_thread_idx
     return _keeps_q64_row_idx(warp_grp_thread_idx)
@@ -150,9 +154,34 @@ def _keeps_col_base(
     cfg: Constexpr[FmhaDecodeConfig], lane_idx: Int32, half_cols: int
 ) -> Int32:
     """Return the lane's keepsMmaAb output-column base."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        return Int32(0)
     if cutlass.const_expr(cfg.tile_size_q == 128):
         return Int32(0)
     return _keeps_q64_col_base(lane_idx, half_cols)
+
+
+@cute.jit
+def _keeps_score_col(
+    cfg: Constexpr[FmhaDecodeConfig],
+    warp_grp_thread_idx: Int32,
+    reg_idx: Constexpr[int],
+    col_base: Int32,
+) -> Int32:
+    """Return the semantic KV column represented by one Keeps score register."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        # A physical thread owns four K32 fragments. The spatial half selects
+        # alternating KV64 blocks; the temporal fragment selects the low/high
+        # K32 sub-block inside that semantic KV64 block.
+        spatial = warp_grp_thread_idx >> Int32(6)
+        fragment = reg_idx // 32
+        semantic_block = Int32(2 * (fragment // 2)) + spatial
+        return (
+            semantic_block * Int32(64)
+            + Int32((fragment % 2) * 32)
+            + Int32(reg_idx % 32)
+        )
+    return col_base + Int32(reg_idx)
 
 
 @cute.jit
@@ -164,7 +193,7 @@ def _keeps_tcgen05_ld(
     offset: Constexpr[int],
 ):
     """Load keepsMmaAb TMEM fragments using the tileSizeQ-specific shape."""
-    if cutlass.const_expr(cfg.tile_size_q == 128):
+    if cutlass.const_expr(cfg.tile_size_kv == 256 or cfg.tile_size_q == 128):
         return prims.tcgen05_ld(
             "32x32b",
             tmem_addr,
@@ -190,7 +219,7 @@ def _keeps_tcgen05_st(
     offset: Constexpr[int],
 ) -> None:
     """Store keepsMmaAb TMEM fragments using the tileSizeQ-specific shape."""
-    if cutlass.const_expr(cfg.tile_size_q == 128):
+    if cutlass.const_expr(cfg.tile_size_kv == 256 or cfg.tile_size_q == 128):
         prims.tcgen05_st(
             "32x32b",
             tmem_addr,

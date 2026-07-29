@@ -29,6 +29,14 @@ TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
 BYTES_PER_KIB = 1024
 
+# The supported BF16 M64N256 profile uses a 64-KiB shared K/V stage. Three
+# stages occupy 192 KiB; its 16-KiB Q stage and small metadata/barrier
+# allocations fit in the remaining SM100 budget. Tail correction starts after
+# the K/V pipeline drains and aliases its 68-KiB exchange scratch onto this
+# ring. Keep this exact-profile override separate from the conservative,
+# topology-independent MAX_KV_STAGE_SMEM_KIB inference above.
+KV_TILE_256_SHARED_FIFO_STAGES = 3
+
 # TMA-swizzled Q rows are padded to 128 B before computing how many KV stages
 # fit in the remaining SMEM budget.
 Q_ROW_ALIGNMENT_BYTES = 128

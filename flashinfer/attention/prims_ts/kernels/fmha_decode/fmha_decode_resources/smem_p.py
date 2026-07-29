@@ -158,12 +158,9 @@ class SmemPResource(DecodeGenResourceBase):
         if not self.cfg.uses_tmem_p:
             return []
         if self._tmem_alloc is None:
-            num_columns = self.cfg.tmem_p_cols
-            if self.cfg.uses_two_inst_tmem_p:
-                num_columns = self.cfg.tile_size_kv * self.cfg.q_dtype_bytes // 4
             self._tmem_alloc = TmemAllocation(
                 name=f"{self.name}_tmem",
-                num_columns=num_columns,
+                num_columns=self.cfg.tmem_p_cols_per_inst,
             )
         return [self._tmem_alloc]
 
@@ -377,9 +374,9 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4), alignment=16
                 )
         if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-            # FP8 publishes Q64/Q128 with one x16/x32 TMEM store. FP16/BF16 uses x16
-            # slices to limit Softmax register pressure, producing two/four
-            # stores. Every slice targets this instance's consumed S region.
+            # FP8 publishes Q64/Q128 with one x16/x32 TMEM store. FP16/BF16
+            # uses x16 slices to limit Softmax register pressure; BF16 emits
+            # four stores for both Q128/KV128 and Q64/KV256.
             assert cfg.num_packed_p_regs in (16, 32, 64)
             regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
             assert cfg.num_packed_p_regs % regs_per_store == 0
