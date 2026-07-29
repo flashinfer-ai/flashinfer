@@ -1,10 +1,11 @@
 {
   "name": "recurrent_kda_q8_v16_d128",
-  "description": "Recurrent Key-Driven Attention decode with per-key-dimension gating and an optional read-only committed-state source.",
+  "description": "Recurrent Key-Driven Attention decode/spec-decode plus exact FlashKDA-compatible ordinary prefill on B200, with per-key-dimension gating and recurrent BF16 state.",
   "op_type": "kda",
   "tags": [
     "fi_api:flashinfer.kda_decode.recurrent_kda",
     "stage:decode",
+    "stage:prefill",
     "status:verified"
   ],
   "axes": {
@@ -42,6 +43,10 @@
     "num_sequences": {
       "type": "var",
       "description": "Number of state-source indices."
+    },
+    "num_sequences_plus_one": {
+      "type": "var",
+      "description": "Number of packed cumulative-length entries."
     }
   },
   "constraints": [
@@ -93,6 +98,23 @@
       ],
       "dtype": "bfloat16"
     },
+    "A_log": {
+      "shape": [
+        "num_q_heads"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "FP32 per-query-head log decay rate."
+    },
+    "dt_bias": {
+      "shape": [
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "FP32 per-head/key decay bias; flattened [H*D] or [H,D] storage is accepted by the API."
+    },
     "initial_state": {
       "shape": [
         "state_pool_size",
@@ -121,6 +143,30 @@
       "dtype": "int32",
       "optional": true,
       "description": "Committed-state slot selected for each sequence."
+    },
+    "cu_seqlens": {
+      "shape": [
+        "num_sequences_plus_one"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Packed cumulative sequence lengths (int32 or int64)."
+    },
+    "num_accepted_tokens": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Accepted-token counts for speculative decode."
+    },
+    "seq_order": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Packed-prefill sequence permutation, normally descending by sequence length."
     },
     "scale": {
       "shape": null,
@@ -166,7 +212,8 @@
         "num_v_heads",
         "head_dim"
       ],
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "param": "output"
     },
     "final_state": {
       "shape": [

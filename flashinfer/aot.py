@@ -60,6 +60,10 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.flash_kda import (
+    gen_flash_kda_m64_module,
+    gen_flash_kda_m128_module,
+)
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
@@ -498,6 +502,7 @@ def gen_all_modules(
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm100a_exact = sm_capabilities.get("sm100a_exact", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
@@ -521,6 +526,16 @@ def gen_all_modules(
     )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    if has_sm100a_exact:
+        # Frozen FlashKDA sources use the SM100a-only tcgen05/TMEM surface.
+        # Do not package them for SM100f, SM103, or later architectures until
+        # those exact cubins have been independently validated.
+        jit_specs.extend(
+            [
+                gen_flash_kda_m64_module(),
+                gen_flash_kda_m128_module(),
+            ]
+        )
 
     if add_act:
         for act_name in act_func_def_str:
@@ -962,6 +977,8 @@ def detect_sm_capabilities():
         "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
+        "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+        and get_cuda_version() >= Version("12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
