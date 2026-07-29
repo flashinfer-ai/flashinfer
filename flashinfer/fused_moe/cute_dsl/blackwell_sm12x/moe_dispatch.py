@@ -33,6 +33,7 @@ from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
+    route_pack_numel_capacity,
     unswizzle_block_scale,
     validate_activation,
 )
@@ -1928,6 +1929,7 @@ def _w4a16_workspace_geometry(
     *,
     routed_rows: int,
     route_num_experts: int,
+    num_topk: int,
     k: int,
     n: int,
     is_gated: bool,
@@ -1939,9 +1941,15 @@ def _w4a16_workspace_geometry(
     fc2_c_tmp_elements = 1
     fc1_cols = (2 if is_gated else 1) * int(n)
     sms = get_num_sm(device)
+    # Size the route buffers for the power-of-2 numel capacity so route packing
+    # takes its shape-stable path (constant triton specialization across token
+    # counts) instead of degrading to exact-numel capacity.
+    routed_rows_capacity = route_pack_numel_capacity(
+        int(routed_rows), topk=int(num_topk)
+    )
     for block_size in _W4A16_ALLOWED_ROUTED_SIZES:
         slots = max_packed_route_slots(
-            int(routed_rows),
+            routed_rows_capacity,
             int(block_size),
             int(route_num_experts),
         )
@@ -2016,6 +2024,7 @@ def _allocate_sm120_w4a16_workspace(
     ) = _w4a16_workspace_geometry(
         routed_rows=routed_rows,
         route_num_experts=route_num_experts,
+        num_topk=num_topk,
         k=k,
         n=n,
         is_gated=is_gated,
