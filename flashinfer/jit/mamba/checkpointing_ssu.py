@@ -85,7 +85,6 @@ def get_checkpointing_ssu_uri(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
-    num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
 ) -> str:
@@ -95,7 +94,6 @@ def get_checkpointing_ssu_uri(
         f"s_{s[state_dtype]}_i_{s[input_dtype]}_dt_{s[dt_dtype]}_w_{s[weight_dtype]}_"
         f"a_{s[matrixA_dtype]}_si_{s[stateIndex_dtype]}_"
         f"d_{dim}_ds_{dstate}_np_{npredicted}_mw_{max_window}_hpg_{heads_per_group}"
-        f"_ng_{num_groups}"
     )
     if state_scale_dtype is not None:
         uri += f"_sc_{s[state_scale_dtype]}"
@@ -119,7 +117,6 @@ def gen_checkpointing_ssu_module(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
-    num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
     extra_cuda_cflags: list = None,
@@ -137,7 +134,6 @@ def gen_checkpointing_ssu_module(
         npredicted,
         max_window,
         heads_per_group,
-        num_groups,
         philox_rounds,
         enable_pdl,
     )
@@ -165,7 +161,6 @@ def gen_checkpointing_ssu_module(
         npredicted=npredicted,
         max_window=max_window,
         heads_per_group=heads_per_group,
-        num_groups=num_groups,
         state_scale_type=state_scale_type,
         philox_rounds=philox_rounds,
         enable_pdl="true" if enable_pdl else "false",
