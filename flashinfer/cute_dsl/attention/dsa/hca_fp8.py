@@ -3122,7 +3122,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
     def _tmem_load_partition(
         self, common_params: SimpleNamespace, tiled_mma_pv: cute.TiledMma, iter_n: int
     ) -> tuple[
-        cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
+        cute.TiledMma,
     ]:
         """Tensor memory load partition for rescale and epilogue.
 
@@ -3133,8 +3138,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :param iter_n: The iteration number
         :type iter_n: int
 
-        :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
+        :return: The tiled copy and five partitioned tensor views.
+        :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
         """
 
         tOtO_shape = tiled_mma_pv.partition_shape_C(

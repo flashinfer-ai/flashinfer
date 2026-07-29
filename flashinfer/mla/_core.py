@@ -1038,7 +1038,7 @@ def _check_dsv4_sparse_mla_inputs(
 def _resolve_dsv4_sparse_mla_backend(
     device: torch.device,
     requested_backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse"] = "auto",
-) -> str:
+) -> Literal["trtllm-gen", "cute-dsl", "sparse"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
@@ -1062,7 +1062,7 @@ def _resolve_dsv4_sparse_mla_backend(
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    return requested_backend
+    return cast(Literal["trtllm-gen", "cute-dsl", "sparse"], requested_backend)
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1778,12 +1778,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "hca_use_persistent": hca_use_persistent if hca_use_persistent else None,
         "hca_sparse_indices_format": hca_sparse_indices_format,
     }
-    unexpected_hca_inputs = [
+    unexpected_hca_input_names = [
         name for name, value in unexpected_hca_inputs.items() if value is not None
     ]
-    if unexpected_hca_inputs:
+    if unexpected_hca_input_names:
         raise ValueError(
-            f"backend={backend!r} does not accept " + ", ".join(unexpected_hca_inputs)
+            f"backend={backend!r} does not accept "
+            + ", ".join(unexpected_hca_input_names)
         )
 
     if enable_pdl is None:
