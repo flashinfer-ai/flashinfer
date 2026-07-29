@@ -237,7 +237,7 @@ class SmemAResource(MemoryResource):
     def build_mma_desc_a_at_stage(
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
-        """Build the A descriptor at the stage reported ready by the proxy."""
+        """Build the A descriptor for the explicit proxy-consumed stage."""
         return self._build_mma_desc_a_impl(pipeline_stage_idx)
 
     @cute.jit
@@ -449,7 +449,7 @@ class SmemBResource(MemoryResource):
     def build_mma_desc_b_at_stage(
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
-        """Build the B descriptor at the stage reported ready by the proxy."""
+        """Build the B descriptor for the explicit proxy-consumed stage."""
         return self._build_mma_desc_b_impl(pipeline_stage_idx)
 
     @cute.jit
