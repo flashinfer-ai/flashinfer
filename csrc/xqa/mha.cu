@@ -465,7 +465,12 @@ using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskType const* mask,
                                           uint32_t rowOffset, uint32_t nbValidCols,
                                           uint32_t qSeqLen, uint32_t actualQSeqLen,
-                                          uint32_t headGrpSize) {
+                                          uint32_t headGrpSize
+#if SLIDING_WINDOW
+                                          ,
+                                          uint32_t tileTokenBeg, int32_t winBegBase
+#endif
+) {
   uint32_t const idxInQuad = laneId() % 4;
   uint32_t const idxQuad = laneId() / 4;
   // Packed mask is aligned with 32 bits (2 uint16_t).
@@ -477,6 +482,11 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
     for (uint32_t i = 0; i < InstAcc::rows; i++) {
       uint32_t const tokenRow =
           min((rowOffset + instM * m + idxQuad + i * 8) / headGrpSize, actualQSeqLen - 1);
+#if SLIDING_WINDOW
+      // Per-row window begin (inclusive); see winBegBase at the call site.
+      // Callers disable window masking with a large negative winBegBase.
+      int32_t const rowWinBeg = winBegBase + int32_t(tokenRow);
+#endif
 #pragma unroll
       for (uint32_t mask_n = 0; mask_n < acc.cols / MMAS_N_PER_MASK; mask_n++) {
         uint32_t const firstCol = instN * mask_n * MMAS_N_PER_MASK + InstAcc::cols * idxInQuad;
@@ -507,7 +517,13 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                 col + actualQSeqLen < nbValidCols
                     ? true
                     : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
+#if SLIDING_WINDOW
+            bool const inWindow = int32_t(tileTokenBeg + col) >= rowWinBeg;
+#else
+            constexpr bool inWindow = true;
+#endif
+            acc(m, n)(i, j) =
+                maskFlag && inWindow && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
           }
         }
       }
@@ -1563,8 +1579,6 @@ CUBIN_EXPORT __global__
 #endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
-  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
-  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
   uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
@@ -1578,31 +1592,7 @@ CUBIN_EXPORT __global__
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
   uint32_t const idxReq = blockIdx.z;
-#if SPEC_DEC
-  // Variable query sequence length support.
-  bool const variableQSeqLen = qCuSeqLens != nullptr;
-  uint32_t const actualQSeqLen =
-      variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen;
-  // Same as idxReq * qSeqLen if all sequences all the same.
-  // Take different beams as different requests/sequences currently.
-  uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
-
-  uint32_t const nbVHeads = nbKHeads;
-  uint32_t const nbQHeads = nbKHeads * headGrpSize;
-  uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
-  uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
-
-  uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
-  uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
-  uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
-  uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
-  uint32_t const nbValidHeadTokens =
-      idxHeadTokenInGrp > totalNbHeadTokensInGrp
-          ? 0u
-          : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
-  // Shift the mask ptr by batch_idx.
-  mask += reqSeqOffset * divUp(qSeqLen, 32u);
-#else
+#if !SPEC_DEC
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
   uint32_t const idxHeadGrp = blockIdx.y;  // inside one request
@@ -1663,6 +1653,41 @@ CUBIN_EXPORT __global__
 #if ENABLE_PDL
   preExit();
   acqBulk();
+#endif
+
+  // The scale tensors and qCuSeqLens may be written by the previous grid;
+  // do not read them before acqBulk().
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
+
+#if SPEC_DEC
+  bool const variableQSeqLen = qCuSeqLens != nullptr;
+  uint32_t const actualQSeqLen =
+      variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen;
+  // Same as idxReq * qSeqLen if all sequences all the same.
+  // Take different beams as different requests/sequences currently.
+  uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
+  // A request whose drafts were all rejected has 0 tokens and owns no rows.
+  // The exit is uniform across the request's CTAs.
+  if (variableQSeqLen && actualQSeqLen == 0) {
+    return;
+  }
+
+  uint32_t const nbVHeads = nbKHeads;
+  uint32_t const nbQHeads = nbKHeads * headGrpSize;
+  uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
+  uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
+
+  uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
+  uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
+  uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
+  uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
+  uint32_t const nbValidHeadTokens =
+      idxHeadTokenInGrp > totalNbHeadTokensInGrp
+          ? 0u
+          : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
+  // Shift the mask ptr by batch_idx.
+  mask += reqSeqOffset * divUp(qSeqLen, 32u);
 #endif
 
   constexpr bool qkSwizzle = true;
@@ -1736,7 +1761,19 @@ CUBIN_EXPORT __global__
   uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW
   bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+#if SPEC_DEC && !IS_SPEC_DEC_TREE
+  // Linear (non-tree) spec-dec: draft row r sits at position
+  // cacheSeqLen - actualQSeqLen + r, so each row's window begins at
+  // winBegBase + r. Skip whole leading tiles only up to the earliest row
+  // handled by this CTA; applyMaskFromInput masks the per-row edge exactly.
+  int32_t const specDecWinBegBase =
+      int32_t(cacheSeqLen - actualQSeqLen + 1) - int32_t(slidingWinSize);
+  uint32_t const ctaTokenRowBeg = min(idxHeadTokenInGrp / headGrpSize, actualQSeqLen - 1);
+  int32_t const ctaWinBeg = specDecWinBegBase + int32_t(ctaTokenRowBeg);
+  uint32_t const nbTotalSkipTokens = (rtIsReallySliding && ctaWinBeg > 0) ? uint32_t(ctaWinBeg) : 0;
+#else
   uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+#endif
 #else
   constexpr bool rtIsReallySliding = false;
   constexpr uint32_t nbTotalSkipTokens = 0;
@@ -2023,11 +2060,31 @@ CUBIN_EXPORT __global__
       // masking
       uint32_t const warpTileTokenBeg = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if SPEC_DEC
-      if (seqIter >= nbSeqItersWithoutMask) {
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+      // Tiles below the last row's window begin (cacheSeqLen - slidingWinSize)
+      // need the per-row window edge mask; tiles fully below this CTA's
+      // first-row window begin were already skipped via nbSkipLeadingTiles.
+      bool const needWinEdgeMask =
+          rtIsReallySliding && (ctaTile.x * seqIter < cacheSeqLen - slidingWinSize);
+      int32_t const winBegBase = rtIsReallySliding ? specDecWinBegBase : int32_t(-(1 << 30));
+#else
+      constexpr bool needWinEdgeMask = false;
+#if SLIDING_WINDOW
+      // Tree-structured draft tokens have no row-indexed positions, so only
+      // the tile-granular window skip applies; no per-row edge mask.
+      int32_t const winBegBase = -(1 << 30);
+#endif
+#endif
+      if (seqIter >= nbSeqItersWithoutMask || needWinEdgeMask) {
         uint32_t const nbValidCols =
             (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
         applyMaskFromInput(warp, acc, mask, idxHeadTokenInGrp, nbValidCols, qSeqLen, actualQSeqLen,
-                           headGrpSize);
+                           headGrpSize
+#if SLIDING_WINDOW
+                           ,
+                           warpTileTokenBeg, winBegBase
+#endif
+        );
       }
 #else
       bool const isFirstIter = (seqIter == nbSkipLeadingTiles);
@@ -2477,6 +2534,11 @@ CUBIN_EXPORT __global__
             idxCurrSMemVBuf++;
           }
         }  // idxBeam
+#if __CUDA_ARCH__ == 1210
+        // GB10 (sm121): release prior reads of smem.x before signaling the buffer
+        // is consumed, so the gemm0 producer does not overwrite it too early.
+        __threadfence_block();
+#endif
         xBar.consumed.arrive();
       }  // xIter
       flip(xBarProducedParityNext);
@@ -2565,6 +2627,9 @@ CUBIN_EXPORT __global__
     bool reorderOutRows = inputElemSize == 2 && cacheElemSize == 1;
 #endif
     SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
+    // In multi-block mode only the last CTA writes the merged output; the other
+    // sub-sequences only contribute their partials via global scratch below.
+    bool ctaShouldWriteOut = !isMultiBlock;
     if (isMultiBlock) {
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
@@ -2599,6 +2664,12 @@ CUBIN_EXPORT __global__
       copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
           warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
       __syncthreads();
+#if __CUDA_ARCH__ == 1210
+      // GB10 (sm121): device-scope release so the partials just written to global
+      // scratch are visible to the last CTA (a different block) before the
+      // semaphore increment below signals that this sub-sequence is done.
+      __threadfence();
+#endif
       constexpr uint32_t nbTileBuffers = 2;
 
       struct MultiBlockSMem {
@@ -2632,6 +2703,7 @@ CUBIN_EXPORT __global__
 
       // merge if we are the last CTA.
       bool const isLastCta = mbsmem.isLastCta;
+      ctaShouldWriteOut = isLastCta;
       if (isLastCta) {
         MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
         SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
@@ -2720,7 +2792,7 @@ CUBIN_EXPORT __global__
         smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
       }
     }
-    if (warpGrpIdx == 0) {
+    if (ctaShouldWriteOut && warpGrpIdx == 0) {
 #if SPEC_DEC
       copyOutputToGlobalMem(
           warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize, (idxHeadGrp * headGrpSize),

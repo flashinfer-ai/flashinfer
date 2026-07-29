@@ -59,11 +59,9 @@ ATTENTION_MASK_TYPE_FUNCTION(Custom)
 enum class FmhaKernelType {
   // The context-phase kernels.
   Context = 0,
-  // Choose the best generation kernel based on the heuristic:
-  // use SwapsMmaAbForGeneration kernels when numHeadsQPerKv <= 16, otherwise
-  // KeepsMmaAbForGeneration.
+  // Choose the best generation kernel based on the heuristic.
   Generation = 1,
-  // Swap tensor A and tensor B of Mma, which only supports numHeadsQPerKv <= 16.
+  // Swap tensor A and tensor B of Mma. MLA cubins provide Q8, Q16, and Q32 head tiles.
   SwapsMmaAbForGeneration,
   // Keep tensor A and tensor B of Mma.
   KeepsMmaAbForGeneration,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     import torch
@@ -135,7 +135,7 @@ def preprocess_mega_weights(
     packed_w13_shape = (num_experts, fc1_out, hidden_size // 2)
     packed_w2_shape = (num_experts, hidden_size, intermediate_size // 2)
 
-    if weights.w13_scale is not None and weights.w2_scale is not None:
+    if isinstance(weights, PrequantizedMoEWeights):
         if (
             weights.w13.shape == packed_w13_shape
             and weights.w2.shape == packed_w2_shape

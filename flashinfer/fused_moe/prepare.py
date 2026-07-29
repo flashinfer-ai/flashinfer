@@ -20,7 +20,7 @@ backend-native ``MoEWeightPack`` views, so that preparation lives in the
 implementation surface rather than being copy-pasted into tests and benchmarks
 (design doc CR2/CR7; reviewer comments C6, C7, C31, C32).
 
-The canonical NVFP4 and BF16 helpers are exposed as
+The canonical TRTLLM FP4 and BF16 helpers are exposed as
 ``TrtllmFp4Config.prepare_weights(...)`` /
 ``CuteDslConfig.prepare_weights(...)`` /
 ``TrtllmBf16Config.prepare_weights(...)`` / ... static helpers (see ``api.py``).
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import functools
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -48,6 +48,7 @@ from ..utils import get_compute_capability
 # dims, so the cache is safe to reuse across shapes and calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PERMUTE_CACHE: dict = {}
+_TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE: dict = {}
 
 
 # The E8M0 range clamp and residual-scale factorization are adapted from
@@ -404,17 +405,19 @@ def prepare_trtllm_fp4_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    variant=None,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the TRTLLM NVFP4 ``trtllm_fp4_routed`` weight view.
+    """Build a TRTLLM FP4 ``trtllm_fp4_routed`` weight view.
 
-    Layout is ``Shuffled_MajorK`` — the only NVFP4-compatible trtllm-gen combo
-    today: per-expert gated-act reorder + MMA shuffle on the packed weights and
-    ``block_scale_interleave`` on the block scales.
+    ``NVFP4`` uses 16-element E4M3 scale blocks. ``MXFP4`` (W4A8) and
+    ``W4A16`` use the same MXFP4 weights with 32-element UE8M0 scale blocks.
+    All variants use per-expert gated-act reorder + MMA shuffle on the packed
+    weights and ``block_scale_interleave`` on the block scales.
 
     Parameters
     ----------
@@ -433,16 +436,40 @@ def prepare_trtllm_fp4_weights(
     -------
     dict
         Keys expected by ``TrtllmFp4RoutedRunner.pack_inputs``: ``gemm1_weights``,
-        ``gemm1_weights_scale``, ``gemm1_alpha``, ``gemm2_weights``,
-        ``gemm2_weights_scale``, ``output1_scale_scalar``,
-        ``output1_scale_gate_scalar``, ``output2_scale_scalar``.
+        ``gemm1_weights_scale``, ``gemm2_weights``, ``gemm2_weights_scale``,
+        ``output1_scale_scalar``, ``output1_scale_gate_scalar``,
+        ``output2_scale_scalar``, and, for NVFP4 only, ``gemm1_alpha``.
     """
     from ..fp4_quantization import fp4_quantize
     from ..quantization.fp4_quantization import block_scale_interleave
+    from .api import QuantVariant
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
+
+    if variant is None:
+        variant = QuantVariant.NVFP4
+    if variant not in (
+        QuantVariant.NVFP4,
+        QuantVariant.MXFP4,
+        QuantVariant.W4A16,
+    ):
+        raise ValueError(
+            "TRTLLM FP4 weight preparation requires QuantVariant.NVFP4, "
+            f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+        )
+    is_mxfp4 = variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+    sf_vec_size = 32 if is_mxfp4 else 16
+    required_alignment = 128 if is_mxfp4 else sf_vec_size
+    if (
+        hidden_size % required_alignment != 0
+        or intermediate_size % required_alignment != 0
+    ):
+        raise ValueError(
+            f"{variant.name} requires hidden_size and intermediate_size divisible "
+            f"by {required_alignment}."
+        )
 
     if device is None:
         device = w1_bf16.device
@@ -454,7 +481,6 @@ def prepare_trtllm_fp4_weights(
     if permute_cache is None:
         permute_cache = _TRTLLM_PERMUTE_CACHE
 
-    sf_vec_size = 16
     epilogue_tile_m = 128  # TRTLLM kernel-internal constant
 
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
@@ -463,6 +489,7 @@ def prepare_trtllm_fp4_weights(
         w1_flat,
         global_scale=w1_gs,
         sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
         is_sf_swizzled_layout=False,
     )
     g1_w = w1_q_flat.view(
@@ -478,6 +505,7 @@ def prepare_trtllm_fp4_weights(
         w2_flat,
         global_scale=w2_gs,
         sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
         is_sf_swizzled_layout=False,
     )
     g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
@@ -523,20 +551,77 @@ def prepare_trtllm_fp4_weights(
         )
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    return {
+    gemm1_scale = torch.stack(g1_s_sh).reshape(
+        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+    )
+    gemm2_scale = torch.stack(g2_s_sh).reshape(
+        num_local_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+    # The FP4 launcher requires float8 tensor metadata for both E4M3 and
+    # UE8M0 scale bytes; the dtype pair/scale length selects the interpretation.
+    gemm1_scale = gemm1_scale.view(torch.float8_e4m3fn)
+    gemm2_scale = gemm2_scale.view(torch.float8_e4m3fn)
+    result = {
         "gemm1_weights": torch.stack(g1_w_sh),
-        "gemm1_weights_scale": torch.stack(g1_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
-        "gemm1_alpha": ones,
+        "gemm1_weights_scale": gemm1_scale,
         "gemm2_weights": torch.stack(g2_w_sh),
-        "gemm2_weights_scale": torch.stack(g2_s_sh)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
+        "gemm2_weights_scale": gemm2_scale,
         "output1_scale_scalar": ones,
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
     }
+    if not is_mxfp4:
+        result["gemm1_alpha"] = ones
+    return result
+
+
+def prepare_trtllm_fp4_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    variant,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Prepare activations for a unified TRTLLM FP4 quantization variant."""
+    from .api import QuantVariant
+
+    if hidden_states_bf16.ndim != 2:
+        raise ValueError(
+            "hidden_states_bf16 must be 2D [num_tokens, hidden_size], got "
+            f"{tuple(hidden_states_bf16.shape)}."
+        )
+    if hidden_states_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            f"hidden_states_bf16 must be torch.bfloat16, got {hidden_states_bf16.dtype}."
+        )
+
+    if variant is QuantVariant.W4A16:
+        return hidden_states_bf16, None
+    if variant is QuantVariant.MXFP4:
+        from ..quantization.fp8_quantization import mxfp8_quantize
+
+        if hidden_states_bf16.shape[1] % 32 != 0:
+            raise ValueError("MXFP4 requires hidden_size divisible by 32.")
+        q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
+        return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
+    if variant is QuantVariant.NVFP4:
+        from ..fp4_quantization import fp4_quantize
+
+        if hidden_states_bf16.shape[1] % 16 != 0:
+            raise ValueError("NVFP4 requires hidden_size divisible by 16.")
+        # The unified NVFP4 weight view currently fixes its epilogue scalars at
+        # one, so activation preparation must use the matching global scale.
+        global_scale = torch.ones(1, device=hidden_states_bf16.device)
+        q, sf = fp4_quantize(
+            hidden_states_bf16,
+            global_scale=global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+        return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
+    raise ValueError(
+        "TRTLLM FP4 activation preparation requires QuantVariant.NVFP4, "
+        f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+    )
 
 
 def _deepseek_fp8_quantize_activations(
@@ -613,7 +698,10 @@ def prepare_trtllm_fp8_block_weights(
     DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
     uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
     Both native views remain in ``MajorK`` layout; the unified runner records
-    the exact variant and passes the corresponding kernel enum.
+    the exact variant and passes the corresponding kernel enum. Shuffled
+    MXFP8 preparation requires ``hidden_size`` and ``intermediate_size`` to be
+    divisible by 128 because the returned scales use TRTLLM's unpadded 128x4
+    physical layout.
     """
     from .api import QuantVariant
 
@@ -645,10 +733,12 @@ def prepare_trtllm_fp8_block_weights(
         w1_q, w1_sf = _deepseek_fp8_quantize_weights(w1_bf16)
         w2_q, w2_sf = _deepseek_fp8_quantize_weights(w2_bf16)
     else:
-        if hidden_size % 32 != 0 or intermediate_size % 32 != 0:
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             raise ValueError(
-                "MXFP8 requires hidden_size and intermediate_size divisible by 32."
+                "MXFP8 shuffled MajorK preparation requires hidden_size and "
+                "intermediate_size divisible by 128."
             )
+        from ..quantization.fp4_quantization import block_scale_interleave
         from ..quantization.fp8_quantization import mxfp8_quantize
         from .core import (
             _maybe_get_cached_w3_w1_permute_indices,
@@ -673,7 +763,11 @@ def prepare_trtllm_fp8_block_weights(
                 is_gated_act_gemm=True,
             )
             w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w1_sf.append(sf[permute_sf.to(device)])
+            w1_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
 
             q, sf = mxfp8_quantize(w2_bf16[expert], is_sf_swizzled_layout=False)
             sf = sf.view(torch.uint8).reshape(hidden_size, intermediate_size // 32)
@@ -687,7 +781,11 @@ def prepare_trtllm_fp8_block_weights(
                 num_elts_per_sf=32,
             )
             w2_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
-            w2_sf.append(sf[permute_sf.to(device)])
+            w2_sf.append(
+                block_scale_interleave(
+                    sf[permute_sf.to(device)].contiguous()
+                ).reshape_as(sf)
+            )
         w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
         w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
 
@@ -727,6 +825,150 @@ def prepare_trtllm_fp8_block_activations(
         "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
         f"got {variant!r}."
     )
+
+
+def _fp8_per_tensor_scale(
+    scale: Union[float, torch.Tensor], *, name: str, device: torch.device
+) -> torch.Tensor:
+    value = torch.as_tensor(scale, dtype=torch.float32, device=device)
+    if value.numel() != 1 or not bool(torch.isfinite(value).all()) or value.item() <= 0:
+        raise ValueError(
+            f"{name} must be one finite positive FP32 value, got {scale!r}."
+        )
+    return value.reshape(())
+
+
+def _quantize_fp8_per_expert(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize each expert tensor with one E4M3 multiplier."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    weights_f32 = weights.float()
+    amax = weights_f32.abs().amax(dim=(-1, -2))
+    # Weight preparation runs once at model load. Fail here instead of silently
+    # sanitizing a corrupted checkpoint or surfacing NaNs much later in inference.
+    # Reuse the required per-expert reduction to avoid another full tensor scan.
+    if not bool(torch.isfinite(amax).all()):
+        raise ValueError(
+            "FP8 per-tensor weight preparation requires finite checkpoint weights."
+        )
+    scales = torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+    quantized = (weights_f32 * scales[:, None, None]).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn), scales.to(torch.float32)
+
+
+def prepare_trtllm_fp8_per_tensor_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the TRTLLM per-tensor-FP8 MajorK weight view.
+
+    ``hidden_states_scale_global`` and ``intermediate_scale_global`` are the
+    E4M3 quantization multipliers obtained during PTQ/QAT calibration. Weight
+    multipliers are computed independently for each local expert.
+    """
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            "prepare_trtllm_fp8_per_tensor_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+
+    input_scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global,
+        name="hidden_states_scale_global",
+        device=device,
+    )
+    intermediate_scale = _fp8_per_tensor_scale(
+        intermediate_scale_global,
+        name="intermediate_scale_global",
+        device=device,
+    )
+    w1_q, w1_scale = _quantize_fp8_per_expert(w1_bf16.to(device).contiguous())
+    w2_q, w2_scale = _quantize_fp8_per_expert(w2_bf16.to(device).contiguous())
+
+    from .core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    w1_shuffled, w2_shuffled = [], []
+    for expert in range(num_local_experts):
+        permute = _maybe_get_cached_w3_w1_permute_indices(
+            _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
+            w1_q[expert].view(torch.uint8),
+            128,
+            is_gated_act_gemm=True,
+        )
+        w1_shuffled.append(
+            w1_q[expert]
+            .view(torch.uint8)[permute.to(device)]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+        permute = get_w2_permute_indices_with_cache(
+            _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
+            w2_q[expert].view(torch.uint8),
+            128,
+        )
+        w2_shuffled.append(
+            w2_q[expert]
+            .view(torch.uint8)[permute.to(device)]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+
+    return {
+        "gemm1_weights": torch.stack(w1_shuffled),
+        "gemm2_weights": torch.stack(w2_shuffled),
+        "output1_scales_scalar": (
+            intermediate_scale / (w1_scale * input_scale)
+        ).contiguous(),
+        "output1_scales_gate_scalar": (1.0 / (w1_scale * input_scale)).contiguous(),
+        "output2_scales_scalar": (1.0 / (intermediate_scale * w2_scale)).contiguous(),
+        # Calibration metadata is retained for callers preparing activations or
+        # constructing an independent reference; the runner ignores these keys.
+        "hidden_states_scale_global": input_scale,
+        "intermediate_scale_global": intermediate_scale,
+    }
+
+
+def prepare_trtllm_fp8_per_tensor_activations(
+    hidden_states_bf16: torch.Tensor,
+    *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+) -> Tuple[torch.Tensor, None]:
+    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale."""
+    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
+        raise ValueError(
+            "prepare_trtllm_fp8_per_tensor_activations expects a 2D BF16 tensor, "
+            f"got shape={tuple(hidden_states_bf16.shape)}, "
+            f"dtype={hidden_states_bf16.dtype}."
+        )
+    scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global,
+        name="hidden_states_scale_global",
+        device=hidden_states_bf16.device,
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    quantized = (hidden_states_bf16.float() * scale).clamp(-fp8_max, fp8_max)
+    return quantized.to(torch.float8_e4m3fn), None
 
 
 def prepare_trtllm_bf16_weights(

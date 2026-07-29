@@ -341,6 +341,8 @@ class PacketPipeline {
   }
 
   __device__ __forceinline__ void* sendFinalize() {
+    // Ensure all packet writers finish before thread 0 publishes the final step.
+    __syncthreads();
     if (packetId > 0 && threadIdx.x == 0) {
       stepCommunicator->releaseSendStep();
     }

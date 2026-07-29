@@ -447,10 +447,12 @@ def test_deepseekv3_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "activation_type",
+    ("activation_type", "alpha_value", "beta_value", "clamp_value"),
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Swiglu, None, None, None, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, None, None, None, id="Geglu"),
+        pytest.param(ActivationType.Situ, None, None, None, id="Situ_Defaults"),
+        pytest.param(ActivationType.Situ, 4.0, 25.0, None, id="Situ_kimi-k3"),
     ],
 )
 @pytest.mark.parametrize(
@@ -468,10 +470,29 @@ def test_topk_routing(
     routing_config,
     weight_processing,
     activation_type,
+    alpha_value,
+    beta_value,
+    clamp_value,
     routing_logits_dtype,
     cache_permute_indices,
 ):
     """Test TopK routing configuration."""
+    num_experts = routing_config["num_experts"]
+    gemm1_alpha = (
+        None
+        if alpha_value is None
+        else torch.full((num_experts,), alpha_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_beta = (
+        None
+        if beta_value is None
+        else torch.full((num_experts,), beta_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_clamp_limit = (
+        None
+        if clamp_value is None
+        else torch.full((num_experts,), clamp_value, device="cuda", dtype=torch.float32)
+    )
     run_moe_test(
         num_tokens,
         hidden_size,
@@ -482,6 +503,9 @@ def test_topk_routing(
         activation_type,
         cache_permute_indices,
         routing_logits_dtype,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 

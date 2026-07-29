@@ -59,7 +59,7 @@ def gen_moe_utils_module() -> JitSpec:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
@@ -119,6 +119,7 @@ def gen_moe_utils_module() -> JitSpec:
             / "kernels"
             / "cutlass_kernels",
             # Include paths for routing kernels and downloaded headers
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
     )
