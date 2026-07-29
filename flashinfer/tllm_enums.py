@@ -74,7 +74,8 @@ class ActivationType(IntEnum):
     SwigluStep = 7
     GegluTanh = 8
     Identity = 9
-    InvalidType = 10
+    Situ = 10
+    InvalidType = 11
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
@@ -92,6 +93,7 @@ _GATED_ACTIVATION_TYPES = (
     ActivationType.SwigluBias,
     ActivationType.SwigluStep,
     ActivationType.GegluTanh,
+    ActivationType.Situ,
 )
 
 
@@ -128,7 +130,7 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     -------
     bool
         ``True`` if ``activation_type`` belongs to the gated activation family
-        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``);
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``);
         ``False`` otherwise.
 
     Examples

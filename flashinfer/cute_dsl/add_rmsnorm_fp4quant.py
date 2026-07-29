@@ -35,10 +35,12 @@ from typing import Callable, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, Uint32, Uint8
+from cutlass import Float32, Int32, Int64, Uint32, Uint64, Uint8
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.norm import add_rmsnorm_fp4quant_trace
+from ..trace.templates.norm import add_rmsnorm_fp4quant_trace_dispatch
 from ..utils import device_support_pdl
 from .fp4_common import (
     # Constants
@@ -60,6 +62,7 @@ from .fp4_common import (
     bfloat2_hmax2,
     bfloat2_hmax_to_f32,
     # FP8 and FP4 conversion
+    cvt_f32x2_to_half2,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
     cvt_f32_to_ue8m0,
@@ -81,6 +84,67 @@ from .fp4_common import (
     load_f32_16_from_smem,
     compute_y_and_max_abs_f32,
 )
+
+
+# =============================================================================
+# Helpers for optional normed (bf16/fp16) output
+# =============================================================================
+
+
+@dsl_user_op
+def cvt_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack two float32 values into a bfloat2 (uint32 containing two bf16 values).
+
+    Uses cvt.rn.bf16.f32 for each value, then packs into a single uint32.
+    Mirrors cvt_f32x2_to_half2 in fp4_common.py.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 h0, h1;
+                cvt.rn.bf16.f32 h0, $1;
+                cvt.rn.bf16.f32 h1, $2;
+                mov.b32 $0, {h0, h1};
+            }
+            """,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _store_y_norm_16(
+    mN: cute.Tensor,
+    y_f32: cute.Tensor,
+    row_offset: Int32,
+    col_offset: Int32,
+    H: int,
+    is_fp16: bool,
+):
+    """Store 16 normalized float32 values as fp16/bf16 to global memory.
+
+    mN is a flat 1D tensor viewed as row-major (M, H). Uses 4x 64-bit stores
+    (each packing 4 16-bit elements).
+    """
+    for j in cutlass.range_constexpr(4):
+        if cutlass.const_expr(is_fp16):
+            lo = cvt_f32x2_to_half2(y_f32[4 * j], y_f32[4 * j + 1])
+            hi = cvt_f32x2_to_half2(y_f32[4 * j + 2], y_f32[4 * j + 3])
+        else:
+            lo = cvt_f32x2_to_bfloat2(y_f32[4 * j], y_f32[4 * j + 1])
+            hi = cvt_f32x2_to_bfloat2(y_f32[4 * j + 2], y_f32[4 * j + 3])
+        packed64 = (Uint64(hi) << Uint64(32)) | Uint64(lo)
+        ptr = get_ptr_as_int64(mN, row_offset * H + col_offset + Int32(4 * j))
+        st_global_u64(ptr, packed64)
 
 
 # =============================================================================
@@ -111,6 +175,7 @@ class AddRMSNormFP4QuantKernel:
         sm_version: int | None = None,
         scale_format: str | None = None,
         output_both_sf_layouts: bool = False,
+        output_norm: bool = False,
     ):
         self.dtype = dtype
         self.H = H
@@ -119,6 +184,7 @@ class AddRMSNormFP4QuantKernel:
         self.is_fp16 = is_fp16
         self.sm_version = sm_version if sm_version is not None else get_sm_version()
         self.output_both_sf_layouts = output_both_sf_layouts
+        self.output_norm = output_norm
 
         if scale_format is None:
             self.scale_format = "ue8m0" if block_size == 32 else "e4m3"
@@ -285,6 +351,7 @@ class AddRMSNormFP4QuantKernel:
         mY: cute.Tensor,
         mS: cute.Tensor,
         mS_unswizzled: cute.Tensor,
+        mYNorm: cute.Tensor,
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
@@ -300,6 +367,8 @@ class AddRMSNormFP4QuantKernel:
         - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
         - mS: Scale factor tensor, shape depends on swizzle mode
         - mS_unswizzled: Unswizzled scale factor tensor (used when output_both_sf_layouts=True)
+        - mYNorm: Optional normed output tensor, flat 1D view of (M, H), same dtype as
+          input (only written when output_norm=True; pass any dummy tensor otherwise)
         - mGlobalScale: Global scale tensor, shape (1,), float32
         """
 
@@ -319,6 +388,7 @@ class AddRMSNormFP4QuantKernel:
             mY,
             mS,
             mS_unswizzled,
+            mYNorm,
             mGlobalScale,
             M,
             eps,
@@ -345,6 +415,7 @@ class AddRMSNormFP4QuantKernel:
         mY: cute.Tensor,
         mS: cute.Tensor,
         mS_unswizzled: cute.Tensor,
+        mYNorm: cute.Tensor,
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
@@ -639,6 +710,16 @@ class AddRMSNormFP4QuantKernel:
                             )
                             st_global_u64(out_ptr, packed64)
 
+                            if cutlass.const_expr(self.output_norm):
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32,
+                                    actual_row_idx,
+                                    block_start,
+                                    H,
+                                    is_fp16,
+                                )
+
                         else:
                             # Global memory path (cluster mode) - use helper functions
                             # mR contains h = x + r, so load from mR
@@ -711,6 +792,16 @@ class AddRMSNormFP4QuantKernel:
                                 mY, actual_row_idx * (H // 2) + out_offset
                             )
                             st_global_u64(out_ptr, packed64)
+
+                            if cutlass.const_expr(self.output_norm):
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32,
+                                    actual_row_idx,
+                                    block_start,
+                                    H,
+                                    is_fp16,
+                                )
 
                     else:
                         # block_size == 32 (MXFP4) - process in two chunks of 16
@@ -804,6 +895,24 @@ class AddRMSNormFP4QuantKernel:
                             fp4_ptr_1 = get_ptr_as_int64(mY, fp4_offset + Int32(8))
                             st_global_u64(fp4_ptr_0, packed64_c0)
                             st_global_u64(fp4_ptr_1, packed64_c1)
+
+                            if cutlass.const_expr(self.output_norm):
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32_c0,
+                                    actual_row_idx,
+                                    block_start,
+                                    H,
+                                    is_fp16,
+                                )
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32_c1,
+                                    actual_row_idx,
+                                    block_start + Int32(16),
+                                    H,
+                                    is_fp16,
+                                )
 
                         else:
                             # Global memory path (cluster mode) - use helper functions
@@ -900,6 +1009,24 @@ class AddRMSNormFP4QuantKernel:
                             st_global_u64(fp4_ptr_0, packed64_c0)
                             st_global_u64(fp4_ptr_1, packed64_c1)
 
+                            if cutlass.const_expr(self.output_norm):
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32_c0,
+                                    actual_row_idx,
+                                    block_start,
+                                    H,
+                                    is_fp16,
+                                )
+                                _store_y_norm_16(
+                                    mYNorm,
+                                    y_f32_c1,
+                                    actual_row_idx,
+                                    block_start + Int32(16),
+                                    H,
+                                    is_fp16,
+                                )
+
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -919,6 +1046,7 @@ def _get_compiled_kernel(
     is_sf_swizzled_layout: bool,
     output_both_sf_layouts: bool = False,
     enable_pdl: bool = False,
+    output_norm: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -936,6 +1064,7 @@ def _get_compiled_kernel(
         sm_version=sm_version,
         scale_format=scale_format,
         output_both_sf_layouts=output_both_sf_layouts,
+        output_norm=output_norm,
     )
 
     # Use symbolic size for dynamic M dimension
@@ -982,6 +1111,14 @@ def _get_compiled_kernel(
         assumed_align=128,
     )
 
+    # Optional normed output tensor (flat 1D view of (M, hidden_size)).
+    # Uses an independent symbolic size so a small dummy tensor can be passed
+    # when output_norm=False (the kernel never touches it in that case).
+    sym_ynorm_size = cute.sym_int()
+    ynorm_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (sym_ynorm_size,), assumed_align=16
+    )
+
     # Create fake stream that uses environment stream at runtime
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -999,6 +1136,7 @@ def _get_compiled_kernel(
         y_fake,
         s_fake,
         s_unswizzled_fake,
+        ynorm_fake,
         global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
@@ -1014,6 +1152,7 @@ def _get_compiled_kernel(
         y: torch.Tensor,
         s: torch.Tensor,
         s_unswizzled: torch.Tensor,
+        y_norm: torch.Tensor,
         global_scale: torch.Tensor,
         M: int,
         eps: float,
@@ -1035,6 +1174,7 @@ def _get_compiled_kernel(
             y_uint8,
             s_tensor,
             s_unswizzled.contiguous(),
+            y_norm,
             global_scale,
             M,
             eps,
@@ -1043,7 +1183,7 @@ def _get_compiled_kernel(
     return tensor_api
 
 
-@flashinfer_api(trace=add_rmsnorm_fp4quant_trace)
+@flashinfer_api(trace=add_rmsnorm_fp4quant_trace_dispatch)
 def add_rmsnorm_fp4quant(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -1058,6 +1198,7 @@ def add_rmsnorm_fp4quant(
     output_both_sf_layouts: bool = False,
     block_scale_unswizzled: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
+    y_out: torch.Tensor | None = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ]:
@@ -1145,6 +1286,15 @@ def add_rmsnorm_fp4quant(
         device supports it (probed via :func:`device_support_pdl`). Pass
         ``False`` to force-disable. See
         https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+    y_out : torch.Tensor, optional
+        Optional output tensor for the normed (pre-quantization) values
+        ``y = RMSNorm(input + residual) * weight`` in the input dtype
+        (fp16/bf16). Shape must be ``(batch_size, hidden_size)`` or matching
+        3D input, contiguous. **Written in place**; the return value of this
+        function is unchanged (same tuple arity as without ``y_out``).
+        When ``None`` (default), the normed values are not materialized and
+        the generated kernel is identical to the baseline (the presence of
+        ``y_out`` is a compile-time specialization).
 
     Returns
     -------
@@ -1275,6 +1425,28 @@ def add_rmsnorm_fp4quant(
     if global_scale is None:
         global_scale = torch.ones(1, dtype=torch.float32, device=input.device)
 
+    # Optional normed (bf16/fp16) output — compile-time specialization
+    output_norm = y_out is not None
+    weight_contig = weight.contiguous()
+    if output_norm:
+        assert y_out.dtype == dtype, (
+            f"y_out dtype {y_out.dtype} must match input dtype {dtype}"
+        )
+        assert y_out.device == input.device, (
+            f"y_out device {y_out.device} must match input device {input.device}"
+        )
+        assert y_out.is_contiguous(), "y_out must be contiguous"
+        assert y_out.shape == input.shape, (
+            f"y_out shape {tuple(y_out.shape)} must match the input shape "
+            f"{tuple(input.shape)} (same (batch, hidden) or 3D layout)"
+        )
+        assert y_out.data_ptr() % 16 == 0, "y_out must be 16-byte aligned"
+        y_norm_arg = y_out.view(-1)
+    else:
+        # Dummy tensor; the kernel never reads or writes it when
+        # output_norm=False (the store is compiled out).
+        y_norm_arg = weight_contig
+
     tensor_api = _get_compiled_kernel(
         hidden_size,
         block_size,
@@ -1284,14 +1456,16 @@ def add_rmsnorm_fp4quant(
         is_sf_swizzled_layout,
         output_both_sf_layouts,
         enable_pdl,
+        output_norm,
     )
     tensor_api(
         input_2d.contiguous(),
         residual_2d.contiguous(),
-        weight.contiguous(),
+        weight_contig,
         y_fp4_2d,
         block_scale_2d.view(torch.uint8),
         block_scale_unswizzled_2d.view(torch.uint8),
+        y_norm_arg,
         global_scale.contiguous(),
         batch_size,
         eps,

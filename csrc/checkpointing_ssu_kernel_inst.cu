@@ -7,6 +7,6 @@
 namespace flashinfer::mamba::checkpointing {
 
 template void launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                     state_scale_t>(CheckpointingSsuParams&, cudaStream_t);
+                                     state_scale_t>(CheckpointingSsuParams&, int, cudaStream_t);
 
 }  // namespace flashinfer::mamba::checkpointing

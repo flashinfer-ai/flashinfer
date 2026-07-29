@@ -194,6 +194,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
     routingData.mUseRoutingSoftmax = false;
 
     int32_t const numDevices = (localNumExperts > 0) ? numExperts / localNumExperts : 1;
@@ -357,6 +358,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
       return ActType::SwiGlu;
     case ActivationType::Geglu:
       return ActType::GeGlu;
+    case ActivationType::Situ:
+      return ActType::SiTuGlu;
     default:
       FLASHINFER_CHECK(false, "Unsupported gated activation type ",
                        serializeActivationType(actType), " of enum ",
@@ -425,6 +428,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -449,6 +455,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -560,6 +569,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
+      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                            : btg::Dtype::Fp32)
+                                            : btg::Dtype::Void,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }
@@ -771,6 +783,21 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
   }
 
   return validIndices;
+}
+
+bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                int32_t intermediateSize, int32_t numLocalExperts,
+                                int32_t numTokens) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
+    return false;
+  }
+
+  auto const& config = mPassingConfigs[configIndex];
+  return mPermuteGemm1.isValidConfigIndex(static_cast<int32_t>(config.gemm1Config), topK,
+                                          hiddenSize, intermediateSize, numLocalExperts,
+                                          numTokens) &&
+         mGemm2.isValidConfigIndex(static_cast<int32_t>(config.gemm2Config), topK, hiddenSize,
+                                   intermediateSize, numLocalExperts, numTokens);
 }
 
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,

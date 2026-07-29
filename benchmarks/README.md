@@ -399,7 +399,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--enable_pdl`           | Enable programmatic dependent launch                                                                       |
 | `--batch_size`           | Batch size for batched quantization (`nvfp4_batched_quantize` only)                                        |
 | `--global_scale`         | Global scale factor for NVFP4 quantization. Default: 1.0                                                   |
-| `--sf_layout`            | Scale factor layout for NVFP4: `128x4` (default), `8x4`, or `linear`                                       |
+| `--sf_layout`            | Scale factor layout for FP4 quantization: `128x4` (default), `8x4`, or `linear`                             |
 | `--do_shuffle`           | Shuffle scale factors for TRTLLM backend (`nvfp4_quantize` only)                                           |
 | `--sf_vec_size`          | Scale factor vector size for NVFP4 quantization. Default: 16                                               |
 | `--backends`             | Backend to test. Default: `cuda`                                                                           |

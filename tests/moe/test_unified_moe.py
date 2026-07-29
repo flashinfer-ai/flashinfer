@@ -14,7 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Two halves:
+Two sections:
 
   * CPU-only config/dataclass tests (no GPU or JIT). These track the actual MVP
     API surface (single-knob ``QuantVariant``, explicit
@@ -42,9 +42,15 @@ from flashinfer.fused_moe import (
     MoEActivationPack,
     MoELayer,
     MoEWeightPack,
+    RoutingInputMode,
     TrtllmFp4RoutedRunner,
 )
-from flashinfer.fused_moe.runners import TrtllmBf16RoutedRunner
+from flashinfer.fused_moe.runners import (
+    CuteDslNvfp4Runner,
+    MoERunner,
+    TrtllmBf16RoutedRunner,
+    TrtllmFp8BlockRunner,
+)
 from flashinfer.fused_moe.api import (
     ActivationConfig,
     ActivationType,
@@ -73,8 +79,6 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     create_moe_tensors,
     is_sm100_family,
 )
-
-
 # ---------------------------------------------------------------------------
 # Enum repr round-trip
 # ---------------------------------------------------------------------------
@@ -255,11 +259,10 @@ class TestBackendOptions:
         opts = BackendOptions(
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
         )
-        # sm80: BF16 requires 100+, FP8Block requires 80+, Cutlass is universal
+        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
         valid = opts.valid_for(80)
-        assert len(valid) == 2
-        assert isinstance(valid[0], TrtllmFp8BlockConfig)
-        assert isinstance(valid[1], CutlassConfig)
+        assert len(valid) == 1
+        assert isinstance(valid[0], CutlassConfig)
 
     def test_valid_for_blackwell(self):
         opts = BackendOptions(
@@ -267,6 +270,17 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert not TrtllmFp4Config.supported(107)
+        assert not TrtllmFp8BlockConfig.supported(107)
+        assert not TrtllmBf16Config.supported(107)
+        assert not TrtllmBf16Config.supported(120)
+        assert not TrtllmFp8BlockConfig.supported(110)
+        assert not TrtllmFp8BlockConfig.supported(120)
+        assert TrtllmFp8PerTensorConfig.supported(100)
+        assert TrtllmFp8PerTensorConfig.supported(103)
+        assert not TrtllmFp8PerTensorConfig.supported(107)
+        assert not TrtllmFp8PerTensorConfig.supported(90)
+        assert not TrtllmFp8PerTensorConfig.supported(120)
 
     def test_iteration(self):
         opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
@@ -510,7 +524,7 @@ class TestExpressiveness:
             backend=BackendOptions((CutlassConfig(),)),
         )
         # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
-        # MoEActivationPack (selected_experts/final_scales), not via config
+        # MoEActivationPack (topk_ids/topk_weights), not via config
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
@@ -567,13 +581,11 @@ class TestExpressiveness:
 
 
 # ---------------------------------------------------------------------------
-# MoELayer MVP fail-fast validation (CR6)
+# Unified runner support validation
 # ---------------------------------------------------------------------------
-# These exercise MoELayer._validate_mvp_scope, which runs at construction time
-# before any device/runner setup, so they need no GPU.
 
 
-class TestMoELayerMVPValidation:
+class TestMoERunnerSupport:
     def _nvfp4_swiglu(self, **overrides):
         base = dict(
             routing=RoutingConfig(num_experts=32, top_k=2),
@@ -585,28 +597,67 @@ class TestMoELayerMVPValidation:
         return MoEConfig(**base)
 
     @pytest.mark.parametrize(
-        "variant",
-        # NVFP4 (CuteDSL/TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM
-        # path) are both MVP-supported now; everything else is still rejected.
-        [v for v in QuantVariant if v not in (QuantVariant.NVFP4, QuantVariant.BF16)],
+        "runner_type,variant",
+        (
+            (CuteDslNvfp4Runner, QuantVariant.BF16),
+            (TrtllmFp4RoutedRunner, QuantVariant.BF16),
+            (TrtllmBf16RoutedRunner, QuantVariant.NVFP4),
+            (TrtllmFp8BlockRunner, QuantVariant.BF16),
+        ),
     )
-    def test_non_nvfp4_quant_rejected(self, variant):
-        from flashinfer.fused_moe import MoELayer
-
+    def test_unsupported_quant_variant_rejected(self, runner_type, variant):
         cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
-        with pytest.raises(NotImplementedError, match="NVFP4"):
-            MoELayer(cfg)
+        runner = runner_type.__new__(runner_type)
+        runner.config = cfg
+        with pytest.raises(NotImplementedError, match=f"QuantVariant.{variant.name}"):
+            runner.check_support()
 
     @pytest.mark.parametrize(
         "act",
         [a for a in ActivationType if a is not ActivationType.Swiglu],
     )
-    def test_non_swiglu_activation_rejected(self, act):
-        from flashinfer.fused_moe import MoELayer
-
-        cfg = self._nvfp4_swiglu(activation=ActivationConfig(type=act))
+    @pytest.mark.parametrize(
+        "runner_type,variant",
+        (
+            (CuteDslNvfp4Runner, QuantVariant.NVFP4),
+            (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
+            (TrtllmBf16RoutedRunner, QuantVariant.BF16),
+            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
+        ),
+    )
+    def test_non_swiglu_activation_not_supported(self, runner_type, variant, act):
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=variant),
+            activation=ActivationConfig(type=act),
+        )
+        runner = runner_type.__new__(runner_type)
+        runner.config = cfg
         with pytest.raises(NotImplementedError, match="Swiglu"):
-            MoELayer(cfg)
+            runner.check_support()
+
+    def test_fp8_block_unfinalized_not_supported(self):
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            execution=ExecutionConfig(do_finalize=False),
+        )
+        runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
+        runner.config = cfg
+        with pytest.raises(NotImplementedError, match="do_finalize=True"):
+            runner.check_support()
+
+    def test_moe_runner_quant_support_check(self):
+        class Runner(MoERunner):
+            supported_quant_variants = (QuantVariant.NVFP4,)
+
+            def get_valid_tactics(self, inputs, profile):
+                return []
+
+            def forward(self, inputs, **kwargs):
+                return None
+
+        runner = Runner()
+        runner.config = self._nvfp4_swiglu()
+        assert runner.check_support() is None
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +684,21 @@ class TestActivationPackValidation:
         x, sf, ids, w, _ = _pack_tensors()
         pack = MoEActivationPack(x, sf, ids, w)  # positional, pre-rename order
         assert pack.topk_ids is ids and pack.topk_weights is w
+
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_valid_unpacked_prerouted(self, weights_dtype):
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        x, sf, ids, w, _ = _pack_tensors()
+        pack = MoEActivationPack(
+            x,
+            sf,
+            ids,
+            w.to(weights_dtype),
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        assert pack.topk_ids is ids
+        assert pack.topk_weights.dtype is weights_dtype
 
     def test_routing_fields_are_keyword_only(self):
         x, sf, ids, w, _ = _pack_tensors()
@@ -691,6 +757,49 @@ class TestActivationPackValidation:
                 w,
                 routing_input_mode=RoutingInputMode.FromLogits,
                 routing_logits=logits,
+            )
+
+    @pytest.mark.parametrize(
+        ("ids_transform", "weights_transform", "match"),
+        [
+            pytest.param(
+                lambda x: x.long(),
+                lambda x: x.to(torch.bfloat16),
+                "int32",
+                id="int64-ids",
+            ),
+            pytest.param(
+                lambda x: x,
+                lambda x: x.half(),
+                "bfloat16",
+                id="fp16-weights",
+            ),
+            pytest.param(
+                lambda x: x[:, :1],
+                lambda x: x.to(torch.bfloat16),
+                "matching",
+                id="mismatched-shapes",
+            ),
+            pytest.param(
+                lambda x: x,
+                lambda x: x.to(torch.bfloat16)[:, :1].expand_as(x),
+                "contiguous",
+                id="noncontiguous-weights",
+            ),
+        ],
+    )
+    def test_unpacked_contract_rejected(self, ids_transform, weights_transform, match):
+        """Reject invalid unpacked dtypes, shapes, and layouts before launch."""
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        x, sf, ids, w, _ = _pack_tensors()
+        with pytest.raises((TypeError, ValueError), match=match):
+            MoEActivationPack(
+                x,
+                sf,
+                ids_transform(ids),
+                weights_transform(w),
+                routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
             )
 
     def test_int64_topk_ids_rejected(self):
@@ -1326,6 +1435,41 @@ def _fp4_dummy_hidden(num_tokens, hidden_size, device):
     )
 
 
+def _fp4_dummy_weight_view(num_experts, hidden_size, intermediate_size, device):
+    """Shape-valid FP4 placeholders for packing-only tests (never launched)."""
+    return {
+        "gemm1_weights": torch.empty(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm1_weights_scale": torch.empty(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // 16,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        "gemm1_alpha": torch.empty(num_experts, dtype=torch.float32, device=device),
+        "gemm2_weights": torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm2_weights_scale": torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size // 16,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+    }
+
+
 def _bf16_dummy_hidden(num_tokens, hidden_size, device):
     return (
         torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device),
@@ -1420,13 +1564,19 @@ class TestTrtllmRoutedPackingContract:
             topk_weights=final_scales,
         )
 
-        # pack_inputs only threads weights into static kwargs; dummies suffice
-        # since we inspect topk_ids only (no kernel launch).
+        # No kernel launches, but runners still validate their backend-native
+        # weight contracts before exposing the packed routing buffers.
+        if spec.variant is QuantVariant.NVFP4:
+            weight_view = _fp4_dummy_weight_view(
+                local_num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            )
+        else:
+            weight_view = {k: torch.empty(0, device=device) for k in spec.view_keys}
         weight_pack = MoEWeightPack()
-        weight_pack.prepare_for(
-            runner.backend_key,
-            {k: torch.empty(0, device=device) for k in spec.view_keys},
-        )
+        weight_pack.prepare_for(runner.backend_key, weight_view)
 
         from flashinfer.fused_moe.core import MoeRunnerInputs
 
@@ -1450,6 +1600,117 @@ class TestTrtllmRoutedPackingContract:
 
 
 @sm100_required
+class TestTrtllmFp4UnpackedContract:
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_pack_inputs_forwards_separate_routing_tensors(self, weights_dtype):
+        from flashinfer.fused_moe.core import MoeRunnerInputs, RoutingInputMode
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens, hidden_size, top_k = 16, 256, 4
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=128, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(
+                intermediate_size=512,
+                local_expert_offset=32,
+                local_num_experts=32,
+            ),
+        )
+        runner = TrtllmFp4RoutedRunner(config, device=device)
+        ids = torch.randint(
+            32, 64, (num_tokens, top_k), dtype=torch.int32, device=device
+        )
+        weights = torch.rand(num_tokens, top_k, dtype=weights_dtype, device=device)
+        act_pack = MoEActivationPack(
+            hidden_states_q=torch.zeros(
+                num_tokens, hidden_size // 2, dtype=torch.uint8, device=device
+            ),
+            hidden_states_scale=torch.zeros(
+                num_tokens, hidden_size // 16, dtype=torch.uint8, device=device
+            ).view(torch.float8_e4m3fn),
+            topk_ids=ids,
+            topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            runner.backend_key,
+            _fp4_dummy_weight_view(
+                config.experts.local_num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            ),
+        )
+
+        moe_inputs = MoeRunnerInputs.from_list(
+            runner.pack_inputs(act_pack, weight_pack)
+        )
+        assert moe_inputs.topk_ids is ids
+        assert moe_inputs.expert_weights is weights
+        assert (
+            runner._static_kwargs["routing_input_mode"]
+            == RoutingInputMode.UnpackedPrecomputed
+        )
+        assert runner._static_kwargs["local_expert_offset"] == 32
+
+    @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+    def test_cuda_graph_replay_matches_eager(self, weights_dtype):
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens, hidden_size, intermediate_size = 16, 256, 512
+        num_experts, top_k = 8, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(
+                intermediate_size=intermediate_size,
+                local_num_experts=num_experts,
+            ),
+        )
+        runner = TrtllmFp4RoutedRunner(config, device=device)
+        act_pack = MoEActivationPack(
+            hidden_states_q=tensors["x"],
+            hidden_states_scale=tensors["x_sf"].squeeze(-1),
+            topk_ids=tensors["token_selected_experts"],
+            topk_weights=tensors["token_final_scales"].to(weights_dtype),
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            runner.backend_key,
+            TrtllmFp4Config.prepare_weights(
+                tensors["w1_weight_bf16"],
+                tensors["w2_weight_bf16"],
+                num_local_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            ),
+        )
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        for _ in range(3):
+            runner.forward(inputs, tactic=-1)
+        torch.cuda.synchronize()
+        eager = runner.forward(inputs, tactic=-1).clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = runner.forward(inputs, tactic=-1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(captured, eager)
+
+
+@sm100_required
 class TestTrtllmEPOffset:
     """EP-shard forward regression (gh #3547): an offset>0 run over the same
     local-shard weights must reproduce the offset-0 baseline, not silently
@@ -1458,7 +1719,17 @@ class TestTrtllmEPOffset:
     """
 
     @pytest.mark.parametrize("local_expert_offset", [32, 96])
-    def test_ep_shard_forward_matches_offset_zero(self, local_expert_offset):
+    @pytest.mark.parametrize(
+        "routing_input_mode",
+        [
+            RoutingInputMode.PackedPrecomputed,
+            RoutingInputMode.UnpackedPrecomputed,
+        ],
+        ids=["packed", "unpacked"],
+    )
+    def test_ep_shard_forward_matches_offset_zero(
+        self, local_expert_offset, routing_input_mode
+    ):
         """Full EP-shard forward equals the identical offset-0 run.
 
         Same local-shard weights, same tokens, global ids shifted up by the
@@ -1509,7 +1780,12 @@ class TestTrtllmEPOffset:
                 hidden_states_q=tensors["x"],
                 hidden_states_scale=tensors["x_sf"].squeeze(-1),
                 topk_ids=tensors["token_selected_experts"] + offset,
-                topk_weights=tensors["token_final_scales"],
+                topk_weights=(
+                    tensors["token_final_scales"].to(torch.bfloat16)
+                    if routing_input_mode == RoutingInputMode.UnpackedPrecomputed
+                    else tensors["token_final_scales"]
+                ),
+                routing_input_mode=routing_input_mode,
             )
             runner = TrtllmFp4RoutedRunner(config, device=device)
             inputs = runner.pack_inputs(act_pack, weight_pack)
@@ -1576,13 +1852,12 @@ class TestTrtllmFromLogitsPackingContract:
         weight_pack = MoEWeightPack()
         weight_pack.prepare_for(
             "trtllm_fp4_routed",
-            {
-                "gemm1_weights": torch.empty(0, device=device),
-                "gemm1_weights_scale": torch.empty(0, device=device),
-                "gemm1_alpha": torch.empty(0, device=device),
-                "gemm2_weights": torch.empty(0, device=device),
-                "gemm2_weights_scale": torch.empty(0, device=device),
-            },
+            _fp4_dummy_weight_view(
+                num_experts,
+                hidden_size,
+                config.experts.intermediate_size,
+                device,
+            ),
         )
 
         moe_inputs = MoeRunnerInputs.from_list(
