@@ -69,7 +69,6 @@ from ...tllm_enums import (
 )
 from ...autotuner import AutoTuner
 from ...cute_dsl.utils import convert_sf_to_mma_layout
-from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
@@ -612,6 +611,7 @@ class CuteDslMoEWrapper:
         moe_output: Optional[torch.Tensor] = None,
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
+        use_async_memset: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -645,7 +645,7 @@ class CuteDslMoEWrapper:
             main_event=self._main_event,
             memset_event=self._memset_event,
             output_dtype=output_dtype,
-            use_async_memset=True,
+            use_async_memset=use_async_memset,
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             activation_type=self.activation_type.value,
@@ -756,7 +756,13 @@ class CuteDslMoEWrapper:
             inputs,
         )
 
-        return runner(inputs, tactic=best_tactic)
+        # Timed tactic runs retain the default async path; only this
+        # selected-tactic execution is single-stream while tuning.
+        return runner(
+            inputs,
+            tactic=best_tactic,
+            use_async_memset=not tuner.is_tuning_mode,
+        )
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
@@ -795,6 +801,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    use_async_memset: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
@@ -826,7 +833,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         per_token_scale=per_token_scale,
         aux_stream=aux_stream,
         output_dtype=output_dtype,
-        use_async_memset=True,
+        use_async_memset=use_async_memset,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
@@ -936,7 +943,6 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
 
     if num_local_experts is None:
@@ -996,10 +1002,13 @@ def cute_dsl_fused_moe_nvfp4(
         aux_stream=aux_stream,
     )
 
+    # Tactic profiling retains the default async path; only this selected
+    # execution is single-stream while tuning.
     return runner(
         inputs,
         tactic=best_tactic,
         aux_stream=aux_stream,
+        use_async_memset=not tuner.is_tuning_mode,
     )
 
 

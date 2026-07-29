@@ -16,15 +16,7 @@ def is_cute_dsl_available():
     try:
         from flashinfer.cute_dsl import is_cute_dsl_available as _is_available
 
-        if not _is_available():
-            return False
-        import torch as _torch
-
-        if _torch.cuda.is_available():
-            from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
-
-            return is_cute_dsl_arch_supported(*_torch.cuda.get_device_capability(0))
-        return True
+        return _is_available()
     except ImportError:
         return False
 

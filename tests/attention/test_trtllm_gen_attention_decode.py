@@ -682,8 +682,6 @@ def _test_trtllm_batch_decode(
 
     # NVFP4 KV cache constraints
     if kv_dtype == "nvfp4":
-        if compute_capability == (10, 7):
-            pytest.skip("KV Cache NVFP4 is not supported on SM107")
         if backend != "trtllm-gen":
             pytest.skip("NVFP4 KV cache only supported by trtllm-gen backend")
         if q_dtype != "fp8":

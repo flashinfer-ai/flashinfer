@@ -82,8 +82,6 @@ def _test_trtllm_batch_prefill(
 
     # NVFP4 KV cache constraints
     if kv_dtype == "nvfp4":
-        if compute_capability == (10, 7):
-            pytest.skip("KV Cache NVFP4 is not supported on SM107")
         if q_dtype != "fp8":
             pytest.skip("NVFP4 KV cache requires FP8 query")
         if o_dtype != "fp8":
@@ -701,8 +699,6 @@ def test_trtllm_gen_prefill(
 
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     if backend == "cute-dsl":
-        if compute_capability == (10, 7):
-            pytest.skip("cute-dsl FMHA prefill is not yet enabled on SM107")
         if head_dim_qk == 192:
             pytest.skip("cute-dsl does not support bf16 with head_dim=192")
 
@@ -874,8 +870,6 @@ def test_trtllm_gen_prefill_fp8(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
-    if compute_capability == (10, 7):
-        pytest.skip("cute-dsl FMHA prefill is not yet enabled on SM107")
 
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     head_dim_vo = mla_dimensions.v_head_dim
