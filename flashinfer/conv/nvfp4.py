@@ -28,7 +28,7 @@ from ..trace.templates.conv import (
     conv3d_nvfp4_trace,
     prepare_nvfp4_conv3d_weight_trace,
 )
-from ..utils import supported_compute_capability
+from ..utils import _ensure_user_env, supported_compute_capability
 
 _NVFP4_BLOCK_SIZE = 16
 _NVFP4_GLOBAL_QUANT_MAX = 448.0 * 6.0
@@ -387,6 +387,10 @@ def _check_output(
     if not output.is_contiguous(memory_format=torch.channels_last_3d):
         raise ValueError("out must be contiguous in channels_last_3d memory format")
     return output.permute(0, 2, 3, 4, 1)
+
+
+# The CUDA custom-op wrapper imports torch._dynamo before entering the backend.
+_ensure_user_env()
 
 
 @torch.library.custom_op(
