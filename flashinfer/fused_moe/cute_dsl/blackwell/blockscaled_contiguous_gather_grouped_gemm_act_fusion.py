@@ -46,6 +46,7 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
+from flashinfer.cute_dsl.fp4_common import fadd_rn, fdiv_rn, fmul_rn
 
 from ..moe_utils import normalize_cute_dsl_moe_activation_type
 from .custom_pipeline import PipelineCpAsyncUmma
@@ -160,6 +161,21 @@ CUDA Graph Support:
 * Only rows within (aligned_groupm[0]+aligned_groupm[1]+...) contain valid data
 * Padding rows in C matrix will not be written by the kernel
 """
+
+
+def _strict_swiglu_f32(
+    gate: cutlass.Float32,
+    up: cutlass.Float32,
+    swiglu_alpha: cutlass.Float32,
+    swiglu_beta: cutlass.Float32,
+) -> cutlass.Float32:
+    """Evaluate parameterized SwiGLU without fast exp or reciprocal math."""
+    sigmoid_arg = fmul_rn(swiglu_alpha, gate)
+    sigmoid_exp = cute.math.exp(-sigmoid_arg, fastmath=False)
+    sigmoid_denom = fadd_rn(cutlass.Float32(1.0), sigmoid_exp)
+    silu = fdiv_rn(gate, sigmoid_denom)
+    up_biased = fadd_rn(up, swiglu_beta)
+    return fmul_rn(silu, up_biased)
 
 
 # TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
@@ -417,6 +433,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        use_strict_swiglu: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -468,6 +485,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param gated: Whether GEMM1 output is split into up/gate halves. If
             False, the epilogue computes non-gated ReLU^2.
         :type gated: bool
+        :param use_strict_swiglu: Use precise exponential and
+            round-to-nearest division for the SwiGLU sigmoid.
+        :type use_strict_swiglu: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -566,6 +586,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_strict_swiglu = use_strict_swiglu and gated
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2751,53 +2772,69 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         nan=True,
                                     ),
                                 )
-                                gate_sigmoid_log2e = cute.arch.mul_packed_f32x2(
-                                    gate_clamped,
-                                    (
-                                        -(swiglu_alpha * LOG2_E),
-                                        -(swiglu_alpha * LOG2_E),
-                                    ),
-                                )
-                                (
-                                    tCompute[i],
-                                    tCompute[i + 1],
-                                ) = cute.arch.add_packed_f32x2(
-                                    (
-                                        cute.math.exp2(
-                                            gate_sigmoid_log2e[0], fastmath=True
-                                        ),
-                                        cute.math.exp2(
-                                            gate_sigmoid_log2e[1], fastmath=True
-                                        ),
-                                    ),
-                                    (1.0, 1.0),
-                                )
-                                tCompute[i] = cute.arch.rcp_approx(tCompute[i])
-                                tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
-                                (
-                                    tCompute[i],
-                                    tCompute[i + 1],
-                                ) = cute.arch.mul_packed_f32x2(
-                                    (tCompute[i], tCompute[i + 1]),
-                                    gate_clamped,
-                                )
-                                up_biased = cute.arch.add_packed_f32x2(
-                                    up_clamped,
-                                    (
+                                if cutlass.const_expr(self.use_strict_swiglu):
+                                    tCompute[i] = _strict_swiglu_f32(
+                                        gate_clamped[0],
+                                        up_clamped[0],
+                                        swiglu_alpha,
                                         swiglu_beta,
+                                    )
+                                    tCompute[i + 1] = _strict_swiglu_f32(
+                                        gate_clamped[1],
+                                        up_clamped[1],
+                                        swiglu_alpha,
                                         swiglu_beta,
-                                    ),
-                                )
-                                (
-                                    tCompute[i],
-                                    tCompute[i + 1],
-                                ) = cute.arch.mul_packed_f32x2(
-                                    (tCompute[i], tCompute[i + 1]),
+                                    )
+                                else:
+                                    gate_sigmoid_log2e = cute.arch.mul_packed_f32x2(
+                                        gate_clamped,
+                                        (
+                                            -(swiglu_alpha * LOG2_E),
+                                            -(swiglu_alpha * LOG2_E),
+                                        ),
+                                    )
                                     (
-                                        up_biased[0],
-                                        up_biased[1],
-                                    ),
-                                )
+                                        tCompute[i],
+                                        tCompute[i + 1],
+                                    ) = cute.arch.add_packed_f32x2(
+                                        (
+                                            cute.math.exp2(
+                                                gate_sigmoid_log2e[0], fastmath=True
+                                            ),
+                                            cute.math.exp2(
+                                                gate_sigmoid_log2e[1], fastmath=True
+                                            ),
+                                        ),
+                                        (1.0, 1.0),
+                                    )
+                                    tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                                    tCompute[i + 1] = cute.arch.rcp_approx(
+                                        tCompute[i + 1]
+                                    )
+                                    (
+                                        tCompute[i],
+                                        tCompute[i + 1],
+                                    ) = cute.arch.mul_packed_f32x2(
+                                        (tCompute[i], tCompute[i + 1]),
+                                        gate_clamped,
+                                    )
+                                    up_biased = cute.arch.add_packed_f32x2(
+                                        up_clamped,
+                                        (
+                                            swiglu_beta,
+                                            swiglu_beta,
+                                        ),
+                                    )
+                                    (
+                                        tCompute[i],
+                                        tCompute[i + 1],
+                                    ) = cute.arch.mul_packed_f32x2(
+                                        (tCompute[i], tCompute[i + 1]),
+                                        (
+                                            up_biased[0],
+                                            up_biased[1],
+                                        ),
+                                    )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(
@@ -2814,18 +2851,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     swiglu_limit,
                                     nan=True,
                                 )
-                                sigmoid_gate = cute.arch.rcp_approx(
-                                    1.0
-                                    + cute.math.exp2(
-                                        -(swiglu_alpha * LOG2_E * gate_clamped),
-                                        fastmath=True,
+                                if cutlass.const_expr(self.use_strict_swiglu):
+                                    tCompute[i] = _strict_swiglu_f32(
+                                        gate_clamped,
+                                        up_clamped,
+                                        swiglu_alpha,
+                                        swiglu_beta,
                                     )
-                                )
-                                tCompute[i] = (
-                                    gate_clamped
-                                    * sigmoid_gate
-                                    * (up_clamped + swiglu_beta)
-                                )
+                                else:
+                                    sigmoid_gate = cute.arch.rcp_approx(
+                                        1.0
+                                        + cute.math.exp2(
+                                            -(swiglu_alpha * LOG2_E * gate_clamped),
+                                            fastmath=True,
+                                        )
+                                    )
+                                    tCompute[i] = (
+                                        gate_clamped
+                                        * sigmoid_gate
+                                        * (up_clamped + swiglu_beta)
+                                    )
 
                     if cutlass.const_expr(self.generate_sfc):
                         #

@@ -201,6 +201,7 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
+        from .cute_dsl.moe_utils import use_strict_swiglu_from_env
         from .cute_dsl.tuner import CuteDslFusedMoENvfp4Runner
 
         self.config = config
@@ -214,6 +215,7 @@ class CuteDslNvfp4Runner(MoERunner):
             top_k=routing.top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=experts.local_expert_offset,
+            use_strict_swiglu=use_strict_swiglu_from_env(),
         )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from

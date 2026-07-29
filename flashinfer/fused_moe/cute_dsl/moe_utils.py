@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Union
 
@@ -40,6 +41,15 @@ SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.Relu2,
 )
+
+_DISABLE_SWIGLU_FAST_MATH_ENV = (
+    "FLASHINFER_DISABLE_CUTE_DSL_FUSED_MOE_NVFP4_SWIGLU_FAST_MATH"
+)
+
+
+def use_strict_swiglu_from_env() -> bool:
+    """Return whether the SM100 CuTe-DSL fused-MoE SwiGLU uses strict math."""
+    return os.environ.get(_DISABLE_SWIGLU_FAST_MATH_ENV) == "1"
 
 
 def normalize_cute_dsl_moe_activation_type(

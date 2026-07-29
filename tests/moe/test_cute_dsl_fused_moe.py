@@ -175,6 +175,206 @@ class TestKernelInputValidation:
 
 
 # =============================================================================
+# Test Class: strict SwiGLU configuration and specialization
+# =============================================================================
+
+
+@cute_dsl_available
+class TestStrictSwiGLUConfiguration:
+    ENV_VAR = "FLASHINFER_DISABLE_CUTE_DSL_FUSED_MOE_NVFP4_SWIGLU_FAST_MATH"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, False),
+            ("0", False),
+            ("1", True),
+            ("true", False),
+        ],
+    )
+    def test_env_flag_uses_exact_one(self, monkeypatch, value, expected):
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            use_strict_swiglu_from_env,
+        )
+
+        if value is None:
+            monkeypatch.delenv(self.ENV_VAR, raising=False)
+        else:
+            monkeypatch.setenv(self.ENV_VAR, value)
+        assert use_strict_swiglu_from_env() is expected
+
+    @staticmethod
+    def _make_runner(*, use_strict_swiglu, activation_type=ActivationType.Swiglu):
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            CuteDslFusedMoENvfp4Runner,
+        )
+
+        return CuteDslFusedMoENvfp4Runner(
+            forward_impl=lambda *args, **kwargs: None,
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+            activation_type=activation_type,
+            use_strict_swiglu=use_strict_swiglu,
+        )
+
+    def test_runner_and_autotune_keys_distinguish_strict_math(self):
+        from flashinfer.autotuner import ProfilingCacheKey
+
+        fast = self._make_runner(use_strict_swiglu=False)
+        strict = self._make_runner(use_strict_swiglu=True)
+
+        assert fast.use_strict_swiglu is False
+        assert strict.use_strict_swiglu is True
+        assert hash(fast) != hash(strict)
+
+        fast_extras = fast.get_cache_key_extras([])
+        strict_extras = strict.get_cache_key_extras([])
+        assert fast_extras != strict_extras
+
+        def file_key(runner):
+            return ProfilingCacheKey(
+                custom_op="test",
+                runner_class_name=type(runner).__name__,
+                runner_hash=hash(runner),
+                nearest_profile=(),
+                extras=runner.get_cache_key_extras([]),
+            ).file_key
+
+        assert file_key(fast) != file_key(strict)
+
+    def test_strict_math_is_ignored_for_relu2(self):
+        runner = self._make_runner(
+            use_strict_swiglu=True,
+            activation_type=ActivationType.Relu2,
+        )
+        assert runner.use_strict_swiglu is False
+
+    @sm100_required
+    def test_wrapper_captures_env_at_construction(self, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl.fused_moe import CuteDslMoEWrapper
+
+        monkeypatch.delenv(self.ENV_VAR, raising=False)
+        fast = CuteDslMoEWrapper(
+            num_experts=8,
+            top_k=2,
+            hidden_size=128,
+            intermediate_size=128,
+        )
+        monkeypatch.setenv(self.ENV_VAR, "1")
+        strict = CuteDslMoEWrapper(
+            num_experts=8,
+            top_k=2,
+            hidden_size=128,
+            intermediate_size=128,
+        )
+
+        assert fast.use_strict_swiglu is False
+        assert fast._runner.use_strict_swiglu is False
+        assert strict.use_strict_swiglu is True
+        assert strict._runner.use_strict_swiglu is True
+
+    def test_unified_runner_captures_env_at_construction(self, monkeypatch):
+        from flashinfer.fused_moe.api import (
+            ActivationConfig,
+            ExpertConfig,
+            MoEConfig,
+            QuantConfig,
+            QuantVariant,
+            RoutingConfig,
+        )
+        from flashinfer.fused_moe.runners import CuteDslNvfp4Runner
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=8, top_k=2),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=128),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
+        )
+
+        monkeypatch.delenv(self.ENV_VAR, raising=False)
+        fast = CuteDslNvfp4Runner(config, torch.device("cpu"))
+        monkeypatch.setenv(self.ENV_VAR, "1")
+        strict = CuteDslNvfp4Runner(config, torch.device("cpu"))
+
+        assert fast._inner.use_strict_swiglu is False
+        assert strict._inner.use_strict_swiglu is True
+
+    def test_compiled_kernel_cache_distinguishes_strict_math(self, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl import (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion as gather,
+        )
+
+        constructed_modes = []
+        compiled_kernels = []
+
+        class StubKernel:
+            def __init__(self, **kwargs):
+                constructed_modes.append(kwargs["use_strict_swiglu"])
+                self.wrapper = object()
+
+        def stub_compile(*args, **kwargs):
+            compiled = object()
+            compiled_kernels.append(compiled)
+            return compiled
+
+        monkeypatch.setattr(gather, "_gather_kernel_cache", {})
+        monkeypatch.setattr(
+            gather, "BlockScaledContiguousGatherGroupedGemmKernel", StubKernel
+        )
+        monkeypatch.setattr(gather.cute, "compile", stub_compile)
+
+        runtime_value = object()
+        kwargs = {
+            "orig_m": 1,
+            "permuted_m": 128,
+            "n": 256,
+            "k": 128,
+            "num_experts": 1,
+            "a_ptr": runtime_value,
+            "b_ptr": runtime_value,
+            "a_sf_ptr": runtime_value,
+            "b_sf_ptr": runtime_value,
+            "c_ptr": runtime_value,
+            "c_sf_ptr": runtime_value,
+            "alpha_ptr": runtime_value,
+            "tile_idx_ptr": runtime_value,
+            "mn_limit_ptr": runtime_value,
+            "token_id_ptr": runtime_value,
+            "num_tiles_ptr": runtime_value,
+            "norm_const_ptr": runtime_value,
+            "a_per_token_scale_ptr": runtime_value,
+            "max_active_clusters": 1,
+            "stream": runtime_value,
+            "ab_dtype": "float4_e2m1fn",
+            "sf_dtype": "float8_e4m3fn",
+            "c_dtype": "bfloat16",
+            "sf_vec_size": 16,
+            "tile_size": 128,
+            "topk": 1,
+            "mma_tiler_mn": (128, 128),
+            "cluster_shape_mn": (1, 1),
+            "vectorized_f32": True,
+            "raster_along_m": False,
+        }
+
+        fast = gather._get_compiled_gather_kernel(**kwargs, use_strict_swiglu=False)
+        fast_again = gather._get_compiled_gather_kernel(
+            **kwargs, use_strict_swiglu=False
+        )
+        strict = gather._get_compiled_gather_kernel(**kwargs, use_strict_swiglu=True)
+        fast_after_strict = gather._get_compiled_gather_kernel(
+            **kwargs, use_strict_swiglu=False
+        )
+
+        assert fast is fast_again is fast_after_strict
+        assert strict is not fast
+        assert constructed_modes == [False, True]
+        assert len(compiled_kernels) == 2
+        assert len(gather._gather_kernel_cache) == 2
+
+
+# =============================================================================
 # Test Class: Tactic-enumeration structural invariants (no GPU required)
 # =============================================================================
 

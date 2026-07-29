@@ -265,6 +265,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        use_strict_swiglu: Whether SwiGLU uses precise exponential and
+            round-to-nearest division.
     """
 
     def __init__(
@@ -282,6 +284,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         use_per_token_activation: bool = False,
+        use_strict_swiglu: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
@@ -298,6 +301,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
         self.use_per_token_activation = use_per_token_activation
+        self.use_strict_swiglu = use_strict_swiglu and gated
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -403,6 +407,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_beta,
                 self.swiglu_limit,
                 self.use_per_token_activation,
+                self.use_strict_swiglu,
             )
         )
 
@@ -412,6 +417,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.use_strict_swiglu,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -632,6 +638,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            use_strict_swiglu=self.use_strict_swiglu,
             **kwargs,
         )
 

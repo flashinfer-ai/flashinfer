@@ -234,6 +234,7 @@ def _get_compiled_gather_kernel(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    use_strict_swiglu: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -249,13 +250,12 @@ def _get_compiled_gather_kernel(
     overhead during autotuning.
     """
     global _gather_kernel_cache
-    activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type
-    )
+    activation, expected_gated = normalize_cute_dsl_moe_activation_type(activation_type)
     if gated != expected_gated:
         raise ValueError(
-            f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+            f"gated={gated} is inconsistent with activation_type {activation!r}"
         )
+    use_strict_swiglu = use_strict_swiglu and gated
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
@@ -270,12 +270,13 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
-        activation_type.value,
+        activation.value,
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
         gated,
         use_a_per_token_scale,
+        use_strict_swiglu,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -288,12 +289,13 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             gated=gated,
             use_a_per_token_scale=use_a_per_token_scale,
+            use_strict_swiglu=use_strict_swiglu,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -365,6 +367,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     gated: bool = True,
+    use_strict_swiglu: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
 
@@ -419,6 +422,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         swiglu_limit: SwiGLU clamp limit.
         gated: Whether to run the gated SwiGLU path. If False, run non-gated
             ReLU2.
+        use_strict_swiglu: Whether to use precise exponential and
+            round-to-nearest division for SwiGLU. Defaults to False.
 
     Returns:
         Tuple of:
@@ -461,12 +466,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
-    activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
-        activation_type
-    )
+    activation, expected_gated = normalize_cute_dsl_moe_activation_type(activation_type)
     if gated != expected_gated:
         raise ValueError(
-            f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+            f"gated={gated} is inconsistent with activation_type {activation!r}"
         )
 
     # Get dimensions
@@ -675,12 +678,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
-        activation_type=activation_type.value,
+        activation_type=activation.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        use_strict_swiglu=use_strict_swiglu and gated,
     )
 
     # Execute kernel with runtime parameters

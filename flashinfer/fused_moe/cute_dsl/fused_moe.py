@@ -79,6 +79,7 @@ from .moe_utils import (
     moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
+    use_strict_swiglu_from_env,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
@@ -173,6 +174,7 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    use_strict_swiglu: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -222,6 +224,8 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
+        use_strict_swiglu: Use precise exponential and round-to-nearest
+            division for SwiGLU.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -315,6 +319,7 @@ def _moe_core_impl(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             gated=gated,
+            use_strict_swiglu=use_strict_swiglu and gated,
         )
     )
     if use_per_token_activation:
@@ -525,6 +530,7 @@ class CuteDslMoEWrapper:
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_strict_swiglu = gated and use_strict_swiglu_from_env()
         self.use_fused_finalize = use_fused_finalize
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
@@ -562,6 +568,7 @@ class CuteDslMoEWrapper:
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             use_per_token_activation=False,
+            use_strict_swiglu=self.use_strict_swiglu,
         )
         self._per_token_runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=_forward_with_tactic_weak,
@@ -577,6 +584,7 @@ class CuteDslMoEWrapper:
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             use_per_token_activation=True,
+            use_strict_swiglu=self.use_strict_swiglu,
         )
 
         if use_cuda_graph:
@@ -612,6 +620,7 @@ class CuteDslMoEWrapper:
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         use_async_memset: bool = True,
+        use_strict_swiglu: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -652,6 +661,7 @@ class CuteDslMoEWrapper:
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            use_strict_swiglu=use_strict_swiglu,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -806,6 +816,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    use_strict_swiglu: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -840,6 +851,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        use_strict_swiglu=use_strict_swiglu,
     )
 
 
@@ -943,7 +955,8 @@ def cute_dsl_fused_moe_nvfp4(
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
     """
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    use_strict_swiglu = gated and use_strict_swiglu_from_env()
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -975,6 +988,7 @@ def cute_dsl_fused_moe_nvfp4(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         use_per_token_activation=use_per_token_activation,
+        use_strict_swiglu=use_strict_swiglu,
     )
 
     inputs = [
