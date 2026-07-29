@@ -382,6 +382,11 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
           << which_weights << " weights K dimension must be equal to intermediate_size.";
     }
+    if (args->num_fused_shared_experts > 0) {
+      TVM_FFI_ICHECK_EQ(weights.size(0), args->local_num_experts + args->num_fused_shared_experts)
+          << which_weights
+          << " weights dim 0 must be local_num_experts + num_fused_shared_experts.";
+    }
   }
 
   void check_optional_per_expert_float_tensor(Optional<TensorView> const& tensor,
@@ -396,8 +401,11 @@ class FusedMoeLauncher {
         << tensor_name << " must be on the same device as hidden_states.";
     TVM_FFI_ICHECK_EQ(value.dtype(), dl_float32) << tensor_name << " must be float32.";
     TVM_FFI_ICHECK_EQ(value.ndim(), 1) << tensor_name << " must be 1D.";
-    TVM_FFI_ICHECK_EQ(value.size(0), args->local_num_experts)
-        << tensor_name << " must have shape [local_num_experts].";
+    // The batched GEMM indexes per-expert tensors by local batch entry, and fused
+    // shared experts occupy the rows after the routed local experts, so the tensor
+    // must cover local_num_experts + num_fused_shared_experts rows.
+    TVM_FFI_ICHECK_EQ(value.size(0), args->local_num_experts + args->num_fused_shared_experts)
+        << tensor_name << " must have shape [local_num_experts + num_fused_shared_experts].";
     TVM_FFI_ICHECK(value.IsContiguous()) << tensor_name << " must be contiguous.";
   }
 
@@ -2038,6 +2046,29 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be byte.";
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
         << "gemm2_weights_scale must be fp8.";
+
+    if (args->num_fused_shared_experts > 0) {
+      int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
+      TVM_FFI_ICHECK_EQ(gemm1_weights.size(0), totalLocalExperts)
+          << "gemm1 weights dim 0 must be local_num_experts + num_fused_shared_experts.";
+      TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), totalLocalExperts)
+          << "gemm2 weights dim 0 must be local_num_experts + num_fused_shared_experts.";
+
+      auto check_per_expert_scale = [&](Optional<TensorView> const& tensor, char const* name) {
+        if (!tensor.has_value()) {
+          return;
+        }
+        TVM_FFI_ICHECK_EQ(tensor.value().ndim(), 1) << name << " must be 1D.";
+        TVM_FFI_ICHECK_EQ(tensor.value().size(0), totalLocalExperts)
+            << name << " must have shape [local_num_experts + num_fused_shared_experts].";
+      };
+      check_per_expert_scale(output1_scales_scalar, "output1_scales_scalar");
+      check_per_expert_scale(output1_scales_gate_scalar, "output1_scales_gate_scalar");
+      check_per_expert_scale(output2_scales_scalar, "output2_scales_scalar");
+      check_optional_per_expert_float_tensor(gemm1_alpha, "gemm1_alpha");
+      check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
+      check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    }
   }
 
   void prepare_moe(int64_t& moe_tactic) override {

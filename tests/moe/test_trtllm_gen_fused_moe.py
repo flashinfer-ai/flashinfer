@@ -1961,12 +1961,117 @@ def test_fused_shared_experts_reject_replay_and_non_deepseek_routing():
 
         # Only DeepSeekV3 routing implements the fused shared-expert slots.
         for method in (RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize):
-            with pytest.raises(ValueError, match="only supported .* DeepSeekV3"):
+            with pytest.raises(ValueError, match=r"only supported .* DeepSeekV3"):
                 op(
                     **op_kwargs,
                     **common_kwargs,
                     routing_method_type=method.value,
                 )
+
+
+def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
+    """Routed-only expert-major tensors must fail host-side, not OOB on the GPU.
+
+    With ``num_fused_shared_experts > 0`` the batched GEMMs index batch entries up
+    to ``local_num_experts + num_fused_shared_experts - 1``, so every expert-major
+    tensor must carry the fused shared rows. The C++ launcher validates this in
+    ``check_moe()`` before any MoE kernel launch; each case below truncates exactly
+    one tensor to the routed-only extent and expects the host-side reject.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    device = torch.device("cuda")
+    num_tokens = 2
+    num_experts = 32
+    num_fused_shared_experts = 1
+    total_experts = num_experts + num_fused_shared_experts
+    top_k = 8
+    n_group, topk_group = 8, 4
+    hidden_size = 256
+    intermediate_size = 256
+    sf_vec_size = 32  # bf16 activation x MxE2m1 weights
+
+    # Tensor contents are irrelevant: every case throws in the host-side shape
+    # validation before the MoE GEMMs consume any data.
+    base_kwargs = {
+        "routing_logits": torch.randn(
+            num_tokens, num_experts, dtype=torch.float32, device=device
+        ),
+        "routing_bias": torch.zeros(num_experts, dtype=torch.bfloat16, device=device),
+        "hidden_states": torch.zeros(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+        ),
+        "hidden_states_scale": None,
+        "gemm1_weights": torch.zeros(
+            total_experts,
+            2 * intermediate_size,
+            hidden_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm1_weights_scale": torch.zeros(
+            total_experts,
+            2 * intermediate_size,
+            hidden_size // sf_vec_size,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        "gemm1_bias": None,
+        "gemm1_alpha": torch.ones(total_experts, dtype=torch.float32, device=device),
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": torch.zeros(
+            total_experts,
+            hidden_size,
+            intermediate_size // 2,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "gemm2_weights_scale": torch.zeros(
+            total_experts,
+            hidden_size,
+            intermediate_size // sf_vec_size,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        "gemm2_bias": None,
+        "output1_scale_scalar": torch.ones(
+            total_experts, dtype=torch.float32, device=device
+        ),
+        "output1_scale_gate_scalar": torch.ones(
+            total_experts, dtype=torch.float32, device=device
+        ),
+        "output2_scale_scalar": torch.ones(
+            total_experts, dtype=torch.float32, device=device
+        ),
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "n_group": n_group,
+        "topk_group": topk_group,
+        "intermediate_size": intermediate_size,
+        "local_expert_offset": 0,
+        "local_num_experts": num_experts,
+        "routed_scaling_factor": 2.5,
+        "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+        "num_fused_shared_experts": num_fused_shared_experts,
+    }
+
+    routed_only_cases = [
+        ("gemm1_weights", "gemm1 weights dim 0"),
+        ("gemm2_weights", "gemm2 weights dim 0"),
+        ("gemm1_weights_scale", "weight scale tensor too small"),
+        ("output1_scale_scalar", "output1_scales_scalar must have shape"),
+        ("output1_scale_gate_scalar", "output1_scales_gate_scalar must have shape"),
+        ("output2_scale_scalar", "output2_scales_scalar must have shape"),
+        ("gemm1_alpha", "gemm1_alpha must have shape"),
+    ]
+    for arg_name, match in routed_only_cases:
+        kwargs = dict(base_kwargs)
+        kwargs[arg_name] = kwargs[arg_name][:num_experts]
+        with pytest.raises(RuntimeError, match=match):
+            trtllm_fp4_block_scale_moe(**kwargs)
 
 
 def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
