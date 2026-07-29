@@ -24,13 +24,16 @@ prefill operations.
 
 import math
 import threading
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
+
+if TYPE_CHECKING:
+    from .jit.flash_kda import FlashKDAVariant
 
 try:
     from .kda_kernels.recurrent_kda import run_recurrent_kda as _run_recurrent_kda
@@ -248,7 +251,7 @@ def _flash_kda_prefill_is_eligible(
 
 def _select_flash_kda_prefill_variant(
     *, fixed_layout: bool, num_sequences: int, num_heads: int
-) -> str:
+) -> "FlashKDAVariant":
     if fixed_layout and num_sequences == 1 and num_heads == 64:
         return "m64"
     return "m128"
@@ -523,7 +526,7 @@ def _validate_prefill_seq_order(
     return seq_order
 
 
-def _get_flash_kda_prefill_module(variant: str):
+def _get_flash_kda_prefill_module(variant: "FlashKDAVariant"):
     from .jit.flash_kda import get_flash_kda_prefill_module
 
     return get_flash_kda_prefill_module(variant)
