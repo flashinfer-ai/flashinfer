@@ -212,11 +212,8 @@ def gen_cutlass_fused_moe_module(
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
     ]
 
-    # Keep the module name versioned with the TVM-FFI interface. Reusing an
-    # older AOT/JIT artifact after changing init or run_moe arguments causes
-    # an arity mismatch before the kernel can run.
     return gen_jit_spec(
-        f"fused_moe_v2_{device_arch}",
+        f"fused_moe_{device_arch}",
         sources,
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
