@@ -2054,17 +2054,22 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(gemm2_weights.size(0), totalLocalExperts)
           << "gemm2 weights dim 0 must be local_num_experts + num_fused_shared_experts.";
 
-      auto check_per_expert_scale = [&](Optional<TensorView> const& tensor, char const* name) {
+      auto check_expert_major = [&](Optional<TensorView> const& tensor, char const* name,
+                                    int32_t expected_ndim) {
         if (!tensor.has_value()) {
           return;
         }
-        TVM_FFI_ICHECK_EQ(tensor.value().ndim(), 1) << name << " must be 1D.";
+        TVM_FFI_ICHECK_EQ(tensor.value().ndim(), expected_ndim)
+            << name << " must be " << expected_ndim << "D.";
         TVM_FFI_ICHECK_EQ(tensor.value().size(0), totalLocalExperts)
-            << name << " must have shape [local_num_experts + num_fused_shared_experts].";
+            << name << " dim 0 must be local_num_experts + num_fused_shared_experts.";
       };
-      check_per_expert_scale(output1_scales_scalar, "output1_scales_scalar");
-      check_per_expert_scale(output1_scales_gate_scalar, "output1_scales_gate_scalar");
-      check_per_expert_scale(output2_scales_scalar, "output2_scales_scalar");
+      check_expert_major(output1_scales_scalar, "output1_scales_scalar", 1);
+      check_expert_major(output1_scales_gate_scalar, "output1_scales_gate_scalar", 1);
+      check_expert_major(output2_scales_scalar, "output2_scales_scalar", 1);
+      check_expert_major(gemm1_bias, "gemm1_bias", 2);
+      check_expert_major(gemm2_bias, "gemm2_bias", 2);
+
       check_optional_per_expert_float_tensor(gemm1_alpha, "gemm1_alpha");
       check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
       check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");

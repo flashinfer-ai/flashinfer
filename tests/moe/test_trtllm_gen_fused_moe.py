@@ -2018,7 +2018,9 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
             dtype=torch.float8_e4m3fn,
             device=device,
         ),
-        "gemm1_bias": None,
+        "gemm1_bias": torch.zeros(
+            total_experts, 2 * intermediate_size, dtype=torch.float32, device=device
+        ),
         "gemm1_alpha": torch.ones(total_experts, dtype=torch.float32, device=device),
         "gemm1_beta": None,
         "gemm1_clamp_limit": None,
@@ -2036,7 +2038,9 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
             dtype=torch.float8_e4m3fn,
             device=device,
         ),
-        "gemm2_bias": None,
+        "gemm2_bias": torch.zeros(
+            total_experts, hidden_size, dtype=torch.float32, device=device
+        ),
         "output1_scale_scalar": torch.ones(
             total_experts, dtype=torch.float32, device=device
         ),
@@ -2062,10 +2066,12 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
         ("gemm1_weights", "gemm1 weights dim 0"),
         ("gemm2_weights", "gemm2 weights dim 0"),
         ("gemm1_weights_scale", "weight scale tensor too small"),
-        ("output1_scale_scalar", "output1_scales_scalar must have shape"),
-        ("output1_scale_gate_scalar", "output1_scales_gate_scalar must have shape"),
-        ("output2_scale_scalar", "output2_scales_scalar must have shape"),
+        ("output1_scale_scalar", "output1_scales_scalar dim 0"),
+        ("output1_scale_gate_scalar", "output1_scales_gate_scalar dim 0"),
+        ("output2_scale_scalar", "output2_scales_scalar dim 0"),
         ("gemm1_alpha", "gemm1_alpha must have shape"),
+        ("gemm1_bias", "gemm1_bias dim 0"),
+        ("gemm2_bias", "gemm2_bias dim 0"),
     ]
     for arg_name, match in routed_only_cases:
         kwargs = dict(base_kwargs)
