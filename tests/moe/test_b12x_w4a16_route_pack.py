@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Route-packing tests for the SM12x W4A16 fused MoE path.
-
-Ported from sparkinfer tests/moe/test_w4a16_route_pack.py, plus
-FlashInfer-local coverage for the workspace capacity contract.
 """
 
 from __future__ import annotations
@@ -270,9 +267,9 @@ def test_pack_topk_routes_by_expert_ignores_invalid_ids() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pack_topk_routes_single_exact_capacity_buffer_degrades() -> None:
-    """A caller-provided buffer sized for the exact-numel capacity must
-    degrade the packing capacity instead of raising, even when the other
-    route buffers are left for the function to allocate."""
+    """A preallocated buffer sized for the exact-numel capacity degrades the
+    packing capacity instead of raising, even when it is the only buffer
+    provided."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
         max_packed_route_slots,
     )

@@ -1,11 +1,4 @@
-"""In-memory compile cache for the SM12x W4A16 CuTe-DSL kernels.
-
-Stand-in for sparkinfer's compiler module, which also has a disk cache and
-telemetry that the FlashInfer port does not need. It keeps the same call
-surface (``KernelCompileSpec`` plus a memoizing ``compile``) so the ported
-kernel code matches upstream, backed by a process-local dict like the rest
-of FlashInfer's kernel caching.
-"""
+"""In-memory compile cache for the SM12x W4A16 CuTe-DSL kernels."""
 
 from __future__ import annotations
 
@@ -69,8 +62,8 @@ class KernelCompileSpec:
 
 
 def _options_cache_key(options: Any) -> str:
-    """Structural key for DSL compile options (their default repr is
-    address-based, so it is useless as a cache key)."""
+    """Structural key for DSL compile options, whose default repr is
+    address-based."""
     if options is None:
         return "None"
     state = vars(options) if hasattr(options, "__dict__") else options

@@ -312,8 +312,8 @@ def pack_topk_routes_by_expert(
     capacity_route_blocks = (capacity_packed_routes + int(block_size) - 1) // int(
         block_size
     )
-    # Degrade to the exact-numel capacity when any caller-provided buffer was
-    # sized for it (the pre-capacity contract) rather than raising.
+    # Callers may size these buffers for the exact numel rather than the
+    # power-of-2 capacity. Degrade the capacity instead of raising.
     if (
         packed_route_indices is not None
         and int(packed_route_indices.numel()) < capacity_packed_routes

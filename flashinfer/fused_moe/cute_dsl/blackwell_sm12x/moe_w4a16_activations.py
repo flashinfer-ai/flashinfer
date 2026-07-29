@@ -1,8 +1,7 @@
 """Activation metadata for the SM12x W4A16 fused MoE path.
 
-Ported from sparkinfer's shared activations module. FlashInfer's W4A16 family
-only serves silu and relu2, so the supported set is narrowed here. The swiglu
-parameter helpers are kept anyway so the kernel code matches upstream.
+Only silu and relu2 are supported. The kernel code normalizes swiglu
+parameters through the helpers here for every activation.
 """
 
 from __future__ import annotations

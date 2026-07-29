@@ -97,9 +97,8 @@ from .moe_w4a16_activations import (
 
 
 def raise_if_kernel_resolution_frozen(*args, **kwargs) -> None:
-    # No-op stand-in for sparkinfer's runtime_control freeze guard, which
-    # rejects new kernel compiles after serving starts. FlashInfer has no such
-    # serving phase, but the call sites are kept to match upstream.
+    # FlashInfer has no serving phase that freezes kernel compilation, so
+    # this guard is a no-op.
     del args, kwargs
 
 
@@ -125,17 +124,15 @@ _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 
-# TC-decode: a small-M decode specialization that runs on the PACKED W4A16
+# TC-decode: a small-M decode specialization that runs on the packed W4A16
 # object (the same weights/scales the prefill GEMM uses). It reuses the packed
 # tensor-core MMA inner loop but folds the top-k sum into the FC2 store
-# epilogue (dropping the separate top-k-sum launch). It is ALWAYS used for the
-# small-M direct-topk decode sizes — there is no opt-in/opt-out switch.
-# _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
+# epilogue, dropping the separate top-k-sum launch. It is always used within
+# its M range, with no opt-in switch.
 #
-# Upstream caps TC-decode at _W4A16_SMALL_M_DIRECT_MAX_M (8). On the SM12x
-# cards FlashInfer targets, the route-packed GEMM overtakes TC-decode earlier,
-# and the crossover varies by card (as low as m=5 on consumer SM120). m=4 is
-# the largest cap that wins or ties everywhere measured.
+# The route-packed GEMM overtakes TC-decode above m=4 on some SM12x cards, and
+# the crossover varies by card, so the cap is the largest value that wins or
+# ties on every card measured.
 _TC_DECODE_MAX_M = 4
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
