@@ -133,9 +133,10 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 # _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
 #
 # Upstream caps TC-decode at _W4A16_SMALL_M_DIRECT_MAX_M (8). On the SM12x
-# cards FlashInfer targets, the route-packed GEMM overtakes TC-decode before
-# that, so the cap is lowered to the direct-topk route bound.
-_TC_DECODE_MAX_M = _MAX_DIRECT_TOPK_ROUTE_M
+# cards FlashInfer targets, the route-packed GEMM overtakes TC-decode earlier,
+# and the crossover varies by card (as low as m=5 on consumer SM120). m=4 is
+# the largest cap that wins or ties everywhere measured.
+_TC_DECODE_MAX_M = 4
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
 
