@@ -36,11 +36,11 @@ _HAS_QUACK = importlib.util.find_spec("quack") is not None
 pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-        reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
+        reason="VSA SM100 backend requires sm100a (Blackwell GPU)",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,
-        reason="VSA Blackwell backend requires the quack package "
+        reason="VSA SM100 backend requires the quack package "
         "(pip install git+https://github.com/Dao-AILab/quack.git)",
     ),
 ]
@@ -129,7 +129,7 @@ def workspace():
 
 
 def _make_wrapper(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ def test_vsa_vs_auto_80k(workspace):
     )
     o_ref = ref_w.run(q, k, v)
 
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         indptr,
         indices,
@@ -499,7 +499,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     Stage 1: compress attention on mean-pooled tokens → output_compress [M, H, D]
              + per-head block_mask [H, MB, NB] from softmax block scores.
-    Stage 2: BlockSparseAttentionWrapper vsa_blackwell → output_select [M, H, D].
+    Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 → output_select [M, H, D].
     Final:   output_compress + output_select  (mirrors fastvideo final_output).
     Dense:   flashinfer.single_prefill_with_kv_cache(backend="auto").
 
@@ -532,7 +532,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     )
 
     # Stage 2: block-sparse attention (select branch)
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         None,
         None,
@@ -576,7 +576,7 @@ def test_vsa_performance_vs_dense(workspace):
       compress_ms – Stage 1: compress attention (pool Q/K/V, dense attn on pooled tokens,
                              softmax top-K → block_mask).  This is the "free" byproduct:
                              output_compress is also produced here.
-      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_blackwell (output_select).
+      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 (output_select).
       total_ms    – compress_ms + attn_ms  (output_compress + output_select = final output)
     Dense:
       dense_ms    – flashinfer.single_prefill_with_kv_cache (auto backend)
@@ -613,7 +613,7 @@ def test_vsa_performance_vs_dense(workspace):
             C,
             topk,
         )
-        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
         vsa_w.plan(
             None,
             None,
@@ -665,7 +665,7 @@ HEAD_DIM_BLK64 = 128  # blk64 kernel requires head_dim=128
 
 
 def _make_wrapper_blk64(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell_blk64")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,7 @@ from flashinfer.api_logging import flashinfer_api
 
 
 @flashinfer_api
-def bsa_attn_blk64_fwd(
+def bsa_attn_sm100_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -58,7 +58,7 @@ def bsa_attn_blk64_fwd(
     Returns:
         (out, lse) where lse is None if return_lse is False.
     """
-    from .blk64 import load_blk64_ext  # noqa: PLC0415
+    from .sm100_blk64 import load_blk64_ext  # noqa: PLC0415
 
     batch_size, seqlen_q, num_head, head_dim = q.shape
     seqlen_k = k.shape[1]
@@ -70,7 +70,7 @@ def bsa_attn_blk64_fwd(
     major, minor = torch.cuda.get_device_capability(q.device)
     arch = major * 10 + minor
     if arch // 10 != 10:
-        raise RuntimeError(f"BSA blk64 only supports SM100, current device is SM{arch}")
+        raise RuntimeError(f"bsa_attn_sm100_blk64_fwd (sm100_blk64) only supports SM100, current device is SM{arch}")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)

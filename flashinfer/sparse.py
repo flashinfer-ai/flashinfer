@@ -192,6 +192,95 @@ def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.T
     return mask_flashinfer
 
 
+# Backward-compatible aliases: old marketing names → canonical arch-tagged names.
+_BACKEND_ALIASES: dict = {
+    "vsa_blackwell": "vsa_sm100_blk128",
+    "vsa_blackwell_blk64": "vsa_sm100_blk64",
+}
+
+
+def _vsa_common_checks(
+    backend: str,
+    R: int,
+    C: int,
+    M: int,
+    N: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    mask,
+    packed_mask,
+    causal: bool,
+    pos_encoding_mode: str,
+    logits_soft_cap,
+) -> None:
+    """Validate the arguments that are identical across all VSA backends."""
+    if num_qo_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+        )
+    if M % R != 0:
+        raise ValueError(f"M={M} must be divisible by block size R={R}")
+    if N % C != 0:
+        raise ValueError(f"N={N} must be divisible by block size C={C}")
+    if mask is not None or packed_mask is not None:
+        raise ValueError(
+            f"{backend} backend does not support per-element block masks "
+            "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
+            "or block_mask is supported."
+        )
+    if causal:
+        raise ValueError(f"{backend} backend does not support causal masking.")
+    if pos_encoding_mode != "NONE":
+        raise ValueError(
+            f"{backend} backend only supports pos_encoding_mode='NONE' "
+            f"(got '{pos_encoding_mode}')."
+        )
+    if logits_soft_cap is not None and logits_soft_cap > 0:
+        raise ValueError(f"{backend} backend does not support logits_soft_cap.")
+
+
+def _vsa_run_core(
+    fwd_fn,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    vsa_q2k_index: torch.Tensor,
+    vsa_q2k_num: torch.Tensor,
+    sm_scale: Optional[float],
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+):
+    """Shared NHD→BSHD dispatch, kernel call, and BSHD→NHD reshape for all VSA backends."""
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+    o_bsa, lse_bsa = fwd_fn(
+        q.unsqueeze(0).contiguous(),
+        k.unsqueeze(0).contiguous(),
+        v.unsqueeze(0).contiguous(),
+        q2k_block_index=vsa_q2k_index,
+        block_sparse_num=1,  # ignored when q2k_block_nums is provided
+        block_sizes=None,
+        q2k_block_nums=vsa_q2k_num,
+        softmax_scale=sm_scale,
+        return_lse=True,
+    )
+
+    output = o_bsa[0]  # [1, M, H, D] -> [M, H, D]
+    if out is not None:
+        out.copy_(output)
+        output = out
+
+    if return_lse:
+        lse_out = lse_bsa[0].permute(1, 0).contiguous()  # [1, H, M] -> [M, H]
+        if lse is not None:
+            lse.copy_(lse_out)
+            lse_out = lse
+        return output, lse_out
+    return output
+
+
 class BlockSparseAttentionWrapper:
     r"""Wrapper class for attention computation with a block-sparse matrix as attention mask.
     The definition of block sparse matrix can be found at
@@ -286,7 +375,7 @@ class BlockSparseAttentionWrapper:
         self.C: Optional[int] = None
         self.M: Optional[int] = None
         self.N: Optional[int] = None
-        self._backend = backend
+        self._backend = _BACKEND_ALIASES.get(backend, backend)
 
     def reset_workspace_buffer(
         self,
@@ -350,12 +439,12 @@ class BlockSparseAttentionWrapper:
         indptr : torch.Tensor, optional
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
-            Required for all backends except ``vsa_blackwell`` and ``vsa_blackwell_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
-            Required for all backends except ``vsa_blackwell`` and ``vsa_blackwell_blk64`` when ``block_mask`` is provided.
+            Required for all backends except ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -417,7 +506,7 @@ class BlockSparseAttentionWrapper:
             for head ``h``.  For GQA (``num_qo_heads > num_kv_heads``), when providing
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
-            Only supported for the ``vsa_blackwell`` and ``vsa_blackwell_blk64`` backends.  When provided,
+            Only supported for the ``vsa_sm100_blk128``, ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
 
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -434,51 +523,28 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
-        # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
-        if self._backend == "vsa_blackwell":
+        # ---- VSA SM100 blk128 backend (BSA blk128 CuTe-DSL kernel, SM100/SM110) ----
+        if self._backend == "vsa_sm100_blk128":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
             if arch // 10 not in (10, 11):
                 raise RuntimeError(
-                    f"vsa_blackwell backend requires SM100/SM110 (Blackwell), "
+                    f"vsa_sm100_blk128 backend requires SM100/SM110 (Blackwell), "
                     f"current device is SM{arch}"
                 )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
             if R != 128 or C != 128:
                 raise ValueError(
-                    f"VSA Blackwell backend requires R == C == 128 (got R={R}, C={C})"
+                    f"vsa_sm100_blk128 backend requires R == C == 128 (got R={R}, C={C})"
                 )
             if head_dim not in (64, 96, 128):
                 raise ValueError(
-                    f"VSA Blackwell backend requires head_dim in {{64, 96, 128}} (got {head_dim})"
+                    f"vsa_sm100_blk128 backend requires head_dim in {{64, 96, 128}} (got {head_dim})"
                 )
-            if num_qo_heads % num_kv_heads != 0:
-                raise ValueError(
-                    f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
-                )
-            if M % R != 0:
-                raise ValueError(f"M={M} must be divisible by block size R={R}")
-            if N % C != 0:
-                raise ValueError(f"N={N} must be divisible by block size C={C}")
-            if mask is not None or packed_mask is not None:
-                raise ValueError(
-                    "VSA Blackwell backend does not support per-element block masks "
-                    "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
-                    "or block_mask is supported."
-                )
-            if causal:
-                raise ValueError(
-                    "VSA Blackwell backend does not support causal masking."
-                )
-            if pos_encoding_mode != "NONE":
-                raise ValueError(
-                    f"VSA Blackwell backend only supports pos_encoding_mode='NONE' "
-                    f"(got '{pos_encoding_mode}')."
-                )
-            if logits_soft_cap is not None and logits_soft_cap > 0:
-                raise ValueError(
-                    "VSA Blackwell backend does not support logits_soft_cap."
-                )
+            _vsa_common_checks(
+                "vsa_sm100_blk128", R, C, M, N, num_qo_heads, num_kv_heads,
+                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+            )
 
             MB = M // R
             NB = N // C
@@ -520,7 +586,7 @@ class BlockSparseAttentionWrapper:
                 # Head-independent BSR path: broadcast the same pattern across all KV heads.
                 if indptr is None or indices is None:
                     raise ValueError(
-                        "vsa_blackwell backend requires either block_mask or "
+                        "vsa_sm100_blk128 backend requires either block_mask or "
                         "(indptr, indices) to be provided."
                     )
                 self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
@@ -541,56 +607,33 @@ class BlockSparseAttentionWrapper:
             self._sm_scale = sm_scale
             return
 
-        # ---- VSA Blackwell blk64 backend (BSA blk64 C++ kernel) ------------------
-        if self._backend == "vsa_blackwell_blk64":
+        # ---- VSA SM100 blk64 backend (BSA blk64 C++ kernel, SM100 only) -----------
+        if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
             if arch // 10 != 10:
                 raise RuntimeError(
-                    f"vsa_blackwell_blk64 backend requires SM100 (Blackwell), "
+                    f"vsa_sm100_blk64 backend requires SM100 (Blackwell), "
                     f"current device is SM{arch}"
                 )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
             if R != 64 or C != 64:
                 raise ValueError(
-                    "vsa_blackwell_blk64 backend requires R == C == 64 "
+                    "vsa_sm100_blk64 backend requires R == C == 64 "
                     f"(got R={R}, C={C})"
                 )
             if head_dim != 128:
                 raise ValueError(
-                    f"vsa_blackwell_blk64 backend requires head_dim=128 (got {head_dim})"
+                    f"vsa_sm100_blk64 backend requires head_dim=128 (got {head_dim})"
                 )
             if q_data_type != torch.bfloat16:
                 raise ValueError(
-                    "vsa_blackwell_blk64 backend only supports bfloat16 inputs"
+                    "vsa_sm100_blk64 backend only supports bfloat16 inputs"
                 )
-            if num_qo_heads % num_kv_heads != 0:
-                raise ValueError(
-                    f"num_qo_heads ({num_qo_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
-                )
-            if M % R != 0:
-                raise ValueError(f"M={M} must be divisible by block size R={R}")
-            if N % C != 0:
-                raise ValueError(f"N={N} must be divisible by block size C={C}")
-            if mask is not None or packed_mask is not None:
-                raise ValueError(
-                    "vsa_blackwell_blk64 backend does not support per-element block masks "
-                    "(mask / packed_mask).  Only block-level sparsity via indptr/indices "
-                    "or block_mask is supported."
-                )
-            if causal:
-                raise ValueError(
-                    "vsa_blackwell_blk64 backend does not support causal masking."
-                )
-            if pos_encoding_mode != "NONE":
-                raise ValueError(
-                    f"vsa_blackwell_blk64 backend only supports pos_encoding_mode='NONE' "
-                    f"(got '{pos_encoding_mode}')."
-                )
-            if logits_soft_cap is not None and logits_soft_cap > 0:
-                raise ValueError(
-                    "vsa_blackwell_blk64 backend does not support logits_soft_cap."
-                )
+            _vsa_common_checks(
+                "vsa_sm100_blk64", R, C, M, N, num_qo_heads, num_kv_heads,
+                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+            )
 
             MB = M // R
             NB = N // C
@@ -608,7 +651,65 @@ class BlockSparseAttentionWrapper:
             else:
                 if indptr is None or indices is None:
                     raise ValueError(
-                        "vsa_blackwell_blk64 backend requires either block_mask or "
+                        "vsa_sm100_blk64 backend requires either block_mask or "
+                        "(indptr, indices) to be provided."
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
+                    indptr, indices, MB, NB, H, self.device, non_blocking
+                )
+
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+
+        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        if self._backend == "vsa_sm120_blk64":
+            cc = get_compute_capability(self.device)
+            arch = cc[0] * 10 + cc[1]
+            if arch // 10 != 12:
+                raise RuntimeError(
+                    f"vsa_sm120_blk64 backend requires SM120/SM121, "
+                    f"current device is SM{arch}"
+                )
+            if R != 64 or C != 64:
+                raise ValueError(
+                    "vsa_sm120_blk64 backend requires R == C == 64 "
+                    f"(got R={R}, C={C})"
+                )
+            if head_dim != 128:
+                raise ValueError(
+                    f"vsa_sm120_blk64 backend requires head_dim=128 (got {head_dim})"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "vsa_sm120_blk64 backend only supports float16 and bfloat16 inputs"
+                )
+            _vsa_common_checks(
+                "vsa_sm120_blk64", R, C, M, N, num_qo_heads, num_kv_heads,
+                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+            )
+
+            MB = M // R
+            NB = N // C
+            # sm120 handles GQA natively via gqa_ratio; index is per QO head.
+            H = num_qo_heads
+
+            if block_mask is not None:
+                if block_mask.shape != (H, MB, NB):
+                    raise ValueError(
+                        f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
+                        f"got {tuple(block_mask.shape)}"
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
+                    block_mask, self.device, non_blocking
+                )
+            else:
+                if indptr is None or indices is None:
+                    raise ValueError(
+                        "vsa_sm120_blk64 backend requires either block_mask or "
                         "(indptr, indices) to be provided."
                     )
                 self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
@@ -624,11 +725,12 @@ class BlockSparseAttentionWrapper:
 
         if block_mask is not None:
             raise ValueError(
-                "block_mask is only supported for the vsa_blackwell and vsa_blackwell_blk64 backends."
+                "block_mask is only supported for the vsa_sm100_blk128, vsa_sm100_blk64, "
+                "and vsa_sm120_blk64 backends."
             )
         if indptr is None or indices is None:
             raise ValueError(
-                "indptr and indices are required for non-vsa_blackwell backends."
+                "indptr and indices are required for non-VSA backends."
             )
 
         if logits_soft_cap is None:
@@ -882,85 +984,32 @@ class BlockSparseAttentionWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
 
-        # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
-        if self._backend == "vsa_blackwell":
-            from flashinfer.cute_dsl.sparse import bsa_attn_fwd  # noqa: PLC0415
-
-            sm_scale = self._sm_scale
-            if sm_scale is None:
-                sm_scale = 1.0 / math.sqrt(q.size(-1))
-
-            # NHD -> BSHD  (batch=1, seqlen, heads, dim) — layout expected by BSA kernel
-            Q_bsa = q.unsqueeze(0).contiguous()  # [1, M, H, D]
-            K_bsa = k.unsqueeze(0).contiguous()  # [1, N, H_kv, D]
-            V_bsa = v.unsqueeze(0).contiguous()  # [1, N, H_kv, D]
-
-            o_bsa, lse_bsa = bsa_attn_fwd(
-                Q_bsa,
-                K_bsa,
-                V_bsa,
-                self._vsa_q2k_index,  # [1, H, MB, NB] int32
-                block_sparse_num=2,  # ignored when q2k_block_nums is provided
-                block_sizes=None,  # full blocks (no per-block padding masking)
-                q2k_block_nums=self._vsa_q2k_num,  # [1, H, MB] int32
-                softmax_scale=sm_scale,
-                return_lse=True,
+        # ---- VSA SM100 blk128 backend (BSA blk128 CuTe-DSL kernel, SM100/SM110) ----
+        if self._backend == "vsa_sm100_blk128":
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import bsa_attn_sm100_blk128_fwd  # noqa: PLC0415
+            return _vsa_run_core(
+                bsa_attn_sm100_blk128_fwd, q, k, v,
+                self._vsa_q2k_index, self._vsa_q2k_num,
+                self._sm_scale, out, lse, return_lse,
             )
 
-            # BSHD -> NHD: [1, M, H, D][0] -> [M, H, D]
-            output = o_bsa[0]
-            if out is not None:
-                out.copy_(output)
-                output = out
-
-            if return_lse:
-                # [1, H, M] -> [M, H]
-                lse_out = lse_bsa[0].permute(1, 0).contiguous()
-                if lse is not None:
-                    lse.copy_(lse_out)
-                    lse_out = lse
-                return output, lse_out
-            return output
-
-        # ---- VSA Blackwell blk64 backend (BSA blk64 C++ kernel) ------------------
-        if self._backend == "vsa_blackwell_blk64":
-            from flashinfer.cute_dsl.sparse import bsa_attn_blk64_fwd  # noqa: PLC0415
-
-            sm_scale = self._sm_scale
-            if sm_scale is None:
-                sm_scale = 1.0 / math.sqrt(q.size(-1))
-
-            # NHD -> BSHD  (batch=1, seqlen, heads, dim)
-            Q_bsa = q.unsqueeze(0).contiguous()
-            K_bsa = k.unsqueeze(0).contiguous()
-            V_bsa = v.unsqueeze(0).contiguous()
-
-            o_bsa, lse_bsa = bsa_attn_blk64_fwd(
-                Q_bsa,
-                K_bsa,
-                V_bsa,
-                self._vsa_q2k_index,
-                block_sparse_num=1,  # ignored when q2k_block_nums is provided
-                block_sizes=None,
-                q2k_block_nums=self._vsa_q2k_num,
-                softmax_scale=sm_scale,
-                return_lse=True,
+        # ---- VSA SM100 blk64 backend (BSA blk64 C++ kernel, SM100 only) -----------
+        if self._backend == "vsa_sm100_blk64":
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd  # noqa: PLC0415
+            return _vsa_run_core(
+                bsa_attn_sm100_blk64_fwd, q, k, v,
+                self._vsa_q2k_index, self._vsa_q2k_num,
+                self._sm_scale, out, lse, return_lse,
             )
 
-            # BSHD -> NHD
-            output = o_bsa[0]
-            if out is not None:
-                out.copy_(output)
-                output = out
-
-            if return_lse:
-                # lse: (1, H, M) -> (M, H)
-                lse_out = lse_bsa[0].permute(1, 0).contiguous()
-                if lse is not None:
-                    lse.copy_(lse_out)
-                    lse_out = lse
-                return output, lse_out
-            return output
+        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        if self._backend == "vsa_sm120_blk64":
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import bsa_attn_sm120_blk64_fwd  # noqa: PLC0415
+            return _vsa_run_core(
+                bsa_attn_sm120_blk64_fwd, q, k, v,
+                self._vsa_q2k_index, self._vsa_q2k_num,
+                self._sm_scale, out, lse, return_lse,
+            )
 
         pos_encoding_mode = self._pos_encoding_mode
         logits_soft_cap = self._logits_soft_cap

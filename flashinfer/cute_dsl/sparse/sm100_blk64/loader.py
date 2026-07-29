@@ -30,7 +30,7 @@ def _get_cutlass_root() -> Path:
         if candidate.is_dir():
             return candidate
         root = root.parent
-    raise RuntimeError("Could not locate 3rdparty/cutlass from blk64 loader")
+    raise RuntimeError("Could not locate 3rdparty/cutlass from sm100_blk64 loader")
 
 
 @lru_cache(maxsize=1)
@@ -44,7 +44,7 @@ def load_blk64_ext():
                 "FLASHINFER_WORKSPACE_BASE", Path.home() / ".cache" / "flashinfer"
             )
         )
-        / "blk64_ext"
+        / "sm100_blk64_ext"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
 

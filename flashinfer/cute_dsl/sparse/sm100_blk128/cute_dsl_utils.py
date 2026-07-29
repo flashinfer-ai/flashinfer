@@ -17,7 +17,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
-from cutlass.cute.runtime import from_dlpack
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -129,55 +128,3 @@ def assume_tensor_aligned(t):
         t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
     )
 
-
-def to_cute_tensor(
-    t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True
-):
-    """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(
-        t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi
-    )
-    if fully_dynamic:
-        return tensor.mark_layout_dynamic()
-    if leading_dim == -1:
-        leading_dim = t.ndim - 1
-    return tensor.mark_layout_dynamic(leading_dim=leading_dim)
-
-
-def to_cute_aux_tensor(t, enable_tvm_ffi=True):
-    """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
-    This allows the user to specify alignment and leading dimension for aux tensors used in
-    custom score_mod callables.
-    """
-    assumed_align: int = getattr(t, "__assumed_align__", None)
-    leading_dim: int = getattr(t, "__leading_dim__", None)
-    fully_dynamic: bool = leading_dim is None
-
-    return to_cute_tensor(
-        t,
-        assumed_align=assumed_align,
-        leading_dim=leading_dim,
-        fully_dynamic=fully_dynamic,
-        enable_tvm_ffi=enable_tvm_ffi,
-    )
-
-
-def get_aux_tensor_metadata(aux_tensors):
-    return tuple(
-        (
-            getattr(t, "__assumed_align__", 0),
-            getattr(t, "__leading_dim__", -1),
-            hasattr(t, "__leading_dim__"),
-        )
-        for t in aux_tensors
-    )
-
-
-def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
-    """Return tuple of bools indicating which dims have stride=0 (broadcast).
-
-    This is useful for compile keys since CuTe's mark_layout_dynamic() keeps
-    stride=0 as static, meaning kernels compiled with different broadcast
-    patterns are not interchangeable.
-    """
-    return tuple(s == 0 for s in tensor.stride())

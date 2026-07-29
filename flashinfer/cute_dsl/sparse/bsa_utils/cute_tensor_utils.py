@@ -11,3 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from cutlass.cute.runtime import from_dlpack
+
+
+def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+    """Convert a torch tensor to a CuTe tensor with dynamic layout marking."""
+    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    if fully_dynamic:
+        return tensor.mark_layout_dynamic()
+    if leading_dim == -1:
+        leading_dim = t.ndim - 1
+    return tensor.mark_layout_dynamic(leading_dim=leading_dim)
