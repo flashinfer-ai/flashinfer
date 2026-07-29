@@ -128,13 +128,14 @@ _W4A16_SMALL_M_DIRECT_MAX_M = 8
 # TC-decode: a small-M decode specialization that runs on the PACKED W4A16
 # object (the same weights/scales the prefill GEMM uses). It reuses the packed
 # tensor-core MMA inner loop but folds the top-k sum into the FC2 store
-# epilogue (dropping the separate top-k-sum launch). It never regresses vs the
-# packed GEMM within its supported M range, so it is ALWAYS used for the small-M
-# direct-topk decode sizes — there is no opt-in/opt-out switch.
-# TC-decode is available for the whole small-M direct-topk range. Its only hard
-# ceiling is the direct-topk route cap (above it, expert route-packing wins).
+# epilogue (dropping the separate top-k-sum launch). It is ALWAYS used for the
+# small-M direct-topk decode sizes — there is no opt-in/opt-out switch.
 # _TC_DECODE_M is retained for callers/tests that enumerate the supported sizes.
-_TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
+#
+# Upstream caps TC-decode at _W4A16_SMALL_M_DIRECT_MAX_M (8). On the SM12x
+# cards FlashInfer targets, the route-packed GEMM overtakes TC-decode before
+# that, so the cap is lowered to the direct-topk route bound.
+_TC_DECODE_MAX_M = _MAX_DIRECT_TOPK_ROUTE_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
 
