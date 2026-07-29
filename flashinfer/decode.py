@@ -3019,7 +3019,7 @@ def _get_uniform_cum_seq_lens_q(
     # Cached per (batch_size, q_len, device) so CUDA-graph capture bakes a
     # stable, pre-existing tensor (cache misses normally happen during eager
     # warmup, outside capture).
-    key = (batch_size, q_len, device.index)
+    key = (batch_size, q_len, device)
     t = _uniform_cum_seq_lens_cache.get(key)
     if t is None:
         if torch.cuda.is_current_stream_capturing():

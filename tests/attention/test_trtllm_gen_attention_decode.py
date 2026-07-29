@@ -1778,7 +1778,7 @@ def test_trtllm_batch_decode_uniform_qlen_packed_layout(q_len_per_req):
         num_pages_per_seq * batch_size, dtype=torch.int32, device=device
     ).view(batch_size, num_pages_per_seq)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
-    workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace, _ = create_workspace_buffers(device)
 
     def run(q_, block_tables_, seq_lens_):
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
