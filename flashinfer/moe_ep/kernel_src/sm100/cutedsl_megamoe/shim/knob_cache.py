@@ -97,7 +97,11 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
         )
         return []
     entries = data.get("entries", [])
-    return entries if isinstance(entries, list) else []
+    if not isinstance(entries, list):
+        return []
+    # Drop non-dict elements too: lookup_knobs/record_knobs call e.get() on
+    # every entry, and a corrupted-but-valid-JSON cache must degrade, not raise.
+    return [e for e in entries if isinstance(e, dict)]
 
 
 def _knobs_to_json(knobs: Dict[str, Any]) -> Dict[str, Any]:

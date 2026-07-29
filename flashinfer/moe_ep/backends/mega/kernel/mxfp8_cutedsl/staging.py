@@ -52,6 +52,11 @@ def stage_mega_moe_inputs(
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
+        # A zero-token step still owns the buffer: rows a previous batch left
+        # routed must be re-masked (and the live-count memo set to 0) or they
+        # would dispatch as stale live tokens.
+        topk_idx_out.fill_(-1)
+        note_staged_tokens(topk_idx_out, 0)
         return
     if hidden % 64 != 0:
         raise ValueError("hidden_size must be a multiple of 64.")

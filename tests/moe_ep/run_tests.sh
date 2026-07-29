@@ -13,6 +13,7 @@
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90_pull_fp8 vs drop reference
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
+#   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
 #
 # Install (transport libs build by default, best-effort):
 #   pip install --no-build-isolation -e .
@@ -245,6 +246,41 @@ run_mega_sm90() {
     -m "gpu_4 and arch_hopper"
 }
 
+# Fault tolerance. Split into a pytest half (a STALLED rank -- every process
+# survives, so it runs under torchrun -m pytest) and a smoke half (a rank that
+# really dies). The smoke half cannot be a pytest test: torchrun reports the
+# victim's non-zero exit, which would fail the survivors' session even when
+# they behaved correctly. Judge it by counting SMOKE_RESULT lines instead.
+run_ft() {
+  local rc=0
+  local expected_ok=$(( NPROC_SMOKE - 1 ))
+
+  for backend in nccl_ep nixl_ep; do
+    if ! "${PY}" -c "from flashinfer.moe_ep import supports_fault_tolerance as s; raise SystemExit(0 if s('${backend}') else 1)"; then
+      echo "${backend} cannot serve the FT API here; skipping its FT tests"
+      continue
+    fi
+
+    "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" \
+      tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py -v \
+      -m "nvep and gpu_4" --backend="${backend}" || rc=1
+
+    local out
+    out="$("${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" --max-restarts=0 \
+      tests/moe_ep/smoke_ft_ep.py --backend "${backend}" 2>&1)" || true
+    echo "${out}"
+    local ok
+    ok="$(printf '%s' "${out}" | grep -c 'SMOKE_RESULT:' || true)"
+    if [ "${ok}" -ne "${expected_ok}" ]; then
+      echo "FT smoke (${backend}): expected ${expected_ok} SMOKE_RESULT lines, got ${ok}" >&2
+      rc=1
+    fi
+  done
+
+  return "${rc}"
+}
+
 run_smoke() {
   require_nccl_ep
 
@@ -308,9 +344,10 @@ case "${1:-all}" in
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_pull_fp8 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
+  ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

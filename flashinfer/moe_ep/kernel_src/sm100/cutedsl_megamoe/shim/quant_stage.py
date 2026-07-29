@@ -146,6 +146,11 @@ def fused_quant_stage(
     num_tokens, hidden = hidden_states.shape
     capacity = x_out.shape[0]
     if num_tokens == 0:
+        # Nothing to quantize, but the staging contract still applies: rows a
+        # previous batch left routed must be re-masked and the live-count memo
+        # must record 0, or staged_tokens()/compute(output=None) would keep
+        # reporting the previous batch.
+        _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
         return
     sf_vec = 16 if is_nvfp4 else 32
     # hidden // sf_vec must be a multiple of 4 so the buffer's round-up-to-4
@@ -219,6 +224,12 @@ def fused_quant_stage(
 
     stager.compiled(*stager.launch_args, **stager.launch_kwargs)
 
+    _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+
+
+def _mask_tail_and_note(
+    topk_idx_out: torch.Tensor, num_tokens: int, capacity: int
+) -> None:
     # Parity with the torch stager: rows beyond this batch must stay masked
     # (-1) so they cannot dispatch as live tokens. The buffer starts fully
     # masked and staging only overwrites [:n], so eagerly a fill is needed

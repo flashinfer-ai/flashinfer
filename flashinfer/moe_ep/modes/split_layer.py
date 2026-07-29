@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from ..algo_knobs import (
     AlgoKnob,
+    FleetAlgoKnobFaultTolerance,
     FleetAlgoKnobQuantization,
     FleetAlgoKnobTopologyCapacity,
     HandleAlgoKnobTopKWeights,
@@ -137,6 +138,7 @@ class MoEEpSplitLayer(nn.Module):
             world_size=self._bootstrap.world_size,
             quant=fleet_knobs.get(FleetAlgoKnobQuantization),  # type: ignore[arg-type]
             topology_capacity=topology_capacity,
+            fault_tolerance=fleet_knobs.get(FleetAlgoKnobFaultTolerance),  # type: ignore[arg-type]
         )
 
     def _ensure_fleet(self) -> Fleet:

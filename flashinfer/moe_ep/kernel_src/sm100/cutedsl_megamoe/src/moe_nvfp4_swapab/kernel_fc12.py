@@ -2213,6 +2213,16 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
+                    # CuTe-DSL 4.5.2 mainloop WAR (cutedsl_megamoe MR!27; see
+                    # TUNING.md "Follow-up 2026-07-22"): 4.5.2's codegen
+                    # mishandles the data-dependent peek guard inside the
+                    # K-loop (`if k_tile + 1 < cnt: try_wait()`), costing
+                    # 34-54% kernel time vs 4.6.1. Peeling the last k-tile out
+                    # of the loop makes the in-loop try_wait unconditional
+                    # (the peeled tail consumes the final peek), which
+                    # restores full 4.6.1 parity. const_expr-gated on exactly
+                    # 4.5.2 so newer runtimes keep the original loop shape;
+                    # delete both peel branches when 4.5.2 support is dropped.
                     cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
                     k_tile_loop_cnt = k_tile_cnt
                     if cutlass.const_expr(cutedsl_452_ver_war):
@@ -2253,7 +2263,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                         handle.release()
 
                     if cutlass.const_expr(cutedsl_452_ver_war):
-                        # Last loop unroll
+                        # 4.5.2 WAR peeled last k-tile (rationale above): same
+                        # body as the loop, consuming the final try_wait peek.
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
 
                         s2t_stage_coord = (None, None, None, None, handle.index)

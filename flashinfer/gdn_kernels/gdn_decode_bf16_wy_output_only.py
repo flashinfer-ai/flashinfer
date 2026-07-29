@@ -38,7 +38,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -694,7 +693,7 @@ class GdnDecodeKernel:
         # (log_alpha=0) cannot reach the real rows through the causal prefix-sum.
         self._ab_native = bool(ab_native)
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -764,7 +763,7 @@ class GdnDecodeKernel:
             min_blocks_per_mp=self._min_blocks_per_mp,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
@@ -1943,6 +1942,13 @@ class GdnDecodeKernel:
 # ============================================================================
 
 _CACHE: dict = {}
+
+
+def _compile_options(device: torch.device) -> tuple:
+    major, minor = torch.cuda.get_device_capability(device)
+    return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
+
+
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
 # pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
@@ -2236,8 +2242,10 @@ def gated_delta_rule_mtp(
     # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
     # by the intense correctness sweep; invisible to the tests/benches, which use
     # one HV per process.
+    cc = torch.cuda.get_device_capability(device)
     cache_key: tuple = (
         str(device),
+        cc,
         mbp,
         t_disc,
         n_valid,
@@ -2297,16 +2305,19 @@ def gated_delta_rule_mtp(
     ]
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
-            GdnDecodeKernel(
-                disable_state_update=True,
-                min_blocks_per_mp=mbp,
-                t_input=t_disc,
-                n_valid=n_valid,
-                qkv_row_stride=_qkv_rs,
-                ab_native=_ab_native_flag,
-            ),
-            *args,
+        kernel = GdnDecodeKernel(
+            disable_state_update=True,
+            min_blocks_per_mp=mbp,
+            t_input=t_disc,
+            n_valid=n_valid,
+            qkv_row_stride=_qkv_rs,
+            ab_native=_ab_native_flag,
+        )
+        options = _compile_options(device)
+        _CACHE[cache_key] = (
+            cute.compile[options](kernel, *args)
+            if options
+            else cute.compile(kernel, *args)
         )
     _CACHE[cache_key](*args)
 
