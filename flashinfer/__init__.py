@@ -120,6 +120,12 @@ from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+
+try:
+    from .gemm import bf16_gemv as bf16_gemv
+    from .gemm import precompile_bf16_gemv as precompile_bf16_gemv
+except (ImportError, AttributeError):
+    pass  # nvidia-cutlass-dsl not installed
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8

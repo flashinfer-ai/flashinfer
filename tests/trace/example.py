@@ -14,6 +14,7 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+bf16_gemv_n96_k5120.json
 bmm_mxfp8_N128_K128.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
@@ -520,6 +521,15 @@ try:
     )
 except Exception:
     pass  # Requires Blackwell (SM100+)
+
+# ── GEMM bf16 small-N GEMV: bf16_gemv (SM120/SM121) ─────────────────────────
+# Qwen3.6-27B GDN in_proj_ba decode shape: 2×96@96×5120.
+try:
+    x_gemv = torch.randn(2, 5120, dtype=torch.bfloat16, device=device)
+    w_gemv = torch.randn(96, 5120, dtype=torch.bfloat16, device=device)
+    flashinfer.bf16_gemv(x_gemv, w_gemv)
+except Exception:
+    pass  # Requires SM120/SM121 and nvidia-cutlass-dsl
 
 # ── GQA paged decode (Llama-3.1-8B, h=32/kv=8/d=128) ────────────────────────
 num_qo, num_kv, head_dim, batch_size = 32, 8, 128, 32

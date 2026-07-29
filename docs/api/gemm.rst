@@ -107,6 +107,15 @@ Blackwell SM100 GEMM
 
     tgv_gemm_sm100
 
+Small-N BF16 GEMV (SM120/SM121)
+-------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    bf16_gemv
+    precompile_bf16_gemv
+
 Grouped GEMM (CuTe-DSL, Blackwell)
 ----------------------------------
 
