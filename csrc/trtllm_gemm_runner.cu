@@ -16,6 +16,8 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+#include <sstream>
 #include <string>
 
 #include "flashinfer/exception.h"
@@ -32,6 +34,38 @@ static thread_local gemm::gemm::GemmInterface::ModuleCache globalTrtllmGenGemmMo
 }  // namespace
 
 namespace flashinfer {
+
+namespace {
+
+// The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
+// it actually covers is not knowable at compile time. Encode only the
+// cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
+// what is available. Unknown cubin families are rejected so that a newly shipped
+// one fails loudly instead of being mis-dispatched onto hardware that cannot run
+// it (see #4107).
+bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
+  using CudaArch = gemm::trtllm::gen::CudaArch;
+  switch (cubinArch) {
+    case CudaArch::Sm100a:
+      return smVersion == 100;
+    case CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case CudaArch::Sm103a:
+      return smVersion == 103;
+#ifdef TLLM_RUBIN_FEATURES
+    // CudaArch::Sm107a only exists in the Rubin cubin pin's generated headers,
+    // which is also the only build that defines TLLM_RUBIN_FEATURES. sm107 is
+    // unreachable in the non-Rubin module: get_trtllm_gemm_module() picks the
+    // Rubin variant by device compute capability before this runs.
+    case CudaArch::Sm107a:
+      return smVersion == 107;
+#endif
+    default:
+      return false;
+  }
+}
+
+}  // namespace
 
 struct TrtllmGenGemmRunnerOptions {
   gemm::trtllm::gen::Dtype eltType;
@@ -110,6 +144,7 @@ class TrtllmGenGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
+    int const sv = getSMVersion();
 
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
       auto const options = configs[i].mOptions;
@@ -118,7 +153,27 @@ class TrtllmGenGemmRunner {
           options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
           options.mSfLayoutB == mOptions.sfLayoutB &&
           options.mLayoutA == mOptions.layoutA) {  // FIXME(siyuanf): expose matrix layout to user
+        if (!isArchCompatible(sv, configs[i].mSm)) continue;
         mPassingConfigIndices.push_back(i);
+      }
+    }
+
+    if (mPassingConfigIndices.empty()) {
+      // Distinguish "this GPU has no cubins at all" from "no cubin matches these GEMM
+      // options". The former is the common failure on unsupported hardware, and the
+      // option dump below would send users looking in entirely the wrong place.
+      bool anyArchCompatible = false;
+      for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
+        if (isArchCompatible(sv, configs[i].mSm)) {
+          anyArchCompatible = true;
+          break;
+        }
+      }
+      if (!anyArchCompatible) {
+        std::ostringstream arch_msg;
+        arch_msg << "The trtllm-gen GEMM cubin manifest contains no kernels runnable on sm" << sv
+                 << "; this backend currently ships cubins for sm100, sm103 and sm107.";
+        FLASHINFER_ERROR(arch_msg.str());
       }
     }
 
@@ -130,11 +185,20 @@ class TrtllmGenGemmRunner {
                      "mSfLayoutB: ", gemm::trtllm::gen::sfLayoutToString(mOptions.sfLayoutB));
   }
 
+  void checkPassingConfigIndex(int64_t tactic) const {
+    auto it = std::find(mPassingConfigIndices.begin(), mPassingConfigIndices.end(), tactic);
+    TVM_FFI_ICHECK(it != mPassingConfigIndices.end())
+        << "Tactic " << tactic
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+  }
+
   int64_t getWorkspaceSizeInBytes(int64_t m, int64_t n, int64_t k, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     FLASHINFER_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
                      "Invalid tactic in getWorkspaceSizeInBytes");
+    checkPassingConfigIndex(tactic);
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;
@@ -156,6 +220,7 @@ class TrtllmGenGemmRunner {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
+    checkPassingConfigIndex(tactic);
     auto const& config = configs[tactic];
     TVM_FFI_ICHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB) << "Invalid sf layout in run";
 
