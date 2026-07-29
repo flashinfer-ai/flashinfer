@@ -74,14 +74,31 @@ if not _USE_CUDA_NORM:
         _USE_CUDA_NORM = True
 
 
-def _require_dsl_arch(device: torch.device) -> None:
-    """Raise when the installed CuTe DSL cannot target ``device``'s
-    architecture (e.g. Rubin/sm_107 against a DSL without ``sm_107a``,
-    unless ``CUTE_DSL_ARCH=sm_100f`` was exported before the process
-    started -- see :func:`flashinfer.cute_dsl.utils.is_cute_dsl_arch_supported`)."""
-    from ..cute_dsl.utils import require_cute_dsl_arch
+@functools.cache
+def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can target this compute capability."""
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
 
-    require_cute_dsl_arch(device)
+        return is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the capability probe itself break norm dispatch.
+        return True
+
+
+def _use_cuda_norm(device: torch.device) -> bool:
+    """Return ``True`` when the CUDA JIT norm kernels should be used instead
+    of the CuTe DSL ones.
+
+    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers
+    devices whose architecture the installed CuTe DSL cannot target (e.g.
+    Rubin/sm_107 against a DSL without ``sm_107a``, unless
+    ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
+    The CUDA JIT kernels are functionally equivalent, so norm falls back
+    instead of raising like the DSL-only kernels do."""
+    if _USE_CUDA_NORM:
+        return True
+    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
 
 
 @functools.cache
@@ -168,10 +185,9 @@ def _rmsnorm_impl(
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
-        _require_dsl_arch(input.device)
         if input.dim() == 3:
             qk_rmsnorm_cute(
                 input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
@@ -227,10 +243,9 @@ def rmsnorm_quant(
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
     else:
-        _require_dsl_arch(input.device)
         rmsnorm_quant_cute(
             out, input, weight, scale, eps, weight_bias=0.0, enable_pdl=enable_pdl
         )
@@ -281,10 +296,9 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
-        _require_dsl_arch(input.device)
         fused_add_rmsnorm_cute(
             input, residual, weight, eps, weight_bias=0.0, enable_pdl=enable_pdl
         )
@@ -343,12 +357,11 @@ def fused_add_rmsnorm_quant(
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm_quant(
             out, input, residual, weight, scale, eps, enable_pdl
         )
     else:
-        _require_dsl_arch(input.device)
         fused_add_rmsnorm_quant_cute(
             out,
             input,
@@ -421,10 +434,9 @@ def _gemma_rmsnorm_impl(
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
     else:
-        _require_dsl_arch(input.device)
         if input.dim() == 3:
             qk_rmsnorm_cute(
                 input, weight, out, eps, weight_bias=1.0, enable_pdl=enable_pdl
@@ -481,12 +493,11 @@ def gemma_fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
     else:
-        _require_dsl_arch(input.device)
         fused_add_rmsnorm_cute(
             input, residual, weight, eps, weight_bias=1.0, enable_pdl=enable_pdl
         )
@@ -529,10 +540,9 @@ def layernorm(
         Layer Normalized tensor, shape (batch_size, hidden_size). Same dtype as input.
     """
     out = torch.empty_like(input)
-    if _USE_CUDA_NORM:
+    if _use_cuda_norm(input.device):
         get_norm_module().layernorm(out, input, gemma, beta, eps)
     else:
-        _require_dsl_arch(input.device)
         layernorm_cute(out, input, gemma, beta, eps)
     return out
 
