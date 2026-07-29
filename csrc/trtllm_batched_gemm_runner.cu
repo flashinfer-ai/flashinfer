@@ -163,7 +163,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       }
       bool const usesPerTokenScaling =
           options.mTransposeMmaOutput ? options.mUsePerTokenSfB : options.mUsePerTokenSfA;
-      if (mOptions.usePerTokenScaling && !usesPerTokenScaling) continue;
+      if (mOptions.usePerTokenScaling) {
+        if (!usesPerTokenScaling) continue;
+        if (options.mPerTokenSfDtype != mOptions.perTokenSfDtype) continue;
+      }
       // The MoE pipeline allocates and consumes output scaling factors in the
       // block format's default dtype. Reject cubins that override that
       // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
@@ -234,6 +237,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
             << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
             << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mPerTokenSfDtype: " << tg::dtypeToString(mOptions.perTokenSfDtype)
             << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
