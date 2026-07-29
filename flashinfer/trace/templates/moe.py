@@ -1298,12 +1298,14 @@ def _fp4_moe_run_experts(
     T = A.shape[0]
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
-    activation_value = int(activation_type)
-    if activation_value not in (3, 10):
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Situ):
         raise ValueError(
-            f"FP4 MoE trace reference supports SwiGLU (3) and SiTU (10), got {activation_value}"
+            "FP4 MoE trace reference supports "
+            f"{ActivationType.Swiglu!r} and {ActivationType.Situ!r}, "
+            f"got {activation_type!r}"
         )
-    if activation_value == 10:
+    if activation_type == ActivationType.Situ:
         for name, param in (
             ("gemm1_alpha", gemm1_alpha),
             ("gemm1_beta", gemm1_beta),
@@ -1336,7 +1338,7 @@ def _fp4_moe_run_experts(
             G1 = G1 + gemm1_bias[le].to(torch.float32)
         # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.
         x0, x1 = G1[:, :I], G1[:, I:]
-        if activation_value == 10:
+        if activation_type == ActivationType.Situ:
             alpha = (
                 torch.tensor(1.0, dtype=torch.float32, device=device)
                 if gemm1_alpha is None
@@ -1839,10 +1841,11 @@ def _moe_fp4_block_scale_init(
         on by default for parity with the test).
     Requires SM100+ at runtime; CPU smoke tests skip.
     """
+    activation_type = normalize_activation_type(activation_type)
     situ_alpha = gemm1_alpha
     situ_beta = gemm1_beta
     situ_clamp = gemm1_clamp_limit
-    if int(activation_type) == 10:
+    if activation_type == ActivationType.Situ:
         materialized: dict[str, torch.Tensor | None] = {}
         for name, value, default in (
             ("gemm1_alpha", gemm1_alpha, 1.0),
