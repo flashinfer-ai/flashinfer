@@ -278,6 +278,8 @@ class FmhaConfig:
     # Explicit D256 schedule: Q remains resident as one full-D tile while
     # QK, K/V staging, PV, and O use two 128-wide head-dimension slices.
     staged_head_dim: bool = False
+    # SM103 fused TMEM load + row-max reduction for unmasked score tiles.
+    use_ldtm_stat: bool = False
     head_dim: int = 128
     num_head_dim_stages: int = 1
 
@@ -2543,6 +2545,36 @@ class TmemSPResource(MemoryResource):
         return s_data
 
     @cute.jit
+    def _load_s_chunks_with_row_max(
+        self, stage_info: StageInfo
+    ) -> tuple[SoftmaxChunks, SoftmaxScalar]:
+        """Load one score tile and use SM103 LDTM.STAT for its row maximum."""
+        tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        loaded_values, tile_row_max = prims.tcgen05_ld_red(
+            "32x32b",
+            prims.make_tmem_ptr(tmem_s_addr, self.cfg.qk_acc_dtype),
+            prims.ReductionKind.MAX,
+            num=self.cfg.qk_mma_tiler[1],
+        )
+        # tcgen05 load-reduce results are asynchronous until the LOAD wait
+        # completes.
+        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+        cute.arch.fence_view_async_tmem_load()
+
+        s_data = []
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            chunk_values = tuple(
+                loaded_values[chunk_idx * tmem_x + elem_idx]
+                for elem_idx in range(tmem_x)
+            )
+            s_data.append(
+                cutlass.Vector.from_elements(chunk_values, self.cfg.qk_acc_dtype)
+            )
+        return s_data, tile_row_max
+
+    @cute.jit
     def _reduce_row_max(
         self,
         s_data: SoftmaxChunks,
@@ -3030,6 +3062,15 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Main K-loop stage: load S from TMEM and compute unmasked row_max."""
+        if cutlass.const_expr(self.cfg.use_ldtm_stat):
+            old_row_max = row_max
+            s_data, tile_row_max = self._load_s_chunks_with_row_max(stage_info)
+            _tmem_sp_sdata[id(self)] = s_data
+            row_max = cute.math.max(row_max, tile_row_max, ftz=True)
+            row_max_safe = row_max
+            if row_max == -Float32.inf:
+                row_max_safe = Float32(0.0)
+            return old_row_max, row_max_safe
         s_data = self._load_s_chunks(stage_info)
         return self._reduce_row_max(s_data, row_max)
 
@@ -4408,7 +4449,9 @@ class TmemOResource(MemoryResource):
     ) -> None:
         """Rescale one 128-wide O half in TMEM."""
         tmem_o_addr = self.tmem_o_addr_base_cached + tmem_o_offset
-        tmem_x = 16
+        # x32 halves issue count within the correction warp's register budget;
+        # x64 was benchmarked but not retained.
+        tmem_x = 32
         for i in cutlass.range_constexpr(self.cfg.cta_tiler[2] // tmem_x):
             tmem_ptr = cutlass.inttoptr(
                 tmem_o_addr + i * tmem_x,

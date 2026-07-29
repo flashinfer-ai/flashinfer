@@ -141,6 +141,32 @@ def test_prims_ts_backend_is_blackwell_only(routine):
     )
 
 
+def test_prims_ts_context_fp8_sample_oracle_quantizes_reference():
+    reference = torch.tensor([1e-3, 1.1e-3, 2.5e-3, 4e-3])
+    out = reference.to(torch.float8_e4m3fn).reshape(1, 1, -1)
+    unquantized_relative_l2 = torch.linalg.vector_norm(out.float() - reference) / (
+        torch.linalg.vector_norm(reference)
+    )
+    assert unquantized_relative_l2 > 1e-1
+
+    sample_count, max_abs_error = attention_routine._validate_prims_ts_context_samples(
+        q=torch.zeros(1, 1, 1),
+        k=torch.zeros(1, 1, 1),
+        v=reference.reshape(1, 1, -1),
+        out=out,
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        num_qo_heads=1,
+        num_kv_heads=1,
+        sm_scale=1.0,
+        output_scale=1.0,
+        causal=False,
+    )
+
+    assert sample_count == 1
+    assert max_abs_error == 0.0
+
+
 @pytest.mark.parametrize(
     ("backend", "out_dtype", "message"),
     [
