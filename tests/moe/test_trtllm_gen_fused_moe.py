@@ -38,6 +38,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     run_moe_test,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
+    trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
 )
@@ -262,7 +263,7 @@ def test_sigmoid_routing(
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "num_fused_shared_experts": 1,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [512],
                 "compatible_activation_types": [ActivationType.Swiglu],
                 "enable_autotune": False,
@@ -280,7 +281,7 @@ def test_sigmoid_routing(
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "num_fused_shared_experts": 2,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [512],
                 "compatible_activation_types": [ActivationType.Swiglu],
                 "enable_autotune": False,
@@ -1845,6 +1846,127 @@ def test_fp8_block_scale_moe_fused_shared_experts_reject_ep():
         trtllm_fp8_block_scale_moe(
             **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
         )
+
+
+def test_fp4_block_scale_moe_fused_shared_experts_reject_ep():
+    """FP4 sibling of the FP8 EP-rejection guard test above.
+
+    Fused shared experts must reject expert-parallel (EP) configurations. The
+    guard is a cheap host-side check, so this test does not require a GPU.
+    """
+    num_experts = 4
+    base_kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 2), dtype=torch.bfloat16),
+        "hidden_states_scale": None,
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.uint8),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.uint8),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm2_bias": None,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+        "num_experts": num_experts,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+        "num_fused_shared_experts": 1,
+    }
+
+    # Non-zero local_expert_offset (this rank does not own the first expert).
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp4_block_scale_moe(
+            **base_kwargs, local_expert_offset=2, local_num_experts=num_experts
+        )
+
+    # Sharded experts: local_num_experts < num_experts.
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp4_block_scale_moe(
+            **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
+        )
+
+
+def test_fused_shared_experts_reject_replay_and_non_deepseek_routing():
+    """Fused shared experts must reject routing replay and non-DeepSeekV3 routing.
+
+    The routing kernel records replay ids at stride
+    ``top_k + num_fused_shared_experts``, which does not match the
+    ``[num_tokens, top_k]`` replay layout, and only the DeepSeekV3 routing
+    branch implements the fused shared-expert slots (the C++ runner rejects
+    every other method). Both guards are cheap host-side checks, so this test
+    does not require a GPU.
+    """
+    num_experts = 4
+    fp8_kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+    }
+    fp4_kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 2), dtype=torch.bfloat16),
+        "hidden_states_scale": None,
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.uint8),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.uint8),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn),
+        "gemm2_bias": None,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+    }
+    common_kwargs = {
+        "num_experts": num_experts,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "local_expert_offset": 0,
+        "local_num_experts": num_experts,
+        "routed_scaling_factor": None,
+        "num_fused_shared_experts": 1,
+    }
+
+    for op, op_kwargs in (
+        (trtllm_fp8_block_scale_moe, fp8_kwargs),
+        (trtllm_fp4_block_scale_moe, fp4_kwargs),
+    ):
+        # Routing replay buffers use the un-fused [num_tokens, top_k] layout.
+        with pytest.raises(ValueError, match="routing_replay_out is not supported"):
+            op(
+                **op_kwargs,
+                **common_kwargs,
+                routing_method_type=RoutingMethodType.DeepSeekV3.value,
+                routing_replay_out=torch.empty((1, 1), dtype=torch.int16),
+            )
+
+        # Only DeepSeekV3 routing implements the fused shared-expert slots.
+        for method in (RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize):
+            with pytest.raises(ValueError, match="only supported .* DeepSeekV3"):
+                op(
+                    **op_kwargs,
+                    **common_kwargs,
+                    routing_method_type=method.value,
+                )
 
 
 def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):

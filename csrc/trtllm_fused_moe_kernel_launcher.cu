@@ -1933,28 +1933,41 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK(topk_weights.dtype() == dl_bfloat16 || topk_weights.dtype() == dl_float32)
           << "topk_weights must be bfloat16 or float32 for unpacked precomputed routing.";
     }
+
+    if (args->num_fused_shared_experts > 0) {
+      int64_t const totalExpertsPerToken = args->top_k + args->num_fused_shared_experts;
+      TVM_FFI_ICHECK_EQ(topk_ids.numel(),
+                        static_cast<int64_t>(args->num_tokens) * totalExpertsPerToken)
+          << "topk_ids must have num_tokens * (top_k + num_fused_shared_experts) elements";
+      TVM_FFI_ICHECK_EQ(topk_weights.numel(),
+                        static_cast<int64_t>(args->num_tokens) * totalExpertsPerToken)
+          << "topk_weights must have num_tokens * (top_k + num_fused_shared_experts) elements";
+    }
   }
 
   void prepare_routing() override {
-    num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, hidden_states.device());
+    int32_t const totalExpertsPerToken = args->top_k + args->num_fused_shared_experts;
+    int32_t const totalNumExperts = args->num_experts + args->num_fused_shared_experts;
+
+    num_tokens_per_expert = alloc_tensor({totalNumExperts}, dl_int32, hidden_states.device());
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
-            args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+            args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
 
     total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
     expanded_idx_to_permuted_idx =
-        alloc_tensor({args->num_tokens * args->top_k}, dl_int32, hidden_states.device());
+        alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, hidden_states.device());
     // WAR: the routed batched-GEMM kernels read one int32 past the end of the route map.
     // TODO: drop the +1 once the fixed kernel cubins land.
     permuted_idx_to_token_idx =
         alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
 
-    int64_t const size_of_expert_count_histogram = std::max(args->num_experts * 2, 256 * 2);
+    int64_t const size_of_expert_count_histogram = std::max(totalNumExperts * 2, 256 * 2);
     expert_count_histogram =
         alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
-        args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
+        args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
     cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
     num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
@@ -2603,6 +2616,9 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
+    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
+    TVM_FFI_ICHECK(num_fused_shared_experts.value_or(0) == 0)
+        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
@@ -2687,15 +2703,20 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TensorView gemm2_weights_scale, Optional<TensorView> gemm2_bias,
     Optional<TensorView> output1_scales_scalar, Optional<TensorView> output1_scales_gate_scalar,
     Optional<TensorView> output2_scales_scalar, Optional<TensorView> per_token_scales,
-    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
-    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
-    bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
-    bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t num_experts, int64_t top_k, Optional<int64_t> num_fused_shared_experts,
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t act_type,
+    TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
+    Optional<TensorView> routing_replay_out) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
   if (hidden_states.dtype() == dl_uint8) hidden_size *= 2;
+
+  int64_t const nFusedShared = num_fused_shared_experts.value_or(0);
+  int64_t const totalExpertsPerToken = top_k + nFusedShared;
+  int64_t const totalLocalExperts = local_num_experts + nFusedShared;
 
   int64_t hidden_states_scale_vec_size = -1;
   if (hidden_states_scale.has_value()) {
@@ -2704,8 +2725,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
   int64_t intermediate_size_factor =
       isGatedActivation(static_cast<ActivationType>(act_type)) ? 2 : 1;
-  int64_t logical_scale_count = static_cast<int64_t>(local_num_experts) * intermediate_size *
-                                intermediate_size_factor * hidden_size;
+  int64_t logical_scale_count =
+      totalLocalExperts * intermediate_size * intermediate_size_factor * hidden_size;
   int64_t weight_scale_vec_size_raw = logical_scale_count / gemm1_weights_scale.numel();
 
   // Snap to nearest valid sf_vec_size (16 or 32).
@@ -2734,6 +2755,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
+    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
+    TVM_FFI_ICHECK(nFusedShared == 0)
+        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
@@ -2785,6 +2809,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->hidden_size = hidden_size;
     args->hidden_size_output = output.size(1) > 0 ? output.size(1) : hidden_size / 2;
     args->top_k = top_k;
+    args->num_fused_shared_experts = nFusedShared;
     args->n_group = n_group.value_or(0);
     args->topk_group = topk_group.value_or(0);
     args->local_expert_offset = local_expert_offset;
@@ -2810,8 +2835,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  auto const [tile_N, config] =
-      resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens, top_k, local_num_experts);
+  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, mSupportedTileN, num_tokens,
+                                                        totalExpertsPerToken, totalLocalExperts);
 
   // Get the launcher for the selected tile_N
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));

@@ -1479,6 +1479,7 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
     topk_group,
     local_expert_offset,
     routed_scaling_factor,
+    num_fused_shared_experts=0,
     **activation_kwargs,
 ):
     """FP4 MoE with DeepSeek-V3 routing: sigmoid + groups + top_k."""
@@ -1519,6 +1520,23 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
     full_weights = (raw_w / weights_sum) * scale
     w_topk = full_weights.gather(1, topk_idx)
 
+    nsfe = int(num_fused_shared_experts or 0)
+    if nsfe > 0:
+        # Fused shared experts: ids num_experts + k with constant weight 1.0,
+        # appended after the routed top-k slots.
+        shared_idx = (
+            torch.arange(
+                E_global, E_global + nsfe, device=topk_idx.device, dtype=topk_idx.dtype
+            )
+            .unsqueeze(0)
+            .expand(T, nsfe)
+        )
+        topk_idx = torch.cat([topk_idx, shared_idx], dim=1)
+        w_topk = torch.cat(
+            [w_topk, torch.ones(T, nsfe, dtype=w_topk.dtype, device=w_topk.device)],
+            dim=1,
+        )
+
     return _fp4_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -1531,7 +1549,7 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
         w_topk,
         topk_idx,
         local_expert_offset,
-        E_global,
+        E_global + nsfe,
         **activation_kwargs,
     )
 
@@ -1985,8 +2003,13 @@ def _moe_fp4_block_scale_renormalize_init(**kwargs):
 
 
 def _moe_fp4_block_scale_ds_init(**kwargs):
+    # The generated benchmark covers the routed path
+    # (num_fused_shared_experts == 0); the fused shared-expert slots only
+    # append extra constant-weight columns and weight rows.
     kwargs["routing_method_type"] = 2
-    return _moe_fp4_block_scale_init(**kwargs)
+    out = _moe_fp4_block_scale_init(**kwargs)
+    out["num_fused_shared_experts"] = 0
+    return out
 
 
 def _moe_fp4_block_scale_llama4_init(**kwargs):
@@ -2066,7 +2089,17 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
             description="Number of groups selected in top-k routing.", abbrev="kg"
         ),
     },
-    inputs=dict(_FP4_STANDARD_INPUTS),
+    inputs={
+        **_FP4_STANDARD_INPUTS,
+        "num_fused_shared_experts": Scalar(
+            "int32",
+            description=(
+                "Number of fused shared experts appended after the routed "
+                "experts (weight rows num_experts + k, constant weight 1.0). "
+                "Only supported with DeepSeekV3 routing."
+            ),
+        ),
+    },
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,
     reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
