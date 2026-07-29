@@ -674,8 +674,14 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
     _assert_per_tensor_fp8_close(direct_out, ref)
 
 
-def test_fp8_per_tensor_llama4_routes_scale_on_input():
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
+    ids=["from-logits", "packed"],
+)
+def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=routing_input_mode,
         routing_method=RoutingMethodType.Llama4,
         top_k=1,
     )

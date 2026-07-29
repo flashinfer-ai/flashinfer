@@ -115,6 +115,14 @@ def _validate_prerouted_inputs(
         )
 
 
+def _pack_prerouted_topk_ids(act: MoEActivationPack) -> torch.Tensor:
+    """Pack global expert IDs and BF16 weight bits for TRTLLM routed APIs."""
+    if act.topk_ids is None or act.topk_weights is None:
+        raise ValueError("Packed routing requires topk_ids + topk_weights.")
+    weight_bits = act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    return (act.topk_ids << 16) | (weight_bits & 0xFFFF)
+
+
 def _validate_logits_inputs(
     act: MoEActivationPack, num_tokens: int, num_experts: int, runner: str
 ) -> None:
@@ -639,11 +647,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            ids = act.topk_ids
-            weight_bf16_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
+            topk_ids = _pack_prerouted_topk_ids(act)
             # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
             # the raw op declares it non-Optional.  The high-level wrapper allocates
             # an empty bf16 placeholder here; we mirror that since we bypass it.
@@ -968,10 +972,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            weight_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (act.topk_ids << 16) | (weight_bits & 0xFFFF)
+            topk_ids = _pack_prerouted_topk_ids(act)
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
@@ -1232,10 +1233,10 @@ class TrtllmFp8PerTensorRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            weight_bf16_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (act.topk_ids << 16) | (weight_bf16_bits & 0xFFFF)
+            topk_ids = _pack_prerouted_topk_ids(act)
+            # The routed per-tensor op allocates its own expert-weight buffer;
+            # this placeholder only satisfies the generic MoeRunnerInputs and
+            # autotuner schemas.
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
@@ -1311,7 +1312,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
     """
 
     backend_key = "trtllm_bf16_routed"
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
@@ -1319,20 +1320,19 @@ class TrtllmBf16RoutedRunner(MoERunner):
 
     def check_support(self) -> None:
         super().check_support()
-        device = getattr(self, "device", None)
-        if device is not None:
-            from ..utils import get_compute_capability
-
-            major, minor = get_compute_capability(device)
-            arch = major * 10 + minor
-            if arch not in (100, 103):
-                raise NotImplementedError(
-                    f"{type(self).__name__} requires SM100/SM103 TRTLLM BF16 "
-                    f"cubins, got sm{arch}."
-                )
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        from ..utils import get_compute_capability
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if arch not in (100, 103):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on validated "
+                f"SM100/SM103 targets, got sm{arch}. SM107 enablement was "
+                "reverted by #4171; SM120/SM121 are unsupported."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -1349,6 +1349,13 @@ class TrtllmBf16RoutedRunner(MoERunner):
         execution = config.execution
         self._num_local_experts = experts.local_num_experts or routing.num_experts
         self._local_expert_offset = experts.local_expert_offset
+        if (
+            self._local_expert_offset != 0
+            or self._num_local_experts != routing.num_experts
+        ):
+            # Keep packed routed EP available, but filter FromLogits before
+            # MoELayer enters runner packing/autotuning.
+            self.supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
@@ -1453,10 +1460,10 @@ class TrtllmBf16RoutedRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            weight_bf16_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (act.topk_ids << 16) | (weight_bf16_bits & 0xFFFF)
+            # Keep global IDs intact. The kernel applies local_expert_offset;
+            # pre-subtracting it here would apply the offset twice and silently
+            # drop experts on nonzero-offset ranks.
+            topk_ids = _pack_prerouted_topk_ids(act)
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
@@ -1498,7 +1505,9 @@ class TrtllmBf16RoutedRunner(MoERunner):
             weight_layout=int(WeightLayout.BlockMajorK),
             do_finalize=self.config.execution.do_finalize,
             enable_pdl=self._enable_pdl,
-            norm_topk_prob=(routing_input_mode == RoutingInputMode.FromLogits),
+            # Matches the canonical BF16 FromLogits wrapper. Precomputed
+            # routing ignores this flag because weights are already final.
+            norm_topk_prob=True,
         )
 
         self._ensure_inner(hidden_size)

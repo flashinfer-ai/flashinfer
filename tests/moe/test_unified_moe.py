@@ -1947,6 +1947,88 @@ class TestTrtllmFromLogitsPackingContract:
         )
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "routing_method",
+        [RoutingMethodType.Default, RoutingMethodType.DeepSeekV3],
+        ids=["default", "deepseek-v3"],
+    )
+    def test_bf16_from_logits_matches_host_reference(
+        self, routing_method, logits_dtype
+    ):
+        from tests.moe.trtllm_gen_fused_moe_utils import noaux_tc_ref
+
+        num_tokens, num_experts, top_k = 16, 8, 2
+        intermediate_size = 512
+        act, weights, config, tensors = _make_bf16_packs_and_config(
+            num_tokens,
+            hidden_size=256,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            max_tokens=num_tokens,
+        )
+        logits = torch.randn(
+            num_tokens,
+            num_experts,
+            dtype=logits_dtype,
+            device=act.hidden_states_q.device,
+        )
+        routing_bias = None
+        if routing_method is RoutingMethodType.DeepSeekV3:
+            routing_bias = torch.randn(
+                num_experts,
+                dtype=torch.bfloat16,
+                device=logits.device,
+            )
+            dense_scores = noaux_tc_ref(
+                logits.float(),
+                routing_bias.float(),
+                n_group=4,
+                topk_group=2,
+                top_k=top_k,
+                routed_scaling_factor=1.0,
+            )
+            topk_weights, topk_ids = torch.topk(dense_scores, top_k, dim=-1)
+            routing = RoutingConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                method=routing_method,
+                n_group=4,
+                topk_group=2,
+                routed_scaling_factor=1.0,
+            )
+        else:
+            topk_weights, topk_ids = torch.topk(
+                torch.softmax(logits.float(), dim=-1), top_k, dim=-1
+            )
+            routing = RoutingConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                method=routing_method,
+            )
+
+        logits_act = MoEActivationPack(
+            hidden_states_q=act.hidden_states_q,
+            hidden_states_scale=None,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=logits,
+            routing_bias=routing_bias,
+        )
+        config = dataclasses.replace(config, routing=routing)
+        output = MoELayer(config)(logits_act, weights)
+        reference = _bf16_dense_reference(
+            tensors["x"],
+            tensors["w1"],
+            tensors["w2"],
+            topk_ids.to(torch.int32),
+            topk_weights,
+            intermediate_size,
+        )
+        torch.testing.assert_close(
+            output.float(), reference, rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+
+    @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
     def test_bf16_cuda_graph_replay_matches_eager(self, logits_dtype):
         runner, inputs, _, _ = self._make_bf16_from_logits_inputs(logits_dtype)
         for _ in range(3):
@@ -1979,9 +2061,9 @@ class TestTrtllmFromLogitsPackingContract:
             routing_input_mode=RoutingInputMode.FromLogits,
             routing_logits=torch.randn(16, 8, device=act.hidden_states_q.device),
         )
-        runner = TrtllmBf16RoutedRunner(config, device=act.hidden_states_q.device)
-        with pytest.raises(NotImplementedError, match="all experts to be local"):
-            runner.pack_inputs(logits_act, weights)
+        layer = MoELayer(config, device=act.hidden_states_q.device)
+        with pytest.raises(NotImplementedError, match="none of the usable backends"):
+            layer(logits_act, weights)
 
 
 # 6. prepare_trtllm_bf16_weights input contract

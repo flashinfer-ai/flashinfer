@@ -1020,11 +1020,15 @@ def _gen(seed):
         )  # route within the local shard
 
     fromlogits_variants = _FROMLOGITS_VARIANT_IDS
+    prerouted_variants = _PREROUTED_VARIANT_IDS
     if method == RoutingMethodType.Llama4:
         # Per-tensor FP8 applies the Llama4 route scale on GEMM1 input rather
         # than in finalization, so it needs a method-aware reference.
         fromlogits_variants = tuple(
             variant for variant in fromlogits_variants if variant != "fp8pertensor"
+        )
+        prerouted_variants = tuple(
+            variant for variant in prerouted_variants if variant != "fp8pertensor"
         )
 
     variant = (
@@ -1032,7 +1036,7 @@ def _gen(seed):
         if fromlogits
         else rng.choice(_UNPACKED_VARIANT_IDS)
         if unpacked
-        else rng.choice(_PREROUTED_VARIANT_IDS)
+        else rng.choice(prerouted_variants)
     )
     # The legacy TRTLLM MXFP4 modes are validated only with BF16 router logits.
     logits_dtype = (
