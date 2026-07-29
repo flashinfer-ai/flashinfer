@@ -2730,12 +2730,12 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        num_fused_shared_experts: int = 0,
         activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        num_fused_shared_experts: int = 0,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2956,12 +2956,12 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        num_fused_shared_experts: int = 0,
         activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        num_fused_shared_experts: int = 0,
     ):
         _ = routing_replay_out
         _ = num_fused_shared_experts
@@ -4429,13 +4429,13 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
-    num_fused_shared_experts: Optional[int] = None,
     activation_type: int = ActivationType.Swiglu.value,
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -4530,17 +4530,6 @@ def trtllm_fp4_block_scale_moe(
         Whether to finalize the output (default ``True``).
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch.
-    num_fused_shared_experts : Optional[int]
-        Number of shared experts to fuse into the MoE kernel (default
-        ``None`` / ``0``).  When ``> 0``, every per-expert tensor
-        (``gemm1_weights``, ``gemm1_weights_scale``, ``gemm2_weights``,
-        ``gemm2_weights_scale``, ``output*_scale_scalar``, biases) must have
-        ``num_experts + num_fused_shared_experts`` rows in the expert
-        dimension — the shared-expert weights are appended after the routed
-        ones.  Every token is unconditionally routed to the shared experts
-        with weight ``1.0``. With ``do_finalize=False``, the returned
-        ``expert_weights`` and ``expanded_idx_to_permuted_idx`` cover
-        ``top_k + num_fused_shared_experts`` slots per token.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
@@ -4560,6 +4549,17 @@ def trtllm_fp4_block_scale_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
+    num_fused_shared_experts : Optional[int]
+        Number of shared experts to fuse into the MoE kernel (default
+        ``None`` / ``0``).  When ``> 0``, every per-expert tensor
+        (``gemm1_weights``, ``gemm1_weights_scale``, ``gemm2_weights``,
+        ``gemm2_weights_scale``, ``output*_scale_scalar``, biases) must have
+        ``num_experts + num_fused_shared_experts`` rows in the expert
+        dimension — the shared-expert weights are appended after the routed
+        ones.  Every token is unconditionally routed to the shared experts
+        with weight ``1.0``. With ``do_finalize=False``, the returned
+        ``expert_weights`` and ``expanded_idx_to_permuted_idx`` cover
+        ``top_k + num_fused_shared_experts`` slots per token.
 
     Returns
     -------
@@ -4624,12 +4624,12 @@ def trtllm_fp4_block_scale_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        nsfe,
         activation_type,
         output,
         tune_max_num_tokens,
         norm_topk_prob,
         routing_replay_out,
+        nsfe,
     )
 
 
@@ -4829,11 +4829,12 @@ def trtllm_fp4_block_scale_routed_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        0,  # num_fused_shared_experts: not supported on the pre-routed path
         activation_type,
         output,
         tune_max_num_tokens,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out: not used for pre-computed routing
+        0,  # num_fused_shared_experts: not used for pre-computed routing
     )
 
 
