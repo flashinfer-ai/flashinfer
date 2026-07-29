@@ -450,8 +450,10 @@ class FusedMoeLauncher {
     expanded_idx_to_permuted_idx =
         alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, hidden_states.device());
 
+    // WAR: the routed batched-GEMM kernels read one int32 past the end of the route map.
+    // TODO: drop the +1 once the fixed kernel cubins land.
     permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
+        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
 
     if (gemm1_bias_type == batchedGemm::gemm::BiasType::Mn) {
       permuted_idx_to_expanded_idx =
@@ -1942,8 +1944,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
     expanded_idx_to_permuted_idx =
         alloc_tensor({args->num_tokens * args->top_k}, dl_int32, hidden_states.device());
+    // WAR: the routed batched-GEMM kernels read one int32 past the end of the route map.
+    // TODO: drop the +1 once the fixed kernel cubins land.
     permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
+        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
 
     int64_t const size_of_expert_count_histogram = std::max(args->num_experts * 2, 256 * 2);
     expert_count_histogram =
