@@ -1499,7 +1499,7 @@ class VariableBlockSparseAttentionWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``(num_qo_heads, qo_len, head_dim)``.
-            * The logsumexp of attention output, shape: ``(num_qo_heads, qo_len)``.
+            * The logsumexp of attention logits, shape: ``(num_qo_heads, qo_len)``.
         """
         # NOTE(Zihao): defer import of einops
         import einops
