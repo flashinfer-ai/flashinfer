@@ -23,7 +23,7 @@ namespace routingCustom {
 // and the kernel was actually launched; the definitions live in
 // trtllm_fused_moe_routing_custom.cu. Keep these signatures in sync (the return
 // type is not part of the mangled name, so a mismatch would silently be UB).
-bool launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchBlockKernel(Data const& data, void* stream);
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream);
@@ -94,7 +94,7 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
         " for the post-topK permutation (dyn-block path). Add a matching Tier<E, K> to "
         "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
   } else if (useStaticBlock) {
-    bool const launched = routingCustom::launchBlockKernel(customData, numThreadsHist, stream);
+    bool const launched = routingCustom::launchBlockKernel(customData, stream);
     FLASHINFER_CHECK(
         launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
         " topK=", data.mTopK,

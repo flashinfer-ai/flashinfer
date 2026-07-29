@@ -393,6 +393,7 @@ struct SumNormalizePostprocess {
 struct ScaledSumNormalizePostprocess {
   /// Opts into the block-per-token kernel (provides applyWithAux below).
   static constexpr bool kSupportsBlockPerToken = true;
+  static constexpr bool kSupportsLaneOwnedTopK = true;
 
   /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
   /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
@@ -431,6 +432,41 @@ struct ScaledSumNormalizePostprocess {
     float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned TopK postprocess for warp-per-token kernels. The selected
+  /// score/expert are scalar values owned by laneIdx, so no K-element output
+  /// arrays need to be materialized in local memory.
+  template <typename DataType, typename ParamsT>
+  __forceinline__ __device__ static void applyForLane(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType& laneTopKScore,
+                                                      int32_t laneTopKExpertIdx, int32_t laneIdx,
+                                                      int32_t topK, ParamsT const& params) {
+    float const biasVal =
+        laneIdx < topK ? loadScalar(params.ptrRoutingBias, laneTopKExpertIdx, params.dtypeBias)
+                       : 0.f;
+    float const sigmoidScore = laneIdx < topK ? static_cast<float>(laneTopKScore) - biasVal : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned block-per-token variant. Reads the un-biased sigmoid from
+  /// smemAux just like applyWithAux, but consumes scalar TopK state.
+  template <typename DataType, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithAux(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, SmemT const* smemAux,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
           static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
     }
   }
@@ -490,6 +526,17 @@ struct PostprocessNeedsAux<PostprocessPolicy_, std::void_t<decltype(PostprocessP
 
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct PolicyPairNeedsAux : PostprocessNeedsAux<PostprocessPolicy_> {};
+
+/// Does a postprocess policy implement the scalar lane-owned TopK interface?
+/// This is intentionally opt-in: adding a new policy cannot silently select a
+/// specialization whose numerical semantics it has not implemented.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessSupportsLaneOwnedTopK : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessSupportsLaneOwnedTopK<
+    PostprocessPolicy_, std::void_t<decltype(PostprocessPolicy_::kSupportsLaneOwnedTopK)>>
+    : std::bool_constant<PostprocessPolicy_::kSupportsLaneOwnedTopK> {};
 
 /// Trait: does a (pre, post) policy pair implement the block-per-token
 /// interface (`PreProc::applyToSmem` + `PostProc::applyWithAux`) and
@@ -569,6 +616,35 @@ struct TopKExpertSelect {
     PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
                               params.mExpertSelectParams.mPostprocessParams);
   }
+
+  /// Lane-owned TopK variant. It shares the generic preprocess and exact
+  /// comparison/tie-breaking logic, but returns only the result consumed by
+  /// laneIdx. Callers gate this method with PostprocessSupportsLaneOwnedTopK.
+  template <typename DataType, typename InputType, int VecSize, int K, typename KP>
+  __forceinline__ __device__ static void applyForLane(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType& laneTopKScore,
+                                                      int32_t& laneTopKExpertIdx, int32_t laneIdx,
+                                                      int32_t numExperts, int32_t topK,
+                                                      InputType const* ptrScores,
+                                                      KP const& params) {
+    DataType const minScore = DataType{-INFINITY};
+    DataType score[VecSize];
+    int32_t idx[VecSize];
+
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i) {
+      int32_t const expertIdx = i * WarpSize + laneIdx;
+      score[i] = expertIdx < numExperts ? static_cast<DataType>(ptrScores[expertIdx]) : minScore;
+      idx[i] = expertIdx;
+    }
+
+    PreprocessPolicy_::apply(warp, score, idx, numExperts,
+                             params.mExpertSelectParams.mPreprocessParams);
+    topk::reduceTopKForLane<K>(warp, laneTopKScore, laneTopKExpertIdx, score, idx, minScore,
+                               laneIdx);
+    PostprocessPolicy_::applyForLane(warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK,
+                                     params.mExpertSelectParams.mPostprocessParams);
+  }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -584,6 +660,7 @@ static constexpr int NumExperts256Experts = 256;
 static constexpr int NumExperts384Experts = 384;
 static constexpr int NumExperts512Experts = 512;
 static constexpr int NumExperts576Experts = 576;
+static constexpr int NumExperts896Experts = 896;
 static constexpr int NumExperts1024Experts = 1024;
 static constexpr int MaxSupportedExperts = 2048;
 
@@ -619,6 +696,8 @@ inline int32_t getMaxNumExperts(int32_t numExperts) {
     return NumExperts512Experts;
   } else if (numExperts <= NumExperts576Experts) {
     return NumExperts576Experts;
+  } else if (numExperts <= NumExperts896Experts) {
+    return NumExperts896Experts;
   } else if (numExperts <= NumExperts1024Experts) {
     return NumExperts1024Experts;
   } else if (numExperts <= MaxSupportedExperts) {
@@ -709,7 +788,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
                          Tier<512, 32>,   // 512-expert models with topK 23..32
                          Tier<576, 8>,    // Customized model with 576 experts
                          Tier<768, 32>,   // 576..768 experts with high topK
-                         Tier<1024, 32>,  // 768..1024 experts with high topK
+                         Tier<896, 16>,   // 769..896 experts with topK <=16
+                         Tier<1024, 32>,  // 896..1024 experts with high topK
                          Tier<2048, 32>   // Large-expert fallback
                          >;
 };
@@ -732,7 +812,8 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          Tier<384, 8>,  // Kimi K2 (384 experts)
                          Tier<512, 8>,  // DeepSeek nGroup≤1 (256 experts → E512 fallback)
                          Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
-                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 512)
+                         Tier<896, 16>,  // 513..896 experts with topK <=16
+                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 896)
                          >;
 };
 
@@ -863,6 +944,10 @@ struct DefaultRoutingLaunchConfig {
   } else if (data.mNumExperts <= NumExperts576Experts) {                                           \
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
                                  stream, NoOpPreprocess, NoOpPostprocess, NumExperts576Experts,    \
+                                 NumTop8Experts);                                                  \
+  } else if (data.mNumExperts <= NumExperts896Experts) {                                           \
+    LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, NoOpPreprocess, NoOpPostprocess, NumExperts896Experts,    \
                                  NumTop8Experts);                                                  \
   } else if (data.mNumExperts <= NumExperts1024Experts) {                                          \
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
