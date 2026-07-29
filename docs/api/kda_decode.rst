@@ -45,4 +45,5 @@ implementation.
 .. autosummary::
     :toctree: ../generated
 
+    fused_kda_decode
     recurrent_kda
