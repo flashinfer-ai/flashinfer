@@ -252,9 +252,6 @@ Topology Probing and Backend Selection
 .. autosummary::
     :toctree: ../generated
 
-    resolve_ulysses_backend
-    decide_ulysses_backend
-    probe_ulysses_rank_topology
     UlyssesBackendDecision
     UlyssesRankTopology
     UlyssesBackendError
@@ -271,6 +268,12 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
     init_ulysses_a2a
     dispose_ulysses_a2a
     ulysses_a2a
+
+.. autofunction:: resolve_ulysses_backend
+
+.. autofunction:: decide_ulysses_backend
+
+.. autofunction:: probe_ulysses_rank_topology
 
 MNNVL (Multi-Node NVLink)
 -------------------------
