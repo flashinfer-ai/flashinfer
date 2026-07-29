@@ -430,6 +430,96 @@ def _mxfp8_quant_matrix(x):
     return q, scale.view(torch.uint8).reshape(x.shape[0], x.shape[1] // 32)
 
 
+def _mxfp4_quant_dequant_matrix(x):
+    """Quantize/dequantize one logical MXFP4 matrix with linear UE8M0 scales."""
+    one = torch.tensor([1.0], device=x.device)
+    q, sf = fp4_quantize(
+        x.to(torch.bfloat16),
+        global_scale=one,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=False,
+    )
+    deq = e2m1_and_ufp8sf_scale_to_float(
+        q.cpu(),
+        sf.cpu().view(torch.uint8).reshape(-1),
+        (1.0 / one).cpu(),
+        32,
+        0,
+        False,
+    )
+    return deq.reshape(x.shape).to(x.device)
+
+
+def _mxfp4_snap(t: torch.Tensor, *, bf16_activation: bool) -> torch.Tensor:
+    if t.dim() == 2:
+        if bf16_activation:
+            return t.to(torch.bfloat16)
+        q, sf = _mxfp8_quant_matrix(t.to(torch.bfloat16))
+        return _block_fp8_dequant(q, sf, QuantVariant.MxFp8).to(torch.bfloat16)
+    return torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in t]).to(
+        torch.bfloat16
+    )
+
+
+def _mxfp4_act_pack(x, selected_experts, final_scales, *, variant: QuantVariant):
+    q, sf = TrtllmFp4Config.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
+def _mxfp4_act_pack_logits(x, routing_logits, routing_bias, *, variant):
+    q, sf = TrtllmFp4Config.prepare_activations(x, variant=variant)
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=sf,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
+def _mxfp4_reference(
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    variant,
+):
+    if variant is QuantVariant.MXFP4:
+        x_q, x_sf = _mxfp8_quant_matrix(x)
+        x32 = _block_fp8_dequant(x_q, x_sf, QuantVariant.MxFp8)
+    else:
+        x32 = x.float()
+    w1_32 = torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in w1])
+    w2_32 = torch.stack([_mxfp4_quant_dequant_matrix(expert) for expert in w2])
+    final_scales = final_scales.to(torch.bfloat16).float()
+    out = torch.zeros_like(x32)
+    for local_e in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == local_e + expert_offset)
+        if token.numel() == 0:
+            continue
+        up = x32[token] @ w1_32[local_e, :intermediate_size].t()
+        gate = x32[token] @ w1_32[local_e, intermediate_size:].t()
+        inter = F.silu(gate) * up
+        if variant is QuantVariant.MXFP4:
+            inter_q, inter_sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
+            inter = _block_fp8_dequant(inter_q, inter_sf, QuantVariant.MxFp8)
+        else:
+            inter = inter.to(torch.bfloat16).float()
+        out[token] += final_scales[token, slot, None] * (inter @ w2_32[local_e].t())
+    return out
+
+
 def _block_fp8_act_pack(x, selected_experts, final_scales, *, variant):
     q, sf = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
     return MoEActivationPack(
@@ -655,7 +745,39 @@ _DTYPE = {
         atol_frac=0.05,
         rtol=0.3,
     ),
-    # MXFP4 / MXINT4 add one entry each as their runners are wired upstream.
+    QuantVariant.MXFP4: DTypeHandler(
+        variant=QuantVariant.MXFP4,
+        candidate_configs=(TrtllmFp4Config,),
+        snap=lambda t: _mxfp4_snap(t, bf16_activation=False),
+        make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
+            x, ids, weights, variant=QuantVariant.MXFP4
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _mxfp4_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.MXFP4
+        ),
+        reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.MXFP4),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
+    ),
+    QuantVariant.W4A16: DTypeHandler(
+        variant=QuantVariant.W4A16,
+        candidate_configs=(TrtllmFp4Config,),
+        snap=lambda t: _mxfp4_snap(t, bf16_activation=True),
+        make_act_pack=lambda x, ids, weights: _mxfp4_act_pack(
+            x, ids, weights, variant=QuantVariant.W4A16
+        ),
+        make_act_pack_logits=lambda x, logits, bias: _mxfp4_act_pack_logits(
+            x, logits, bias, variant=QuantVariant.W4A16
+        ),
+        reference=lambda *args: _mxfp4_reference(*args, variant=QuantVariant.W4A16),
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=0.05,  # provisional; recalibrate over the expanded SM100 sweep
+        rtol=0.3,
+    ),
+    # MXINT4 adds one entry when its runner is wired upstream.
 }
 
 # Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
@@ -744,6 +866,11 @@ _UNPACKED_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if RoutingInputMode.UnpackedPrecomputed in runner_cls.supported_routing_modes
 }
+_UNPACKED_VARIANT_IDS = tuple(
+    variant.name.lower()
+    for variant, handler in _DTYPE.items()
+    if any(cfg_cls in _UNPACKED_BACKENDS for cfg_cls in handler.candidate_configs)
+)
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
 # REQUIRES a bias; MiniMax2's is optional but we always supply one to exercise the bias path.
@@ -873,20 +1000,26 @@ def _gen(seed):
             variant for variant in fromlogits_variants if variant != "fp8pertensor"
         )
 
+    variant = (
+        rng.choice(fromlogits_variants)
+        if fromlogits
+        else rng.choice(_UNPACKED_VARIANT_IDS)
+        if unpacked
+        else rng.choice(_PREROUTED_VARIANT_IDS)
+    )
+    # The legacy TRTLLM MXFP4 modes are validated only with BF16 router logits.
+    logits_dtype = (
+        "bf16"
+        if variant in ("mxfp4", "w4a16")
+        else ("fp32" if rng.random() < 0.25 else "bf16")
+    )
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
         intermediate=i,
         num_experts=ne,
         top_k=top_k,
-        # Each routing mode can use only variants with a capable runner.
-        variant=(
-            rng.choice(fromlogits_variants)
-            if fromlogits
-            else "nvfp4"
-            if unpacked
-            else rng.choice(_PREROUTED_VARIANT_IDS)
-        ),
+        variant=variant,
         route=rng.choice(_ROUTE),
         seed=seed,
         local_experts=local,
@@ -895,9 +1028,7 @@ def _gen(seed):
         routing_input_mode=(
             "fromlogits" if fromlogits else "unpacked" if unpacked else "prerouted"
         ),
-        logits_dtype="fp32"
-        if rng.random() < 0.25
-        else "bf16",  # #2796 fp32-logits axis
+        logits_dtype=logits_dtype,
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
@@ -1058,6 +1189,55 @@ _CURATED = [
         routing_input_mode="unpacked",
         unpacked_weights_dtype="fp32",
     ),  # Unpacked FP32 weights + nonzero EP offset; seed % 4 == 0 autotunes
+    Cfg(128, 1024, 512, 16, 4, "mxfp4", "uniform", 900_017),
+    Cfg(128, 1024, 512, 16, 4, "w4a16", "imbalanced", 900_018),
+    Cfg(
+        128,
+        1024,
+        512,
+        16,
+        4,
+        "mxfp4",
+        "uniform",
+        900_019,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+    ),
+    Cfg(
+        128,
+        1024,
+        512,
+        16,
+        4,
+        "w4a16",
+        "imbalanced",
+        900_021,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+    ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "mxfp4",
+        "uniform",
+        900_032,
+        routing_input_mode="unpacked",
+    ),
+    Cfg(
+        64,
+        1024,
+        512,
+        16,
+        4,
+        "w4a16",
+        "imbalanced",
+        900_036,
+        routing_input_mode="unpacked",
+        unpacked_weights_dtype="fp32",
+    ),
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}
@@ -1306,6 +1486,8 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
+    if handler.variant is QuantVariant.W4A16 and sm == 103:
+        pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
     # Backend *config classes* whose runner is registered in the live MoELayer registry AND valid
     # on this arch. A newly-wired backend lands here automatically.
     wired_backends = [
@@ -1380,9 +1562,9 @@ def test_unified_moe_fuzz(cfg):
             intermediate_size=cfg.intermediate,
             device=dev,
         )
-        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
-        # handler's variant explicitly to select the native scale/layout format.
-        if BackendCfg is TrtllmFp8BlockConfig:
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
+        if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = handler.variant
         elif BackendCfg is TrtllmFp8PerTensorConfig:
             prepare_kwargs.update(
@@ -1650,9 +1832,9 @@ def test_autotune_cache_coherence(base, variant):
             intermediate_size=I,
             device=dev,
         )
-        # TrtllmFp8BlockConfig is shared by DeepSeekFp8 and MxFp8, so pass the
-        # handler's variant explicitly to select the native scale/layout format.
-        if B is TrtllmFp8BlockConfig:
+        # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
+        # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
+        if B in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["variant"] = variant
         weight_pack.prepare_for(
             _BACKEND_RUNNERS[B].backend_key,

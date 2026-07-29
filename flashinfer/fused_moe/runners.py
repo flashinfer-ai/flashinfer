@@ -294,7 +294,7 @@ class CuteDslNvfp4Runner(MoERunner):
 
 
 class TrtllmFp4RoutedRunner(MoERunner):
-    """NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
+    """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
     plus the static weight/config kwargs that ``core.MoERunner.forward``
@@ -328,7 +328,11 @@ class TrtllmFp4RoutedRunner(MoERunner):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_quant_variants = (
+        QuantVariant.NVFP4,
+        QuantVariant.MXFP4,
+        QuantVariant.W4A16,
+    )
 
     def check_support(self) -> None:
         super().check_support()
@@ -336,6 +340,23 @@ class TrtllmFp4RoutedRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
+        variant = self.config.quant.variant
+        if variant in self.supported_quant_variants:
+            from ..utils import get_compute_capability
+
+            # Direct-runner guard: NVFP4/MXFP4 support SM100/SM103. W4A16
+            # remains SM100-only, matching the upstream SM103 xfail in #1754.
+            compute_capability = get_compute_capability(self.device)
+            supported = (
+                compute_capability in ((10, 0), (10, 3))
+                if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
+                else compute_capability == (10, 0)
+            )
+            if not supported:
+                raise NotImplementedError(
+                    f"TRTLLM {variant.name} is unsupported on "
+                    f"SM{compute_capability[0]}{compute_capability[1]}."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -355,9 +376,20 @@ class TrtllmFp4RoutedRunner(MoERunner):
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
 
-        # NVFP4: E2m1 activations + weights, no fp8 sub-quant.
-        self._dtype_act = DtypeTrtllmGen.E2m1
-        self._dtype_weights = DtypeTrtllmGen.E2m1
+        variant = config.quant.variant
+        if variant is QuantVariant.MXFP4:
+            dtype_act = DtypeTrtllmGen.MxE4m3
+            dtype_weights = DtypeTrtllmGen.MxE2m1
+        elif variant is QuantVariant.W4A16:
+            dtype_act = DtypeTrtllmGen.Bfloat16
+            dtype_weights = DtypeTrtllmGen.MxE2m1
+        else:
+            # Harmless construction default; check_support rejects unknown variants.
+            dtype_act = DtypeTrtllmGen.E2m1
+            dtype_weights = DtypeTrtllmGen.E2m1
+        self._variant = variant
+        self._dtype_act = dtype_act
+        self._dtype_weights = dtype_weights
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
 
         # enable_pdl=None means "auto" — resolve once here exactly like the
@@ -419,6 +451,113 @@ class TrtllmFp4RoutedRunner(MoERunner):
         )
         return inputs[0]
 
+    def _validate_fp4_tensors(
+        self,
+        act: MoEActivationPack,
+        view: dict,
+        hidden_size: int,
+    ) -> torch.Tensor | None:
+        num_tokens = act.hidden_states_q.shape[0]
+        if self._variant is QuantVariant.NVFP4:
+            if act.hidden_states_q.dtype != torch.uint8:
+                raise TypeError(
+                    "NVFP4 hidden_states_q must be packed uint8, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            scale = act.hidden_states_scale
+            expected_scale = (num_tokens, hidden_size // 16)
+            if (
+                scale is None
+                or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+                or tuple(scale.shape) != expected_scale
+            ):
+                got = None if scale is None else (scale.dtype, tuple(scale.shape))
+                raise ValueError(
+                    "NVFP4 hidden_states_scale must have shape "
+                    f"{expected_scale} and uint8/float8_e4m3fn storage, got {got}."
+                )
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e4m3fn)
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 16
+        elif self._variant is QuantVariant.MXFP4:
+            if act.hidden_states_q.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "MXFP4×MXFP8 hidden_states_q must be float8_e4m3fn, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            scale = act.hidden_states_scale
+            expected_scale = (num_tokens, hidden_size // 32)
+            if (
+                scale is None
+                or scale.dtype != torch.float8_e4m3fn
+                or tuple(scale.shape) != expected_scale
+            ):
+                got = None if scale is None else (scale.dtype, tuple(scale.shape))
+                raise ValueError(
+                    "MXFP4×MXFP8 hidden_states_scale must carry UE8M0 bytes in "
+                    f"a float8_e4m3fn tensor with shape {expected_scale}, got {got}."
+                )
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 32
+        else:
+            if act.hidden_states_q.dtype != torch.bfloat16:
+                raise TypeError(
+                    "TRTLLM W4A16 hidden_states_q must be bfloat16, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            if act.hidden_states_scale is not None:
+                raise ValueError("TRTLLM W4A16 does not consume hidden_states_scale.")
+            scale = None
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 32
+
+        expected_weights = {
+            "gemm1_weights": (
+                self._num_local_experts,
+                2 * self._intermediate_size,
+                hidden_size // 2,
+            ),
+            "gemm2_weights": (
+                self._num_local_experts,
+                hidden_size,
+                self._intermediate_size // 2,
+            ),
+        }
+        for name, expected in expected_weights.items():
+            tensor = view[name]
+            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be packed uint8 with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+
+        for name, expected in (
+            (
+                "gemm1_weights_scale",
+                (
+                    self._num_local_experts,
+                    2 * self._intermediate_size,
+                    hidden_size // sf_vec_size,
+                ),
+            ),
+            (
+                "gemm2_weights_scale",
+                (
+                    self._num_local_experts,
+                    hidden_size,
+                    self._intermediate_size // sf_vec_size,
+                ),
+            ),
+        ):
+            tensor = view[name]
+            if tensor.dtype != scale_dtype or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be {scale_dtype} with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+        return scale
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -446,13 +585,12 @@ class TrtllmFp4RoutedRunner(MoERunner):
         routing = self.config.routing
 
         num_tokens = act.hidden_states_q.shape[0]
-        hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
-
-        # trtllm-gen requires the nvfp4 activation scale as float8_e4m3fn; the
-        # canonical Pack may carry it as raw uint8 bytes.
-        hidden_states_scale = act.hidden_states_scale
-        if hidden_states_scale.dtype == torch.uint8:
-            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+        hidden_size = (
+            act.hidden_states_q.shape[1] * 2
+            if self._variant is QuantVariant.NVFP4
+            else act.hidden_states_q.shape[1]
+        )
+        hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
 
         output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
@@ -470,6 +608,14 @@ class TrtllmFp4RoutedRunner(MoERunner):
                 act, num_tokens, routing.num_experts, "TrtllmFp4RoutedRunner"
             )
             routing_logits = act.routing_logits
+            if (
+                self._variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+                and routing_logits.dtype != torch.bfloat16
+            ):
+                raise TypeError(
+                    f"{self._variant.name} FromLogits requires bfloat16 "
+                    f"routing_logits, got {routing_logits.dtype}."
+                )
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.int32
@@ -584,7 +730,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         return moe_inputs.to_list()
 
     def __hash__(self):
-        return hash(("trtllm_fp4_routed",))
+        return hash(("trtllm_fp4_routed", self._variant))
 
 
 # ---------------------------------------------------------------------------
