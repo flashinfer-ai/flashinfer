@@ -95,11 +95,13 @@ def is_cute_dsl_arch_supported(
             return False
         family = _family_fallback_arch(major, minor)
         if family is not None:
-            # Pin the DSL's default compile target before the first kernel
-            # compile; without this the DSL derives the target from the
-            # device and raises KeyError. An explicit user setting wins.
-            os.environ.setdefault("CUTE_DSL_ARCH", family)
-            return True
+            # The device's native arch is absent, but the DSL has the
+            # family-conditional target (e.g. ``sm_100f`` for an sm_107
+            # device); family-portable kernels compile and run correctly
+            # when the DSL targets it.
+            env = os.environ.get("CUTE_DSL_ARCH", "")
+            if env.replace("_", "").lower() == family.replace("_", "").lower():
+                return True
         return False
     except Exception:
         # Arch module layout changed or import failed: fall back to
@@ -127,8 +129,17 @@ def require_cute_dsl_arch(device, native_only: bool = False) -> None:
 
     major, minor = torch.cuda.get_device_capability(device)
     if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
+        hint = ""
+        if not native_only:
+            family = _family_fallback_arch(major, minor)
+            if family is not None:
+                hint = (
+                    f"; family-portable CuTe-DSL kernels can run on this device "
+                    f"when CUTE_DSL_ARCH={family} is exported in the environment "
+                    f"before the process starts (see the release notes)"
+                )
         raise NotImplementedError(
-            f"the installed CuTe DSL does not support sm_{major}{minor} on this device"
+            f"the installed CuTe DSL does not support sm_{major}{minor} on this device{hint}"
         )
 
 
