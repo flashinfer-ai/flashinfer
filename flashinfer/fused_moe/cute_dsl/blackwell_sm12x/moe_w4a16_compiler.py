@@ -1,13 +1,10 @@
-"""In-memory CuTe-DSL compile cache for the SM12x W4A16 fused MoE path.
+"""In-memory compile cache for the SM12x W4A16 CuTe-DSL kernels.
 
-FlashInfer-local stand-in for sparkinfer's ``_lib/compiler.py``. Upstream layers
-a spec-keyed memory cache, an on-disk object cache, and compile-progress
-telemetry over ``cute.compile``; the W4A16 kernel call sites only rely on the
-call surface (``KernelCompileSpec.from_key`` / ``from_facts`` plus
-``compile(kernel, *fakes, compile_spec=..., dsl_compile_options=...)``) and on
-memoization per compile spec. This module provides exactly that surface so the
-ported kernel code stays byte-comparable with upstream, backed by a plain
-process-local dict (FlashInfer's existing caching model for these kernels).
+Stand-in for sparkinfer's compiler module, which also has a disk cache and
+telemetry that the FlashInfer port does not need. It keeps the same call
+surface (``KernelCompileSpec`` plus a memoizing ``compile``) so the ported
+kernel code matches upstream, backed by a process-local dict like the rest
+of FlashInfer's kernel caching.
 """
 
 from __future__ import annotations
@@ -82,11 +79,10 @@ def compile(
     dsl_compile_options: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Memoizing wrapper over ``cute.compile`` keyed on the compile spec.
+    """Memoizing wrapper over ``cute.compile``.
 
-    Every W4A16 call site passes a ``compile_spec`` that fully identifies the
-    kernel specialization (upstream relies on the same property for its disk
-    cache), so the spec plus the DSL compile options is a sufficient cache key.
+    The compile spec fully identifies a kernel specialization, so it plus the
+    DSL compile options is a sufficient cache key.
     """
     import cutlass.cute as cute
 

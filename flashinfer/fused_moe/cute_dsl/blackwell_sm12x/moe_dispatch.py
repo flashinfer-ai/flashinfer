@@ -1941,9 +1941,8 @@ def _w4a16_workspace_geometry(
     fc2_c_tmp_elements = 1
     fc1_cols = (2 if is_gated else 1) * int(n)
     sms = get_num_sm(device)
-    # Size the route buffers for the power-of-2 numel capacity so route packing
-    # takes its shape-stable path (constant triton specialization across token
-    # counts) instead of degrading to exact-numel capacity.
+    # Size the route buffers for the power-of-2 capacity so route packing keeps
+    # a single triton specialization across token counts.
     routed_rows_capacity = route_pack_numel_capacity(
         int(routed_rows), topk=int(num_topk)
     )

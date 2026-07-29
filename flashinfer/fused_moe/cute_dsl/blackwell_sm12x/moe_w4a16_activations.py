@@ -1,10 +1,8 @@
-"""Shared activation metadata for the SM12x W4A16 fused MoE path.
+"""Activation metadata for the SM12x W4A16 fused MoE path.
 
-Ported from sparkinfer ``moe/_shared/kernels/activations.py``. FlashInfer's
-W4A16 family supports only ``silu`` and ``relu2`` (no target checkpoint pairs
-W4A16 with other activations), so ``SUPPORTED_MOE_ACTIVATIONS`` is narrowed
-here — this is the single enforcement point. The swiglu parameter helpers are
-kept verbatim so the kernel code stays byte-comparable with upstream.
+Ported from sparkinfer's shared activations module. FlashInfer's W4A16 family
+only serves silu and relu2, so the supported set is narrowed here. The swiglu
+parameter helpers are kept anyway so the kernel code matches upstream.
 """
 
 from __future__ import annotations
