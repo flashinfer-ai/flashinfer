@@ -2964,7 +2964,9 @@ class TmemSPResource(MemoryResource):
         packed_words: tuple[Any, ...] = ()
         local_sum_pair_0 = (Float32(0.0), Float32(0.0))
         local_sum_pair_1 = (Float32(0.0), Float32(0.0))
-        use_two_sum_pairs = not self.cfg.stage_kv_by_head_dim
+        use_two_sum_pairs = True  # staged D256: enable four independent sum chains
+        if cutlass.const_expr(self.cfg.use_ldtm_stat):
+            cute.nvgpu.sched_res_busy_xu64()
         for flat_idx in cutlass.range_constexpr(0, num_values, 2):
             if cutlass.const_expr(flat_idx >= 8):
                 delayed_idx = flat_idx - 8
@@ -2993,7 +2995,12 @@ class TmemSPResource(MemoryResource):
                         ftz=False,
                     )
 
+            if cutlass.const_expr(self.cfg.use_ldtm_stat):
+                # cfence prevents ptxas from regrouping the latency-hiding cadence.
+                cute.nvgpu.cfence()
             p0 = cute.math.exp2(fma_values[flat_idx], fastmath=True)
+            if cutlass.const_expr(self.cfg.use_ldtm_stat):
+                cute.nvgpu.cfence()
             if cutlass.const_expr(flat_idx + 8 < num_values):
                 future_idx = flat_idx + 8
                 chunk_idx = future_idx // tmem_x
@@ -3009,8 +3016,14 @@ class TmemSPResource(MemoryResource):
                     ftz=False,
                 )
                 fma_values += (fma_pair[0], fma_pair[1])
+            if cutlass.const_expr(self.cfg.use_ldtm_stat):
+                cute.nvgpu.cfence()
             p1 = cute.math.exp2(fma_values[flat_idx + 1], fastmath=True)
+            if cutlass.const_expr(self.cfg.use_ldtm_stat):
+                cute.nvgpu.cfence()
             p_values += (p0, p1)
+        if cutlass.const_expr(self.cfg.use_ldtm_stat):
+            cute.nvgpu.reset_sched_res_busy_xu64()
 
         for delayed_idx in cutlass.range_constexpr(num_values - 8, num_values, 2):
             if cutlass.const_expr(delayed_idx % 4 == 0):
@@ -4900,6 +4913,7 @@ class GmemOResource(MemoryResource):
         seq_coord_q: Int32,
         head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         correction_fused: cutlass.Constexpr[bool] = False,
+        wait_after_write: cutlass.Constexpr[bool] = True,
     ) -> None:
         """TMA store O from SMEM to GMEM.
 
@@ -4967,5 +4981,7 @@ class GmemOResource(MemoryResource):
             # Q tile coordinates. Keep commit paired with an actual store.
             if should_store:
                 prims.cp_async_bulk_commit_group()
-                if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
+                if cutlass.const_expr(
+                    self.cfg.gmem_o_store_wait_after_write and wait_after_write
+                ):
                     prims.cp_async_bulk_wait_group(0, read=True)

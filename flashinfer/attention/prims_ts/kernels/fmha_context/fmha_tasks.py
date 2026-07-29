@@ -2562,6 +2562,7 @@ def create_correction_epilogue_task_staged_head_dim(
                 vec_old_max, vec_new_max, _, vec_scale = v0.read_vec(
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                v0.release()
                 vd0.wait()
                 vd0.release()
                 to.wait()
@@ -2570,7 +2571,6 @@ def create_correction_epilogue_task_staged_head_dim(
                     vec_new_max=vec_new_max,
                     vec_scale=vec_scale,
                 )
-                v0.release()
                 to.release()
 
             v0.wait()
@@ -2598,8 +2598,8 @@ def create_correction_epilogue_task_staged_head_dim(
                 seq_coord_q=seq_coord_q,
                 head_dim_stage_idx=0,
                 correction_fused=True,
+                wait_after_write=False,
             )
-            so0.release()
 
             so1.acquire()
             so1.store_o(
@@ -2617,6 +2617,9 @@ def create_correction_epilogue_task_staged_head_dim(
                 head_dim_stage_idx=1,
                 correction_fused=True,
             )
+            # go1's wait drains both committed TMA groups. Keep both staging
+            # buffers owned until neither store can read from them.
+            so0.release()
             so1.release()
             to.release()
 
