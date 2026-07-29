@@ -124,15 +124,8 @@ _E8M0_K32_BF16_GLOBAL_COMPENSATION = float(2.0**119)
 _MAX_DIRECT_TOPK_ROUTE_M = 6
 _W4A16_SMALL_M_DIRECT_MAX_M = 8
 
-# TC-decode: a small-M decode specialization that runs on the packed W4A16
-# object (the same weights/scales the prefill GEMM uses). It reuses the packed
-# tensor-core MMA inner loop but folds the top-k sum into the FC2 store
-# epilogue, dropping the separate top-k-sum launch. It is always used within
-# its M range, with no opt-in switch.
-#
-# The route-packed GEMM overtakes TC-decode above m=4 on some SM12x cards, and
-# the crossover varies by card, so the cap is the largest value that wins or
-# ties on every card measured.
+# Largest m where TC-decode wins or ties the route-packed GEMM on every SM12x
+# card measured (the crossover varies by card).
 _TC_DECODE_MAX_M = 4
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
 
