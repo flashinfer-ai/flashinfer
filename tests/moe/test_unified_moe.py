@@ -649,13 +649,17 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="do_finalize=True"):
             runner.check_support()
 
-    def test_bf16_unfinalized_not_supported(self):
+    def test_bf16_unfinalized_not_supported(self, monkeypatch):
+        import flashinfer.utils as utils
+
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.BF16),
             execution=ExecutionConfig(do_finalize=False),
         )
         runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
         runner.config = cfg
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
         with pytest.raises(NotImplementedError, match="do_finalize=True"):
             runner.check_support()
 
@@ -1165,6 +1169,7 @@ def _bf16_dense_reference(
     LOCAL experts; a token routed to global id ``g`` uses local weight
     ``g - expert_offset``.
     """
+    final_scales = final_scales.to(torch.bfloat16).float()
     x32 = x.float()
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -2054,8 +2059,8 @@ class TestTrtllmFromLogitsPackingContract:
 
         torch.testing.assert_close(captured, eager)
 
-    def test_bf16_from_logits_ep_rejected(self):
-        act, weights, config, _ = _make_bf16_packs_and_config(
+    def test_bf16_from_logits_with_local_expert_offset(self):
+        act, weights, config, tensors = _make_bf16_packs_and_config(
             16,
             hidden_size=256,
             intermediate_size=512,
@@ -2065,15 +2070,33 @@ class TestTrtllmFromLogitsPackingContract:
             local_expert_offset=4,
             max_tokens=16,
         )
+        logits = torch.full(
+            (16, 8), -4.0, dtype=torch.float32, device=act.hidden_states_q.device
+        )
+        logits[:8, :4] = torch.randn_like(logits[:8, :4]) + 4.0
+        logits[8:, 4:] = torch.randn_like(logits[8:, 4:]) + 4.0
+        topk_weights, topk_ids = torch.topk(torch.softmax(logits, dim=-1), 2, dim=-1)
         logits_act = MoEActivationPack(
             hidden_states_q=act.hidden_states_q,
             hidden_states_scale=None,
             routing_input_mode=RoutingInputMode.FromLogits,
-            routing_logits=torch.randn(16, 8, device=act.hidden_states_q.device),
+            routing_logits=logits,
         )
         layer = MoELayer(config, device=act.hidden_states_q.device)
-        with pytest.raises(NotImplementedError, match="none of the usable backends"):
-            layer(logits_act, weights)
+        output = layer(logits_act, weights)
+        reference = _bf16_dense_reference(
+            tensors["x"],
+            tensors["w1"],
+            tensors["w2"],
+            topk_ids.to(torch.int32),
+            topk_weights,
+            512,
+            expert_offset=4,
+        )
+        assert torch.count_nonzero(reference)
+        torch.testing.assert_close(
+            output.float(), reference, rtol=BF16_RTOL, atol=BF16_ATOL
+        )
 
 
 # 6. prepare_trtllm_bf16_weights input contract

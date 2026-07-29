@@ -1234,12 +1234,9 @@ class TrtllmFp8PerTensorRunner(MoERunner):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            # The routed per-tensor op allocates its own expert-weight buffer;
-            # this placeholder only satisfies the generic MoeRunnerInputs and
-            # autotuner schemas.
-            expert_weights = act.topk_weights.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # The routed per-tensor op allocates its own expert-weight buffer
+            # and consumes only the packed topk_ids from this generic schema.
+            expert_weights = None
         else:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only FromLogits and "
@@ -1353,13 +1350,6 @@ class TrtllmBf16RoutedRunner(MoERunner):
         execution = config.execution
         self._num_local_experts = experts.local_num_experts or routing.num_experts
         self._local_expert_offset = experts.local_expert_offset
-        if (
-            self._local_expert_offset != 0
-            or self._num_local_experts != routing.num_experts
-        ):
-            # Keep packed routed EP available, but filter FromLogits before
-            # MoELayer enters runner packing/autotuning.
-            self.supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
@@ -1437,14 +1427,6 @@ class TrtllmBf16RoutedRunner(MoERunner):
 
         routing_input_mode = act.routing_input_mode
         if routing_input_mode == RoutingInputMode.FromLogits:
-            if (
-                self._local_expert_offset != 0
-                or self._num_local_experts != routing.num_experts
-            ):
-                raise NotImplementedError(
-                    "TrtllmBf16RoutedRunner FromLogits currently requires all "
-                    "experts to be local; EP routing is a separate contract."
-                )
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, type(self).__name__
             )

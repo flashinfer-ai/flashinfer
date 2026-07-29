@@ -735,7 +735,9 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
     )
 
     runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
-    packed = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights)).topk_ids
+    moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
+    packed = moe_inputs.topk_ids
+    assert moe_inputs.expert_weights is None
     assert torch.equal(packed >> 16, expected_ids)
     assert torch.equal(packed & 0xFFFF, expected_bits)
 
