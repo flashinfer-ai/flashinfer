@@ -90,6 +90,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
