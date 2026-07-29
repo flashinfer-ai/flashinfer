@@ -168,9 +168,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // block format's default dtype. Reject cubins that override that
       // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
       // scaling factors into a buffer sized for E4M3 factors.
-      if (tg::dtypeIsBlockFmt(options.mDtypeC)) {
-        if (options.mDtypeSfC != tg::dtypeGetBlockSfType(options.mDtypeC)) continue;
-      } else if (options.mDtypeSfC != Dtype::Void) {
+      //
+      // The published cubin packages predate BatchedGemmOptions::mDtypeSfC, so
+      // filter by kernel name instead: the offending kernels encode the linear
+      // FP32 output scale-factor dtype as the "E2m1xFp32" name token (present
+      // only in the sm_107a package). TODO: restore the typed mDtypeSfC check
+      // once packages carrying the field are published and pinned.
+      if (config.mFunctionName != nullptr &&
+          std::strstr(config.mFunctionName, "E2m1xFp32") != nullptr) {
         continue;
       }
       if (mOptions.usePerChannelScaling) {
