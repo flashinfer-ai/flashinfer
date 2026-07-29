@@ -15,6 +15,7 @@ from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
 from .moe_w4a16_compiler import (
     KernelCompileSpec,
+    clear_compile_cache,
     compile as cached_compile,
 )
 from .moe_w4a16_fp4_helpers import (
@@ -96,6 +97,9 @@ from .moe_w4a16_activations import (
 
 
 def raise_if_kernel_resolution_frozen(*args, **kwargs) -> None:
+    # No-op stand-in for sparkinfer's runtime_control freeze guard, which
+    # rejects new kernel compiles after serving starts. FlashInfer has no such
+    # serving phase, but the call sites are kept to match upstream.
     del args, kwargs
 
 
@@ -5011,7 +5015,7 @@ def _normalize_scale_format(scale_format: str) -> str:
         return _SCALE_FORMATS[scale_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "scale_format must be one of 'e4m3_k16', 'e8m0_k32', or 'e4m3_k32', "
+            "scale_format must be one of 'e4m3_k16' or 'e8m0_k32', "
             f"got {scale_format!r}"
         ) from exc
 
@@ -5767,6 +5771,7 @@ def clear_w4a16_kernel_cache() -> None:
     _FUSED_CACHE.clear()
     _ACTIVATION_CACHE.clear()
     _SUM_CACHE.clear()
+    clear_compile_cache()
 
 
 def compile_w4a16_activation(

@@ -68,6 +68,15 @@ class KernelCompileSpec:
         return KernelCompileSpec.from_facts(kernel_id, version, *facts)
 
 
+def _options_cache_key(options: Any) -> str:
+    """Structural key for DSL compile options (their default repr is
+    address-based, so it is useless as a cache key)."""
+    if options is None:
+        return "None"
+    state = vars(options) if hasattr(options, "__dict__") else options
+    return f"{type(options).__module__}.{type(options).__qualname__}:{state!r}"
+
+
 _COMPILE_CACHE: dict[tuple[str, str], Any] = {}
 _COMPILE_CACHE_LOCK = RLock()
 
@@ -88,7 +97,7 @@ def compile(
 
     if compile_spec is None:
         raise ValueError("compile() requires a compile_spec")
-    cache_key = (compile_spec.json_key, repr(dsl_compile_options))
+    cache_key = (compile_spec.json_key, _options_cache_key(dsl_compile_options))
     with _COMPILE_CACHE_LOCK:
         compiled = _COMPILE_CACHE.get(cache_key)
     if compiled is not None:

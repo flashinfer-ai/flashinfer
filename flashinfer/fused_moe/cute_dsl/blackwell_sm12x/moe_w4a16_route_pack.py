@@ -312,18 +312,22 @@ def pack_topk_routes_by_expert(
     capacity_route_blocks = (capacity_packed_routes + int(block_size) - 1) // int(
         block_size
     )
-    if packed_route_indices is not None and block_expert_ids is not None:
-        if (
-            int(packed_route_indices.numel()) < capacity_packed_routes
-            or int(block_expert_ids.numel()) < capacity_route_blocks
-        ):
-            numel_capacity = numel
-            capacity_packed_routes = max_packed_route_slots(
-                numel, int(block_size), int(num_experts)
-            )
-            capacity_route_blocks = (
-                capacity_packed_routes + int(block_size) - 1
-            ) // int(block_size)
+    # Degrade to the exact-numel capacity when any caller-provided buffer was
+    # sized for it (the pre-capacity contract) rather than raising.
+    if (
+        packed_route_indices is not None
+        and int(packed_route_indices.numel()) < capacity_packed_routes
+    ) or (
+        block_expert_ids is not None
+        and int(block_expert_ids.numel()) < capacity_route_blocks
+    ):
+        numel_capacity = numel
+        capacity_packed_routes = max_packed_route_slots(
+            numel, int(block_size), int(num_experts)
+        )
+        capacity_route_blocks = (capacity_packed_routes + int(block_size) - 1) // int(
+            block_size
+        )
     max_packed_routes = capacity_packed_routes
     max_route_blocks = capacity_route_blocks
     max_packed_routes = max(max_packed_routes, 1)

@@ -63,33 +63,6 @@ class W4A16PackedWeights:
     scale_format: str = "e4m3_k16"
 
 
-@dataclass(frozen=True)
-class W4A16ModelOptWeights:
-    w13: torch.Tensor
-    w13_scale: torch.Tensor
-    w13_global_scale: torch.Tensor
-    w2: torch.Tensor
-    w2_scale: torch.Tensor
-    w2_global_scale: torch.Tensor
-    workspace: torch.Tensor
-    hidden_size: int
-    intermediate_size: int
-    num_experts: int
-    is_gated: bool
-    params_dtype: torch.dtype
-    source_format: str = "modelopt"
-    weight_layout: str = "modelopt"
-    scale_format: str = "e4m3_k16"
-    micro_w13_scale: torch.Tensor | None = None
-    micro_w13_global_scale: torch.Tensor | None = None
-    micro_w2_scale: torch.Tensor | None = None
-    micro_w2_global_scale: torch.Tensor | None = None
-    # Physical order of the two fused FC1 halves in source W13. "w13" (logical,
-    # == "up_gate" physical) needs a row rotation before W4A16 SwiGLU; "w31"
-    # (== "gate_up") is already in the kernel-native order.
-    w13_layout: str = "w13"
-
-
 def _make_workspace(
     device: torch.device, *, max_blocks_per_sm: int = 4
 ) -> torch.Tensor:
@@ -225,24 +198,6 @@ def _process_nvfp4_packed_global_scale(
     return global_scale * (2.0 ** (exponent_bias - 7))
 
 
-def _process_nvfp4_micro_global_scale_from_packed(
-    packed_global_scale: torch.Tensor,
-    *,
-    a_dtype: torch.dtype,
-) -> torch.Tensor:
-    if a_dtype == torch.float16:
-        target_exponent = 5
-    elif a_dtype == torch.bfloat16:
-        target_exponent = 8
-    else:
-        raise TypeError(f"unsupported W4A16 activation dtype {a_dtype}")
-    fp4_exponent = 2
-    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
-    return (
-        (packed_global_scale * (2.0 ** (-exponent_bias))).to(torch.float32).contiguous()
-    )
-
-
 def _normalize_source_format(source_format: str) -> str:
     if source_format.lower() == "mxfp4_native":
         raise ValueError(
@@ -254,7 +209,7 @@ def _normalize_source_format(source_format: str) -> str:
         return _SOURCE_FORMATS[source_format.lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of 'modelopt_nvfp4', "
+            "source_format must be one of 'modelopt', "
             "'fp4_e8m0_k32', or 'compressed_tensors', "
             f"got {source_format!r}"
         ) from exc
@@ -774,220 +729,6 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     )
 
 
-def prepare_w4a16_modelopt_native_weights(
-    w13_fp4: torch.Tensor,
-    w13_blockscale: torch.Tensor,
-    w13_global_scale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_blockscale: torch.Tensor,
-    w2_global_scale: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype = torch.bfloat16,
-    source_format: str = "modelopt",
-    w13_layout: str = "w13",
-) -> W4A16ModelOptWeights:
-    """Prepare W4A16 metadata while keeping ModelOpt FP4 weights native.
-
-    This is the memory-safe path for GLM serving that needs A4 prefill and A16
-    decode in the same process. It keeps the checkpoint FP4 tensors resident
-    instead of materializing a second full W4A16 packed copy.
-    """
-    source_format = _normalize_source_format(source_format)
-    if source_format not in _MODEL_OPT_NVFP4_FORMATS:
-        raise ValueError(
-            "native W4A16 ModelOpt weights require source_format 'modelopt_nvfp4'"
-        )
-    w13_layout = _normalize_w13_layout(w13_layout)
-
-    shape = validate_w4a16_packed_inputs(
-        w13_fp4,
-        w13_global_scale,
-        w2_fp4,
-        w2_global_scale,
-        activation=activation,
-    )
-    num_experts = shape.num_experts
-    hidden_size = shape.hidden_size
-    intermediate_size = shape.intermediate_size
-    w13_rows = shape.w13_rows
-    is_gated = shape.is_gated
-
-    w13_scale = unswizzle_expert_scales(
-        w13_blockscale,
-        rows=w13_rows,
-        cols=hidden_size,
-    )
-    w2_scale = unswizzle_expert_scales(
-        w2_blockscale,
-        rows=hidden_size,
-        cols=intermediate_size,
-    )
-    native_w13_global_scale = _source_global_scale(
-        w13_global_scale,
-        source_format=source_format,
-    )
-    native_w2_global_scale = _source_global_scale(
-        w2_global_scale,
-        source_format=source_format,
-    )
-
-    # The W4A16 activation consumes FC1 output in gate/up logical order.
-    # Checkpoint-native ModelOpt GLM tensors are up/gate, while vLLM/FI can
-    # hand over gate/up tensors after its own W13 reorder. Keep that physical
-    # order explicit so source_format never implies a layout transformation.
-    w13_row_rotation = intermediate_size if is_gated and w13_layout == "w13" else None
-    packed_w13_scale, packed_w13_global_scale = _permute_nvfp4_scales(
-        w13_scale,
-        native_w13_global_scale,
-        size_k=hidden_size,
-        size_n=w13_rows,
-        a_dtype=params_dtype,
-        row_rotation=w13_row_rotation,
-    )
-    packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
-        w2_scale,
-        native_w2_global_scale,
-        size_k=intermediate_size,
-        size_n=hidden_size,
-        a_dtype=params_dtype,
-    )
-
-    return W4A16ModelOptWeights(
-        w13=w13_fp4,
-        w13_scale=packed_w13_scale,
-        w13_global_scale=packed_w13_global_scale,
-        w2=w2_fp4,
-        w2_scale=packed_w2_scale,
-        w2_global_scale=packed_w2_global_scale,
-        workspace=_make_workspace(w13_fp4.device, max_blocks_per_sm=4),
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        is_gated=is_gated,
-        params_dtype=params_dtype,
-        source_format=source_format,
-        micro_w13_scale=packed_w13_scale,
-        micro_w13_global_scale=_process_nvfp4_micro_global_scale_from_packed(
-            packed_w13_global_scale,
-            a_dtype=params_dtype,
-        ),
-        micro_w2_scale=packed_w2_scale,
-        micro_w2_global_scale=_process_nvfp4_micro_global_scale_from_packed(
-            packed_w2_global_scale,
-            a_dtype=params_dtype,
-        ),
-        w13_layout=w13_layout,
-    )
-
-
-def prepare_w4a16_e8m0_native_weights(
-    w13_fp4: torch.Tensor,
-    w13_e8m0_scale: torch.Tensor,
-    w13_global_scale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_e8m0_scale: torch.Tensor,
-    w2_global_scale: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype = torch.bfloat16,
-    w13_layout: str = "w13",
-) -> W4A16ModelOptWeights:
-    """Prepare native MXFP4 (E8M0 K/32) weights for the W4A16 path.
-
-    Keeps the FP4 weights resident as a single copy (``weight_layout="modelopt"``)
-    and carries two small scale forms so one object serves both kernels:
-    ``w13_scale``/``w2_scale`` are the packed E8M0 grid the main W4A16 GEMM reads
-    at med/large M, and ``micro_*`` are packed E8M0 grids in the native row order
-    that the small-M micro decode kernel reads. ``run_w4a16_moe`` routes small M
-    to micro and the rest to the main W4A16 kernel automatically.
-    """
-    w13_layout = _normalize_w13_layout(w13_layout)
-    shape = validate_w4a16_packed_inputs(
-        w13_fp4,
-        w13_global_scale,
-        w2_fp4,
-        w2_global_scale,
-        activation=activation,
-    )
-    num_experts = shape.num_experts
-    hidden_size = shape.hidden_size
-    intermediate_size = shape.intermediate_size
-    w13_rows = shape.w13_rows
-    is_gated = shape.is_gated
-    allow_w2_k_tail = intermediate_size % 32 != 0
-    padded_w13_scale_n = (
-        _e8m0_logical_tail_scale_n(w13_rows) if allow_w2_k_tail else w13_rows
-    )
-
-    w13_scale = _validate_e8m0_k32_scales(
-        w13_e8m0_scale,
-        rows=w13_rows,
-        cols=hidden_size,
-        name="w13_e8m0_scale",
-    )
-    w2_scale = _validate_e8m0_k32_scales(
-        w2_e8m0_scale,
-        rows=hidden_size,
-        cols=intermediate_size,
-        name="w2_e8m0_scale",
-        allow_k_tail=allow_w2_k_tail,
-    )
-    # Main-GEMM (med/large M) packed E8M0 scales. The "w13" (up_gate) layout
-    # needs the FC1 half-swap folded into the scale grid; the kernel applies the
-    # matching source_n_rotation to the native weights. micro reads the un-rotated
-    # grid and handles the layout itself (w13_gate_first).
-    w13_row_rotation = intermediate_size if (is_gated and w13_layout == "w13") else None
-    packed_w13_scale = _pack_e8m0_k32_scales(
-        w13_scale,
-        size_k=hidden_size,
-        size_n=w13_rows,
-        row_rotation=w13_row_rotation,
-        padded_size_n=padded_w13_scale_n,
-    )
-    micro_w13_scale = (
-        packed_w13_scale
-        if w13_row_rotation is None
-        else _pack_e8m0_k32_scales(
-            w13_scale,
-            size_k=hidden_size,
-            size_n=w13_rows,
-            padded_size_n=padded_w13_scale_n,
-        )
-    )
-    packed_w2_scale = _pack_e8m0_k32_scales(
-        w2_scale,
-        size_k=intermediate_size,
-        size_n=hidden_size,
-        allow_k_tail=allow_w2_k_tail,
-    )
-    # Storage-compatible single grid: micro reads the SAME packed _pack_e8m0_k32
-    # scales the main GEMM reads (no separate K/16 micro grid).
-    w13_global = w13_global_scale.contiguous()
-    w2_global = w2_global_scale.contiguous()
-    return W4A16ModelOptWeights(
-        w13=w13_fp4,
-        w13_scale=packed_w13_scale,
-        w13_global_scale=w13_global,
-        w2=w2_fp4,
-        w2_scale=packed_w2_scale,
-        w2_global_scale=w2_global,
-        workspace=_make_workspace(w13_fp4.device, max_blocks_per_sm=4),
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        is_gated=is_gated,
-        params_dtype=params_dtype,
-        source_format="fp4_e8m0_k32",
-        scale_format="e8m0_k32",
-        micro_w13_scale=micro_w13_scale,
-        micro_w13_global_scale=w13_global,
-        micro_w2_scale=packed_w2_scale,
-        micro_w2_global_scale=w2_global,
-        w13_layout=w13_layout,
-    )
-
-
 def prepare_w4a16_compressed_tensors_weights(
     w13_fp4: torch.Tensor,
     w13_blockscale: torch.Tensor,
@@ -1143,7 +884,7 @@ def prepare_w4a16_packed_weights(
 
 
 def make_w4a16_packed_buffers(
-    prepared: W4A16PackedWeights | W4A16ModelOptWeights,
+    prepared: W4A16PackedWeights,
     *,
     m: int,
     topk: int,
@@ -1163,13 +904,10 @@ def make_w4a16_packed_buffers(
 
 __all__ = [
     "W4A16PackedBuffers",
-    "W4A16ModelOptWeights",
     "W4A16PackedWeights",
     "make_w4a16_packed_buffers",
     "prepare_w4a16_compressed_tensors_weights",
-    "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fp4_e8m0_k32_weights",
-    "prepare_w4a16_modelopt_native_weights",
     "prepare_w4a16_modelopt_nvfp4_weights",
     "prepare_w4a16_packed_weights",
 ]
