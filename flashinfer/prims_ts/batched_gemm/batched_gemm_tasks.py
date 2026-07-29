@@ -1048,7 +1048,7 @@ def create_mma_task(
         if has_proxy:
             proxy.try_wait()
             proxy.wait()
-            proxy.consumer_work()
+            proxy_stage_idx = proxy.consumer_work()
         elif has_cast_a:
             smem_b_res.try_wait()
         else:
@@ -1087,8 +1087,20 @@ def create_mma_task(
                 tmem_cast_a_addr=tmem_cast_a_addr,
             )
         else:
-            desc_a_mma_base, smem_a_stage_ptr = smem_a_res.build_mma_desc_a()
-            desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
+            if has_proxy:
+                desc_a_mma_base, smem_a_stage_ptr = (
+                    smem_a_res.build_mma_desc_a_at_stage(
+                        pipeline_stage_idx=proxy_stage_idx
+                    )
+                )
+                desc_b_mma_base, smem_b_stage_ptr = (
+                    smem_b_res.build_mma_desc_b_at_stage(
+                        pipeline_stage_idx=proxy_stage_idx
+                    )
+                )
+            else:
+                desc_a_mma_base, smem_a_stage_ptr = smem_a_res.build_mma_desc_a()
+                desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
             if has_fused_sf:
                 desc_a_s2t_base, smem_sfa_stage_ptr = smem_sfa_res.build_sfa_s2t_desc()
                 desc_b_s2t_base = smem_sfb_res.build_sfb_s2t_desc()

@@ -330,8 +330,16 @@ class _DummyResource(MemoryResource):
     def build_mma_desc_a(self, stage_info):
         pass
 
+    @consumer_work_decorator(returns=("desc_a_mma_base", "smem_a_stage_ptr"))
+    def build_mma_desc_a_at_stage(self, stage_info, *, pipeline_stage_idx):
+        pass
+
     @consumer_work_decorator(returns=("desc_b_mma_base", "smem_b_stage_ptr"))
     def build_mma_desc_b(self, stage_info):
+        pass
+
+    @consumer_work_decorator(returns=("desc_b_mma_base", "smem_b_stage_ptr"))
+    def build_mma_desc_b_at_stage(self, stage_info, *, pipeline_stage_idx):
         pass
 
     # TmemSf producer/consumer
@@ -445,7 +453,25 @@ class _DummyResource(MemoryResource):
     ):
         pass
 
-def _res(name: str, **kwargs) -> _DummyResource:
+@dataclass(kw_only=True)
+class _DummyProxyResource(MemoryResource):
+    """Proxy stub whose consumer publishes one pipeline-stage token."""
+
+    consumer_stage_idx: TaskLocalVariable = TaskLocalVariable.uninitialized()
+
+    def __post_init__(self) -> None:
+        self.consumer_stage_idx = TaskLocalVariable(
+            dtype=cutlass.Int32,
+            default=cutlass.Int32(0),
+        )
+
+    @consumer_work_decorator(returns=consumer_stage_idx)
+    def consumer_work(self, stage_info):
+        pass
+
+def _res(name: str, **kwargs) -> MemoryResource:
+    if name == "Proxy":
+        return _DummyProxyResource(name=name, **kwargs)
     return _DummyResource(name=name, **kwargs)
 
 def _work_queue() -> WorkQueue:

@@ -230,9 +230,19 @@ class SmemAResource(MemoryResource):
     @cute.jit
     def build_mma_desc_a(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         """Build SMEM descriptor for MMA A operand (s128b swizzle)."""
-        stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_a_per_stage * stage_info.stage_idx
-        )
+        return self._build_mma_desc_a_impl(stage_info.stage_idx)
+
+    @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
+    @cute.jit
+    def build_mma_desc_a_at_stage(
+        self, stage_info: StageInfo, *, pipeline_stage_idx
+    ) -> tuple[Int64, Int64]:
+        """Build the A descriptor at the stage reported ready by the proxy."""
+        return self._build_mma_desc_a_impl(pipeline_stage_idx)
+
+    @cute.jit
+    def _build_mma_desc_a_impl(self, stage_idx) -> tuple[Int64, Int64]:
+        stage_base = self.smem_buf.subview(self.cfg.num_bytes_a_per_stage * stage_idx)
         if cutlass.const_expr(self.cfg.is_fp8_mma):
             desc_a_mma_base = prims.Tcgen05SmemDesc.build(
                 stage_base,
@@ -432,8 +442,20 @@ class SmemBResource(MemoryResource):
     @cute.jit
     def build_mma_desc_b(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         """Build SMEM descriptor for MMA B operand (s128b swizzle)."""
+        return self._build_mma_desc_b_impl(stage_info.stage_idx)
+
+    @consumer_work(returns=(desc_b_mma_base, smem_b_stage_ptr))
+    @cute.jit
+    def build_mma_desc_b_at_stage(
+        self, stage_info: StageInfo, *, pipeline_stage_idx
+    ) -> tuple[Int64, Int64]:
+        """Build the B descriptor at the stage reported ready by the proxy."""
+        return self._build_mma_desc_b_impl(pipeline_stage_idx)
+
+    @cute.jit
+    def _build_mma_desc_b_impl(self, stage_idx) -> tuple[Int64, Int64]:
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_b_smem_per_stage * stage_info.stage_idx
+            self.cfg.num_bytes_b_smem_per_stage * stage_idx
         )
         if cutlass.const_expr(self.cfg.has_cast_a):
             # The CastA-generated BF16 MMA path uses the B
@@ -686,17 +708,33 @@ class SmemGatherResource(MemoryResource):
     @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
     @cute.jit
     def build_mma_desc_a(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
-        desc, stage_ptr = self._build_mma_desc_impl(stage_info)
+        desc, stage_ptr = self._build_mma_desc_impl(stage_info.stage_idx)
+        return desc, stage_ptr
+
+    @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
+    @cute.jit
+    def build_mma_desc_a_at_stage(
+        self, stage_info: StageInfo, *, pipeline_stage_idx
+    ) -> tuple[Int64, Int64]:
+        desc, stage_ptr = self._build_mma_desc_impl(pipeline_stage_idx)
         return desc, stage_ptr
 
     @consumer_work(returns=(desc_b_mma_base, smem_b_stage_ptr))
     @cute.jit
     def build_mma_desc_b(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
-        desc, stage_ptr = self._build_mma_desc_impl(stage_info)
+        desc, stage_ptr = self._build_mma_desc_impl(stage_info.stage_idx)
+        return desc, stage_ptr
+
+    @consumer_work(returns=(desc_b_mma_base, smem_b_stage_ptr))
+    @cute.jit
+    def build_mma_desc_b_at_stage(
+        self, stage_info: StageInfo, *, pipeline_stage_idx
+    ) -> tuple[Int64, Int64]:
+        desc, stage_ptr = self._build_mma_desc_impl(pipeline_stage_idx)
         return desc, stage_ptr
 
     @cute.jit
-    def _build_mma_desc_impl(self, stage_info: StageInfo):
+    def _build_mma_desc_impl(self, stage_idx):
         """Build SMEM descriptor for MMA operand (s128b swizzle)."""
         is_operand_b = cutlass.const_expr(self._operand == "b")
         bytes_per_stage = (
@@ -705,7 +743,7 @@ class SmemGatherResource(MemoryResource):
             else self.cfg.num_bytes_a_per_stage
         )
 
-        stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
+        stage_base = self.smem_buf.subview(bytes_per_stage * stage_idx)
         if cutlass.const_expr(self.cfg.is_fp8_mma):
             if cutlass.const_expr(is_operand_b):
                 leading_byte_offset = max(1024, self.cfg.tile_n * 64)

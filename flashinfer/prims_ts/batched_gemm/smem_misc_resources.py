@@ -24,7 +24,9 @@ from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
+    TaskLocalVariable,
     WorkQueue,
+    consumer_work,
 )
 
 from .batched_gemm_config import BatchedGemmConfig
@@ -116,6 +118,14 @@ class ProxyClusterBarrierResource(MemoryResource):
     """
 
     cfg: Constexpr[BatchedGemmConfig]
+    consumer_stage_idx: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __post_init__(self) -> None:
+        self.consumer_stage_idx = TaskLocalVariable(
+            dtype=cutlass.Int32,
+            default=cutlass.Int32(0),
+            docs="Pipeline stage consumed by the cross-CTA proxy.",
+        )
 
     @cute.jit
     def producer_work(self, stage_info: StageInfo) -> None:
@@ -128,7 +138,9 @@ class ProxyClusterBarrierResource(MemoryResource):
         """
         prims.fence_proxy_async_release_sync_restrict()
 
+    @consumer_work(returns=consumer_stage_idx)
     @cute.jit
-    def consumer_work(self, stage_info: StageInfo) -> None:
-        """Make cross-CTA SMEM writes visible to the leader MMA task."""
+    def consumer_work(self, stage_info: StageInfo) -> cutlass.Int32:
+        """Make cross-CTA SMEM writes visible and publish the ready stage."""
         prims.fence_proxy_async_acquire_sync_restrict()
+        return stage_info.stage_idx

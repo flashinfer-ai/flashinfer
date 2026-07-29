@@ -427,7 +427,8 @@ def _make_pipeline_configs(cfg):
     # 2-CTA + gather: proxy barrier for cross-CTA sync
     if cfg.has_gather and cfg.has_cluster:
         proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
-            num_stages=max(cfg.num_stages_a, cfg.num_stages_b),
+            # validate_config() requires equal A/B depths for this path.
+            num_stages=cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * cfg.cluster_m,  # SyncTask warp × CTAs

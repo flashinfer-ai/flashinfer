@@ -216,6 +216,7 @@ class TestBf16Fc1GatherGPU:
         top_k=1,
         swap_ab=False,
         cluster_m=1,
+        problem_k=None,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -240,6 +241,7 @@ class TestBf16Fc1GatherGPU:
             tile_k=128,
             mma_n=tile_n,
             epi_tile_n=tile_n,
+            problem_k=problem_k,
             **uniform_pipeline_stage_overrides(pipeline_stages),
             **cfg,
         )
@@ -283,6 +285,18 @@ class TestBf16Fc1GatherGPU:
             pipeline_stages=4,
         )
 
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_gather_2cta_multistage_wrap(self, swap_ab):
+        """Cover two full turns of the four-stage 2-CTA LDGSTS pipeline."""
+        self._run(
+            tile_n=64,
+            swap_ab=swap_ab,
+            cluster_m=2,
+            num_experts=1,
+            num_tokens=64,
+            problem_k=1024,
+            pipeline_stages=4,
+        )
 class TestBf16Fc1SwiGLU:
 
     def _run_swiglu(

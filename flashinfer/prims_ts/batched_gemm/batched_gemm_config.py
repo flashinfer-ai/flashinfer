@@ -2378,6 +2378,16 @@ def _validate_pipeline_stage_counts(cfg: BatchedGemmConfig) -> None:
     if cfg.is_persistent:
         _validate_pipeline_stage_count(cfg, "num_stages_workid")
 
+    if (
+        cfg.has_gather
+        and cfg.has_cluster
+        and cfg.num_stages_a != cfg.num_stages_b
+    ):
+        raise ValueError(
+            "2-CTA gather requires num_stages_a == num_stages_b, got "
+            f"{cfg.num_stages_a} and {cfg.num_stages_b}"
+        )
+
 
 def _validate_output_store_dtype(cfg: BatchedGemmConfig) -> None:
     """Validate dtype_c against the output store formats implemented by GmemC."""

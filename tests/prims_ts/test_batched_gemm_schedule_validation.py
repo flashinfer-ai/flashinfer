@@ -250,6 +250,40 @@ def test_validation_rejects_zero_required_pipeline_stage_counts(stage_name):
 
 
 @pytest.mark.parametrize(
+    ("num_stages_a", "num_stages_b"),
+    ((3, 4), (4, 3)),
+)
+def test_validation_rejects_unequal_2cta_gather_pipeline_stages(
+    num_stages_a, num_stages_b
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        cluster_m=2,
+        route_act=2,
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        tile_k=128,
+        mma_k=16,
+        tile_n=64,
+        mma_n=64,
+        mma_m=256,
+        num_stages_a=num_stages_a,
+        num_stages_b=num_stages_b,
+    )
+
+    with pytest.raises(
+        ValueError, match="2-CTA gather requires num_stages_a == num_stages_b"
+    ):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
     "stage_name",
     (
         "num_stages_c_smem",
