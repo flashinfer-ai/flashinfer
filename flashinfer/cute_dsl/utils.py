@@ -98,9 +98,16 @@ def is_cute_dsl_arch_supported(
             # The device's native arch is absent, but the DSL has the
             # family-conditional target (e.g. ``sm_100f`` for an sm_107
             # device); family-portable kernels compile and run correctly
-            # when the DSL targets it.
-            env = os.environ.get("CUTE_DSL_ARCH", "")
-            if env.replace("_", "").lower() == family.replace("_", "").lower():
+            # when the DSL targets it. Ground truth is the target the DSL
+            # captured at first ``cutlass`` import (from ``CUTE_DSL_ARCH``),
+            # not ``os.environ`` now: an env var set after that import does
+            # not retarget the DSL, so checking the environment here would
+            # report supported while ``cute.compile`` still fails.
+            target = _dsl_captured_arch()
+            if target is None:
+                # Internal API unavailable: fall back to the env-var proxy.
+                target = os.environ.get("CUTE_DSL_ARCH", "")
+            if target.replace("_", "").lower() == family.replace("_", "").lower():
                 return True
         return False
     except Exception:
@@ -118,6 +125,18 @@ def _family_fallback_arch(major: int, minor: int) -> Optional[str]:
         name = f"sm_{major}0f"
         Arch[name]
         return name
+    except Exception:
+        return None
+
+
+def _dsl_captured_arch() -> Optional[str]:
+    r"""Return the compile target the DSL captured when ``cutlass`` was first
+    imported (e.g. ``"sm_100f"`` when ``CUTE_DSL_ARCH`` was exported before
+    the process started), or ``None`` if the internal API is unavailable."""
+    try:
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        return str(CuTeDSL._get_dsl().envar.arch)
     except Exception:
         return None
 
