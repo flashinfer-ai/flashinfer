@@ -649,6 +649,16 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="do_finalize=True"):
             runner.check_support()
 
+    def test_bf16_unfinalized_not_supported(self):
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.BF16),
+            execution=ExecutionConfig(do_finalize=False),
+        )
+        runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
+        runner.config = cfg
+        with pytest.raises(NotImplementedError, match="do_finalize=True"):
+            runner.check_support()
+
     def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
         import flashinfer.utils as utils
 

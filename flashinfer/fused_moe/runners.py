@@ -1324,6 +1324,10 @@ class TrtllmBf16RoutedRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only do_finalize=True."
+            )
         from ..utils import get_compute_capability
 
         major, minor = get_compute_capability(self.device)
