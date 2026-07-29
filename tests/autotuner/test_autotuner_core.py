@@ -1283,7 +1283,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
     """_make_tuning_config must return configs whose topk_ids initializer is the
     same object across calls for the same num_experts.
     """
-    fn = core_mod.get_trtllm_moe_sm100_module
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
         mock_module = MagicMock()
