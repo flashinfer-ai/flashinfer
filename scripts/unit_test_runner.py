@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -47,6 +48,13 @@ EXIT_HELP = """exit codes:
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return int(value) if value is not None else default
+
+
+def _pytest_command_prefix() -> tuple[str, ...]:
+    try:
+        return tuple(shlex.split(os.environ.get("PYTEST_COMMAND_PREFIX", "")))
+    except ValueError as error:
+        raise RunnerStateError(f"invalid PYTEST_COMMAND_PREFIX: {error}") from error
 
 
 def _configure_output() -> None:
@@ -144,13 +152,16 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--test-path",
         type=Path,
-        default=Path(os.environ.get("TEST_PATH", "tests/")),
+        default=Path(os.environ.get("TEST_PATH") or "tests/"),
         help="pytest collection scope (TEST_PATH; default: tests/)",
     )
     parser.add_argument(
         "--sanity-test",
         action="store_true",
-        help="select every SAMPLE_RATE-th node using deterministic SAMPLE_OFFSET",
+        help=(
+            "globally select every SAMPLE_RATE-th collected node using a zero-based "
+            "SAMPLE_OFFSET (defaults: SAMPLE_RATE=5, SAMPLE_OFFSET=0)"
+        ),
     )
     parser.add_argument(
         "--workers",
@@ -161,8 +172,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--unit-timeout-seconds",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_TIMEOUT_SECONDS", 3600),
-        help="cumulative unit timeout; 0 disables (UNIT_TEST_TIMEOUT_SECONDS; default: 3600)",
+        default=_env_int("UNIT_TEST_TIMEOUT_SECONDS", 14400),
+        help="cumulative unit timeout; 0 disables (UNIT_TEST_TIMEOUT_SECONDS; default: 14400)",
     )
     parser.add_argument(
         "--timeout-grace-seconds",
@@ -179,8 +190,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--deadline-seconds",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_DEADLINE_SECONDS", 7200),
-        help="shared attempt deadline; 0 disables (UNIT_TEST_DEADLINE_SECONDS; default: 7200)",
+        default=_env_int("UNIT_TEST_DEADLINE_SECONDS", 0),
+        help="shared attempt deadline; 0 disables (UNIT_TEST_DEADLINE_SECONDS; default: 0)",
     )
 
 
@@ -254,6 +265,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             "UNIT_TEST_TIMEOUT_GRACE_SECONDS or --timeout-grace-seconds"
         )
 
+    pytest_command_prefix = _pytest_command_prefix()
     profile = args.timing_profile or _auto_profile()
     planning = PlanningOptions(
         profile=profile,
@@ -293,8 +305,10 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             selection=selection,
             planning=planning,
             collection_timeout_seconds=collection_timeout,
+            collection_grace_seconds=args.timeout_grace_seconds,
             attempt_settings=attempt if args.command == "run" else None,
             operation_started_at=operation_started_at,
+            pytest_command_prefix=pytest_command_prefix,
         )
     )
     print(("Created" if created else "Using") + f" plan in {junit_dir}", flush=True)
@@ -347,6 +361,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         monitor_memory=os.environ.get("MONITOR_TEST_MEMORY", "true").lower()
         not in {"0", "false", "no"},
         memory_interval=float(os.environ.get("MEMORY_MONITOR_INTERVAL", "2")),
+        pytest_command_prefix=pytest_command_prefix,
     )
     return execute_shard(
         repo_root=REPO_ROOT,

@@ -82,3 +82,35 @@ def test_unselected():
         for prop in testcases[0].findall("./properties/property")
     }
     assert properties["pytest_nodeid"] == selected_node
+
+
+def test_plugin_marks_every_node_from_a_solo_source(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_solo.py"
+    test_file.write_text(
+        """\
+import pytest
+
+@pytest.mark.solo
+def test_marked():
+    pass
+
+def test_same_source():
+    pass
+""",
+        encoding="utf-8",
+    )
+    collection_path = tmp_path / "collection.json"
+
+    collected = _pytest(
+        tmp_path,
+        "--strict-markers",
+        "--collect-only",
+        f"--flashinfer-collection-json={collection_path}",
+        str(test_file),
+    )
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    collection = json.loads(collection_path.read_text(encoding="utf-8"))
+    assert len(collection["nodes"]) == 2
+    assert all(node["solo"] is True for node in collection["nodes"])
+    assert "PytestUnknownMarkWarning" not in collected.stdout + collected.stderr

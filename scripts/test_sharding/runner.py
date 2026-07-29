@@ -56,7 +56,6 @@ from .workers import BatchExecutionRequest, execute_batch
 
 
 _COLLECTION_HEARTBEAT_SECONDS = 30.0
-_COLLECTION_TERMINATION_GRACE_SECONDS = 5.0
 _LEASE_HEARTBEAT_SECONDS = 10.0
 
 
@@ -144,6 +143,7 @@ class ExecutionSettings:
     attempt: AttemptSettings
     monitor_memory: bool = True
     memory_interval: float = 2.0
+    pytest_command_prefix: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,8 +153,10 @@ class ManifestPreparation:
     selection: SelectionSettings
     planning: PlanningOptions
     collection_timeout_seconds: float | None = None
+    collection_grace_seconds: float = 5.0
     attempt_settings: AttemptSettings | None = None
     operation_started_at: float | None = None
+    pytest_command_prefix: tuple[str, ...] = ()
 
 
 def _report_shard_status(
@@ -200,15 +202,14 @@ def _wait_for_collection(
     *,
     test_path: Path,
     timeout_seconds: float | None,
+    grace_seconds: float,
 ) -> None:
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds if timeout_seconds is not None else None
     while process.poll() is None:
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
-            termination_signal = terminate_process_group(
-                process, _COLLECTION_TERMINATION_GRACE_SECONDS
-            )
+            termination_signal = terminate_process_group(process, grace_seconds)
             raise CollectionTimeoutError(
                 termination_signal, time.monotonic() - started_at
             )
@@ -219,9 +220,7 @@ def _wait_for_collection(
             process.wait(timeout=max(0.001, wait_seconds))
         except subprocess.TimeoutExpired:
             if deadline is not None and time.monotonic() >= deadline:
-                termination_signal = terminate_process_group(
-                    process, _COLLECTION_TERMINATION_GRACE_SECONDS
-                )
+                termination_signal = terminate_process_group(process, grace_seconds)
                 raise CollectionTimeoutError(
                     termination_signal, time.monotonic() - started_at
                 ) from None
@@ -234,7 +233,10 @@ def _wait_for_collection(
 
 
 def _collect_nodes(
-    repo_root: Path, test_path: Path, timeout_seconds: float | None
+    repo_root: Path,
+    test_path: Path,
+    timeout_seconds: float | None,
+    grace_seconds: float,
 ) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="flashinfer-test-collection-") as directory:
         output = Path(directory) / "collection.json"
@@ -270,6 +272,7 @@ def _collect_nodes(
                 process,
                 test_path=test_path,
                 timeout_seconds=timeout_seconds,
+                grace_seconds=grace_seconds,
             )
         if process.returncode != 0 or not output.exists():
             diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
@@ -314,6 +317,7 @@ def _selected_nodes(
             base_function=node["base_function"],
             order=int(node["order"]),
             shard_group=node.get("shard_group"),
+            solo=bool(node.get("solo", False)),
         )
         for node in raw_nodes
     ]
@@ -346,6 +350,7 @@ def _write_new_manifest(
                 test_path=request.selection.test_path,
                 selection=request.selection.to_dict(),
                 planning_options=request.planning.to_dict(),
+                pytest_command_prefix=request.pytest_command_prefix,
             )
             _verify_collection(concurrent, nodes)
             return concurrent, Plan.from_dict(concurrent["plan"]), False
@@ -381,6 +386,7 @@ def prepare_manifest(
             test_path=test_path,
             selection=selection_value,
             planning_options=planning.to_dict(),
+            pytest_command_prefix=request.pytest_command_prefix,
         )
         existing_plan = Plan.from_dict(existing["plan"])
     if existing is None:
@@ -422,7 +428,12 @@ def prepare_manifest(
         junit_dir, collection_timeout_seconds
     )
     try:
-        raw_nodes = _collect_nodes(repo_root, test_path, collection_timeout_seconds)
+        raw_nodes = _collect_nodes(
+            repo_root,
+            test_path,
+            collection_timeout_seconds,
+            request.collection_grace_seconds,
+        )
     except CollectionTimeoutError as error:
         if existing_plan is not None:
             error.record_existing_results(publish_summary(junit_dir, existing_plan))
@@ -445,6 +456,7 @@ def prepare_manifest(
             plan=plan,
             selection=selection_value,
             estimate_files=_estimate_checksums(repo_root),
+            pytest_command_prefix=request.pytest_command_prefix,
         )
     )
     return _write_new_manifest(
@@ -743,6 +755,39 @@ class _UnitTimer:
 
 
 @dataclass
+class _ExecutionGate:
+    condition: threading.Condition = field(default_factory=threading.Condition)
+    regular_active: int = 0
+    solo_active: bool = False
+    solo_waiting: int = 0
+
+    def acquire(self, *, solo: bool) -> None:
+        with self.condition:
+            if solo:
+                self.solo_waiting += 1
+                try:
+                    self.condition.wait_for(
+                        lambda: not self.solo_active and self.regular_active == 0
+                    )
+                    self.solo_active = True
+                finally:
+                    self.solo_waiting -= 1
+                return
+            self.condition.wait_for(
+                lambda: not self.solo_active and self.solo_waiting == 0
+            )
+            self.regular_active += 1
+
+    def release(self, *, solo: bool) -> None:
+        with self.condition:
+            if solo:
+                self.solo_active = False
+            else:
+                self.regular_active -= 1
+            self.condition.notify_all()
+
+
+@dataclass
 class _ShardExecutor:
     repo_root: Path
     junit_dir: Path
@@ -752,7 +797,9 @@ class _ShardExecutor:
     attempt: AttemptRecord
     devices: list[str | None]
     heartbeat: _LeaseHeartbeat
+    solo_sources: frozenset[str]
     work: queue.Queue[Unit] = field(default_factory=queue.Queue)
+    execution_gate: _ExecutionGate = field(default_factory=_ExecutionGate)
     infrastructure_errors: list[str] = field(default_factory=list)
     interruption_reasons: set[str] = field(default_factory=set)
     errors_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -796,12 +843,18 @@ class _ShardExecutor:
                 unit = self.work.get_nowait()
             except queue.Empty:
                 return
+            solo = self._unit_is_solo(unit)
+            self.execution_gate.acquire(solo=solo)
             try:
-                self._execute_unit(index, unit)
+                self._execute_unit(index, unit, solo=solo)
             finally:
+                self.execution_gate.release(solo=solo)
                 self.work.task_done()
 
-    def _execute_unit(self, worker_index: int, unit: Unit) -> None:
+    def _unit_is_solo(self, unit: Unit) -> bool:
+        return any(batch.source_file in self.solo_sources for batch in unit.batches)
+
+    def _execute_unit(self, worker_index: int, unit: Unit, *, solo: bool) -> None:
         claim_path = claims_dir(self.junit_dir) / f"{unit.id}.json"
         prior_elapsed = recover_unit_elapsed(
             self.attempt_path,
@@ -817,7 +870,7 @@ class _ShardExecutor:
             active_started_at=time.time(),
         )
         try:
-            self._execute_unit_batches(worker_index, unit, timer)
+            self._execute_unit_batches(worker_index, unit, timer, solo=solo)
         finally:
             write_unit_elapsed(
                 self.attempt_path,
@@ -832,6 +885,8 @@ class _ShardExecutor:
         worker_index: int,
         unit: Unit,
         timer: _UnitTimer,
+        *,
+        solo: bool,
     ) -> None:
         for batch_position, batch in enumerate(unit.batches):
             if batch_is_final(self.junit_dir, unit, batch):
@@ -852,9 +907,10 @@ class _ShardExecutor:
                         timeout_reason=timeout_reason,
                         grace_seconds=self.execution.attempt.timeout_grace_seconds,
                         worker_index=worker_index,
-                        device=self.devices[worker_index],
+                        device=None if solo else self.devices[worker_index],
                         monitor_memory=self.execution.monitor_memory,
                         memory_interval=self.execution.memory_interval,
+                        pytest_command_prefix=self.execution.pytest_command_prefix,
                         abort_event=self.heartbeat.failed,
                     )
                 )
@@ -1123,6 +1179,7 @@ def execute_shard(
         attempt=attempt,
         devices=devices,
         heartbeat=leases.heartbeat,
+        solo_sources=frozenset(node.source_file for node in plan.nodes if node.solo),
     )
     shard_executor.add_units(shard_units)
     try:

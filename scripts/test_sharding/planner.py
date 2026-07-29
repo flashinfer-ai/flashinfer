@@ -135,10 +135,28 @@ def build_plan(
         source_nodes[node.source_file].append(node)
 
     batches: list[Batch] = []
+    solo_sources = {node.source_file for node in nodes if node.solo}
     for source_file in sorted(source_nodes, key=lambda value: value.encode("utf-8")):
         overhead_ms = estimate_book.overhead_ms(source_file, options.profile)
         checkpoint_ms = max(options.checkpoint_seconds * 1000, 4 * overhead_ms)
         item_capacity = max(1, checkpoint_ms - overhead_ms)
+        if source_file in solo_sources:
+            batch_nodes = tuple(
+                sorted(source_nodes[source_file], key=lambda node: node.order)
+            )
+            nodeids = tuple(node.nodeid for node in batch_nodes)
+            item_ms = sum(duration_ms[nodeid] for nodeid in nodeids)
+            batches.append(
+                Batch(
+                    id=_stable_id("batch", nodeids),
+                    source_file=source_file,
+                    nodeids=nodeids,
+                    estimated_ms=overhead_ms + item_ms,
+                    overhead_ms=overhead_ms,
+                    oversized=item_ms > item_capacity,
+                )
+            )
+            continue
         atomic = _atomic_items(source_nodes[source_file], duration_ms)
         item_bins = _pack_with_soft_target(
             atomic,
@@ -166,8 +184,15 @@ def build_plan(
                 )
             )
 
-    unit_bins = _pack_with_soft_target(
-        batches,
+    solo_batches = sorted(
+        (batch for batch in batches if batch.source_file in solo_sources),
+        key=lambda batch: batch.id.encode("utf-8"),
+    )
+    regular_batches = [
+        batch for batch in batches if batch.source_file not in solo_sources
+    ]
+    unit_bins = [[batch] for batch in solo_batches] + _pack_with_soft_target(
+        regular_batches,
         options.target_unit_seconds * 1000,
         lambda batch: batch.estimated_ms,
         lambda batch: batch.id,
@@ -214,16 +239,30 @@ def build_plan(
     return plan
 
 
-def _estimated_worker_loads(units: Sequence[Unit], workers: int) -> list[int]:
+def _estimated_worker_loads(
+    units: Sequence[Unit],
+    workers: int,
+    solo_sources: frozenset[str],
+) -> list[int]:
     if workers <= 0:
         raise ValueError("workers must be positive")
+    solo_units = [unit for unit in units if _unit_is_solo(unit, solo_sources)]
+    regular_units = [unit for unit in units if not _unit_is_solo(unit, solo_sources)]
     bins = _lpt_bins(
-        units,
+        regular_units,
         workers,
         lambda unit: unit.estimated_ms,
         lambda unit: unit.id,
     )
-    return [sum(unit.estimated_ms for unit in worker_units) for worker_units in bins]
+    exclusive_ms = sum(unit.estimated_ms for unit in solo_units)
+    return [
+        exclusive_ms + sum(unit.estimated_ms for unit in worker_units)
+        for worker_units in bins
+    ]
+
+
+def _unit_is_solo(unit: Unit, solo_sources: frozenset[str]) -> bool:
+    return any(batch.source_file in solo_sources for batch in unit.batches)
 
 
 def capacity_metrics(
@@ -240,27 +279,33 @@ def capacity_metrics(
     makespans: list[int] = []
     required_by_shard: dict[str, int | None] = {}
     deadline_ms = deadline_seconds * 1000
+    solo_sources = frozenset(node.source_file for node in plan.nodes if node.solo)
     for shard_index in range(plan.options.shard_count):
         units = [unit for unit in plan.units if unit.shard_index == shard_index]
         load = sum(unit.estimated_ms for unit in units)
         shard_loads[str(shard_index)] = load
         workers = max(1, int(configured.get(shard_index, 1)))
-        loads = _estimated_worker_loads(units, workers)
+        loads = _estimated_worker_loads(units, workers, solo_sources)
         worker_loads[str(shard_index)] = loads
         makespans.append(max(loads, default=0))
         if deadline_ms <= 0:
             required_by_shard[str(shard_index)] = None
         elif not units:
             required_by_shard[str(shard_index)] = 0
-        elif max(unit.estimated_ms for unit in units) > deadline_ms:
-            required_by_shard[str(shard_index)] = None
         else:
-            required = 1
-            while (
-                max(_estimated_worker_loads(units, required), default=0) > deadline_ms
-            ):
-                required += 1
-            required_by_shard[str(shard_index)] = required
+            regular_count = sum(not _unit_is_solo(unit, solo_sources) for unit in units)
+            required_by_shard[str(shard_index)] = next(
+                (
+                    candidate
+                    for candidate in range(1, max(1, regular_count) + 1)
+                    if max(
+                        _estimated_worker_loads(units, candidate, solo_sources),
+                        default=0,
+                    )
+                    <= deadline_ms
+                ),
+                None,
+            )
     required_values = list(required_by_shard.values())
     required_total = (
         sum(value for value in required_values if value is not None)

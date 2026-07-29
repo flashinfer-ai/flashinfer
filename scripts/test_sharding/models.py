@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 2
-ALGORITHM_VERSION = "lpt-ms-v2"
+SCHEMA_VERSION = 3
+ALGORITHM_VERSION = "lpt-ms-v3"
 
 
 def source_file_for_nodeid(nodeid: str) -> str:
@@ -27,10 +27,16 @@ class CollectedNode:
     base_function: str
     order: int
     shard_group: str | None = None
+    solo: bool = False
 
     @classmethod
     def from_nodeid(
-        cls, nodeid: str, order: int, shard_group: str | None = None
+        cls,
+        nodeid: str,
+        order: int,
+        shard_group: str | None = None,
+        *,
+        solo: bool = False,
     ) -> "CollectedNode":
         return cls(
             nodeid=nodeid,
@@ -38,6 +44,7 @@ class CollectedNode:
             base_function=base_function_for_nodeid(nodeid),
             order=order,
             shard_group=shard_group,
+            solo=solo,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +54,7 @@ class CollectedNode:
             "base_function": self.base_function,
             "order": self.order,
             "shard_group": self.shard_group,
+            "solo": self.solo,
         }
 
 
@@ -171,6 +179,10 @@ class Plan:
             for index, node in enumerate(self.nodes)
             if node.shard_group is not None
         }
+        solo_sources = sorted(
+            {node.source_file for node in self.nodes if node.solo},
+            key=lambda value: value.encode("utf-8"),
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "algorithm_version": ALGORITHM_VERSION,
@@ -181,6 +193,7 @@ class Plan:
                 for path, indexes in sorted(source_file_groups.items())
             ],
             "shard_groups": shard_groups,
+            "solo_sources": solo_sources,
             "units": [
                 {
                     "id": unit.id,
@@ -232,6 +245,7 @@ class Plan:
                         base_function=node["base_function"],
                         order=int(node["order"]),
                         shard_group=node.get("shard_group"),
+                        solo=bool(node.get("solo", False)),
                     )
                     for node in value["nodes"]
                 ),
@@ -255,6 +269,7 @@ class Plan:
             for group in value.get("source_files", [])
             for index in group["node_indexes"]
         }
+        solo_sources = {str(source) for source in value.get("solo_sources", [])}
         nodes = tuple(
             CollectedNode(
                 nodeid,
@@ -262,6 +277,7 @@ class Plan:
                 base_function_for_nodeid(nodeid),
                 index,
                 shard_groups.get(index),
+                source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
             )
             for index, nodeid in enumerate(nodeids)
         )

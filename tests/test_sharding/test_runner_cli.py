@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import shlex
 import subprocess
 import sys
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import unit_test_runner
 from scripts.test_sharding import runner
 from scripts.test_sharding.models import (
     Batch,
@@ -26,6 +28,104 @@ from scripts.test_sharding.workers import BatchExecution
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "unit_test_runner.py"
+
+
+def test_compatibility_defaults_disable_deadline_and_allow_four_hour_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UNIT_TEST_DEADLINE_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_TIMEOUT_SECONDS", raising=False)
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.deadline_seconds == 0
+    assert args.unit_timeout_seconds == 14400
+
+
+def test_explicit_zero_deadline_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNIT_TEST_DEADLINE_SECONDS", "60")
+
+    args = unit_test_runner._parser().parse_args(["run", "--deadline-seconds", "0"])
+
+    assert args.deadline_seconds == 0
+    clock = runner.DeadlineClock(started_at=100.0, limit_seconds=args.deadline_seconds)
+    assert clock.status_fields().endswith("deadline=disabled")
+
+
+def test_empty_test_path_environment_uses_default_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_PATH", "")
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.test_path == Path("tests/")
+
+
+def test_help_defines_global_zero_based_sanity_sampling(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        unit_test_runner._parser().parse_args(["run", "--help"])
+
+    assert exit_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "globally select every SAMPLE_RATE-th collected node" in help_text
+    assert "SAMPLE_RATE=5, SAMPLE_OFFSET=0" in help_text
+
+
+def test_pytest_command_prefix_wraps_batches_and_is_frozen_in_manifest(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+    record = tmp_path / "prefix-arguments.json"
+    wrapper = tmp_path / "prefix wrapper.py"
+    wrapper.write_text(
+        """\
+import json
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["PREFIX_RECORD"]).write_text(
+    json.dumps(sys.argv[1:]), encoding="utf-8"
+)
+os.execv(sys.argv[1], sys.argv[1:])
+""",
+        encoding="utf-8",
+    )
+    prefix = shlex.join([sys.executable, str(wrapper)])
+    environment = {
+        "PREFIX_RECORD": str(record),
+        "PYTEST_COMMAND_PREFIX": prefix,
+    }
+
+    created = _run(tmp_path, "run", suite, env_override=environment)
+
+    assert created.returncode == 0, created.stdout + created.stderr
+    forwarded = json.loads(record.read_text(encoding="utf-8"))
+    assert forwarded[:3] == [sys.executable, "-m", "pytest"]
+    manifest = json.loads(
+        (tmp_path / "junit" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["pytest_command_prefix"] == [sys.executable, str(wrapper)]
+
+    changed = _run(
+        tmp_path,
+        "run",
+        suite,
+        env_override={
+            **environment,
+            "PYTEST_COMMAND_PREFIX": shlex.join([sys.executable, "-u", str(wrapper)]),
+        },
+    )
+
+    assert changed.returncode == 3
+    assert "pytest_command_prefix" in changed.stderr
 
 
 def _run(
@@ -141,12 +241,38 @@ def test_slow_collection_reports_a_live_heartbeat(
     (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
     monkeypatch.setattr(runner, "_COLLECTION_HEARTBEAT_SECONDS", 0.05)
 
-    nodes = runner._collect_nodes(REPO_ROOT, suite, 5)
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 5, 5)
 
     assert len(nodes) == 1
     output = capsys.readouterr().out
     assert "RUNNER HEARTBEAT: state=collecting" in output
     assert f"test_path={suite}" in output
+
+
+def test_collection_termination_uses_configured_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    grace_values: list[float] = []
+
+    def terminate(_process, grace_seconds: float) -> str:
+        grace_values.append(grace_seconds)
+        return "SIGTERM"
+
+    monkeypatch.setattr(runner, "terminate_process_group", terminate)
+
+    with pytest.raises(runner.CollectionTimeoutError):
+        runner._wait_for_collection(
+            RunningProcess(),  # type: ignore[arg-type]
+            test_path=tmp_path,
+            timeout_seconds=0,
+            grace_seconds=17,
+        )
+
+    assert grace_values == [17]
 
 
 def test_final_status_reports_elapsed_against_deadline(
@@ -346,7 +472,7 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
     combined = result.stdout + result.stderr
     assert "PYTEST KILLED phase=collection reason=attempt-deadline" in combined
     assert "RUNNER STATUS: state=killed phase=collection" in combined
-    assert "signal=SIGTERM" in combined
+    assert "signal=SIGKILL" in combined
     assert "deadline_elapsed=" in combined
     assert "deadline=1s" in combined
 
@@ -455,6 +581,88 @@ def test_fails():
     )
     assert repeated.returncode == 1
     assert len(list((tmp_path / "junit" / "attempts").glob("attempt-*"))) == 1
+
+
+def test_solo_source_runs_exclusively_with_full_gpu_visibility(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "solo-state"
+    state.mkdir()
+    (suite / "test_solo.py").write_text(
+        """\
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.solo
+
+@pytest.fixture(scope="module", autouse=True)
+def exclusive_source():
+    state = Path(os.environ["SOLO_STATE"])
+    solo = state / "solo-active"
+    regular = state / "regular-active"
+    assert not regular.exists(), "regular batch overlapped solo setup"
+    solo.write_text("active", encoding="utf-8")
+    (state / "solo-devices").write_text(
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
+    )
+    time.sleep(1)
+    yield
+    time.sleep(1)
+    assert not regular.exists(), "regular batch overlapped solo teardown"
+    solo.unlink()
+
+def test_solo_one():
+    pass
+
+def test_solo_two():
+    pass
+""",
+        encoding="utf-8",
+    )
+    (suite / "test_regular.py").write_text(
+        """\
+import os
+import time
+from pathlib import Path
+
+def test_regular():
+    state = Path(os.environ["SOLO_STATE"])
+    solo = state / "solo-active"
+    regular = state / "regular-active"
+    assert not solo.exists(), "solo batch overlapped regular setup"
+    regular.write_text("active", encoding="utf-8")
+    (state / "regular-devices").write_text(
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""), encoding="utf-8"
+    )
+    try:
+        time.sleep(2)
+        assert not solo.exists(), "solo batch overlapped regular execution"
+    finally:
+        regular.unlink()
+""",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--workers",
+        "2",
+        env_override={
+            "CUDA_VISIBLE_DEVICES": "0,1",
+            "SOLO_STATE": str(state),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
+    assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
 
 
 def test_run_records_the_shared_attempt_before_pytest_collection(

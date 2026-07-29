@@ -203,6 +203,7 @@ class ManifestBuild:
     plan: Plan
     selection: dict[str, Any]
     estimate_files: dict[str, str | None]
+    pytest_command_prefix: tuple[str, ...] = ()
 
 
 def build_manifest(request: ManifestBuild) -> dict[str, Any]:
@@ -218,6 +219,7 @@ def build_manifest(request: ManifestBuild) -> dict[str, Any]:
         "collection_fingerprint": collection_fingerprint(plan),
         "test_path": str(test_path.resolve()),
         "selection": request.selection,
+        "pytest_command_prefix": list(request.pytest_command_prefix),
         "estimate_files": request.estimate_files,
         "plan": plan.to_dict(),
     }
@@ -230,6 +232,7 @@ def verify_manifest(
     test_path: Path,
     selection: dict[str, Any],
     planning_options: dict[str, Any],
+    pytest_command_prefix: tuple[str, ...] = (),
 ) -> None:
     mismatches: list[str] = []
     checks = {
@@ -240,6 +243,10 @@ def verify_manifest(
         ),
         "test_path": (manifest.get("test_path"), str(test_path.resolve())),
         "selection": (manifest.get("selection"), selection),
+        "pytest_command_prefix": (
+            tuple(manifest.get("pytest_command_prefix", ())),
+            pytest_command_prefix,
+        ),
         "planning_options": (
             manifest.get("plan", {}).get("options"),
             planning_options,

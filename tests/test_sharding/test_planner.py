@@ -18,8 +18,14 @@ def _node(
     order: int,
     *,
     shard_group: str | None = None,
+    solo: bool = False,
 ) -> CollectedNode:
-    return CollectedNode.from_nodeid(nodeid, order=order, shard_group=shard_group)
+    return CollectedNode.from_nodeid(
+        nodeid,
+        order=order,
+        shard_group=shard_group,
+        solo=solo,
+    )
 
 
 def test_plan_is_reproducible_and_covers_each_node_once(tmp_path: Path) -> None:
@@ -92,6 +98,73 @@ def test_shard_group_is_atomic_even_when_it_exceeds_checkpoint() -> None:
         "tests/test_grouped.py::test_grouped[1]",
     )
     assert grouped_batches[0].oversized is True
+
+
+def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
+    nodes = [
+        _node("tests/test_solo.py::test_case[0]", 0, solo=True),
+        _node("tests/test_solo.py::test_case[1]", 1, solo=True),
+        _node("tests/test_regular.py::test_case", 2),
+    ]
+    plan = build_plan(
+        nodes,
+        EstimateBook(
+            [DurationEstimate("profile", node.nodeid, 4.0, 1) for node in nodes]
+        ),
+        PlanningOptions(
+            profile="profile",
+            checkpoint_seconds=5,
+            target_unit_seconds=20,
+            shard_count=1,
+        ),
+    )
+
+    solo_units = [
+        unit
+        for unit in plan.units
+        if any(batch.source_file == "tests/test_solo.py" for batch in unit.batches)
+    ]
+    assert len(solo_units) == 1
+    assert len(solo_units[0].batches) == 1
+    assert solo_units[0].batches[0].nodeids == (
+        "tests/test_solo.py::test_case[0]",
+        "tests/test_solo.py::test_case[1]",
+    )
+    assert Plan.from_dict(plan.to_dict()) == plan
+
+
+def test_capacity_metrics_account_for_solo_exclusivity() -> None:
+    nodes = [
+        _node("tests/test_solo.py::test_case", 0, solo=True),
+        _node("tests/test_regular_a.py::test_case", 1),
+        _node("tests/test_regular_b.py::test_case", 2),
+    ]
+    plan = build_plan(
+        nodes,
+        EstimateBook(
+            [
+                DurationEstimate("profile", nodes[0].nodeid, 10.0, 1),
+                DurationEstimate("profile", nodes[1].nodeid, 8.0, 1),
+                DurationEstimate("profile", nodes[2].nodeid, 8.0, 1),
+            ]
+        ),
+        PlanningOptions(
+            profile="profile",
+            checkpoint_seconds=5,
+            target_unit_seconds=5,
+            shard_count=1,
+        ),
+    )
+
+    metrics = capacity_metrics(plan, {0: 2}, deadline_seconds=18)
+
+    assert metrics["total_estimated_load_ms"] == 26000
+    assert metrics["estimated_worker_load_ms"] == {"0": [18000, 18000]}
+    assert metrics["estimated_makespan_ms"] == 18000
+    assert metrics["required_workers_by_shard"] == {"0": 2}
+    assert capacity_metrics(plan, deadline_seconds=17)["required_workers_by_shard"] == {
+        "0": None
+    }
 
 
 def test_unknown_duration_uses_documented_fallback_order_and_floor() -> None:
@@ -272,7 +345,7 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     encoded = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
 
     assert Plan.from_dict(serialized) == plan
-    assert serialized["schema_version"] == 2
+    assert serialized["schema_version"] == 3
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded

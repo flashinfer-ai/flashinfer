@@ -43,6 +43,7 @@ class BatchExecutionRequest:
     device: str | None
     monitor_memory: bool
     memory_interval: float
+    pytest_command_prefix: tuple[str, ...] = ()
     abort_event: threading.Event | None = None
 
 
@@ -281,6 +282,7 @@ def _pytest_command(
     request: BatchExecutionRequest, artifacts: _BatchArtifacts
 ) -> list[str]:
     return [
+        *request.pytest_command_prefix,
         sys.executable,
         "-m",
         "pytest",

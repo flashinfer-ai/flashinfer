@@ -40,6 +40,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "shard_group(name): keep marked nodes from one source in one pytest batch",
     )
+    config.addinivalue_line(
+        "markers",
+        "solo: run every node from this source without overlapping another local unit",
+    )
     config._flashinfer_sharding = {  # type: ignore[attr-defined]
         "session_start": time.time(),
         "collection_complete": None,
@@ -63,6 +67,11 @@ def _marker_name(item: pytest.Item) -> str | None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
+    solo_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("solo") is not None
+    }
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
@@ -78,6 +87,7 @@ def pytest_collection_modifyitems(
                 base_function=node.base_function,
                 order=node.order,
                 shard_group=node.shard_group,
+                solo=item_path in solo_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")
