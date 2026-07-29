@@ -262,6 +262,10 @@ def test_xqa_mtp_decode_supports_hopper_q_len_two(monkeypatch):
     assert not is_supported(logits_soft_cap=1.0)
     assert not is_supported(fixed_split_size=1)
     assert not is_supported(has_jit_module=True)
+    monkeypatch.setattr(
+        flashinfer.decode, "get_compute_capability", lambda device: (8, 0)
+    )
+    assert not is_supported()
 
 
 def test_xqa_mtp_causal_mask_q_len_two():
