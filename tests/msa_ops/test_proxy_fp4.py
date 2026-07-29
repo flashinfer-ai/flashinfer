@@ -439,6 +439,14 @@ def test_proxy_fp4_paged_packed():
     assert rel < 5e-2, f"paged-packed max rel err {rel}"
 
 
+def _makespan_cost(base_ctas, max_k_tiles, resident_ctas, ns):
+    """Same cost model `_split_k_makespan_argmin` picks its argmin from (see its
+    docstring): full resident-CTA waves times per-split work, plus ~one KV block
+    of fixed per-CTA overhead."""
+    waves = -(-(base_ctas * ns) // resident_ctas)
+    return waves * (-(-max_k_tiles // ns) + 1)
+
+
 def test_proxy_split_k_heuristic():
     """The kv-block split factor is 1 once the base grid fills the SMs and grows
     as the base grid shrinks (low-batch decode), capped by max_k_tiles."""
@@ -453,7 +461,20 @@ def test_proxy_split_k_heuristic():
     assert _proxy_split_k_fp4(8, 1, dev) == 1
     assert _proxy_split_k_fp4(0, 512, dev) == 1
     # Small base grid -> split enough to reach ~2 CTAs/SM, capped by max_k_tiles.
-    assert _proxy_split_k_fp4(8, 512, dev) == -(-2 * sm // 8)
+    # The split factor minimizing makespan cost isn't a fixed ceiling formula:
+    # ties break to the smaller split (fewer Q reloads), so the argmin can land
+    # below a naive ceil(2*sm/base_ctas) on many SM counts (e.g. 170, RTX 5090).
+    base_ctas, max_k_tiles, resident = 8, 512, 2 * sm
+    ns = _proxy_split_k_fp4(base_ctas, max_k_tiles, dev)
+    best_cost = min(
+        _makespan_cost(base_ctas, max_k_tiles, resident, n)
+        for n in range(1, max_k_tiles + 1)
+    )
+    assert _makespan_cost(base_ctas, max_k_tiles, resident, ns) == best_cost
+    assert all(
+        _makespan_cost(base_ctas, max_k_tiles, resident, n) > best_cost
+        for n in range(1, ns)
+    )
     assert _proxy_split_k_fp4(4, 8, dev) == 8  # clamped to max_k_tiles
 
 
