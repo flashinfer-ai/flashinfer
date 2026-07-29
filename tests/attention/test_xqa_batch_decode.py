@@ -1079,9 +1079,11 @@ def test_xqa_batch_decode_nvfp4_kv(
 @pytest.mark.parametrize(
     "num_kv_heads,head_grp_size",
     [
-        # q_len * head_grp_size <= 32: falls back to the generic kernel on SM90 fp8
+        # q_len(4) * head_grp_size = 16 <= 32: SM90 fp8 takes the SWAP_AB
+        # specialization of mha_sm90.cu
         (2, 4),
-        # q_len * head_grp_size > 32: stays on the SM90 fp8 kernel (mha_sm90.cu)
+        # q_len(4) * head_grp_size = 64 > 32: SM90 fp8 takes the non-SWAP_AB
+        # path of mha_sm90.cu
         (2, 16),
     ],
 )

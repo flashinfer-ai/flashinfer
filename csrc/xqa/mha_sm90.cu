@@ -1758,41 +1758,119 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #endif
                                         uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank) {
   constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
-  static_assert(SPEC_Q_SEQ_LEN <= sizeof(MaskType) * 8, "not implemented");
-
-  assert(cacheSeqLen >= SPEC_Q_SEQ_LEN);
-  uint32_t const maskStartRow = cacheSeqLen - SPEC_Q_SEQ_LEN;
-  uint32_t const tileStartRow = tileSize * idxTile;
-  if (tileStartRow + tileSize < maskStartRow) {
-    return;
-  }
+  constexpr uint64_t fullMask = ~uint64_t{0};
+  static_assert(tileSize == sizeof(fullMask) * 8, "not implemented");
 
   uint32_t const idxInQuad = laneId() % 4;
   uint32_t const idxQuad = laneId() / 4;
+  uint32_t const tileStartRow = tileSize * idxTile;
 
+  if (specDec.params.mask == nullptr) {
+    // Fallback: no device-side mask available; synthesize a causal draft mask
+    // (legacy behavior).
+    static_assert(SPEC_Q_SEQ_LEN <= sizeof(MaskType) * 8, "not implemented");
+    // cacheSeqLen < SPEC_Q_SEQ_LEN is reachable via direct C++ callers; clamp
+    // instead of letting the uint32 subtraction underflow, which would make
+    // the early-exit below skip masking entirely in release builds.
+    uint32_t const maskStartRow = cacheSeqLen >= SPEC_Q_SEQ_LEN ? cacheSeqLen - SPEC_Q_SEQ_LEN : 0;
+    if (tileStartRow + tileSize < maskStartRow) {
+      return;
+    }
+#pragma unroll
+    for (uint32_t n = 0; n < acc.cols; n++) {
+#pragma unroll
+      for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++) {
+        uint32_t const col = GmmaAccCoreMat::cols * (4 * n + idxInQuad) + j;
+        uint32_t const maskCol = col / headGrpSize;
+        MaskType const bit_mask = (1ULL << (maskCol + 1)) - 1;
+
+#pragma unroll
+        for (uint32_t m = 0; m < acc.rows; m++) {
+#pragma unroll
+          for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++) {
+            uint32_t const row = gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad;
+            uint32_t const globalRow = tileStartRow + row;
+            if (globalRow >= cacheSeqLen) {
+              acc(m, n)(i, j) = safeInitRowMax;
+              continue;
+            }
+            if (globalRow >= maskStartRow) {
+              uint32_t const maskRow = globalRow - maskStartRow;
+              if ((bit_mask >> maskRow) == 0) {
+                acc(m, n)(i, j) = safeInitRowMax;
+              }
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // Runtime draft mask. SWAP_AB transposes gemm0: acc rows are KV positions
+  // inside the tile and acc columns are q heads, so the mask lookup direction
+  // is the opposite of the non-SWAP_AB version: each q token (column group)
+  // selects one TileMaskRow and the bit index is the KV row.
+  uint32_t const nbValidRows =
+      mha::min(tileStartRow < cacheSeqLen ? cacheSeqLen - tileStartRow : 0U, tileSize);
+  bool const ctaNeedEndMask = (nbValidRows < tileSize);
+  bool const ctaNeedSpecDecMask = specDec.needMask(idxTile, 0);
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+  // The last q token in the CTA has the largest window begin: tok0WinBeg +
+  // (inputTokensPerCta - 1). tok0WinBeg is int32 and may be deeply negative.
+  bool const ctaNeedBegMask =
+      int64_t(tileStartRow) < int64_t(mha::max(0, tok0WinBeg)) + int64_t(inputTokensPerCta - 1);
+#else
+  constexpr bool ctaNeedBegMask = false;
+#endif
+  if (!(ctaNeedBegMask || ctaNeedEndMask || ctaNeedSpecDecMask)) {
+    return;
+  }
+  uint64_t const endMask =
+      ctaNeedEndMask ? (nbValidRows == 0 ? uint64_t{0} : fullMask >> (tileSize - nbValidRows))
+                     : fullMask;
+
+  uint32_t prevMaskCol = ~0U;
+  uint64_t colMask = fullMask;
 #pragma unroll
   for (uint32_t n = 0; n < acc.cols; n++) {
 #pragma unroll
     for (uint32_t j = 0; j < GmmaAccCoreMat::cols; j++) {
       uint32_t const col = GmmaAccCoreMat::cols * (4 * n + idxInQuad) + j;
-      uint32_t const maskCol = col / headGrpSize;
-      MaskType const bit_mask = (1ULL << (maskCol + 1)) - 1;
-
+      uint32_t const maskCol = col / headGrpSize;  // q token index inside the CTA
+      if (maskCol != prevMaskCol) {
+        prevMaskCol = maskCol;
+        bool const isQTokValid =
+            (headGrpSize * inputTokensPerCta == ctaNbQHeads) || (maskCol < inputTokensPerCta);
+        uint64_t specDecMask = fullMask;
+        if (isQTokValid && specDec.needMask(idxTile, maskCol)) {
+          auto const tileMaskRow = specDec.loadTileMaskRow(idxTile, maskCol);
+          specDecMask = reinterpret_cast<uint64_t const&>(tileMaskRow);
+        }
+#if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
+        // KV rows before this q token's window begin (tok0WinBeg + maskCol)
+        // are masked out. Guard the 64-bit shift explicitly: the shift count
+        // may reach or exceed 64 and tok0WinBeg may be deeply negative.
+        int32_t const begNbMaskOut = int32_t(tok0WinBeg) - int32_t(tileStartRow) + int32_t(maskCol);
+        uint64_t const begMask =
+            begNbMaskOut <= 0
+                ? fullMask
+                : (begNbMaskOut >= int32_t(tileSize) ? uint64_t{0} : fullMask << begNbMaskOut);
+#else
+        uint64_t const begMask = fullMask;
+#endif
+        colMask = specDecMask & begMask & endMask;
+      }
+      if (colMask == fullMask) {
+        continue;
+      }
 #pragma unroll
       for (uint32_t m = 0; m < acc.rows; m++) {
 #pragma unroll
         for (uint32_t i = 0; i < GmmaAccCoreMat::rows; i++) {
           uint32_t const row = gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad;
-          uint32_t const globalRow = tileStartRow + row;
-          if (globalRow >= cacheSeqLen) {
+          if ((colMask & (uint64_t{1} << row)) == 0) {
             acc(m, n)(i, j) = safeInitRowMax;
-            continue;
-          }
-          if (globalRow >= maskStartRow) {
-            uint32_t const maskRow = globalRow - maskStartRow;
-            if ((bit_mask >> maskRow) == 0) {
-              acc(m, n)(i, j) = safeInitRowMax;
-            }
           }
         }
       }
