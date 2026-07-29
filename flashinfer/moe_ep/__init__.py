@@ -42,6 +42,10 @@ from .backends.mega.kernel.deep_gemm_mega import (
     DeepGemmMegaMoeConfig,
     preprocess_mega_weights,
 )
+from .backends.mega.kernel.bf16_cutedsl import (
+    Bf16CutedslMegaMoeConfig,
+    preprocess_mega_weights as preprocess_bf16_cutedsl_mega_weights,
+)
 from .backends.mega.kernel.mxfp8_cutedsl import (
     Mxfp8CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
@@ -114,6 +118,7 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "Bf16CutedslMegaMoeConfig",
     "CombineInputParams",
     "CombineOutput",
     "DeepGemmMegaMoeConfig",
@@ -174,6 +179,7 @@ __all__ = [
     "have_nixl_ep",
     "kernel_requires_weights",
     "preprocess_mega_weights",
+    "preprocess_bf16_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "run_split_kernel",

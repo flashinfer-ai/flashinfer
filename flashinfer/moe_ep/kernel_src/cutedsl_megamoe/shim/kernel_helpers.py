@@ -44,6 +44,10 @@ _LAZY = {
         "moe_mxfp8_glu.mega_reference_mxfp8",
         "compute_megamoe_reference_mxfp8",
     ),
+    "compute_megamoe_reference_bf16": (
+        "moe_bf16_glu.mega_reference_bf16",
+        "compute_megamoe_reference",
+    ),
 }
 
 
@@ -71,4 +75,5 @@ __all__ = [
     "_make_e8m0_scale_tensor",  # noqa: F822
     "_make_fp8_tensor",  # noqa: F822
     "compute_megamoe_reference_mxfp8",  # noqa: F822
+    "compute_megamoe_reference_bf16",  # noqa: F822
 ]

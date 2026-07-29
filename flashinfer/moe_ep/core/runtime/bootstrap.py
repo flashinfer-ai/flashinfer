@@ -243,16 +243,26 @@ def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
     return frozenset()
 
 
-def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
-    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+def cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL mega kernels."""
     if _mega_no_dist():
         return frozenset()
     return frozenset({TORCH_DIST, NVSHMEM})
 
 
+def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
 def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
     """Runtime needs for the CuTeDSL MXFP8 mega kernel."""
-    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+    return cutedsl_runtime_requirements(bootstrap)
+
+
+def bf16_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL BF16 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
 
 
 __all__ = [
@@ -262,6 +272,7 @@ __all__ = [
     "bootstrap_moe_ep_runtime",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
+    "bf16_cutedsl_runtime_requirements",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",

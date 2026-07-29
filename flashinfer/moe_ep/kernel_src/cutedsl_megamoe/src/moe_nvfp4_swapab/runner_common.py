@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import List, Optional, Tuple
 
 import torch
@@ -14,9 +13,12 @@ from common.megamoe_constants import (
     Fp8E4M3FNMax,
     Nvfp4E2M1Max,
     Nvfp4BlockSize,
+    Mxfp8BlockSize,
     SfPaddingBlock,
     TmaLeadingDimByteAlign,
     Nvfp4E2M1RcpLimit,
+    Fp8E4M3RcpLimit,
+    Fp8E5M2RcpLimit,
 )
 
 ### TO BE REMOVED
@@ -43,12 +45,15 @@ def round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
 
 
+from common.host_utils import kind_data_dtype, kind_scale_dtype, kind_sf_vec_size
+
+
 def kind_data_max(kind: str) -> float:
     if kind == "nvfp4":
         return Nvfp4E2M1Max
-    if kind == "mxfp8_e4m3":
+    if kind in ("mxfp8_e4m3", "fp8_e4m3"):
         return Fp8E4M3FNMax
-    if kind == "mxfp8_e5m2":
+    if kind in ("mxfp8_e5m2", "fp8_e5m2"):
         return Fp8E5M2Max
     raise ValueError(f"Unknown kind: {kind!r}")
 
@@ -66,12 +71,10 @@ def leading_dim_bytes(leading_elems: int, dtype: torch.dtype) -> int:
         return leading_elems * 2
     if dtype == torch.float32:
         return leading_elems * 4
-    if dtype in (
-        Nvfp4ScaleDtype,
-        Mxfp8DataDtype_e4m3,
-        Mxfp8DataDtype_e5m2,
-        Mxfp8ScaleDtype,
-    ):
+    if dtype in (Nvfp4ScaleDtype,
+                 Mxfp8DataDtype_e4m3,
+                 Mxfp8DataDtype_e5m2,
+                 Mxfp8ScaleDtype):
         return leading_elems
     raise ValueError(f"leading_dim_bytes: unsupported dtype {dtype!r}.")
 
@@ -103,22 +106,8 @@ def offs_to_group_sizes(offs: torch.Tensor) -> List[int]:
 
 _Fp4DecodeTable: torch.Tensor = torch.tensor(
     [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ],
     dtype=torch.float32,
 )
@@ -182,11 +171,7 @@ def dequant_block_scale_to_fp32(
     global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize one 2D NVFP4 tensor using raw block scales."""
-    data_fp32 = (
-        unpack_fp4_to_f32(data)
-        if data.dtype == Nvfp4DataDtype
-        else data.to(torch.float32)
-    )
+    data_fp32 = unpack_fp4_to_f32(data) if data.dtype == Nvfp4DataDtype else data.to(torch.float32)
     if data_fp32.dim() != 2 or raw_scale.dim() != 2:
         raise ValueError(
             f"Expected 2D tensors, got data={data_fp32.dim()}D raw_scale={raw_scale.dim()}D."
@@ -342,7 +327,6 @@ def _create_raw_scale_tensor(
     scales = scale_values[indices]
     return scales.to(scale_dtype).reshape(non_k_size, scale_cols)
 
-
 def make_nvfp4_tensor_from_torch_rng(
     rng: torch.Generator,
     logical_shape: Tuple[int, ...],
@@ -365,21 +349,13 @@ def make_nvfp4_tensor_from_torch_rng(
         for dim_size in logical_shape:
             total_elements *= dim_size
         flat_bytes = torch.randint(
-            0,
-            256,
-            (total_elements // 2,),
-            dtype=torch.uint8,
-            device=device,
-            generator=rng,
+            0, 256, (total_elements // 2,),
+            dtype=torch.uint8, device=device, generator=rng,
         )
     else:
         random_u8 = torch.randint(
-            0,
-            100,
-            logical_shape,
-            dtype=torch.uint8,
-            device=device,
-            generator=rng,
+            0, 100, logical_shape,
+            dtype=torch.uint8, device=device, generator=rng,
         )
         nibbles = torch.zeros_like(random_u8)
         nibbles[(random_u8 >= 80) & (random_u8 < 90)] = 0x2
@@ -389,8 +365,7 @@ def make_nvfp4_tensor_from_torch_rng(
         if need_perm:
             perm_to_last = list(range(ndim))
             perm_to_last[packed_dim], perm_to_last[-1] = (
-                perm_to_last[-1],
-                perm_to_last[packed_dim],
+                perm_to_last[-1], perm_to_last[packed_dim],
             )
             nibbles = nibbles.permute(perm_to_last).contiguous()
         even, odd = nibbles[..., 0::2], nibbles[..., 1::2]
@@ -400,16 +375,14 @@ def make_nvfp4_tensor_from_torch_rng(
     need_perm = packed_dim != ndim - 1
     if need_perm:
         storage_shape[packed_dim], storage_shape[-1] = (
-            storage_shape[-1],
-            storage_shape[packed_dim],
+            storage_shape[-1], storage_shape[packed_dim],
         )
     storage_shape[-1] //= 2
     tensor = flat_bytes.view(Nvfp4DataDtype).reshape(storage_shape)
     if need_perm:
         permute_back = list(range(ndim))
         permute_back[packed_dim], permute_back[-1] = (
-            permute_back[-1],
-            permute_back[packed_dim],
+            permute_back[-1], permute_back[packed_dim],
         )
         tensor = tensor.permute(permute_back)
     return tensor
@@ -495,42 +468,6 @@ def swiglu_fold_interleave_16(
     return swiglu_fold_interleave(c_fp32, 16, gate_up_clamp=gate_up_clamp)
 
 
-@functools.lru_cache(None)
-def _get_pack_fp4_triton_kernel():
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _pack_fp4_kernel(x_ptr, out_ptr, n_pairs, BLOCK: tl.constexpr):
-        # int64 offsets: the combine round-trip packs the whole (world*tok, topk,
-        # hidden) terms (billions of elements at ep4 / 32768), so ``2 * offsets``
-        # overflows int32 and wraps to a negative address (illegal access).
-        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < n_pairs
-        # Even element -> low nibble, odd -> high (matches unpack_fp4_to_f32).
-        # cvt.rn.satfinite.e2m1x2.f32 stores src $1 in the HIGH nibble and $2 in
-        # the LOW nibble, so pass (odd, even).
-        even = tl.load(x_ptr + 2 * offsets, mask=mask, other=0.0)
-        odd = tl.load(x_ptr + 2 * offsets + 1, mask=mask, other=0.0)
-        packed = tl.inline_asm_elementwise(
-            """
-            {
-                .reg .b8 r;
-                cvt.rn.satfinite.e2m1x2.f32 r, $1, $2;
-                mov.b32 $0, {r, r, r, r};
-            }
-            """,
-            constraints="=r,f,f",
-            args=[odd, even],
-            dtype=tl.uint8,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(out_ptr + offsets, packed, mask=mask)
-
-    return triton, _pack_fp4_kernel
-
-
 def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     """Round fp32 to FP4 E2M1 (HW ``cvt.rn.satfinite.e2m1x2.f32``, RTNE, bit-exact
     with the device encoder) and nibble-pack into ``float4_e2m1fn_x2``.
@@ -549,37 +486,9 @@ def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     if last % 2 != 0:
         raise ValueError(f"FP4 pack needs an even trailing dim, got {last}.")
     flat = fp32.reshape(-1).contiguous()
-    n_pairs = flat.numel() // 2
-    out = torch.empty(n_pairs, dtype=torch.uint8, device=fp32.device)
-    if n_pairs > 0:
-        triton, kernel = _get_pack_fp4_triton_kernel()
-        block = 1024
-        grid = (triton.cdiv(n_pairs, block),)
-        kernel[grid](flat, out, n_pairs, BLOCK=block)
+    from moe_nvfp4_swapab.cute_ref_ops import pack_f32_to_fp4_u8
+    out = pack_f32_to_fp4_u8(flat)
     return out.view(*lead, last // 2).view(Nvfp4DataDtype)
-
-
-@functools.lru_cache(None)
-def _get_rcp_approx_triton_kernel():
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _rcp_approx_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
-        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < n_elements
-        x = tl.load(x_ptr + offsets, mask=mask, other=1.0)
-        y = tl.inline_asm_elementwise(
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=r, r",
-            [x],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        tl.store(y_ptr + offsets, y, mask=mask)
-
-    return triton, _rcp_approx_kernel
 
 
 def _rcp_approx_ftz_f32_cuda(x: torch.Tensor) -> torch.Tensor:
@@ -590,52 +499,8 @@ def _rcp_approx_ftz_f32_cuda(x: torch.Tensor) -> torch.Tensor:
             f"got device={x.device}, dtype={x.dtype}."
         )
     x_contig = x.contiguous()
-    y = torch.empty_like(x_contig)
-    n_elements = x_contig.numel()
-    if n_elements == 0:
-        return y.view_as(x)
-
-    triton, kernel = _get_rcp_approx_triton_kernel()
-    block = 1024
-    grid = (triton.cdiv(n_elements, block),)
-    kernel[grid](x_contig, y, n_elements, BLOCK=block)
-    return y.view_as(x)
-
-
-@functools.lru_cache(None)
-def _get_swiglu_pair_hw_match_triton_kernel():
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def _swiglu_pair_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
-        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < n_elements
-        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
-        up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
-        ug = up * gate
-        neg_g_l2e = gate * (-1.4426950408889634)
-        exp_neg = tl.inline_asm_elementwise(
-            "ex2.approx.f32 $0, $1;",
-            "=r, r",
-            [neg_g_l2e],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        one_plus = exp_neg + 1.0
-        sigmoid = tl.inline_asm_elementwise(
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=r, r",
-            [one_plus],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        out = ug * sigmoid
-        tl.store(out_ptr + offsets, out, mask=mask)
-
-    return triton, _swiglu_pair_kernel
+    from moe_nvfp4_swapab.cute_ref_ops import rcp_approx_ftz_f32
+    return rcp_approx_ftz_f32(x_contig).view_as(x)
 
 
 def _swiglu_pair_hw_match_cuda(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -656,14 +521,9 @@ def _swiglu_pair_hw_match_cuda(gate: torch.Tensor, up: torch.Tensor) -> torch.Te
 
     gate_c = gate.contiguous()
     up_c = up.contiguous()
-    out = torch.empty_like(gate_c)
-    n_elements = gate_c.numel()
 
-    triton, kernel = _get_swiglu_pair_hw_match_triton_kernel()
-    block = 1024
-    grid = (triton.cdiv(n_elements, block),)
-    kernel[grid](gate_c, up_c, out, n_elements, BLOCK=block)
-    return out.view_as(gate)
+    from moe_nvfp4_swapab.cute_ref_ops import swiglu_pair_hw_match
+    return swiglu_pair_hw_match(gate_c, up_c).view_as(gate)
 
 
 def nvfp4_quantize_per_block_16(
@@ -687,11 +547,11 @@ def nvfp4_quantize_per_block_16(
 
     fp32_max = torch.finfo(torch.float32).max
     acc_scale = float(norm_const) * _rcp_approx_ftz_f32_cuda(sfc_fp32_rt)
-    acc_scale = torch.nan_to_num(
-        acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max
-    )
+    acc_scale = torch.nan_to_num(acc_scale, nan=fp32_max, posinf=fp32_max, neginf=fp32_max)
     acc_scale = torch.clamp(acc_scale, max=fp32_max)
-    acc_scale = torch.where(sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale))
+    acc_scale = torch.where(
+        sfc_fp32_rt > 0, acc_scale, torch.zeros_like(acc_scale)
+    )
 
     scaled = c_swiglu * acc_scale.unsqueeze(-1).expand_as(blocked).reshape(M, N)
     c_fp4 = _pack_f32_to_fp4(scaled)

@@ -23,11 +23,11 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
+  backends/mega/kernel/{deep_gemm_mega,bf16_cutedsl,nvfp4_cutedsl,mxfp8_cutedsl,…}
   kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
-    src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
-    __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
-    shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
+    src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    __init__.py                ← public API consumed by BF16, NVFP4, and MXFP8 backends
+    shim/                      ← thin adapters over src/ (_paths, comm, bf16, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
     ACKNOWLEDGEMENT.md         ← kernel authors
