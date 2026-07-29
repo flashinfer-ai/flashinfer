@@ -2965,8 +2965,6 @@ class TmemSPResource(MemoryResource):
         local_sum_pair_0 = (Float32(0.0), Float32(0.0))
         local_sum_pair_1 = (Float32(0.0), Float32(0.0))
         use_two_sum_pairs = True  # staged D256: enable four independent sum chains
-        if cutlass.const_expr(self.cfg.use_ldtm_stat):
-            cute.nvgpu.sched_res_busy_xu64()
         for flat_idx in cutlass.range_constexpr(0, num_values, 2):
             if cutlass.const_expr(flat_idx >= 8):
                 delayed_idx = flat_idx - 8
@@ -2995,12 +2993,7 @@ class TmemSPResource(MemoryResource):
                         ftz=False,
                     )
 
-            if cutlass.const_expr(self.cfg.use_ldtm_stat):
-                # cfence prevents ptxas from regrouping the latency-hiding cadence.
-                cute.nvgpu.cfence()
             p0 = cute.math.exp2(fma_values[flat_idx], fastmath=True)
-            if cutlass.const_expr(self.cfg.use_ldtm_stat):
-                cute.nvgpu.cfence()
             if cutlass.const_expr(flat_idx + 8 < num_values):
                 future_idx = flat_idx + 8
                 chunk_idx = future_idx // tmem_x
@@ -3016,14 +3009,8 @@ class TmemSPResource(MemoryResource):
                     ftz=False,
                 )
                 fma_values += (fma_pair[0], fma_pair[1])
-            if cutlass.const_expr(self.cfg.use_ldtm_stat):
-                cute.nvgpu.cfence()
             p1 = cute.math.exp2(fma_values[flat_idx + 1], fastmath=True)
-            if cutlass.const_expr(self.cfg.use_ldtm_stat):
-                cute.nvgpu.cfence()
             p_values += (p0, p1)
-        if cutlass.const_expr(self.cfg.use_ldtm_stat):
-            cute.nvgpu.reset_sched_res_busy_xu64()
 
         for delayed_idx in cutlass.range_constexpr(num_values - 8, num_values, 2):
             if cutlass.const_expr(delayed_idx % 4 == 0):
