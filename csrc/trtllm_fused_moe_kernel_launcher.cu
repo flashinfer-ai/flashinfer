@@ -3378,7 +3378,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_run_from_routing_metadata_impl(
     }
   }
 
-  std::vector<int32_t> supported_tile_n = FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct);
+  std::vector<int32_t> supported_tile_n =
+      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
   auto tile_it = std::find(supported_tile_n.begin(), supported_tile_n.end(), tile_N);
   TVM_FFI_ICHECK(tile_it != supported_tile_n.end())
       << "Unsupported FP4 MoE tile_N " << tile_N << " for activation dtype.";
@@ -4219,6 +4220,9 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     Array<int64_t> tile_tokens_dims, int64_t routing_input_mode,
     Optional<TensorView> topk_weights) {
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
+  for (int64_t tile_tokens_dim : tile_tokens_dims) {
+    TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";
+  }
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
   TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
@@ -4263,16 +4267,12 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
       routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
   auto const mRoutingBiasDtype =
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
-  bool all_tiles_power_of_two = true;
-  for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
-    all_tiles_power_of_two = all_tiles_power_of_two && computeRoutingLog2(tile_tokens_dims[i]) > 0;
-  }
   bool const can_use_multi_cluster =
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
       static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
       tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
       mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
-      top_k <= 8 && all_tiles_power_of_two;
+      top_k <= 8;
   if (!can_use_multi_cluster) {
     Array<Tensor> flat_metadata;
     for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
@@ -4294,7 +4294,6 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
 
   for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
     int64_t const tile_tokens_dim = tile_tokens_dims[i];
-    TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";
     int32_t const max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
             num_tokens, top_k, num_experts, tile_tokens_dim);
@@ -4387,6 +4386,9 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
     int64_t routing_input_mode, Optional<TensorView> topk_weights,
     bool allow_packed_multi_cluster) {
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
+  for (int64_t tile_tokens_dim : tile_tokens_dims) {
+    TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";
+  }
   TVM_FFI_ICHECK_EQ(flat_routing_metadata.size(), tile_tokens_dims.size() * kNumTensors)
       << "flat_routing_metadata must contain nine tensors per tile.";
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
@@ -4419,21 +4421,21 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
   cudaStream_t routing_stream = get_stream(topk_ids.device());
 
-  bool all_tiles_power_of_two = true;
-  for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
-    all_tiles_power_of_two = all_tiles_power_of_two && computeRoutingLog2(tile_tokens_dims[i]) > 0;
-  }
   bool const can_use_multi_cluster =
       // A post-deduplication DA singleton has no metadata sharing to exploit;
       // use the lower-overhead ordinary routingIndicesClusterKernel instead.
       tile_tokens_dims.size() > 1 &&
+      // TODO(DA-MoE): Allow graph-stable packed routed inputs here after the
+      // BF16, FP8-family, and MXINT4 wrappers provide the same lifetime and
+      // no-copy contract as packed logits replay. Until then,
+      // allow_packed_multi_cluster is intentionally false for those wrappers.
       (input_mode == RoutingInputMode::UnpackedPrecomputed ||
        (allow_packed_multi_cluster && input_mode == RoutingInputMode::PackedPrecomputed)) &&
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
       static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
       tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
       mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
-      top_k <= 8 && all_tiles_power_of_two;
+      top_k <= 8;
 
   if (can_use_multi_cluster) {
     std::vector<moe::dev::routing::routingDeepSeek::Data> routing_data;

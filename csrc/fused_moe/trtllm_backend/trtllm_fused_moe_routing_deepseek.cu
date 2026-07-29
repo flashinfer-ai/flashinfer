@@ -444,6 +444,9 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
     return;
   }
 
+  // Each tile carries its own power-of-two flag and divisor. Mixed launches
+  // therefore retain shift arithmetic for power-of-two entries while using
+  // the existing generic arithmetic only for arbitrary entries.
   KernelParams params = args.params[tileIdx];
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   int32_t const clusterBlockRank = blockIdx.x - tileIdx * NumBlocksPerCluster;
@@ -511,8 +514,6 @@ static void launchRoutingDeepSeekMultiTileCluster(Data* data, int32_t numTiles, 
                    "score=fp32, bias=bf16, expert_weight=bf16 only");
   FLASHINFER_CHECK(data[0].mNumExpertGroups > 1,
                    "multi-tile DeepSeek routing currently requires grouped routing");
-  FLASHINFER_CHECK(data[0].mPaddingLog2 > 0,
-                   "multi-tile DeepSeek routing currently requires power-of-two tile sizes");
   FLASHINFER_CHECK(!data[0].mUsePdl,
                    "multi-tile DeepSeek routing currently captures as a normal graph node");
 
@@ -743,8 +744,12 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
                    "runMultiTileCluster requires precomputed top-k ids");
   FLASHINFER_CHECK(first.mPtrPermutedIdxSize != nullptr,
                    "runMultiTileCluster requires routing metadata output buffers");
+  FLASHINFER_CHECK(first.mTileTokensDim > 0,
+                   "multi-tile routing entries must have positive tile sizes");
 
   for (int32_t i = 1; i < numTiles; ++i) {
+    FLASHINFER_CHECK(data[i].mTileTokensDim > 0,
+                     "multi-tile routing entries must have positive tile sizes");
     FLASHINFER_CHECK(data[i].mNumTokens == first.mNumTokens,
                      "all multi-tile routing entries must have the same num_tokens");
     FLASHINFER_CHECK(data[i].mNumExperts == first.mNumExperts,
@@ -761,8 +766,6 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
                      "all multi-tile routing entries must have the same local expert stride");
     FLASHINFER_CHECK(data[i].mNumLocalExperts == first.mNumLocalExperts,
                      "all multi-tile routing entries must have the same local expert count");
-    FLASHINFER_CHECK((data[i].mPaddingLog2 > 0) == (first.mPaddingLog2 > 0),
-                     "all multi-tile routing entries must agree on pow2 tile mode");
   }
 
   int32_t const numThreadsHist = getMaxNumExperts(first.mNumExperts);

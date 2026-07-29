@@ -854,6 +854,13 @@ def try_trtllm_capture_aware_da(
                 if int(tile) != first_tile
             )
         else:
+            # TODO(DA-MoE): BF16, FP8-family, and MXINT4 routed wrappers
+            # currently normalize routing metadata to PackedPrecomputed. This
+            # path therefore passes allow_packed_multi_cluster=False below and
+            # launches one routingIndicesClusterKernel per SWITCH body. Once
+            # those wrappers guarantee graph-stable packed IDs and weights,
+            # opt them into one all-tile kernel and require zero per-tile
+            # kernels/copies while preserving the independent selector branch.
             remaining_tiles = tuple(int(tile) for tile in candidate_tile_sizes)
         if remaining_tiles:
             deferred_tiles = tuple(remaining_tiles)

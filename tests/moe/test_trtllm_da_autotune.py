@@ -2347,6 +2347,137 @@ def test_precomputed_all_expert_route_prepares_multi_tile_metadata():
         assert torch.all(metadata[1] >= 0)
 
 
+@pytest.mark.parametrize("tile_tokens_dims", ([96, 192], [64, 96]))
+def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
+    tile_tokens_dims,
+):
+    """Arbitrary and mixed tile arithmetic matches independent routing launches."""
+    _require_sm100()
+    # Use each expert exactly once so the opaque permutation metadata has a
+    # unique order. Repeated assignments may be ordered differently by
+    # independent cluster launches while remaining semantically equivalent.
+    num_tokens = 16
+    num_experts = 128
+    top_k = 8
+    expert_ids = (
+        (torch.arange(num_tokens * top_k, dtype=torch.int32, device="cuda") * 17)
+        .remainder(num_experts)
+        .reshape(num_tokens, top_k)
+    )
+    expert_weights = torch.linspace(
+        0.125,
+        0.875,
+        num_tokens * top_k,
+        dtype=torch.bfloat16,
+        device=expert_ids.device,
+    ).reshape(num_tokens, top_k)
+
+    def allocate_single_tile_references():
+        return [
+            fused_moe_api.trtllm_moe_allocate_routing_metadata(
+                expert_ids,
+                None,
+                num_experts,
+                top_k,
+                8,
+                4,
+                0,
+                num_experts,
+                None,
+                int(RoutingMethodType.DeepSeekV3),
+                tile_tokens_dim,
+                int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+                expert_weights,
+            )
+            for tile_tokens_dim in tile_tokens_dims
+        ]
+
+    metadata_by_tile = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        None,
+        num_experts,
+        top_k,
+        8,
+        4,
+        0,
+        num_experts,
+        None,
+        int(RoutingMethodType.DeepSeekV3),
+        tile_tokens_dims,
+        int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+        expert_weights,
+    )
+    module = _load_moe_ffi_op()
+    flat_metadata = [tensor for metadata in metadata_by_tile for tensor in metadata]
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        module.trtllm_moe_populate_routing_metadata_multi_tile(
+            expert_ids,
+            None,
+            num_experts,
+            top_k,
+            8,
+            4,
+            0,
+            num_experts,
+            None,
+            int(RoutingMethodType.DeepSeekV3),
+            tile_tokens_dims,
+            flat_metadata,
+            int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+            expert_weights,
+            False,
+        )
+
+    expert_ids.copy_(torch.flip(expert_ids, dims=(0,)))
+    expert_weights.copy_(torch.flip(expert_weights, dims=(0,)))
+    single_tile_references = allocate_single_tile_references()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expanded_tokens = num_tokens * top_k
+    num_filled_experts = min(num_experts, expanded_tokens)
+    remaining_tokens = expanded_tokens - num_filled_experts
+    for tile_tokens_dim, metadata, reference in zip(
+        tile_tokens_dims,
+        metadata_by_tile,
+        single_tile_references,
+        strict=True,
+    ):
+        expected_max_ctas = num_filled_experts + remaining_tokens // tile_tokens_dim
+        assert metadata[1].numel() == expanded_tokens
+        assert metadata[2].numel() == expected_max_ctas * tile_tokens_dim
+        assert metadata[6].numel() == metadata[7].numel() == expected_max_ctas
+        assert metadata[3].data_ptr() == expert_weights.data_ptr()
+
+        total_num_padded_tokens = int(reference[0].item())
+        num_non_exiting_ctas = int(reference[8].item())
+        assert 0 <= total_num_padded_tokens <= metadata[2].numel()
+        assert 0 <= num_non_exiting_ctas <= expected_max_ctas
+        assert torch.equal(metadata[0], reference[0])
+        assert torch.equal(metadata[1], reference[1])
+        permuted_indices = reference[1]
+        assert torch.equal(
+            metadata[2][permuted_indices],
+            reference[2][permuted_indices],
+        )
+        assert torch.equal(metadata[3], expert_weights)
+        assert torch.equal(
+            metadata[6][:num_non_exiting_ctas],
+            reference[6][:num_non_exiting_ctas],
+        )
+        assert torch.equal(
+            metadata[7][:num_non_exiting_ctas],
+            reference[7][:num_non_exiting_ctas],
+        )
+        assert torch.equal(metadata[8], reference[8])
+
+    graph.reset()
+    del graph
+    torch.cuda.synchronize()
+
+
 def test_nvfp4_unpacked_public_wrapper_metadata_replay_is_bit_exact():
     """Raw FP4 routing IDs and weights survive metadata preparation unchanged."""
     _require_sm100()
