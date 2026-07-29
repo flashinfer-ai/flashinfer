@@ -1579,8 +1579,6 @@ CUBIN_EXPORT __global__
 #endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
-  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
-  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
   uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
@@ -1594,37 +1592,7 @@ CUBIN_EXPORT __global__
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
   uint32_t const idxReq = blockIdx.z;
-#if SPEC_DEC
-  // Variable query sequence length support.
-  bool const variableQSeqLen = qCuSeqLens != nullptr;
-  uint32_t const actualQSeqLen =
-      variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen;
-  // Same as idxReq * qSeqLen if all sequences all the same.
-  // Take different beams as different requests/sequences currently.
-  uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
-  // A ragged request may have 0 draft tokens (all rejected). It owns no rows
-  // and min(row, actualQSeqLen - 1) would underflow, so exit before any
-  // barrier/semaphore interaction (uniform across the request's CTAs).
-  if (variableQSeqLen && actualQSeqLen == 0) {
-    return;
-  }
-
-  uint32_t const nbVHeads = nbKHeads;
-  uint32_t const nbQHeads = nbKHeads * headGrpSize;
-  uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
-  uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
-
-  uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
-  uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
-  uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
-  uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
-  uint32_t const nbValidHeadTokens =
-      idxHeadTokenInGrp > totalNbHeadTokensInGrp
-          ? 0u
-          : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
-  // Shift the mask ptr by batch_idx.
-  mask += reqSeqOffset * divUp(qSeqLen, 32u);
-#else
+#if !SPEC_DEC
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
 
   uint32_t const idxHeadGrp = blockIdx.y;  // inside one request
@@ -1685,6 +1653,41 @@ CUBIN_EXPORT __global__
 #if ENABLE_PDL
   preExit();
   acqBulk();
+#endif
+
+  // The scale tensors and qCuSeqLens may be written by the previous grid;
+  // do not read them before acqBulk().
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
+
+#if SPEC_DEC
+  bool const variableQSeqLen = qCuSeqLens != nullptr;
+  uint32_t const actualQSeqLen =
+      variableQSeqLen ? uint32_t(qCuSeqLens[idxReq + 1] - qCuSeqLens[idxReq]) : qSeqLen;
+  // Same as idxReq * qSeqLen if all sequences all the same.
+  // Take different beams as different requests/sequences currently.
+  uint32_t const reqSeqOffset = variableQSeqLen ? uint32_t(qCuSeqLens[idxReq]) : (qSeqLen * idxReq);
+  // A request whose drafts were all rejected has 0 tokens and owns no rows.
+  // The exit is uniform across the request's CTAs.
+  if (variableQSeqLen && actualQSeqLen == 0) {
+    return;
+  }
+
+  uint32_t const nbVHeads = nbKHeads;
+  uint32_t const nbQHeads = nbKHeads * headGrpSize;
+  uint32_t const nbQHeadTokens = nbQHeads * actualQSeqLen;
+  uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
+
+  uint32_t const nbTokenBlocksPerGrp = gridDim.y / nbKHeads;
+  uint32_t const idxHeadGrp = blockIdx.y / nbTokenBlocksPerGrp;  // inside one request
+  uint32_t const idxHeadTokenInGrp = (blockIdx.y % nbTokenBlocksPerGrp) * warpTile.y;
+  uint32_t const totalNbHeadTokensInGrp = actualQSeqLen * headGrpSize;
+  uint32_t const nbValidHeadTokens =
+      idxHeadTokenInGrp > totalNbHeadTokensInGrp
+          ? 0u
+          : mha::min(totalNbHeadTokensInGrp - idxHeadTokenInGrp, rowsPerBlock);
+  // Shift the mask ptr by batch_idx.
+  mask += reqSeqOffset * divUp(qSeqLen, 32u);
 #endif
 
   constexpr bool qkSwizzle = true;
