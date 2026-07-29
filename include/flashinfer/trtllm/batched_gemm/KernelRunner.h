@@ -96,6 +96,8 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype biasDtype{batchedGemm::trtllm::gen::Dtype::Fp32};
   // whether to apply row-wise scaling factors to the activations
   bool usePerTokenScaling{false};
+  // dtype of the row-wise scaling factors when usePerTokenScaling is enabled
+  batchedGemm::trtllm::gen::Dtype perTokenSfDtype{batchedGemm::trtllm::gen::Dtype::Void};
   // whether to apply row-wise scaling factors to the weights
   bool usePerChannelScaling{false};
 };

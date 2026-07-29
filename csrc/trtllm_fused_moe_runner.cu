@@ -427,6 +427,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -451,6 +454,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -562,6 +568,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
+      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                            : btg::Dtype::Fp32)
+                                            : btg::Dtype::Void,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }

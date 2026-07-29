@@ -513,12 +513,7 @@ class FusedMoeLauncher {
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
-    // FIXME(siyuan): check llama4 routing after the fp4 FC1 kernels with bf16 scale factors were
-    // generated
-    bool usePerTokenScalingGemm1 =
-        per_token_scales.has_value() /* ||
-        static_cast<RoutingMethodType>(this->routing_method_type) == RoutingMethodType::Llama4*/
-        ;
+    bool usePerTokenScalingGemm1 = per_token_scales.has_value() || args->mUseRoutingScalesOnInput;
     // FIXME(siyuan): currently only nvfp4 x nvfp4 uses per-token scaling in both FC1 and FC2
     bool usePerTokenScalingGemm2 = per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1;
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8 and no
@@ -947,6 +942,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
             int64_t weight_layout, bool use_routing_scales_on_input_param,
             ActivationType activation_type, bool norm_topk_prob = true) {
     this->use_routing_scales_on_input = use_routing_scales_on_input_param;
+    args->mUseRoutingScalesOnInput = use_routing_scales_on_input_param;
 
     auto dtype = hidden_states.dtype();
     if (dtype == dl_float16) {
@@ -1175,7 +1171,8 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
                                                int64_t intermediate_size, int64_t num_local_experts,
                                                int64_t num_tokens, int64_t act_type,
                                                bool use_shuffled_weight, int64_t weight_layout,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                               bool use_routing_scales_on_input) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
@@ -1190,10 +1187,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
           static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
           // FP8 per-tensor doesn't use Mn-bias (LoRA) cubins.
           /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
-          // Keep tactic enumeration aligned with prepare_moe_common(). The
-          // one-way cubin filter still admits the exported FP8 FC1 kernels
-          // that optionally consume BF16 routing scales.
-          /*usePerTokenScalingGemm1*/ false,
+          /*usePerTokenScalingGemm1*/ use_routing_scales_on_input,
           /*usePerTokenScalingGemm2*/ false, false, false);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
@@ -2984,7 +2978,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     }
     return Fp8PerTensorLauncher::getValidConfigs(
         top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
-        use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
+        use_shuffled_weight, weight_layout, dtype_act, dtype_weights, use_per_token_scaling);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     if (has_gemm1_lora_delta) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)

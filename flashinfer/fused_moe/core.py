@@ -2141,6 +2141,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
             activation_type=activation_type,
+            use_per_token_scaling=use_routing_scales_on_input,
             num_experts=num_experts,
         )
 
