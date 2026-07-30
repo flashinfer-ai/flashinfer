@@ -278,7 +278,7 @@ def _softmax_reference(logits, temperature=None, **_unused):
         else:
             t = float(temperature)
         x = x / t
-    return torch.softmax(x, dim=-1).to(logits.dtype)
+    return torch.softmax(x, dim=-1)
 
 
 def _softmax_init(
@@ -313,7 +313,7 @@ softmax_trace = TraceTemplate(
         ),
     },
     outputs={
-        "output": Tensor(["batch_size", "vocab_size"], dtype_from="logits"),
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
     },
     tags=["status:verified"],
     reference=_softmax_reference,

@@ -50,21 +50,39 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
   CHECK_INPUT(logits);
   CHECK_INPUT(output);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  CHECK_DIM(2, output);
+  CHECK_DEVICE(output, logits);
+  TVM_FFI_ICHECK(output.dtype() == dl_float32) << "softmax output must be float32";
+  TVM_FFI_ICHECK(logits.dtype() == dl_float32 || logits.dtype() == dl_float16 ||
+                 logits.dtype() == dl_bfloat16)
+      << "softmax logits must be float32, float16, or bfloat16";
+  TVM_FFI_ICHECK(output.size(0) == logits.size(0) && output.size(1) == logits.size(1))
+      << "softmax output shape must match logits";
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
 
   bool has_temperature_arr = maybe_temperature_arr.has_value();
+  if (has_temperature_arr) {
+    CHECK_INPUT(maybe_temperature_arr.value());
+    CHECK_DEVICE(maybe_temperature_arr.value(), logits);
+    TVM_FFI_ICHECK(maybe_temperature_arr.value().dtype() == dl_float32)
+        << "softmax temperature must be float32";
+  }
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
-  cudaError_t status = sampling::OnlineSoftmax<float>(
-      static_cast<float*>(logits.data_ptr()), static_cast<float*>(output.data_ptr()), batch_size,
-      vocab_size,
-      has_temperature_arr ? static_cast<float*>(maybe_temperature_arr.value().data_ptr()) : nullptr,
-      temperature_val, workspace_buffer.data_ptr(),
-      get_element_size(workspace_buffer) * workspace_buffer.size(0), enable_pdl, stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "OnlineSoftmax failed with error code " << cudaGetErrorString(status);
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(logits.dtype(), DTypeIn, [&] {
+    cudaError_t status = sampling::OnlineSoftmax<DTypeIn, float>(
+        static_cast<DTypeIn*>(logits.data_ptr()), static_cast<float*>(output.data_ptr()),
+        batch_size, vocab_size,
+        has_temperature_arr ? static_cast<float*>(maybe_temperature_arr.value().data_ptr())
+                            : nullptr,
+        temperature_val, workspace_buffer.data_ptr(),
+        get_element_size(workspace_buffer) * workspace_buffer.size(0), enable_pdl, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "OnlineSoftmax failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
 }
 
 void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,

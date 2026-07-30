@@ -76,6 +76,17 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_softmax_input_float32_output(dtype):
+    torch.manual_seed(42)
+    logits = torch.randn(8, 154880, device="cuda:0", dtype=dtype)
+    probs = flashinfer.sampling.softmax(logits)
+    probs_ref = torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+    assert probs.dtype == torch.float32
+    torch.testing.assert_close(probs, probs_ref, rtol=2e-5, atol=1e-7)
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
@@ -446,6 +457,96 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def test_top_p_renorm_probs_out_and_inplace():
+    torch.manual_seed(42)
+    probs = torch.randn(8, 154880, device="cuda:0").softmax(dim=-1)
+    top_p = torch.full((8,), 0.95, device="cuda:0")
+    expected = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=True
+    )
+    workspace_size = flashinfer.sampling.get_top_p_renorm_probs_workspace_size(
+        *probs.shape, is_deterministic=True
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=probs.device)
+
+    out = torch.empty_like(probs)
+    actual_out = flashinfer.sampling.top_p_renorm_probs(
+        probs,
+        top_p,
+        is_deterministic=True,
+        out=out,
+        workspace=workspace,
+    )
+    assert actual_out.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual_out, expected, rtol=0, atol=0)
+
+    inplace = probs.clone()
+    actual_inplace = flashinfer.sampling.top_p_renorm_probs(
+        inplace,
+        top_p,
+        is_deterministic=True,
+        out=inplace,
+        workspace=workspace,
+    )
+    assert actual_inplace.data_ptr() == inplace.data_ptr()
+    torch.testing.assert_close(actual_inplace, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unaligned_workspace",
+        "partial_out",
+        "workspace_probs",
+        "workspace_out",
+        "workspace_top_p",
+        "top_p_out",
+    ],
+)
+def test_top_p_renorm_probs_rejects_invalid_memory(case):
+    vocab_size = 1024 if case == "top_p_out" else 32768
+    probs = torch.randn(2, vocab_size, device="cuda:0").softmax(dim=-1)
+    top_p = torch.full((2,), 0.95, device="cuda:0")
+    workspace_size = flashinfer.sampling.get_top_p_renorm_probs_workspace_size(
+        *probs.shape
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=probs.device)
+    out = torch.empty_like(probs)
+
+    if case == "unaligned_workspace":
+        workspace = torch.empty(
+            workspace_size + 1, dtype=torch.uint8, device=probs.device
+        )[1:]
+        match = "workspace must be aligned"
+    elif case == "partial_out":
+        storage = torch.empty(probs.numel() + 1, device=probs.device)
+        probs = storage[:-1].view_as(probs)
+        out = storage[1:].view_as(probs)
+        match = "must either alias exactly or not overlap"
+    elif case == "top_p_out":
+        storage = torch.empty(probs.numel(), device=probs.device)
+        out = storage.view_as(probs)
+        top_p = storage[: probs.size(0)]
+        match = "renorm_probs must not overlap top_p"
+    else:
+        storage = torch.empty(
+            max(probs.nbytes, workspace_size), dtype=torch.uint8, device=probs.device
+        )
+        workspace = storage[:workspace_size]
+        if case == "workspace_probs":
+            probs = storage[: probs.nbytes].view(torch.float32).view_as(probs)
+        elif case == "workspace_out":
+            out = storage[: out.nbytes].view(torch.float32).view_as(out)
+        else:
+            top_p = storage[: top_p.nbytes].view(torch.float32).view_as(top_p)
+        match = "workspace must not overlap"
+
+    with pytest.raises(ValueError, match=match):
+        flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p, out=out, workspace=workspace
+        )
 
 
 @pytest.mark.parametrize("batch_size", [4, 99, 989])
