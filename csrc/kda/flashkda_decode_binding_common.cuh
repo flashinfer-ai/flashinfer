@@ -32,8 +32,19 @@
 namespace flashinfer {
 namespace flash_kda_decode {
 
-constexpr int32_t kHeadDim = 128;
-constexpr int32_t kTokens = 5;
+template <int32_t HeadDim, int32_t Tokens, int32_t GateKind, int32_t ValueSplit>
+struct VariantTraits {
+  static_assert(HeadDim == 64 || HeadDim == 128);
+  static_assert(Tokens >= 2);
+  static_assert(GateKind == 0 || GateKind == 1);
+  static_assert(ValueSplit == 1 || ValueSplit == 2 || ValueSplit == 4 || ValueSplit == 8);
+  static_assert(HeadDim % (16 * ValueSplit) == 0);
+
+  static constexpr int32_t kHeadDim = HeadDim;
+  static constexpr int32_t kTokens = Tokens;
+  static constexpr int32_t kGateKind = GateKind;
+  static constexpr int32_t kValueSplit = ValueSplit;
+};
 
 struct LaunchContext {
   int32_t device_id;
@@ -116,11 +127,11 @@ inline void CheckStateLayout(const TensorView& state, int64_t num_value_heads, i
   TVM_FFI_ICHECK(state.ndim() == 4) << "initial_state must be rank 4";
   TVM_FFI_ICHECK(state.size(0) > 0 && state.size(1) == num_value_heads &&
                  state.size(2) == head_dim && state.size(3) == head_dim)
-      << "initial_state must have shape [slots, HV, 128, 128]";
+      << "initial_state must have shape [slots, HV, D, D] with D=" << head_dim;
   TVM_FFI_ICHECK(state.stride(3) == 1 && state.stride(2) == head_dim &&
                  state.stride(1) == head_dim * head_dim &&
                  state.stride(0) >= num_value_heads * head_dim * head_dim)
-      << "initial_state must have compact [HV, 128, 128] blocks and may "
+      << "initial_state must have compact [HV, D, D] blocks and may "
          "only pad the outer slot stride";
   CheckedInt32(state.stride(0), "initial_state slot stride", true);
   TVM_FFI_ICHECK(state.stride(0) % 8 == 0)
@@ -158,15 +169,17 @@ inline void CheckNoOverlap(const TensorView& lhs, const char* lhs_name, const Te
       << ": the frozen kernel uses __restrict__ pointers";
 }
 
-template <int kValueSplit>
+template <typename Traits>
 LaunchContext CheckInputs(const TensorView& q, const TensorView& k, const TensorView& v,
                           const TensorView& g, const TensorView& beta, const TensorView& A_log,
                           const TensorView& dt_bias, const TensorView& state, const TensorView& out,
                           const TensorView& cu_seqlens, const TensorView& ssm_state_indices,
                           const TensorView& num_accepted_tokens, double scale, double lower_bound,
                           int64_t cuda_stream) {
-  static_assert(kValueSplit == 1 || kValueSplit == 2 || kValueSplit == 4 || kValueSplit == 8);
-  static_assert(kHeadDim % (16 * kValueSplit) == 0);
+  constexpr int32_t kHeadDim = Traits::kHeadDim;
+  constexpr int32_t kTokens = Traits::kTokens;
+  constexpr int32_t kGateKind = Traits::kGateKind;
+  constexpr int32_t kValueSplit = Traits::kValueSplit;
 
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
@@ -206,7 +219,7 @@ LaunchContext CheckInputs(const TensorView& q, const TensorView& k, const Tensor
   CheckDtype(num_accepted_tokens, "num_accepted_tokens", dl_int32);
 
   TVM_FFI_ICHECK(q.ndim() == 4 && q.size(0) == 1 && q.size(3) == kHeadDim)
-      << "q must have shape [1, total_tokens, H, 128]";
+      << "q must have shape [1, total_tokens, H, " << kHeadDim << "]";
   const int64_t total_tokens = q.size(1);
   const int64_t num_heads = q.size(2);
   TVM_FFI_ICHECK(total_tokens > 0 && num_heads > 0)
@@ -218,7 +231,7 @@ LaunchContext CheckInputs(const TensorView& q, const TensorView& k, const Tensor
   const int64_t num_value_heads = v.ndim() == 4 ? v.size(2) : 0;
   TVM_FFI_ICHECK(v.ndim() == 4 && v.size(0) == 1 && v.size(1) == total_tokens &&
                  v.size(3) == kHeadDim)
-      << "v must have shape [1, total_tokens, HV, 128]";
+      << "v must have shape [1, total_tokens, HV, " << kHeadDim << "]";
   TVM_FFI_ICHECK(num_value_heads >= num_heads && num_value_heads % num_heads == 0)
       << "HV must be a positive multiple of H";
   TVM_FFI_ICHECK(g.ndim() == 4 && g.size(0) == 1 && g.size(1) == total_tokens &&
@@ -251,15 +264,27 @@ LaunchContext CheckInputs(const TensorView& q, const TensorView& k, const Tensor
   const int64_t num_sequences = cu_seqlens.numel() - 1;
   TVM_FFI_ICHECK(num_sequences <= 65535) << "number of sequences exceeds CUDA grid.y limit";
   TVM_FFI_ICHECK(total_tokens == num_sequences * kTokens)
-      << "packed speculative input must contain exactly N * 5 tokens";
+      << "packed speculative input must contain exactly N * " << kTokens << " tokens";
   TVM_FFI_ICHECK(ssm_state_indices.numel() == num_sequences * kTokens)
-      << "ssm_state_indices must contain N * 5 elements";
+      << "ssm_state_indices must contain N * " << kTokens << " elements";
   TVM_FFI_ICHECK(num_accepted_tokens.ndim() == 1 && num_accepted_tokens.numel() == num_sequences)
       << "num_accepted_tokens must contain N elements";
 
-  TVM_FFI_ICHECK(A_log.numel() >= 1 && dt_bias.numel() >= 1)
-      << "precomputed-gate variants require non-empty dummy A_log/dt_bias";
-  TVM_FFI_ICHECK(lower_bound == 0.0) << "precomputed-gate variants require lower_bound=0";
+  if constexpr (kGateKind == 0) {
+    TVM_FFI_ICHECK(A_log.numel() >= 1 && dt_bias.numel() >= 1)
+        << "precomputed-gate variants require non-empty dummy A_log/dt_bias";
+    TVM_FFI_ICHECK(lower_bound == 0.0) << "precomputed-gate variants require lower_bound=0";
+  } else {
+    CheckContiguous(A_log, "A_log");
+    CheckContiguous(dt_bias, "dt_bias");
+    TVM_FFI_ICHECK(A_log.numel() >= num_heads)
+        << "lower-bound gate variants require at least H A_log values";
+    TVM_FFI_ICHECK(dt_bias.numel() >= num_heads * kHeadDim)
+        << "lower-bound gate variants require at least H * D dt_bias values";
+    TVM_FFI_ICHECK(std::isfinite(lower_bound) && std::isfinite(static_cast<float>(lower_bound)) &&
+                   lower_bound < 0.0)
+        << "lower-bound gate variants require a finite negative lower_bound";
+  }
   TVM_FFI_ICHECK(std::isfinite(scale) && std::isfinite(static_cast<float>(scale)))
       << "scale must be finite and representable as float32";
 

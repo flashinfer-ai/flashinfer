@@ -22,6 +22,7 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags
 
 FlashKDADecodeVariant = Literal[
+    "d128_t3_lower_bound_split4",
     "d128_t5_precomputed_gram_split1",
     "d128_t5_precomputed_gram_split2",
     "d128_t5_precomputed_gram_split4",
@@ -29,6 +30,7 @@ FlashKDADecodeVariant = Literal[
 ]
 
 FLASH_KDA_DECODE_VARIANTS: tuple[FlashKDADecodeVariant, ...] = (
+    "d128_t3_lower_bound_split4",
     "d128_t5_precomputed_gram_split1",
     "d128_t5_precomputed_gram_split2",
     "d128_t5_precomputed_gram_split4",

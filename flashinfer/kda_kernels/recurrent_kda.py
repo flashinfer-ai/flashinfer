@@ -1195,27 +1195,43 @@ def _select_flash_kda_decode_variant(
 ) -> Optional[FlashKDADecodeVariant]:
     """Select a frozen B200 decode schedule, or preserve the CuTe fallback.
 
-    The frozen family covers only the measured D128/T5 speculative-decode
-    contract. Any other public-API feature, tensor layout, or aliasing pattern
-    stays on the existing CuTe DSL implementation.
+    The production family covers the measured D128/T5 speculative-decode
+    contract. The D128/T3 lower-bound specialization is intentionally limited
+    to its N1/2/4/8/16, H=HV=16 evaluation coordinates until its public-API
+    performance envelope is established. Any other public-API feature, tensor
+    layout, or aliasing pattern stays on the existing CuTe DSL implementation.
     """
 
+    f32_max = torch.finfo(torch.float32).max
+    is_t3_lower_bound = (
+        num_spec_tokens == 2
+        and num_tokens == 3
+        and use_gate_in_kernel
+        and lower_bound is not None
+        and math.isfinite(lower_bound)
+        and -f32_max <= lower_bound < 0.0
+        and A_log is not None
+        and dt_bias is not None
+    )
+    is_t5_precomputed = (
+        num_spec_tokens == 4
+        and num_tokens == 5
+        and not use_gate_in_kernel
+        and lower_bound is None
+        and A_log is None
+        and dt_bias is None
+    )
     if (
         not q.is_cuda
         or get_compute_capability(q.device) != (10, 0)
-        or num_spec_tokens != 4
-        or num_tokens != 5
+        or not (is_t3_lower_bound or is_t5_precomputed)
         or cu_seqlens is None
         or ssm_state_indices is None
         or initial_state_source is not None
         or beta_is_logit
         or not use_qk_l2norm_in_kernel
-        or use_gate_in_kernel
-        or lower_bound is not None
-        or A_log is not None
-        or dt_bias is not None
         or not math.isfinite(scale)
-        or abs(scale) > torch.finfo(torch.float32).max
+        or abs(scale) > f32_max
     ):
         return None
 
@@ -1223,6 +1239,7 @@ def _select_flash_kda_decode_variant(
     _, _, num_value_heads, value_dim = v.shape
     num_sequences = cu_seqlens.numel() - 1
     int32_max = torch.iinfo(torch.int32).max
+    route_gate_tensors = (A_log, dt_bias) if is_t3_lower_bound else ()
     tensors = (
         q,
         k,
@@ -1234,7 +1251,7 @@ def _select_flash_kda_decode_variant(
         cu_seqlens,
         ssm_state_indices,
         num_accepted_tokens,
-    )
+    ) + route_gate_tensors
     if (
         head_dim != 128
         or value_dim != 128
@@ -1245,6 +1262,14 @@ def _select_flash_kda_decode_variant(
         or num_value_heads % num_heads
         or num_sequences <= 0
         or num_sequences > 65535
+        or (
+            is_t3_lower_bound
+            and (
+                num_sequences not in (1, 2, 4, 8, 16)
+                or num_heads != 16
+                or num_value_heads != 16
+            )
+        )
         or total_tokens != num_sequences * num_tokens
         or total_tokens * num_heads * head_dim > int32_max
         or total_tokens * num_value_heads * head_dim > int32_max
@@ -1291,6 +1316,17 @@ def _select_flash_kda_decode_variant(
         or not num_accepted_tokens.is_contiguous()
         or num_accepted_tokens.ndim != 1
         or num_accepted_tokens.numel() != num_sequences
+        or (
+            is_t3_lower_bound
+            and (
+                A_log.dtype != torch.float32
+                or dt_bias.dtype != torch.float32
+                or not A_log.is_contiguous()
+                or not dt_bias.is_contiguous()
+                or A_log.numel() < num_heads
+                or dt_bias.numel() < num_heads * head_dim
+            )
+        )
     ):
         return None
 
@@ -1303,13 +1339,16 @@ def _select_flash_kda_decode_variant(
         cu_seqlens,
         ssm_state_indices,
         num_accepted_tokens,
-    )
+    ) + route_gate_tensors
     if _tensors_overlap(out, state) or any(
         _tensors_overlap(mutated, read)
         for mutated in (out, state)
         for read in read_tensors
     ):
         return None
+
+    if is_t3_lower_bound:
+        return "d128_t3_lower_bound_split4"
 
     work = num_sequences * num_value_heads
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -1337,7 +1376,9 @@ def _run_flash_kda_decode(
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     scale: float,
-    dummy_f32: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
 ) -> None:
     """Launch one frozen decode specialization on the current CUDA stream."""
 
@@ -1348,15 +1389,15 @@ def _run_flash_kda_decode(
         v,
         g,
         beta,
-        dummy_f32,
-        dummy_f32,
+        A_log,
+        dt_bias,
         state,
         out,
         cu_seqlens,
         ssm_state_indices,
         num_accepted_tokens,
         float(scale),
-        0.0,
+        float(lower_bound),
         int(torch.cuda.current_stream(q.device).cuda_stream),
     )
 
@@ -1783,7 +1824,9 @@ def run_recurrent_kda(
             ssm_state_indices=ssi,
             num_accepted_tokens=num_accepted_tokens_i32,
             scale=effective_scale,
-            dummy_f32=dc["f32_1"],
+            A_log=A_log if A_log is not None else dc["f32_1"],
+            dt_bias=dt_bias if dt_bias is not None else dc["f32_1"],
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
         )
         if _batched_spec_B is not None:
             out_buf = out_buf.reshape(_batched_spec_B, 1 + num_spec_tokens, HV, V)

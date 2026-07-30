@@ -135,6 +135,40 @@ def _fake_selector_kwargs():
     }
 
 
+def _fake_t3_selector_kwargs(*, num_sequences=4):
+    address = iter(range(0x400000000000, 0x500000000000, 0x100000000))
+
+    def tensor(shape, dtype=torch.bfloat16, **kwargs):
+        return _fake_tensor(shape, dtype, next(address), **kwargs)
+
+    num_tokens = 3
+    num_heads = 16
+    total_tokens = num_sequences * num_tokens
+    q = tensor((1, total_tokens, num_heads, _D))
+    return {
+        "q": q,
+        "k": tensor(q.shape),
+        "v": tensor((1, total_tokens, num_heads, _D)),
+        "g": tensor((1, total_tokens, num_heads, _D)),
+        "beta": tensor((1, total_tokens, num_heads)),
+        "state": tensor((total_tokens, num_heads, _D, _D)),
+        "out": tensor((1, total_tokens, num_heads, _D)),
+        "cu_seqlens": tensor((num_sequences + 1,), torch.int32),
+        "ssm_state_indices": tensor((total_tokens,), torch.int32),
+        "num_accepted_tokens": tensor((num_sequences,), torch.int32),
+        "scale": _D**-0.5,
+        "num_tokens": num_tokens,
+        "num_spec_tokens": num_tokens - 1,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "A_log": tensor((num_heads,), torch.float32),
+        "dt_bias": tensor((num_heads * _D,), torch.float32),
+        "initial_state_source": None,
+        "beta_is_logit": False,
+    }
+
+
 def _patch_cpu_selector_environment(monkeypatch, *, sm_count=148, cc=(10, 0)):
     monkeypatch.setattr(recurrent_module, "get_compute_capability", lambda device: cc)
     monkeypatch.setattr(
@@ -169,6 +203,71 @@ def test_exact_cpu_contract_selects_frozen_variant(monkeypatch):
     assert recurrent_module._select_flash_kda_decode_variant(
         **_fake_selector_kwargs()
     ) == (_VARIANT_PREFIX + "8")
+
+
+@pytest.mark.parametrize("num_sequences", [1, 2, 4, 8, 16])
+def test_t3_lower_bound_evaluation_contract_selects_frozen_variant(
+    monkeypatch, num_sequences
+):
+    _patch_cpu_selector_environment(monkeypatch)
+    assert (
+        recurrent_module._select_flash_kda_decode_variant(
+            **_fake_t3_selector_kwargs(num_sequences=num_sequences)
+        )
+        == "d128_t3_lower_bound_split4"
+    )
+
+
+def test_t3_lower_bound_route_rejects_unmeasured_sequence_count(monkeypatch):
+    _patch_cpu_selector_environment(monkeypatch)
+    assert (
+        recurrent_module._select_flash_kda_decode_variant(
+            **_fake_t3_selector_kwargs(num_sequences=3)
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("num_tokens", 4),
+        ("num_spec_tokens", 3),
+        ("use_gate_in_kernel", False),
+        ("lower_bound", None),
+        ("lower_bound", 0.0),
+        ("lower_bound", float("-inf")),
+        ("A_log", None),
+        ("dt_bias", None),
+    ],
+)
+def test_t3_lower_bound_route_strictly_rejects_contract_mismatches(
+    monkeypatch, field, value
+):
+    _patch_cpu_selector_environment(monkeypatch)
+    kwargs = _fake_t3_selector_kwargs()
+    kwargs[field] = value
+    assert recurrent_module._select_flash_kda_decode_variant(**kwargs) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "changes"),
+    [
+        ("A_log", {"dtype": torch.bfloat16}),
+        ("A_log", {"contiguous": False}),
+        ("A_log", {"shape": (15,), "strides": (1,)}),
+        ("dt_bias", {"dtype": torch.bfloat16}),
+        ("dt_bias", {"contiguous": False}),
+        ("dt_bias", {"shape": (16 * _D - 1,), "strides": (1,)}),
+    ],
+)
+def test_t3_lower_bound_route_strictly_checks_gate_parameters(
+    monkeypatch, name, changes
+):
+    _patch_cpu_selector_environment(monkeypatch)
+    kwargs = _fake_t3_selector_kwargs()
+    _replace_fake(kwargs, name, **changes)
+    assert recurrent_module._select_flash_kda_decode_variant(**kwargs) is None
 
 
 @pytest.mark.parametrize(
@@ -327,7 +426,9 @@ def test_frozen_runner_forwards_ffi_abi_and_current_stream_cpu(monkeypatch):
         ssm_state_indices=tensors["ssm_state_indices"],
         num_accepted_tokens=tensors["num_accepted_tokens"],
         scale=tensors["scale"],
-        dummy_f32=dummy_f32,
+        A_log=dummy_f32,
+        dt_bias=dummy_f32,
+        lower_bound=0.0,
     )
 
     assert loaded == [variant]
@@ -351,6 +452,44 @@ def test_frozen_runner_forwards_ffi_abi_and_current_stream_cpu(monkeypatch):
     assert args[12] == tensors["scale"]
     assert args[13] == 0.0
     assert args[14] == 0xCAFE
+
+
+def test_t3_frozen_runner_forwards_real_gate_parameters_cpu(monkeypatch):
+    module = _RecorderModule()
+    monkeypatch.setattr(
+        recurrent_module,
+        "get_flash_kda_decode_module",
+        lambda variant: module,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device: SimpleNamespace(cuda_stream=0xFACE),
+    )
+    tensors = _fake_t3_selector_kwargs()
+    recurrent_module._run_flash_kda_decode(
+        "d128_t3_lower_bound_split4",
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        g=tensors["g"],
+        beta=tensors["beta"],
+        state=tensors["state"],
+        out=tensors["out"],
+        cu_seqlens=tensors["cu_seqlens"],
+        ssm_state_indices=tensors["ssm_state_indices"],
+        num_accepted_tokens=tensors["num_accepted_tokens"],
+        scale=tensors["scale"],
+        A_log=tensors["A_log"],
+        dt_bias=tensors["dt_bias"],
+        lower_bound=tensors["lower_bound"],
+    )
+
+    (args,) = module.calls
+    assert args[5] is tensors["A_log"]
+    assert args[6] is tensors["dt_bias"]
+    assert args[13] == tensors["lower_bound"]
+    assert args[14] == 0xFACE
 
 
 def _padded_slot_state(slots, num_value_heads, device, *, seed):

@@ -26,6 +26,10 @@ from flashinfer.jit import flash_kda_decode
 # The normalization removes only identity-derived temporary suffixes; all
 # schedule-relevant source text remains covered by the stable digest.
 FROZEN_GENERATED_BODY_SHA256 = {
+    "d128_t3_lower_bound_split4": (
+        "70c838b717a9eb7765bf9291db786b2b7a0387fbf80a3c337d5c04e7a553fe21",
+        "76976b198f567bd68ed246343d9e795b9ca2883dce89033e20e2125cb4a84b82",
+    ),
     "d128_t5_precomputed_gram_split1": (
         "7d44765cc20864dca2fc5f96ed2ae653e4d421f963c20fed5ba825d4989c8b4e",
         "3716601286aae19dde3d52020a97966b5f6b973ffcb128dfee6995855843c851",
@@ -120,12 +124,17 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(monkeypatch, variant, body_ha
     assert f"Raw generated body SHA256: {raw_sha256}" in before_body
     assert f"Normalized generated SHA256: {normalized_sha256}" in before_body
     assert after_body.strip() == "// clang-format on"
-    assert "#define GATE_KIND 0" in generated_body
+    expected_gate_kind = 1 if variant == "d128_t3_lower_bound_split4" else 0
+    assert f"#define GATE_KIND {expected_gate_kind}" in generated_body
     assert "#define DIRECT_PREFIX_CHECKPOINT 0" in generated_body
     assert "#define BLOCK_CHECKPOINT_MMA 0" in generated_body
 
     split = int(variant.rpartition("split")[2])
     binding_text = spec.sources[0].read_text()
+    expected_tokens = 3 if variant == "d128_t3_lower_bound_split4" else 5
+    assert "#define FLASHKDA_DECODE_HEAD_DIM 128" in binding_text
+    assert f"#define FLASHKDA_DECODE_TOKENS {expected_tokens}" in binding_text
+    assert f"#define FLASHKDA_DECODE_GATE_KIND {expected_gate_kind}" in binding_text
     assert f"#define FLASHKDA_DECODE_VALUE_SPLIT {split}" in binding_text
 
 
@@ -135,10 +144,14 @@ def test_flash_kda_decode_binding_contract():
     impl = (csrc_dir / "flashkda_decode_binding_impl.cuh").read_text()
 
     assert "CheckExactSm100a" in common
+    assert "struct VariantTraits" in common
     assert "state.stride(0) >= num_value_heads * head_dim * head_dim" in common
     assert "gate.stride(1) >= num_value_heads * head_dim" in common
     assert "g must be compact in its [HV, K] trailing dimensions" in common
     assert 'CheckNoOverlap(out, "output", state, "initial_state")' in common
+    assert "lower-bound gate variants require at least H A_log values" in common
+    assert "lower-bound gate variants require at least H * D dt_bias values" in common
+    assert "finite negative lower_bound" in common
     assert "torch.cuda.current_stream" not in impl
     assert "cuda_stream" in impl
     assert "VALUE_SPLIT" in impl

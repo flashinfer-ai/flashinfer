@@ -19,6 +19,15 @@
 #ifndef FLASHKDA_DECODE_VALUE_SPLIT
 #error "FLASHKDA_DECODE_VALUE_SPLIT must be defined by the binding translation unit"
 #endif
+#ifndef FLASHKDA_DECODE_HEAD_DIM
+#error "FLASHKDA_DECODE_HEAD_DIM must be defined by the binding translation unit"
+#endif
+#ifndef FLASHKDA_DECODE_TOKENS
+#error "FLASHKDA_DECODE_TOKENS must be defined by the binding translation unit"
+#endif
+#ifndef FLASHKDA_DECODE_GATE_KIND
+#error "FLASHKDA_DECODE_GATE_KIND must be defined by the binding translation unit"
+#endif
 #ifndef FLASHKDA_DECODE_LAUNCH_THREADS
 #error "FLASHKDA_DECODE_LAUNCH_THREADS must be defined by the binding translation unit"
 #endif
@@ -29,14 +38,17 @@
 namespace flashinfer {
 namespace flash_kda_decode {
 
+using ActiveVariant = VariantTraits<FLASHKDA_DECODE_HEAD_DIM, FLASHKDA_DECODE_TOKENS,
+                                    FLASHKDA_DECODE_GATE_KIND, FLASHKDA_DECODE_VALUE_SPLIT>;
+
 static_assert(THREADS == 256);
 static_assert(SMEM_TOTAL == FLASHKDA_DECODE_EXPECTED_SMEM);
-static_assert(GATE_KIND == 0);
+static_assert(GATE_KIND == FLASHKDA_DECODE_GATE_KIND);
 static_assert(DIRECT_PREFIX_CHECKPOINT == 0);
 static_assert(BLOCK_CHECKPOINT_MMA == 0);
 static_assert(FLASHKDA_DECODE_VALUE_SPLIT == 1 || FLASHKDA_DECODE_VALUE_SPLIT == 2 ||
               FLASHKDA_DECODE_VALUE_SPLIT == 4 || FLASHKDA_DECODE_VALUE_SPLIT == 8);
-static_assert(kHeadDim % (16 * FLASHKDA_DECODE_VALUE_SPLIT) == 0);
+static_assert(FLASHKDA_DECODE_HEAD_DIM % (16 * FLASHKDA_DECODE_VALUE_SPLIT) == 0);
 static_assert(FLASHKDA_DECODE_LAUNCH_THREADS % 32 == 0);
 static_assert(FLASHKDA_DECODE_LAUNCH_THREADS <= THREADS);
 
@@ -44,7 +56,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
          TensorView dt_bias, TensorView state, TensorView out, TensorView cu_seqlens,
          TensorView ssm_state_indices, TensorView num_accepted_tokens, double scale,
          double lower_bound, int64_t cuda_stream) {
-  const LaunchContext ctx = CheckInputs<FLASHKDA_DECODE_VALUE_SPLIT>(
+  const LaunchContext ctx = CheckInputs<ActiveVariant>(
       q, k, v, g, beta, A_log, dt_bias, state, out, cu_seqlens, ssm_state_indices,
       num_accepted_tokens, scale, lower_bound, cuda_stream);
   ffi::CUDADeviceGuard device_guard(ctx.device_id);

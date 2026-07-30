@@ -17,11 +17,13 @@
 #include "flashkda_decode_binding_common.cuh"
 
 #define FLASHKDA_DECODE_HEAD_DIM 128
-#define FLASHKDA_DECODE_TOKENS 5
-#define FLASHKDA_DECODE_GATE_KIND 0
-#define FLASHKDA_DECODE_VALUE_SPLIT 2
-#define FLASHKDA_DECODE_LAUNCH_THREADS 160
-#define FLASHKDA_DECODE_EXPECTED_SMEM 31360
+#define FLASHKDA_DECODE_TOKENS 3
+#define FLASHKDA_DECODE_GATE_KIND 1
+#define FLASHKDA_DECODE_VALUE_SPLIT 4
+#define FLASHKDA_DECODE_LAUNCH_THREADS 96
+// The generated allocator rounds the 15,868-byte live extent to 15,872 bytes.
+// Launch the exact SMEM_TOTAL declared by the frozen body.
+#define FLASHKDA_DECODE_EXPECTED_SMEM 15872
 
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
@@ -32,7 +34,7 @@
 #define LoomTensorMap flashkda_generated_LoomTensorMap
 #define LoomTensorMapPack flashkda_generated_LoomTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#include "flashkda_decode_d128_t5_precomputed_gram_split2.cu"
+#include "flashkda_decode_d128_t3_lower_bound_split4.cu"
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
