@@ -18,15 +18,15 @@ The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. With ``--flash-kda-peer``, two commit-verified
 MoonshotAI/FlashKDA measurements are reported:
 
-* the raw ``_fwd_raw`` timing scope used as the Official peer in Cake MR !458;
+* the raw ``_fwd_raw`` kernel timing scope;
 * a public-semantics adapter that follows ``_fwd_raw`` with the same-stream
   state copy-back required to emulate ``recurrent_kda`` on FlashKDA.
 
-All paths use the exact MR !458 tensors and seeds. Preinitialized rotating
-state buffers ensure every timed invocation sees the same initial state. The
-FlashInfer path updates each state slot in place inside the kernel; it has no
-state scratch or copy-back. Allocation, metadata, sequence ordering, build/JIT,
-and state-pool reset are outside the measured region.
+All paths use the same deterministic tensors and seeds. Preinitialized
+rotating state buffers ensure every timed invocation sees the same initial
+state. The FlashInfer path updates each state slot in place inside the kernel;
+it has no state scratch or copy-back. Allocation, metadata, sequence ordering,
+build/JIT, and state-pool reset are outside the measured region.
 """
 
 import argparse
@@ -51,12 +51,6 @@ from flashinfer.utils import get_compute_capability
 
 FLASH_KDA_PEER_COMMIT = "d2ff19a6a0c82f39f796f637ebd1c36090b1268f"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
-# This is an opaque identity recorded by the MR !458 contract. The contract
-# does not define its derivation, so it is not asserted to be a source or
-# rebuilt-binary digest. The actual extension digest is recorded separately.
-FLASH_KDA_CONTRACT_IDENTITY = (
-    "sha256:997c3a1d1338f8bf9dba3c1a01386b1b74448214c294d64409454cc11141c04c"
-)
 DEFAULT_STATE_ROTATIONS = 512
 
 
@@ -181,9 +175,6 @@ def _verify_peer_provenance(flash_kda, source_dir: Path) -> dict:
         "package_sha256": _sha256(package_path),
         "extension_path": str(extension_path),
         "extension_sha256": _sha256(extension_path),
-        "contract_recorded_peer_identity": FLASH_KDA_CONTRACT_IDENTITY,
-        "contract_identity_derivation": "unspecified",
-        "byte_identical_to_contract_artifact": "not_claimed",
     }
 
 
@@ -472,7 +463,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Compare against FlashKDA commit "
-            f"{FLASH_KDA_PEER_COMMIT} using both MR !458 raw and "
+            f"{FLASH_KDA_PEER_COMMIT} using both raw and "
             "public-semantics-adapted scopes."
         ),
     )
@@ -513,7 +504,7 @@ def main() -> None:
         except ImportError as error:
             raise RuntimeError(
                 "install MoonshotAI/FlashKDA at "
-                f"{FLASH_KDA_PEER_COMMIT} to run the MR !458 comparison"
+                f"{FLASH_KDA_PEER_COMMIT} to run the peer comparison"
             ) from error
         flash_kda = imported_flash_kda
         assert args.flash_kda_source_dir is not None
@@ -594,7 +585,7 @@ def main() -> None:
                         block_medians["adapted"]
                     ),
                     "speedup_vs_flash_kda_peer_adapted": (adapted_ms / candidate_ms),
-                    "peer_raw_timing_scope": ("mr458_official_peer_raw_fwd"),
+                    "peer_raw_timing_scope": ("flash_kda_raw_fwd"),
                     "peer_adapted_timing_scope": (
                         "raw_fwd_plus_public_state_copy_back"
                     ),

@@ -27,12 +27,12 @@ from flashinfer.jit import flash_kda
         (
             "m64",
             219136,
-            "468780f04768c949b22c688c1b85d235b6ffe050fd3327394fcdda7ea5112203",
+            "c28aacd475983c72ffe84acac7321a0b2e1c495d7c6e9cdc4a80ada112d76515",
         ),
         (
             "m128",
             227328,
-            "a2378074fde64fa454edb972dc51e188294dcb89369ee5ea1153f6c67200f1ab",
+            "e6ea814f0f2e0e0cb33c1562458de9e47272760562dbcb2364855c5b48f0b6ce",
         ),
     ],
 )
@@ -60,7 +60,9 @@ def test_flash_kda_uri_and_jit_spec(monkeypatch, variant, smem_bytes, generated_
     )
     frozen_source = spec.sources[0].parent / f"flashkda_bf16_fused_{variant}.cu"
     frozen_text = frozen_source.read_text()
-    assert "Provenance: loom @ 8437e0515b212e7973b196c4ab680d3d90c1209c" in frozen_text
+    assert f"Provenance: generated Loom schedule 'flashkda_bf16_fused_{variant}'" in (
+        frozen_text
+    )
     assert f"#define SMEM_TOTAL {smem_bytes}" in frozen_text
     assert frozen_text.count("// clang-format off") == 1
     assert frozen_text.rstrip().endswith("// clang-format on")
