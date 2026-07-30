@@ -15,7 +15,8 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
 @pytest.mark.parametrize(
-    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
+    "backend",
+    ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"],
 )
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
@@ -49,6 +50,16 @@ def test_mm_bf16(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+
+    if backend == "cute-dsl":
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            pytest.skip("nvidia-cutlass-dsl is not available.")
+        if m > 32:
+            pytest.skip("CuTeDSL split-K backend requires M <= 32.")
+        if res_dtype != torch.bfloat16:
+            pytest.skip("CuTeDSL split-K backend requires BF16 output.")
 
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")

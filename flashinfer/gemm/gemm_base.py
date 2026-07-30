@@ -18,7 +18,7 @@ import functools
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
@@ -387,6 +387,54 @@ def _tgv_gemm_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
+def _cute_dsl_splitk_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cute-dsl", "auto"
+    ] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The CuTeDSL split-K backend requires bfloat16 output.")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("The CuTeDSL split-K backend requires 2D inputs.")
+    if not a.is_contiguous():
+        raise ValueError("The CuTeDSL split-K backend requires row-major A.")
+    if not b.T.is_contiguous():
+        raise ValueError("The CuTeDSL split-K backend requires column-major B.")
+    if b.shape[0] != a.shape[1]:
+        raise ValueError(
+            f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
+        )
+    if b.device != a.device:
+        raise ValueError("A and B must be on the same CUDA device.")
+    if out is not None and not out.is_contiguous():
+        raise ValueError("The CuTeDSL split-K backend requires row-major output.")
+    if bias is not None and (
+        bias.device != a.device
+        or bias.shape != (b.shape[1],)
+        or not bias.is_contiguous()
+    ):
+        raise ValueError(
+            f"Bias must be contiguous on A's device with shape {(b.shape[1],)}."
+        )
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise LibraryError("The CuTeDSL split-K backend requires nvidia-cutlass-dsl.")
+
+    from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
+
+    default_tactic(a.shape[0], b.shape[1], a.shape[1])
+    return True
+
+
 @supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _cutile_mm_bf16_requirement(
     a: torch.Tensor,
@@ -534,6 +582,7 @@ def _heuristic_func_mm_bf16(
         "cublaslt": _cublaslt_mm_bf16_requirement,
         "tinygemm": _tinygemm_mm_bf16_requirement,
         "cutile": _cutile_mm_bf16_requirement,
+        "cute-dsl": _cute_dsl_splitk_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -547,7 +596,14 @@ def mm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
-        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
+        "cudnn",
+        "cutlass",
+        "tgv",
+        "cublaslt",
+        "tinygemm",
+        "cutile",
+        "cute-dsl",
+        "auto",
     ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
@@ -574,7 +630,7 @@ def mm_bf16(
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
@@ -584,6 +640,8 @@ def mm_bf16(
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
+        ``"cute-dsl"`` uses the standalone Blackwell low-M split-K kernel. It is
+        never auto-selected; serving frameworks must select it explicitly.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -1416,6 +1474,74 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
     return TGVRunner()
 
 
+@functools.cache
+def _cute_dsl_splitk_bf16_gemm_runner(
+    compute_capability: int,
+):
+    from .kernels.dense_bf16_gemm_sm100_splitk import (
+        SplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_splitk_dense,
+    )
+
+    class CuteDSLSplitKBf16Runner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (
+                str(inputs[0].dtype),
+                str(inputs[4].dtype),
+                inputs[2] is not None,
+                bool(inputs[3]),
+                compute_capability,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list[tuple[int, int, int, int]]:
+            m, k = inputs[0].shape
+            n = inputs[1].shape[1]
+            return list(
+                dict.fromkeys(
+                    astuple(config)
+                    for config in (
+                        default_tactic(m, n, k),
+                        *autotune_tactics(m, n, k),
+                    )
+                )
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, *_ = inputs
+            if tactic == -1:
+                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            else:
+                try:
+                    tactic = SplitKTactic(*tactic)
+                except TypeError as error:
+                    raise ValueError(
+                        "CuTeDSL split-K tactics must be "
+                        "(mma_m, mma_n, split_k, ab_stages)."
+                    ) from error
+            return run_splitk_dense(
+                a,
+                b,
+                inputs[2],
+                inputs[4],
+                bool(inputs[3]),
+                tactic,
+            )
+
+    return CuteDSLSplitKBf16Runner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1452,6 +1578,13 @@ def bf16_gemm_sm100(
         runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f))
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())
+    if "cute-dsl" in runner_names:
+        compute_capability = torch.cuda.get_device_capability(a.device)
+        runners.append(
+            _cute_dsl_splitk_bf16_gemm_runner(
+                compute_capability[0] * 10 + compute_capability[1],
+            )
+        )
     assert runners, "No suitable runners found"
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]
