@@ -188,7 +188,8 @@ run_oracle() {
     -m arch_blackwell || rc=1
 
   # deep_gemm's symm buffer needs an initialized process group (no
-  # MEGA_NO_DIST equivalent), hence the 1-proc torchrun.
+  # MEGA_NO_DIST equivalent). The test self-bootstraps a 1-rank group under
+  # plain pytest; the 1-proc torchrun here also exercises its env:// path.
   "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \
