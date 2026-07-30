@@ -2935,6 +2935,42 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         )
 
 
+def _check_mxfp8_gemm_strides(a: torch.Tensor, b: torch.Tensor, backend: str) -> None:
+    if a.stride(-1) != 1:
+        raise ValueError(
+            f"{backend} mxfp8 GEMM expects A to be row-major [batch, m, k] "
+            f"(K contiguous); got a.stride()={tuple(a.stride())}."
+        )
+    if b.stride(-2) != 1:
+        raise ValueError(
+            f"{backend} mxfp8 GEMM expects B to be column-major [batch, k, n] "
+            f"(K contiguous); got b.stride()={tuple(b.stride())}. Quantize the "
+            "contiguous [b, n, k] weight and pass the transpose of the "
+            "quantized tensor, e.g. B = mxfp8_quantize(weight)[0].transpose(-2, -1)."
+        )
+
+
+def _check_cudnn_bmm_mxfp8_scale_len(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> None:
+    scale_specs = (
+        ("A_scale", a_scale, a.numel() // a.shape[-1], a.shape[-1]),
+        ("B_scale", b_scale, b.shape[0] * b.shape[-1], b.shape[-2]),
+    )
+    for name, scale, rows, k in scale_specs:
+        expected_len = _mxfp8_swizzled_scale_len(rows, k, SfLayout.layout_128x4)
+        if scale.numel() != expected_len:
+            raise ValueError(
+                f"cuDNN bmm_mxfp8 expects {name} to contain {expected_len} "
+                "elements in the F8_128x4 swizzled layout for the operand "
+                f"shape, but got {scale.numel()}. Quantize with "
+                "mxfp8_quantize(..., is_sf_swizzled_layout=True)."
+            )
+
+
 def execute_cudnn_gemm_mxfp8_graph(
     graph,
     a,
@@ -2945,6 +2981,8 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _check_mxfp8_gemm_strides(a, b, "cuDNN")
+
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -4522,6 +4560,7 @@ def _cutlass_gemm_mxfp8_requirement(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
 ):
+    # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
         # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales (SfLayout.layout_128x4).
         if use_8x4_sf_layout:
@@ -4531,6 +4570,12 @@ def _cutlass_gemm_mxfp8_requirement(
         # K and N must be multiples of 32.
         if a.shape[1] % 32 != 0 or b.shape[1] % 32 != 0:
             return False
+    elif use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
+        raise ValueError(
+            "cutlass mm_mxfp8 requires 1D 128x4-swizzled block scales; the "
+            "provided scale layout (8x4 or 2D linear) is not supported. "
+            "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
+        )
     return True
 
 
@@ -4549,6 +4594,13 @@ def _trtllm_gemm_mxfp8_requirement(
         return False
     if a.ndim != 2 or b.ndim != 2:  # currently don't support BlockMajorK layout
         return False
+    # trtllm-gen cubins read both scales as swizzled 1D, never linear.
+    if a_descale.ndim != 1 or b_descale.ndim != 1:
+        raise ValueError(
+            "trtllm mm_mxfp8 requires a_descale and b_descale to be 1D swizzled "
+            "buffers; 2D linear scales are not supported. "
+            "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
+        )
     k, n = b.shape
     if k % 256 != 0:
         return False
@@ -5125,19 +5177,20 @@ def mm_mxfp8(
         Input B tensor, shape (k, n), should be column major, mxfp8 e4m3.
 
     a_descale: torch.Tensor
-        Block scale tensor for A. Can be:
-        - 2D non-swizzled: shape (m, k // 32)
-        - 1D swizzled: shape (M_padded * K_padded,)
-          where M_padded = round_up(m, 8 if 8x4 layout else 128), K_padded = round_up(k // 32, 4)
-        dtype: uint8.
+        Block scale tensor for A, uint8 (fp8 e8m0), 1D swizzled layout:
+        shape (M_padded * K_padded,) where M_padded = round_up(m, 8 if 8x4
+        layout else 128) and K_padded = round_up(k // 32, 4). Produced by
+        ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``. The 8x4 layout
+        (``use_8x4_sf_layout=True``) is only consumed by the trtllm backend.
+        2D linear scales are not supported by any backend and raise ValueError.
 
     b_descale: torch.Tensor
-        Block scale tensor for B. Can be:
-        - 2D non-swizzled: shape (k // 32, n) - transposed format
-        - 1D swizzled: shape (N_padded * K_padded,) where N_padded = round_up(n, 128), K_padded = round_up(k // 32, 4)
-        dtype: uint8.
-        Note: For 2D format, this is the transposed version (typically passed as scale.t()).
-        For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
+        Block scale tensor for B, uint8 (fp8 e8m0), 1D swizzled 128x4 layout:
+        shape (N_padded * K_padded,) where N_padded = round_up(n, 128) and
+        K_padded = round_up(k // 32, 4), flattened from the (N_padded,
+        K_padded) grid. For the trtllm backend, quantize with the linear
+        layout and shuffle with ``shuffle_matrix_sf_a`` instead (it emits the
+        swizzled+shuffled layout trtllm expects).
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
@@ -5157,9 +5210,10 @@ def mm_mxfp8(
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
-        - On SM12x GPUs, the ``"cutlass"`` backend only supports
-          1D swizzled scales (``SfLayout.layout_128x4``). Passing 2D linear scales will raise
-          an error. Use ``mxfp8_quantize(..., sf_swizzle_layout=SfLayout.layout_128x4)``.
+        - The ``"cutlass"`` backend only supports 1D swizzled scales
+          (``SfLayout.layout_128x4``); the kernel has no linear-scale path.
+          Passing 2D linear scales raises ValueError. Use
+          ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
 
@@ -5177,23 +5231,12 @@ def mm_mxfp8(
     >>> a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     >>> weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     >>>
-    >>> # Option 1: Use swizzled layout (recommended for accuracy)
     >>> # Quantize input [m, k] - scales are 1D swizzled for (M, K/32) layout
     >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=True)
     >>> # Quantize weight [n, k] - scales are 1D swizzled for (N, K/32) layout
     >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=True)
     >>> # Pass weight.T as [k, n] and 1D swizzled scales directly
     >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf, w_sf, out_dtype=torch.bfloat16)
-    >>> out.shape
-    torch.Size([512, 256])
-    >>>
-    >>> # Option 2: Use non-swizzled layout (for compatibility)
-    >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=False)
-    >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=False)
-    >>> # For non-swizzled: reshape to 2D and transpose weight scale to (k//32, n)
-    >>> a_sf_2d = a_sf.view(m, k // 32)
-    >>> w_sf_2d = w_sf.view(n, k // 32).t()  # Transpose to (k // 32, n)
-    >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf_2d, w_sf_2d, out_dtype=torch.bfloat16)
     >>> out.shape
     torch.Size([512, 256])
     """
@@ -5205,11 +5248,11 @@ def mm_mxfp8(
     )
 
     assert a_descale.ndim in (1, 2), (
-        f"mm_mxfp8: a_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"mm_mxfp8: a_descale must be 1D (swizzled) or 2D (legacy linear), "
         f"got {a_descale.ndim}D with shape {a_descale.shape}, dtype={a_descale.dtype}"
     )
     assert b_descale.ndim in (1, 2), (
-        f"mm_mxfp8: b_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"mm_mxfp8: b_descale must be 1D (swizzled) or 2D (legacy linear), "
         f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
     )
 
@@ -5684,7 +5727,7 @@ def _cutlass_gemm_fp4_requirement(
     b_descale: torch.Tensor,  # unused
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
-    out: Optional[torch.Tensor] = None,  # unused
+    out: Optional[torch.Tensor] = None,
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
@@ -5697,6 +5740,10 @@ def _cutlass_gemm_fp4_requirement(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
+    if out is not None and not out.is_contiguous():
+        raise ValueError(
+            "The CUTLASS FP4 GEMM backend requires a contiguous output tensor."
+        )
     return True
 
 
@@ -9010,6 +9057,12 @@ def _check_bmm_mxfp8_problem_size(
             f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        raise ValueError(
+            "bmm_mxfp8 requires 1D swizzled scale tensors "
+            "(produced by mxfp8_quantize(..., is_sf_swizzled_layout=True)); "
+            f"got A_scale.ndim={A_scale.ndim}, B_scale.ndim={B_scale.ndim}."
+        )
     _validate_mxfp8_output_dtype(dtype)
     return True
 
@@ -9075,13 +9128,19 @@ def bmm_mxfp8(
         Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
 
     B: torch.Tensor
-        Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
+        Mat2 tensor, shape (b, k, n), must be column major, fp8 e4m3 or fp8 e5m2.
+        Quantize the contiguous [b, n, k] weight (so the 32-element scale blocks
+        run along k, the reduction dim) and pass the transpose of the quantized
+        tensor, e.g. ``B = mxfp8_quantize(weight)[0].transpose(-2, -1)``
+        (do NOT call ``.contiguous()`` on the transpose).
 
     A_scale: torch.Tensor
-        Scale tensor for A, uint8 (fp8 e8m0 format).
+        Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
+        layout produced by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
 
     B_scale: torch.Tensor
-        Scale tensor for B, uint8 (fp8 e8m0 format).
+        Scale tensor for B, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
+        layout, as returned by quantizing the [b, n, k] weight (see ``B``).
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
@@ -9094,6 +9153,12 @@ def bmm_mxfp8(
         On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
         be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
         shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
+        Both the cuDNN and CUTLASS backends read the scale tensors in the
+        F8_128x4 swizzled layout; linear-layout scales are not supported.
+        Both layouts are flat 1D buffers, so a linear scale whose length happens
+        to match the padded swizzled length cannot be detected at runtime. Ensure
+        the scale was produced with the swizzled layout rather than relying on a
+        warning.
 
     Returns
     -------
@@ -9119,6 +9184,7 @@ def bmm_mxfp8(
         resolved_backend = bmm_mxfp8.suitable_auto_backends[0]
 
     if resolved_backend == "cutlass":
+        _check_mxfp8_gemm_strides(A, B, "CUTLASS")
         # SM120/121 CUTLASS path.
         # B is [b, k, n] col-major; CUTLASS expects mat2 as [B, N, K].
         # col-major [b, k, n] with strides (k*n, 1, k) → .transpose(1,2) → [b, n, k]
@@ -9133,6 +9199,7 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
+        _check_cudnn_bmm_mxfp8_scale_len(A, B, A_scale, B_scale)
         mxfp8_gemm_sm100(
             A,
             B,

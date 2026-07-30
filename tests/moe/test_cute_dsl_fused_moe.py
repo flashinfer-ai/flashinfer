@@ -418,6 +418,81 @@ class TestInputsHelperContract:
 
 
 # =============================================================================
+# Test Class: autotune replay stream contract (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestAutotuneReplayMemsetContract:
+    @pytest.mark.parametrize("api", ["functional", "wrapper"])
+    @pytest.mark.parametrize("is_tuning_mode", [False, True])
+    def test_selected_tactic_disables_async_memset_while_tuning(
+        self, monkeypatch, api, is_tuning_mode
+    ):
+        from flashinfer.fused_moe.cute_dsl import fused_moe
+
+        calls = []
+
+        class RecordingRunner:
+            def __init__(self, *args, **kwargs):
+                self.tuning_config = object()
+
+            def __call__(self, inputs, **kwargs):
+                calls.append(kwargs)
+                return inputs[-1]
+
+        class StubTuner:
+            def __init__(self):
+                self.is_tuning_mode = is_tuning_mode
+
+            def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+                assert "use_async_memset" not in kwargs
+                return runners[0], ("selected",)
+
+        monkeypatch.setattr(
+            fused_moe.AutoTuner, "get", staticmethod(lambda: StubTuner())
+        )
+
+        tensors = {
+            "x": torch.empty((2, 8), dtype=torch.uint8),
+            "x_sf": torch.empty((2, 1), dtype=torch.uint8),
+            "token_selected_experts": torch.zeros((2, 1), dtype=torch.int32),
+            "token_final_scales": torch.ones((2, 1), dtype=torch.float32),
+            "w1_weight": torch.empty((1, 32, 8), dtype=torch.uint8),
+            "w1_weight_sf": torch.empty((1, 32, 1), dtype=torch.uint8),
+            "w1_alpha": torch.ones(1, dtype=torch.float32),
+            "fc2_input_scale": torch.ones(1, dtype=torch.float32),
+            "w2_weight": torch.empty((1, 16, 8), dtype=torch.uint8),
+            "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
+            "w2_alpha": torch.ones(1, dtype=torch.float32),
+        }
+
+        if api == "functional":
+            monkeypatch.setattr(
+                fused_moe, "CuteDslFusedMoENvfp4Runner", RecordingRunner
+            )
+            result = fused_moe.cute_dsl_fused_moe_nvfp4(
+                **tensors,
+                num_experts=1,
+                top_k=1,
+            )
+        else:
+            wrapper = fused_moe.CuteDslMoEWrapper(
+                num_experts=1,
+                top_k=1,
+                hidden_size=16,
+                intermediate_size=16,
+                use_cuda_graph=False,
+            )
+            wrapper._runner = RecordingRunner()
+            wrapper._per_token_runner = RecordingRunner()
+            result = wrapper.run(**tensors)
+
+        assert result.shape == (2, 16)
+        assert calls[-1]["use_async_memset"] is not is_tuning_mode
+
+
+# =============================================================================
 # Test Class: get_max_num_tiles / get_max_num_permuted_tokens (no GPU required)
 # =============================================================================
 

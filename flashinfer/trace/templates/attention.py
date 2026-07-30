@@ -2692,6 +2692,11 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
 
 
 def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
+    if kwargs.get("enable_dcp", False):
+        raise NotImplementedError(
+            "fi_trace does not yet represent cyclic DCP KV ownership or "
+            "cross-rank LSE merging for MLA decode"
+        )
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
         return trtllm_batch_decode_mla_sparse_trace

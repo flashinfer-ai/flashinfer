@@ -602,8 +602,17 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has

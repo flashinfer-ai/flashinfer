@@ -173,8 +173,8 @@ def test_split_bf16_kernel_matches_torch_reference():
     act = MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=torch.empty(0, device=x.device),
-        selected_experts=topk_ids.to(torch.int32),
-        final_scales=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
     y_kernel = MoELayer(cfg)(act, wp)
     torch.cuda.synchronize()
@@ -227,8 +227,8 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     act = MoEActivationPack(
         hidden_states_q=x_q,
         hidden_states_scale=x_sf,
-        selected_experts=topk_ids.to(torch.int32),
-        final_scales=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
     y_kernel = MoELayer(cfg)(act, wp)
     torch.cuda.synchronize()
