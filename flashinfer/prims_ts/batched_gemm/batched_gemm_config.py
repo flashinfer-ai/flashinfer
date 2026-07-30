@@ -632,7 +632,11 @@ class BatchedGemmConfig:
     """
 
     use_clc_fast_drain: int = 0
-    """Cancel queued persistent CTAs after entering an early-exit suffix."""
+    """Enable batched CLC cancellation for persistent early-exit overlaunch.
+
+    When a CUDA graph launches more token CTAs than the active batch needs,
+    this lets the work queue cancel queued tail CTAs in batches.
+    """
 
     use_early_exit: int = 0
     """Let over-launched token CTAs skip work past the active batch. ``0``/``1``.
@@ -2230,12 +2234,12 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                 (
                     "epilogue",
                     "copy_sfb",
+                    "gather",
                     "load_b",
                     "load_sfb",
                     "load_a",
                     "load_sfa",
                     "copy_sfa",
-                    "gather",
                     "sync",
                     "mma",
                     "workid",

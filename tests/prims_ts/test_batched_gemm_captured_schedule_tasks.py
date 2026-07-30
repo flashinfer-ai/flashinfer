@@ -485,6 +485,61 @@ def _work_queue() -> WorkQueue:
     )
 
 
+def test_fast_drain_work_queue_reserves_response_and_barrier_smem():
+    scheduler_config = TileSchedulerConfig(
+        tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
+        tile_scheduler_params=None,
+    )
+    work_queue = BatchedGemmWorkQueue(
+        tile_scheduler_config=scheduler_config,
+        cfg=SimpleNamespace(
+            is_persistent=True,
+            use_early_exit=True,
+            use_clc_fast_drain=True,
+            is_swap_ab=False,
+        ),
+        name="WorkQueue",
+    )
+
+    allocations = work_queue.get_smem_requirements()
+
+    assert [
+        (alloc.name, alloc.size_bytes, alloc.alignment) for alloc in allocations
+    ] == [
+        ("WorkQueue_fast_drain_response", 64, 16),
+        ("WorkQueue_fast_drain_mbar", 8, 8),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("is_persistent", "use_early_exit", "use_clc_fast_drain"),
+    (
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ),
+)
+def test_fast_drain_work_queue_omits_smem_when_disabled(
+    is_persistent, use_early_exit, use_clc_fast_drain
+):
+    scheduler_config = TileSchedulerConfig(
+        tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
+        tile_scheduler_params=None,
+    )
+    work_queue = BatchedGemmWorkQueue(
+        tile_scheduler_config=scheduler_config,
+        cfg=SimpleNamespace(
+            is_persistent=is_persistent,
+            use_early_exit=use_early_exit,
+            use_clc_fast_drain=use_clc_fast_drain,
+            is_swap_ab=False,
+        ),
+        name="WorkQueue",
+    )
+
+    assert work_queue.get_smem_requirements() == []
+
+
 def _producer_aux_labels(schedule_list) -> list[str | None]:
     return [
         label

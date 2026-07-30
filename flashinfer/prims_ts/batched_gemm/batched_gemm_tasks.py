@@ -111,6 +111,7 @@ def _work_tile_schedule_loop(cfg, work_queue, work_tile_preheader=None):
 @contextmanager
 def _k_tile_schedule_loop(cfg, work_queue, num_k_tiles: int, domain_start: int = 0):
     """Wrap a task body in either the persistent work-tile loop or static K loop."""
+    # Keep these scopes nested: the task-scheduling DSL captures their structure.
     with _work_tile_schedule_loop(cfg, work_queue):  # noqa: SIM117
         with domain_loop(domain_start, num_k_tiles, 1):
             yield
@@ -168,7 +169,8 @@ def create_load_a_task(
         _ = gmem.init_coords_state()
         smem.init_load_state()
         with _work_tile_schedule_loop(cfg, wq):
-            gmem.compute_a_coords_head()
+            # The DSL captures these named outputs even though Python does not.
+            coords = gmem.compute_a_coords_head()  # noqa: F841
             _call_named_aux_if_present(
                 smem, "prepare_gather_tile", has_prepare_gather_tile
             )
@@ -253,7 +255,8 @@ def create_load_b_task(
         _ = gmem.init_coords_state()
         smem.init_load_state()
         with _work_tile_schedule_loop(cfg, wq):
-            gmem.compute_b_coords_head()
+            # The DSL captures these named outputs even though Python does not.
+            coords = gmem.compute_b_coords_head()  # noqa: F841
             _call_named_aux_if_present(
                 smem, "prepare_gather_tile", has_prepare_gather_tile
             )
@@ -719,15 +722,19 @@ def create_copy_sfb_task(
     ) -> None:
         _ = smem.init_s2t_state()
         tmem.init_copy_state()
-        with _k_tile_schedule_loop(cfg, wq, num_k_tiles):
+
+        def issue_sfb_copy() -> None:
             smem.try_wait()
             smem.wait()
             desc_b_s2t_base = smem.build_sfb_s2t_desc()
             tmem.acquire()
             tmem.copy_sfb(desc_b_s2t_base=desc_b_s2t_base)
-            tmem.commit()
             if needs_copy_sync:
                 tmem.sync_sttm_copy()
+
+        with _k_tile_schedule_loop(cfg, wq, num_k_tiles):
+            issue_sfb_copy()
+            tmem.commit()
             smem.release()
 
     captured_schedule = _call_schedule_with_optional_work_queue(

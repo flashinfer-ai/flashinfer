@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from typing import Any
 
 import cutlass
 import cutlass.experimental.cuda as cuda
@@ -133,6 +134,10 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
 
 def _task_manager_verify_enabled() -> bool:
     return _env_flag_enabled("FLASHINFER_PRIMS_TS_DEBUG_CHECKS")
+
+
+def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
+    return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas and cfg.has_gather)
 
 
 class _ProductionTaskManager(TaskManager):
@@ -738,11 +743,10 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             pipeline_config=pcfgs["work_throttle"],
             name="WorkThrottle",
         )
+    pdl_wait_completed_before_tasks = _pdl_wait_completed_before_tasks(cfg)
     pdl_wait_resource = (
-        None
-        if cfg.do_pdl_wait_for_num_non_exiting_ctas
-        else PdlWaitBarrier(name="PdlWait")
-        if cfg.use_pdl
+        PdlWaitBarrier(name="PdlWait")
+        if cfg.use_pdl and not pdl_wait_completed_before_tasks
         else None
     )
     pdl_launch_resource = PdlLaunchBarrier(name="PdlLaunch") if cfg.use_pdl else None
@@ -1208,6 +1212,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         smem_resources = smem_resources + (smem_sfa, smem_sfb)
     if cfg.has_deepseek_fp8 and smem_dsfp8_sfab is not None:
         smem_resources = smem_resources + (smem_dsfp8_sfab,)
+    if cfg.is_persistent:
+        smem_resources = smem_resources + (work_queue,)
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
@@ -1269,7 +1275,7 @@ def build_batched_gemm_task_manager(
         resource_dependency_graph=dep_graph,
         smem_allocator=smem_alloc,
         tmem_allocator=tmem_alloc,
-        assume_pdl_wait_completed=cfg.do_pdl_wait_for_num_non_exiting_ctas != 0,
+        assume_pdl_wait_completed=_pdl_wait_completed_before_tasks(cfg),
         exhaustive_deadlock_race_check=_exhaustive_deadlock_race_check_enabled(),
         verbose=verbose,
     )
@@ -1327,9 +1333,36 @@ def _batched_gemm_kernel_bf16_body(
 
     pcfgs = _make_pipeline_configs(cfg)
 
+    num_non_exiting_ctas_value = None
+    if cutlass.const_expr(
+        cfg.is_persistent
+        and cfg.use_early_exit
+        and cfg.do_pdl_wait_for_num_non_exiting_ctas
+        and not _pdl_wait_completed_before_tasks(cfg)
+    ):
+        # Non-gather FC2 is transitively ordered through FC1.  Match TRT-LLM
+        # Gen by loading the launch bound in the prologue and keeping the PDL
+        # waits on the tasks that consume FC1 output.
+        num_non_exiting_ctas_view = cutlass.make_array_view(
+            num_non_exiting_ctas_tensor
+        )
+        num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
+            idx=Int32(0), vector_size=1
+        )[0]
+        if cutlass.const_expr(cfg.metadata_compute_tile_ratio > 1):
+            num_non_exiting_ctas_value *= cutlass.Int32(
+                cfg.metadata_compute_tile_ratio
+            )
+
     tma_a_ptr = tma_a_desc.get_ptr()
     tma_b_ptr = tma_b_desc.get_ptr()
     tma_c_ptr = tma_c_desc.get_ptr()
+    prims.prefetch_tensormap(tma_a_ptr)
+    prims.prefetch_tensormap(tma_b_ptr)
+    if cutlass.const_expr(cfg.has_scale_factors):
+        prims.prefetch_tensormap(tma_sfa_desc.get_ptr())
+        prims.prefetch_tensormap(tma_sfb_desc.get_ptr())
+    prims.prefetch_tensormap(tma_c_ptr)
 
     # tile_idx_tensor: maps token tiles to expert indices.
     # mn_limit_tensor: maps token tiles to TRT-LLM Gen absolute end-row limits.
@@ -1690,15 +1723,64 @@ def _batched_gemm_kernel_bf16_body(
         name="GmemC",
     )
 
+    # WorkQueue — CLC persistent or static (non-persistent)
+    if cutlass.const_expr(cfg.is_persistent):
+        if cutlass.const_expr(
+            cfg.use_early_exit
+            and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
+        ):
+            if cutlass.const_expr(_pdl_wait_completed_before_tasks(cfg)):
+                # Gather FC1 directly consumes routing output.  Delay its
+                # single global wait until immediately before the first count
+                # load so descriptor and resource setup can overlap routing.
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            num_non_exiting_ctas_view = cutlass.make_array_view(
+                num_non_exiting_ctas_tensor
+            )
+            num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
+                idx=Int32(0), vector_size=1
+            )[0]
+        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
+        tile_sched_cfg = (
+            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+                response_ptr=clc_response_ptr,
+            )
+        )
+        work_queue = BatchedGemmWorkQueue(
+            tile_scheduler_config=tile_sched_cfg,
+            cfg=cfg,
+            num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
+            num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+            pipeline_config=pcfgs["workid"],
+            name="WorkQueue",
+        )
+    else:
+        tile_sched_cfg = (
+            TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+            )
+        )
+        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+
+    work_throttle = None
+    if cutlass.const_expr(cfg.use_work_throttle_barrier):
+        work_throttle = WorkThrottleBarrierResource(
+            pipeline_config=pcfgs["work_throttle"],
+            name="WorkThrottle",
+        )
+
     # SMEM allocator
     smem_allocator = SmemAllocator()
-    smem_resources = (smem_a, smem_b)
+    smem_resources: tuple[Any, ...] = (smem_a, smem_b)
     if cutlass.const_expr(cfg.has_cast_a):
         smem_resources = smem_resources + (smem_sfa,)
     if cutlass.const_expr(cfg.has_scale_factors):
         smem_resources = smem_resources + (smem_sfa, smem_sfb)
     if cutlass.const_expr(cfg.has_deepseek_fp8):
         smem_resources = smem_resources + (smem_dsfp8_sfab,)
+    if cutlass.const_expr(cfg.is_persistent):
+        smem_resources = smem_resources + (work_queue,)
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
@@ -1735,61 +1817,12 @@ def _batched_gemm_kernel_bf16_body(
             tmem_allocator.add_resource(tmem_sfb)
     tmem_allocator.compute_layout()
 
-    # WorkQueue — CLC persistent or static (non-persistent)
-    if cutlass.const_expr(cfg.is_persistent):
-        num_non_exiting_ctas_value = None
-        if cutlass.const_expr(
-            cfg.use_early_exit
-            and (not cfg.use_pdl or cfg.do_pdl_wait_for_num_non_exiting_ctas)
-        ):
-            num_non_exiting_ctas_view = cutlass.make_array_view(
-                num_non_exiting_ctas_tensor
-            )
-            num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
-                idx=Int32(0), vector_size=1
-            )[0]
-        # CLC response buffer in SMEM
-        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
-        fast_drain_response_ptr = None
-        fast_drain_mbar_ptr = None
-        if cutlass.const_expr(cfg.use_clc_fast_drain):
-            fast_drain_response_ptr = cute.arch.alloc_smem(cutlass.Int128, 4)
-            fast_drain_mbar_ptr = cute.arch.alloc_smem(cutlass.Int64, 1)
-        tile_sched_cfg = (
-            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
-                tile_scheduler_params=tile_sched_params,
-                response_ptr=clc_response_ptr,
-            )
-        )
-        work_queue = BatchedGemmWorkQueue(
-            tile_scheduler_config=tile_sched_cfg,
-            cfg=cfg,
-            num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
-            num_non_exiting_ctas_value=num_non_exiting_ctas_value,
-            fast_drain_response_ptr=fast_drain_response_ptr,
-            fast_drain_mbar_ptr=fast_drain_mbar_ptr,
-            pipeline_config=pcfgs["workid"],
-            name="WorkQueue",
-        )
-    else:
-        tile_sched_cfg = (
-            TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
-                tile_scheduler_params=tile_sched_params,
-            )
-        )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
-
-    work_throttle = None
-    if cutlass.const_expr(cfg.use_work_throttle_barrier):
-        work_throttle = WorkThrottleBarrierResource(
-            pipeline_config=pcfgs["work_throttle"],
-            name="WorkThrottle",
-        )
+    pdl_wait_completed_before_tasks = cutlass.const_expr(
+        _pdl_wait_completed_before_tasks(cfg)
+    )
     pdl_wait_resource = (
-        None
-        if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas)
-        else PdlWaitBarrier(name="PdlWait")
-        if cutlass.const_expr(cfg.use_pdl)
+        PdlWaitBarrier(name="PdlWait")
+        if cutlass.const_expr(cfg.use_pdl and not pdl_wait_completed_before_tasks)
         else None
     )
     pdl_launch_resource = (
@@ -2120,9 +2153,7 @@ def _batched_gemm_kernel_bf16_body(
         resource_dependency_graph=resource_dependency_graph,
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
-        assume_pdl_wait_completed=cutlass.const_expr(
-            cfg.do_pdl_wait_for_num_non_exiting_ctas != 0
-        ),
+        assume_pdl_wait_completed=pdl_wait_completed_before_tasks,
         exhaustive_deadlock_race_check=cutlass.const_expr(
             _exhaustive_deadlock_race_check_enabled()
         ),
@@ -2286,7 +2317,9 @@ def batched_gemm_kernel_bf16(
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     early_exit_max_token_ctas: cutlass.Int32,
 ) -> None:
-    if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
+    if cutlass.const_expr(
+        cfg.do_pdl_wait_for_num_non_exiting_ctas and not cfg.is_persistent
+    ):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     _batched_gemm_kernel_bf16_body(

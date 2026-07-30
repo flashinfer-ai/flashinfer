@@ -42,6 +42,70 @@ def _generate_line_info_enabled() -> bool:
     return _env_flag_enabled("FLASHINFER_PRIMS_TS_DEBUG_CHECKS")
 
 
+def _default_task_registers_for_compile(io: dict) -> int:
+    """Return the kernel register budget derived from the concrete task graph."""
+    cfg_overrides = {
+        name: value
+        for name, value in io["cfg"].__dict__.items()
+        if name != "ldgsts_sfb_producer_commit_prefetch_depth"
+    }
+    task_manager = build_batched_gemm_task_manager(
+        num_experts=io.get("L", io["shape"][3]),
+        num_tokens=io.get("num_tokens", io["shape"][4]),
+        top_k=1,
+        early_exit_max_token_ctas=io["launch_early_exit_max_token_ctas"],
+        verbose=False,
+        **cfg_overrides,
+    )
+    return task_manager._default_task_registers()
+
+
+def _nested_mlir_ops(operation):
+    """Yield operations recursively from an MLIR operation."""
+    for region in operation.regions:
+        for block in region.blocks:
+            for op in block.operations:
+                yield op
+                yield from _nested_mlir_ops(op.operation)
+
+
+def _cuda_kernel_ops(module):
+    """Yield every CUDA kernel nested in a traced MLIR module."""
+    for op in _nested_mlir_ops(module.operation):
+        if op.operation.name == "cuda.kernel":
+            yield op
+
+
+def _num_regs_trace_finalize_hook(num_regs: int):
+    """Set the traced CUDA kernel's initial per-thread register budget."""
+
+    def hook(_owner, module, _function_name) -> None:
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import cuda as cuda_dialect
+
+        attr_name = str(cuda_dialect.CUFunctionAttribute.num_regs)
+        attr_value = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(32),
+            num_regs,
+        )
+        kernel_count = 0
+        for kernel_op in _cuda_kernel_ops(module):
+            attrs = kernel_op.attributes
+            cu_attrs = attrs["cu_attrs"]
+            attrs["cu_attrs"] = ir.DictAttr.get(
+                {named_attr.name: named_attr.attr for named_attr in cu_attrs}
+                | {attr_name: attr_value}
+            )
+            kernel_count += 1
+        if kernel_count == 0:
+            raise RuntimeError(
+                "Unable to set the initial register budget: no cuda.kernel "
+                "operation was found in the traced MLIR module."
+            )
+
+    return hook
+
+
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -262,20 +326,15 @@ def _launch_metadata_lists(
     return tile_idx, mn_limit, route_map
 
 
-def _normalize_runtime_scheduler(
+def _normalize_early_exit_launch_extent(
     cfg,
     token_layout: TokenLayout,
-    out_hidden: int,
     early_exit_max_token_ctas: int,
-):
-    """Normalize runtime-only options for the concrete token layout."""
-    if (
-        cfg.use_early_exit
-        and cfg.is_persistent
-        and token_layout.num_token_tiles >= early_exit_max_token_ctas
-    ):
-        cfg = replace(cfg, use_early_exit=0)
-    return cfg
+) -> int:
+    """Return an early-exit extent that cannot underlaunch active token tiles."""
+    if cfg.use_early_exit:
+        return max(int(token_layout.num_token_tiles), int(early_exit_max_token_ctas))
+    return int(early_exit_max_token_ctas)
 
 
 def _runtime_config(cfg, in_hidden: int):
@@ -1619,10 +1678,9 @@ def reference_check(
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    cfg = _normalize_runtime_scheduler(
+    launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden,
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
@@ -2759,10 +2817,9 @@ def _build_launch_io(
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    cfg = _normalize_runtime_scheduler(
+    launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
-        out_hidden,
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
@@ -3362,6 +3419,7 @@ def _compile_for_launch(io: dict, stream) -> object:
     if _generate_line_info_enabled():
         compile_entry = cute.compile[cute.GenerateLineInfo(True)]
 
+    compile_num_regs = _default_task_registers_for_compile(io)
     with BaseDSL.enable_pyir():
         compiled = compile_entry(
             gemm,
@@ -3370,6 +3428,7 @@ def _compile_for_launch(io: dict, stream) -> object:
             # Matches the FMHA TS runner workaround and can be removed after
             # upgrading to a CUDA toolkit with the OCG/NVVM fixes.
             options=_cute_compile_options(),
+            trace_finalize_hooks=_num_regs_trace_finalize_hook(compile_num_regs),
         )
     return compiled
 

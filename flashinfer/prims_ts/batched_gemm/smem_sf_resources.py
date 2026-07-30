@@ -741,6 +741,7 @@ class SmemSfLdgstsResource(MemoryResource):
     mn_limit: Any = None  # make_array_view of TRT absolute token end-row limits
     smem_buf: Any = None
     routed_rows: Any = None
+    tile_limit: Any = None
     _alloc_sf: Constexpr[Optional[SmemAllocation]] = None
     _operand: Constexpr[str] = "a"
     producer_commit_prefetch_depth: Constexpr[int] = 0
@@ -903,29 +904,27 @@ class SmemSfLdgstsResource(MemoryResource):
             shape=(self._alloc_sf.size_bytes,),
             addrspace=3,
         )
-        if cutlass.const_expr(self.cfg.has_cluster):
-            is_b = cutlass.const_expr(self._operand == "b")
-            tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
-            sf_block_size = (
-                self.cfg.input_sf_block_size_b
-                if is_b
-                else self.cfg.input_sf_block_size_a
-            )
-            sf_k = self.cfg.tile_k // sf_block_size
-            num_load_warps = (
-                self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
-            )
-            num_threads = max(1, num_load_warps) * 32
-            elts_per_load = 4
-            total_elts = tile_rows * sf_k
-            loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
-                num_threads * elts_per_load
-            )
-            self.routed_rows = cutlass.Array(
-                cutlass.Int32,
-                max(1, loads_per_thread),
-                space=cutlass.AddressSpace.rmem,
-            )
+        is_b = cutlass.const_expr(self._operand == "b")
+        tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
+        sf_block_size = (
+            self.cfg.input_sf_block_size_b if is_b else self.cfg.input_sf_block_size_a
+        )
+        sf_k = self.cfg.tile_k // sf_block_size
+        num_load_warps = (
+            self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
+        )
+        num_threads = max(1, num_load_warps) * 32
+        elts_per_load = 4
+        total_elts = tile_rows * sf_k
+        loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
+            num_threads * elts_per_load
+        )
+        self.routed_rows = cutlass.Array(
+            cutlass.Int32,
+            max(1, loads_per_thread),
+            space=cutlass.AddressSpace.rmem,
+        )
+        self.tile_limit = Int32(0)
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -950,73 +949,66 @@ class SmemSfLdgstsResource(MemoryResource):
     @cute.jit
     def _prepare_ldgsts_tile_impl(self, stage_info: StageInfo) -> None:
         """Prefetch routed SF rows once per output tile."""
-        if cutlass.const_expr(self.cfg.has_cluster):
-            tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        is_b = cutlass.const_expr(self._operand == "b")
+        tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
+        sf_block_size = (
+            self.cfg.input_sf_block_size_b if is_b else self.cfg.input_sf_block_size_a
+        )
+        sf_k = self.cfg.tile_k // sf_block_size
+        elts_per_load = 4
+        total_elts = tile_rows * sf_k
 
-            is_b = cutlass.const_expr(self._operand == "b")
-            tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
-            sf_block_size = (
-                self.cfg.input_sf_block_size_b
-                if is_b
-                else self.cfg.input_sf_block_size_a
-            )
-            sf_k = self.cfg.tile_k // sf_block_size
-            elts_per_load = 4
-            total_elts = tile_rows * sf_k
-
-            if cutlass.const_expr(is_b):
-                if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
-                    coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
-                else:
-                    coord_mn = tile_coord_n
-                load_warp_idx = self.cfg.load_sfb_warp_idx
-                num_load_warps = self.cfg.num_load_sfb_warps
+        if cutlass.const_expr(is_b):
+            if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
+                coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
             else:
-                coord_mn = tile_coord_m
-                load_warp_idx = self.cfg.load_sfa_warp_idx
-                num_load_warps = self.cfg.num_load_sfa_warps
+                coord_mn = tile_coord_n
+            load_warp_idx = self.cfg.load_sfb_warp_idx
+            num_load_warps = self.cfg.num_load_sfb_warps
+        else:
+            coord_mn = tile_coord_m
+            load_warp_idx = self.cfg.load_sfa_warp_idx
+            num_load_warps = self.cfg.num_load_sfa_warps
 
-            num_threads = max(1, num_load_warps) * 32
-            loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
-                num_threads * elts_per_load
+        num_threads = max(1, num_load_warps) * 32
+        loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
+            num_threads * elts_per_load
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        local_tid = tidx - Int32(load_warp_idx * 32)
+        if cutlass.const_expr(is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
+            tile_limit_idx = coord_mn // Int32(tile_rows)
+        else:
+            tile_limit_idx = coord_mn
+        self.tile_limit = self._local_tile_limit(
+            self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
+            tile_limit_idx,
+            tile_rows,
+        )
+
+        for li in cutlass.range_constexpr(loads_per_thread):
+            thread_base = local_tid * Int32(elts_per_load) + Int32(
+                li * num_threads * elts_per_load
             )
-
-            tidx, _, _ = cute.arch.thread_idx()
-            local_tid = tidx - Int32(load_warp_idx * 32)
+            row_in_tile = thread_base // Int32(sf_k)
             if cutlass.const_expr(
                 is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab
             ):
-                tile_limit_idx = coord_mn // Int32(tile_rows)
+                route_idx = coord_mn + row_in_tile
             else:
-                tile_limit_idx = coord_mn
-            tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
-                tile_limit_idx,
-                tile_rows,
+                route_idx = coord_mn * Int32(tile_rows) + row_in_tile
+
+            is_valid = (
+                (local_tid >= Int32(0))
+                & (local_tid < Int32(num_threads))
+                & (thread_base < Int32(total_elts))
+                & (row_in_tile < self.tile_limit)
             )
-
-            for li in cutlass.range_constexpr(loads_per_thread):
-                thread_base = local_tid * Int32(elts_per_load) + Int32(
-                    li * num_threads * elts_per_load
-                )
-                row_in_tile = thread_base // Int32(sf_k)
-                if cutlass.const_expr(
-                    is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab
-                ):
-                    route_idx = coord_mn + row_in_tile
-                else:
-                    route_idx = coord_mn * Int32(tile_rows) + row_in_tile
-
-                is_valid = (
-                    (local_tid >= Int32(0))
-                    & (local_tid < Int32(num_threads))
-                    & (thread_base < Int32(total_elts))
-                    & (row_in_tile < tile_limit)
-                )
-                if is_valid:
-                    self.routed_rows[li] = self.route_map.load(
-                        idx=route_idx, vector_size=1
-                    )[0]
+            if is_valid:
+                self.routed_rows[li] = self.route_map.load(
+                    idx=route_idx, vector_size=1
+                )[0]
 
     @cute.jit
     def _producer_work_impl(self, stage_info: StageInfo, coord_k, coord_mn) -> None:
@@ -1061,15 +1053,7 @@ class SmemSfLdgstsResource(MemoryResource):
         loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
             num_threads * elts_per_load
         )
-        if cutlass.const_expr(is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
-            tile_limit_idx = coord_mn // Int32(tile_rows)
-        else:
-            tile_limit_idx = coord_mn
-        tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
-            tile_limit_idx,
-            tile_rows,
-        )
+        tile_limit = self.tile_limit
 
         for li in cutlass.range_constexpr(loads_per_thread):
             thread_base = local_tid * Int32(elts_per_load) + Int32(
@@ -1086,16 +1070,7 @@ class SmemSfLdgstsResource(MemoryResource):
             )
             routed_row = Int32(0)
             if is_valid:
-                if cutlass.const_expr(self.cfg.has_cluster):
-                    routed_row = self.routed_rows[li]
-                else:
-                    if cutlass.const_expr(
-                        is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab
-                    ):
-                        route_idx = coord_mn + row_in_tile
-                    else:
-                        route_idx = coord_mn * Int32(tile_rows) + row_in_tile
-                    routed_row = self.route_map.load(idx=route_idx, vector_size=1)[0]
+                routed_row = self.routed_rows[li]
             gmem_offset = routed_row * self.sf_gmem_stride + k_sf_offset + col_in_tile
             gmem_src = self.sf_gmem_ptr.data_ptr() + gmem_offset
 
@@ -1120,14 +1095,12 @@ class SmemSfLdgstsResource(MemoryResource):
                 smem_offset = data_blk_idx * Int32(32) + idx_in_blk
             smem_dst = stage_base.subview(smem_offset)
 
-            # Keep one cp.async issue point for each producer thread/slot while
-            # using cp_size=0 for rows outside mn_limit.
-            prims.cp_async_shared_global(
-                smem_dst,
-                gmem_src,
-                size=4,
-                modifier="ca",
-                cp_size=is_valid * Int32(4),
+            # BS=1 leaves most routed rows padded. Predicate invalid rows so
+            # they do not issue zero-byte cp.async instructions.
+            prims.inline_ptx_hl(
+                "cp.async.ca.shared.global.L2::128B [{$r0}], [{$r1}], 4;",
+                read_only_args=[smem_dst.data_ptr(), gmem_src],
+                pred=is_valid,
             )
 
         # Non-cluster route-SF LDGSTS uses an AsyncLoad full barrier, so the

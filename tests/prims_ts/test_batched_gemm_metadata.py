@@ -16,6 +16,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_partial_route_map_padding_keeps_trt_absolute_limits():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -79,6 +81,61 @@ def test_early_exit_route_map_padding_is_not_semantic_metadata():
     assert len(route_map) == 4 * token_layout.tile_size
     assert extra_routes
     assert set(extra_routes) == {0}
+
+@pytest.mark.parametrize(
+    ("num_tokens", "requested_extent", "expected_extent"),
+    (
+        (1, 8, 8),
+        (512, 1, 4),
+    ),
+)
+def test_early_exit_launch_extent_covers_active_token_tiles(
+    num_tokens, requested_extent, expected_extent
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _make_token_layout,
+        _normalize_early_exit_launch_extent,
+    )
+
+    cfg = SimpleNamespace(use_early_exit=1)
+    token_layout = _make_token_layout(
+        num_tokens=num_tokens,
+        num_experts=2,
+        top_k=1,
+        tile_size=128,
+        cluster_dim_in_token=1,
+    )
+
+    extent = _normalize_early_exit_launch_extent(
+        cfg,
+        token_layout,
+        early_exit_max_token_ctas=requested_extent,
+    )
+
+    assert extent == expected_extent
+
+def test_disabled_early_exit_keeps_requested_launch_extent():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _make_token_layout,
+        _normalize_early_exit_launch_extent,
+    )
+
+    cfg = SimpleNamespace(use_early_exit=0)
+    token_layout = _make_token_layout(
+        num_tokens=512,
+        num_experts=2,
+        top_k=1,
+        tile_size=128,
+        cluster_dim_in_token=1,
+    )
+
+    extent = _normalize_early_exit_launch_extent(
+        cfg,
+        token_layout,
+        early_exit_max_token_ctas=3,
+    )
+
+    assert extent == 3
 
 
 def test_clustered_persistent_normalization_keeps_invalid_static_grid():

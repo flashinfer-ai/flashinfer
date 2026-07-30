@@ -15,16 +15,20 @@
 """WorkQueue, work-throttle barrier, and cluster proxy resources."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 
+from cutlass.experimental.task_scheduling.enums import TileSchedulerType
+from cutlass.experimental.task_scheduling.memory import SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
     TaskLocalVariable,
+    WorkAttr,
+    WorkTileInfo,
     WorkQueue,
     consumer_work,
 )
@@ -51,11 +55,14 @@ class WorkThrottleBarrierResource(MemoryResource):
 class BatchedGemmWorkQueue(WorkQueue):
     """WorkQueue with batched-GEMM CUDA-graph early-exit knowledge."""
 
+    fast_drain_rate: Constexpr[int] = 4
     cfg: Constexpr[BatchedGemmConfig]
     num_non_exiting_ctas_tensor: Any = None
     num_non_exiting_ctas_value: Any = None
     fast_drain_response_ptr: Any = None
     fast_drain_mbar_ptr: Any = None
+    _alloc_fast_drain_response: Constexpr[Optional[SmemAllocation]] = None
+    _alloc_fast_drain_mbar: Constexpr[Optional[SmemAllocation]] = None
 
     def __init__(
         self,
@@ -74,8 +81,82 @@ class BatchedGemmWorkQueue(WorkQueue):
         self.cfg = cfg
         self.num_non_exiting_ctas_tensor = num_non_exiting_ctas_tensor
         self.num_non_exiting_ctas_value = num_non_exiting_ctas_value
-        self.fast_drain_response_ptr = fast_drain_response_ptr
-        self.fast_drain_mbar_ptr = fast_drain_mbar_ptr
+        self.fast_drain_response_ptr = None
+        self.fast_drain_mbar_ptr = None
+        object.__setattr__(self, "_alloc_fast_drain_response", None)
+        object.__setattr__(self, "_alloc_fast_drain_mbar", None)
+        if self._uses_fast_drain():
+            object.__setattr__(
+                self,
+                "_alloc_fast_drain_response",
+                SmemAllocation(
+                    f"{self.name}_fast_drain_response",
+                    dtype=cutlass.Int128,
+                    count=self.fast_drain_rate,
+                    alignment=16,
+                ),
+            )
+            object.__setattr__(
+                self,
+                "_alloc_fast_drain_mbar",
+                SmemAllocation(
+                    f"{self.name}_fast_drain_mbar",
+                    dtype=cutlass.Int64,
+                    alignment=8,
+                ),
+            )
+
+    def _uses_fast_drain(self) -> bool:
+        return (
+            getattr(self.cfg, "is_persistent", False)
+            and getattr(self.cfg, "use_early_exit", False)
+            and getattr(self.cfg, "use_clc_fast_drain", False)
+        )
+
+    def get_smem_requirements(self):
+        requirements = []
+        if self._alloc_fast_drain_response is not None:
+            requirements.append(self._alloc_fast_drain_response)
+        if self._alloc_fast_drain_mbar is not None:
+            requirements.append(self._alloc_fast_drain_mbar)
+        return requirements
+
+    @cute.jit
+    def _init_fast_drain_smem_state(self, stage_info: StageInfo) -> None:
+        if cutlass.const_expr(not self._uses_fast_drain()):
+            return
+        assert self._alloc_fast_drain_response is not None
+        assert self._alloc_fast_drain_mbar is not None
+        context = stage_info.context
+        self.fast_drain_response_ptr = cute.make_ptr(
+            cutlass.Int128,
+            context.smem_base.data_ptr() + self._alloc_fast_drain_response.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        self.fast_drain_mbar_ptr = cute.make_ptr(
+            cutlass.Int64,
+            context.smem_base.data_ptr() + self._alloc_fast_drain_mbar.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY, returns=("work_tile", "skip_work_tile")
+    )
+    @cute.jit
+    def init_work_tile(
+        self,
+        stage_info: StageInfo,
+    ) -> tuple[Any, cutlass.Boolean]:
+        self._init_fast_drain_smem_state(stage_info)
+        tile_scheduler = object.__getattribute__(self, "tile_scheduler")
+        if cutlass.const_expr(tile_scheduler is not None):
+            initial_work_tile = self.initial_work_tile_info()
+        else:
+            initial_work_tile = WorkTileInfo(
+                (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
+                cutlass.Boolean(False),
+            )
+        return initial_work_tile, cutlass.Boolean(False)
 
     @cute.jit
     def should_skip_work_tile(self, work_tile) -> bool:
@@ -109,49 +190,72 @@ class BatchedGemmWorkQueue(WorkQueue):
         return token_cta_idx >= num_non_exiting_ctas
 
     @cute.jit
-    def _fast_drain_if_skipped(self) -> None:
-        """Cancel all queued CTAs after reaching the inactive token suffix."""
+    def _clc_fast_drain_batch(self, parity: cutlass.Int32) -> cutlass.Int32:
+        assert self.fast_drain_response_ptr is not None
+        assert self.fast_drain_mbar_ptr is not None
 
-        if cutlass.const_expr(
-            (not self.cfg.use_clc_fast_drain)
-            or self.fast_drain_response_ptr is None
-            or self.fast_drain_mbar_ptr is None
-        ):
-            return
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                self.fast_drain_mbar_ptr,
+                16 * self.fast_drain_rate,
+                relaxed=True,
+            )
+            for drain_idx in cutlass.range_constexpr(self.fast_drain_rate):
+                cute.arch.issue_clc_query(
+                    self.fast_drain_mbar_ptr,
+                    self.fast_drain_response_ptr + drain_idx,
+                    multicast=False,
+                )
 
-        skip_work_tile = self._get_consumer_var_from_ts("skip_work_tile")
-        if skip_work_tile:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_init(self.fast_drain_mbar_ptr, 1)
-                cute.arch.mbarrier_init_fence()
+        while not prims.mbarrier_try_wait_parity(self.fast_drain_mbar_ptr, parity):
+            pass
 
-            parity = cutlass.Int32(0)
-            drained = cutlass.Int32(1)
-            while drained > 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        self.fast_drain_mbar_ptr, 4 * 16
-                    )
-                    for response_idx in cutlass.range_constexpr(4):
-                        cute.arch.issue_clc_query(
-                            self.fast_drain_mbar_ptr,
-                            self.fast_drain_response_ptr + response_idx,
-                            multicast=False,
-                        )
-                cute.arch.mbarrier_wait(self.fast_drain_mbar_ptr, parity)
+        canceled_count = cutlass.Int32(0)
+        for drain_idx in cutlass.range_constexpr(self.fast_drain_rate):
+            _, _, _, is_canceled_i32 = cute.arch.clc_response(
+                self.fast_drain_response_ptr + drain_idx
+            )
+            canceled_count += is_canceled_i32
+        return canceled_count
 
-                drained = cutlass.Int32(0)
-                for response_idx in cutlass.range_constexpr(4):
-                    _, _, _, was_canceled = cute.arch.clc_response(
-                        self.fast_drain_response_ptr + response_idx
-                    )
-                    drained += was_canceled
-                parity ^= cutlass.Int32(1)
+    @cute.jit
+    def _clc_fast_drain_all(self) -> None:
+        assert self.fast_drain_mbar_ptr is not None
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_init(self.fast_drain_mbar_ptr, 1)
+            cute.arch.mbarrier_init_fence()
+
+        parity = cutlass.Int32(0)
+        drained = cutlass.Int32(1)
+        while drained > cutlass.Int32(0):
+            drained = self._clc_fast_drain_batch(parity)
+            parity = cutlass.Int32(1) - parity
+
+    @cute.jit
+    def _maybe_fast_drain_skipped_tile(self) -> None:
+        if cutlass.const_expr(self._uses_fast_drain()):
+            skip_work_tile = self._get_consumer_var_from_ts("skip_work_tile")
+            if skip_work_tile:
+                self._clc_fast_drain_all()
 
     @cute.jit
     def _fetch_work_tile_impl(self, stage_info: StageInfo) -> None:
-        self._fast_drain_if_skipped()
-        super()._fetch_work_tile_impl(stage_info)
+        self._init_fast_drain_smem_state(stage_info)
+        if cutlass.const_expr(
+            self.tile_scheduler_config.tile_scheduler_type
+            == TileSchedulerType.ClcDynamicPersistent
+        ):
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+            if cta_rank_in_cluster == 0:
+                self._maybe_fast_drain_skipped_tile()
+                mbarrier_addr = self.pipeline.producer_get_barrier(self.producer_state)
+                stage_response_ptr = self._get_stage_response_ptr(stage_info.stage_idx)
+                with cute.arch.elect_one():
+                    cute.arch.issue_clc_query(mbarrier_addr, stage_response_ptr)
+            assert self.tile_scheduler is not None
+            self.tile_scheduler._num_tiles_executed += cutlass.Int32(1)
 
 
 @dataclass(kw_only=True)

@@ -513,6 +513,8 @@ class SmemGatherResource(MemoryResource):
     route_map: Any = None  # make_array_view of route map tensor
     mn_limit: Any = None  # make_array_view of TRT absolute token end-row limits
     smem_buf: Any = None
+    routed_rows: Any = None
+    tile_limit: Any = None
     _alloc: Constexpr[Optional[SmemAllocation]] = None
     # Which MMA operand this maps to: "a" or "b"
     _operand: Constexpr[str] = "b"
@@ -563,6 +565,32 @@ class SmemGatherResource(MemoryResource):
             shape=(self._alloc.size_bytes,),
             addrspace=3,
         )
+        is_operand_b = cutlass.const_expr(self._operand == "b")
+        tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
+        tile_rows_per_cta = (
+            tile_rows // self.cfg.cluster_m
+            if is_operand_b and self.cfg.has_cluster
+            else tile_rows
+        )
+        copy_bytes = 16
+        dtype_bits = (
+            self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
+        )
+        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        copies_per_row_box = box_k * dtype_bits // 8 // copy_bytes
+        num_k_boxes = self.cfg.tile_k // box_k
+        total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
+        num_threads = self.cfg.num_gather_warps * 32
+        copies_per_thread = (total_copies + num_threads - 1) // num_threads
+        reuse_route_across_k_boxes = (
+            num_threads == tile_rows_per_cta * copies_per_row_box
+        )
+        self.routed_rows = cutlass.Array(
+            cutlass.Int32,
+            1 if reuse_route_across_k_boxes else max(1, copies_per_thread),
+            space=cutlass.AddressSpace.rmem,
+        )
+        self.tile_limit = Int32(0)
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -577,7 +605,61 @@ class SmemGatherResource(MemoryResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def prepare_gather_tile(self, stage_info: StageInfo) -> None:
-        pass
+        tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        is_operand_b = cutlass.const_expr(self._operand == "b")
+        tile_rows = self.cfg.tile_n if is_operand_b else self.cfg.tile_m
+        if cutlass.const_expr(is_operand_b and self.cfg.has_cluster):
+            tile_rows_per_cta = tile_rows // self.cfg.cluster_m
+            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            cta_row_offset = cta_rank * Int32(tile_rows_per_cta)
+        else:
+            tile_rows_per_cta = tile_rows
+            cta_row_offset = Int32(0)
+
+        if cutlass.const_expr(is_operand_b):
+            coord_tile = tile_coord_n * Int32(tile_rows)
+            token_tile = tile_coord_n
+        else:
+            coord_tile = tile_coord_m * Int32(tile_rows)
+            token_tile = tile_coord_m
+
+        self.tile_limit = self._local_tile_limit(
+            self.mn_limit.load(idx=token_tile, vector_size=1)[0],
+            token_tile,
+            tile_rows,
+        )
+
+        tidx, _, _ = cute.arch.thread_idx()
+        local_tid = tidx - Int32(self.cfg.gather_warp_idx * 32)
+        copy_bytes = 16
+        dtype_bits = (
+            self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
+        )
+        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        copies_per_row_box = box_k * dtype_bits // 8 // copy_bytes
+        num_k_boxes = self.cfg.tile_k // box_k
+        total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
+        num_threads = self.cfg.num_gather_warps * 32
+        copies_per_thread = (total_copies + num_threads - 1) // num_threads
+        reuse_route_across_k_boxes = cutlass.const_expr(
+            num_threads == tile_rows_per_cta * copies_per_row_box
+        )
+        routed_row_count = 1 if reuse_route_across_k_boxes else copies_per_thread
+        is_task_thread = (local_tid >= Int32(0)) & (local_tid < Int32(num_threads))
+        for ci in cutlass.range_constexpr(routed_row_count):
+            my_copy = local_tid + Int32(ci * num_threads)
+            copy_in_box = my_copy % Int32(tile_rows_per_cta * copies_per_row_box)
+            row_in_tile = copy_in_box // Int32(copies_per_row_box)
+            logical_row = coord_tile + cta_row_offset + row_in_tile
+            is_valid = (
+                is_task_thread
+                & (my_copy < Int32(total_copies))
+                & (cta_row_offset + row_in_tile < self.tile_limit)
+            )
+            if is_valid:
+                self.routed_rows[ci] = self.route_map.load(
+                    idx=logical_row, vector_size=1
+                )[0]
 
     @cute.jit
     def _local_tile_limit(self, raw_limit, token_tile, tile_rows):
@@ -622,10 +704,11 @@ class SmemGatherResource(MemoryResource):
     ) -> None:
         """LDGSTS: gather activations from GMEM to SMEM via cp.async 16B.
 
-        Uses cp.async.ca.shared.global for true LDGSTS (async copy from
-        global to shared memory). Each thread copies 16 bytes. Route map
-        provides the physical GMEM row for each logical token. s128b swizzle
-        is applied to the SMEM destination for BF16, FP8, and packed FP4.
+        Uses cp.async.cg.shared.global for true LDGSTS (async copy from
+        global to shared memory). Each thread copies 16 bytes. Packed inputs
+        use bit-width-based byte offsets.
+        Route map provides the physical GMEM row for each logical token.
+        s128b swizzle applied to SMEM destination.
         """
         is_operand_b = cutlass.const_expr(self._operand == "b")
         bytes_per_stage = (
@@ -645,19 +728,24 @@ class SmemGatherResource(MemoryResource):
         stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
 
         tidx, _, _ = cute.arch.thread_idx()
-        local_tid = tidx % Int32(self.cfg.num_gather_warps * 32)
+        local_tid = tidx - Int32(self.cfg.gather_warp_idx * 32)
 
         copy_bytes = 16
         dtype_bits = (
             self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
         )
-        box_k = 64 if dtype_bits == 16 else 128 if dtype_bits == 8 else 256
-        bytes_per_row_box = box_k * dtype_bits // 8
-        copies_per_row_box = bytes_per_row_box // copy_bytes
+        box_k = 64 if dtype_bits == 16 else (256 if dtype_bits == 4 else 128)
+        row_box_bytes = box_k * dtype_bits // 8
+        copies_per_row_box = row_box_bytes // copy_bytes
         num_k_boxes = self.cfg.tile_k // box_k
         total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
         num_threads = self.cfg.num_gather_warps * 32
         copies_per_thread = (total_copies + num_threads - 1) // num_threads
+        reuse_route_across_k_boxes = cutlass.const_expr(
+            num_threads == tile_rows_per_cta * copies_per_row_box
+        )
+        tile_limit = self.tile_limit
+        is_task_thread = (local_tid >= Int32(0)) & (local_tid < Int32(num_threads))
 
         for ci in cutlass.range_constexpr(copies_per_thread):
             my_copy = local_tid + Int32(ci * num_threads)
@@ -667,40 +755,29 @@ class SmemGatherResource(MemoryResource):
             row_in_tile = copy_in_box // Int32(copies_per_row_box)
             col_chunk = copy_in_box % Int32(copies_per_row_box)
 
-            # Route map lookup: logical row -> physical GMEM row.
-            logical_row = coord_tile_n + cta_row_offset + row_in_tile
-            token_tile = coord_tile_n // Int32(tile_rows)
-            tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
-                token_tile,
-                tile_rows,
-            )
-
             # SMEM destination with s128b swizzle
-            smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * bytes_per_row_box)
-            smem_row_bytes = row_in_tile * Int32(bytes_per_row_box)
+            smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * row_box_bytes)
+            smem_row_bytes = row_in_tile * Int32(row_box_bytes)
             smem_col_bytes = col_chunk * Int32(copy_bytes)
             smem_off_bytes = smem_kbox_bytes + smem_row_bytes + smem_col_bytes
             swizzle_mask = (row_in_tile % Int32(8)) * Int32(copy_bytes)
             swizzled_off = smem_off_bytes ^ swizzle_mask
             smem_ptr = stage_base.subview(swizzled_off)
 
-            is_valid = my_copy < Int32(total_copies)
+            is_valid = is_task_thread & (my_copy < Int32(total_copies))
             if is_valid:
                 in_bounds = cta_row_offset + row_in_tile < tile_limit
                 if in_bounds:
-                    phys_row = self.route_map.load(idx=logical_row, vector_size=1)[0]
+                    phys_row = self.routed_rows[0 if reuse_route_across_k_boxes else ci]
                     # GMEM source: byte offset from activation base
                     gmem_col_bytes = (
-                        (coord_k + k_box * Int32(box_k)) * Int32(dtype_bits)
-                    ) // Int32(8) + col_chunk * Int32(copy_bytes)
+                        (coord_k + k_box * Int32(box_k)) * Int32(dtype_bits) // Int32(8)
+                    ) + col_chunk * Int32(copy_bytes)
                     gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
-                    prims.cp_async_shared_global(
-                        smem_ptr,
-                        gmem_ptr,
-                        size=16,
-                        modifier="ca",
+                    prims.inline_ptx_hl(
+                        "cp.async.cg.shared.global.L2::128B [{$r0}], [{$r1}], 16;",
+                        read_only_args=[smem_ptr.data_ptr(), gmem_ptr],
                     )
 
         # The following producer_commit uses cp.async.mbarrier.arrive for all

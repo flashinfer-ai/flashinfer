@@ -851,8 +851,7 @@ def test_deepseek_fp8_tma_route_uses_generated_load_b_warp_count(
     assert by_name["PaddingTask"].warp_idx == padding_warp_idx
     assert cfg.threads_per_cta == 512
 
-
-def test_validation_accepts_persistent_clc_fast_drain():
+def test_validation_accepts_clc_fast_drain_for_persistent_early_exit():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         TileScheduler,
