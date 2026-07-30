@@ -1,6 +1,7 @@
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
+    get_checksums,
     get_subdir_file_list,
 )
 
@@ -413,3 +414,66 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
     assert len(meta_info_headers) == 3, (
         f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
     )
+
+
+@responses.activate
+def test_get_checksums_does_not_collide_across_subdirs(monkeypatch, tmp_path):
+    """Two pins publishing the same kernel filename must keep separate hashes.
+
+    Per-arch cubin pins ship identically-named sm100f/sm103a kernels built from
+    different sources. Keying the checksum map by bare filename let whichever
+    subdir was processed last overwrite the earlier one, so every shared name
+    was then verified against the wrong pin's hash.
+    """
+    from flashinfer import artifacts
+
+    temp_cubin_dir = tmp_path / "cubins"
+    temp_cubin_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        artifacts, "FLASHINFER_CUBINS_REPOSITORY", test_cubin_repository
+    )
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", temp_cubin_dir)
+
+    shared_kernel = "Bmm_Bfloat16_E2m1E2m1_Fp32_shared_name_sm100f.cubin"
+    subdir_a = "pin-a/batched_gemm-aaaaaaa-bbbbbbb/"
+    subdir_b = "pin-b/batched_gemm-ccccccc-ddddddd/"
+    hash_a = "1111111111111111111111111111111111111111111111111111111111111111"
+    hash_b = "2222222222222222222222222222222222222222222222222222222222222222"
+    header_a = "3333333333333333333333333333333333333333333333333333333333333333"
+    header_b = "4444444444444444444444444444444444444444444444444444444444444444"
+
+    for subdir, kernel_hash, header_hash in (
+        (subdir_a, hash_a, header_a),
+        (subdir_b, hash_b, header_b),
+    ):
+        responses.add(
+            responses.GET,
+            safe_urljoin(test_cubin_repository, safe_urljoin(subdir, "checksums.txt")),
+            body=(
+                f"{header_hash} include/flashinferMetaInfo.h\n"
+                f"{kernel_hash} {shared_kernel}\n"
+            ),
+            status=200,
+        )
+
+    checksums = get_checksums([subdir_a, subdir_b])
+
+    key_a = safe_urljoin(subdir_a, shared_kernel)
+    key_b = safe_urljoin(subdir_b, shared_kernel)
+
+    # The bare filename must not be a key at all -- that is what collided.
+    assert shared_kernel not in checksums
+
+    assert checksums[key_a] == hash_a, (
+        f"{subdir_a} kernel resolved to {checksums[key_a]}, expected {hash_a}"
+    )
+    assert checksums[key_b] == hash_b, (
+        f"{subdir_b} kernel resolved to {checksums[key_b]}, expected {hash_b}"
+    )
+    assert checksums[key_a] != checksums[key_b], (
+        "both pins resolved to the same checksum -- the per-pin hashes collided"
+    )
+
+    # Headers were already namespaced before this fix; keep them covered.
+    assert checksums[safe_urljoin(subdir_a, "include/flashinferMetaInfo.h")] == header_a
+    assert checksums[safe_urljoin(subdir_b, "include/flashinferMetaInfo.h")] == header_b
