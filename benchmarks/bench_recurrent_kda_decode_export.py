@@ -16,8 +16,9 @@
 
 Run this script in separate processes with ``PYTHONPATH`` pointing at the
 pinned current-upstream, evolution-peer, or candidate checkout. Every mode
-calls ``flashinfer.kda_decode.recurrent_kda`` with identical D128/T5 inputs.
-The caller can alternate mode order across processes to form paired rounds.
+calls ``flashinfer.kda_decode.recurrent_kda`` with identical D128/T3
+lower-bound and D128/T5 precomputed-gate inputs. The caller can alternate mode
+order across processes to form paired rounds.
 """
 
 import argparse
@@ -40,7 +41,21 @@ from flashinfer.testing import bench_gpu_time
 
 UPSTREAM_MAIN_SHA = "a02d94de5796650ead1c6be27b834c3a063bf45d"
 EVOLUTION_PEER_SHA = "cea7f46ffc190cabf82c95a39cd0d2aa6c888c17"
+T3_LOWER_BOUND_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
+T5_PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 CASES = tuple(
+    {
+        "name": f"d128_t3_b{batch_size}_h16_hv16_lower_bound",
+        "D": 128,
+        "T": 3,
+        "N": batch_size,
+        "H": 16,
+        "HV": 16,
+        "gate_mode": "lower_bound",
+        "expected_variant": "d128_t3_lower_bound_split4",
+    }
+    for batch_size in T3_LOWER_BOUND_SEQUENCE_COUNTS
+) + tuple(
     {
         "name": f"d128_t5_b{batch_size}_h16_hv32_precomputed",
         "D": 128,
@@ -48,9 +63,10 @@ CASES = tuple(
         "N": batch_size,
         "H": 16,
         "HV": 32,
+        "gate_mode": "precomputed",
         "expected_variant": "d128_t5_precomputed_gram_split1",
     }
-    for batch_size in (8, 16, 32, 64, 128)
+    for batch_size in T5_PRECOMPUTED_SEQUENCE_COUNTS
 )
 
 
@@ -88,14 +104,45 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         generator=generator,
     )
     beta = torch.sigmoid(beta_logits)
-    g = F.logsigmoid(
-        torch.randn(
+    if spec["gate_mode"] == "precomputed":
+        g = F.logsigmoid(
+            torch.randn(
+                (1, total_tokens, num_value_heads, head_dim),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+        ).to(torch.bfloat16)
+        A_log = None
+        dt_bias = None
+        use_gate_in_kernel = False
+        lower_bound = None
+    elif spec["gate_mode"] == "lower_bound":
+        g = torch.randn(
             (1, total_tokens, num_value_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        A_log = torch.log(
+            torch.rand(
+                num_heads,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            + 1.0
+        )
+        dt_bias = torch.randn(
+            num_heads * head_dim,
             dtype=torch.float32,
             device=device,
             generator=generator,
         )
-    ).to(torch.bfloat16)
+        use_gate_in_kernel = True
+        lower_bound = -5.0
+    else:
+        raise ValueError(f"unknown gate mode: {spec['gate_mode']}")
     cu_seqlens = torch.arange(
         0,
         total_tokens + 1,
@@ -135,14 +182,14 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         "v": v,
         "g": g,
         "beta": beta,
-        "A_log": None,
-        "dt_bias": None,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
         "scale": head_dim**-0.5,
         "initial_state": state,
         "output_final_state": False,
         "use_qk_l2norm_in_kernel": True,
-        "use_gate_in_kernel": False,
-        "lower_bound": None,
+        "use_gate_in_kernel": use_gate_in_kernel,
+        "lower_bound": lower_bound,
         "cu_seqlens": cu_seqlens,
         "ssm_state_indices": ssm_state_indices,
         "num_spec_tokens": num_tokens - 1,
@@ -168,10 +215,10 @@ def _assert_frozen_route(spec: dict, kwargs: dict) -> None:
         num_tokens=spec["T"],
         num_spec_tokens=spec["T"] - 1,
         use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=False,
-        lower_bound=None,
-        A_log=None,
-        dt_bias=None,
+        use_gate_in_kernel=kwargs["use_gate_in_kernel"],
+        lower_bound=kwargs["lower_bound"],
+        A_log=kwargs["A_log"],
+        dt_bias=kwargs["dt_bias"],
         initial_state_source=None,
         beta_is_logit=False,
     )

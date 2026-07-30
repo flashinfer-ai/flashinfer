@@ -1195,11 +1195,11 @@ def _select_flash_kda_decode_variant(
 ) -> Optional[FlashKDADecodeVariant]:
     """Select a frozen B200 decode schedule, or preserve the CuTe fallback.
 
-    The production family covers the measured D128/T5 speculative-decode
-    contract. The D128/T3 lower-bound specialization is intentionally limited
-    to its N1/2/4/8/16, H=HV=16 evaluation coordinates until its public-API
-    performance envelope is established. Any other public-API feature, tensor
-    layout, or aliasing pattern stays on the existing CuTe DSL implementation.
+    The production family covers measured D128 speculative-decode contracts.
+    The D128/T3 lower-bound specialization is limited to its measured
+    N1/2/4/8/16, H=HV=16 coordinates, while the D128/T5 specialization covers
+    the precomputed-gate contract. Any other public-API feature, tensor layout,
+    or aliasing pattern stays on the existing CuTe DSL implementation.
     """
 
     f32_max = torch.finfo(torch.float32).max
