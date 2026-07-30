@@ -340,19 +340,6 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
 prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
 
 
-def prims_ts_block_sparse_trace_dispatch(
-    **_kwargs: object,
-) -> TraceTemplate:
-    """Return the single compact-BSHD one-shot block-sparse schema."""
-
-    return prims_ts_block_sparse_trace
-
-
-prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    prims_ts_block_sparse_trace
-]
-
-
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
 # fixed multi-Q, and packed Q use distinct templates. In particular, a rank-3
 # query is not sufficient to identify packed mode: ``qo_indptr is not None`` is

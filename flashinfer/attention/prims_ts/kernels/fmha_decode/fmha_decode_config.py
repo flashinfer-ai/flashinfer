@@ -2496,11 +2496,9 @@ def _select_auto_launch_mode(
     num_heads_kv: int,
     seq_len_kv: int,
     num_q_tiles: int = 1,
-    tile_size_q: int,
     tile_size_kv: int = AUTO_LAUNCH_TILE_SIZE_KV,
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
-    persistent_min_tile_size_q: int = 1,
 ) -> str:
     """Pick the launch mode that best matches the kernel's parallelism budget.
 
@@ -2522,30 +2520,17 @@ def _select_auto_launch_mode(
           Switch to the CLC dynamic persistent scheduler whenever the direct
           launch contains more than ``persistent_min_waves`` resident CTA
           waves and at least ``persistent_min_tiles_per_cta`` K/V tiles per
-          task, and its Q tile is at least ``persistent_min_tile_size_q``.
-          Persistence has no launch work to eliminate within one wave; callers
-          with heavier per-task scheduling may require more work or a wider Q
-          tile to amortize that overhead.
+          task. Persistence has no launch work to eliminate within one wave;
+          callers with heavier per-task scheduling may require more work to
+          amortize that overhead.
 
       ``"static"``
           Everything else. The default static grid is a good fit when the
           launch already saturates the device with substantial per-CTA
           work.
     """
-    if (
-        seq_len_kv <= 0
-        or batch_size <= 0
-        or num_heads_kv <= 0
-        or num_q_tiles <= 0
-        or tile_size_q <= 0
-    ):
+    if seq_len_kv <= 0 or batch_size <= 0 or num_heads_kv <= 0 or num_q_tiles <= 0:
         return "static"
-    if persistent_min_waves <= 0:
-        raise ValueError("persistent_min_waves must be positive")
-    if persistent_min_tiles_per_cta <= 0:
-        raise ValueError("persistent_min_tiles_per_cta must be positive")
-    if persistent_min_tile_size_q <= 0:
-        raise ValueError("persistent_min_tile_size_q must be positive")
     hardware_info = utils.HardwareInfo()
     sm_count = hardware_info.get_device_multiprocessor_count()
     sm_count = FALLBACK_SM_COUNT_B200 if sm_count <= 0 else sm_count
@@ -2557,7 +2542,6 @@ def _select_auto_launch_mode(
     if (
         ctas > persistent_min_waves * sm_count
         and tiles_per_cta >= persistent_min_tiles_per_cta
-        and tile_size_q >= persistent_min_tile_size_q
     ):
         return "persistent"
     return "static"
@@ -3096,7 +3080,6 @@ def _apply_auto_launch_mode(
         num_heads_kv=num_heads_kv,
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
-        tile_size_q=cfg.tile_size_q,
         tile_size_kv=cfg.tile_size_kv,
     )
     if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (

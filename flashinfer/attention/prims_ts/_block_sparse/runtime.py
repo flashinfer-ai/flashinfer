@@ -20,6 +20,7 @@ import math
 
 import torch
 
+from .._tensor_aliasing import _validate_out_does_not_overlap_inputs
 from ..decode import (
     _validate_16byte_alignment,
     _validate_exact_compact_strides,
@@ -63,21 +64,14 @@ def _validate_bshd_tensor(
     _validate_16byte_alignment(tensor, name)
 
 
-def _compact_tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    """Return whether two validated compact tensors share any storage bytes."""
-
-    lhs_begin = lhs.data_ptr()
-    rhs_begin = rhs.data_ptr()
-    lhs_end = lhs_begin + lhs.numel() * lhs.element_size()
-    rhs_end = rhs_begin + rhs.numel() * rhs.element_size()
-    return max(lhs_begin, rhs_begin) < min(lhs_end, rhs_end)
-
-
 def prepare_block_sparse_runtime(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    block_indptr: torch.Tensor,
+    block_indices: torch.Tensor,
+    runtime_kv_valid_bits: torch.Tensor,
     device: torch.device,
     batch_size: int,
     seq_len_q: int,
@@ -94,8 +88,8 @@ def prepare_block_sparse_runtime(
 
     Q/O use compact ``[B, Sq, H, D]`` and K/V use compact
     ``[B, Skv, H, D]`` on the planned device and dtype. An explicit output is
-    returned by identity and may not overlap Q, K, or V. ``sm_scale=None`` is
-    materialized as ``1 / sqrt(D)``.
+    returned by identity and may not overlap any live launch input.
+    ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
     """
 
     q_shape = (batch_size, seq_len_q, num_heads, head_dim)
@@ -126,8 +120,15 @@ def prepare_block_sparse_runtime(
             expected_dtype=output_dtype,
             expected_device=device,
         )
-        if any(_compact_tensors_overlap(out, tensor) for tensor in (q, k, v)):
-            raise ValueError("out must not overlap Q, K, or V storage")
+        _validate_out_does_not_overlap_inputs(
+            out,
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("block_indptr", block_indptr),
+            ("block_indices", block_indices),
+            ("kv_valid_bits", runtime_kv_valid_bits),
+        )
     return _BlockSparseRuntime(q=q, k=k, v=v, out=out, sm_scale=effective_scale)
 
 

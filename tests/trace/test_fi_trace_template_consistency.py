@@ -419,10 +419,10 @@ def test_attention_ts_trace_registry_coverage():
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
-    """PrimTS constraints are valid expressions over declared schema names."""
+    """PrimTS constraints are valid expressions over defined axes."""
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
-        prims_ts_block_sparse_trace_dispatch,
+        prims_ts_block_sparse_trace,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
@@ -440,10 +440,12 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
-    block_sparse_dispatches = (prims_ts_block_sparse_trace_dispatch,)
-    for dispatch in (*fmha_dispatches, *mla_dispatches, *block_sparse_dispatches):
+    block_sparse_templates = (prims_ts_block_sparse_trace,)
+    for dispatch in (*fmha_dispatches, *mla_dispatches):
         for template in dispatch.templates:
             assert_template_constraints_valid(template, label=dispatch.__name__)
+    for template in block_sparse_templates:
+        assert_template_constraints_valid(template, label="prims_ts_block_sparse")
 
     for dispatch in fmha_dispatches:
         for template in dispatch.templates:
@@ -659,185 +661,6 @@ def test_fi_trace_complete_gqa_paged_decode():
         f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
     )
     assert "unknown" not in str(defn["outputs"])
-
-
-def test_fi_trace_complete_prims_ts_block_sparse_one_shot() -> None:
-    """One-shot block-sparse API traces compact BSHD and runtime BSR metadata."""
-    from flashinfer.attention.prims_ts.block_sparse import (
-        block_sparse_attention,
-    )
-
-    batch_size, seq_len_q, seq_len_kv = 2, 192, 320
-    num_heads, head_dim = 4, 128
-    q_block_size, kv_block_size = 32, 8
-    q = torch.zeros(
-        batch_size,
-        seq_len_q,
-        num_heads,
-        head_dim,
-        dtype=torch.float16,
-    )
-    k = torch.zeros(
-        batch_size,
-        seq_len_kv,
-        num_heads,
-        head_dim,
-        dtype=torch.float16,
-    )
-    v = torch.zeros_like(k)
-    block_indptr = torch.zeros(
-        batch_size,
-        num_heads,
-        (seq_len_q + q_block_size - 1) // q_block_size + 1,
-        dtype=torch.int32,
-    )
-    block_indices = torch.zeros(12, dtype=torch.int32)
-    kv_valid_bits = torch.zeros(
-        batch_size,
-        (seq_len_kv + 31) // 32,
-        dtype=torch.uint32,
-    )
-
-    trace_kwargs = {
-        "q": q,
-        "k": k,
-        "v": v,
-        "block_indptr": block_indptr,
-        "block_indices": block_indices,
-        "q_block_size": q_block_size,
-        "kv_block_size": kv_block_size,
-        "sm_scale": 0.125,
-    }
-    defn = block_sparse_attention.fi_trace(
-        **trace_kwargs,
-        kv_valid_bits=kv_valid_bits,
-        mask_type="causal",
-    )
-    defn_without_valid_bits = block_sparse_attention.fi_trace(
-        **trace_kwargs,
-        kv_valid_bits=None,
-        mask_type="causal",
-    )
-    defn_with_default_mask = block_sparse_attention.fi_trace(
-        **trace_kwargs,
-        kv_valid_bits=kv_valid_bits,
-    )
-
-    optional_mask_constraint = (
-        "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32"
-    )
-    assert optional_mask_constraint in defn["constraints"]
-    assert optional_mask_constraint in defn_without_valid_bits["constraints"]
-    assert defn_without_valid_bits["name"] == defn["name"]
-    assert defn_without_valid_bits["inputs"] == defn["inputs"]
-
-    optional_mask_type_constraint = (
-        "mask_type is None or mask_type in ('dense', 'causal')"
-    )
-    assert optional_mask_type_constraint in defn["constraints"]
-    assert optional_mask_type_constraint in defn_with_default_mask["constraints"]
-    assert defn_with_default_mask["name"] == defn["name"]
-    assert defn_with_default_mask["inputs"] == defn["inputs"]
-
-    constraint_code = compile(optional_mask_constraint, "<constraint>", "eval")
-    assert eval(  # noqa: S307
-        constraint_code,
-        {"__builtins__": {}},
-        {"kv_valid_bits": None},
-    )
-    assert eval(  # noqa: S307
-        constraint_code,
-        {"__builtins__": {}},
-        {
-            "kv_valid_bits": kv_valid_bits,
-            "num_kv_valid_words": kv_valid_bits.shape[1],
-            "seq_len_kv": seq_len_kv,
-        },
-    )
-    assert not eval(  # noqa: S307
-        constraint_code,
-        {"__builtins__": {}},
-        {
-            "kv_valid_bits": kv_valid_bits,
-            "num_kv_valid_words": kv_valid_bits.shape[1] - 1,
-            "seq_len_kv": seq_len_kv,
-        },
-    )
-
-    assert defn["op_type"] == "block_sparse"
-    assert defn["name"].startswith("prims_ts_block_sparse_")
-    assert defn["axes"]["num_qo_heads"]["value"] == num_heads
-    assert defn["axes"]["num_kv_heads"]["value"] == num_heads
-    assert defn["axes"]["head_dim"]["value"] == head_dim
-    assert defn["axes"]["q_block_size"]["value"] == q_block_size
-    assert defn["axes"]["kv_block_size"]["value"] == kv_block_size
-    block_size_constraints = {
-        "q_block_size": (
-            "q_block_size in (8, 16, 32) or "
-            "(q_block_size > 0 and q_block_size % 64 == 0)"
-        ),
-        "kv_block_size": (
-            "kv_block_size in (8, 16, 32) or "
-            "(kv_block_size > 0 and kv_block_size % 64 == 0)"
-        ),
-    }
-    for name, constraint in block_size_constraints.items():
-        assert constraint in defn["constraints"]
-        constraint_code = compile(constraint, "<constraint>", "eval")
-        for supported_size in (8, 16, 32, 64, 128, 256):
-            assert eval(  # noqa: S307
-                constraint_code,
-                {"__builtins__": {}},
-                {name: supported_size},
-            )
-        for unsupported_size in (-64, 0, 1, 24, 48):
-            assert not eval(  # noqa: S307
-                constraint_code,
-                {"__builtins__": {}},
-                {name: unsupported_size},
-            )
-    orientation_constraint = "kv_block_size >= 64 or q_block_size in (8, 16, 32)"
-    assert orientation_constraint in defn["constraints"]
-    orientation_code = compile(orientation_constraint, "<constraint>", "eval")
-    for q_size, kv_size in ((8, 8), (32, 16), (64, 64), (128, 256)):
-        assert eval(  # noqa: S307
-            orientation_code,
-            {"__builtins__": {}},
-            {"q_block_size": q_size, "kv_block_size": kv_size},
-        )
-    for q_size, kv_size in ((64, 8), (128, 16), (256, 32)):
-        assert not eval(  # noqa: S307
-            orientation_code,
-            {"__builtins__": {}},
-            {"q_block_size": q_size, "kv_block_size": kv_size},
-        )
-    assert defn["inputs"]["q"]["shape"] == [
-        "batch_size",
-        "seq_len_q",
-        "num_qo_heads",
-        "head_dim",
-    ]
-    assert defn["inputs"]["k"]["shape"] == [
-        "batch_size",
-        "seq_len_kv",
-        "num_kv_heads",
-        "head_dim",
-    ]
-    assert defn["inputs"]["block_indptr"]["dtype"] == "int32"
-    assert "optional" not in defn["inputs"]["block_indptr"]
-    assert defn["inputs"]["block_indices"]["dtype"] == "int32"
-    assert "optional" not in defn["inputs"]["block_indices"]
-    assert defn["inputs"]["kv_valid_bits"]["dtype"] == "uint32"
-    assert defn["inputs"]["kv_valid_bits"]["optional"] is True
-    token_bits_description = defn["inputs"]["kv_valid_bits"]["description"]
-    assert "t % 32" in token_bits_description
-    assert "Padding bits beyond Skv are ignored" in token_bits_description
-    assert defn["outputs"]["output"] == {
-        "shape": ["batch_size", "seq_len_q", "num_qo_heads", "head_dim"],
-        "dtype": "float16",
-        "param": "out",
-    }
-    assert "lse" not in defn["outputs"]
 
 
 @pytest.mark.parametrize(

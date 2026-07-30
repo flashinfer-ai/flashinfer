@@ -65,7 +65,6 @@ from .fmha_decode_constants import (
 )
 from .fmha_decode_resources.helpers_block_sparse import (
     _block_sparse_row_retained_route_count,
-    _block_sparse_row_retained_route_count_host,
 )
 from .fmha_decode_resources.helpers_common import (
     ResourceVars,
@@ -987,38 +986,19 @@ class DecodeGenTask(Task):
                 num_q_blocks + 1
             ) + q_block
 
-            if isinstance(row_address, int) and isinstance(
-                sparse_indptr, (list, tuple)
-            ):
-                # Host-only domain tests use Python metadata and need no warp
-                # communication.
-                row_begin = sparse_indptr[row_address]
-                row_end = sparse_indptr[row_address + 1]
-            else:
-                row_begin, row_end = _load_sparse_row_bounds_warp(
-                    sparse_indptr,
-                    cutlass.Int32(row_address),
-                    self._lane_idx,
-                )
+            row_begin, row_end = _load_sparse_row_bounds_warp(
+                sparse_indptr,
+                cutlass.Int32(row_address),
+                self._lane_idx,
+            )
             row_nnz = row_end - row_begin
-            if isinstance(row_begin, int) and isinstance(
-                self.block_sparse_indices, (list, tuple)
-            ):
-                retained_route_count = _block_sparse_row_retained_route_count_host(
-                    self.block_sparse_indices,
-                    row_begin,
-                    row_nnz,
-                    self.cfg.kv_block_size,
-                    int(self.max_seq_len_kv),
-                )
-            else:
-                retained_route_count = _block_sparse_row_retained_route_count(
-                    self.block_sparse_indices,
-                    cutlass.Int32(row_begin),
-                    cutlass.Int32(row_end),
-                    self.cfg.kv_block_size,
-                    cutlass.Int32(self.max_seq_len_kv),
-                )
+            retained_route_count = _block_sparse_row_retained_route_count(
+                self.block_sparse_indices,
+                cutlass.Int32(row_begin),
+                cutlass.Int32(row_end),
+                self.cfg.kv_block_size,
+                cutlass.Int32(self.max_seq_len_kv),
+            )
 
             # Sparse resources reuse the paged-KV cache fields as compact row
             # metadata. Clear dense/paged-only coordinates on every logical

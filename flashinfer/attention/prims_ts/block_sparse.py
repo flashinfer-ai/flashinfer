@@ -22,7 +22,6 @@ preparing or copying sparse routes.
 """
 
 from collections.abc import Callable
-from copy import copy, deepcopy
 from dataclasses import dataclass
 import functools
 import threading
@@ -31,17 +30,19 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.trace.templates.attention import prims_ts_block_sparse_trace_dispatch
+from flashinfer.trace.templates.attention import prims_ts_block_sparse_trace
+from flashinfer.utils import ceil_div
 
+from ._block_sparse.common import (
+    _KV_ROUTE_SIZE,
+    _canonical_block_sparse_q_tile_size,
+    _validate_sparse_block_size,
+)
 from ._block_sparse.inspection import _inspect_block_sparse_bsr
 from ._block_sparse.plan import (
-    _BlockSparseCompileKey,
     _BlockSparsePlanState,
-    _BlockSparseExecutionGeometry as _BlockSparseExecutionGeometry,
-    _BlockSparseLaunchSpec,
     _allocate_dummy_kv_valid_bits,
     _record_block_sparse_plan_ready_event,
-    _resolve_execution_geometry,
     _serialize_plan,
     _wait_and_record_block_sparse_plan,
 )
@@ -76,23 +77,45 @@ _CAUSAL_CLC_MIN_MAX_ROW_ROUTES = 4
 _RAW_BSR_CLC_MIN_TILE_SIZE_Q = 16
 
 
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
+_BlockSparseCompileKey = tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    str,
+    Literal["dense", "causal"],
+    bool,
+    bool,
+]
+
+
+@dataclass(frozen=True)
+class _BlockSparseLaunchSpec:
+    """Resolved launch policy and compiler key for one sparse plan."""
+
+    policy: tuple[tuple[str, object], ...]
+    compile_key: _BlockSparseCompileKey
 
 
 def _validate_matching_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     output_dtype: torch.dtype,
-) -> None:
-    for dtype in (q_dtype, kv_dtype, output_dtype):
-        _dtype_key(dtype)
+) -> str:
+    dtype_key = _dtype_key(q_dtype)
+    _dtype_key(kv_dtype)
+    _dtype_key(output_dtype)
     if not (q_dtype == kv_dtype == output_dtype):
         raise ValueError("block-sparse requires matching Q, K/V, and output dtypes")
     if q_dtype not in _SUPPORTED_DTYPES:
         raise NotImplementedError(
             "block-sparse supports only torch.float16 and torch.bfloat16"
         )
+    return dtype_key
 
 
 def _validate_metadata_tensor(
@@ -136,7 +159,7 @@ def _validate_plan_metadata(
     num_kv_heads: int,
     q_block_size: int,
 ) -> tuple[torch.device, int]:
-    num_q_blocks = _ceil_div(seq_len_q, q_block_size)
+    num_q_blocks = ceil_div(seq_len_q, q_block_size)
     expected_indptr_shape = (batch_size, num_kv_heads, num_q_blocks + 1)
     _validate_metadata_tensor(
         block_indptr,
@@ -160,7 +183,7 @@ def _validate_plan_metadata(
             "kv_valid_bits",
             ndim=2,
             dtype=torch.uint32,
-            expected_shape=(batch_size, _ceil_div(seq_len_kv, 32)),
+            expected_shape=(batch_size, ceil_div(seq_len_kv, 32)),
             expected_device=device,
         )
     return device, device_index
@@ -175,9 +198,7 @@ def _make_block_sparse_config(
     head_dim: int,
     q_block_size: int,
     kv_block_size: int,
-    q_tile_size: int,
-    q_dtype_key: str,
-    output_dtype_key: str,
+    dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
@@ -190,22 +211,19 @@ def _make_block_sparse_config(
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
     }
-    geometry = _resolve_execution_geometry(
-        q_block_size,
-        kv_block_size,
-        q_tile_size=q_tile_size,
-    )
-    use_keeps_mma_ab = geometry.q_tile_size >= 64
+    dtype = dtype_map[dtype_key]
+    q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
+    use_keeps_mma_ab = q_tile_size >= 64
     config_args: dict[str, object] = {
         "use_keeps_mma_ab": use_keeps_mma_ab,
-        "tile_size_q": geometry.q_tile_size,
-        "tile_size_kv": geometry.kv_tile_size,
+        "tile_size_q": q_tile_size,
+        "tile_size_kv": _KV_ROUTE_SIZE,
         "groups_tokens_heads_q": True,
         "use_block_sparse": True,
         "q_block_size": q_block_size,
         "kv_block_size": kv_block_size,
         "use_kv_valid_bits": use_kv_valid_bits,
-        "num_kv_valid_words": (_ceil_div(seq_len_kv, 32) if use_kv_valid_bits else 0),
+        "num_kv_valid_words": (ceil_div(seq_len_kv, 32) if use_kv_valid_bits else 0),
     }
     if use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
@@ -217,8 +235,8 @@ def _make_block_sparse_config(
         batch_size=batch_size,
         num_heads_q=num_heads,
         num_heads_kv=num_heads,
-        qkv_dtype=dtype_map[q_dtype_key],
-        o_dtype=dtype_map[output_dtype_key],
+        qkv_dtype=dtype,
+        o_dtype=dtype,
         qkv_layout="contiguousKv",
         split_kv_mode="disabled",
         splits_kv=1,
@@ -227,119 +245,7 @@ def _make_block_sparse_config(
     )
 
 
-@dataclass(frozen=True)
-class _RawBlockSparseLaunchTraits:
-    """Hashable compile-time traits shared by static and persistent profiles."""
-
-    device_index: int
-    batch_size: int
-    seq_len_q: int
-    seq_len_kv: int
-    num_heads: int
-    head_dim: int
-    q_block_size: int
-    kv_block_size: int
-    q_tile_size: int
-    q_dtype_key: str
-    kv_dtype_key: str
-    output_dtype_key: str
-    mask_type: Literal["dense", "causal"]
-    use_kv_valid_bits: bool
-
-
-@dataclass(frozen=True)
-class _RawBlockSparseLaunchProfile:
-    """One scheduler choice: resolved config plus its exact compiler key."""
-
-    config: "FmhaDecodeConfig"
-    use_persistent_scheduler: bool
-    compile_key: _BlockSparseCompileKey
-
-
-def _make_raw_block_sparse_launch_profile(
-    traits: _RawBlockSparseLaunchTraits,
-    *,
-    use_persistent_scheduler: bool,
-) -> _RawBlockSparseLaunchProfile:
-    """Build one raw-BSR scheduler specialization."""
-
-    if traits.q_dtype_key != traits.kv_dtype_key:
-        raise ValueError("the cached sparse compiler requires one QKV dtype")
-    config = _make_block_sparse_config(
-        batch_size=traits.batch_size,
-        seq_len_q=traits.seq_len_q,
-        seq_len_kv=traits.seq_len_kv,
-        num_heads=traits.num_heads,
-        head_dim=traits.head_dim,
-        q_block_size=traits.q_block_size,
-        kv_block_size=traits.kv_block_size,
-        q_tile_size=traits.q_tile_size,
-        q_dtype_key=traits.q_dtype_key,
-        output_dtype_key=traits.output_dtype_key,
-        mask_type=traits.mask_type,
-        use_kv_valid_bits=traits.use_kv_valid_bits,
-        use_persistent_scheduler=use_persistent_scheduler,
-    )
-    compile_key: _BlockSparseCompileKey = (
-        traits.device_index,
-        traits.batch_size,
-        traits.seq_len_q,
-        traits.seq_len_kv,
-        traits.num_heads,
-        traits.head_dim,
-        traits.q_block_size,
-        traits.kv_block_size,
-        traits.q_tile_size,
-        traits.q_dtype_key,
-        traits.kv_dtype_key,
-        traits.output_dtype_key,
-        traits.mask_type,
-        traits.use_kv_valid_bits,
-        use_persistent_scheduler,
-    )
-    return _RawBlockSparseLaunchProfile(
-        config=config,
-        use_persistent_scheduler=use_persistent_scheduler,
-        compile_key=compile_key,
-    )
-
-
 @functools.cache
-def _resolve_cached_raw_block_sparse_static_launch_profile(
-    traits: _RawBlockSparseLaunchTraits,
-) -> _RawBlockSparseLaunchProfile:
-    return _make_raw_block_sparse_launch_profile(
-        traits,
-        use_persistent_scheduler=False,
-    )
-
-
-@functools.cache
-def _resolve_cached_raw_block_sparse_persistent_launch_profile(
-    traits: _RawBlockSparseLaunchTraits,
-) -> _RawBlockSparseLaunchProfile | None:
-    static_profile = _resolve_cached_raw_block_sparse_static_launch_profile(traits)
-    if static_profile.config.use_keeps_mma_ab:
-        persistent_probe = deepcopy(static_profile.config)
-        persistent_probe.use_persistent_scheduler = True
-        if not persistent_probe.supports_grouped_keeps:
-            return None
-        return _make_raw_block_sparse_launch_profile(
-            traits,
-            use_persistent_scheduler=True,
-        )
-
-    # Grouped SWAPAB has no Keeps-style capability predicate. Reuse the full
-    # profile validator and retain the valid static launch on rejection.
-    try:
-        return _make_raw_block_sparse_launch_profile(
-            traits,
-            use_persistent_scheduler=True,
-        )
-    except ValueError:
-        return None
-
-
 def _resolve_raw_block_sparse_launch_spec(
     device_index: int,
     batch_size: int,
@@ -349,69 +255,82 @@ def _resolve_raw_block_sparse_launch_spec(
     head_dim: int,
     q_block_size: int,
     kv_block_size: int,
-    q_tile_size: int,
-    q_dtype_key: str,
-    kv_dtype_key: str,
-    output_dtype_key: str,
+    dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     max_execution_tiles: int,
 ) -> _BlockSparseLaunchSpec:
-    """Select static or CLC scheduling without preparing route payloads.
+    """Resolve and cache one validated static or CLC launch.
 
     ``max_execution_tiles`` is the per-row KV128 scheduler capacity. Static
     plans use the largest physical-tail-trimmed route count; dynamic plans use
-    the untrimmed capacity implied by the fixed indptr row length.
+    the untrimmed capacity implied by the fixed indptr row length. If the
+    selected persistent profile is unsupported, retain the valid static
+    profile instead.
     """
 
     from .kernels.fmha_decode.fmha_decode_config import _select_auto_launch_mode
 
-    geometry = _resolve_execution_geometry(
+    q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
+    scheduler_kv_capacity_tokens = max_execution_tiles * _KV_ROUTE_SIZE
+    mode = "static"
+    if q_tile_size >= _RAW_BSR_CLC_MIN_TILE_SIZE_Q:
+        with torch.cuda.device(device_index):
+            mode = _select_auto_launch_mode(
+                batch_size=batch_size,
+                num_heads_kv=num_heads,
+                seq_len_kv=scheduler_kv_capacity_tokens,
+                num_q_tiles=ceil_div(seq_len_q, q_tile_size),
+                tile_size_kv=_KV_ROUTE_SIZE,
+                persistent_min_waves=(
+                    _CAUSAL_CLC_WAVE_THRESHOLD if mask_type == "causal" else 1
+                ),
+                persistent_min_tiles_per_cta=(
+                    _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
+                ),
+            )
+
+    def validate_profile(use_persistent_scheduler: bool) -> None:
+        _make_block_sparse_config(
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
+            dtype_key=dtype_key,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            use_persistent_scheduler=use_persistent_scheduler,
+        )
+
+    use_persistent_scheduler = mode == "persistent"
+    try:
+        validate_profile(use_persistent_scheduler)
+    except ValueError:
+        if not use_persistent_scheduler:
+            raise
+        use_persistent_scheduler = False
+        validate_profile(use_persistent_scheduler)
+
+    compile_key: _BlockSparseCompileKey = (
+        device_index,
+        batch_size,
+        seq_len_q,
+        seq_len_kv,
+        num_heads,
+        head_dim,
         q_block_size,
         kv_block_size,
-        q_tile_size=q_tile_size,
+        dtype_key,
+        mask_type,
+        use_kv_valid_bits,
+        use_persistent_scheduler,
     )
-    scheduler_kv_capacity_tokens = max_execution_tiles * geometry.kv_tile_size
-    with torch.cuda.device(device_index):
-        mode = _select_auto_launch_mode(
-            batch_size=batch_size,
-            num_heads_kv=num_heads,
-            seq_len_kv=scheduler_kv_capacity_tokens,
-            num_q_tiles=_ceil_div(seq_len_q, geometry.q_tile_size),
-            tile_size_q=geometry.q_tile_size,
-            tile_size_kv=geometry.kv_tile_size,
-            persistent_min_waves=(
-                _CAUSAL_CLC_WAVE_THRESHOLD if mask_type == "causal" else 1
-            ),
-            persistent_min_tiles_per_cta=(
-                _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
-            ),
-            persistent_min_tile_size_q=_RAW_BSR_CLC_MIN_TILE_SIZE_Q,
-        )
-    traits = _RawBlockSparseLaunchTraits(
-        device_index=device_index,
-        batch_size=batch_size,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        q_block_size=q_block_size,
-        kv_block_size=kv_block_size,
-        q_tile_size=q_tile_size,
-        q_dtype_key=q_dtype_key,
-        kv_dtype_key=kv_dtype_key,
-        output_dtype_key=output_dtype_key,
-        mask_type=mask_type,
-        use_kv_valid_bits=use_kv_valid_bits,
-    )
-    profile = None
-    if mode == "persistent":
-        profile = _resolve_cached_raw_block_sparse_persistent_launch_profile(traits)
-    if profile is None:
-        profile = _resolve_cached_raw_block_sparse_static_launch_profile(traits)
     policy: tuple[tuple[str, object], ...] = (
-        ("tile_size_q", geometry.q_tile_size),
-        ("use_persistent_scheduler", profile.use_persistent_scheduler),
+        ("tile_size_q", q_tile_size),
+        ("use_persistent_scheduler", use_persistent_scheduler),
         ("max_execution_tiles", max_execution_tiles),
         # Preserve the public diagnostic key for existing benchmark schemas.
         # Dynamic plans report scheduler capacity rather than current visibility.
@@ -420,17 +339,9 @@ def _resolve_raw_block_sparse_launch_spec(
         ("use_kv_valid_bits", use_kv_valid_bits),
     )
     return _BlockSparseLaunchSpec(
-        copy(profile.config),
         policy,
-        profile.compile_key,
+        compile_key,
     )
-
-
-def _clear_block_sparse_launch_profile_cache() -> None:
-    """Clear raw scheduler-profile caches for isolated tests."""
-
-    _resolve_cached_raw_block_sparse_persistent_launch_profile.cache_clear()
-    _resolve_cached_raw_block_sparse_static_launch_profile.cache_clear()
 
 
 @functools.cache
@@ -443,18 +354,13 @@ def _get_compiled_block_sparse(
     head_dim: int,
     q_block_size: int,
     kv_block_size: int,
-    q_tile_size: int,
-    q_dtype_key: str,
-    kv_dtype_key: str,
-    output_dtype_key: str,
+    dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
 ) -> Callable[..., object]:
     """Compile and cache one canonical raw-BSR TVM-FFI adapter."""
 
-    if q_dtype_key != kv_dtype_key:
-        raise ValueError("the cached sparse compiler requires one QKV dtype")
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
@@ -468,8 +374,7 @@ def _get_compiled_block_sparse(
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
     }
-    qkv_dtype = dtype_map[q_dtype_key]
-    output_dtype = dtype_map[output_dtype_key]
+    dtype = dtype_map[dtype_key]
     config = _make_block_sparse_config(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -478,9 +383,7 @@ def _get_compiled_block_sparse(
         head_dim=head_dim,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        q_tile_size=q_tile_size,
-        q_dtype_key=q_dtype_key,
-        output_dtype_key=output_dtype_key,
+        dtype_key=dtype_key,
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
@@ -539,15 +442,15 @@ def _get_compiled_block_sparse(
     logical_nnz = cute.sym_int()
     q_shape = (batch_size, seq_len_q, num_heads, head_dim)
     kv_shape = (batch_size, seq_len_kv, num_heads, head_dim)
-    q_fake = fake_compact(qkv_dtype, q_shape, 16)
-    k_fake = fake_compact(qkv_dtype, kv_shape, 16)
-    v_fake = fake_compact(qkv_dtype, kv_shape, 16)
-    out_fake = fake_compact(output_dtype, q_shape, 16)
-    num_q_blocks = _ceil_div(seq_len_q, q_block_size)
+    q_fake = fake_compact(dtype, q_shape, 16)
+    k_fake = fake_compact(dtype, kv_shape, 16)
+    v_fake = fake_compact(dtype, kv_shape, 16)
+    out_fake = fake_compact(dtype, q_shape, 16)
+    num_q_blocks = ceil_div(seq_len_q, q_block_size)
     indptr_fake = fake_compact(Int32, (batch_size, num_heads, num_q_blocks + 1), 4)
     indices_fake = fake_compact(Int32, (logical_nnz,), 4)
     valid_bits_fake = fake_compact(
-        cutlass.Uint32, (batch_size, _ceil_div(seq_len_kv, 32)), 4
+        cutlass.Uint32, (batch_size, ceil_div(seq_len_kv, 32)), 4
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     with torch.cuda.device(device_index):
@@ -606,28 +509,8 @@ class BlockSparseTSWrapper:
         return state
 
     @property
-    def _planned(self) -> bool:
-        return self._plan_state is not None
-
-    @property
     def _policy(self) -> tuple[tuple[str, object], ...]:
         return self._published_state().policy
-
-    @property
-    def _block_indptr(self) -> torch.Tensor:
-        return self._published_state().block_indptr
-
-    @property
-    def _block_indices(self) -> torch.Tensor:
-        return self._published_state().block_indices
-
-    @property
-    def _kv_valid_bits(self) -> torch.Tensor | None:
-        return self._published_state().kv_valid_bits
-
-    @property
-    def _compiled(self) -> Callable[..., object]:
-        return self._published_state().compiled
 
     @_serialize_plan
     def plan(
@@ -710,8 +593,12 @@ class BlockSparseTSWrapper:
         head_dim = _validate_positive_int(head_dim, "head_dim")
         if not isinstance(dynamic_metadata, bool):
             raise TypeError("dynamic_metadata must be a bool")
-        geometry = _resolve_execution_geometry(q_block_size, kv_block_size)
-        use_keeps_mma_ab = geometry.q_tile_size >= 64
+        q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
+        kv_block_size = _validate_sparse_block_size(
+            kv_block_size,
+            "kv_block_size",
+        )
+        use_keeps_mma_ab = q_tile_size >= 64
         if kv_block_size < 64 and use_keeps_mma_ab:
             raise ValueError("fine KV blocks require a SwapsMmaAb Q tile")
         _validate_mask(mask_type)
@@ -725,7 +612,11 @@ class BlockSparseTSWrapper:
             kv_data_type = q_data_type
         if o_data_type is None:
             o_data_type = q_data_type
-        _validate_matching_dtypes(q_data_type, kv_data_type, o_data_type)
+        dtype_key = _validate_matching_dtypes(
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+        )
         device, device_index = _validate_plan_metadata(
             block_indptr,
             block_indices,
@@ -737,8 +628,6 @@ class BlockSparseTSWrapper:
             q_block_size=q_block_size,
         )
 
-        previous_state = self._plan_state
-        revision = 0 if previous_state is None else previous_state.revision + 1
         plan_stream = torch.cuda.current_stream(device)
         # Dynamic plans must compile the masked path regardless of current
         # values, so scanning a mutable bitset here cannot affect policy.
@@ -770,14 +659,11 @@ class BlockSparseTSWrapper:
         # route_size) holds for every replay, while the inspected value may
         # undercount when a later update avoids the physical tail.
         max_execution_tiles = (
-            -(-(max_row_nnz * kv_block_size) // geometry.kv_tile_size)
+            ceil_div(max_row_nnz * kv_block_size, _KV_ROUTE_SIZE)
             if dynamic_metadata
             else inspection.max_retained_routes
         )
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
-            q_dtype_key = _dtype_key(q_data_type)
-            kv_dtype_key = _dtype_key(kv_data_type)
-            output_dtype_key = _dtype_key(o_data_type)
             spec = _resolve_raw_block_sparse_launch_spec(
                 device_index,
                 batch_size,
@@ -787,15 +673,11 @@ class BlockSparseTSWrapper:
                 head_dim,
                 q_block_size,
                 kv_block_size,
-                geometry.q_tile_size,
-                q_dtype_key,
-                kv_dtype_key,
-                output_dtype_key,
+                dtype_key,
                 mask_type,
                 use_token_mask,
                 max_execution_tiles,
             )
-            config = spec.config
             policy = (
                 *spec.policy,
                 ("dynamic_metadata", dynamic_metadata),
@@ -814,31 +696,18 @@ class BlockSparseTSWrapper:
             ready_event = _record_block_sparse_plan_ready_event(plan_stream)
 
         candidate = _BlockSparsePlanState(
-            revision=revision,
             device=device,
-            device_index=device_index,
             batch_size=batch_size,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             num_heads=num_qo_heads,
             head_dim=head_dim,
-            q_block_size=q_block_size,
-            kv_block_size=kv_block_size,
-            geometry=geometry,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
-            mask_type=mask_type,
             block_indptr=block_indptr,
             block_indices=block_indices,
-            # Retain only a mask consumed by run. Once inspection proves an
-            # optional mask is all-valid, the unmasked specialization and its
-            # plan-owned dummy no longer need to extend the caller tensor's
-            # lifetime.
-            kv_valid_bits=kv_valid_bits if use_token_mask else None,
             runtime_kv_valid_bits=runtime_kv_valid_bits,
-            max_row_nnz=max_row_nnz,
-            config=config,
             policy=policy,
             compiled=compiled,
             ready_event=ready_event,
@@ -882,6 +751,9 @@ class BlockSparseTSWrapper:
             q,
             k,
             v,
+            block_indptr=state.block_indptr,
+            block_indices=state.block_indices,
+            runtime_kv_valid_bits=state.runtime_kv_valid_bits,
             device=state.device,
             batch_size=state.batch_size,
             seq_len_q=state.seq_len_q,
@@ -903,7 +775,7 @@ class BlockSparseTSWrapper:
         )
 
 
-@flashinfer_api(trace=prims_ts_block_sparse_trace_dispatch)
+@flashinfer_api(trace=prims_ts_block_sparse_trace)
 def block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,

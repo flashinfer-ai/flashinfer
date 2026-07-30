@@ -14,27 +14,23 @@
 
 """Host side of the plan-time raw-BSR inspection.
 
-This module validates the tensor ABI, launches the GPU inspector, and decodes
-its fixed Int64 summary into Python planning facts. Inspection deliberately
-performs one packed device-to-host copy and does not build a remapped route
-payload or specialize the launch for the current route/guard morphology.
+The public wrapper validates the tensor ABI before this module checks Int32
+addressing limits, launches the GPU inspector, and decodes its fixed Int64
+summary into Python planning facts. Inspection deliberately performs one
+packed device-to-host copy and does not build a remapped route payload or
+specialize the launch for the current route/guard morphology.
 """
 
-import threading
 from dataclasses import dataclass
 
 import torch
 
-from .common import (
-    _SIGNED_INT32_MAX,
-    _validate_sparse_block_size,
-)
+from .common import _SIGNED_INT32_MAX
 
 
 # Device summary ABI; keep this order synchronized with block_sparse_inspect.py:
 # error, max row NNZ, max KV128 routes, reachable token hole.
 _SUMMARY_FIELDS = 4
-_SUMMARY_HOST_STORAGE = threading.local()
 
 
 @dataclass(frozen=True)
@@ -56,37 +52,11 @@ class _BlockSparseInspection:
     token_mask_has_holes: bool
 
 
-def _validate_positive_int32(value: object, name: str) -> int:
-    """Return a positive Python integer representable by device Int32."""
+def _validate_int32_extent(value: int, name: str) -> None:
+    """Reject a validated positive extent that device Int32 cannot represent."""
 
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{name} must be a positive Python integer")
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
     if value > _SIGNED_INT32_MAX:
         raise OverflowError(f"{name} must fit in signed int32")
-    return value
-
-
-def _validate_cuda_tensor(
-    tensor: torch.Tensor,
-    name: str,
-    *,
-    dtype: torch.dtype,
-    ndim: int,
-) -> None:
-    """Validate the compact tensor contract used by TVM FFI."""
-
-    if not isinstance(tensor, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if not tensor.is_cuda:
-        raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.dtype != dtype:
-        raise TypeError(f"{name} must have dtype {dtype}")
-    if tensor.ndim != ndim:
-        raise ValueError(f"{name} must have rank {ndim}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
 
 
 def _validate_device_int32_product(name: str, *factors: int) -> None:
@@ -97,29 +67,6 @@ def _validate_device_int32_product(name: str, *factors: int) -> None:
         product *= factor
         if product > _SIGNED_INT32_MAX:
             raise OverflowError(f"{name} must fit in signed int32")
-
-
-def _read_summary_values(
-    summary_gpu: torch.Tensor,
-    stream: torch.cuda.Stream,
-) -> tuple[int, ...]:
-    """Perform the inspection's sole D2H through reusable pinned storage.
-
-    The returned Python tuple is detached from the thread-local staging buffer,
-    so a later inspection may safely reuse that pinned allocation.
-    """
-
-    summary_host = getattr(_SUMMARY_HOST_STORAGE, "buffer", None)
-    if summary_host is None or summary_host.numel() != _SUMMARY_FIELDS:
-        summary_host = torch.empty(
-            _SUMMARY_FIELDS,
-            dtype=torch.int64,
-            pin_memory=True,
-        )
-        _SUMMARY_HOST_STORAGE.buffer = summary_host
-    summary_host.copy_(summary_gpu, non_blocking=True)
-    stream.synchronize()
-    return tuple(int(value) for value in summary_host.tolist())
 
 
 def _raise_for_noncanonical_bsr(summary_values: tuple[int, ...]) -> None:
@@ -147,7 +94,7 @@ def _inspect_block_sparse_bsr(
     q_block_size: int,
     kv_block_size: int,
     kv_valid_bits: torch.Tensor | None = None,
-    stream: torch.cuda.Stream | None = None,
+    stream: torch.cuda.Stream,
 ) -> _BlockSparseInspection:
     """Inspect raw BSR on its CUDA device and return host planning facts.
 
@@ -164,32 +111,15 @@ def _inspect_block_sparse_bsr(
     combine the two halves of one KV128 route.
     """
 
-    q_block_size = _validate_sparse_block_size(q_block_size, "q_block_size")
-    kv_block_size = _validate_sparse_block_size(kv_block_size, "kv_block_size")
-    batch_size = _validate_positive_int32(batch_size, "batch_size")
-    num_kv_heads = _validate_positive_int32(num_kv_heads, "num_kv_heads")
-    seq_len_q = _validate_positive_int32(seq_len_q, "seq_len_q")
-    seq_len_kv = _validate_positive_int32(seq_len_kv, "seq_len_kv")
+    for value, name in (
+        (batch_size, "batch_size"),
+        (num_kv_heads, "num_kv_heads"),
+        (seq_len_q, "seq_len_q"),
+        (seq_len_kv, "seq_len_kv"),
+    ):
+        _validate_int32_extent(value, name)
 
-    _validate_cuda_tensor(
-        block_indptr,
-        "block_indptr",
-        dtype=torch.int32,
-        ndim=3,
-    )
-    _validate_cuda_tensor(
-        block_indices,
-        "block_indices",
-        dtype=torch.int32,
-        ndim=1,
-    )
     num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
-    expected_indptr_shape = (batch_size, num_kv_heads, num_q_block_rows + 1)
-    if tuple(block_indptr.shape) != expected_indptr_shape:
-        raise ValueError(
-            f"block_indptr must have shape {expected_indptr_shape}, got "
-            f"{tuple(block_indptr.shape)}"
-        )
     if block_indices.numel() > _SIGNED_INT32_MAX:
         raise OverflowError("block_indices.numel() must fit in signed int32")
     _validate_device_int32_product(
@@ -204,24 +134,8 @@ def _inspect_block_sparse_bsr(
         num_kv_heads,
         num_q_block_rows + 1,
     )
-    if block_indptr.device != block_indices.device:
-        raise ValueError("block_indptr and block_indices must be on the same device")
-
     if kv_valid_bits is not None:
-        _validate_cuda_tensor(
-            kv_valid_bits,
-            "kv_valid_bits",
-            dtype=torch.uint32,
-            ndim=2,
-        )
         expected_bits_shape = (batch_size, (seq_len_kv + 31) // 32)
-        if tuple(kv_valid_bits.shape) != expected_bits_shape:
-            raise ValueError(
-                f"kv_valid_bits must have shape {expected_bits_shape}, got "
-                f"{tuple(kv_valid_bits.shape)}"
-            )
-        if kv_valid_bits.device != block_indptr.device:
-            raise ValueError("kv_valid_bits must share the BSR metadata device")
         _validate_device_int32_product(
             "kv_valid_bits.numel()",
             *expected_bits_shape,
@@ -231,12 +145,6 @@ def _inspect_block_sparse_bsr(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    if stream is not None and not isinstance(stream, torch.cuda.Stream):
-        raise TypeError("stream must be a torch.cuda.Stream")
-    if stream is None:
-        stream = torch.cuda.current_stream(device_index)
-    if stream.device.index != device_index:
-        raise ValueError("inspection stream must be on the BSR metadata device")
 
     # Checking the caller's current stream first avoids entering another
     # device/stream context while an enclosing graph capture is active.
@@ -275,7 +183,7 @@ def _inspect_block_sparse_bsr(
             kv_valid_bits,
             summary_gpu,
         )
-        summary_values = _read_summary_values(summary_gpu, stream)
+        summary_values = tuple(int(value) for value in summary_gpu.tolist())
 
     _raise_for_noncanonical_bsr(summary_values)
     # This positional decode is the host mirror of the device summary ABI.

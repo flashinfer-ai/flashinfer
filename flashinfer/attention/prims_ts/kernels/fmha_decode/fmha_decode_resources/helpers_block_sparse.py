@@ -20,9 +20,6 @@ coarse blocks. Returned origins always refer to the original, uncompressed KV
 token coordinates.
 """
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32
@@ -37,93 +34,6 @@ from ...._block_sparse.common import (
 
 _KEEPS_ATOM_SIZE = _MAX_KV_ATOM_SIZE
 _KEEPS_ATOMS_PER_ROUTE = _KV_ROUTE_SIZE // _KEEPS_ATOM_SIZE
-
-
-@dataclass(frozen=True)
-class _BlockSparseAtomHostResult:
-    """Resolved host-side metadata for one KV atom in an execution route."""
-
-    bsr_entry_offset: int
-    atom_in_block: int
-    physical_token_offset: int
-    valid: bool
-
-
-def _validate_block_sparse_host_row(
-    block_indices: Sequence[int],
-    row_begin: int,
-    row_nnz: int,
-    kv_block_size: int,
-    seq_len_kv: int,
-) -> int:
-    """Validate host-only exact-route inputs and return the exclusive row end."""
-    if row_begin < 0:
-        raise ValueError("row_begin must be non-negative")
-    if row_nnz < 0:
-        raise ValueError("row_nnz must be non-negative")
-    _block_sparse_kv_atom_size(kv_block_size)
-    if seq_len_kv <= 0:
-        raise ValueError("seq_len_kv must be positive")
-
-    row_end = row_begin + row_nnz
-    num_indices = len(block_indices)
-    if row_begin > num_indices or row_end > num_indices:
-        raise ValueError(
-            f"row range [{row_begin}, {row_end}) exceeds block_indices length "
-            f"{num_indices}"
-        )
-    return row_end
-
-
-def _block_sparse_row_retained_route_count_host(
-    block_indices: Sequence[int],
-    row_begin: int,
-    row_nnz: int,
-    kv_block_size: int,
-    seq_len_kv: int,
-) -> int:
-    """Return the exact number of KV128 routes retained by the physical tail.
-
-    Canonical BSR rows are sorted and contain only in-range block IDs. Thus all
-    entries before the final selected block contribute complete atoms; only
-    the final block can intersect ``seq_len_kv``. The empty-row
-    branch deliberately precedes the ``row_end - 1`` index calculation.
-    """
-    row_end = _validate_block_sparse_host_row(
-        block_indices, row_begin, row_nnz, kv_block_size, seq_len_kv
-    )
-    if row_nnz == 0:
-        return 0
-
-    last_block_idx = block_indices[row_end - 1]
-    last_block_origin = last_block_idx * kv_block_size
-    remaining_tokens = seq_len_kv - last_block_origin
-    if _block_sparse_kv_routes_are_block_aligned(kv_block_size):
-        # B128/B256/... map each semantic block directly to whole KV128
-        # execution tiles. A final partial tile stays one KV128 TMA and relies
-        # on hardware OOB fill, so KV64 metadata fragments do not enter this
-        # scheduler count.
-        routes_per_entry = kv_block_size // _KV_ROUTE_SIZE
-        retained_routes = (row_nnz - 1) * routes_per_entry
-        if remaining_tokens > 0:
-            retained_routes += min(
-                routes_per_entry,
-                (remaining_tokens + _KV_ROUTE_SIZE - 1) // _KV_ROUTE_SIZE,
-            )
-        return retained_routes
-
-    atom_size = _block_sparse_kv_atom_size(kv_block_size)
-    atoms_per_entry = kv_block_size // atom_size
-    atoms_per_route = _KV_ROUTE_SIZE // atom_size
-    retained_atoms = (row_nnz - 1) * atoms_per_entry
-    retained_last_atoms = 0
-    if remaining_tokens > 0:
-        retained_last_atoms = min(
-            atoms_per_entry,
-            (remaining_tokens - 1) // atom_size + 1,
-        )
-    retained_atoms += retained_last_atoms
-    return (retained_atoms + atoms_per_route - 1) // atoms_per_route
 
 
 @cute.jit
@@ -175,35 +85,6 @@ def _block_sparse_row_retained_route_count(
     return retained_routes
 
 
-def _sparse_keeps_can_skip_structural_mask_host(
-    *,
-    q_row_is_valid: bool,
-    origin0: int,
-    origin1: int,
-    valid0: bool,
-    valid1: bool,
-    seq_len_kv: int,
-    causal_end: int | None,
-) -> bool:
-    """Return whether a complete KV128 route needs no structural masking."""
-    last_complete_kv_origin = seq_len_kv - _KEEPS_ATOM_SIZE
-    can_skip_structural_mask = (
-        q_row_is_valid
-        and valid0
-        and valid1
-        and origin0 <= last_complete_kv_origin
-        and origin1 <= last_complete_kv_origin
-    )
-    if causal_end is not None:
-        last_causal_origin = causal_end - _KEEPS_ATOM_SIZE
-        can_skip_structural_mask = (
-            can_skip_structural_mask
-            and origin0 <= last_causal_origin
-            and origin1 <= last_causal_origin
-        )
-    return can_skip_structural_mask
-
-
 @cute.jit
 def sparse_keeps_can_skip_structural_mask(
     q_row_is_valid: Boolean,
@@ -241,77 +122,6 @@ def sparse_keeps_can_skip_structural_mask(
             and origin1 <= last_causal_origin
         )
     return can_skip_structural_mask
-
-
-def _resolve_block_sparse_route_origins_host(
-    block_indices: Sequence[int],
-    row_begin: int,
-    row_nnz: int,
-    route_idx: int,
-    kv_block_size: int,
-    seq_len_kv: int,
-) -> tuple[_BlockSparseAtomHostResult, ...]:
-    """Resolve every atom in one KV128 route in physical token coordinates."""
-    if route_idx < 0:
-        raise ValueError("route_idx must be non-negative")
-    _validate_block_sparse_host_row(
-        block_indices, row_begin, row_nnz, kv_block_size, seq_len_kv
-    )
-    atom_size = _block_sparse_kv_atom_size(kv_block_size)
-    atoms_per_block = kv_block_size // atom_size
-    atoms_per_route = _KV_ROUTE_SIZE // atom_size
-    results = []
-    for atom_in_route in range(atoms_per_route):
-        flat_atom = route_idx * atoms_per_route + atom_in_route
-        bsr_entry_offset, atom_in_block = divmod(flat_atom, atoms_per_block)
-        valid = bsr_entry_offset < row_nnz
-        physical_token_offset = 0
-        if valid:
-            block_idx = block_indices[row_begin + bsr_entry_offset]
-            candidate = block_idx * kv_block_size + atom_in_block * atom_size
-            valid = candidate < seq_len_kv
-            if valid:
-                physical_token_offset = candidate
-        results.append(
-            _BlockSparseAtomHostResult(
-                bsr_entry_offset=bsr_entry_offset,
-                atom_in_block=atom_in_block,
-                physical_token_offset=physical_token_offset,
-                valid=valid,
-            )
-        )
-    return tuple(results)
-
-
-def _resolve_block_sparse_aligned_route_origin_host(
-    block_indices: Sequence[int],
-    row_begin: int,
-    row_nnz: int,
-    route_idx: int,
-    kv_block_size: int,
-    seq_len_kv: int,
-) -> tuple[int, bool]:
-    """Resolve one block-aligned KV128 route from canonical BSR."""
-
-    if route_idx < 0:
-        raise ValueError("route_idx must be non-negative")
-    _validate_block_sparse_host_row(
-        block_indices, row_begin, row_nnz, kv_block_size, seq_len_kv
-    )
-    if not _block_sparse_kv_routes_are_block_aligned(kv_block_size):
-        raise ValueError("aligned route resolution requires kv_block_size % 128 == 0")
-
-    routes_per_entry = kv_block_size // _KV_ROUTE_SIZE
-    bsr_entry_offset, route_in_block = divmod(route_idx, routes_per_entry)
-    if bsr_entry_offset >= row_nnz:
-        return 0, False
-
-    block_idx = block_indices[row_begin + bsr_entry_offset]
-    block_origin = block_idx * kv_block_size
-    route_offset = route_in_block * _KV_ROUTE_SIZE
-    if route_offset >= seq_len_kv - block_origin:
-        return 0, False
-    return block_origin + route_offset, True
 
 
 @cute.jit

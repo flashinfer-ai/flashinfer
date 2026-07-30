@@ -2654,85 +2654,11 @@ def test_attention_ts_decode_auto_launch_persists_only_above_one_sm_wave(
             num_heads_kv=1,
             seq_len_kv=128,
             num_q_tiles=1,
-            tile_size_q=64,
             tile_size_kv=128,
         )
         for ctas in (3, 4, 5)
     )
     assert modes == ("static", "static", "persistent")
-
-
-def test_attention_ts_decode_auto_launch_respects_minimum_q_tile(monkeypatch):
-    """Caller policy can reject narrow CLC tiles without disabling split-KV."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
-        _select_auto_launch_mode,
-    )
-
-    class _FourSmHardware:
-        def get_device_multiprocessor_count(self) -> int:
-            return 4
-
-    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
-    common = {
-        "num_heads_kv": 1,
-        "num_q_tiles": 1,
-        "tile_size_kv": 128,
-        "persistent_min_tile_size_q": 16,
-    }
-
-    assert (
-        _select_auto_launch_mode(
-            batch_size=5,
-            seq_len_kv=128,
-            tile_size_q=8,
-            **common,
-        )
-        == "static"
-    )
-    assert (
-        _select_auto_launch_mode(
-            batch_size=5,
-            seq_len_kv=128,
-            tile_size_q=16,
-            **common,
-        )
-        == "persistent"
-    )
-    assert (
-        _select_auto_launch_mode(
-            batch_size=5,
-            seq_len_kv=128,
-            tile_size_q=8,
-            num_heads_kv=1,
-            num_q_tiles=1,
-            tile_size_kv=128,
-        )
-        == "persistent"
-    )
-    assert (
-        _select_auto_launch_mode(
-            batch_size=1,
-            seq_len_kv=2048,
-            tile_size_q=8,
-            **common,
-        )
-        == "gmem_reduction"
-    )
-    with pytest.raises(
-        ValueError,
-        match="persistent_min_tile_size_q must be positive",
-    ):
-        _select_auto_launch_mode(
-            batch_size=5,
-            seq_len_kv=128,
-            tile_size_q=8,
-            num_heads_kv=1,
-            num_q_tiles=1,
-            tile_size_kv=128,
-            persistent_min_tile_size_q=0,
-        )
 
 
 @pytest.mark.parametrize("seq_len_q", (3, 5, 17))

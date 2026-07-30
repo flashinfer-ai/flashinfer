@@ -16,6 +16,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | --- | --- | --- |
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prims_ts_batch_decode_with_kv_cache` |
+| Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_decode_mla_with_paged_kv_cache`, `get_prims_ts_batch_decode_mla_workspace_size`, `prims_ts_batch_decode_with_kv_cache_mla` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
@@ -30,6 +31,7 @@ contracts:
 pytest -q \
   tests/attention/test_attention_ts_context.py \
   tests/attention/test_attention_ts_decode.py \
+  tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
   tests/attention/test_attention_ts_mla_decode.py
 ```

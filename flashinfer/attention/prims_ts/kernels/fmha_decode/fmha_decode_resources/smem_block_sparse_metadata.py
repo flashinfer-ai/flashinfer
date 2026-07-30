@@ -47,7 +47,6 @@ from ...._block_sparse.common import (
     _KV_ROUTE_SIZE,
     _block_sparse_kv_atom_size,
     _block_sparse_kv_routes_are_block_aligned,
-    _validate_sparse_block_size,
 )
 from ...placeholder_helpers import _placeholder_smem_array
 from ...stage import FmhaStage
@@ -145,7 +144,6 @@ class _BlockSparseSoftmaxMetadataLayout:
     route_flags_word_offset: int | None
     token_words_word_offset: int | None
     stage_stride_words: int
-    num_stages: int
     total_words: int
 
     @property
@@ -164,16 +162,6 @@ class _BlockSparseSoftmaxMetadataLayout:
     ) -> "_BlockSparseSoftmaxMetadataLayout":
         """Build a stage-count-dependent layout for Softmax metadata."""
 
-        if not isinstance(use_keeps_mma_ab, bool):
-            raise TypeError("use_keeps_mma_ab must be a bool")
-        if not isinstance(has_token_bits, bool):
-            raise TypeError("has_token_bits must be a bool")
-        if (
-            isinstance(num_stages, bool)
-            or not isinstance(num_stages, int)
-            or num_stages <= 0
-        ):
-            raise ValueError("num_stages must be a positive integer")
         atom_size = _block_sparse_kv_atom_size(kv_block_size)
         if use_keeps_mma_ab:
             softmax_atom_size = 64
@@ -198,7 +186,6 @@ class _BlockSparseSoftmaxMetadataLayout:
             route_flags_word_offset=route_flags_word_offset,
             token_words_word_offset=token_words_word_offset,
             stage_stride_words=stage_stride_words,
-            num_stages=num_stages,
             total_words=num_stages * stage_stride_words,
         )
 
@@ -220,15 +207,18 @@ def _block_sparse_k_local_route_idx(
 
 
 @cute.jit
-def _warp_broadcast_lane0_i32(value: Int32) -> Int32:
-    """Broadcast one lane-zero scalar as a warp-uniform Int32 value."""
+def _warp_broadcast_i32(
+    value: Int32,
+    src_lane: Constexpr[int],
+) -> Int32:
+    """Broadcast one source-lane scalar as a warp-uniform Int32 value."""
 
     return cute.arch.make_warp_uniform(
         Int32(
             prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
                 val=value,
-                offset=0,
+                offset=src_lane,
                 mask_and_clamp=0x1F,
                 kind=prims.Shfl.IDX,
             )
@@ -245,8 +235,29 @@ def _resolve_block_sparse_route_metadata(
     kv_block_size: Constexpr[int],
     seq_len_kv: Int32,
     lane_idx: Int32,
+    parallelize_b64_keeps_fragments: Constexpr[bool],
 ) -> tuple[Int32, Int32, Int32]:
     """Resolve one KV128 route and derive its two KV64 mask views."""
+
+    # B64 Keeps assigns the two independent BSR entries to lanes 0/1.
+    if cutlass.const_expr(parallelize_b64_keeps_fragments):
+        origin = Int32(0)
+        valid = cutlass.Boolean(False)
+        if lane_idx < Int32(2):
+            origin, valid = resolve_block_sparse_route_atom_origin(
+                block_sparse_indices,
+                row_begin,
+                row_end,
+                route_idx,
+                lane_idx,
+                kv_block_size,
+                seq_len_kv,
+            )
+        origin0 = _warp_broadcast_i32(origin, 0)
+        origin1 = _warp_broadcast_i32(origin, 1)
+        # Lanes 2-31 retain valid=False, so only bits 0/1 can be set.
+        valid_mask = Int32(cute.arch.vote_ballot_sync(valid))
+        return origin0, origin1, valid_mask
 
     origin0 = Int32(0)
     origin1 = Int32(0)
@@ -280,9 +291,9 @@ def _resolve_block_sparse_route_metadata(
             )
         valid_mask = Int32(valid0) | (Int32(valid1) << Int32(1))
 
-    origin0 = _warp_broadcast_lane0_i32(origin0)
-    origin1 = _warp_broadcast_lane0_i32(origin1)
-    valid_mask = _warp_broadcast_lane0_i32(valid_mask)
+    origin0 = _warp_broadcast_i32(origin0, 0)
+    origin1 = _warp_broadcast_i32(origin1, 0)
+    valid_mask = _warp_broadcast_i32(valid_mask, 0)
     return origin0, origin1, valid_mask
 
 
@@ -362,22 +373,8 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     )
 
     def __post_init__(self) -> None:
-        """Validate the profile and create its execution-atom origin layout."""
+        """Create the execution-atom origin layout."""
 
-        if self.cfg is None:
-            raise ValueError("cfg is required")
-        if not self.cfg.use_block_sparse:
-            raise ValueError(
-                "SmemBlockSparseKvMetadataResource requires block-sparse mode"
-            )
-        if self.pipeline_config is not None:
-            raise ValueError("K/V metadata resource must not own a pipeline")
-        _validate_sparse_block_size(self.cfg.q_block_size, "q_block_size")
-        _validate_sparse_block_size(self.cfg.kv_block_size, "kv_block_size")
-        if self.cfg.num_insts_kv != 2:
-            raise ValueError("raw sparse K/V metadata requires two KV instructions")
-        if self.inst_id not in (0, 1):
-            raise ValueError("inst_id must be 0 or 1")
         self.layout = _BlockSparseKvMetadataLayout.create(
             kv_block_size=self.cfg.kv_block_size
         )
@@ -457,6 +454,9 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                 self.cfg.kv_block_size,
                 seq_len_kv,
                 lane_idx,
+                cutlass.const_expr(
+                    self.cfg.use_keeps_mma_ab and self.cfg.kv_block_size == 64
+                ),
             )
 
         # Fine routes stay lane-distributed: each active lane carries only its
@@ -610,22 +610,8 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     )
 
     def __post_init__(self) -> None:
-        """Validate the profile and derive its staged metadata layout."""
+        """Derive the staged metadata layout."""
 
-        if self.cfg is None:
-            raise ValueError("cfg is required")
-        if not self.cfg.use_block_sparse:
-            raise ValueError(
-                "SmemBlockSparseSoftmaxMetadataResource requires block-sparse mode"
-            )
-        if self.pipeline_config is None:
-            raise ValueError("Softmax metadata resource requires a pipeline")
-        _validate_sparse_block_size(self.cfg.q_block_size, "q_block_size")
-        _validate_sparse_block_size(self.cfg.kv_block_size, "kv_block_size")
-        if self.cfg.num_insts_kv != 2:
-            raise ValueError("raw sparse Softmax metadata requires two KV instructions")
-        if self.inst_id not in (0, 1):
-            raise ValueError("inst_id must be 0 or 1")
         self.layout = _BlockSparseSoftmaxMetadataLayout.create(
             use_keeps_mma_ab=self.cfg.use_keeps_mma_ab,
             kv_block_size=self.cfg.kv_block_size,
@@ -1058,8 +1044,4 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 __all__ = [
     "SmemBlockSparseKvMetadataResource",
     "SmemBlockSparseSoftmaxMetadataResource",
-    "_BlockSparseKvMetadataLayout",
-    "_BlockSparseSoftmaxMetadataLayout",
-    "_resolve_block_sparse_route_metadata",
-    "_load_block_sparse_token_word_from_route",
 ]
