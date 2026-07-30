@@ -270,9 +270,9 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
-        assert not TrtllmFp4Config.supported(107)
+        assert TrtllmFp4Config.supported(107)
         assert not TrtllmFp8BlockConfig.supported(107)
-        assert not TrtllmBf16Config.supported(107)
+        assert TrtllmBf16Config.supported(107)
         assert not TrtllmBf16Config.supported(120)
         assert not TrtllmFp8BlockConfig.supported(110)
         assert not TrtllmFp8BlockConfig.supported(120)
@@ -1079,6 +1079,12 @@ class TestUnifiedMoEDispatch:
         """
         act_pack, weight_pack, config, _ = _make_packs_and_config(256, **SMALL)
         layer = MoELayer(config)
+        if len(layer.runners) < 2:
+            pytest.skip(
+                "cross-backend autotune needs >=2 instantiable backends on "
+                "this device/stack (e.g. the installed CuTe DSL cannot "
+                "target this arch)"
+            )
 
         # Wrap each runner's forward to count invocations.
         call_counts: dict = {}
@@ -1368,10 +1374,23 @@ class TestUnifiedMoEConformance:
         act_pack, weight_pack, config, tensors = spec.make(256, max_tokens=256)
         layer = MoELayer(config)
         ref = spec.reference(act_pack, tensors)
+        checked = 0
         for backend_key in spec.backend_keys:
-            runner = next(r for r in layer.runners if r.backend_key == backend_key)
+            runner = next(
+                (r for r in layer.runners if r.backend_key == backend_key), None
+            )
+            if runner is None:
+                # Backend not instantiable on this device/stack (e.g. the
+                # installed CuTe DSL cannot target this arch) — MoELayer
+                # already dropped it from the candidate list.
+                continue
             out = runner.forward(runner.pack_inputs(act_pack, weight_pack), tactic=-1)
             spec.check(out, ref, backend_key)
+            checked += 1
+        if checked == 0:
+            pytest.skip(
+                f"none of {spec.backend_keys} is available on this device/stack"
+            )
 
     def test_runner_with_local_expert_offset(self, spec):
         """Nonzero local shard offset through the real kernel: global ids in

@@ -288,7 +288,7 @@ def get_gemm_module():
     return _gemm_module
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -674,7 +674,7 @@ def mm_bf16(
     return out
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cutlass_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1550,7 +1550,7 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
 
 @functools.cache
 def get_gemm_sm100_module_cutlass_fp4():
-    """Get the SM100/110 FP4 GEMM module."""
+    """Get the SM100/103/107/110 FP4 GEMM module."""
     module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
     return _create_cutlass_fp4_gemm_module(
         module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
@@ -1676,10 +1676,14 @@ def tgv_gemm_sm100(
     torch.Tensor
         Output tensor of shape ``(M, N)`` in row-major layout.
 
-    Notes
-    -----
-    Requires SM100 or SM103 architecture.  Supported dtypes are
-    ``torch.bfloat16`` and ``torch.float16``.
+    Supported dtypes:
+        - torch.bfloat16
+        - torch.float16
+
+    Note:
+        - Requires SM100 or SM103 architecture
+        - Input tensors a and b must have the same dtype
+        - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103"]):
@@ -4549,7 +4553,7 @@ def _check_mm_mxfp8_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -4579,7 +4583,7 @@ def _cutlass_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -5650,7 +5654,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -5692,7 +5696,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -5719,7 +5723,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -6393,7 +6397,6 @@ def _heuristic_func_mm_fp4(
     # Otherwise, prioritize cutlass
     else:
         candidate_backends = ("cutlass", "cudnn")
-
     # Filter and return only supported backends
     return [c for c in candidate_backends if c in suitable_backends]
 
@@ -6685,7 +6688,7 @@ def mm_fp4(
     return out
 
 
-@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6698,7 +6701,7 @@ def _cudnn_bmm_fp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6711,7 +6714,7 @@ def _cublas_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutlass_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6726,6 +6729,7 @@ def _cutlass_bmm_fp8_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 107])
 def _check_bmm_fp8_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6751,7 +6755,7 @@ def _heuristic_func_bmm_fp8(
 ):
     # No e5m2 for cutlass
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
-    is_sm_supported = _match_sm_version(A.device, ["100", "103", "110"])
+    is_sm_supported = _match_sm_version(A.device, ["100", "103", "107", "110"])
     is_sm120_supported = _match_sm_version(A.device, ["120", "121"])
 
     # preserve order of ["cudnn", "cublas", "cutlass"]
@@ -6870,7 +6874,7 @@ def bmm_fp8(
     return out
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _cutlass_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6889,7 +6893,7 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7141,11 +7145,17 @@ def gemm_fp8_nt_groupwise(
     return out
 
 
-@functools.cache
 def get_trtllm_gemm_module():
-    mod = gen_trtllm_gen_gemm_module()
+    device = torch.device("cuda", torch.cuda.current_device())
+    enable_rubin = get_compute_capability(device) == (10, 7)
+    return _get_trtllm_gemm_module_impl(enable_rubin)
+
+
+@functools.cache
+def _get_trtllm_gemm_module_impl(enable_rubin: bool):
+    mod = gen_trtllm_gen_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    setup_cubin_loader(str(mod.get_library_path()))
 
     class TrtllmGemmRunner(TunableRunner):
         def __init__(
@@ -7308,7 +7318,7 @@ def get_trtllm_gemm_module():
     )
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _check_gemm_fp8_nt_blockscaled_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7409,7 +7419,7 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
-@supported_compute_capability([100, 103, 120, 121])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _check_group_gemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7629,7 +7639,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -8129,7 +8139,7 @@ def get_deepgemm_sm100_module():
     return module
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -8283,7 +8293,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -9005,7 +9015,7 @@ def mxfp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_mxfp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
