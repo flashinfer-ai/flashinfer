@@ -81,8 +81,8 @@ def test_softmax(
     [
         (1, 32000, "none"),  # cooperative route
         (256, 32000, "none"),  # rowwise route
-        (1, 111, "scalar"),  # scalar-temperature rowwise route
-        (1, 111, "per_row"),  # per-row-temperature rowwise route
+        (1, 111, "scalar"),  # scalar-temperature warp-packed route
+        (1, 111, "per_row"),  # per-row-temperature warp-packed route
     ],
 )
 def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):

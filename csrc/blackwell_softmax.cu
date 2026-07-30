@@ -28,8 +28,12 @@ namespace {
 
 constexpr int kBootstrapThreads = 256;
 constexpr int kRowwiseThreads = 512;
+constexpr int kWarpThreads = 128;
+constexpr int kWarpRowsPerCta = 4;
 constexpr int kMaxSplits = 64;
-constexpr size_t kDynamicSmemBytes = 128;
+constexpr size_t kBootstrapDynamicSmemBytes = 128;
+constexpr size_t kRowwiseDynamicSmemBytes = 128;
+constexpr size_t kWarpDynamicSmemBytes = 0;
 
 enum class ParameterKind : int {
   kNone = 0,
@@ -37,14 +41,21 @@ enum class ParameterKind : int {
   kPerRow = 2,
 };
 
+bool use_warp_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
+  return rows <= 128 && vocab_size <= 257 &&
+         (parameter_kind == ParameterKind::kScalar ||
+          parameter_kind == ParameterKind::kPerRow);
+}
+
 bool use_rowwise_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
   const bool small_low_row = rows <= 32 && vocab_size <= 16384;
   const bool dense_aligned_mid_row = rows > 128 && rows <= 384 && vocab_size >= 24576 &&
                                      vocab_size <= 256000 && vocab_size % 4 == 0 &&
                                      parameter_kind == ParameterKind::kNone;
   const bool dense_aligned_high_row_narrow = rows > 384 && rows <= 1024 && vocab_size >= 24576 &&
-                                             vocab_size <= 32000 && vocab_size % 4 == 0 &&
-                                             parameter_kind == ParameterKind::kNone;
+                                             vocab_size <= 64000 && vocab_size % 4 == 0 &&
+                                             (parameter_kind == ParameterKind::kNone ||
+                                              vocab_size <= 32000);
   const bool measured_large_odd = rows > 128 && rows <= 512 && vocab_size >= 24576 &&
                                   vocab_size <= 131072 && vocab_size % 4 != 0;
   return small_low_row || dense_aligned_mid_row || dense_aligned_high_row_narrow ||
@@ -66,18 +77,27 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   int vocab_size_i = static_cast<int>(vocab_size);
   int parameter_kind_i = static_cast<int>(parameter_kind);
 
+  if (use_warp_kernel(rows, vocab_size, parameter_kind)) {
+    void* args[] = {&logits,       &parameter,        &output,         &rows_i,
+                    &vocab_size_i, &parameter_kind_i, &temperature_val};
+    return cudaLaunchKernel(
+        reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_followup_warp),
+        dim3(ceil_div(rows, static_cast<uint32_t>(kWarpRowsPerCta))), dim3(kWarpThreads), args,
+        kWarpDynamicSmemBytes, stream);
+  }
+
   if (use_rowwise_kernel(rows, vocab_size, parameter_kind)) {
     void* args[] = {&logits,       &parameter,        &output,         &rows_i,
                     &vocab_size_i, &parameter_kind_i, &temperature_val};
     return cudaLaunchKernel(
         reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_followup_rowwise),
-        dim3(rows), dim3(kRowwiseThreads), args, kDynamicSmemBytes, stream);
+        dim3(rows), dim3(kRowwiseThreads), args, kRowwiseDynamicSmemBytes, stream);
   }
 
   int active_blocks_per_sm = 0;
   cudaError_t status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &active_blocks_per_sm, kernel_flashinfer_blackwell_softmax_bootstrap_seed, kBootstrapThreads,
-      kDynamicSmemBytes);
+      kBootstrapDynamicSmemBytes);
   if (status != cudaSuccess) {
     return status;
   }
@@ -118,7 +138,8 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
                   &rows_i, &vocab_size_i, &splits_i, &parameter_kind_i, &temperature_val};
   return cudaLaunchCooperativeKernel(
       reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_bootstrap_seed),
-      dim3(static_cast<uint32_t>(grid)), dim3(kBootstrapThreads), args, kDynamicSmemBytes, stream);
+      dim3(static_cast<uint32_t>(grid)), dim3(kBootstrapThreads), args,
+      kBootstrapDynamicSmemBytes, stream);
 }
 
 }  // namespace

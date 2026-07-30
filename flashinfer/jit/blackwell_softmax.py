@@ -24,6 +24,11 @@ def gen_blackwell_softmax_module() -> JitSpec:
     )
     return gen_jit_spec(
         "blackwell_softmax",
-        [jit_env.FLASHINFER_CSRC_DIR / "blackwell_softmax.cu"],
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "blackwell_softmax.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "blackwell_softmax_bootstrap.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "blackwell_softmax_rowwise.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "blackwell_softmax_warp.cu",
+        ],
         extra_cuda_cflags=nvcc_flags,
     )
