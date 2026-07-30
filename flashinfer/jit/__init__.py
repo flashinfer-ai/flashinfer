@@ -93,6 +93,7 @@ from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
+from .tinygemm2_sm100 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
