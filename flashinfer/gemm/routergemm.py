@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Optional
 import torch
 from flashinfer.utils import (
-    get_compute_capability,
+    is_sm100a_supported,
     register_custom_op,
     supported_compute_capability,
     backend_requirement,
@@ -465,7 +465,7 @@ def get_tinygemm2_sm100_module():
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
-    return get_compute_capability(device) in ((10, 0), (10, 3))
+    return is_sm100a_supported(device)
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
@@ -518,7 +518,7 @@ def tinygemm_bf16(
     On SM100/SM103 (B200/B300 class) devices the bias path dispatches to
     ``tinygemm2_sm100`` — generated variants of the same kernel with
     bit-identical outputs and lower latency (see
-    ``csrc/tinygemm2_sm100/``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
+    ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
     to force the reference implementation everywhere.
     """
     if bias is None:
