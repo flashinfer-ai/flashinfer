@@ -37,7 +37,7 @@ def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
     # FP4 enable flag is missing plus a static_assert pinning DTypeKV to the
     # packed FP4 container type.
     assert (
-        "#error \"NVFP4 KV paged prefill compiled without FLASHINFER_ENABLE_FP4_E2M1\""
+        '#error "NVFP4 KV paged prefill compiled without FLASHINFER_ENABLE_FP4_E2M1"'
         in generated
     )
     assert "static_assert(std::is_same_v<DTypeKV, __nv_fp4x2_e2m1>," in generated

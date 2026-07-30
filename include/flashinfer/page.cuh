@@ -247,15 +247,13 @@ struct paged_kv_t {
   }
 
   __device__ __forceinline__ size_t protective_get_k_offset(IdType page_iter, uint32_t head_idx,
-                                                            uint32_t entry_idx,
-                                                            uint32_t feat_idx,
+                                                            uint32_t entry_idx, uint32_t feat_idx,
                                                             IdType last_indptr) const {
     return protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 
   __device__ __forceinline__ size_t protective_get_v_offset(IdType page_iter, uint32_t head_idx,
-                                                            uint32_t entry_idx,
-                                                            uint32_t feat_idx,
+                                                            uint32_t entry_idx, uint32_t feat_idx,
                                                             IdType last_indptr) const {
     if (page_iter < last_indptr) {
       return get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);

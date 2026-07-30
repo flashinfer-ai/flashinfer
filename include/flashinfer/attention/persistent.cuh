@@ -265,10 +265,10 @@ struct BlockBatchPagedAttentionPersistent {
              v_smem_offset_w = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_V>(
                  warp_idx * KTraits::KV_THR_LAYOUT_ROW + lane_idx / KTraits::KV_THR_LAYOUT_COL,
                  lane_idx % KTraits::KV_THR_LAYOUT_COL);
-    size_t thr_local_kv_offset_k[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 /
-                                 KTraits::NUM_WARPS_Q];
-    size_t thr_local_kv_offset_v[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 /
-                                 KTraits::NUM_WARPS_Q];
+    size_t
+        thr_local_kv_offset_k[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
+    size_t
+        thr_local_kv_offset_v[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];

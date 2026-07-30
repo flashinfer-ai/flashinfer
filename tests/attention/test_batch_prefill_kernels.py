@@ -1745,7 +1745,10 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
     # large-head modules to major [10, 11, 12], so on pre-SM100 the JIT spec-gen in
     # plan() raises before the tile assertion. skip_if_head_dim_unsupported only gates
     # the 16-bit path, so gate the 1-byte (FP8) parametrization here explicitly.
-    if kv_dtype.itemsize == 1 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
+    if (
+        kv_dtype.itemsize == 1
+        and get_compute_capability(torch.device("cuda:0"))[0] < 10
+    ):
         pytest.skip("FP8 KV with head_dim > 256 requires SM100 or newer")
     props = torch.cuda.get_device_properties(0)
     optin = getattr(props, "shared_memory_per_block_optin", None)

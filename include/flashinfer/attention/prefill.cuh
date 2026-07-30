@@ -604,7 +604,8 @@ __device__ __forceinline__ size_t get_paged_kv_offset_for_logical_row(
   constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
   uint32_t page_iter, entry_idx;
   paged_kv.page_size.divmod(packed_page_iter_base + logical_row, page_iter, entry_idx);
-  const uint32_t feat_idx = (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DType>() / (IS_FP4 ? 2 : 1);
+  const uint32_t feat_idx =
+      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DType>() / (IS_FP4 ? 2 : 1);
   // The K and V pools may carry different strides (e.g. NVFP4 VO-split caches
   // where head_dim_qk != head_dim_vo), so route V rows through the V strides.
   if constexpr (produce_v) {
@@ -795,8 +796,8 @@ __device__ __forceinline__ void page_produce_kv_sf(
         // rows including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
         // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
         // update_mdo_states, so they never reach the accumulator.
-        constexpr auto fill_mode =
-            produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
+        constexpr auto fill_mode = produce_v ? cp_async::SharedMemFillMode::kFillZero
+                                             : cp_async::SharedMemFillMode::kNoFill;
         cp_async::pred_load_32b<fill_mode>(
             reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
             reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
@@ -2991,8 +2992,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                    k_stride_n, k_stride_h, 0,
-                                    chunk_size, warp_idx, lane_idx);
+                                    k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
