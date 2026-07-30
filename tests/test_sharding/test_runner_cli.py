@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import select
 import shlex
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,16 +32,79 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "unit_test_runner.py"
 
 
-def test_compatibility_defaults_disable_deadline_and_allow_four_hour_units(
+def _queue_test_unit(identifier: str) -> Unit:
+    return Unit(
+        id=identifier,
+        batches=(),
+        estimated_ms=1,
+        oversized=False,
+    )
+
+
+def test_worker_unit_selection_prefers_local_queue_then_lowest_tied_donor() -> None:
+    work_by_worker = [queue.Queue() for _ in range(3)]
+    work_by_worker[0].put(_queue_test_unit("donor-0-first"))
+    work_by_worker[0].put(_queue_test_unit("donor-0-second"))
+    work_by_worker[1].put(_queue_test_unit("local"))
+    work_by_worker[2].put(_queue_test_unit("donor-2-first"))
+    work_by_worker[2].put(_queue_test_unit("donor-2-second"))
+
+    local_queue, local_unit = runner._next_worker_unit(work_by_worker, 1)
+
+    assert local_queue is work_by_worker[1]
+    assert local_unit.id == "local"
+
+    donor_queue, donor_unit = runner._next_worker_unit(work_by_worker, 1)
+
+    assert donor_queue is work_by_worker[0]
+    assert donor_unit.id == "donor-0-first"
+
+
+def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
+    work_by_worker = [queue.Queue() for _ in range(4)]
+    expected = [f"unit-{index}" for index in range(40)]
+    for index, identifier in enumerate(expected):
+        work_by_worker[index % 2].put(_queue_test_unit(identifier))
+
+    def drain(worker_index: int) -> list[str]:
+        completed = []
+        while True:
+            try:
+                work, unit = runner._next_worker_unit(work_by_worker, worker_index)
+            except queue.Empty:
+                return completed
+            completed.append(unit.id)
+            work.task_done()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        completed = [
+            identifier
+            for worker_units in executor.map(drain, range(4))
+            for identifier in worker_units
+        ]
+
+    assert sorted(completed) == sorted(expected)
+    assert all(work.unfinished_tasks == 0 for work in work_by_worker)
+
+
+def test_compatibility_defaults_use_file_sized_units_without_time_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("UNIT_TEST_DEADLINE_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_UNKNOWN_CASE_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_CHECKPOINT_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_TARGET_SECONDS", raising=False)
 
     args = unit_test_runner._parser().parse_args(["run"])
 
     assert args.deadline_seconds == 0
-    assert args.unit_timeout_seconds == 14400
+    assert args.unit_timeout_seconds == 0
+    assert args.unknown_case_seconds == 1
+    assert args.checkpoint_seconds == 1_000_000
+    assert args.target_unit_seconds == 1_000_000
+    assert PlanningOptions(profile="test").checkpoint_seconds == 1_000_000
+    assert PlanningOptions(profile="test").target_unit_seconds == 1_000_000
 
 
 def test_explicit_zero_deadline_is_disabled(
@@ -64,6 +129,55 @@ def test_empty_test_path_environment_uses_default_suite(
     assert args.test_path == Path("tests/")
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("UNIT_TEST_CHECKPOINT_SECONDS", "0"),
+        ("UNIT_TEST_SHARD_COUNT", "0"),
+        ("UNIT_TEST_WORKERS", "0"),
+        ("UNIT_TEST_DEADLINE_SECONDS", "-1"),
+        ("UNIT_TEST_TIMEOUT_POLICY", "bogus"),
+    ],
+)
+def test_invalid_cli_environment_defaults_fail_argument_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit) as exit_info:
+        unit_test_runner._parser().parse_args(["run"])
+
+    assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SAMPLE_RATE", "0"),
+        ("SAMPLE_OFFSET", "5"),
+        ("PYTEST_COMMAND_PREFIX", "'unterminated"),
+        ("MEMORY_MONITOR_INTERVAL", "invalid"),
+        ("MEMORY_MONITOR_INTERVAL", "0"),
+        ("MEMORY_MONITOR_INTERVAL", "-1"),
+        ("MEMORY_MONITOR_INTERVAL", "nan"),
+        ("MEMORY_MONITOR_INTERVAL", "inf"),
+    ],
+)
+def test_invalid_runtime_environment_fails_shell_settings_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit) as exit_info:
+        unit_test_runner._shell_settings(["--dry-run"])
+
+    assert exit_info.value.code == 2
+
+
 def test_help_defines_global_zero_based_sanity_sampling(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -74,6 +188,44 @@ def test_help_defines_global_zero_based_sanity_sampling(
     help_text = capsys.readouterr().out
     assert "globally select every SAMPLE_RATE-th collected node" in help_text
     assert "SAMPLE_RATE=5, SAMPLE_OFFSET=0" in help_text
+
+
+def test_help_reports_effective_argument_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UNIT_TEST_TARGET_SECONDS", "123")
+    monkeypatch.delenv("UNIT_TEST_TIMING_PROFILE", raising=False)
+
+    with pytest.raises(SystemExit) as exit_info:
+        unit_test_runner._parser().parse_args(["run", "--help"])
+
+    assert exit_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert (
+        "soft logical-unit target (UNIT_TEST_TARGET_SECONDS) (default: 123)"
+        in help_text
+    )
+    assert (
+        "stable timing profile (UNIT_TEST_TIMING_PROFILE; default: auto-detected)"
+    ) in help_text
+    assert "exit codes: 0=complete without failures;" in help_text
+
+
+def test_help_reports_configured_timing_profile_default(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("UNIT_TEST_TIMING_PROFILE", "sm103-cuda13")
+
+    with pytest.raises(SystemExit) as exit_info:
+        unit_test_runner._parser().parse_args(["run", "--help"])
+
+    assert exit_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert (
+        "stable timing profile (UNIT_TEST_TIMING_PROFILE) (default: sm103-cuda13)"
+    ) in help_text
 
 
 def test_pytest_command_prefix_wraps_batches_and_is_frozen_in_manifest(
@@ -477,7 +629,7 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
     assert "deadline=1s" in combined
 
 
-def test_collection_kill_reports_results_from_a_previous_run(tmp_path: Path) -> None:
+def test_completed_manifest_skips_slow_recollection(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "conftest.py").write_text(
@@ -496,7 +648,7 @@ if os.environ.get("SLOW_COLLECTION"):
     completed = _run(tmp_path, "run", suite)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
-    killed = _run(
+    reused = _run(
         tmp_path,
         "run",
         suite,
@@ -505,13 +657,11 @@ if os.environ.get("SLOW_COLLECTION"):
         env_override={"SLOW_COLLECTION": "1"},
     )
 
-    assert killed.returncode == 3, killed.stdout + killed.stderr
-    combined = killed.stdout + killed.stderr
-    assert "RUNNER STATUS: state=killed phase=collection" in combined
-    assert "scope=suite finalized=2 passed=2 failed=0 skipped=0 pending=0" in combined
-    assert "deadline_elapsed=" in combined
-    assert "deadline=1s" in combined
-    assert "deadline=unknown" not in combined
+    assert reused.returncode == 0, reused.stdout + reused.stderr
+    assert "Using plan" in reused.stdout
+    assert "RUNNER STATUS: shard=0 state=completed" in reused.stdout
+    assert "finalized=2/2 passed=2 failed=0 skipped=0 pending=0" in reused.stdout
+    assert "PYTEST KILLED phase=collection" not in reused.stdout + reused.stderr
 
 
 def test_plan_and_run_publish_complete_resumable_artifacts(tmp_path: Path) -> None:
@@ -559,14 +709,15 @@ def test_fails():
         "pending_nodes": 0,
         "planned_nodes": 2,
     }
-    assert summary["fallback_counts"] == {"suite-other-profile": 2}
+    assert summary["fallback_counts"] == {"suite-mean-other-profile": 2}
     assert summary["fallbacks"] == [
-        {"node_indexes": [0, 1], "source": "suite-other-profile"}
+        {"node_indexes": [0, 1], "source": "suite-mean-other-profile"}
     ]
     assert summary["capacity"]["estimated_makespan_ms"] > 0
     assert not list((tmp_path / "junit").glob("unit-*.xml"))
     batch_xml = sorted((tmp_path / "junit").glob("units/*/batches/batch-*.xml"))
-    assert len(batch_xml) == 1
+    planned_batches = sum(len(unit["batches"]) for unit in manifest["plan"]["units"])
+    assert len(batch_xml) == planned_batches
     assert all(ET.parse(path).getroot().tag == "testsuites" for path in batch_xml)
     assert not (tmp_path / "junit" / ".state").exists()
 
@@ -581,6 +732,116 @@ def test_fails():
     )
     assert repeated.returncode == 1
     assert len(list((tmp_path / "junit" / "attempts").glob("attempt-*"))) == 1
+
+
+def test_unit_progress_omits_skipped_results_and_reports_all_outcomes(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text(
+        """\
+import pytest
+
+def test_passes():
+    pass
+
+def test_fails():
+    assert False, "intentional"
+
+def test_skips():
+    pytest.skip("intentional")
+""",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--checkpoint-seconds",
+        "100",
+        "--target-unit-seconds",
+        "100",
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "PYTEST RESULT" in result.stdout
+    assert "outcome=failed" in result.stdout
+    assert not any(
+        "PYTEST RESULT" in line and "outcome=skipped" in line
+        for line in result.stdout.splitlines()
+    )
+    unit_lines = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("PYTEST UNIT COMPLETE")
+    ]
+    assert len(unit_lines) == 1
+    assert (
+        "finalized=3 passed=1 failed=1 skipped=1 unknown=0 completed_nodes=3/3"
+    ) in unit_lines[0]
+
+
+def test_completed_node_progress_observes_finalized_batches_from_every_shard(
+    tmp_path: Path,
+) -> None:
+    nodes = tuple(
+        CollectedNode.from_nodeid(f"tests/test_{index}.py::test_case", index)
+        for index in range(2)
+    )
+    units = tuple(
+        Unit(
+            id=f"unit-{index}",
+            batches=(
+                Batch(
+                    id=f"batch-{index}",
+                    source_file=node.source_file,
+                    nodeids=(node.nodeid,),
+                    estimated_ms=1000,
+                    overhead_ms=0,
+                    oversized=False,
+                ),
+            ),
+            estimated_ms=1000,
+            oversized=False,
+            shard_index=index,
+        )
+        for index, node in enumerate(nodes)
+    )
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic", shard_count=2),
+        nodes=nodes,
+        units=units,
+    )
+    metadata = runner.SyntheticBatchMetadata(
+        policy="skip",
+        batch_id=units[0].batches[0].id,
+        unit_id=units[0].id,
+        shard_index=0,
+        attempt_id="attempt-1",
+        profile="synthetic",
+    )
+
+    assert runner._completed_node_count(tmp_path / "junit", plan) == 0
+    runner._synthesize_batch(
+        tmp_path / "junit", units[0], units[0].batches[0], metadata
+    )
+    assert runner._completed_node_count(tmp_path / "junit", plan) == 1
+    runner._synthesize_batch(
+        tmp_path / "junit",
+        units[1],
+        units[1].batches[0],
+        runner.SyntheticBatchMetadata(
+            policy="fail",
+            batch_id=units[1].batches[0].id,
+            unit_id=units[1].id,
+            shard_index=1,
+            attempt_id="attempt-1",
+            profile="synthetic",
+        ),
+    )
+    assert runner._completed_node_count(tmp_path / "junit", plan) == 2
 
 
 def test_solo_source_runs_exclusively_with_full_gpu_visibility(
@@ -766,6 +1027,13 @@ def test_terminal_timeout_policies_synthesize_junit(
     assert summary["complete"] is True
     assert summary["synthetic"] == 1
     assert summary["outcomes"][outcome] == 1
+    expected_counts = (
+        "passed=0 failed=1 skipped=0 unknown=0"
+        if policy == "fail"
+        else "passed=0 failed=0 skipped=1 unknown=0"
+    )
+    assert expected_counts in result.stdout
+    assert "completed_nodes=1/1" in result.stdout
     assert len(summary["attempts"][0]["unit_timeout_events"]) == 1
     assert summary["attempts"][0]["unit_timeout_events"][0]["timeout_policy"] == policy
 
@@ -836,7 +1104,7 @@ def test_timed_out_shard_is_not_retried_inside_the_same_attempt(
     assert logs[0].read_text(encoding="utf-8").count("command:") == 1
 
 
-def test_resume_rejects_environment_dependent_collection_changes(
+def test_existing_manifest_skips_environment_dependent_recollection(
     tmp_path: Path,
 ) -> None:
     suite = tmp_path / "suite"
@@ -867,11 +1135,12 @@ def test_dynamic(value):
     )
 
     assert first.returncode == 0, first.stdout + first.stderr
-    assert changed.returncode == 3
-    assert "collection_fingerprint" in changed.stderr
-    assert "RUNNER STATUS: state=failed" in changed.stderr
-    assert "deadline_elapsed=" in changed.stderr
-    assert "deadline=120s" in changed.stderr
+    assert changed.returncode == 0, changed.stdout + changed.stderr
+    assert "Using plan" in changed.stdout
+    manifest = json.loads(
+        (tmp_path / "junit" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert len(manifest["plan"]["nodeids"]) == 1
 
 
 def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(

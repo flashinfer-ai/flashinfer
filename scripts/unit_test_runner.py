@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shlex
 import sys
@@ -15,7 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.test_sharding.models import Plan, PlanningOptions
+from scripts.test_sharding.models import (
+    DEFAULT_CHECKPOINT_SECONDS,
+    DEFAULT_TARGET_UNIT_SECONDS,
+    Plan,
+    PlanningOptions,
+)
 from scripts.test_sharding.runner import (
     CollectionTimeoutError,
     DeadlineClock,
@@ -37,17 +43,26 @@ from scripts.test_sharding.state import (
 from scripts.test_sharding.summary import exit_code_for_summary, publish_summary
 
 
-EXIT_HELP = """exit codes:
-  0  complete without failures
-  1  complete with real or synthetic failures
-  2  incomplete and resumable
-  3  configuration, manifest, collection, or infrastructure error
-"""
+EXIT_HELP = (
+    "exit codes: 0=complete without failures; "
+    "1=complete with real or synthetic failures; "
+    "2=incomplete and resumable; "
+    "3=configuration, manifest, collection, or infrastructure error"
+)
+DEFAULT_DEADLINE_SECONDS = 0
+DEFAULT_UNIT_TIMEOUT_SECONDS = 0
 
 
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return int(value) if value is not None else default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    value = float(os.environ.get(name, str(default)))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return value
 
 
 def _pytest_command_prefix() -> tuple[str, ...]:
@@ -78,6 +93,12 @@ def _nonnegative(value: str) -> int:
     return parsed
 
 
+def _timeout_policy(value: str) -> str:
+    if value not in {"resume", "skip", "fail"}:
+        raise argparse.ArgumentTypeError("must be one of: resume, skip, fail")
+    return value
+
+
 def _auto_profile() -> str:
     cuda = "unknown"
     gpu = "unknown"
@@ -103,6 +124,7 @@ def _auto_profile() -> str:
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
+    timing_profile = os.environ.get("UNIT_TEST_TIMING_PROFILE") or None
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -112,48 +134,57 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--junit-dir",
         type=Path,
         default=Path(os.environ.get("JUNIT_DIR", "./junit")),
-        help="shared result and persistent state directory (JUNIT_DIR; default: ./junit)",
+        help="shared result and persistent state directory (JUNIT_DIR)",
     )
     parser.add_argument(
         "--target-unit-seconds",
         type=_positive,
-        default=_env_int("UNIT_TEST_TARGET_SECONDS", 2700),
-        help="soft logical-unit target (UNIT_TEST_TARGET_SECONDS; default: 2700)",
+        default=os.environ.get("UNIT_TEST_TARGET_SECONDS", DEFAULT_TARGET_UNIT_SECONDS),
+        help="soft logical-unit target (UNIT_TEST_TARGET_SECONDS)",
     )
     parser.add_argument(
         "--checkpoint-seconds",
         type=_positive,
-        default=_env_int("UNIT_TEST_CHECKPOINT_SECONDS", 300),
-        help="source-local checkpoint target (UNIT_TEST_CHECKPOINT_SECONDS; default: 300)",
+        default=os.environ.get(
+            "UNIT_TEST_CHECKPOINT_SECONDS", DEFAULT_CHECKPOINT_SECONDS
+        ),
+        help="source-local checkpoint target (UNIT_TEST_CHECKPOINT_SECONDS)",
     )
     parser.add_argument(
         "--unknown-case-seconds",
         type=_positive,
-        default=_env_int("UNIT_TEST_UNKNOWN_CASE_SECONDS", 5),
-        help="unknown-node estimate floor (UNIT_TEST_UNKNOWN_CASE_SECONDS; default: 5)",
+        default=os.environ.get("UNIT_TEST_UNKNOWN_CASE_SECONDS", 1),
+        help="unknown-node estimate floor (UNIT_TEST_UNKNOWN_CASE_SECONDS)",
     )
     parser.add_argument(
         "--timing-profile",
-        default=os.environ.get("UNIT_TEST_TIMING_PROFILE"),
-        help="stable timing profile (UNIT_TEST_TIMING_PROFILE; default: auto-detected)",
+        default=timing_profile if timing_profile is not None else argparse.SUPPRESS,
+        help=(
+            "stable timing profile (UNIT_TEST_TIMING_PROFILE)"
+            if timing_profile is not None
+            else (
+                "stable timing profile "
+                "(UNIT_TEST_TIMING_PROFILE; default: auto-detected)"
+            )
+        ),
     )
     parser.add_argument(
         "--shard-count",
         type=_positive,
-        default=_env_int("UNIT_TEST_SHARD_COUNT", 1),
-        help="number of deterministic external shards (UNIT_TEST_SHARD_COUNT; default: 1)",
+        default=os.environ.get("UNIT_TEST_SHARD_COUNT", 1),
+        help="number of deterministic external shards (UNIT_TEST_SHARD_COUNT)",
     )
     parser.add_argument(
         "--shard-index",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_SHARD_INDEX", 0),
-        help="zero-based external shard (UNIT_TEST_SHARD_INDEX; default: 0)",
+        default=os.environ.get("UNIT_TEST_SHARD_INDEX", 0),
+        help="zero-based external shard (UNIT_TEST_SHARD_INDEX)",
     )
     parser.add_argument(
         "--test-path",
         type=Path,
         default=Path(os.environ.get("TEST_PATH") or "tests/"),
-        help="pytest collection scope (TEST_PATH; default: tests/)",
+        help="pytest collection scope (TEST_PATH)",
     )
     parser.add_argument(
         "--sanity-test",
@@ -166,32 +197,35 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workers",
         type=_positive,
-        default=_env_int("UNIT_TEST_WORKERS", max(1, len(visible_devices()))),
+        default=os.environ.get("UNIT_TEST_WORKERS", max(1, len(visible_devices()))),
         help="local workers, at most visible GPU count (UNIT_TEST_WORKERS)",
     )
     parser.add_argument(
         "--unit-timeout-seconds",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_TIMEOUT_SECONDS", 14400),
-        help="cumulative unit timeout; 0 disables (UNIT_TEST_TIMEOUT_SECONDS; default: 14400)",
+        default=os.environ.get(
+            "UNIT_TEST_TIMEOUT_SECONDS", DEFAULT_UNIT_TIMEOUT_SECONDS
+        ),
+        help="cumulative unit timeout; 0 disables (UNIT_TEST_TIMEOUT_SECONDS)",
     )
     parser.add_argument(
         "--timeout-grace-seconds",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_TIMEOUT_GRACE_SECONDS", 300),
-        help="SIGTERM-to-SIGKILL grace (UNIT_TEST_TIMEOUT_GRACE_SECONDS; default: 300)",
+        default=os.environ.get("UNIT_TEST_TIMEOUT_GRACE_SECONDS", 300),
+        help="SIGTERM-to-SIGKILL grace (UNIT_TEST_TIMEOUT_GRACE_SECONDS)",
     )
     parser.add_argument(
         "--timeout-policy",
+        type=_timeout_policy,
         choices=("resume", "skip", "fail"),
         default=os.environ.get("UNIT_TEST_TIMEOUT_POLICY", "resume"),
-        help="handling for unexecuted nodes (UNIT_TEST_TIMEOUT_POLICY; default: resume)",
+        help="handling for unexecuted nodes (UNIT_TEST_TIMEOUT_POLICY)",
     )
     parser.add_argument(
         "--deadline-seconds",
         type=_nonnegative,
-        default=_env_int("UNIT_TEST_DEADLINE_SECONDS", 0),
-        help="shared attempt deadline; 0 disables (UNIT_TEST_DEADLINE_SECONDS; default: 0)",
+        default=os.environ.get("UNIT_TEST_DEADLINE_SECONDS", DEFAULT_DEADLINE_SECONDS),
+        help="shared attempt deadline; 0 disables (UNIT_TEST_DEADLINE_SECONDS)",
     )
 
 
@@ -199,7 +233,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=EXIT_HELP,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command, help_text in (
@@ -210,7 +244,7 @@ def _parser() -> argparse.ArgumentParser:
             command,
             help=help_text,
             epilog=EXIT_HELP,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         _add_common(child)
     for command, help_text in (
@@ -221,19 +255,32 @@ def _parser() -> argparse.ArgumentParser:
             command,
             help=help_text,
             epilog=EXIT_HELP,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         child.add_argument(
             "--junit-dir",
             type=Path,
             default=Path(os.environ.get("JUNIT_DIR", "./junit")),
+            help="shared result and persistent state directory (JUNIT_DIR)",
         )
     return parser
 
 
 def _shell_settings(argv: list[str]) -> int:
     operation = "plan" if "--dry-run" in argv else "run"
-    args = _parser().parse_args([operation, *argv])
+    parser = _parser()
+    args = parser.parse_args([operation, *argv])
+    try:
+        sample_rate = _env_int("SAMPLE_RATE", 5)
+        sample_offset = _env_int("SAMPLE_OFFSET", 0)
+        if sample_rate <= 0:
+            raise ValueError("SAMPLE_RATE must be positive")
+        if not 0 <= sample_offset < sample_rate:
+            raise ValueError("SAMPLE_OFFSET must be in [0, SAMPLE_RATE)")
+        _pytest_command_prefix()
+        _env_positive_float("MEMORY_MONITOR_INTERVAL", 2)
+    except (RunnerStateError, ValueError) as error:
+        parser.error(str(error))
     print(operation)
     print(args.test_path)
     return 0
@@ -266,7 +313,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         )
 
     pytest_command_prefix = _pytest_command_prefix()
-    profile = args.timing_profile or _auto_profile()
+    profile = getattr(args, "timing_profile", None) or _auto_profile()
     planning = PlanningOptions(
         profile=profile,
         checkpoint_seconds=args.checkpoint_seconds,
@@ -360,7 +407,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         attempt=attempt,
         monitor_memory=os.environ.get("MONITOR_TEST_MEMORY", "true").lower()
         not in {"0", "false", "no"},
-        memory_interval=float(os.environ.get("MEMORY_MONITOR_INTERVAL", "2")),
+        memory_interval=_env_positive_float("MEMORY_MONITOR_INTERVAL", 2),
         pytest_command_prefix=pytest_command_prefix,
     )
     return execute_shard(

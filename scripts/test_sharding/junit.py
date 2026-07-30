@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
@@ -107,6 +108,39 @@ def validate_batch_xml(path: Path, expected_nodeids: Sequence[str]) -> BatchVali
     if duplicates:
         diagnostics.append("duplicate nodes: " + ", ".join(duplicates[:5]))
     return BatchValidation(not diagnostics, tuple(cases), tuple(diagnostics))
+
+
+def finalized_batch_outcomes(
+    path: Path, expected_nodeids: Sequence[str]
+) -> tuple[Counter[str], tuple[str, ...]]:
+    validation = validate_batch_xml(path, expected_nodeids)
+    if not validation.valid:
+        return Counter(), validation.diagnostics
+
+    recorded: dict[str, str] = {}
+    result_path = path.with_name(f"{path.stem}.results.json")
+    try:
+        value = json.loads(result_path.read_text(encoding="utf-8"))
+        results = value.get("results", [])
+        if isinstance(results, list):
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                nodeid = result.get("nodeid")
+                outcome = result.get("outcome")
+                if isinstance(nodeid, str) and isinstance(outcome, str):
+                    recorded[nodeid] = (
+                        outcome
+                        if outcome in {"passed", "failed", "skipped", "unknown"}
+                        else "unknown"
+                    )
+    except (OSError, AttributeError, json.JSONDecodeError):
+        pass
+
+    return (
+        Counter(recorded.get(case.nodeid, case.outcome) for case in validation.cases),
+        (),
+    )
 
 
 def _add_properties(element: ET.Element, values: dict[str, str]) -> None:

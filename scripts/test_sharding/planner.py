@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
@@ -30,6 +31,18 @@ class _AtomicItem:
     estimated_ms: int
 
 
+@dataclass(frozen=True)
+class _UnitGroup:
+    id: str
+    units: tuple[Unit, ...]
+    estimated_ms: int
+
+
+_MIN_WORK_TO_OVERHEAD_RATIO = 15
+_MAX_BATCHES_PER_TARGET_UNIT = 4  # to reduce pytest overhead
+_MIN_AFFINITY_IMPROVEMENT_PERCENT = 5
+
+
 def _stable_id(kind: str, nodeids: Iterable[str]) -> str:
     digest = hashlib.sha256()
     digest.update(kind.encode())
@@ -51,15 +64,16 @@ def _lpt_bins(
     stable_id: Callable[[T], str],
 ) -> list[list[T]]:
     bins: list[list[T]] = [[] for _ in range(count)]
-    loads = [0] * count
+    loads = [(0, index) for index in range(count)]
+    heapq.heapify(loads)
     ordered = sorted(
         items,
         key=lambda item: (-duration(item), stable_id(item).encode("utf-8")),
     )
     for item in ordered:
-        index = min(range(count), key=lambda candidate: (loads[candidate], candidate))
+        load, index = heapq.heappop(loads)
         bins[index].append(item)
-        loads[index] += duration(item)
+        heapq.heappush(loads, (load + duration(item), index))
     return bins
 
 
@@ -79,11 +93,120 @@ def _pack_with_soft_target(
     if not regular:
         return result
     count = max(1, math.ceil(sum(duration(item) for item in regular) / target_ms))
-    while True:
-        bins = _lpt_bins(regular, count, duration, stable_id)
-        if all(sum(duration(item) for item in group) <= target_ms for group in bins):
-            return result + bins
-        count += 1
+    attempts: dict[int, list[list[T]]] = {}
+
+    def try_count(candidate: int) -> list[list[T]]:
+        if candidate not in attempts:
+            attempts[candidate] = _lpt_bins(regular, candidate, duration, stable_id)
+        return attempts[candidate]
+
+    def fits(candidate: int) -> bool:
+        return all(
+            sum(duration(item) for item in group) <= target_ms
+            for group in try_count(candidate)
+        )
+
+    if fits(count):
+        return result + try_count(count)
+
+    lower = count
+    upper = min(len(regular), max(lower + 1, lower * 2))
+    while upper < len(regular) and not fits(upper):
+        lower = upper
+        upper = min(len(regular), upper * 2)
+    while lower + 1 < upper:
+        middle = (lower + upper) // 2
+        if fits(middle):
+            upper = middle
+        else:
+            lower = middle
+    return result + try_count(upper)
+
+
+def _unit_source(unit: Unit) -> str:
+    sources = {batch.source_file for batch in unit.batches}
+    if len(sources) != 1:
+        raise ValueError(f"unit {unit.id} crosses source files")
+    return sources.pop()
+
+
+def source_affine_unit_bins(
+    units: Sequence[Unit],
+    count: int,
+) -> list[list[Unit]]:
+    """Balance units, splitting sources only for a material makespan improvement."""
+
+    if count <= 0:
+        raise ValueError("count must be positive")
+    if not units:
+        return [[] for _ in range(count)]
+    by_source: dict[str, list[Unit]] = defaultdict(list)
+    for unit in units:
+        by_source[_unit_source(unit)].append(unit)
+    whole_groups = [
+        _UnitGroup(
+            id=source,
+            units=tuple(
+                sorted(by_source[source], key=lambda unit: unit.id.encode("utf-8"))
+            ),
+            estimated_ms=sum(unit.estimated_ms for unit in by_source[source]),
+        )
+        for source in sorted(by_source, key=lambda value: value.encode("utf-8"))
+    ]
+    whole_bins = _lpt_bins(
+        whole_groups,
+        count,
+        lambda group: group.estimated_ms,
+        lambda group: group.id,
+    )
+    fair_share = max(
+        1,
+        math.ceil(sum(unit.estimated_ms for unit in units) / count),
+    )
+    split_groups: list[_UnitGroup] = []
+    for source in sorted(by_source, key=lambda value: value.encode("utf-8")):
+        source_units = by_source[source]
+        source_load = sum(unit.estimated_ms for unit in source_units)
+        chunk_count = min(count, max(1, math.ceil(source_load / fair_share)))
+        chunks = _lpt_bins(
+            source_units,
+            chunk_count,
+            lambda unit: unit.estimated_ms,
+            lambda unit: unit.id,
+        )
+        for index, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            ordered = tuple(sorted(chunk, key=lambda unit: unit.id.encode("utf-8")))
+            split_groups.append(
+                _UnitGroup(
+                    id=f"{source}\0{index:04d}",
+                    units=ordered,
+                    estimated_ms=sum(unit.estimated_ms for unit in ordered),
+                )
+            )
+    split_bins = _lpt_bins(
+        split_groups,
+        count,
+        lambda group: group.estimated_ms,
+        lambda group: group.id,
+    )
+    whole_makespan = max(
+        (sum(group.estimated_ms for group in group_bin) for group_bin in whole_bins),
+        default=0,
+    )
+    split_makespan = max(
+        (sum(group.estimated_ms for group in group_bin) for group_bin in split_bins),
+        default=0,
+    )
+    materially_better = split_makespan * 100 <= whole_makespan * (
+        100 - _MIN_AFFINITY_IMPROVEMENT_PERCENT
+    )
+    group_bins = split_bins if materially_better else whole_bins
+    return [
+        [unit for group in group_bin for unit in group.units]
+        for group_bin in group_bins
+    ]
 
 
 def _atomic_items(
@@ -118,12 +241,16 @@ def build_plan(
     nodes = tuple(sorted(collected_nodes, key=lambda node: node.order))
     if len({node.nodeid for node in nodes}) != len(nodes):
         raise ValueError("collection contains duplicate node IDs")
+    coverage = estimate_book.coverage(node.nodeid for node in nodes)
     duration_ms: dict[str, int] = {}
     fallback_counts: Counter[str] = Counter()
     fallback_sources: dict[str, str] = {}
     for node in nodes:
         lookup = estimate_book.lookup(
-            node.nodeid, options.profile, options.unknown_case_seconds
+            node.nodeid,
+            options.profile,
+            options.unknown_case_seconds,
+            coverage=coverage,
         )
         duration_ms[node.nodeid] = max(1, round(lookup.seconds * 1000))
         fallback_counts[lookup.source] += 1
@@ -138,8 +265,13 @@ def build_plan(
     solo_sources = {node.source_file for node in nodes if node.solo}
     for source_file in sorted(source_nodes, key=lambda value: value.encode("utf-8")):
         overhead_ms = estimate_book.overhead_ms(source_file, options.profile)
-        checkpoint_ms = max(options.checkpoint_seconds * 1000, 4 * overhead_ms)
-        item_capacity = max(1, checkpoint_ms - overhead_ms)
+        baseline_capacity = max(1, options.checkpoint_seconds * 1000 - overhead_ms)
+        unit_capacity = max(1, options.target_unit_seconds * 1000 - overhead_ms)
+        overhead_aware_capacity = min(
+            unit_capacity,
+            _MIN_WORK_TO_OVERHEAD_RATIO * overhead_ms,
+        )
+        item_capacity = max(baseline_capacity, overhead_aware_capacity)
         if source_file in solo_sources:
             batch_nodes = tuple(
                 sorted(source_nodes[source_file], key=lambda node: node.order)
@@ -164,6 +296,18 @@ def build_plan(
             lambda item: item.estimated_ms,
             lambda item: item.id,
         )
+        target_unit_count = max(
+            1,
+            math.ceil(sum(item.estimated_ms for item in atomic) / unit_capacity),
+        )
+        process_count_cap = target_unit_count * _MAX_BATCHES_PER_TARGET_UNIT
+        if len(item_bins) > process_count_cap:
+            item_bins = _lpt_bins(
+                atomic,
+                min(process_count_cap, len(atomic)),
+                lambda item: item.estimated_ms,
+                lambda item: item.id,
+            )
         for item_bin in item_bins:
             batch_nodes = tuple(
                 sorted(
@@ -184,19 +328,30 @@ def build_plan(
                 )
             )
 
-    solo_batches = sorted(
-        (batch for batch in batches if batch.source_file in solo_sources),
-        key=lambda batch: batch.id.encode("utf-8"),
-    )
-    regular_batches = [
-        batch for batch in batches if batch.source_file not in solo_sources
-    ]
-    unit_bins = [[batch] for batch in solo_batches] + _pack_with_soft_target(
-        regular_batches,
-        options.target_unit_seconds * 1000,
-        lambda batch: batch.estimated_ms,
-        lambda batch: batch.id,
-    )
+    batches_by_source: dict[str, list[Batch]] = defaultdict(list)
+    for batch in batches:
+        batches_by_source[batch.source_file].append(batch)
+    unit_bins: list[list[Batch]] = []
+    for source_file in sorted(
+        batches_by_source, key=lambda value: value.encode("utf-8")
+    ):
+        source_batches = batches_by_source[source_file]
+        if source_file in solo_sources:
+            unit_bins.extend(
+                [batch]
+                for batch in sorted(
+                    source_batches, key=lambda batch: batch.id.encode("utf-8")
+                )
+            )
+            continue
+        unit_bins.extend(
+            _pack_with_soft_target(
+                source_batches,
+                options.target_unit_seconds * 1000,
+                lambda batch: batch.estimated_ms,
+                lambda batch: batch.id,
+            )
+        )
     units = []
     for batch_bin in unit_bins:
         ordered_batches = tuple(sorted(batch_bin, key=lambda batch: batch.id.encode()))
@@ -211,12 +366,7 @@ def build_plan(
             )
         )
 
-    shard_bins = _lpt_bins(
-        units,
-        options.shard_count,
-        lambda unit: unit.estimated_ms,
-        lambda unit: unit.id,
-    )
+    shard_bins = source_affine_unit_bins(units, options.shard_count)
     shard_for_unit = {
         unit.id: shard_index
         for shard_index, shard_units in enumerate(shard_bins)
@@ -248,6 +398,8 @@ def _estimated_worker_loads(
         raise ValueError("workers must be positive")
     solo_units = [unit for unit in units if _unit_is_solo(unit, solo_sources)]
     regular_units = [unit for unit in units if not _unit_is_solo(unit, solo_sources)]
+    # Workers start with source-affine queues but steal whole units after
+    # draining their own queue, so LPT is the appropriate steady-state model.
     bins = _lpt_bins(
         regular_units,
         workers,
@@ -359,6 +511,9 @@ def validate_plan(plan: Plan) -> list[str]:
     for unit in plan.units:
         if not 0 <= unit.shard_index < plan.options.shard_count:
             errors.append(f"unit {unit.id} has invalid shard {unit.shard_index}")
+        unit_sources = {batch.source_file for batch in unit.batches}
+        if len(unit_sources) > 1:
+            errors.append(f"unit {unit.id} crosses source files")
         for batch in unit.batches:
             sources = {
                 sources_by_nodeid.get(nodeid, batch.source_file)

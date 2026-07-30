@@ -71,7 +71,35 @@ main() {
     # are deliberately not forwarded to the replacement runner.
     unset PYTEST_FILE_TIMEOUT_SECONDS PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS
 
-    python "${RUNNER}" "${operation}" "$@"
+    local runner_exit_code
+    local runner_status
+    if python "${RUNNER}" "${operation}" "$@"; then
+        runner_exit_code=0
+    else
+        runner_exit_code=$?
+    fi
+
+    case "${runner_exit_code}" in
+        0)
+            runner_status="complete-without-failures"
+            ;;
+        1)
+            runner_status="complete-with-failures"
+            ;;
+        2)
+            runner_status="incomplete-and-resumable"
+            ;;
+        3)
+            runner_status="configuration-collection-or-infrastructure-error"
+            ;;
+        *)
+            echo "UNIT TEST RUNNER ABNORMAL EXIT: exit_code=${runner_exit_code} wrapper_exit_code=unchanged" >&2
+            return "${runner_exit_code}"
+            ;;
+    esac
+
+    echo "UNIT TEST RUNNER RESULT: exit_code=${runner_exit_code} status=${runner_status} wrapper_exit_code=0"
+    return 0
 }
 
 main "$@"

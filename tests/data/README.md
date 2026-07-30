@@ -26,6 +26,31 @@ python scripts/rebuild_test_duration_estimates.py refresh \
 
 The refresh uses nearest-rank p90 observations, grows estimates immediately, decreases them by at most 10% per refresh, ignores skipped and synthetic timeout cases, and writes deterministic gzip output. Add newly produced estimate and summary changes to the same review as the test-suite change that motivated them.
 
+During planning, exact node estimates remain preferred. Function- and
+source-level p90 fallbacks are used only when the timing database covers at
+least 80% of the corresponding nodes in the current collection. Sparser
+aggregate data falls back to the selected profile's arithmetic mean (about 1.5
+seconds for the current `sm103` profiles), with `--unknown-case-seconds` as its
+floor. This prevents a biased subset of slow parametrizations from assigning
+its p90 to thousands of unseen cases.
+
+The default checkpoint and logical-unit targets are both 1,000,000 seconds.
+This preserves the original one-pytest-process-per-source-file behavior for
+ordinary files while retaining deterministic manifests and per-file resume
+boundaries. Configure lower targets when finer-grained load balancing or resume
+checkpoints are more important than avoiding repeated process warm-up.
+
+For a source with high measured process startup and warm-up cost, the planner
+deterministically expands a smaller configured checkpoint up to the
+logical-unit target so estimated work can reach fifteen times the per-process
+overhead.
+
+The planner also caps each source at four pytest batches per estimated
+logical-unit target. This bounds process churn when overhead telemetry is
+missing or underestimates warm-up cost. A capped batch may exceed the soft
+checkpoint target, but it remains an independently finalized JUnit/resume
+boundary.
+
 GitLab's artifact cleaner truncates XML attributes, so long parametrized node IDs
 cannot be used directly. Reconstruct a manifest with the same source revision,
 collection environment, timing inputs, and packing options as the jobs, then

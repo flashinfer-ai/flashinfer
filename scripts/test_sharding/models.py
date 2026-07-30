@@ -6,6 +6,8 @@ from typing import Any
 
 SCHEMA_VERSION = 3
 ALGORITHM_VERSION = "lpt-ms-v3"
+DEFAULT_CHECKPOINT_SECONDS = 1_000_000
+DEFAULT_TARGET_UNIT_SECONDS = 1_000_000
 
 
 def source_file_for_nodeid(nodeid: str) -> str:
@@ -61,8 +63,8 @@ class CollectedNode:
 @dataclass(frozen=True)
 class PlanningOptions:
     profile: str
-    checkpoint_seconds: int = 300
-    target_unit_seconds: int = 2700
+    checkpoint_seconds: int = DEFAULT_CHECKPOINT_SECONDS
+    target_unit_seconds: int = DEFAULT_TARGET_UNIT_SECONDS
     unknown_case_seconds: int = 5
     shard_count: int = 1
 

@@ -87,7 +87,7 @@ _CONSOLE_LOCK = threading.Lock()
 _PROGRESS_INTERVAL_SECONDS = 30.0
 
 
-def _console(message: str) -> None:
+def write_console(message: str) -> None:
     with _CONSOLE_LOCK:
         print(message, flush=True)
 
@@ -190,7 +190,7 @@ def _forward_pytest_output(
                 nodeid, float(event.get("started_at", time.time()))
             )
             if should_print:
-                _console(
+                write_console(
                     f"PYTEST START worker={worker_index} batch={batch_id} "
                     f"function={function} node={nodeid}"
                 )
@@ -198,8 +198,8 @@ def _forward_pytest_output(
             outcome = str(event.get("outcome", "unknown"))
             duration = float(event.get("duration_seconds", 0.0))
             progress.finish(nodeid, outcome)
-            if outcome in {"failed", "skipped", "unknown"}:
-                _console(
+            if outcome in {"failed", "unknown"}:
+                write_console(
                     f"PYTEST RESULT worker={worker_index} batch={batch_id} "
                     f"outcome={outcome} duration={duration:.3f}s node={nodeid}"
                 )
@@ -216,7 +216,7 @@ def _progress_heartbeat(
         nodeid, started_at, completed = progress.current()
         if nodeid is None or started_at is None:
             continue
-        _console(
+        write_console(
             f"PYTEST RUNNING worker={worker_index} batch={batch_id} "
             f"elapsed={max(0.0, time.time() - started_at):.1f}s "
             f"completed_in_batch={completed} node={nodeid}"
@@ -427,7 +427,7 @@ def _timeout_result(
 ) -> BatchExecution:
     active_nodeid, _, _ = outcome.progress.current()
     completed, outcomes = outcome.progress.totals()
-    _console(
+    write_console(
         f"PYTEST KILLED worker={request.worker_index} batch={request.batch.id} "
         f"reason={request.timeout_reason or 'timeout'} "
         f"signal={outcome.termination_signal} "
@@ -530,7 +530,7 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
         return BatchExecution("infrastructure", "; ".join(validation.diagnostics))
     _promote_batch_artifacts(request, artifacts, outcome)
     outcomes = Counter(case.outcome for case in validation.cases)
-    _console(
+    write_console(
         f"PYTEST BATCH COMPLETE worker={request.worker_index} "
         f"batch={request.batch.id} finalized={len(validation.cases)} "
         f"passed={outcomes['passed']} failed={outcomes['failed']} "

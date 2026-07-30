@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 
 from scripts.test_sharding.junit import (
     SyntheticBatchMetadata,
     annotate_batch_xml,
     create_synthetic_batch_xml,
+    finalized_batch_outcomes,
     validate_batch_xml,
 )
 
@@ -35,6 +38,32 @@ def test_batch_is_final_only_when_exact_node_coverage_matches(tmp_path: Path) ->
     assert valid.cases[0].seconds == 1.25
     assert missing.valid is False
     assert "missing" in missing.diagnostics[0]
+
+
+def test_finalized_batch_outcomes_preserve_unknown_plugin_results(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "batch.xml"
+    nodeid = "tests/test_sample.py::test_case"
+    _write_batch(report, nodeid)
+    report.with_name("batch.results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "nodeid": nodeid,
+                        "outcome": "unknown",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    outcomes, diagnostics = finalized_batch_outcomes(report, [nodeid])
+
+    assert diagnostics == ()
+    assert outcomes == Counter({"unknown": 1})
 
 
 def test_synthetic_timeout_report_is_self_describing(tmp_path: Path) -> None:

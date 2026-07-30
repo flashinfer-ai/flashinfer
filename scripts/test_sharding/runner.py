@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,9 +16,13 @@ from typing import Any
 
 from .estimates import EstimateBook
 from .io import atomic_write_json
-from .junit import SyntheticBatchMetadata, create_synthetic_batch_xml
+from .junit import (
+    SyntheticBatchMetadata,
+    create_synthetic_batch_xml,
+    finalized_batch_outcomes,
+)
 from .models import CollectedNode, Plan, PlanningOptions, Unit
-from .planner import build_plan, capacity_metrics
+from .planner import build_plan, capacity_metrics, source_affine_unit_bins
 from .processes import terminate_process_group
 from .state import (
     AttemptRecord,
@@ -52,7 +57,7 @@ from .summary import (
     publish_summary,
     publish_summary_under_lock,
 )
-from .workers import BatchExecutionRequest, execute_batch
+from .workers import BatchExecutionRequest, execute_batch, write_console
 
 
 _COLLECTION_HEARTBEAT_SECONDS = 30.0
@@ -427,6 +432,9 @@ def prepare_manifest(
     collection_timeout_seconds = active_attempt_collection_timeout(
         junit_dir, collection_timeout_seconds
     )
+    if existing is not None:
+        assert existing_plan is not None
+        return existing, existing_plan, False
     try:
         raw_nodes = _collect_nodes(
             repo_root,
@@ -441,10 +449,6 @@ def prepare_manifest(
             error.record_deadline_clock(deadline_clock)
         raise
     nodes = _selected_nodes(raw_nodes, selection)
-    if existing is not None:
-        _verify_collection(existing, nodes)
-        assert existing_plan is not None
-        return existing, existing_plan, False
     duration_path, overhead_path = _estimate_paths(repo_root)
     estimates = EstimateBook.from_files(duration_path, overhead_path)
     plan = build_plan(nodes, estimates, planning)
@@ -567,6 +571,19 @@ def _synthesize_batch(
             "timeout_policy": metadata.policy,
         },
     )
+
+
+def _completed_node_count(junit_dir: Path, plan: Plan) -> int:
+    """Count batches whose final XML and last-written metadata marker are visible."""
+
+    completed = 0
+    for unit in plan.units:
+        for batch in unit.batches:
+            xml_path = batch_xml_path(junit_dir, unit, batch)
+            metadata_path = xml_path.with_name(f"{batch.id}.meta.json")
+            if xml_path.exists() and metadata_path.exists():
+                completed += len(batch.nodeids)
+    return completed
 
 
 def _live_attempt_leases(attempt_path: Path) -> list[Path]:
@@ -787,6 +804,31 @@ class _ExecutionGate:
             self.condition.notify_all()
 
 
+def _next_worker_unit(
+    work_by_worker: list[queue.Queue[Unit]],
+    worker_index: int,
+) -> tuple[queue.Queue[Unit], Unit]:
+    preferred = work_by_worker[worker_index]
+    try:
+        return preferred, preferred.get_nowait()
+    except queue.Empty:
+        pass
+    donors = sorted(
+        (
+            (work.qsize(), index, work)
+            for index, work in enumerate(work_by_worker)
+            if index != worker_index
+        ),
+        key=lambda item: (-item[0], item[1]),
+    )
+    for _, _, work in donors:
+        try:
+            return work, work.get_nowait()
+        except queue.Empty:
+            continue
+    raise queue.Empty
+
+
 @dataclass
 class _ShardExecutor:
     repo_root: Path
@@ -798,7 +840,7 @@ class _ShardExecutor:
     devices: list[str | None]
     heartbeat: _LeaseHeartbeat
     solo_sources: frozenset[str]
-    work: queue.Queue[Unit] = field(default_factory=queue.Queue)
+    work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
     execution_gate: _ExecutionGate = field(default_factory=_ExecutionGate)
     infrastructure_errors: list[str] = field(default_factory=list)
     interruption_reasons: set[str] = field(default_factory=set)
@@ -806,13 +848,23 @@ class _ShardExecutor:
     stop_workers: threading.Event = field(default_factory=threading.Event)
 
     def add_units(self, units: list[Unit]) -> None:
+        pending = []
         for unit in units:
             timed_out = (self.attempt_path / "timed-out" / f"{unit.id}.json").exists()
             if not timed_out and any(
                 not batch_is_final(self.junit_dir, unit, batch)
                 for batch in unit.batches
             ):
-                self.work.put(unit)
+                pending.append(unit)
+        self.work_by_worker = []
+        for worker_units in source_affine_unit_bins(pending, self.execution.workers):
+            work: queue.Queue[Unit] = queue.Queue()
+            for unit in sorted(
+                worker_units,
+                key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
+            ):
+                work.put(unit)
+            self.work_by_worker.append(work)
 
     def run(self) -> None:
         with ThreadPoolExecutor(
@@ -840,7 +892,7 @@ class _ShardExecutor:
     def _worker(self, index: int) -> None:
         while not self.stop_workers.is_set():
             try:
-                unit = self.work.get_nowait()
+                work, unit = _next_worker_unit(self.work_by_worker, index)
             except queue.Empty:
                 return
             solo = self._unit_is_solo(unit)
@@ -849,7 +901,7 @@ class _ShardExecutor:
                 self._execute_unit(index, unit, solo=solo)
             finally:
                 self.execution_gate.release(solo=solo)
-                self.work.task_done()
+                work.task_done()
 
     def _unit_is_solo(self, unit: Unit) -> bool:
         return any(batch.source_file in self.solo_sources for batch in unit.batches)
@@ -870,7 +922,9 @@ class _ShardExecutor:
             active_started_at=time.time(),
         )
         try:
-            self._execute_unit_batches(worker_index, unit, timer, solo=solo)
+            completed = self._execute_unit_batches(worker_index, unit, timer, solo=solo)
+            if completed:
+                self._report_unit_complete(worker_index, unit)
         finally:
             write_unit_elapsed(
                 self.attempt_path,
@@ -887,7 +941,7 @@ class _ShardExecutor:
         timer: _UnitTimer,
         *,
         solo: bool,
-    ) -> None:
+    ) -> bool:
         for batch_position, batch in enumerate(unit.batches):
             if batch_is_final(self.junit_dir, unit, batch):
                 continue
@@ -922,14 +976,38 @@ class _ShardExecutor:
                     )
             if status == "finalized":
                 continue
-            if status != "infrastructure":
-                self._handle_timeout(
-                    unit,
-                    batch_position,
-                    timer,
-                    timeout_reason or "timeout",
+            if status == "infrastructure":
+                return False
+            completed = self._handle_timeout(
+                unit,
+                batch_position,
+                timer,
+                timeout_reason or "timeout",
+            )
+            if completed:
+                return True
+            return False
+        return True
+
+    def _report_unit_complete(self, worker_index: int, unit: Unit) -> None:
+        outcomes: Counter[str] = Counter()
+        for batch in unit.batches:
+            path = batch_xml_path(self.junit_dir, unit, batch)
+            batch_outcomes, diagnostics = finalized_batch_outcomes(path, batch.nodeids)
+            if diagnostics:
+                raise RunnerStateError(
+                    f"completed unit {unit.id} has invalid batch {batch.id}: "
+                    + "; ".join(diagnostics)
                 )
-            return
+            outcomes.update(batch_outcomes)
+        completed_nodes = _completed_node_count(self.junit_dir, self.plan)
+        write_console(
+            f"PYTEST UNIT COMPLETE worker={worker_index} unit={unit.id} "
+            f"finalized={sum(outcomes.values())} "
+            f"passed={outcomes['passed']} failed={outcomes['failed']} "
+            f"skipped={outcomes['skipped']} unknown={outcomes['unknown']} "
+            f"completed_nodes={completed_nodes}/{len(self.plan.nodes)}"
+        )
 
     def _remaining_budget(self, timer: _UnitTimer) -> tuple[float | None, str | None]:
         limits: list[tuple[float, str]] = []
@@ -947,7 +1025,7 @@ class _ShardExecutor:
         batch_position: int,
         timer: _UnitTimer,
         reason: str,
-    ) -> None:
+    ) -> bool:
         with self.errors_lock:
             self.interruption_reasons.add(reason)
         timeout = self.execution.attempt.unit_timeout_seconds
@@ -955,7 +1033,7 @@ class _ShardExecutor:
         deadline_at = self.attempt.get("deadline_at")
         deadline_timeout = deadline_at is not None and time.time() >= deadline_at
         if not unit_timeout or deadline_timeout:
-            return
+            return False
         policy = self.execution.attempt.timeout_policy
         atomic_write_json(
             self.attempt_path / "timed-out" / f"{unit.id}.json",
@@ -967,7 +1045,7 @@ class _ShardExecutor:
             },
         )
         if policy not in {"skip", "fail"}:
-            return
+            return False
         for pending in unit.batches[batch_position:]:
             if not batch_is_final(self.junit_dir, unit, pending):
                 _synthesize_batch(
@@ -983,6 +1061,7 @@ class _ShardExecutor:
                         profile=self.plan.options.profile,
                     ),
                 )
+        return True
 
 
 @dataclass
