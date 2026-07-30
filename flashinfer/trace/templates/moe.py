@@ -4010,6 +4010,9 @@ b12x_fused_moe_trace = TraceTemplate(
         "input_global_scale_size": Var(
             description="1 (shared scale) or num_local_experts."
         ),
+        # Var because a Const axis sourced from this optional tensor would
+        # get no value when the map is absent.
+        "num_global_experts": Var(description="Equals num_experts."),
     },
     inputs={
         "x": Tensor(
@@ -4043,6 +4046,15 @@ b12x_fused_moe_trace = TraceTemplate(
         ),
         "num_experts": Scalar("int32", description="Total experts."),
         "top_k": Scalar("int32"),
+        "expert_map": Tensor(
+            ["num_global_experts"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Global-to-local expert map for expert parallelism (-1 for "
+                "non-local experts). Only with quant_mode='w4a16'."
+            ),
+        ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
@@ -4124,6 +4136,12 @@ _b12x_wrapper_inputs["source_format"] = Scalar(
 )
 _b12x_wrapper_inputs["num_experts"] = Scalar(
     "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_b12x_wrapper_inputs["expert_map"] = Tensor(
+    ["num_global_experts"],
+    dtype="int32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
@@ -4281,6 +4299,7 @@ def _b12x_moe_run_experts(
     fc2_input_scale,
     quant_mode=None,
     source_format="modelopt",
+    expert_map=None,
 ):
     """B12x MoE expert computation with optional FP4 activation quantization."""
     quant_mode = _b12x_quant_mode(quant_mode, activation_precision)
@@ -4297,9 +4316,16 @@ def _b12x_moe_run_experts(
     W1 = gemm1_weights.to(torch.float32)
     W2 = gemm2_weights.to(torch.float32)
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
-    local_start = int(local_expert_offset)
-    for le in range(E_local):
-        ge = local_start + le
+    if expert_map is not None:
+        expert_pairs = [
+            (le, ge) for ge, le in enumerate(expert_map.tolist()) if le >= 0
+        ]
+        if any(le >= E_local for le, _ in expert_pairs):
+            raise ValueError("expert_map local ids exceed the local expert count")
+    else:
+        local_start = int(local_expert_offset)
+        expert_pairs = [(le, local_start + le) for le in range(E_local)]
+    for le, ge in expert_pairs:
         if ge < 0 or ge >= E_global:
             continue
         sel_mask = (topk_idx == ge).any(dim=1)
@@ -4348,6 +4374,7 @@ def _b12x_fused_moe_reference(
     activation_precision="fp4",
     quant_mode=None,
     source_format="modelopt",
+    expert_map=None,
     **_unused,
 ):
     """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
@@ -4370,6 +4397,7 @@ def _b12x_fused_moe_reference(
         fc2_input_scale=fc2_input_scale,
         quant_mode=quant_mode,
         source_format=source_format,
+        expert_map=expert_map,
     )
 
 
