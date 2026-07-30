@@ -77,20 +77,32 @@ def test_softmax(
 
 
 @pytest.mark.parametrize(
-    "batch_size,vocab_size",
+    "batch_size,vocab_size,temperature_kind",
     [
-        (129, 24576),  # aligned mid-row route
-        (385, 24577),  # odd-stride route
+        (1, 32000, "none"),  # cooperative route
+        (256, 32000, "none"),  # rowwise route
+        (1, 111, "scalar"),  # scalar-temperature rowwise route
+        (1, 111, "per_row"),  # per-row-temperature rowwise route
     ],
 )
-def test_softmax_blackwell_rowwise_routes(batch_size, vocab_size):
+def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Loom Softmax routes require SM100 or SM103")
 
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda")
-    probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
-    probs_ref = torch.softmax(logits, dim=-1)
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.full((batch_size,), 0.5, device="cuda")
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 

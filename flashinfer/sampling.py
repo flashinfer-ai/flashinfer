@@ -65,8 +65,48 @@ def get_seed_and_offset(
 
 
 @functools.cache
-def get_blackwell_softmax_module():
-    return gen_blackwell_softmax_module().build_and_load()
+def get_blackwell_softmax_op():
+    module = gen_blackwell_softmax_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::blackwell_softmax", mutates_args=("workspace_buffer",)
+    )
+    def blackwell_softmax(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+        temperature_is_none: bool,
+    ) -> torch.Tensor:
+        logits = logits.float()
+        probs = torch.empty_like(logits, device=logits.device)
+        maybe_temperature_arr = (
+            maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+        )
+        module.softmax(
+            workspace_buffer,
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+            temperature_is_none,
+        )
+        return probs
+
+    @register_fake_op("flashinfer::blackwell_softmax")
+    def _fake_blackwell_softmax(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+        temperature_is_none: bool,
+    ) -> torch.Tensor:
+        return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
+
+    return blackwell_softmax
 
 
 @functools.cache
@@ -86,35 +126,20 @@ def get_sampling_module():
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
         enable_pdl: bool,
-        temperature_is_none: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
-        device_index = logits.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-        if _supports_blackwell_softmax(device_index):
-            get_blackwell_softmax_module().softmax(
-                workspace_buffer,
-                logits,
-                probs,
-                maybe_temperature_arr,
-                temperature_val,
-                enable_pdl,
-                temperature_is_none,
-            )
-        else:
-            module.softmax(
-                workspace_buffer,
-                logits,
-                probs,
-                maybe_temperature_arr,
-                temperature_val,
-                enable_pdl,
-            )
+        module.softmax(
+            workspace_buffer,
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
         return probs
 
     @register_fake_op("flashinfer::softmax")
@@ -124,7 +149,6 @@ def get_sampling_module():
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
         enable_pdl: bool,
-        temperature_is_none: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -815,12 +839,24 @@ def softmax(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(logits.device)
 
+    temperature_args = _to_tensor_scalar_tuple(temperature)
+    device_index = logits.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if _supports_blackwell_softmax(device_index):
+        return get_blackwell_softmax_op()(
+            workspace_buffer,
+            logits,
+            *temperature_args,
+            enable_pdl,
+            temperature_is_none,
+        )
+
     return get_sampling_module().softmax(
         workspace_buffer,
         logits,
-        *_to_tensor_scalar_tuple(temperature),
+        *temperature_args,
         enable_pdl,
-        temperature_is_none,
     )
 
 
