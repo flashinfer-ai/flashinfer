@@ -64,11 +64,10 @@ State and graph semantics
 
 The BF16 state layout remains ``[N,H,V,K]`` and an explicitly supplied
 ``initial_state`` is still updated in place, even when
-``output_final_state=False``. The frozen CUDA ABI marks initial and final
-state pointers ``__restrict__``; FlashInfer therefore launches into separate
-per-stream scratch storage and enqueues a same-stream copy back into
-``initial_state``. If no initial state is supplied, a final state is allocated
-only when ``output_final_state=True``.
+``output_final_state=False``. The frozen kernels load each CTA's disjoint
+state rows before writing the final rows back to the same storage, so no
+separate state scratch or copy-back is required. If no initial state is
+supplied, a final state is allocated only when ``output_final_state=True``.
 
 The frozen kernel uses restricted output storage. A preallocated ``output``
 must not overlap Q, K, V, G, beta, or ``initial_state``.
@@ -79,14 +78,15 @@ be used during CUDA graph capture.
 
 CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
-workspace owns stable state scratch, beta padding, and separate 768-byte M64
-and M128 TMA descriptor blocks. It binds to the device and CUDA stream of its
-first ``recurrent_kda`` call. Warm it eagerly on the intended capture stream
-with the exact Q, K, V, G, beta, and output tensors, then synchronize that
-stream before capture. Packed graphs must also pass preallocated int64
-``cu_seqlens`` and int32 ``seq_order``. The warm call prepares descriptors;
-capture accepts only the exact warmed pointer, shape, stride, and dtype
-signature and performs no descriptor preparation.
+workspace owns optional final-state scratch for calls without an initial
+state, beta padding, and separate 768-byte M64 and M128 TMA descriptor blocks.
+It binds to the device and CUDA stream of its first ``recurrent_kda`` call.
+Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
+beta, and output tensors, then synchronize that stream before capture. Packed
+graphs must also pass preallocated int64 ``cu_seqlens`` and int32
+``seq_order``. The warm call prepares descriptors; capture accepts only the
+exact warmed pointer, shape, stride, and dtype signature and performs no
+descriptor preparation.
 
 The workspace must outlive its graph and every replay. Use one distinct
 workspace for each captured ``recurrent_kda`` invocation, including two KDA
@@ -100,6 +100,6 @@ stream.
 
 When an explicit workspace is used with ``initial_state=None`` and
 ``output_final_state=True``, the returned final state is workspace-owned
-stable scratch. Otherwise an explicitly supplied ``initial_state`` keeps its
-usual in-place copy-back semantics. The small-head ``H < 8`` path captures
+stable scratch. Otherwise an explicitly supplied ``initial_state`` is updated
+directly in place by the frozen kernel. The small-head ``H < 8`` path captures
 the beta copy into workspace-owned padded storage before the frozen launch.

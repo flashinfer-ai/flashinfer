@@ -87,6 +87,17 @@ inline void CheckNoOverlap(const TensorView& lhs, const char* lhs_name, const Te
                             << ": the frozen kernel uses __restrict__ pointers";
 }
 
+inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char* lhs_name,
+                                              const TensorView& rhs, const char* rhs_name) {
+  const TensorByteRange lhs_range = GetTensorByteRange(lhs, lhs_name);
+  const TensorByteRange rhs_range = GetTensorByteRange(rhs, rhs_name);
+  const bool overlaps = lhs_range.begin < rhs_range.end && rhs_range.begin < lhs_range.end;
+  const bool exact_alias = lhs_range.begin == rhs_range.begin && lhs_range.end == rhs_range.end;
+  TVM_FFI_ICHECK(!overlaps || exact_alias)
+      << lhs_name << " and " << rhs_name
+      << " must either be disjoint or exactly alias the same state storage";
+}
+
 inline void CheckExactSm100a(int32_t device_id) {
   int major = 0;
   int minor = 0;
@@ -245,7 +256,7 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
     CheckNoOverlap(final_state, "final_state", cu_seqlens, "cu_seqlens");
     CheckNoOverlap(final_state, "final_state", seq_order, "seq_order");
     if (use_initial_state != 0) {
-      CheckNoOverlap(initial_state, "initial_state", final_state, "final_state");
+      CheckNoPartialOverlapOrExactAlias(initial_state, "initial_state", final_state, "final_state");
     }
   }
   return num_seqs;

@@ -497,7 +497,9 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
+// FLASHINFER INTEGRATION BEGIN: allow exact state alias
+kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound)
+// FLASHINFER INTEGRATION END: allow exact state alias
 {
     // FLASHINFER INTEGRATION BEGIN: acquire global tensor maps
     // CUDA kernel-start ordering does not acquire the tensor-map proxy.

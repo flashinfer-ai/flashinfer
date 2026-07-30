@@ -320,7 +320,7 @@ def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
     assert module.calls == []
 
 
-def test_initial_state_uses_distinct_final_and_copies_back(cuda_device, monkeypatch):
+def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
     monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
     module = _RecorderModule(final_value=0.25)
     monkeypatch.setattr(
@@ -337,7 +337,7 @@ def test_initial_state_uses_distinct_final_and_copies_back(cuda_device, monkeypa
     assert returned_state is original_state
     (args,) = module.calls
     assert args[10].data_ptr() == original_state.data_ptr()
-    assert args[12].data_ptr() != original_state.data_ptr()
+    assert args[12].data_ptr() == original_state.data_ptr()
     assert args[16] == 1
     assert args[17] == 1
     torch.testing.assert_close(
@@ -346,7 +346,9 @@ def test_initial_state_uses_distinct_final_and_copies_back(cuda_device, monkeypa
     )
 
 
-def test_stream_workspace_retains_only_largest_state_buffer(cuda_device, monkeypatch):
+def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
+    cuda_device, monkeypatch
+):
     monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(kda_api, "_flash_kda_stream_workspaces", {})
     module = _RecorderModule(final_value=0.0)
@@ -381,8 +383,7 @@ def test_stream_workspace_retains_only_largest_state_buffer(cuda_device, monkeyp
 
     assert len(kda_api._flash_kda_stream_workspaces) == 1
     (workspace,) = kda_api._flash_kda_stream_workspaces.values()
-    largest_state_numel = max(inputs["initial_state"].numel() for inputs in cases)
-    assert workspace._state_scratch.numel() == largest_state_numel
+    assert workspace._state_scratch is None
     assert workspace._beta_padding.numel() == 32 * 8
 
 
@@ -824,10 +825,8 @@ def test_frozen_prefill_cuda_graph_workspaces_are_isolated(b200):
             )
         )
 
-    assert (
-        bundles[0][1]._state_scratch.data_ptr()
-        != bundles[1][1]._state_scratch.data_ptr()
-    )
+    assert bundles[0][1]._state_scratch is None
+    assert bundles[1][1]._state_scratch is None
     assert (
         bundles[0][1]._descriptor_storages["m128"].data_ptr()
         != bundles[1][1]._descriptor_storages["m128"].data_ptr()

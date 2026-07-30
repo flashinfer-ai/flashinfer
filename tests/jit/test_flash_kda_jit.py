@@ -84,9 +84,27 @@ def test_flash_kda_uri_and_jit_spec(monkeypatch, variant, smem_bytes, generated_
     assert integration_prologue.count("__syncthreads();") == 1
     for tensor_map in ("q_tma", "k_tma", "v_tma", "g_tma", "beta_tma", "out_tma"):
         assert f'"l"({tensor_map})' in integration_prologue
-    # Keep the exporter output immutable below the narrowly marked FlashInfer
-    # integration prologue.
-    normalized_generated_body = generated_prefix + generated_suffix
+    generated_body_without_tma_integration = generated_prefix + generated_suffix
+    alias_begin = "// FLASHINFER INTEGRATION BEGIN: allow exact state alias\n"
+    alias_end = "// FLASHINFER INTEGRATION END: allow exact state alias\n"
+    alias_prefix, begin_marker, alias_tail = (
+        generated_body_without_tma_integration.partition(alias_begin)
+    )
+    alias_signature, end_marker, alias_suffix = alias_tail.partition(alias_end)
+    assert begin_marker == alias_begin
+    assert end_marker == alias_end
+    assert alias_signature.count("__nv_bfloat16* initial_state") == 1
+    assert alias_signature.count("__nv_bfloat16* final_state") == 1
+    restricted_alias_signature = alias_signature.replace(
+        "__nv_bfloat16* initial_state",
+        "__nv_bfloat16* __restrict__ initial_state",
+    ).replace(
+        "__nv_bfloat16* final_state",
+        "__nv_bfloat16* __restrict__ final_state",
+    )
+    # Keep the exporter output immutable outside the two narrowly marked
+    # FlashInfer integration patches.
+    normalized_generated_body = alias_prefix + restricted_alias_signature + alias_suffix
     assert (
         hashlib.sha256(normalized_generated_body.encode()).hexdigest()
         == generated_sha256

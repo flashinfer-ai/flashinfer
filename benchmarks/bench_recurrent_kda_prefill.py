@@ -20,12 +20,13 @@ MoonshotAI/FlashKDA measurements are reported:
 
 * the raw ``_fwd_raw`` timing scope used as the Official peer in Cake MR !458;
 * a public-semantics adapter that follows ``_fwd_raw`` with the same-stream
-  state copy-back required by ``recurrent_kda``.
+  state copy-back required to emulate ``recurrent_kda`` on FlashKDA.
 
 All paths use the exact MR !458 tensors and seeds. Preinitialized rotating
-state buffers ensure every timed invocation sees the same initial state.
-Allocation, metadata, sequence ordering, build/JIT, and state-pool reset are
-outside the measured region.
+state buffers ensure every timed invocation sees the same initial state. The
+FlashInfer path updates each state slot in place inside the kernel; it has no
+state scratch or copy-back. Allocation, metadata, sequence ordering, build/JIT,
+and state-pool reset are outside the measured region.
 """
 
 import argparse
@@ -613,7 +614,7 @@ def main() -> None:
                 "timing_backend": "cupti",
                 "cold_l2": True,
                 "cuda_graph": False,
-                "timing_scope": ("public_recurrent_kda_with_state_copy_back"),
+                "timing_scope": ("public_recurrent_kda_with_inplace_state_update"),
                 "warmup_ms": args.warmup_ms,
                 "bench_ms": args.bench_ms,
             }

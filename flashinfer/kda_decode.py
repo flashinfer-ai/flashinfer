@@ -82,8 +82,9 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     Construct one workspace per captured :func:`recurrent_kda` invocation on
     the graph's CUDA device. Warm it by invoking :func:`recurrent_kda` eagerly
     with the exact tensors and capture stream, then synchronize that stream
-    before capture. The workspace owns stable state scratch, beta padding, and
-    M64/M128 TMA descriptor storage for the lifetime of the graph.
+    before capture. The workspace owns optional final-state scratch for calls
+    without an initial state, beta padding, and M64/M128 TMA descriptor storage
+    for the lifetime of the graph.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -612,6 +613,7 @@ def _run_flash_kda_prefill(
     use_initial_state = initial_state is not None
     if initial_state is not None:
         initial_state_arg = initial_state
+        final_state_arg = initial_state
         store_final_state = True
         returned_state = initial_state
     elif output_final_state:
@@ -649,8 +651,8 @@ def _run_flash_kda_prefill(
     else:
         workspace = prefill_workspace
     # TVM FFI may release the GIL. Serialize the complete shared-workspace
-    # enqueue sequence so two host threads cannot interleave preparation,
-    # launch, or state copy-back on the same CUDA stream.
+    # enqueue sequence so two host threads cannot interleave preparation or
+    # launch on the same CUDA stream.
     with workspace._lock:
         _bind_workspace(
             workspace,
@@ -660,10 +662,7 @@ def _run_flash_kda_prefill(
             explicit=explicit_workspace,
         )
         beta_tma = _beta_tma_source(beta, workspace)
-        if initial_state is not None or (output_final_state and explicit_workspace):
-            # The frozen ABI marks both state pointers __restrict__. Always
-            # launch into distinct storage, then preserve recurrent_kda's
-            # in-place mutation with a same-stream copy-back.
+        if initial_state is None and output_final_state and explicit_workspace:
             final_state_arg = _state_scratch(
                 workspace=workspace,
                 device=q.device,
@@ -722,8 +721,6 @@ def _run_flash_kda_prefill(
             raise
         if prepare_descriptors:
             workspace._descriptor_signatures[variant] = signature
-        if initial_state is not None:
-            initial_state.copy_(final_state_arg)
         if capturing and explicit_workspace:
             workspace._captured = True
     return (
