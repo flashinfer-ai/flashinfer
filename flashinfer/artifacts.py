@@ -150,6 +150,7 @@ class ArtifactPath:
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
+    # (and KernelMap.KERNEL_MAP_HASH_RUBIN for the Rubin variant below).
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
     DEEPGEMM_RUBIN: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
     DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
@@ -261,6 +262,7 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ArtifactPath.TRTLLM_GEN_BMM_RUBIN,
         ArtifactPath.TRTLLM_GEN_GEMM_RUBIN,
         ArtifactPath.DEEPGEMM,
+        ArtifactPath.DEEPGEMM_RUBIN,
         # DSL FMHA: per cpu-arch and sm-arch subdirectories
         *(
             safe_urljoin(ArtifactPath.DSL_FMHA, f"{cpu_arch}/{arch}/")
