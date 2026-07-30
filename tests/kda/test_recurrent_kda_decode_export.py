@@ -397,12 +397,31 @@ def _make_case(
     padded_state=False,
     padded_last_sequence=False,
     accepted_tokens=None,
+    num_tokens=_T,
     seed=42,
 ):
+    if num_tokens < 1:
+        raise ValueError("num_tokens must be positive")
+    if num_tokens == 1 and accepted_tokens is not None:
+        raise ValueError("standard decode does not take accepted-token metadata")
+    if num_tokens == 1 and padded_last_sequence:
+        raise ValueError("dense standard decode has no packed padding metadata")
+    if num_tokens == 1 and padded_gate:
+        raise ValueError("the padded gate helper models packed token layout")
     generator = torch.Generator(device=device).manual_seed(seed)
-    total_tokens = num_sequences * _T
+    total_tokens = num_sequences * num_tokens
+    q_shape = (
+        (num_sequences, 1, num_heads, _D)
+        if num_tokens == 1
+        else (1, total_tokens, num_heads, _D)
+    )
+    v_shape = (
+        (num_sequences, 1, num_value_heads, _D)
+        if num_tokens == 1
+        else (1, total_tokens, num_value_heads, _D)
+    )
     q = torch.randn(
-        (1, total_tokens, num_heads, _D),
+        q_shape,
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
@@ -414,7 +433,7 @@ def _make_case(
         generator=generator,
     )
     v = torch.randn(
-        (1, total_tokens, num_value_heads, _D),
+        v_shape,
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
@@ -436,7 +455,7 @@ def _make_case(
     else:
         g = F.logsigmoid(
             torch.randn(
-                (1, total_tokens, num_value_heads, _D),
+                v_shape,
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -444,26 +463,45 @@ def _make_case(
         ).to(torch.bfloat16)
         gate_storage = None
     beta = torch.rand(
-        (1, total_tokens, num_value_heads),
+        (*v_shape[:2], num_value_heads),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
-    cu_seqlens = torch.arange(0, total_tokens + 1, _T, dtype=torch.int32, device=device)
-    ssm_state_indices = torch.arange(
-        num_sequences * _T, dtype=torch.int32, device=device
-    ).reshape(num_sequences, _T)
-    if padded_last_sequence:
-        ssm_state_indices[-1].fill_(-1)
-    if accepted_tokens is None:
-        num_accepted_tokens = (
-            torch.arange(num_sequences, dtype=torch.int32, device=device) % _T
-        ) + 1
+    if num_tokens == 1:
+        cu_seqlens = None
+        ssm_state_indices = None
+        num_accepted_tokens = None
+        num_spec_tokens = None
     else:
-        num_accepted_tokens = torch.tensor(
-            accepted_tokens, dtype=torch.int32, device=device
+        cu_seqlens = torch.arange(
+            0,
+            total_tokens + 1,
+            num_tokens,
+            dtype=torch.int32,
+            device=device,
         )
-    slots = num_sequences * _T
+        ssm_state_indices = torch.arange(
+            num_sequences * num_tokens, dtype=torch.int32, device=device
+        ).reshape(num_sequences, num_tokens)
+        if padded_last_sequence:
+            ssm_state_indices[-1].fill_(-1)
+        if accepted_tokens is None:
+            num_accepted_tokens = (
+                torch.arange(num_sequences, dtype=torch.int32, device=device)
+                % num_tokens
+            ) + 1
+        else:
+            if len(accepted_tokens) != num_sequences:
+                raise ValueError("accepted_tokens must contain one value per sequence")
+            num_accepted_tokens = torch.tensor(
+                accepted_tokens, dtype=torch.int32, device=device
+            )
+        num_spec_tokens = num_tokens - 1
+    slots = num_sequences * num_tokens
+    if num_tokens == 1:
+        # Dense standard decode has one caller-owned cache slot per sequence.
+        slots = num_sequences
     if padded_state:
         state, state_storage = _padded_slot_state(
             slots, num_value_heads, device, seed=seed + 2
@@ -491,7 +529,7 @@ def _make_case(
         "lower_bound": None,
         "cu_seqlens": cu_seqlens,
         "ssm_state_indices": ssm_state_indices,
-        "num_spec_tokens": _T - 1,
+        "num_spec_tokens": num_spec_tokens,
         "num_accepted_tokens": num_accepted_tokens,
         "output": output,
         "_state_storage": state_storage,
@@ -590,6 +628,122 @@ def test_public_recurrent_kda_exact_routes_match_upstream_cute(
     torch.testing.assert_close(
         actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 6])
+def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
+    b200, monkeypatch, num_tokens
+):
+    num_sequences = 5
+    accepted_tokens = (
+        None
+        if num_tokens == 1
+        else [0, 1, num_tokens, num_tokens + 7, max(1, num_tokens - 1)]
+    )
+    case = _make_case(
+        b200,
+        num_sequences=num_sequences,
+        num_heads=16,
+        num_value_heads=32,
+        padded_last_sequence=num_tokens != 1,
+        accepted_tokens=accepted_tokens,
+        num_tokens=num_tokens,
+        seed=2100 + num_tokens,
+    )
+
+    if num_tokens == 1:
+        assert case["num_spec_tokens"] is None
+        assert case["num_accepted_tokens"] is None
+        assert case["q"].shape == (num_sequences, 1, 16, _D)
+        assert case["cu_seqlens"] is None
+        assert case["ssm_state_indices"] is None
+    else:
+        assert case["num_spec_tokens"] == num_tokens - 1
+        assert case["ssm_state_indices"].shape == (
+            num_sequences,
+            num_tokens,
+        )
+        assert case["num_accepted_tokens"].tolist() == accepted_tokens
+        assert case["cu_seqlens"].tolist() == [
+            sequence * num_tokens for sequence in range(num_sequences + 1)
+        ]
+
+    initial = _clone_state_with_layout(case["initial_state"])
+    baseline_state = _clone_state_with_layout(initial)
+    actual_state = _clone_state_with_layout(initial)
+    baseline_output = torch.empty_like(case["output"])
+    actual_output_buffer = torch.empty_like(case["output"])
+
+    # This is the same public API and input contract, with only the exported
+    # selector disabled, so it is the strongest existing-backend reference.
+    with monkeypatch.context() as baseline_patch:
+        baseline_patch.setattr(
+            recurrent_module,
+            "_select_flash_kda_decode_variant",
+            lambda **kwargs: None,
+        )
+        expected_output, expected_state = recurrent_kda(
+            **_call_kwargs(case, state=baseline_state, output=baseline_output)
+        )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    actual_output, actual_state_result = recurrent_kda(
+        **_call_kwargs(case, state=actual_state, output=actual_output_buffer)
+    )
+
+    if num_tokens == _T:
+        split = recurrent_module._select_flash_kda_decode_value_split(
+            num_sequences * 32,
+            torch.cuda.get_device_properties(b200).multi_processor_count,
+        )
+        assert frozen_calls == [_VARIANT_PREFIX + str(split)]
+    else:
+        assert frozen_calls == []
+
+    assert actual_output.data_ptr() == actual_output_buffer.data_ptr()
+    assert actual_state_result is actual_state
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+    # Check every active checkpoint explicitly, rather than relying only on
+    # the whole-pool comparison above to cover speculative state writes.
+    if num_tokens == 1:
+        active_checkpoint_slots = range(num_sequences)
+    else:
+        active_checkpoint_slots = case["ssm_state_indices"][:-1].reshape(-1).tolist()
+    for slot in active_checkpoint_slots:
+        torch.testing.assert_close(
+            actual_state[slot].float(),
+            expected_state[slot].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    if num_tokens > 1:
+        torch.testing.assert_close(
+            actual_output[:, -num_tokens:],
+            torch.zeros_like(actual_output[:, -num_tokens:]),
+            atol=0,
+            rtol=0,
+        )
+        padded_slot_start = (num_sequences - 1) * num_tokens
+        torch.testing.assert_close(
+            actual_state[padded_slot_start:],
+            initial[padded_slot_start:],
+            atol=0,
+            rtol=0,
+        )
 
 
 def test_public_route_supports_padded_slots_nat_and_outer_strides(b200, monkeypatch):
