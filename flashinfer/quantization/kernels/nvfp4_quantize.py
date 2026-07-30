@@ -39,7 +39,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import torch
-from cutlass import Float32, Int32, Uint8
+from cutlass import Float32, Int32, Int64, Uint8
 
 from ...api_logging import flashinfer_api
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -786,7 +786,35 @@ class NVFP4QuantizePerTokenKernel:
         row_idx = bidx
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
-        row_input = mInput[row_idx, None]
+        # Build the row views from 64-bit byte addresses. Slicing with
+        # mInput[row_idx, None] computes the row offset row_idx * K in
+        # Int32, which wraps once row_idx * K exceeds 2**31 - 1 (reached by
+        # the MoE per-token intermediate, e.g. M=851456 x K=2688) and makes
+        # the loads fault.
+        input_row_addr = get_ptr_as_int64(mInput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K * (mInput.element_type.width // 8)
+        )
+        row_input = cute.make_tensor(
+            cute.make_ptr(
+                mInput.element_type,
+                input_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            cute.make_layout((self.K,)),
+        )
+        output_row_addr = get_ptr_as_int64(mOutput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K // 2
+        )
+        row_output = cute.make_tensor(
+            cute.make_ptr(
+                mOutput.element_type,
+                output_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=8,
+            ),
+            cute.make_layout((self.K // 2,)),
+        )
 
         local_amax = Float32(0.0)
         sf_col_idx = tidx
@@ -840,7 +868,6 @@ class NVFP4QuantizePerTokenKernel:
             sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
             mScales[sf_offset] = scale_fp8
 
-            row_output = mOutput[row_idx, None]
             out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
             out_ptr = get_ptr_as_int64(row_output, out_base)
             st_global_u64(out_ptr, packed64)
