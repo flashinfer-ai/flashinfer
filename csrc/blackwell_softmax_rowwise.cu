@@ -18,6 +18,7 @@
 // sha256:e47f82923112e143173f32dbb145986f8c9a1503fd2bb71f22f5c065769162e3.
 // The sm_100a and sm_103a payloads are byte-identical.
 
+// clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -260,4 +261,5 @@ kernel_flashinfer_blackwell_softmax_followup_rowwise(float* __restrict__ x, floa
 
 } // extern "C"
 
+// clang-format on
 // End exact generated payload.
