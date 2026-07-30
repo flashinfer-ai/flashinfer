@@ -221,7 +221,7 @@ class TestB12xUnifiedValidation:
         with pytest.raises(error, match=match):
             self._runner(config).check_support()
 
-    def test_b12x_does_not_support_expert_parallelism(self, monkeypatch):
+    def test_b12x_nvfp4_does_not_support_expert_parallelism(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
             QuantVariant.NVFP4,
@@ -235,6 +235,49 @@ class TestB12xUnifiedValidation:
         runner = self._runner(config)
         with pytest.raises(NotImplementedError, match="expert parallelism"):
             runner.check_support()
+
+    def test_b12x_w4a16_supports_expert_parallelism(self, monkeypatch):
+        config = self._config(
+            B12xW4A16Config(),
+            QuantVariant.W4A16,
+            experts=ExpertConfig(
+                intermediate_size=512,
+                local_expert_offset=4,
+                local_num_experts=4,
+            ),
+        )
+        self._mock_environment(monkeypatch)
+        assert self._runner(config, B12xW4A16Runner).check_support() is None
+
+    def test_b12x_w4a16_rejects_out_of_range_expert_shard(self, monkeypatch):
+        config = self._config(
+            B12xW4A16Config(),
+            QuantVariant.W4A16,
+            experts=ExpertConfig(
+                intermediate_size=512,
+                local_expert_offset=6,
+                local_num_experts=4,
+            ),
+        )
+        self._mock_environment(monkeypatch)
+        with pytest.raises(ValueError, match="exceeds"):
+            self._runner(config, B12xW4A16Runner).check_support()
+
+    @pytest.mark.parametrize("local_num_experts", (0, 10))
+    def test_b12x_w4a16_rejects_out_of_bounds_local_count(
+        self, monkeypatch, local_num_experts
+    ):
+        config = self._config(
+            B12xW4A16Config(),
+            QuantVariant.W4A16,
+            experts=ExpertConfig(
+                intermediate_size=512,
+                local_num_experts=local_num_experts,
+            ),
+        )
+        self._mock_environment(monkeypatch)
+        with pytest.raises(ValueError, match=r"\[1, num_experts"):
+            self._runner(config, B12xW4A16Runner).check_support()
 
     def test_b12x_does_not_support_unfinalized_output(self, monkeypatch):
         config = self._config(
@@ -807,3 +850,69 @@ class TestUnifiedB12xConformance:
                 rtol=rtol,
                 atol=0,
             )
+
+    def test_w4a16_ep_partials_sum_to_full(self):
+        """Contiguous-shard EP through the unified API: two fake ranks'
+        partials must sum to the full single-rank output."""
+        from tests.moe.test_b12x_w4a16_ep import _make_rank_shard
+
+        num_tokens, hidden_size, intermediate_size = 24, 256, 512
+        num_experts, top_k = 8, 2
+        tensors = _make_b12x_tensors(
+            activation="silu",
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            seed=20260730,
+        )
+        layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
+            tensors,
+            variant=QuantVariant.W4A16,
+            activation="silu",
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        )
+        expected = _run_b12x_unified(layer, act_pack, weight_pack).clone()
+
+        partials = []
+        for offset in (0, num_experts // 2):
+            local_e = num_experts // 2
+            shard = _make_rank_shard(tensors, torch.arange(offset, offset + local_e))
+            backend_config = B12xW4A16Config()
+            prepared = backend_config.prepare_weights(
+                shard["w1_weight"],
+                shard["w1_weight_sf"],
+                shard["w1_alpha"],
+                shard["w2_weight"],
+                shard["w2_weight_sf"],
+                shard["w2_alpha"],
+                activation=ActivationConfig.swiglu,
+                source_format="modelopt",
+            )
+            rank_weight_pack = MoEWeightPack()
+            rank_weight_pack.prepare_for("b12x_w4a16", prepared)
+            config = MoEConfig(
+                routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+                quant=QuantConfig(variant=QuantVariant.W4A16),
+                experts=ExpertConfig(
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=offset,
+                    local_num_experts=local_e,
+                ),
+                activation=ActivationConfig.swiglu,
+                backend=BackendOptions((backend_config,)),
+                execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
+            )
+            rank_layer = MoELayer(config)
+            partials.append(
+                _run_b12x_unified(rank_layer, act_pack, rank_weight_pack).clone()
+            )
+
+        actual = partials[0] + partials[1]
+        torch.cuda.synchronize()
+        assert int(torch.count_nonzero(expected).item()) > 0
+        assert int(torch.count_nonzero(actual).item()) > 0
+        torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
