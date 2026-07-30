@@ -213,6 +213,7 @@ def test_recurrent_kda_vs_naive(
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=q.device),
         scale=scale,
         initial_state=h0_bf16.clone(),
         output_final_state=True,
@@ -273,6 +274,7 @@ def test_recurrent_kda_vs_fla(
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=q.device),
         scale=scale,
         initial_state=h0_bf16.clone(),
         output_final_state=True,
@@ -455,15 +457,21 @@ def test_vllm_decode(
     assert_close("Untouched ht", ref_untouched, tri_untouched, atol=1e-2, rtol=1e-2)
 
 
-def test_standard_decode_state_indices_update_pool():
+@pytest.mark.parametrize(
+    ("B", "H", "D"),
+    [
+        pytest.param(4, 8, 64, id="grouped"),
+        pytest.param(4, 32, 128, id="register-tile"),
+    ],
+)
+def test_standard_decode_state_indices_update_pool(B, H, D):
     """Standard decode with ssm_state_indices updates the caller's state pool."""
     torch.manual_seed(42)
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    B, H, D = 4, 8, 64
     HV = H
-    n_slots = B * 3
+    n_slots = B * 16
 
     q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
     k = torch.rand(B, 1, H, D, dtype=dtype, device=device)
@@ -473,7 +481,7 @@ def test_standard_decode_state_indices_update_pool():
     scale = D**-0.5
 
     state_pool = torch.randn(n_slots, HV, D, D, dtype=dtype, device=device) * 0.01
-    state_indices = torch.randperm(n_slots, device=device)[:B].int()
+    state_indices = torch.tensor([49, 2, 55, 20], dtype=torch.int32, device=device)
     untouched = torch.ones(n_slots, dtype=torch.bool, device=device)
     untouched[state_indices.long()] = False
 
@@ -484,6 +492,7 @@ def test_standard_decode_state_indices_update_pool():
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=compact_state,
         output_final_state=True,
@@ -516,6 +525,64 @@ def test_standard_decode_state_indices_update_pool():
         indexed_pool[untouched].float(),
         atol=1e-3,
         rtol=1e-3,
+    )
+
+
+def test_standard_decode_state_indices_cuda_graph():
+    """Direct paged-state standard decode is CUDA graph compatible."""
+    torch.manual_seed(43)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    B, H, D = 4, 32, 128
+    n_slots = B * 16
+
+    q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    v = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    g = F.logsigmoid(torch.randn(B, 1, H, D, device=device)).to(dtype)
+    beta = torch.rand(B, 1, H, dtype=dtype, device=device).sigmoid()
+    state_pool = torch.randn(n_slots, H, D, D, dtype=dtype, device=device) * 0.01
+    state_indices = torch.tensor([49, 2, 55, 20], dtype=torch.int32, device=device)
+    output = torch.empty(B, 1, H, D, dtype=dtype, device=device)
+
+    # Compile and initialize module-level dummy buffers before capture.
+    recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state_pool,
+        ssm_state_indices=state_indices,
+        output=output,
+    )
+    untouched = torch.ones(n_slots, dtype=torch.bool, device=device)
+    untouched[state_indices.long()] = False
+    untouched_before = state_pool[untouched].clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output, _ = recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=state_pool,
+            ssm_state_indices=state_indices,
+            output=output,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert torch.isfinite(output).all()
+    assert_close(
+        "graph untouched state",
+        untouched_before.float(),
+        state_pool[untouched].float(),
+        atol=0,
+        rtol=0,
     )
 
 
@@ -830,6 +897,7 @@ def test_non_contiguous_gate_stride(H: int, D: int):
         v=v,
         g=g_noncontiguous,
         beta=beta,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=state_nc,
     )
@@ -839,6 +907,7 @@ def test_non_contiguous_gate_stride(H: int, D: int):
         v=v,
         g=g_contiguous,
         beta=beta,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=state_c,
     )
@@ -2443,6 +2512,7 @@ def test_t1_cu_seqlens_zero_length_rows(D):
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=ref_state,
     )
@@ -2453,6 +2523,7 @@ def test_t1_cu_seqlens_zero_length_rows(D):
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=torch.arange(N, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=state_pool,
         cu_seqlens=torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device),
@@ -2475,6 +2546,7 @@ def test_t1_cu_seqlens_zero_length_rows(D):
         v=v[:, :0],
         g=g[:, :0],
         beta=beta[:, :0],
+        ssm_state_indices=torch.arange(N, dtype=torch.int32, device=device),
         scale=scale,
         initial_state=empty_state,
         output_final_state=True,
@@ -2494,7 +2566,6 @@ def test_t1_cu_seqlens_zero_length_rows(D):
 # reshapes inputs to the packed cu_seqlens form and reuses the same kernel.
 # Coverage below is intentionally minimal:
 #   - vs_cuseqlens: parity with the cu_seqlens path (proves the shim is a pass-through).
-#   - auto_ssi: verifies ssm_state_indices=None auto-generates identity slots.
 # The kernel-side correctness (gate modes, CUDA graph capture, various shapes) is
 # fully covered by the cu_seqlens tests above.
 
@@ -2568,88 +2639,3 @@ def test_spec_decode_batched_vs_cuseqlens():
         atol=0,
         rtol=0,
     )
-
-
-# ------------------------------------------------------------------------------
-# 4b: test_spec_decode_batched_auto_ssi
-# ------------------------------------------------------------------------------
-
-
-def test_spec_decode_batched_auto_ssi():
-    """ssm_state_indices=None: auto-generates sequential slots 0,1,...,B*T-1."""
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    B, H, HV, D, S = 4, 8, 8, 64, 1
-    T = 1 + S
-    scale = D**-0.5
-
-    q = torch.rand(B, T, H, D, dtype=dtype, device=device)
-    k = torch.rand(B, T, H, D, dtype=dtype, device=device)
-    v = torch.rand(B, T, HV, D, dtype=dtype, device=device)
-    g = F.logsigmoid(torch.randn(B, T, HV, D, device=device)).to(dtype)
-    beta = torch.rand(B, T, HV, dtype=dtype, device=device).sigmoid()
-
-    n_pool = B * T + 5
-    state_pool = torch.randn(n_pool, HV, D, D, dtype=dtype, device=device) * 0.1
-
-    # Call with ssm_state_indices=None -- shim auto-generates arange(B*T).reshape(B, T)
-    tri_state_pool = state_pool.clone()
-    tri_out, final_state = recurrent_kda(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=tri_state_pool,
-        output_final_state=True,
-        num_spec_tokens=S,
-        ssm_state_indices=None,
-    )
-
-    # Output shape is [B, T, HV, D]
-    assert tri_out.shape == (B, T, HV, D), (
-        f"Expected [{B},{T},{HV},{D}], got {list(tri_out.shape)}"
-    )
-
-    # Auto-generated indices: slot b*T+t for sequence b, token t
-    expected_ssi = torch.arange(B * T, dtype=torch.int32, device=device).reshape(B, T)
-
-    # Per-token states are in slots 0, 1, ..., B*T-1
-    q_packed = q.reshape(1, B * T, H, D)
-    k_packed = k.reshape(1, B * T, H, D)
-    v_packed = v.reshape(1, B * T, HV, D)
-    g_packed = g.reshape(1, B * T, HV, D)
-    beta_packed = beta.reshape(1, B * T, HV)
-
-    ref_out, ref_states = spec_decode_naive_reference(
-        q_packed,
-        k_packed,
-        v_packed,
-        g_packed,
-        beta_packed,
-        expected_ssi,
-        state_pool,
-        scale,
-        B,
-        T,
-        H,
-        HV,
-    )
-
-    ref_out_batched = ref_out.reshape(B, T, HV, D)
-    assert_close(
-        "auto_ssi_out",
-        ref_out_batched.bfloat16().float(),
-        tri_out.float(),
-        atol=1e-1,
-        rtol=5e-2,
-    )
-
-    # Verify states are in slots 0..B*T-1
-    assert_spec_states(
-        tri_state_pool, expected_ssi, ref_states, B, T, atol=1e-1, rtol=5e-2
-    )
-    assert final_state is tri_state_pool
-    assert final_state.shape == (n_pool, HV, D, D)

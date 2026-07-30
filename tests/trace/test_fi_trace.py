@@ -180,6 +180,7 @@ def test_recurrent_kda_fi_trace():
         batch_size + 2, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16
     )
     source_indices = torch.arange(batch_size, dtype=torch.int32)
+    state_indices = torch.arange(batch_size, dtype=torch.int32)
 
     defn = flashinfer.kda_decode.recurrent_kda.fi_trace(
         q=q,
@@ -187,6 +188,7 @@ def test_recurrent_kda_fi_trace():
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=state_indices,
         initial_state=state,
         initial_state_source=source,
         initial_state_indices=source_indices,

@@ -43,6 +43,7 @@ def recurrent_kda(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
@@ -52,7 +53,6 @@ def recurrent_kda(
     use_gate_in_kernel: bool = False,
     lower_bound: Optional[float] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
-    ssm_state_indices: Optional[torch.Tensor] = None,
     num_spec_tokens: Optional[int] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
@@ -82,6 +82,11 @@ def recurrent_kda(
         beta (torch.Tensor):
             Delta-rule learning rate of shape ``[B, 1, HV]``. Must be bfloat16.
             Pre-sigmoided unless ``beta_is_logit=True``.
+        ssm_state_indices (torch.Tensor):
+            State cache indices. Shape ``[B]`` int32 for standard decode, or
+            ``[N, 1+S]`` int32 for packed speculative decode. Every live index
+            must be in ``[0, initial_state.shape[0] - 1]``; ``-1`` is reserved
+            for padded packed rows.
         A_log (Optional[torch.Tensor]):
             Log decay parameter of shape ``[H]``. Must be float32.
             Required when ``use_gate_in_kernel=True``.
@@ -91,10 +96,8 @@ def recurrent_kda(
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
-            decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
-            count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
-            omitted.
+            If ``None``, zero-initialized. Updated in-place. ``N`` is the
+            writable cache-slot count and may exceed the active batch size.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -107,10 +110,6 @@ def recurrent_kda(
             gate formula instead of softplus. Must be negative.
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
-        ssm_state_indices (Optional[torch.Tensor]):
-            State cache indices. Shape ``[N]`` int32 for standard decode, or
-            ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
-            be set).
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.
@@ -148,6 +147,7 @@ def recurrent_kda(
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=ssm_state_indices,
         A_log=A_log,
         dt_bias=dt_bias,
         scale=scale,
@@ -157,7 +157,6 @@ def recurrent_kda(
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
         num_spec_tokens=num_spec_tokens,
         num_accepted_tokens=num_accepted_tokens,
         output=output,
