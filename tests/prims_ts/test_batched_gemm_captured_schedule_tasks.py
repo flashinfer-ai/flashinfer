@@ -48,6 +48,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     SfSmemToTmemCopy,
     TileScheduler,
     _ldgsts_sfb_producer_commit_prefetch_depth,
+    compute_warp_layout,
     make_config,
     uniform_pipeline_stage_overrides,
     validate_config,
@@ -58,6 +59,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
 from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
     _runtime_config,
 )
+from flashinfer.prims_ts.batched_gemm.tmem_c_resources import TmemCResource
 from flashinfer.prims_ts.batched_gemm.smem_misc_resources import (
     BatchedGemmWorkQueue,
     ProxyClusterBarrierResource,
@@ -71,6 +73,8 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_tasks import (
     create_copy_sfab_task,
     create_copy_sfb_task,
     create_epilogue_task,
+    create_fused_gather_sfb_task,
+    create_fused_load_a_sfa_task,
     create_gather_task,
     create_load_a_task,
     create_load_b_task,
@@ -255,6 +259,14 @@ class _DummyResource(MemoryResource):
         returns=("coord_b_k", "coord_b_mn", "coord_b_l", "mn_limit")
     )
     def compute_b_coords_head(self, stage_info):
+        pass
+
+    @consumer_work_decorator(
+        returns=("coord_b_k", "coord_b_mn", "coord_b_l", "mn_limit")
+    )
+    def compute_b_coords_prefetch(
+        self, stage_info, *, prefetch_idx: cutlass.Constexpr[int]
+    ):
         pass
 
     @consumer_work_decorator(
@@ -956,6 +968,113 @@ def test_ldgsts_sf_pipeline_configs_use_async_load_producers():
     assert smem_sfb_cfg.producer_group.size == compact_cfg.num_load_sfb_warps * 32
     assert not smem_sfb_cfg.advance_on_acquire
 
+def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_N),
+        cluster_m=2,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        epi_tile_n=32,
+        act_kind=int(ActKind.SWIGLU),
+        fuse_operand_sf_loads=1,
+        fuse_sf_copy_to_mma=1,
+        gather_regs=128,
+        load_b_regs=96,
+        load_sfb_regs=128,
+        mma_k=64,
+        mma_m=256,
+        mma_n=128,
+        num_load_sfb_warps=4,
+        num_stages_a=3,
+        num_stages_b=3,
+        num_stages_smem_sfa=3,
+        num_stages_smem_sfb=3,
+        route_act=int(RouteImpl.LDGSTS),
+        route_sfs_act=int(RouteImpl.LDGSTS),
+        sf_layout_b=int(SfLayout.LINEAR),
+        tile_k=512,
+        tile_n=128,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        transpose_mma_output=1,
+        use_early_exit=1,
+    )
+    compute_warp_layout(cfg)
+    validate_config(cfg)
+
+    assert cfg.threads_per_cta == 384
+    assert cfg.epilogue_warp_idx == 0
+    assert cfg.gather_warp_idx == 4
+    assert cfg.load_b_warp_idx == cfg.gather_warp_idx
+    assert cfg.load_sfb_warp_idx == cfg.gather_warp_idx
+    assert cfg.load_a_warp_idx == 8
+    assert cfg.load_sfa_warp_idx == cfg.load_a_warp_idx
+    assert cfg.mma_warp_idx == 9
+    assert cfg.workid_warp_idx == 10
+    assert cfg.padding_warp_idx == 11
+    assert cfg.num_sync_warps == 0
+
+    pipeline_cfgs = _make_pipeline_configs(cfg)
+    gather_pipeline = pipeline_cfgs["smem_gather"]
+    assert gather_pipeline.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+    assert gather_pipeline.advance_on_acquire
+    assert (
+        gather_pipeline.producer_group.size == cfg.num_gather_warps * 32 * cfg.cluster_m
+    )
+
+    work_queue = _work_queue()
+    fused_a = create_fused_load_a_sfa_task(
+        cfg,
+        _res("GmemA"),
+        _res("SmemA"),
+        _res("GmemSfA"),
+        _res("SmemSfA"),
+        work_queue,
+        num_k_tiles=14,
+    )
+    fused_b = create_fused_gather_sfb_task(
+        cfg,
+        _res("GmemB"),
+        _res("SmemB"),
+        _res("GmemSfB"),
+        _res(
+            "SmemSfB",
+            pipeline_config=SimpleNamespace(advance_on_acquire=True),
+            producer_commit_prefetch_depth=2,
+        ),
+        work_queue,
+        num_k_tiles=14,
+    )
+
+    assert fused_a.name == "FusedLoadASfATask"
+    assert fused_a.warp_idx == cfg.load_a_warp_idx
+    assert fused_a.num_warps == 1
+    assert fused_b.name == "FusedGatherSfBTask"
+    assert fused_b.warp_idx == cfg.gather_warp_idx
+    assert fused_b.num_warps == 4
+
+
+def test_fused_sf_copy_reserves_tmem_after_accumulator():
+    cfg = make_config(
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        fuse_sf_copy_to_mma=1,
+        mma_k=64,
+        mma_m=256,
+        mma_n=128,
+        num_stages_tmem_acc=2,
+        tile_k=512,
+        tile_n=128,
+    )
+    resource = TmemCResource(cfg=cfg, pipeline_config=None, name="TmemC")
+
+    assert resource._alloc_c.num_columns == (
+        cfg.tmem_c_cols_per_stage * cfg.num_stages_tmem_acc
+        + cfg.tmem_sfa_cols
+        + cfg.tmem_sfb_cols
+    )
+    assert resource._alloc_c.num_columns == cfg.tmem_required_cols
 
 def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     source = inspect.getsource(ts_pipeline.TSPipelineAsyncUmma.producer_commit)
@@ -1222,8 +1341,13 @@ def test_runtime_config_preserves_plain_bf16_stages():
     assert normalized.num_stages_a == 5
     assert normalized.num_stages_b == 5
 
-
-def test_runtime_config_preserves_unsupported_mma_unroll_for_validation():
+@pytest.mark.parametrize(
+    ("in_hidden", "expected_unroll"),
+    ((64, 0), (128, 1), (192, 0)),
+)
+def test_runtime_config_enables_mma_unroll_only_for_even_k_tiles(
+    in_hidden, expected_unroll
+):
     cfg = make_config(
         dtype_a=int(DType.BF16),
         dtype_b=int(DType.BF16),
@@ -1234,11 +1358,10 @@ def test_runtime_config_preserves_unsupported_mma_unroll_for_validation():
         use_unroll_loop_2x_for_mma=1,
     )
 
-    normalized = _runtime_config(cfg, in_hidden=64)
+    normalized = _runtime_config(cfg, in_hidden=in_hidden)
 
-    assert normalized.use_unroll_loop_2x_for_mma == 1
-    with pytest.raises(ValueError, match="use_unroll_loop_2x_for_mma"):
-        validate_config(normalized)
+    assert normalized.use_unroll_loop_2x_for_mma == expected_unroll
+    validate_config(normalized)
 
 
 def test_runtime_config_preserves_scaled_fp4_stages():

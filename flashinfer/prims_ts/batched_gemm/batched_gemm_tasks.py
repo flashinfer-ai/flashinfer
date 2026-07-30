@@ -405,6 +405,259 @@ def create_gather_task(
     )
 
 
+def create_fused_load_a_sfa_task(
+    cfg,
+    gmem_a,
+    smem_a,
+    gmem_sfa,
+    smem_sfa,
+    work_queue,
+    num_k_tiles: int,
+    work_throttle=None,
+) -> Task:
+    """Load the weight operand and its scale factors on the same warp.
+
+    This is the swap-AB high-throughput schedule used by TRT-LLM Gen: one warp
+    issues both TMA streams before committing either pipeline.
+    """
+    is_persistent = _is_persistent(cfg)
+    has_work_throttle = is_persistent and work_throttle is not None
+    has_prepare_a_tile = hasattr(smem_a, "prepare_gather_tile")
+    has_prepare_sfa_tile = hasattr(smem_sfa, "prepare_sfa_tile")
+
+    @schedule
+    def fused_load_a_sfa_schedule(
+        gmem_a_res: MemoryResource,
+        smem_a_res: MemoryResource,
+        gmem_sfa_res: MemoryResource,
+        smem_sfa_res: MemoryResource,
+        *extra,
+    ) -> None:
+        idx = 0
+        throttle = extra[idx] if has_work_throttle else None
+        idx += 1 if has_work_throttle else 0
+        wq = extra[idx] if is_persistent else None
+
+        _ = gmem_a_res.init_coords_state()
+        _ = gmem_sfa_res.init_coords_state()
+        smem_a_res.init_load_state()
+        smem_sfa_res.init_load_state()
+        with _work_tile_schedule_loop(cfg, wq):
+            _ = gmem_a_res.compute_a_coords_head()
+            _call_named_aux_if_present(
+                smem_a_res, "prepare_gather_tile", has_prepare_a_tile
+            )
+            _call_named_aux_if_present(
+                smem_sfa_res, "prepare_sfa_tile", has_prepare_sfa_tile
+            )
+            if throttle is not None:
+                throttle.try_acquire()
+                throttle.acquire()
+                throttle.commit()
+            with domain_loop(0, num_k_tiles, 1):
+                coord_a_k, coord_a_mn, coord_a_l, expert_idx, mn_limit = (
+                    gmem_a_res.compute_a_coords_loop()
+                )
+                coord_sfa_k, coord_sfa_mn = gmem_sfa_res.compute_sfa_coords_loop()
+                smem_a_res.try_acquire()
+                smem_sfa_res.try_acquire()
+                smem_a_res.acquire()
+                smem_sfa_res.acquire()
+                smem_a_res.load_a_tile(
+                    coord_a_k=coord_a_k,
+                    coord_a_mn=coord_a_mn,
+                    coord_a_l=coord_a_l,
+                    expert_idx=expert_idx,
+                    mn_limit=mn_limit,
+                )
+                smem_sfa_res.load_sfa_tile(
+                    coord_sfa_k=coord_sfa_k,
+                    coord_sfa_mn=coord_sfa_mn,
+                )
+                smem_a_res.commit()
+                smem_sfa_res.commit()
+
+    extra_resources = []
+    if has_work_throttle:
+        extra_resources.append(work_throttle)
+    if is_persistent:
+        extra_resources.append(work_queue)
+    captured_schedule = fused_load_a_sfa_schedule(
+        gmem_a,
+        smem_a,
+        gmem_sfa,
+        smem_sfa,
+        *extra_resources,
+    )
+    return Task(
+        src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
+        dst_resources=[smem_a, smem_sfa]
+        + ([work_throttle] if has_work_throttle else []),
+        warp_idx=cfg.load_a_warp_idx,
+        num_warps=cfg.num_load_a_warps,
+        schedule=captured_schedule,
+        num_registers=max(cfg.load_a_task_regs, cfg.load_sfa_task_regs),
+        name="FusedLoadASfATask",
+    )
+
+
+def create_fused_gather_sfb_task(
+    cfg,
+    gmem_b,
+    smem_b,
+    gmem_sfb,
+    smem_sfb,
+    work_queue,
+    num_k_tiles: int,
+    pdl_wait_resource=None,
+    pdl_launch_resource=None,
+) -> Task:
+    """Gather routed activations and their SFs with one LDGSTS warpgroup.
+
+    Both resources advance their acquire cursor ahead of the commit cursor.
+    The SFB copy closes the shared cp.async group, then its drain publishes
+    both barriers together after the same two-stage prefetch window as Gen.
+    """
+    is_persistent = _is_persistent(cfg)
+    has_pdl_wait = pdl_wait_resource is not None
+    has_pdl_launch = pdl_launch_resource is not None
+    has_prepare_gather_tile = hasattr(smem_b, "prepare_gather_tile")
+    has_prepare_sfb_tile = hasattr(smem_sfb, "prepare_sfb_tile")
+    prefetch_depth = _producer_commit_prefetch_depth(smem_sfb)
+
+    @schedule
+    def fused_gather_sfb_schedule(
+        gmem_b_res: MemoryResource,
+        smem_b_res: MemoryResource,
+        gmem_sfb_res: MemoryResource,
+        smem_sfb_res: MemoryResource,
+        *extra,
+    ) -> None:
+        idx = 0
+        pdl_wait = extra[idx] if has_pdl_wait else None
+        idx += 1 if has_pdl_wait else 0
+        pdl_launch = extra[idx] if has_pdl_launch else None
+        idx += 1 if has_pdl_launch else 0
+        wq = extra[idx] if is_persistent else None
+        if pdl_wait is not None:
+            pdl_wait.wait_griddep()
+
+        _ = gmem_b_res.init_coords_state()
+        _ = gmem_sfb_res.init_coords_state()
+        smem_b_res.init_load_state()
+        smem_sfb_res.init_load_state()
+        with _work_tile_schedule_loop(cfg, wq):
+            _ = gmem_b_res.compute_b_coords_head()
+            _ = gmem_sfb_res.init_tile_state()
+            _call_named_aux_if_present(
+                smem_b_res, "prepare_gather_tile", has_prepare_gather_tile
+            )
+            _call_named_aux_if_present(
+                smem_sfb_res, "prepare_sfb_tile", has_prepare_sfb_tile
+            )
+            if prefetch_depth > 0:
+                for prefetch_idx in range(prefetch_depth):
+                    coord_b_k, coord_b_mn, coord_b_l, mn_limit = (
+                        gmem_b_res.compute_b_coords_prefetch(prefetch_idx=prefetch_idx)
+                    )
+                    coord_sfb_k, coord_sfb_mn = gmem_sfb_res.compute_sfb_coords_head(
+                        prefetch_idx=prefetch_idx + 1
+                    )
+                    smem_b_res.try_acquire()
+                    smem_sfb_res.try_acquire()
+                    smem_b_res.acquire()
+                    smem_sfb_res.acquire()
+                    smem_b_res.load_b_tile(
+                        coord_b_k=coord_b_k,
+                        coord_b_mn=coord_b_mn,
+                        coord_b_l=coord_b_l,
+                        mn_limit=mn_limit,
+                    )
+                    smem_sfb_res.load_sfb_tile(
+                        coord_sfb_k=coord_sfb_k,
+                        coord_sfb_mn=coord_sfb_mn,
+                    )
+                with domain_loop(prefetch_depth, num_k_tiles, 1):
+                    smem_sfb_res.drain_loop()
+                    smem_b_res.commit()
+                    smem_sfb_res.commit()
+                    coord_b_k, coord_b_mn, coord_b_l, mn_limit = (
+                        gmem_b_res.compute_b_coords_loop()
+                    )
+                    coord_sfb_k, coord_sfb_mn = gmem_sfb_res.compute_sfb_coords_loop()
+                    smem_b_res.try_acquire()
+                    smem_sfb_res.try_acquire()
+                    smem_b_res.acquire()
+                    smem_sfb_res.acquire()
+                    smem_b_res.load_b_tile(
+                        coord_b_k=coord_b_k,
+                        coord_b_mn=coord_b_mn,
+                        coord_b_l=coord_b_l,
+                        mn_limit=mn_limit,
+                    )
+                    smem_sfb_res.load_sfb_tile(
+                        coord_sfb_k=coord_sfb_k,
+                        coord_sfb_mn=coord_sfb_mn,
+                    )
+                for prefetch_idx in range(prefetch_depth):
+                    smem_sfb_res.drain_tail(prefetch_idx=prefetch_idx)
+                    smem_b_res.commit()
+                    smem_sfb_res.commit()
+            else:
+                with domain_loop(0, num_k_tiles, 1):
+                    coord_b_k, coord_b_mn, coord_b_l, mn_limit = (
+                        gmem_b_res.compute_b_coords_loop()
+                    )
+                    coord_sfb_k, coord_sfb_mn = gmem_sfb_res.compute_sfb_coords_loop()
+                    smem_b_res.try_acquire()
+                    smem_sfb_res.try_acquire()
+                    smem_b_res.acquire()
+                    smem_sfb_res.acquire()
+                    smem_b_res.load_b_tile(
+                        coord_b_k=coord_b_k,
+                        coord_b_mn=coord_b_mn,
+                        coord_b_l=coord_b_l,
+                        mn_limit=mn_limit,
+                    )
+                    smem_sfb_res.load_sfb_tile(
+                        coord_sfb_k=coord_sfb_k,
+                        coord_sfb_mn=coord_sfb_mn,
+                    )
+                    smem_sfb_res.drain_loop()
+                    smem_b_res.commit()
+                    smem_sfb_res.commit()
+        if pdl_launch is not None:
+            pdl_launch.launch_griddep()
+
+    extra_resources = []
+    if pdl_wait_resource is not None:
+        extra_resources.append(pdl_wait_resource)
+    if pdl_launch_resource is not None:
+        extra_resources.append(pdl_launch_resource)
+    if is_persistent:
+        extra_resources.append(work_queue)
+    captured_schedule = fused_gather_sfb_schedule(
+        gmem_b,
+        smem_b,
+        gmem_sfb,
+        smem_sfb,
+        *extra_resources,
+    )
+    return Task(
+        src_resources=(
+            [gmem_b, gmem_sfb]
+            + _pdl_wait_resources(pdl_wait_resource)
+            + ([work_queue] if cfg.is_persistent else [])
+        ),
+        dst_resources=[smem_b, smem_sfb] + _pdl_launch_resources(pdl_launch_resource),
+        warp_idx=cfg.gather_warp_idx,
+        num_warps=cfg.num_gather_warps,
+        schedule=captured_schedule,
+        num_registers=max(cfg.gather_regs, cfg.load_sfb_task_regs),
+        name="FusedGatherSfBTask",
+    )
+
+
 def create_sync_task(
     cfg,
     proxy_cluster,
@@ -1017,19 +1270,35 @@ def create_mma_task(
             else:
                 tmem_c_res.try_acquire()
                 tmem_c_res.acquire()
-                with domain_loop(0, num_k_tiles, 1):
-                    _mma_loop_body(
-                        smem_a_res,
-                        smem_b_res,
-                        tmem_c_res,
-                        proxy,
-                        smem_sfa_res,
-                        smem_sfb_res,
-                        tmem_sfa_res,
-                        tmem_sfb_res,
-                        tmem_sfab_res,
-                        tmem_cast_a_res,
-                    )
+                if getattr(cfg, "use_unroll_loop_2x_for_mma", 0):
+                    with domain_loop(0, num_k_tiles, 2):
+                        for _ in range(2):
+                            _mma_loop_body(
+                                smem_a_res,
+                                smem_b_res,
+                                tmem_c_res,
+                                proxy,
+                                smem_sfa_res,
+                                smem_sfb_res,
+                                tmem_sfa_res,
+                                tmem_sfb_res,
+                                tmem_sfab_res,
+                                tmem_cast_a_res,
+                            )
+                else:
+                    with domain_loop(0, num_k_tiles, 1):
+                        _mma_loop_body(
+                            smem_a_res,
+                            smem_b_res,
+                            tmem_c_res,
+                            proxy,
+                            smem_sfa_res,
+                            smem_sfb_res,
+                            tmem_sfa_res,
+                            tmem_sfb_res,
+                            tmem_sfab_res,
+                            tmem_cast_a_res,
+                        )
                 tmem_c_res.commit()
                 if cfg.use_tile256_tmem_overlap and cfg.num_epilogue_warps == 4:
                     tmem_c_res.advance_mma_overlap_window()

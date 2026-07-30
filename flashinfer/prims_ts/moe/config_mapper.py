@@ -149,6 +149,8 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "epi_tile_n",
         "epilogue_regs",
         "fused_act",
+        "fuse_operand_sf_loads",
+        "fuse_sf_copy_to_mma",
         "gather_regs",
         "load_a_regs",
         "load_b_regs",
@@ -202,6 +204,7 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "use_tma_oob_opt",
         "use_tma_store",
         "use_two_tma_load_warps",
+        "use_unroll_loop_2x_for_mma",
         "use_work_throttle",
         "weight_layout",
         "workid_regs",
@@ -897,7 +900,9 @@ def _json_config_kwargs(
         "num_stages_tmem_sfa": int(options["num_stages_tmem_sfa"]),
         "num_stages_tmem_sfb": int(options["num_stages_tmem_sfb"]),
         "num_stages_tmem_acc": tmem_acc_stages,
-        "use_unroll_loop_2x_for_mma": 0,
+        "use_unroll_loop_2x_for_mma": int(
+            _bool_value(options.get("use_unroll_loop_2x_for_mma", False))
+        ),
         "transpose_mma_output": int(
             _bool_value(options.get("transpose_mma_output", True))
         ),
@@ -913,6 +918,12 @@ def _json_config_kwargs(
         "use_global_scales": int(use_global_scales),
         "use_work_throttle": int(_bool_value(options.get("use_work_throttle", False))),
         "use_max_tmem_overlap": use_max_tmem_overlap,
+        "fuse_sf_copy_to_mma": int(
+            _bool_value(options.get("fuse_sf_copy_to_mma", False))
+        ),
+        "fuse_operand_sf_loads": int(
+            _bool_value(options.get("fuse_operand_sf_loads", False))
+        ),
         "epilogue_regs": epilogue_regs,
         "mma_regs": mma_regs,
         "load_regs": load_regs,

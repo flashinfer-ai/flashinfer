@@ -659,6 +659,24 @@ class BatchedGemmConfig:
     scales). See :attr:`uses_global_scales` for the effective value.
     """
 
+    fuse_sf_copy_to_mma: int = 0
+    """Fuse the scale-factor SMEM-to-TMEM copy into the MMA task. ``0``/``1``.
+
+    This matches TRT-LLM Gen's ``fuseUtccpWithUtcmma`` path and removes the
+    otherwise separate CopySf tasks.  Unlike :attr:`use_max_tmem_overlap`, it
+    does not require a tile-256 accumulator layout.
+    """
+
+    fuse_operand_sf_loads: int = 0
+    """Fuse each operand load with its scale-factor load. ``0``/``1``.
+
+    The clustered high-throughput LDGSTS path uses the same four warps for the
+    routed activation and activation-SF copies, and the same warp for the
+    weight and weight-SF TMA loads.  This matches the generated kernel's
+    12-warp schedule and lets both LDGSTS streams share one delayed commit
+    window.
+    """
+
     use_max_tmem_overlap: int = 0
     """Enable the tile256 fused-SF / maximum-TMEM-overlap path. ``0``/``1``.
 
@@ -731,10 +749,10 @@ class BatchedGemmConfig:
     """
 
     use_unroll_loop_2x_for_mma: int = 0
-    """Reserved.
+    """Unroll the MMA K loop by two stages. ``0``/``1``.
 
-    .. warning::
-        Not implemented -- must be ``0`` (:func:`validate_config` rejects ``1``).
+    The task consumes and releases two consecutive operand stages per captured
+    loop iteration. Odd K-tile counts automatically use the scalar loop.
     """
 
     use_work_throttle: int = 1
@@ -1518,9 +1536,14 @@ class BatchedGemmConfig:
     @property
     def uses_unfused_tmem_sf_copy(self) -> bool:
         """True when SF use a separate CopySf task (block-scaled and
-        not :attr:`use_max_tmem_overlap`).
+        neither explicitly fused into MMA nor covered by the tile-256
+        :attr:`use_max_tmem_overlap` path).
         """
-        return self.has_scale_factors and self.use_max_tmem_overlap == 0
+        return (
+            self.has_scale_factors
+            and self.fuse_sf_copy_to_mma == 0
+            and self.use_max_tmem_overlap == 0
+        )
 
     @property
     def smem_sfa_layout(self) -> int:
@@ -1607,13 +1630,16 @@ class BatchedGemmConfig:
     def split_b_across_ctas(self) -> bool:
         """True when a clustered kernel stages only a B slice per CTA.
 
-        Holds for clustered plain-MMA, tile256-overlap, or non-routed block-scaled
-        kernels; the TMA transaction stays cluster-total. See
-        :attr:`num_bytes_b_smem_per_stage`.
+        Holds for clustered plain-MMA, tile256-overlap, non-routed block-scaled,
+        or swap-AB LDGSTS gather kernels.  The LDGSTS gather resource assigns
+        ``tile_n / cluster_m`` routed rows to each CTA, so its per-stage SMEM
+        allocation and K-group descriptor stride must use the same split.
+        See :attr:`num_bytes_b_smem_per_stage`.
         """
         return self.has_cluster and (
             self.uses_plain_mma
             or self.use_tile256_tmem_overlap
+            or (self.is_swap_ab and self.has_gather)
             or (self.has_scale_factors and not self.has_routed_act)
             or (self.has_scale_factors and self.is_swap_ab and not self.has_routed_act)
         )
@@ -2202,7 +2228,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_gather_warps = min(max_gather_warps, max(1, (routed_rows + 3) // 4))
     else:
         cfg.num_gather_warps = 0
-    cfg.num_sync_warps = 1 if cfg.has_cluster and cfg.has_gather else 0
+    cfg.num_sync_warps = (
+        1 if cfg.has_cluster and cfg.has_gather and not cfg.fuse_operand_sf_loads else 0
+    )
     cfg.num_workid_warps = 1 if cfg.is_persistent else 0
     # CopySf warps copy scale factors to TMEM before the MMA. The compact low-N
     # SFB path needs the 4-warp STTM warpgroup; all bulk S2T paths use one warp
@@ -2220,6 +2248,27 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     else:
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
+
+    if cfg.fuse_operand_sf_loads:
+        # Gen's high-throughput FC1 layout:
+        #   epilogue 0-3, routed B/SFB 4-7, A/SFA 8, MMA 9, WorkId 10,
+        #   padding 11.
+        _pack_warp_layout(
+            cfg,
+            WarpLayout(
+                (
+                    "epilogue",
+                    "gather",
+                    "load_a",
+                    "mma",
+                    "workid",
+                )
+            ),
+        )
+        cfg.load_b_warp_idx = cfg.gather_warp_idx
+        cfg.load_sfb_warp_idx = cfg.gather_warp_idx
+        cfg.load_sfa_warp_idx = cfg.load_a_warp_idx
+        return
 
     sfb_uses_r8c4_sttm = cfg.sfb_smem_to_tmem_copy == int(
         SfSmemToTmemCopy.LDS_STTM
@@ -2267,6 +2316,34 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                     "copy_sfb",
                     "gather",
                     "sync",
+                    "mma",
+                    "workid",
+                )
+            ),
+        )
+        return
+
+    if (
+        cfg.has_tma_route
+        and cfg.is_swap_ab
+        and cfg.has_cluster
+        and cfg.tile_n >= 128
+        and cfg.num_load_b_warps == 4
+        and cfg.num_load_sfb_warps == 4
+    ):
+        # Keep the two four-warp routed load tasks warpgroup-aligned.  Besides
+        # matching the generated high-throughput schedule, this lets LoadB/SFB
+        # use their larger register budgets without sharing a warpgroup with
+        # the low-register MMA, LoadA, LoadSfA, and WorkId tasks.
+        _pack_warp_layout(
+            cfg,
+            WarpLayout(
+                (
+                    "epilogue",
+                    "load_b",
+                    "load_sfb",
+                    "load_a",
+                    "load_sfa",
                     "mma",
                     "workid",
                 )
@@ -2651,7 +2728,31 @@ def validate_config(
         raise ValueError(
             f"use_max_tmem_overlap must be 0 or 1, got {cfg.use_max_tmem_overlap}"
         )
-
+    if cfg.fuse_sf_copy_to_mma not in (0, 1):
+        raise ValueError(
+            f"fuse_sf_copy_to_mma must be 0 or 1, got {cfg.fuse_sf_copy_to_mma}"
+        )
+    if cfg.fuse_sf_copy_to_mma != 0 and not cfg.has_scale_factors:
+        raise ValueError("fuse_sf_copy_to_mma requires block-scaled MMA operands")
+    _validate_binary_config_option(
+        "fuse_operand_sf_loads",
+        cfg.fuse_operand_sf_loads,
+    )
+    if cfg.fuse_operand_sf_loads:
+        if not (
+            cfg.has_scale_factors
+            and cfg.has_gather
+            and cfg.has_cluster
+            and cfg.is_swap_ab
+            and cfg.uses_ldgsts_routed_sfs
+            and cfg.tile_n >= 128
+        ):
+            raise ValueError(
+                "fuse_operand_sf_loads requires clustered swap-AB LDGSTS "
+                "activation and scale-factor routing with tile_n >= 128"
+            )
+        if not cfg.fuse_sf_copy_to_mma:
+            raise ValueError("fuse_operand_sf_loads requires fuse_sf_copy_to_mma=1")
     if cfg.use_tma_oob_opt not in (0, 1):
         raise ValueError(f"use_tma_oob_opt must be 0 or 1, got {cfg.use_tma_oob_opt}")
 
@@ -2672,10 +2773,14 @@ def validate_config(
             f"use_work_throttle must be 0 or 1, got {cfg.use_work_throttle}"
         )
 
-    if cfg.use_unroll_loop_2x_for_mma != 0:
+    _validate_binary_config_option(
+        "use_unroll_loop_2x_for_mma",
+        cfg.use_unroll_loop_2x_for_mma,
+    )
+    if cfg.use_unroll_loop_2x_for_mma and cfg.has_deepseek_fp8:
         raise ValueError(
-            "use_unroll_loop_2x_for_mma is not supported; no separate "
-            "unrolled MMA task path is implemented yet"
+            "use_unroll_loop_2x_for_mma is not supported by the DeepSeek FP8 "
+            "per-K accumulator pipeline"
         )
 
     _validate_binary_config_option(

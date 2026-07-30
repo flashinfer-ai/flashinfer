@@ -102,7 +102,7 @@ def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     )
 
 
-def test_validation_rejects_unimplemented_mma_unroll():
+def test_validation_accepts_mma_unroll():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         make_config,
@@ -118,8 +118,7 @@ def test_validation_rejects_unimplemented_mma_unroll():
         tile_n=16,
         use_unroll_loop_2x_for_mma=1,
     )
-    with pytest.raises(ValueError, match="use_unroll_loop_2x_for_mma"):
-        validate_config(cfg)
+    validate_config(cfg)
 
 
 @pytest.mark.parametrize(
@@ -660,6 +659,45 @@ def test_validation_accepts_silu_activation():
     validate_config(cfg)
 
 
+def test_clustered_swap_ab_ldgsts_splits_b_smem_across_ctas():
+    """Each CTA stages its routed B rows and uses the matching K-group stride."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        RouteImpl,
+        make_config,
+    )
+
+    cfg = make_config(
+        cluster_m=2,
+        route_act=int(RouteImpl.LDGSTS),
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        tile_n=128,
+        mma_n=128,
+        epi_tile_n=32,
+        tile_k=512,
+        mma_k=64,
+    )
+
+    assert cfg.is_swap_ab
+    assert cfg.has_gather
+    assert cfg.split_b_across_ctas
+    assert cfg.num_bytes_b_per_stage == 32_768
+    assert cfg.num_bytes_b_smem_per_stage == 16_384
+
+
+def test_r128c4_sfb_s2t_descriptors_advance_in_k_group_order():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+    from flashinfer.prims_ts.batched_gemm.tmem_c_resources import (
+        _sfb_s2t_desc_increment,
+    )
+
+    assert [
+        _sfb_s2t_desc_increment(int(SfLayout.R128c4), copy_idx) for copy_idx in range(8)
+    ] == [0, 32, 64, 96, 128, 160, 192, 224]
+
+
 def test_ldgsts_routed_sf_does_not_use_routed_tma_descriptors():
     """LDGSTS-routed scale factors must not build compact TMA TensorMaps."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -882,6 +920,7 @@ def test_validation_rejects_clc_fast_drain_without_persistent_early_exit(
 ):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
+        TileScheduler,
         make_config,
         validate_config,
     )

@@ -270,6 +270,21 @@ class GmemBResource(MemoryResource):
 
     @consumer_work(returns=(coord_b_k, coord_b_mn, coord_b_l, mn_limit))
     @cute.jit
+    def compute_b_coords_prefetch(
+        self,
+        stage_info: StageInfo,
+        *,
+        prefetch_idx: cutlass.Constexpr[int],
+    ) -> tuple[Int32, Int32, Int32, Int32]:
+        """Build a prologue coordinate without relying on a loop offset."""
+        _, tile_coord_n, _ = stage_info.work_tile.tile_idx
+        coord_k = Int32(prefetch_idx * self.cfg.tile_k)
+        coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
+        coord_l = Int32(0) if self.cfg.is_swap_ab else self.tile_expert_idx
+        return coord_k, coord_mn, coord_l, self.tile_mn_limit
+
+    @consumer_work(returns=(coord_b_k, coord_b_mn, coord_b_l, mn_limit))
+    @cute.jit
     def compute_b_coords_loop(
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Int32]:

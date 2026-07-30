@@ -265,6 +265,50 @@
             ]
         },
         {
+            "_comment": "FP4_FC1_HighThroughputTile128K512",
+            "_template": "BatchedGemmFp4HighThroughput",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
+            "fused_act,act,eltwise_act_type": [
+                [true, "swiglu", "none"],
+                [true, "geglu", "none"],
+                [false, "none", "relu2"]
+            ],
+            "sf_layout_b": "linear",
+            "sf_layout_c": "128x4",
+            "mma_regs": 48,
+            "load_regs": 48,
+            "load_b_regs": 96,
+            "load_sf_regs": 48,
+            "load_sfb_regs": 128,
+            "copy_sf_regs": 48,
+            "padding_regs": 48,
+            "workid_regs": 48,
+            "gather_regs": 128,
+            "dtype_c": "e2m1",
+            "use_per_token_sf_b": false,
+            "per_token_sf_dtype": "fp32",
+            "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_work_throttle": true,
+            "fuse_sf_copy_to_mma": true,
+            "fuse_operand_sf_loads": true,
+            "use_unroll_loop_2x_for_mma": true,
+            "use_tma_oob_opt": false,
+            "num_stages_tmem_acc": 2,
+            "mma_n": 128,
+            "tile_n": 128,
+            "epi_tile_n": 32,
+            "tile_k": 512,
+            "num_stages_a": 3,
+            "num_stages_b": 3,
+            "num_stages_smem_sfa": 3,
+            "num_stages_smem_sfb": 3,
+            "num_stages_tmem_sfa": 1,
+            "num_stages_tmem_sfb": 3,
+            "num_load_sfb_warps": 4
+        },
+        {
             "_comment": "FP4_FC1_HighThroughputTile256",
             "_template": "BatchedGemmFp4HighThroughput",
             "route_act": "tma",
@@ -351,10 +395,14 @@
             "fused_act": false,
             "dtype_c": "bf16",
             "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "fuse_sf_copy_to_mma": false,
+            "use_unroll_loop_2x_for_mma": true,
             "num_stages_tmem_acc": 2,
+            "num_stages_c_smem": 1,
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b": [
                 [64, 64, 64, 512, 4, 4, 4, 4, 4, 4, "8x4"],
-                [128, 128, 128, 256, 5, 5, 5, 5, 5, 5, "128x4"]
+                [128, 128, 128, 256, 6, 6, 6, 6, 6, 6, "128x4"]
             ]
         },
         {
@@ -364,6 +412,8 @@
             "fused_act": false,
             "dtype_c": "bf16",
             "tile_scheduler": "persistent",
+            "use_clc_fast_drain": true,
+            "use_unroll_loop_2x_for_mma": true,
             "num_stages_tmem_acc": 1,
             "use_max_tmem_overlap": true,
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b": [

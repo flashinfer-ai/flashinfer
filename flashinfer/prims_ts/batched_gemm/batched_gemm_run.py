@@ -286,7 +286,17 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
                 f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
             )
-    runtime_cfg = replace(cfg)
+    num_k_tiles = (in_hidden + cfg.tile_k - 1) // cfg.tile_k
+    use_unroll_loop_2x_for_mma = cfg.use_unroll_loop_2x_for_mma
+    if use_unroll_loop_2x_for_mma and (num_k_tiles < 2 or num_k_tiles % 2 != 0):
+        # The captured unrolled schedule consumes exactly two pipeline stages
+        # per loop iteration. Fall back to the scalar MMA loop when concrete K
+        # does not contain an even number of tile-k slices.
+        use_unroll_loop_2x_for_mma = 0
+    runtime_cfg = replace(
+        cfg,
+        use_unroll_loop_2x_for_mma=use_unroll_loop_2x_for_mma,
+    )
     derive_problem_shape_constants(runtime_cfg, problem_mnk=(0, 0, in_hidden))
     return runtime_cfg
 

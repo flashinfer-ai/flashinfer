@@ -55,12 +55,20 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
     MX_MMA_FORMAT_E2M1,
     MX_MMA_FORMAT_E4M3,
+    SfLayout,
     TMEM_SF_UTCCP_COLS_PER_COPY,
     TMEM_SF_PACK_SIZE_BYTES,
 )
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
+
+
+def _sfb_s2t_desc_increment(smem_layout: int, copy_idx: int) -> int:
+    """Return the generated SFB SMEM-descriptor increment for one S2T copy."""
+    if smem_layout == int(SfLayout.R128c4):
+        return 32 * copy_idx
+    return 32 * (copy_idx // 2) + 128 * (copy_idx % 2)
 
 
 def _mx_dtype_from_format(format_id: int) -> type:
@@ -118,6 +126,16 @@ class TmemCResource(MemoryResource):
             else:
                 cols_per_stage = self.cfg.tmem_c_cols_per_stage
             total_cols = cols_per_stage * self.cfg.num_stages_tmem_acc
+            if (
+                self.cfg.has_scale_factors
+                and not self.cfg.uses_unfused_tmem_sf_copy
+                and not self.cfg.use_tile256_tmem_overlap
+            ):
+                # Fused S2T writes scale factors immediately after the
+                # accumulator. Reserve those columns as part of this resource;
+                # no standalone TmemSf resources participate in the task graph
+                # (and therefore the allocator) on this path.
+                total_cols += self.cfg.tmem_sfa_cols + self.cfg.tmem_sfb_cols
             self._alloc_c = TmemAllocation(
                 f"{self.name}_tmem_c",
                 num_columns=total_cols,
@@ -183,7 +201,10 @@ class TmemCResource(MemoryResource):
             base_row = self.tmem_raw_addr >> 16
             # TMEM allocator order: C first (at offset 0), then SFA, SFB
             # Matches nvfp4_gemm reference: acc at base, SFA after acc
-            c_total_cols = self._alloc_c.num_columns
+            # The fused SF reservation is included in _alloc_c, but SFA starts
+            # after the accumulator region rather than after the whole
+            # allocation.
+            c_total_cols = self._tmem_c_cols_per_stage() * self.cfg.num_stages_tmem_acc
             sf_stage_mult = (
                 self.cfg.num_stages_tmem_sfa
                 if self.cfg.uses_unfused_tmem_sf_copy
@@ -530,7 +551,9 @@ class TmemCResource(MemoryResource):
                         increment_s2t = 32 * s2t_idx
                     else:
                         sfb_tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
-                        increment_s2t = 32 * (s2t_idx // 2) + 128 * (s2t_idx % 2)
+                        increment_s2t = _sfb_s2t_desc_increment(
+                            self.cfg.smem_sfb_layout, s2t_idx
+                        )
                     sfb_tmem_addr = self.sfb_tmem_addr_base + sfb_tmem_delta
                     sfb_tmem_ptr = prims.make_tmem_ptr(sfb_tmem_addr, cutlass.Int32)
                     desc_s2t = desc_b_s2t_base + increment_s2t

@@ -87,7 +87,6 @@ def test_config_mapper_json_uses_prims_ts_option_names():
         "num_slices_for_split_k",
         "slice_k",
         "use_shuffled_matrix",
-        "use_unroll_loop_2x_for_mma",
     }
     for cfg in _expanded_prims_ts_json_configs():
         assert not stale_keys.intersection(cfg.options)

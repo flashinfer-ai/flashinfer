@@ -100,6 +100,8 @@ from .batched_gemm_tasks import (
     create_load_a_task,
     create_load_b_task,
     create_gather_task,
+    create_fused_load_a_sfa_task,
+    create_fused_gather_sfb_task,
     create_sync_task,
     create_load_sfa_task,
     create_load_sfb_task,
@@ -424,17 +426,25 @@ def _make_pipeline_configs(cfg):
         gather_consumer_wait_signaling = (
             SignalingThreads.All if cfg.has_cluster and cfg.num_sync_warps > 0 else None
         )
+        gather_producer_threads = cfg.num_gather_warps * 32
+        gather_producer_op = pipeline.PipelineOp.AsyncLoad
+        gather_advance_on_acquire = False
+        if cfg.fuse_operand_sf_loads:
+            gather_producer_threads *= cfg.cluster_m
+            gather_producer_op = pipeline.PipelineOp.AsyncThread
+            gather_advance_on_acquire = True
         gather_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.num_stages_b if cfg.is_swap_ab else cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, cfg.num_gather_warps * 32
+                pipeline.Agent.Thread, gather_producer_threads
             ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_vmnk,
             producer_signaling_threads=SignalingThreads.All,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
             consumer_wait_signaling_threads=gather_consumer_wait_signaling,
-            producer_op=pipeline.PipelineOp.AsyncLoad,
+            producer_op=gather_producer_op,
+            advance_on_acquire=gather_advance_on_acquire,
         )
         result["smem_gather"] = gather_cfg
 
@@ -647,12 +657,13 @@ def _make_pipeline_configs(cfg):
         add_clc_consumer_warps(cfg.num_cast_a_warps)
         add_clc_consumer_warps(cfg.num_mma_warps, leader_only=cfg.has_cluster)
         add_clc_consumer_warps(cfg.num_workid_warps, leader_only=cfg.has_cluster)
-        if cfg.has_scale_factor_a:
+        if cfg.has_scale_factor_a and not cfg.fuse_operand_sf_loads:
             add_clc_consumer_warps(cfg.num_load_sfa_warps)
         if cfg.has_deepseek_fp8:
             add_clc_consumer_warps(cfg.num_load_sfab_warps)
         if cfg.has_scale_factors:
-            add_clc_consumer_warps(cfg.num_load_sfb_warps)
+            if not cfg.fuse_operand_sf_loads:
+                add_clc_consumer_warps(cfg.num_load_sfb_warps)
             if cfg.use_combined_sfab_copy:
                 add_clc_consumer_warps(
                     cfg.num_copy_sfa_warps,
@@ -845,16 +856,16 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 num_k_tiles,
                 work_throttle=work_throttle,
             )
+            smem_b = smem_tma_gather
             load_b = create_load_b_task(
                 cfg,
                 gmem_b,
-                smem_tma_gather,
+                smem_b,
                 work_queue,
                 num_k_tiles,
                 pdl_wait_resource=pdl_wait_resource,
                 pdl_launch_resource=pdl_launch_resource,
             )
-            smem_b = smem_tma_gather
             task_list = [load_a, load_b]
         else:
             load_a = create_load_a_task(
@@ -1008,25 +1019,50 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tmem_sfa = TmemSfAResource(cfg=cfg, pipeline_config=None, name="TmemSfA")
             tmem_sfb = TmemSfBResource(cfg=cfg, pipeline_config=None, name="TmemSfB")
 
-        load_sfa = create_load_sfa_task(
-            cfg,
-            gmem_sfa,
-            smem_sfa,
-            work_queue,
-            num_k_tiles,
-            pdl_wait_resource=None if cfg.is_swap_ab else pdl_wait_resource,
-            pdl_launch_resource=None if cfg.is_swap_ab else pdl_launch_resource,
-        )
-        load_sfb = create_load_sfb_task(
-            cfg,
-            gmem_sfb,
-            smem_sfb,
-            work_queue,
-            num_k_tiles,
-            pdl_wait_resource=pdl_wait_resource if cfg.is_swap_ab else None,
-            pdl_launch_resource=pdl_launch_resource if cfg.is_swap_ab else None,
-        )
-        task_list += [load_sfa, load_sfb]
+        if cfg.fuse_operand_sf_loads:
+            task_list = [
+                create_fused_load_a_sfa_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_sfa,
+                    smem_sfa,
+                    work_queue,
+                    num_k_tiles,
+                    work_throttle=work_throttle,
+                ),
+                create_fused_gather_sfb_task(
+                    cfg,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    num_k_tiles,
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                ),
+            ]
+        else:
+            load_sfa = create_load_sfa_task(
+                cfg,
+                gmem_sfa,
+                smem_sfa,
+                work_queue,
+                num_k_tiles,
+                pdl_wait_resource=None if cfg.is_swap_ab else pdl_wait_resource,
+                pdl_launch_resource=None if cfg.is_swap_ab else pdl_launch_resource,
+            )
+            load_sfb = create_load_sfb_task(
+                cfg,
+                gmem_sfb,
+                smem_sfb,
+                work_queue,
+                num_k_tiles,
+                pdl_wait_resource=pdl_wait_resource if cfg.is_swap_ab else None,
+                pdl_launch_resource=pdl_launch_resource if cfg.is_swap_ab else None,
+            )
+            task_list += [load_sfa, load_sfb]
 
         if cfg.uses_unfused_tmem_sf_copy:
             if cfg.use_combined_sfab_copy:
@@ -1156,17 +1192,28 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
+        ab_dependencies = [smem_a, smem_b]
+        if proxy_cluster is not None:
+            resource_dependency_graph[proxy_cluster] = ab_dependencies
+            ab_dependencies = [proxy_cluster]
         if cfg.use_combined_sfab_copy:
             resource_dependency_graph[tmem_sfab] = [smem_sfa, smem_sfb]
-            resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfab]
+            resource_dependency_graph[tmem_c] = ab_dependencies + [tmem_sfab]
         else:
             resource_dependency_graph[tmem_sfa] = [smem_sfa]
             resource_dependency_graph[tmem_sfb] = [smem_sfb]
-            resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfa, tmem_sfb]
+            resource_dependency_graph[tmem_c] = ab_dependencies + [
+                tmem_sfa,
+                tmem_sfb,
+            ]
     elif cfg.has_scale_factors:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
-        resource_dependency_graph[tmem_c] = [smem_a, smem_b, smem_sfa, smem_sfb]
+        ab_dependencies = [smem_a, smem_b]
+        if proxy_cluster is not None:
+            resource_dependency_graph[proxy_cluster] = ab_dependencies
+            ab_dependencies = [proxy_cluster]
+        resource_dependency_graph[tmem_c] = ab_dependencies + [smem_sfa, smem_sfb]
     elif cfg.has_cast_a:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[tmem_cast_a] = [smem_a, smem_sfa]
@@ -1833,23 +1880,46 @@ def _batched_gemm_kernel_bf16_body(
     proxy_cluster = None
     if cutlass.const_expr(cfg.has_gather):
         if cutlass.const_expr(cfg.is_swap_ab):
-            load_a = create_load_a_task(
-                cfg,
-                gmem_a,
-                smem_a,
-                work_queue,
-                k_tile_cnt,
-                work_throttle=work_throttle,
-            )
-            gather = create_gather_task(
-                cfg,
-                gmem_b,
-                smem_b,
-                work_queue,
-                k_tile_cnt,
-                pdl_wait_resource=pdl_wait_resource,
-                pdl_launch_resource=pdl_launch_resource,
-            )
+            if cutlass.const_expr(cfg.fuse_operand_sf_loads):
+                load_a = create_fused_load_a_sfa_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    gmem_sfa,
+                    smem_sfa,
+                    work_queue,
+                    k_tile_cnt,
+                    work_throttle=work_throttle,
+                )
+                gather = create_fused_gather_sfb_task(
+                    cfg,
+                    gmem_b,
+                    smem_b,
+                    gmem_sfb,
+                    smem_sfb,
+                    work_queue,
+                    k_tile_cnt,
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                )
+            else:
+                load_a = create_load_a_task(
+                    cfg,
+                    gmem_a,
+                    smem_a,
+                    work_queue,
+                    k_tile_cnt,
+                    work_throttle=work_throttle,
+                )
+                gather = create_gather_task(
+                    cfg,
+                    gmem_b,
+                    smem_b,
+                    work_queue,
+                    k_tile_cnt,
+                    pdl_wait_resource=pdl_wait_resource,
+                    pdl_launch_resource=pdl_launch_resource,
+                )
             tma_smem = smem_a  # TMA resource for SyncTask
             gather_smem = smem_b  # Gather resource for SyncTask
             task_list = [load_a, gather]
@@ -1946,7 +2016,7 @@ def _batched_gemm_kernel_bf16_body(
         )
         task_list += [load_sfa, cast_a]
 
-    if cutlass.const_expr(cfg.has_scale_factors):
+    if cutlass.const_expr(cfg.has_scale_factors and not cfg.fuse_operand_sf_loads):
         load_sfa = create_load_sfa_task(
             cfg,
             gmem_sfa,
@@ -2082,19 +2152,36 @@ def _batched_gemm_kernel_bf16_body(
     if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
+        ab_dependencies = [smem_a, smem_b]
+        if cutlass.const_expr(
+            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+        ):
+            resource_dependency_graph[proxy_cluster] = ab_dependencies
+            ab_dependencies = [proxy_cluster]
         if cutlass.const_expr(cfg.use_combined_sfab_copy):
             resource_dependency_graph[tmem_sfab] = [smem_sfa, smem_sfb]
-            resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfab]
+            resource_dependency_graph[tmem_c] = ab_dependencies + [tmem_sfab]
         else:
             resource_dependency_graph[tmem_sfa] = [smem_sfa]
             resource_dependency_graph[tmem_sfb] = [smem_sfb]
-            # Separate CopySf: TmemC depends on SmemA, SmemB, TmemSfA, TmemSfB
-            resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfa, tmem_sfb]
+            # Separate CopySf: TmemC depends on the A/B readiness proxy (when
+            # clustered gather is active) and both TMEM scale-factor rings.
+            resource_dependency_graph[tmem_c] = ab_dependencies + [
+                tmem_sfa,
+                tmem_sfb,
+            ]
     elif cutlass.const_expr(cfg.has_scale_factors):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
-        # Fused S2T+MMA: TmemC depends on SmemA, SmemB, SmemSfA, SmemSfB
-        resource_dependency_graph[tmem_c] = [smem_a, smem_b, smem_sfa, smem_sfb]
+        ab_dependencies = [smem_a, smem_b]
+        if cutlass.const_expr(
+            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+        ):
+            resource_dependency_graph[proxy_cluster] = ab_dependencies
+            ab_dependencies = [proxy_cluster]
+        # Fused S2T+MMA waits for the clustered A/B readiness proxy (when
+        # present) as well as both SMEM scale-factor rings.
+        resource_dependency_graph[tmem_c] = ab_dependencies + [smem_sfa, smem_sfb]
     elif cutlass.const_expr(cfg.has_cast_a):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[tmem_cast_a] = [smem_a, smem_sfa]
