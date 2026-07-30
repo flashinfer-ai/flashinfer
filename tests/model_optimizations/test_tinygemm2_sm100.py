@@ -10,14 +10,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm100a_supported
 
 
 def _skip_if_not_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("tinygemm2_sm100 tests require a CUDA device")
-    cc = get_compute_capability(torch.device("cuda"))
-    if cc not in ((10, 0), (10, 3)):
+    if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("tinygemm2_sm100 requires SM100/SM103")
 
 
