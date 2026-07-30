@@ -10,16 +10,24 @@ Requires Hopper (exactly sm_90), >=4 GPUs, and CuTeDSL runtime deps
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
 
-Parity methodology (mirrors the mxfp8_cutedsl twin): each test drives the SAME
-fused kernel twice — once through the full ``MoEEpLayer`` EP plumbing and once
-directly through the shim API (``hopper_fp8_mega_moe`` on a fresh symm buffer)
-with identical staged inputs, quantization, and preprocessed weights — and
-asserts bit-exact equality for the deterministic separate-reduce paths.  The
-kernel-vs-textbook-math anchor is the single-GPU oracle
-(``test_sm90_pull_fp8_kernel_vs_reference.py`` vs the drop's
-``compute_megamoe_reference_fp8``); this file anchors the EP layer plumbing on
-real cross-rank traffic.  The ikr (REDG) test compares against the
-explicit-reduce reference within the bf16 K-term accumulation band instead.
+Parity methodology (mirrors the mxfp8_cutedsl twin): each layer test drives
+the SAME fused kernel twice — once through the full ``MoEEpLayer`` EP plumbing
+and once directly through the shim API (``hopper_fp8_mega_moe`` on a fresh
+symm buffer) with identical staged inputs, quantization, and preprocessed
+weights — and asserts bit-exact equality for the deterministic separate-reduce
+paths.  The ikr (REDG) test compares against the explicit-reduce reference
+within the bf16 K-term accumulation band instead.
+
+Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
+self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
+ownership, peer-token dequant, cross-rank combine), because both sides run the
+same CUDA kernel.  ``test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle``
+closes that gap: every rank all-gathers the ACTUAL staged fp8 payloads,
+routing, and preprocessed weight legs, runs the drop's multi-rank-native
+pure-torch ground truth (``compute_megamoe_reference_fp8``) on the global
+problem, and checks its own rank's slice against the real-EP kernel output.
+The single-GPU oracle (``test_sm90_pull_fp8_kernel_vs_reference.py``) remains
+the ``world_size == 1`` anchor.
 
 per_tensor contract: the activation dequant scales are STATIC config scalars
 identical on every EP rank (the kernel dequantizes peer tokens with the local
@@ -571,6 +579,203 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_in_kernel_fc2_reduce():
     print(
         f"rank {rank}: sm90_pull_fp8 mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
+    )
+
+
+def _all_gather_stack(t):
+    """all_gather a per-rank tensor and stack it on a new leading rank dim.
+
+    FP8 payloads and E8M0 scale planes travel as uint8 bytes (NCCL supports
+    neither dtype) and are reinterpreted after the stack.
+    """
+    import torch
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size()
+    tc = t.contiguous()
+    byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
+    wire = tc.view(torch.uint8) if byte_wire else tc
+    gathered = [torch.empty_like(wire) for _ in range(world_size)]
+    dist.all_gather(gathered, wire)
+    stacked = torch.stack(gathered)
+    return stacked.view(tc.dtype) if byte_wire else stacked
+
+
+def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
+    """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
+
+    Every rank stages its own bf16 shard, runs the fused kernel with real
+    cross-rank NVSHMEM pulls, then all-gathers the ACTUAL staged fp8
+    activations + routing + preprocessed weight legs (no reliance on
+    cross-rank RNG determinism) and feeds the global problem to
+    ``compute_megamoe_reference_fp8`` — which is multi-rank native: it takes
+    ``(num_ranks, tokens_per_rank, ...)`` operands and computes
+    ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
+    its own output slice within the single-GPU oracle's tolerances.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        Fp8BlockScaleK,
+        compute_megamoe_reference_fp8,
+        hopper_fp8_mega_moe,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(
+        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+    )
+    kernel = create_mega_kernel(_megakernel_config(problem))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap,
+        kernel.runtime_requirements(bootstrap),
+    )
+    try:
+        n = problem["num_tokens"]
+        hidden = problem["hidden"]
+
+        symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            kind=problem["kind"],
+            fp8_scale_mode=fp8_scale_mode,
+            fc1_activation_dequant_scale=FC1_ACT_SCALE,
+        )
+        # Snapshot exactly what the kernel consumes (this rank's shard).
+        x_local = symm_buffer.x[:n].clone()
+        x_sf_local = symm_buffer.x_sf[:n].clone()
+
+        transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+        y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
+        hopper_fp8_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=n,
+            gate_up_clamp=problem["gate_up_clamp"],
+            fast_math=problem["fast_math"],
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        symm_buffer.destroy()
+
+        # Reassemble the global problem from the operands each rank staged.
+        x_g = _all_gather_stack(x_local)  # (R, n, hidden) fp8
+        idx_g = _all_gather_stack(problem["topk_ids"])  # (R, n, K) int64
+        w_g = _all_gather_stack(problem["topk_weights"])  # (R, n, K) fp32
+        # The per-tensor reference multiplies via torch._scaled_mm, which
+        # needs column-major B (K stride-1, as preprocess_mega_weights lays
+        # out); ship the contiguous transpose and transpose back so the
+        # gather does not silently re-stride the weights to row-major.
+        fc1_w_g = _all_gather_stack(transformed_l1[0].mT).mT  # (R, E_local, H, 2I)
+        fc2_w_g = _all_gather_stack(transformed_l2[0].mT).mT  # (R, E_local, I, H)
+        fc1_sf_g = _all_gather_stack(transformed_l1[1])
+        fc2_sf_g = _all_gather_stack(transformed_l2[1])
+
+        common_kwargs = dict(
+            input_activation=x_g,
+            input_topk_idx=idx_g,
+            input_topk_weights=w_g,
+            fc1_weight=fc1_w_g,
+            fc1_weight_sf=fc1_sf_g,
+            fc2_weight=fc2_w_g,
+            fc2_weight_sf=fc2_sf_g,
+            ab_dtype=torch.float8_e4m3fn,
+            ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
+            fp8_accum_mode="1xacc",
+            mma_tiler_k=128,
+            fc2_output_dtype=torch.bfloat16,
+            gate_up_clamp=problem["gate_up_clamp"],
+            fp8_scale_mode=fp8_scale_mode,
+        )
+        if fp8_scale_mode == "blockwise":
+            sf_cols = hidden // Fp8BlockScaleK
+            x_sf_g = _all_gather_stack(x_sf_local[:, :sf_cols].clone())
+            combine_ref = compute_megamoe_reference_fp8(
+                input_activation_sf=x_sf_g,
+                fc1_activation_block_scale=x_sf_g,
+                fc1_weight_block_scale=fc1_sf_g,
+                fc2_weight_block_scale=fc2_sf_g,
+                fc2_activation_block_scale=None,  # derived per token, like the kernel
+                **common_kwargs,
+            )
+        else:
+            # Static per-tensor activation scales are identical on every EP
+            # rank by contract, so the local (1,) legs stand in globally.
+            combine_ref = compute_megamoe_reference_fp8(
+                input_activation_sf=_all_gather_stack(x_sf_local),  # unused (ABI)
+                fc1_activation_dequant_scale=transformed_l1[2],
+                fc1_weight_dequant_scale=_all_gather_stack(transformed_l1[3]),
+                fc2_activation_dequant_scale=transformed_l2[2],
+                fc2_weight_dequant_scale=_all_gather_stack(transformed_l2[3]),
+                **common_kwargs,
+            )
+        # deepgemm graph folds topk weights before fc1-out quantization, so
+        # the per-topk terms reduce with a plain sum; compare this rank's slice.
+        y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+        assert torch.isfinite(y_kernel).all()
+        yk = y_kernel.to(torch.float32)
+        rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+        print(
+            f"[sm90 fp8 multirank oracle rank {rank} {fp8_scale_mode} "
+            f"swap_ab={swap_ab}] rel_l2={rel_l2.item():.4g} "
+            f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+            f"amax(ref)={y_ref.abs().max().item():.4g}"
+        )
+        # Single-GPU oracle tolerances (drop mega_runner: atol=rtol=1e-2),
+        # valid because the problem is conditioned to O(1) outputs and kernel
+        # + reference share the same gathered fp8 operands.
+        torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
+        assert rel_l2.item() < 0.02
+        return rank
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [
+        ("per_tensor", False),
+        ("per_tensor", True),
+        ("blockwise", False),
+        ("blockwise", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(fp8_scale_mode, swap_ab):
+    """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_torch_oracle(
+        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+    )
+    print(
+        f"rank {rank}: sm90_pull_fp8 mega kernel ({fp8_scale_mode}, "
+        f"swap_ab={swap_ab}) matches the multi-rank torch oracle"
     )
 
 
