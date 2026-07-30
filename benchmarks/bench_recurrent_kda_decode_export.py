@@ -81,17 +81,16 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         device=device,
         generator=generator,
     )
+    beta_logits = torch.randn(
+        (1, total_tokens, num_value_heads),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    beta = torch.sigmoid(beta_logits)
     g = F.logsigmoid(
         torch.randn(
             (1, total_tokens, num_value_heads, head_dim),
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-        )
-    ).to(torch.bfloat16)
-    beta = torch.sigmoid(
-        torch.randn(
-            (1, total_tokens, num_value_heads),
             dtype=torch.float32,
             device=device,
             generator=generator,
