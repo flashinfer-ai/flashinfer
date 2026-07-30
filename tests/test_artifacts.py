@@ -224,6 +224,14 @@ def _mock_file_index_responses():
     responses.add(
         responses.GET, deepgemm_source, body=success_deepgemm_response, status=200
     )
+    # DEEPGEMM_RUBIN ships the same deep-gemm kernel filenames from a separate
+    # directory, so reuse the same directory index body.
+    deepgemm_rubin_source = safe_urljoin(
+        test_cubin_repository, artifact_paths.DEEPGEMM_RUBIN
+    )
+    responses.add(
+        responses.GET, deepgemm_rubin_source, body=success_deepgemm_response, status=200
+    )
     # The Rubin pins list the *same* sm100f kernel filenames as their non-Rubin
     # counterparts (built from different sources), so reuse the same directory
     # index bodies. This is what makes bare-filename checksum keys collide.
@@ -349,6 +357,16 @@ e8f9a0b1c2d3 kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
 f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 """
 
+    # DEEPGEMM_RUBIN: identical deep-gemm kernel filenames to the non-Rubin pin,
+    # but every hash differs (built from different sources / a separate
+    # kernel_map.json), so it needs its own checksums body.
+    checksums_deepgemm_rubin = """3333333333333333333333333333333333333333333333333333333333333333 kernel_map.json
+1111aaaabbbbcccc kernel.fp8_m_grouped_gemm.007404769193.cubin
+2222aaaabbbbcccc kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
+3333aaaabbbbcccc kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
+4444aaaabbbbcccc kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
+"""
+
     # Add mock responses for checksums.txt files
     fmha_checksums_url = safe_urljoin(
         test_cubin_repository,
@@ -389,6 +407,17 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
     )
     responses.add(
         responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
+    )
+
+    deepgemm_rubin_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+    )
+    responses.add(
+        responses.GET,
+        deepgemm_rubin_checksums_url,
+        body=checksums_deepgemm_rubin,
+        status=200,
     )
 
     # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
@@ -445,6 +474,14 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 
     for expected_file_name in expected_deepgemm_cubin_files:
         expected_file_path = safe_urljoin(artifact_paths.DEEPGEMM, expected_file_name)
+        assert any(expected_file_path in url for url in cubin_file_paths), (
+            f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        )
+
+    for expected_file_name in expected_deepgemm_cubin_files:
+        expected_file_path = safe_urljoin(
+            artifact_paths.DEEPGEMM_RUBIN, expected_file_name
+        )
         assert any(expected_file_path in url for url in cubin_file_paths), (
             f"Expected cubin file '{expected_file_path}' not found in cubin file list"
         )
