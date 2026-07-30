@@ -1869,11 +1869,17 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-      // Keep tactic enumeration aligned with the public BMM artifact.
+#ifndef TLLM_RUBIN_FEATURES
+      // Keep tactic enumeration aligned with the public BMM artifact. The
+      // pinned Rubin package (TRTLLM_GEN_BMM_RUBIN) has no 192-tile FP4
+      // kernels (its only 192-tile kernels are FP8), and launchers are built
+      // eagerly for every advertised tile, so advertising 192 there fails
+      // runner construction outright.
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
+#endif
       tiles.push_back(256);
     }
     return tiles;
