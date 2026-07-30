@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_api
+from .jit.blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
@@ -64,6 +65,17 @@ def get_seed_and_offset(
 
 
 @functools.cache
+def get_blackwell_softmax_module():
+    return gen_blackwell_softmax_module().build_and_load()
+
+
+@functools.cache
+def _supports_blackwell_softmax(device_index: int) -> bool:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return major == 10 and minor in (0, 3)
+
+
+@functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
@@ -74,20 +86,35 @@ def get_sampling_module():
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
         enable_pdl: bool,
+        temperature_is_none: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
-        module.softmax(
-            workspace_buffer,
-            logits,
-            probs,
-            maybe_temperature_arr,
-            temperature_val,
-            enable_pdl,
-        )
+        device_index = logits.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        if _supports_blackwell_softmax(device_index):
+            get_blackwell_softmax_module().softmax(
+                workspace_buffer,
+                logits,
+                probs,
+                maybe_temperature_arr,
+                temperature_val,
+                enable_pdl,
+                temperature_is_none,
+            )
+        else:
+            module.softmax(
+                workspace_buffer,
+                logits,
+                probs,
+                maybe_temperature_arr,
+                temperature_val,
+                enable_pdl,
+            )
         return probs
 
     @register_fake_op("flashinfer::softmax")
@@ -97,6 +124,7 @@ def get_sampling_module():
         maybe_temperature_arr: Optional[torch.Tensor],
         temperature_val: float,
         enable_pdl: bool,
+        temperature_is_none: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -779,6 +807,7 @@ def softmax(
             [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
     """
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
+    temperature_is_none = temperature is None
     if temperature is None:
         temperature = 1.0
 
@@ -787,7 +816,11 @@ def softmax(
         enable_pdl = device_support_pdl(logits.device)
 
     return get_sampling_module().softmax(
-        workspace_buffer, logits, *_to_tensor_scalar_tuple(temperature), enable_pdl
+        workspace_buffer,
+        logits,
+        *_to_tensor_scalar_tuple(temperature),
+        enable_pdl,
+        temperature_is_none,
     )
 
 
