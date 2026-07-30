@@ -1,9 +1,9 @@
 """Tests for tinygemm2_sm100 — the generated SM100/SM103 tinygemm2 variants.
 
-The four frozen device TUs under ``csrc/tinygemm2_sm100/`` are generated Loom
-schedules exactly porting ``csrc/tinygemm2.cu``; the contract is bit-identical
-outputs. Every parity test below therefore uses ``torch.equal``, not a
-tolerance.
+The four frozen variants in ``csrc/tinygemm2_sm100/tinygemm2_sm100.cu`` are
+generated Loom schedules exactly porting ``csrc/tinygemm2.cu``; the contract
+is bit-identical outputs. Every parity test below therefore uses
+``torch.equal``, not a tolerance.
 """
 
 import pytest
