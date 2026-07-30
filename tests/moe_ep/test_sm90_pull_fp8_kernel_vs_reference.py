@@ -252,9 +252,9 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
     # contract; here derived from the known test inputs with the reference's
     # 0.95 headroom margin).
     if fp8_scale_mode == "per_tensor":
-        s1 = float(
-            problem["hidden_states"].to(torch.float32).abs().amax().item()
-        ) / (0.95 * E4M3_MAX)
+        s1 = float(problem["hidden_states"].to(torch.float32).abs().amax().item()) / (
+            0.95 * E4M3_MAX
+        )
     else:
         s1 = 1.0
 

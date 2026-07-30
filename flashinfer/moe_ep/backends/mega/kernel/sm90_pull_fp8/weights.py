@@ -20,7 +20,7 @@ kernel's PostSwigluHalf fold), NOT the SM100 MXFP8 tree's 32.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Tuple
 
 from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
@@ -123,9 +123,9 @@ def _swizzle_unit_e8m0_sf(
 
     plane = torch.ones(rows, cols, dtype=torch.float8_e8m0fnu, device=device)
     swizzled = to_blocked(plane)
-    return _stack_byte_reinterpretable_tensors(
-        [swizzled] * num_experts, dim=0
-    ).view(num_experts, swizzled.numel())
+    return _stack_byte_reinterpretable_tensors([swizzled] * num_experts, dim=0).view(
+        num_experts, swizzled.numel()
+    )
 
 
 def preprocess_mega_weights(
@@ -186,9 +186,7 @@ def preprocess_mega_weights(
 
     # FC1 N axis: gate/up interleaved in blocks of 8 rows BEFORE quantization,
     # so blockwise (N, K) scale blocks align with the layout the kernel sees.
-    w13_interleaved = _interleave_gate_up_8(
-        weights.w13, intermediate_size=fc1_out
-    )
+    w13_interleaved = _interleave_gate_up_8(weights.w13, intermediate_size=fc1_out)
 
     fc1_q_parts: list["torch.Tensor"] = []
     fc2_q_parts: list["torch.Tensor"] = []
@@ -249,9 +247,7 @@ def preprocess_mega_weights(
 
     hidden_sf_cols = ceil_div(hidden_size, 32)
     intermediate_sf_cols = ceil_div(intermediate_size, 32)
-    fc1_weight_sf = _swizzle_unit_e8m0_sf(
-        num_experts, fc1_out, hidden_sf_cols, device
-    )
+    fc1_weight_sf = _swizzle_unit_e8m0_sf(num_experts, fc1_out, hidden_sf_cols, device)
     fc2_weight_sf = _swizzle_unit_e8m0_sf(
         num_experts, hidden_size, intermediate_sf_cols, device
     )
@@ -316,6 +312,8 @@ def validate_transformed_mega_weights(
     data_dtype = _fp8_data_dtype(kind)
     blockwise = fp8_scale_mode == "blockwise"
 
+    fc1_sf_shape: Tuple[int, ...]
+    fc2_sf_shape: Tuple[int, ...]
     if blockwise:
         fc1_sf_shape = (local_experts, fc1_out // 128, hidden_size // 128)
         fc2_sf_shape = (local_experts, hidden_size // 128, intermediate_size // 128)
@@ -352,7 +350,9 @@ def validate_transformed_mega_weights(
         expected_scale_shape=fc2_sf_shape,
     )
 
-    for idx, (label, expert_dim) in enumerate((("fc1", local_experts), ("fc2", local_experts))):
+    for idx, (label, expert_dim) in enumerate(
+        (("fc1", local_experts), ("fc2", local_experts))
+    ):
         _weight, _sf, act_scale, weight_scale = transformed[idx]
         for name, scale, shape in (
             (f"{label} activation_dequant_scale", act_scale, (1,)),

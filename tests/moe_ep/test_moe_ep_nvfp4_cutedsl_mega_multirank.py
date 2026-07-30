@@ -823,7 +823,9 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import MegaMoENvfp4Config
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
+        MegaMoENvfp4Config,
+    )
 
     base = dict(
         rank=0,

@@ -49,6 +49,7 @@ plane alone is ~2.7 GB).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import os
 import sys
@@ -140,9 +141,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--gate-up-clamp", type=float, default=10.0)
     p.add_argument("--kind", choices=["fp8_e4m3", "fp8_e5m2"], default="fp8_e4m3")
-    p.add_argument(
-        "--fp8-accum-mode", choices=["1xacc", "2xacc"], default="1xacc"
-    )
+    p.add_argument("--fp8-accum-mode", choices=["1xacc", "2xacc"], default="1xacc")
     p.add_argument(
         "--load-balance-mode",
         choices=["static", "atomic_counter"],
@@ -321,7 +320,9 @@ def _is_oom(exc: BaseException) -> bool:
     return "out of memory" in msg or "oom" in msg or "nvshmem_malloc" in msg
 
 
-def _run_point(args, scale_mode: str, operand_order: str, tile, tokens: int) -> PointResult:
+def _run_point(
+    args, scale_mode: str, operand_order: str, tile, tokens: int
+) -> PointResult:
     """One (scale_mode, layout, tokens) point: build layer, time e2e + compute.
 
     Collective status agreement after the fallible phase keeps ranks in
@@ -401,9 +402,7 @@ def _run_point(args, scale_mode: str, operand_order: str, tile, tokens: int) -> 
         bench_workspace = bench_backend.prepare_workspace(bootstrap, fleet_params)
         bench_backend.stage_inputs(t, bench_workspace, quantize_input=True)
         compute = _time_calls(
-            lambda: bench_backend.compute(
-                bench_workspace, transformed, output=None
-            ),
+            lambda: bench_backend.compute(bench_workspace, transformed, output=None),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -420,21 +419,24 @@ def _run_point(args, scale_mode: str, operand_order: str, tile, tokens: int) -> 
     except Exception as exc:  # noqa: BLE001 - sweep must survive one bad point
         status = "skip_oom" if _is_oom(exc) else "failed"
         error = f"{type(exc).__name__}: {exc}"
-        my_stats = (status, float("nan"), float("nan"), float("nan"), float("nan"), error)
+        my_stats = (
+            status,
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            error,
+        )
     finally:
         # Free THIS point's session before the next allocation (the 32k-token
         # workspace needs the symmetric heap to itself). Backend release first
         # (drops the pool refcount), then the layer's (last release frees).
         if bench_backend is not None and bench_workspace is not None:
-            try:
+            with contextlib.suppress(Exception):
                 bench_backend.destroy(bench_workspace)
-            except Exception:  # noqa: BLE001
-                pass
         if layer is not None:
-            try:
+            with contextlib.suppress(Exception):
                 layer.destroy()
-            except Exception:  # noqa: BLE001
-                pass
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -456,9 +458,7 @@ def _run_point(args, scale_mode: str, operand_order: str, tile, tokens: int) -> 
         )
     else:
         worst = "skip_oom" if "skip_oom" in statuses else "failed"
-        errors = "; ".join(
-            f"rank{i}:{s[5]}" for i, s in enumerate(all_stats) if s[5]
-        )
+        errors = "; ".join(f"rank{i}:{s[5]}" for i, s in enumerate(all_stats) if s[5])
         result = PointResult(
             status=worst,
             e2e_us=[],
@@ -490,7 +490,9 @@ def _emit_row(
     result: PointResult,
     header_done: bool,
 ) -> None:
-    fc1, fc2, total = _flops_per_rank(tokens, args.top_k, args.hidden, args.intermediate)
+    fc1, fc2, total = _flops_per_rank(
+        tokens, args.top_k, args.hidden, args.intermediate
+    )
     ref_csv = _ref_csv_name(scale_mode, operand_order, tile)
     if not header_done:
         print(CSV_HEADER, flush=True)
@@ -572,9 +574,7 @@ def main() -> int:
 
     tokens_list = [int(t) for t in args.tokens.split(",") if t]
     scale_modes = (
-        ("per_tensor", "blockwise")
-        if args.scale_mode == "both"
-        else (args.scale_mode,)
+        ("per_tensor", "blockwise") if args.scale_mode == "both" else (args.scale_mode,)
     )
     orders = (
         ("non_swap_ab", "swap_ab")

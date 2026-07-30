@@ -42,9 +42,7 @@ import pytest
 # shim public API (``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip(
-    "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel"
-)
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel")
 
 E4M3_MAX = 448.0
 # Static per-tensor calibration (identical on all ranks by contract): randn
@@ -97,9 +95,10 @@ def _make_inputs(
     # rank — with topk == world_size that is experts {0, L, 2L, 3L} (distinct,
     # so no duplicate-expert rows).
     num_local = num_experts // world_size
-    forced = torch.arange(
-        min(topk, world_size), device="cuda", dtype=torch.int64
-    ) * num_local
+    forced = (
+        torch.arange(min(topk, world_size), device="cuda", dtype=torch.int64)
+        * num_local
+    )
     topk_ids[0, : forced.numel()] = forced
 
     return hidden_states, topk_weights.to(torch.float32), topk_ids

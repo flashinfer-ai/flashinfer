@@ -112,7 +112,9 @@ def preprocess_mega_weights(
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # shim exposes this cutlass-pulling helper lazily via the package boundary.
-    from .....kernel_src.sm100.cutedsl_megamoe import _stack_byte_reinterpretable_tensors
+    from .....kernel_src.sm100.cutedsl_megamoe import (
+        _stack_byte_reinterpretable_tensors,
+    )
 
     # Reject conflicting clamp aliases; the clamp itself is a kernel-side
     # nonlinearity parameter and must NOT scale the weight quantization.

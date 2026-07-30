@@ -205,9 +205,7 @@ class MegaMoEHopperFp8Config:
         if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
-            raise ValueError(
-                "in_kernel_fc2_reduce requires apply_topk_in_fc1=True."
-            )
+            raise ValueError("in_kernel_fc2_reduce requires apply_topk_in_fc1=True.")
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper FP8 v1 kernel only implements "
@@ -250,9 +248,7 @@ class MegaMoEHopperFp8Config:
                 f"group_hint must be positive when set, got {self.group_hint}."
             )
         if self.flag_batch < 1 or self.flag_batch > 32:
-            raise ValueError(
-                f"flag_batch must be in [1, 32], got {self.flag_batch}."
-            )
+            raise ValueError(f"flag_batch must be in [1, 32], got {self.flag_batch}.")
         eb = self.epi_flag_batch
         if len(eb) != 2:
             raise ValueError(
@@ -582,13 +578,9 @@ class MegaMoEHopperFp8Frontend:
 
         # Keep the dispatch pool and scheduler on the physical token tile: M
         # for the native layout and N after swapping A/B (driver recipe).
-        token_padding_block = (
-            c.mma_tiler_mnk[1] if c.swap_ab else c.mma_tiler_mnk[0]
-        )
+        token_padding_block = c.mma_tiler_mnk[1] if c.swap_ab else c.mma_tiler_mnk[0]
 
-        kernel_cls = (
-            Sm90MegaMoESwapABFp8Kernel if c.swap_ab else Sm90MegaMoEFp8Kernel
-        )
+        kernel_cls = Sm90MegaMoESwapABFp8Kernel if c.swap_ab else Sm90MegaMoEFp8Kernel
         kernel = kernel_cls(
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
@@ -838,7 +830,7 @@ class MegaMoEHopperFp8Frontend:
                 f"fp8_scale_mode={c.fp8_scale_mode!r})."
             )
 
-        weight_checks = (
+        weight_checks: Tuple[Tuple[str, torch.Tensor, Tuple[int, ...]], ...] = (
             ("fc1_weight", inputs.fc1_weight, (e, c.hidden, c.fc1_out)),
             ("fc2_weight", inputs.fc2_weight, (e, c.intermediate, c.hidden)),
         )
@@ -928,9 +920,7 @@ class MegaMoEHopperFp8Frontend:
                     f"{name} must have shape {shape}, got {tuple(tensor.shape)}."
                 )
             if tensor.dtype != torch.float32:
-                raise ValueError(
-                    f"{name} must be float32, got {tensor.dtype}."
-                )
+                raise ValueError(f"{name} must be float32, got {tensor.dtype}.")
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous.")
 
@@ -1233,9 +1223,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         # Legacy E8M0 wire: pad K_sf to a multiple of 4 SFs so dispatch_pull's
         # LDG.32 byte stride matches the host row stride; the trailing padded
         # SFs pair with fp8 data in TMA's OOB-fill-0 region.
-        sf_storage_cols = _round_up(
-            _ceil_div(hidden, _FP8_E8M0_SF_VEC_SIZE), 4
-        )
+        sf_storage_cols = _round_up(_ceil_div(hidden, _FP8_E8M0_SF_VEC_SIZE), 4)
         x_sf, x_sf_root = _sym_zeros_byte_view_1b(
             (num_max_tokens, sf_storage_cols),
             _E8M0_SCALE_DTYPE,
@@ -1555,15 +1543,11 @@ def _create_dummy_weights(
     )
 
     # Perf-style constant per-tensor dequant scales (driver perf_run branch).
-    fc1_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(
-        data_dtype, (1,)
-    )
+    fc1_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(data_dtype, (1,))
     fc1_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
         data_dtype, (num_local_experts,)
     )
-    fc2_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(
-        data_dtype, (1,)
-    )
+    fc2_activation_dequant_scale = make_fp8_per_tensor_dequant_scale(data_dtype, (1,))
     fc2_weight_dequant_scale = make_fp8_per_tensor_dequant_scale(
         data_dtype, (num_local_experts,)
     )
@@ -1678,9 +1662,7 @@ def create_dummy_inputs(
     )
     if fp8_scale_mode == "blockwise":
         sf_cols = hidden // _FP8_BLOCK_SCALE_K
-        activation_sf = make_constant_block_scale(
-            data_dtype, (num_tokens, sf_cols)
-        )
+        activation_sf = make_constant_block_scale(data_dtype, (num_tokens, sf_cols))
         symm_buffer.x_sf[:num_tokens, :sf_cols].copy_(activation_sf)
     else:
         sf_cols = _ceil_div(hidden, _FP8_E8M0_SF_VEC_SIZE)
@@ -1717,7 +1699,11 @@ def _main() -> None:
     NUM_TOPK = 4
     NUM_EXPERTS = 32
     GATE_UP_CLAMP = 10.0
-    FP8_SCALE_MODE = os.environ.get("MEGA_FP8_SCALE_MODE", "per_tensor")
+    FP8_SCALE_MODE: Literal["per_tensor", "blockwise"] = (
+        "blockwise"
+        if os.environ.get("MEGA_FP8_SCALE_MODE", "per_tensor") == "blockwise"
+        else "per_tensor"
+    )
     SWAP_AB = bool(int(os.environ.get("MEGA_FP8_SWAP_AB", "0")))
 
     rank, world_size = init_dist()
