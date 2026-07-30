@@ -53,6 +53,63 @@ def _is_cuda_graph_capturing() -> bool:
         return False
 
 
+def _resolve_cuda_device(device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def _prepare_ep_expert_map(
+    expert_map: torch.Tensor,
+    *,
+    num_local_experts: int,
+    num_experts: int,
+    device=None,
+) -> torch.Tensor:
+    """Validate one EP rank's global-to-local expert map.
+
+    Runs on the host and may synchronize. Every local expert id must occur
+    exactly once, matching vLLM's linear and round-robin expert placements,
+    so a malformed map cannot index outside the rank-local weights.
+    """
+    if not isinstance(expert_map, torch.Tensor):
+        raise TypeError("expert_map must be a torch.Tensor")
+    if expert_map.dtype != torch.int32:
+        raise TypeError(
+            f"expert_map must have dtype torch.int32, got {expert_map.dtype}"
+        )
+    if expert_map.ndim != 1 or not expert_map.is_contiguous():
+        raise ValueError("expert_map must be a contiguous rank-1 tensor")
+    if expert_map.numel() != num_experts:
+        raise ValueError(
+            f"expert_map must have num_experts={num_experts} entries, "
+            f"got {expert_map.numel()}"
+        )
+    if device is not None:
+        expected = _resolve_cuda_device(device)
+        if _resolve_cuda_device(expert_map.device) != expected:
+            raise ValueError(
+                f"expert_map must be on {expected}, got {expert_map.device}"
+            )
+    if _is_cuda_graph_capturing():
+        raise RuntimeError("expert_map must be validated before CUDA graph capture")
+    values = expert_map.detach().cpu().tolist()
+    invalid = [value for value in values if value < -1 or value >= num_local_experts]
+    if invalid:
+        raise ValueError(
+            "expert_map values must be -1 or valid local expert ids, "
+            f"found {invalid[0]} for num_local_experts={num_local_experts}"
+        )
+    mapped = sorted(value for value in values if value >= 0)
+    if mapped != list(range(num_local_experts)):
+        raise ValueError(
+            "expert_map must map every local expert id exactly once: "
+            f"expected {list(range(num_local_experts))}, got {mapped}"
+        )
+    return expert_map
+
+
 @supported_compute_capability([120, 121])
 @flashinfer_api(trace=b12x_fused_moe_trace)
 def b12x_fused_moe(
@@ -71,6 +128,7 @@ def b12x_fused_moe(
     fc2_input_scale: Optional[torch.Tensor] = None,
     input_global_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
+    expert_map: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
@@ -125,7 +183,19 @@ def b12x_fused_moe(
         ``w1_alpha``, which then serves both roles.  Ignored for
         ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
-        Local experts for expert parallelism.  Defaults to ``num_experts``.
+        Number of experts whose weights this rank holds, for expert
+        parallelism.  Defaults to ``num_experts``.  Requires
+        ``quant_mode="w4a16"`` and ``expert_map`` when it differs from
+        ``num_experts``.
+    expert_map : Optional[torch.Tensor]
+        Global-to-local expert map for expert parallelism, ``int32`` of shape
+        ``[num_experts]``.  Entry ``g`` is the rank-local weight index of
+        global expert ``g``, or ``-1`` if this rank does not hold it.  Every
+        rank sees the same activations and global top-k routes.  Non-local
+        routes are dropped, and the output is this rank's zero-filled
+        partial for the caller to sum across the EP group.  The values are
+        trusted per call and must cover ``[0, num_local_experts)`` exactly
+        once.  Only supported with ``quant_mode="w4a16"``.
     output : Optional[torch.Tensor]
         Pre-allocated output buffer of shape ``[num_tokens, hidden_size]``,
         ``bfloat16``.
@@ -180,12 +250,29 @@ def b12x_fused_moe(
     if num_local_experts is None:
         num_local_experts = num_experts
 
-    if num_local_experts != num_experts:
-        raise NotImplementedError(
-            f"b12x_fused_moe does not yet support Expert Parallelism "
-            f"(num_local_experts={num_local_experts} != num_experts={num_experts}). "
-            f"Use a different MoE backend for EP configurations."
-        )
+    if num_local_experts != num_experts or expert_map is not None:
+        from .blackwell_sm12x.moe_dispatch import _normalize_quant_mode
+
+        if _normalize_quant_mode(quant_mode, activation_precision) != "w4a16":
+            raise NotImplementedError(
+                f"b12x_fused_moe supports Expert Parallelism only for "
+                f"quant_mode='w4a16' "
+                f"(num_local_experts={num_local_experts}, "
+                f"num_experts={num_experts}). "
+                f"Use a different MoE backend for EP configurations."
+            )
+        if expert_map is None:
+            raise ValueError(
+                f"Expert Parallelism (num_local_experts={num_local_experts} != "
+                f"num_experts={num_experts}) requires expert_map. A default "
+                f"map would silently assume this rank holds global experts "
+                f"[0, {num_local_experts})."
+            )
+        if expert_map.numel() != num_experts:
+            raise ValueError(
+                f"expert_map must have num_experts={num_experts} entries, "
+                f"got {expert_map.numel()}"
+            )
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = x.size(1)
@@ -219,6 +306,7 @@ def b12x_fused_moe(
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
+        expert_map=expert_map,
         scatter_output=output,
         activation=activation,
         swiglu_alpha=swiglu_alpha,
@@ -243,7 +331,12 @@ class B12xMoEWrapper:
         intermediate_size: Intermediate size.
         use_cuda_graph: Pre-allocate buffers for CUDA graph compatibility.
         max_num_tokens: Maximum tokens (only for use_cuda_graph=True).
-        num_local_experts: Local experts for EP. Default: num_experts.
+        num_local_experts: Experts whose weights this rank holds, for EP.
+            Default: num_experts. Requires quant_mode="w4a16" and expert_map
+            when it differs from num_experts.
+        expert_map: Global-to-local expert map for EP, int32 [num_experts]
+            with -1 for non-local experts. run() returns this rank's
+            zero-filled partial for the caller to sum across the EP group.
         output_dtype: Output data type. Only torch.bfloat16 is currently
             supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
@@ -273,6 +366,7 @@ class B12xMoEWrapper:
         use_cuda_graph: bool = False,
         max_num_tokens: int = 4096,
         num_local_experts: Optional[int] = None,
+        expert_map: Optional[torch.Tensor] = None,
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         activation: str = "silu",
@@ -303,8 +397,17 @@ class B12xMoEWrapper:
             Maximum batch size, only used when ``use_cuda_graph=True``.
             Defaults to ``4096``.
         num_local_experts : Optional[int]
-            Number of local experts for expert parallelism.  Defaults to
+            Number of experts whose weights this rank holds, for expert
+            parallelism.  Defaults to ``num_experts``.  Requires
+            ``quant_mode="w4a16"`` and ``expert_map`` when it differs from
             ``num_experts``.
+        expert_map : Optional[torch.Tensor]
+            Global-to-local expert map for expert parallelism.  See
+            :func:`b12x_fused_moe`.  Validated on the host once here, which
+            may synchronize.  The tensor's storage must stay unchanged for
+            the wrapper lifetime, since validation happens only here and a
+            captured graph keeps the original pointer.  Only supported with
+            ``quant_mode="w4a16"``.
         output_dtype : torch.dtype
             Output dtype.  Only ``torch.bfloat16`` is currently supported.
         device : str
@@ -352,15 +455,9 @@ class B12xMoEWrapper:
         self.intermediate_size = intermediate_size
         self.use_cuda_graph = use_cuda_graph
         self.max_num_tokens = max_num_tokens
-        self.num_local_experts = num_local_experts or num_experts
-
-        if self.num_local_experts != self.num_experts:
-            raise NotImplementedError(
-                f"B12xMoEWrapper does not yet support Expert Parallelism "
-                f"(num_local_experts={self.num_local_experts} != "
-                f"num_experts={self.num_experts}). "
-                f"Use a different MoE backend for EP configurations."
-            )
+        self.num_local_experts = (
+            num_local_experts if num_local_experts is not None else num_experts
+        )
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
@@ -372,6 +469,34 @@ class B12xMoEWrapper:
             self.quant_mode
         )
         self.source_format = source_format
+
+        if self.num_local_experts != self.num_experts or expert_map is not None:
+            if self.quant_mode != "w4a16":
+                raise NotImplementedError(
+                    f"B12xMoEWrapper supports Expert Parallelism only for "
+                    f"quant_mode='w4a16' "
+                    f"(num_local_experts={self.num_local_experts}, "
+                    f"num_experts={self.num_experts}). "
+                    f"Use a different MoE backend for EP configurations."
+                )
+            if expert_map is None:
+                raise ValueError(
+                    f"Expert Parallelism (num_local_experts="
+                    f"{self.num_local_experts} != num_experts="
+                    f"{self.num_experts}) requires expert_map. A default map "
+                    f"would silently assume this rank holds global experts "
+                    f"[0, {self.num_local_experts})."
+                )
+            expert_map = _prepare_ep_expert_map(
+                expert_map,
+                num_local_experts=self.num_local_experts,
+                num_experts=self.num_experts,
+                device=self.device,
+            )
+        self.expert_map = expert_map
+        self._expert_map_data_ptr = (
+            expert_map.data_ptr() if expert_map is not None else None
+        )
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -532,6 +657,12 @@ class B12xMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
 
+        if (
+            self.expert_map is not None
+            and self.expert_map.data_ptr() != self._expert_map_data_ptr
+        ):
+            raise RuntimeError("expert_map storage changed after wrapper construction")
+
         if self.use_cuda_graph and num_tokens > self.max_num_tokens:
             raise ValueError(
                 f"num_tokens ({num_tokens}) exceeds max_num_tokens "
@@ -674,6 +805,7 @@ class B12xMoEWrapper:
             num_experts=self.num_experts,
             top_k=self.top_k,
             num_local_experts=self.num_local_experts,
+            expert_map=self.expert_map,
             scatter_output=moe_output,
             activation=self.activation,
             swiglu_alpha=self.swiglu_alpha,
