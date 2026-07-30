@@ -151,7 +151,6 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
-    DEEPGEMM_RUBIN: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
     DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
@@ -170,9 +169,6 @@ class CheckSumHash:
         "d0178cd486be54e622386e88daba9c2aca654be7e6f3dcd1af7ecca3354492d2"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
-    DEEPGEMM_RUBIN: str = (
-        "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
-    )
     TRTLLM_GEN_GEMM: str = (
         "f97f90f9ce1dab73eb3d7c90fca4bbd52687642dd87a79dd10b77d7802b25c33"
     )
@@ -200,7 +196,6 @@ class CheckSumHash:
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
-        safe_urljoin(ArtifactPath.DEEPGEMM_RUBIN, "checksums.txt"): DEEPGEMM_RUBIN,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "checksums.txt"): TRTLLM_GEN_GEMM,
         safe_urljoin(
             ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "checksums.txt"
