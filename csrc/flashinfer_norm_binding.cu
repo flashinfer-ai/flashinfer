@@ -15,13 +15,16 @@
  */
 #include "tvm_ffi_utils.h"
 
-void rmsnorm(TensorView out, TensorView input, TensorView weight, double eps, bool enable_pdl);
+using tvm::ffi::Optional;
+
+void rmsnorm(TensorView out, TensorView input, Optional<TensorView> weight, double eps,
+             bool enable_pdl);
 
 void rmsnorm_quant(TensorView out, TensorView input, TensorView weight, TensorView scale,
                    double eps, bool enable_pdl);
 
-void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
-                       bool enable_pdl);
+void fused_add_rmsnorm(TensorView input, TensorView residual, Optional<TensorView> weight,
+                       double eps, bool enable_pdl);
 
 void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView residual,
                              TensorView weight, TensorView scale, double eps, bool enable_pdl);
