@@ -49,9 +49,12 @@ class SparseDecodeForwardSm12x:
         q_fp8: bool = False,
         fused: bool = False,
         qoff_default: bool = False,
+        kv_packed: bool = False,
     ):
         if head_dim != 128 or blk_kv != 128:
             raise ValueError("only head_dim=blk_kv=128 supported")
+        if kv_packed and (not paged or kv_nvfp4):
+            raise ValueError("kv_packed requires the paged bf16/fp16/fp8 path")
         if group_size > 16:
             raise ValueError("group_size must be <= 16")
         self._head_dim = head_dim
@@ -72,6 +75,9 @@ class SparseDecodeForwardSm12x:
         self._kv_nvfp4 = kv_nvfp4
         self._q_fp8 = q_fp8
         self._fused = fused
+        # K/V packed in one cache: mK/mV are the same 5-D tensor
+        # (pages, Hkv, blk, 2, d); K is plane 0 of dim 3 and V plane 1.
+        self._kv_packed = kv_packed
         # Right-aligned decode (q_offset=None): the offset is seqlen_k - seqlen_q,
         # computed in-kernel so the wrapper launches no helper kernels to build it.
         self._qoff_default = qoff_default
@@ -82,6 +88,12 @@ class SparseDecodeForwardSm12x:
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
         )
+
+    def _paged_kv_block(self, mK, mV, page, kv_head):
+        """(128, d) K/V block views for one page; picks the planes when packed."""
+        if cutlass.const_expr(self._kv_packed):
+            return mK[page, kv_head, None, 0, None], mV[page, kv_head, None, 1, None]
+        return mK[page, kv_head, None, None], mV[page, kv_head, None, None]
 
     @cute.jit
     def __call__(
@@ -463,8 +475,9 @@ class SparseDecodeForwardSm12x:
                         ld_blk = mQ2K[kv_head, qi, ld_it]
                         if cutlass.const_expr(self._paged):
                             ld_page = mPageTable[batch_idx, ld_blk]
-                            ld_mK = mK[ld_page, kv_head, None, None]
-                            ld_mV = mV[ld_page, kv_head, None, None]
+                            ld_mK, ld_mV = self._paged_kv_block(
+                                mK, mV, ld_page, kv_head
+                            )
                         else:
                             ld_mK = cute.domain_offset(
                                 (k_start + ld_blk * self._blk_kv, 0),
@@ -626,8 +639,7 @@ class SparseDecodeForwardSm12x:
                     kv_block = mQ2K[kv_head, qi, it]
                     if cutlass.const_expr(self._paged):
                         page = mPageTable[batch_idx, kv_block]
-                        mK_blk = mK[page, kv_head, None, None]  # (128, d)
-                        mV_blk = mV[page, kv_head, None, None]
+                        mK_blk, mV_blk = self._paged_kv_block(mK, mV, page, kv_head)
                     else:
                         mK_blk = cute.domain_offset(
                             (k_start + kv_block * self._blk_kv, 0),
@@ -1002,8 +1014,7 @@ class SparseDecodeForwardSm12x:
             kv_block = mQ2K[kv_head, qi, it]
             if cutlass.const_expr(self._paged):
                 page = mPageTable[batch_idx, kv_block]
-                mK_blk = mK[page, kv_head, None, None]  # (128, d)
-                mV_blk = mV[page, kv_head, None, None]
+                mK_blk, mV_blk = self._paged_kv_block(mK, mV, page, kv_head)
             else:
                 mK_blk = cute.domain_offset(
                     (k_start + kv_block * self._blk_kv, 0), mK[None, kv_head, None]

@@ -20,33 +20,45 @@ from pathlib import Path
 from multiprocessing import Pool
 
 
-def gen_fused_moe_worker_process(temp_dir):
+def _bmm_export_symlink_path(gen_src_dir):
+    """Location where the BMM export headers are symlinked for C++ includes."""
+    return (
+        Path(gen_src_dir)
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+
+
+def gen_fused_moe_worker_process(dirs):
     """
     Worker function that calls gen_trtllm_gen_fused_moe_sm100_module end-to-end.
 
     Each process will:
-    1. Patch FLASHINFER_CUBIN_DIR in all modules to use the shared temp directory
+    1. Patch FLASHINFER_CUBIN_DIR (artifact download cache) and
+       FLASHINFER_GEN_SRC_DIR (where the symlink is created) to use the shared
+       temp directories
     2. Call gen_trtllm_gen_fused_moe_sm100_module (downloads artifacts, creates symlinks)
     3. Verify the symlink is correct
     """
+    cubin_dir, gen_src_dir = dirs
+
     from flashinfer.jit import env as jit_env
     from flashinfer.jit import cubin_loader
 
-    jit_env.FLASHINFER_CUBIN_DIR = Path(temp_dir)
-    cubin_loader.FLASHINFER_CUBIN_DIR = Path(temp_dir)
+    jit_env.FLASHINFER_CUBIN_DIR = Path(cubin_dir)
+    cubin_loader.FLASHINFER_CUBIN_DIR = Path(cubin_dir)
+    # The symlink is created under FLASHINFER_GEN_SRC_DIR, so it must be
+    # redirected too or the test would race on the real workspace directory.
+    jit_env.FLASHINFER_GEN_SRC_DIR = Path(gen_src_dir)
 
     from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 
     gen_trtllm_gen_fused_moe_sm100_module()
 
     # Verify the symlink was created correctly.
-    symlink_path = (
-        Path(temp_dir)
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
-    )
+    symlink_path = _bmm_export_symlink_path(gen_src_dir)
     assert symlink_path.is_symlink(), f"Expected {symlink_path} to be a symlink"
 
     # Verify we can read a header through the symlink
@@ -74,6 +86,10 @@ def test_gen_fused_moe_symlink_race_condition(num_iterations=100, num_processes=
     after the first download. Between iterations, the symlink is deleted to
     re-trigger the race condition without re-downloading.
 
+    The artifact cache and the generated-source directory are kept as separate
+    subdirectories so the assertion pins the symlink to FLASHINFER_GEN_SRC_DIR
+    and would catch it moving back under FLASHINFER_CUBIN_DIR.
+
     Args:
         num_iterations: Number of times to repeat the test
         num_processes: Number of concurrent processes per iteration
@@ -88,25 +104,23 @@ def test_gen_fused_moe_symlink_race_condition(num_iterations=100, num_processes=
         return
 
     temp_dir = tempfile.mkdtemp(prefix="flashinfer_test_fused_moe_symlink_")
-    symlink_path = (
-        Path(temp_dir)
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
-    )
+    cubin_dir = Path(temp_dir) / "cubins"
+    gen_src_dir = Path(temp_dir) / "generated"
+    cubin_dir.mkdir(parents=True, exist_ok=True)
+    gen_src_dir.mkdir(parents=True, exist_ok=True)
+    symlink_path = _bmm_export_symlink_path(gen_src_dir)
 
     try:
         with Pool(processes=num_processes) as pool:
             for iteration in range(num_iterations):
                 # Delete the symlink to re-trigger the race, but keep
-                # downloaded artifacts cached in temp_dir.
+                # downloaded artifacts cached in cubin_dir.
                 if symlink_path.is_symlink():
                     symlink_path.unlink()
 
                 results = pool.map(
                     gen_fused_moe_worker_process,
-                    [temp_dir] * num_processes,
+                    [(cubin_dir, gen_src_dir)] * num_processes,
                 )
 
                 assert all(results), (

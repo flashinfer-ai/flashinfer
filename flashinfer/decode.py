@@ -3575,6 +3575,9 @@ def xqa_batch_decode_with_kv_cache(
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+        On SM90 with fp8 KV cache, speculative decode with a non-negative window
+        runs on the generic kernel instead of the Hopper fp8 kernel (see
+        :func:`flashinfer.xqa.xqa`).
 
     out :  Optional[torch.Tensor] = None
         output tensor, if not provided, will be allocated with ``query.dtype``.
@@ -3608,7 +3611,9 @@ def xqa_batch_decode_with_kv_cache(
         ragged Q: requests may have different draft lengths. When given,
         query/out stay packed as [total_q_tokens, num_heads, head_dim],
         q_len_per_req must be the maximum draft length, and mask rows are
-        packed by the same cumulative offsets.
+        packed by the same cumulative offsets. On SM90 with fp8 KV cache,
+        speculative decode runs on the generic kernel instead of the Hopper
+        fp8 kernel (see :func:`flashinfer.xqa.xqa`).
 
     Returns
     -------

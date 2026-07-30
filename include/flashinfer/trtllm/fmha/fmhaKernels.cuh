@@ -605,17 +605,31 @@ class TllmGenFmhaKernel {
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
+  // Return the smallest shipped MLA head tile that contains a non-power-of-two head group below
+  // 64 heads. Power-of-two groups and groups with at least 128 heads return zero so callers
+  // preserve their existing heuristics; the unsupported 65-127 gap has no Q128 MLA cubin.
+  static int getPaddedMlaTileSizeQ(int numHeadsQPerKv) {
+    FLASHINFER_CHECK(numHeadsQPerKv > 0, "The numHeadsQPerKv must be positive, got %d.",
+                     numHeadsQPerKv);
+    if (numHeadsQPerKv >= 128 || (numHeadsQPerKv & (numHeadsQPerKv - 1)) == 0) {
+      return 0;
+    }
+    FLASHINFER_CHECK(numHeadsQPerKv <= 64,
+                     "Non-power-of-two MLA numHeadsQPerKv must be <= 64, got %d.", numHeadsQPerKv);
+    return std::max(8, flashinfer::UpPowerOfTwo(numHeadsQPerKv));
+  }
+
   // Select the sparse MLA generation kernel.
   // Heuristics benchmarked on B200 (SM=148, sparseMlaTopK=2048).
   void selectSparseMlaGenerationKernel(RunnerParams const& params,
                                        SelectKernelParams& selectKernelParams) const {
     // numHeadsQ <= 32 : SwapsMmaAbForGeneration
-    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 (GPU under-utilized with full tile; halving creates
-    //               2x more head-splitting CTAs), or numHeadsQPerKv at batch>=2.
+    //   Non-power-of-two head counts use one padded Q8/Q16/Q32 tile. Power-of-two head counts use
+    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 or numHeadsQPerKv at batch>=2.
     //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
     //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
     //     full tileSizeQ wins by 2-11% at batch>=2.
-    // numHeadsQ >= 64 : KeepsMmaAbForGeneration, tileSizeQ = 64
+    // numHeadsQ > 32 : KeepsMmaAbForGeneration, tileSizeQ = 64
     //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
     //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
     //   Note: at small batch e4m3 prefers SwapsMmaAb tileSizeQ=32 (+10%), but fp16 prefers
@@ -645,7 +659,7 @@ class TllmGenFmhaKernel {
                                                               params.mMultiProcessorCount / 8;
       tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
     } else {
-      // numHeadsQ >= 64: use KeepsMmaAbForGeneration.
+      // numHeadsQ > 32: use KeepsMmaAbForGeneration.
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       tileSizeQ = 64;
       selectKernelParams.mTileSizeKv = 128;
@@ -674,6 +688,12 @@ class TllmGenFmhaKernel {
         selectKernelParams.mHeadDimPerCtaV = 256;
       }
     }
+    // Preserve the legacy heuristic above for power-of-two groups. A non-power-of-two group must
+    // fit in one padded tile because the final head CTA cannot process a partial tile.
+    if (int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
+        paddedTileSizeQ != 0) {
+      tileSizeQ = paddedTileSizeQ;
+    }
   }
 
   // Select the MLA generation kernel.
@@ -687,13 +707,16 @@ class TllmGenFmhaKernel {
     if (isSparseMla(params.mSparseMlaType)) {
       selectSparseMlaGenerationKernel(params, selectKernelParams);
     } else {
+      int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
       // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
-      bool const useSwapsMmaAb = params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
+      // Padded Q64 must use KeepsMmaAb so split-KV also follows its standalone-reducer path.
+      bool const useSwapsMmaAb =
+          paddedTileSizeQ != 0 ? paddedTileSizeQ <= 32
+                               : params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
 
       if (useSwapsMmaAb) {
         kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        // Non-sparse MLA (legacy): tileSizeQ capped at 16.
-        tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+        tileSizeQ = paddedTileSizeQ != 0 ? paddedTileSizeQ : (params.mNumHeadsQPerKv <= 8 ? 8 : 16);
       } else {
         kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
         tileSizeQ = 64;

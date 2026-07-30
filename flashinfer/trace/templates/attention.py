@@ -2692,6 +2692,11 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
 
 
 def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
+    if kwargs.get("enable_dcp", False):
+        raise NotImplementedError(
+            "fi_trace does not yet represent cyclic DCP KV ownership or "
+            "cross-rank LSE merging for MLA decode"
+        )
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
         return trtllm_batch_decode_mla_sparse_trace
@@ -2764,16 +2769,6 @@ xqa_batch_decode_trace = TraceTemplate(
         ),
         "bmm2_scale": Scalar(
             "float32", optional=True, description="Scale applied after softmax @ V."
-        ),
-        "q_cu_seq_lens": Tensor(
-            ["len_indptr"],
-            dtype="int32",
-            optional=True,
-            description=(
-                "Cumulative per-request draft lengths [batch_size + 1] for "
-                "ragged speculative decode; query stays packed as "
-                "[num_tokens, num_heads, head_dim]."
-            ),
         ),
     },
     outputs={
