@@ -270,9 +270,9 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
-        assert not TrtllmFp4Config.supported(107)
+        assert TrtllmFp4Config.supported(107)
         assert not TrtllmFp8BlockConfig.supported(107)
-        assert not TrtllmBf16Config.supported(107)
+        assert TrtllmBf16Config.supported(107)
         assert not TrtllmBf16Config.supported(120)
         assert not TrtllmFp8BlockConfig.supported(110)
         assert not TrtllmFp8BlockConfig.supported(120)
