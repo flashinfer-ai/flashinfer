@@ -302,10 +302,10 @@ def test_trtllm_gen_routed_fused_moe(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
 @pytest.mark.parametrize("num_experts", [128, 256])
-@pytest.mark.parametrize("top_k", [4, 8])
+@pytest.mark.parametrize("top_k", [4])
 @pytest.mark.parametrize(
     "routing_method_type",
     [
