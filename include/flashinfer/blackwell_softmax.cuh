@@ -27,15 +27,17 @@
 extern "C" {
 
 __global__ void kernel_flashinfer_blackwell_softmax_bootstrap_seed(
-    float* logits, float* parameter, float* output, float* partial_max, float* partial_sum, int rows,
-    int vocab_size, int splits, int parameter_kind, float scalar_temperature);
+    float* logits, float* parameter, float* output, float* partial_max, float* partial_sum,
+    int rows, int vocab_size, int splits, int parameter_kind, float scalar_temperature);
 
 __global__ void kernel_flashinfer_blackwell_softmax_followup_rowwise(
     float* logits, float* parameter, float* output, int rows, int vocab_size, int parameter_kind,
     float scalar_temperature);
 
-__global__ void kernel_flashinfer_blackwell_softmax_followup_warp(
-    float* logits, float* parameter, float* output, int rows, int vocab_size, int parameter_kind,
-    float scalar_temperature);
+__global__ void kernel_flashinfer_blackwell_softmax_followup_warp(float* logits, float* parameter,
+                                                                  float* output, int rows,
+                                                                  int vocab_size,
+                                                                  int parameter_kind,
+                                                                  float scalar_temperature);
 
 }  // extern "C"

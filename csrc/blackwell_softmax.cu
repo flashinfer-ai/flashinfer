@@ -43,8 +43,7 @@ enum class ParameterKind : int {
 
 bool use_warp_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
   return rows <= 128 && vocab_size <= 257 &&
-         (parameter_kind == ParameterKind::kScalar ||
-          parameter_kind == ParameterKind::kPerRow);
+         (parameter_kind == ParameterKind::kScalar || parameter_kind == ParameterKind::kPerRow);
 }
 
 bool use_rowwise_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind) {
@@ -139,8 +138,8 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
                   &rows_i, &vocab_size_i, &splits_i, &parameter_kind_i, &temperature_val};
   return cudaLaunchCooperativeKernel(
       reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_bootstrap_seed),
-      dim3(static_cast<uint32_t>(grid)), dim3(kBootstrapThreads), args,
-      kBootstrapDynamicSmemBytes, stream);
+      dim3(static_cast<uint32_t>(grid)), dim3(kBootstrapThreads), args, kBootstrapDynamicSmemBytes,
+      stream);
 }
 
 }  // namespace
