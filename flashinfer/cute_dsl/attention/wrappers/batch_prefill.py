@@ -12,6 +12,7 @@ and reused across batches of any size.
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
@@ -24,9 +25,17 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.attention import cute_dsl_batch_prefill_run_trace
 
 from ..config import AttentionConfig, AttentionFusion
-from ..fusion.mask import MaskType
+from ..fusion.mask import MaskSpec
 from ..fusion.variant import AttentionVariant, StandardAttention
 from ..prefill import BlackwellFusedMultiHeadAttentionForward
+
+# V dtypes accepted when v.dtype differs from the planned q/k dtype
+# (mixed-dtype PV path: P converts to V's dtype for the PV MMA).
+_V_DTYPE_MAP = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+}
 
 
 @functools.cache
@@ -36,11 +45,12 @@ def _get_compiled_prefill_kernel(
     num_qo_heads,
     num_kv_heads,
     head_dim,
-    mask_type,
-    window_left,
+    mask_spec,
     is_persistent,
     variant,
     params_shape,
+    with_lse=False,
+    v_in_dtype=None,
 ):
     """Compile and cache the prefill kernel.
 
@@ -65,9 +75,8 @@ def _get_compiled_prefill_kernel(
         pv_acc_dtype=cutlass.Float32,
         mma_tiler=(128, 128, head_dim),
         is_persistent=is_persistent,
-        mask_type=mask_type,
+        mask_spec=mask_spec,
         num_repeat_kv_heads=h_r,
-        window_left=window_left,
     )
     _dtype_width_map = {
         cutlass.Float16: 16,
@@ -94,7 +103,7 @@ def _get_compiled_prefill_kernel(
         assumed_align=16,
     )
     v_fake = cute.runtime.make_fake_compact_tensor(
-        in_dtype,
+        v_in_dtype if v_in_dtype is not None else in_dtype,
         (sym_s_k, num_kv_heads, head_dim),
         stride_order=(2, 1, 0),
         assumed_align=16,
@@ -127,6 +136,15 @@ def _get_compiled_prefill_kernel(
             assumed_align=16,
         )
 
+    lse_fake = None
+    if with_lse:
+        lse_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_s_q, num_qo_heads),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+
     problem_size = (1, 1, 1, num_qo_heads, num_kv_heads, head_dim)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -143,7 +161,10 @@ def _get_compiled_prefill_kernel(
         1,
         0.0,
         1.0,
+        0,
+        0,
         params_fake,
+        lse_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -206,11 +227,12 @@ class BatchPrefillCuteDSLWrapper:
         head_dim_qk,
         head_dim_vo=None,
         causal=True,
-        sm_scale=1.0,
+        sm_scale=None,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
         window_left: int = -1,
         variant: AttentionVariant | None = None,
+        window_right: int = -1,
     ) -> None:
         """Compile the FMHA prefill kernel for the given configuration.
 
@@ -230,14 +252,21 @@ class BatchPrefillCuteDSLWrapper:
             Head dimension for values and output. Must equal head_dim_qk if set.
         causal : bool
             Whether to apply causal masking.
-        sm_scale : float
-            Softmax scale factor (typically 1/sqrt(head_dim)).
+        sm_scale : Optional[float]
+            Softmax scale factor.  Defaults to ``1/sqrt(head_dim_qk)``
+            when None (matching the top-level flashinfer wrappers).
         q_data_type : torch.dtype
             Data type for queries (float16, bfloat16, or float8_e4m3fn).
         kv_data_type : torch.dtype
             Data type for keys/values.
         window_left : int
-            Sliding window size. -1 disables sliding window.
+            Max lookback distance: query ``q`` attends to keys
+            ``k >= q + (kv_len - qo_len) - window_left``. -1 = unbounded.
+            Composes with ``causal`` (causal sliding window attention).
+        window_right : int
+            Max lookahead distance for non-causal masks: query ``q`` attends
+            to keys ``k <= q + (kv_len - qo_len) + window_right``. -1 =
+            unbounded. Mutually exclusive with ``causal=True``.
         variant : Optional[AttentionVariant]
             Attention variant (ALiBi, RPE, Sigmoid, etc.). None uses standard softmax.
         """
@@ -255,10 +284,10 @@ class BatchPrefillCuteDSLWrapper:
             "head_dim_vo must be None or equal to head_dim_qk"
         )
         self._causal = causal
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(head_dim_qk)
         self._sm_scale = sm_scale
         self._device = qo_indptr.device
-        self._is_persistent = True
-
         if variant is None:
             variant = StandardAttention()
         self._variant = variant
@@ -301,17 +330,40 @@ class BatchPrefillCuteDSLWrapper:
                 )
             self._params_torch = ep
 
-        mma_tiler_n = 128
+        # Mask band: causal and window bounds are independent, composable
+        # parameters.
+        if self._causal and window_right >= 0:
+            raise ValueError(
+                "window_right is mutually exclusive with causal "
+                "(causal already bounds lookahead at 0)"
+            )
+        # Causal is a right bound with runtime value 0; window VALUES are
+        # runtime kernel arguments (only their presence is compiled in),
+        # so one cached kernel serves every window size and the causal /
+        # right-window cases share a kernel.
+        self._mask_spec = MaskSpec(
+            has_window_left=window_left >= 0,
+            has_window_right=self._causal or window_right >= 0,
+        )
+        self._window_left = max(window_left, 0)
+        self._window_right = 0 if self._causal else max(window_right, 0)
 
-        # Determine mask type
-        self._mask_type = MaskType.NO_MASK
-        if self._causal:
-            self._mask_type = MaskType.CAUSAL_MASK
-        elif window_left > 0:
-            self._mask_type = MaskType.SLIDING_WINDOW_MASK
+        # Scheduling: the persistent kernel assigns work items to SMs
+        # statically at launch; the non-persistent kernel launches one CTA
+        # per item and lets the hardware dispatch dynamically.  Banded
+        # masks (causal / windows) run faster non-persistent: their items
+        # are short or heterogeneous, and the static assignment's
+        # imbalance costs more than the per-CTA prologue it saves.
+        # Unmasked items are uniform, so the static schedule is free and
+        # the amortized prologue wins.
+        # FLASHINFER_CUTE_PREFILL_PERSISTENT=0/1 overrides.
+        _persistent_env = os.environ.get("FLASHINFER_CUTE_PREFILL_PERSISTENT")
+        if _persistent_env is not None:
+            self._is_persistent = _persistent_env == "1"
         else:
-            if torch.any(s_k % mma_tiler_n != 0).item():
-                self._mask_type = MaskType.RESIDUAL_MASK
+            self._is_persistent = not (
+                self._mask_spec.has_left_bound or self._mask_spec.has_right_bound
+            )
 
         self._problem_size = (
             self._batch_size,
@@ -331,18 +383,24 @@ class BatchPrefillCuteDSLWrapper:
         )
         params_shape = tuple(self._params_torch.shape) if self._has_params else None
 
-        self._compiled_fmha = _get_compiled_prefill_kernel(
+        # Stashed so run(return_lse=True) can lazily compile the LSE
+        # variant (return_lse is a run-time argument).
+        self._compile_key = (
             self._in_dtype,
             self._out_dtype,
             num_qo_heads,
             num_kv_heads,
             self._head_dim,
-            self._mask_type,
-            window_left,
+            self._mask_spec,
             self._is_persistent,
             cache_variant,
             params_shape,
         )
+        self._cache_variant = cache_variant
+        self._compiled_fmha = _get_compiled_prefill_kernel(*self._compile_key)
+        # Lazily compiled kernel variants, keyed by (with_lse, v_in_dtype):
+        # return_lse and a mixed V dtype are both run()-time properties.
+        self._kernel_cache = {(False, None): self._compiled_fmha}
 
         # Pre-allocate padded output scratch buffer.  The kernel uses a
         # negative pointer offset into the output tensor for TMA varlen
@@ -370,12 +428,20 @@ class BatchPrefillCuteDSLWrapper:
         out: Optional[torch.Tensor],
     ) -> None:
         """Check that run() inputs are consistent with the plan() configuration."""
-        for name, tensor in [("q", q), ("k", k), ("v", v)]:
+        for name, tensor in [("q", q), ("k", k)]:
             if tensor.dtype != self._q_data_type:
                 raise ValueError(
                     f"{name}.dtype={tensor.dtype} does not match the planned "
                     f"q_data_type={self._q_data_type}"
                 )
+        # V may differ from Q/K (mixed-dtype PV path, e.g. fp8 V with
+        # bf16 Q/K); the kernel variant is selected per V dtype in run().
+        if v.dtype != self._q_data_type and v.dtype not in _V_DTYPE_MAP:
+            raise ValueError(
+                f"v.dtype={v.dtype} is not supported; expected "
+                f"{self._q_data_type} or one of {sorted(map(str, _V_DTYPE_MAP))}"
+            )
+        for name, tensor in [("q", q), ("k", k), ("v", v)]:
             if tensor.device != self._device:
                 raise ValueError(
                     f"{name}.device={tensor.device} does not match the planned "
@@ -410,7 +476,9 @@ class BatchPrefillCuteDSLWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+        lse: Optional[torch.Tensor] = None,
+    ):
         r"""Run the prefill attention computation.
 
         Parameters
@@ -421,20 +489,62 @@ class BatchPrefillCuteDSLWrapper:
             The key tensor with shape [total_kv_len, num_heads, head_dim].
         v : torch.Tensor
             The value tensor with shape [total_kv_len, num_heads, head_dim].
+            May use a different dtype than q/k (e.g. fp8 V with bf16 Q/K);
+            the matching kernel variant is JIT-compiled on first use.
         out : Optional[torch.Tensor], optional
             The output tensor. If None, a new tensor will be created.
+        return_lse : bool
+            Whether to also return the per-row log-sum-exp, shape
+            [total_q_len, num_heads], float32, log2 domain (flashinfer
+            convention).  Standard attention only.  The LSE kernel variant
+            is JIT-compiled on the first such call.
+        lse : Optional[torch.Tensor], optional
+            Pre-allocated LSE tensor. If None, a new tensor is created.
 
         Returns
         -------
-        torch.Tensor
-            The output tensor with shape [total_q_len, num_heads, head_dim].
+        torch.Tensor or (torch.Tensor, torch.Tensor)
+            The output tensor with shape [total_q_len, num_heads, head_dim],
+            plus the LSE tensor when ``return_lse=True``.
         """
         if self._compiled_fmha is None:
             raise RuntimeError("Plan the prefill attention computation first!")
 
         self._validate_run_inputs(q, k, v, out)
 
-        self._compiled_fmha(
+        if return_lse:
+            if self._cache_variant is not None and (
+                self._cache_variant.has_logits_transform
+                or self._cache_variant.has_vectorized_logits_transform
+            ):
+                # The transform path has no correction warp (softmax warps
+                # own the epilogs) and no softmax normalization — LSE is
+                # undefined there.  score_mod and statistics-update
+                # variants use the standard path and their finals already
+                # reflect the modification (sinks fold into row_sum at
+                # tile 0), so LSE is exact for them.
+                raise NotImplementedError(
+                    "return_lse is not supported with logits-transform variants"
+                )
+            if lse is None:
+                lse = torch.empty(
+                    (self._s_q_all, self._num_qo_heads),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+        else:
+            lse = None
+
+        v_in_dtype = _V_DTYPE_MAP[v.dtype] if v.dtype != self._q_data_type else None
+        kernel_key = (return_lse, v_in_dtype)
+        kernel_fn = self._kernel_cache.get(kernel_key)
+        if kernel_fn is None:
+            kernel_fn = _get_compiled_prefill_kernel(
+                *self._compile_key, with_lse=return_lse, v_in_dtype=v_in_dtype
+            )
+            self._kernel_cache[kernel_key] = kernel_fn
+
+        kernel_fn(
             q,
             k,
             v,
@@ -446,10 +556,16 @@ class BatchPrefillCuteDSLWrapper:
             self._s_k_all,
             self._scale_softmax_log2,
             self._scale_output,
+            self._window_left,
+            self._window_right,
             self._params_torch if self._has_params else None,
+            lse,
         )
 
         if out is not None:
             out.copy_(self._o_scratch_view)
-            return out
-        return self._o_scratch_view.clone()
+        else:
+            out = self._o_scratch_view.clone()
+        if return_lse:
+            return out, lse
+        return out

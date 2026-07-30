@@ -628,7 +628,7 @@ def _snap_nvfp4(t, dtype=None):
     gsf = (448 * 6) / flat.float().abs().nan_to_num().max().clamp_min(1e-30)
     q, sf = nvfp4_quantize(flat, gsf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
     deq = e2m1_and_ufp8sf_scale_to_float(
-        q.cpu(), sf.cpu().view(torch.uint8).reshape(-1), (1.0 / gsf).cpu(), 16, 1, False
+        q.cpu(), sf.cpu().view(torch.uint8).reshape(-1), (1.0 / gsf).cpu(), 16, 1, True
     )
     return deq.reshape(t.shape).to(t.device, torch.bfloat16)
 

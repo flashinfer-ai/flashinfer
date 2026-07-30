@@ -4714,9 +4714,21 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   // FP4 sizes
   bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
   size_t const fp8_mxfp4_token_scale_size = num_expanded_tokens * sizeof(float);
+  bool const is_nvfp4_quant =
+      mSM >= 100 && (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
+      (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   size_t quant_5_size = 0;
   size_t quant_6_size = 0;
-  if (is_native_wfp4afp8_family) {
+  if (is_nvfp4_quant) {
+    quant_1_size = sizeof(float);
+    quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
+                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    quant_3_size = num_experts_per_node * sizeof(float);
+    quant_4_size = sizeof(float);
+    quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
+                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    quant_6_size = num_experts_per_node * sizeof(float);
+  } else if (is_native_wfp4afp8_family) {
     quant_1_size = sizeof(float);
     quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
                    sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);

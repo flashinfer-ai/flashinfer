@@ -39,6 +39,26 @@ Code Contribution Procedure
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
 
+# Pull Request Guidelines
+
+* **Use the default PR template.** When opening a PR, fill in the repository's PR template
+  (`.github/pull_request_template.md`) — do not overwrite or replace it with a custom or
+  tool-generated description format. The PR title and description normally become the commit
+  title and message on (squash) merge, and are relied on when bisecting changes to identify
+  owners and possible bugs — keep both accurate.
+* **Report performance results for optimizations.** If your PR is a performance optimization,
+  report the observed performance improvement in the PR description: before/after numbers from
+  a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), along with the GPU and
+  problem sizes used.
+* **Understand your changes.** We support AI-assisted contributions, but we expect authors to
+  understand the idea and rationale of their changes. Reviewers may raise questions about the
+  design — especially when the code touches a relatively durable area of the library — and if
+  the author cannot walk through the rationale upon being asked, the PR submission may be
+  rejected.
+
+For how we review, see [docs/code_review_guidance_human.md](docs/code_review_guidance_human.md)
+(agent reviewers follow [docs/code_review_guidance.md](docs/code_review_guidance.md)).
+
 # Continuous Integration (CI)
 
 FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVIDIA internal CI running on GitLab.

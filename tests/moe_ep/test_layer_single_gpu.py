@@ -265,22 +265,24 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
         split.forward(t)
 
 
-def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized):
+def test_split_layer_nixl_defers_missing_tcp_store_to_fleet_creation(
+    dist_not_initialized,
+):
+    """Layer init must NOT require the rendezvous store (layers are routinely
+    built before torch.distributed is initialized); the actionable error is
+    raised by the fleet's store resolution at first use instead."""
     from unittest import mock
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        MoEEpConfigError,
         MoEEpSplitLayer,
         NvepConfig,
         FleetParams,
         dummy_moe_weights,
     )
+    from flashinfer.moe_ep.backends.split.comm.nixl_ep.fleet import _resolve_store
 
-    with (
-        mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"),
-        pytest.raises(MoEEpConfigError, match="tcp_store"),
-    ):
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
@@ -291,6 +293,9 @@ def test_split_layer_nixl_rejects_missing_tcp_store_at_init(dist_not_initialized
             weights=dummy_moe_weights(num_local_experts=4, hidden=4096),
             backend=NvepConfig(),
         )
+
+    with pytest.raises(ValueError, match="rendezvous store"):
+        _resolve_store(BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False))
 
 
 def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):
@@ -327,3 +332,45 @@ def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):
     )
     out = split.forward(t)
     assert out.shape == (3, 8)
+
+
+def test_split_layer_releases_pack_after_init():
+    """MoEEpSplitLayer must not pin the source weight pack past __init__."""
+    import gc
+    import weakref
+    from unittest import mock
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        dummy_moe_weights,
+        IdentityConfig,
+        MoEEpSplitLayer,
+        NCCLEPConfig,
+        SplitConfig,
+    )
+
+    pack = dummy_moe_weights(num_local_experts=2, hidden=8)
+    ref = weakref.ref(pack)
+    # Arch/CUDA-13 validation is orthogonal to the pack-release contract under
+    # test; mock it so the check still runs on CUDA-12 CI hosts.
+    with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
+        split = MoEEpSplitLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=2,
+                max_tokens_per_rank=4,
+                token_hidden_size=8,
+            ),
+            weights=pack,
+            backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
+        )
+    assert split._weights is None
+    del pack
+    gc.collect()
+    assert ref() is None, "split layer retained the source weight pack"
