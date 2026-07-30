@@ -81,6 +81,9 @@ def test_softmax(
     [
         (1, 32000, "none"),  # cooperative route
         (256, 32000, "none"),  # rowwise route
+        (512, 64000, "none"),  # bootstrap side of the wide-row boundary
+        (1024, 64000, "none"),  # rowwise side of the wide-row boundary
+        (989, 128256, "per_row"),  # full-sweep worst-row profile
         (1, 111, "scalar"),  # scalar-temperature warp-packed route
         (1, 111, "per_row"),  # per-row-temperature warp-packed route
     ],

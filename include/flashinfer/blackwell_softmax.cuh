@@ -17,7 +17,8 @@
 
 #include <cuda_runtime.h>
 
-// Frozen from Cake commit dcece84ec6a568402d0e37fac4f15f61f2cb9741.
+// Frozen from Cake measured checkpoint 924403cd62ea6dc160ffcea63c944d1e828d393a
+// and retained byte-for-byte by MR474 cleanup d77b50ee1e56fb3701a512f1dd2765e6067b1be2.
 // Weave sm_100a and sm_103a output is byte-identical for all three kernels:
 //   bootstrap: sha256:46049370dbd905ff7234d414745d197f883157c8edc01d83230562b4dff5f862
 //   rowwise:   sha256:e47f82923112e143173f32dbb145986f8c9a1503fd2bb71f22f5c065769162e3

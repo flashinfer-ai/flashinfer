@@ -53,13 +53,14 @@ bool use_rowwise_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parame
                                      vocab_size <= 256000 && vocab_size % 4 == 0 &&
                                      parameter_kind == ParameterKind::kNone;
   const bool dense_aligned_high_row_narrow = rows > 384 && rows <= 1024 && vocab_size >= 24576 &&
-                                             vocab_size <= 64000 && vocab_size % 4 == 0 &&
-                                             (parameter_kind == ParameterKind::kNone ||
-                                              vocab_size <= 32000);
+                                             vocab_size <= 32000 && vocab_size % 4 == 0;
+  const bool dense_aligned_high_row_wide = rows > 512 && rows <= 1024 && vocab_size > 32000 &&
+                                           vocab_size <= 64000 && vocab_size % 4 == 0 &&
+                                           parameter_kind == ParameterKind::kNone;
   const bool measured_large_odd = rows > 128 && rows <= 512 && vocab_size >= 24576 &&
                                   vocab_size <= 131072 && vocab_size % 4 != 0;
   return small_low_row || dense_aligned_mid_row || dense_aligned_high_row_narrow ||
-         measured_large_odd;
+         dense_aligned_high_row_wide || measured_large_odd;
 }
 
 cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temperature_arr,
