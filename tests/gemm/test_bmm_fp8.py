@@ -7,6 +7,39 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
+@pytest.mark.parametrize("scale_name", ["A_scale", "B_scale"])
+@pytest.mark.parametrize(
+    "invalid_scale, error",
+    [
+        ("non_scalar", "must contain exactly one element"),
+        ("wrong_dtype", "must have dtype torch.float32"),
+        ("wrong_device", "must be a CUDA tensor on"),
+    ],
+)
+def test_bmm_fp8_rejects_invalid_tensorwide_scale(scale_name, invalid_scale, error):
+    A = torch.empty((1, 1, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    B = torch.empty((1, 16, 16), dtype=torch.float8_e4m3fn, device="cuda")
+    scales = {
+        "A_scale": torch.ones((), dtype=torch.float32, device="cuda"),
+        "B_scale": torch.ones((), dtype=torch.float32, device="cuda"),
+    }
+    if invalid_scale == "non_scalar":
+        scales[scale_name] = torch.ones((1, 2), dtype=torch.float32, device="cuda")
+    elif invalid_scale == "wrong_dtype":
+        scales[scale_name] = torch.ones((), dtype=torch.float16, device="cuda")
+    else:
+        scales[scale_name] = torch.ones((), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=rf"{scale_name} {error}"):
+        bmm_fp8(
+            A,
+            B,
+            scales["A_scale"],
+            scales["B_scale"],
+            torch.bfloat16,
+        )
+
+
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("m", [1, 48, 128])
 @pytest.mark.parametrize("n", [64, 80, 10304])

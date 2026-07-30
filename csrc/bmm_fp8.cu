@@ -20,6 +20,18 @@
 
 #include "tvm_ffi_utils.h"
 
+namespace {
+
+void check_bmm_fp8_scale(TensorView scale, TensorView operand, const char* name) {
+  TVM_FFI_ICHECK_EQ(scale.device().device_type, kDLCUDA) << name << " must be a CUDA tensor";
+  TVM_FFI_ICHECK_EQ(scale.device().device_id, operand.device().device_id)
+      << name << " must be on the same CUDA device as its operand";
+  TVM_FFI_ICHECK_EQ(scale.dtype(), dl_float32) << name << " must have dtype float32";
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1) << name << " must contain exactly one element";
+}
+
+}  // namespace
+
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
              TensorView workspace_buffer, int64_t cublas_handle) {
   CHECK_CUDA(A);
@@ -32,6 +44,8 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
       << "Result tensor has incorrect shape";
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
 
   // PyTorch is row major by default. cuBLASLt is column major by default.
   // We need row major D as expected.
@@ -77,6 +91,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
       << "Result tensor has incorrect shape";
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
 
   int64_t result = 0;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(B.dtype(), b_type, [&] {
@@ -118,6 +134,8 @@ void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView 
   TVM_FFI_ICHECK(A.size(2) == B.size(1)) << "Incompatible matrix sizes";
   TVM_FFI_ICHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2))
       << "Result tensor has incorrect shape";
+  check_bmm_fp8_scale(A_scale, A, "A_scale");
+  check_bmm_fp8_scale(B_scale, B, "B_scale");
 
   int64_t max_algos =
       algo_buffer.numel() * get_element_size(algo_buffer) / flashinfer::bmm_fp8::kAlgoBytes;
