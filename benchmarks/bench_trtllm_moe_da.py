@@ -6,6 +6,11 @@ experiments. Each precision records its full launcher context in the bundle,
 so a saved artifact is only reused when it matches the runtime configuration.
 The DA-enabled graph must increment the capture dispatch counter; otherwise
 the row fails instead of silently measuring the original path.
+
+Default autotune reporting measures two independent fresh cache lifecycles:
+ordinary NoDA autotuning and the complete one-sweep DA transaction. The NoDA
+cache is discarded before DA tuning so the measurement does not change the
+product's one-sweep DA publication contract.
 """
 
 from __future__ import annotations
@@ -1071,27 +1076,17 @@ def _tune_result_from_loaded_bundle(
         raise RuntimeError(f"bundle has no runtime bodies for {key}")
     return {
         "tactics": [(int(tile), int(config)) for tile, config in tactics],
+        "autotune_measurement_contract": "bundle_reload_no_autotune",
+        "noda_autotune_measured": False,
+        "noda_profiles": 0,
+        "da_profiles": 0,
         "static_profiles": 0,
         "total_profiles": 0,
         "static_tune_seconds": 0.0,
+        "noda_tune_seconds": 0.0,
         "da_tune_seconds": 0.0,
         "tune_seconds": 0.0,
     }
-
-
-def _is_value_profile_cache_key(cache_key: Any) -> bool:
-    """Return whether an autotuner cache key includes value-profile buckets."""
-    if hasattr(cache_key, "nearest_profile"):
-        profile_key = cache_key.nearest_profile
-    else:
-        profile_key = cache_key[3]
-    return bool(
-        isinstance(profile_key, tuple)
-        and len(profile_key) == 2
-        and isinstance(profile_key[0], tuple)
-        and profile_key[0]
-        and isinstance(profile_key[0][0], tuple)
-    )
 
 
 def _run_real_autotune(
@@ -1099,15 +1094,22 @@ def _run_real_autotune(
     cfg: BenchConfig,
     device: torch.device,
     routing_input_mode: str,
+    *,
+    measure_noda_autotune: bool = True,
 ) -> dict:
     tuner = AutoTuner.get()
-    tuner.clear_cache()
-    tuner.reset_statistics()
-    da_state.PER_TILE_TACTICS.clear()
-    da_state.PER_BODY_TACTICS.clear()
-    da_state.STATIC_FALLBACK_TACTICS.clear()
-    da_state.BUNDLE_EAGER_TACTICS.clear()
-    da_state.BASELINE_GUARD_DECISIONS.clear()
+
+    def reset_tuning_state() -> None:
+        """Start an independent autotune lifecycle without stale DA products."""
+        tuner.clear_cache()
+        tuner.reset_statistics()
+        da_state.PER_TILE_TACTICS.clear()
+        da_state.PER_BODY_TACTICS.clear()
+        da_state.STATIC_FALLBACK_TACTICS.clear()
+        da_state.BUNDLE_EAGER_TACTICS.clear()
+        da_state.BASELINE_GUARD_DECISIONS.clear()
+
+    reset_tuning_state()
 
     tuning_input = _make_routing_input(
         routing_input_mode, case.name, "uniform", cfg, device
@@ -1116,7 +1118,32 @@ def _run_real_autotune(
     # shape that happened to trigger this benchmark invocation.
     tuning_buckets = get_hybrid_num_tokens_buckets(cfg.tune_max_num_tokens, 1)
 
-    tune_start = time.perf_counter()
+    # Initialize the precision-owned extension and workspaces before either
+    # timer. The reported values compare autotuning rather than one side's JIT
+    # or first-call setup.
+    os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "0"
+    case.call(tuning_input)
+    torch.cuda.synchronize()
+
+    noda_tune_seconds = 0.0
+    noda_profiles = 0
+    if measure_noda_autotune:
+        noda_tune_start = time.perf_counter()
+        with (
+            nvtx_range(f"phase=noda-autotune, precision={case.name}"),
+            autotune(True, tuning_buckets=tuning_buckets, round_up=True),
+        ):
+            case.call(tuning_input)
+        torch.cuda.synchronize()
+        noda_tune_seconds = time.perf_counter() - noda_tune_start
+        noda_profiles = len(tuner.profiling_cache)
+
+        # NoDA is a measurement control. DA must still execute its production
+        # one-sweep transaction from a fresh cache, not incrementally extend
+        # the just-measured NoDA cache.
+        reset_tuning_state()
+
+    da_tune_start = time.perf_counter()
     os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
     with (
         cuda_profiler_da_phase(),
@@ -1125,14 +1152,9 @@ def _run_real_autotune(
     ):
         case.call(tuning_input)
     torch.cuda.synchronize()
-    tune_seconds = time.perf_counter() - tune_start
-    da_tune_seconds = tune_seconds
-    static_tune_seconds = 0.0
-    static_profiles = sum(
-        1
-        for cache_key in tuner.profiling_cache
-        if not _is_value_profile_cache_key(cache_key)
-    )
+    da_tune_seconds = time.perf_counter() - da_tune_start
+    tune_seconds = noda_tune_seconds + da_tune_seconds
+    da_profiles = len(tuner.profiling_cache)
 
     da_context = _make_da_context(case, cfg, device)
     key = da_state.cache_key(
@@ -1147,9 +1169,19 @@ def _run_real_autotune(
     return {
         "tactics": [(int(tile), int(config)) for tile, config in tactics or ()],
         "guard_decision": guard_decision,
-        "static_profiles": static_profiles,
-        "total_profiles": len(tuner.profiling_cache),
-        "static_tune_seconds": static_tune_seconds,
+        "autotune_measurement_contract": (
+            "independent_fresh_noda_then_one_sweep_da_v1"
+            if measure_noda_autotune
+            else "one_sweep_da_only_v1"
+        ),
+        "noda_autotune_measured": measure_noda_autotune,
+        "noda_profiles": noda_profiles,
+        "da_profiles": da_profiles,
+        # Legacy aliases retained for historical CSV consumers.
+        "static_profiles": noda_profiles,
+        "total_profiles": da_profiles,
+        "static_tune_seconds": noda_tune_seconds,
+        "noda_tune_seconds": noda_tune_seconds,
         "da_tune_seconds": da_tune_seconds,
         "tune_seconds": tune_seconds,
     }
@@ -1465,14 +1497,19 @@ def _run_precision_sweep(
                 )
             else:
                 tune_result = _run_real_autotune(
-                    tuning_case, tuning_cfg, device, args.routing_input_mode
+                    tuning_case,
+                    tuning_cfg,
+                    device,
+                    args.routing_input_mode,
+                    measure_noda_autotune=not args.skip_noda_autotune,
                 )
             if not args.skip_autotune:
                 print(
                     "  [autotune] "
-                    f"static={tune_result['static_tune_seconds']:.2f}s "
-                    f"da={tune_result['da_tune_seconds']:.2f}s "
-                    f"total={tune_result['tune_seconds']:.2f}s",
+                    f"noda={tune_result['noda_tune_seconds']:.2f}s "
+                    f"da_one_sweep={tune_result['da_tune_seconds']:.2f}s "
+                    f"combined={tune_result['tune_seconds']:.2f}s "
+                    f"contract={tune_result['autotune_measurement_contract']}",
                     flush=True,
                 )
         except Exception as exc:
@@ -1498,9 +1535,16 @@ def _run_precision_sweep(
                     "bundle_output": bundle_path,
                     "da_num_bodies": len(tactics),
                     "da_tactics": repr(tactics),
+                    "autotune_measurement_contract": tune_result[
+                        "autotune_measurement_contract"
+                    ],
+                    "noda_autotune_measured": tune_result["noda_autotune_measured"],
+                    "noda_profiles": tune_result["noda_profiles"],
+                    "da_profiles": tune_result["da_profiles"],
                     "static_profiles": tune_result["static_profiles"],
                     "total_profiles": tune_result["total_profiles"],
                     "static_tune_seconds": tune_result["static_tune_seconds"],
+                    "noda_tune_seconds": tune_result["noda_tune_seconds"],
                     "da_tune_seconds": tune_result["da_tune_seconds"],
                     "tune_seconds": tune_result["tune_seconds"],
                     **_guard_row_fields(guard_decision),
@@ -1556,9 +1600,16 @@ def _run_precision_sweep(
                     "intermediate_size": cfg.intermediate_size,
                     "da_num_bodies": len(tactics),
                     "da_tactics": repr(tactics),
+                    "autotune_measurement_contract": tune_result[
+                        "autotune_measurement_contract"
+                    ],
+                    "noda_autotune_measured": tune_result["noda_autotune_measured"],
+                    "noda_profiles": tune_result["noda_profiles"],
+                    "da_profiles": tune_result["da_profiles"],
                     "static_profiles": tune_result["static_profiles"],
                     "total_profiles": tune_result["total_profiles"],
                     "static_tune_seconds": tune_result["static_tune_seconds"],
+                    "noda_tune_seconds": tune_result["noda_tune_seconds"],
                     "da_tune_seconds": tune_result["da_tune_seconds"],
                     "tune_seconds": tune_result["tune_seconds"],
                     "match_ratio_threshold": case.match_ratio,
@@ -1730,7 +1781,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-noda-autotune",
         action="store_true",
-        help="Retained for legacy invocations; the static cache is in-memory",
+        help=(
+            "Skip the independent NoDA autotune timing control; DA still runs "
+            "one complete fresh-cache sweep"
+        ),
     )
     parser.add_argument(
         "--build-only",
@@ -1783,9 +1837,7 @@ def main() -> int:
     device = torch.device("cuda:0")
     torch.manual_seed(args.seed)
     if args.skip_noda_autotune:
-        print(
-            "[legacy] --skip-noda-autotune uses the current AutoTuner cache", flush=True
-        )
+        print("[autotune] independent NoDA timing control disabled", flush=True)
 
     configs = []
     for num_tokens in token_counts:

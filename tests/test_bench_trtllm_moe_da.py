@@ -1,24 +1,99 @@
 """Contracts for the all-precision DA-versus-NoDA benchmark."""
 
+import os
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from benchmarks import bench_trtllm_moe_da as benchmark
-from flashinfer.autotuner import ProfilingCacheKey
 
 
-def test_profile_count_accepts_typed_and_legacy_autotuner_cache_keys():
-    shapes = ((64, 7168), (128, 7168))
-    value_profile = (shapes, (32, 1))
-    typed_value = ProfilingCacheKey("op", "runner", 1, value_profile, ())
-    typed_static = ProfilingCacheKey("op", "runner", 1, shapes, ())
-    legacy_value = ("op", "runner", 1, value_profile)
-    legacy_static = ("op", "runner", 1, shapes)
+def test_autotune_timing_compares_fresh_noda_with_one_sweep_da(monkeypatch):
+    """Default reporting times two independent caches and retains the DA one."""
 
-    assert benchmark._is_value_profile_cache_key(typed_value)
-    assert benchmark._is_value_profile_cache_key(legacy_value)
-    assert not benchmark._is_value_profile_cache_key(typed_static)
-    assert not benchmark._is_value_profile_cache_key(legacy_static)
+    class FakeTuner:
+        def __init__(self):
+            self.profiling_cache = {}
+            self.clear_count = 0
+            self.reset_count = 0
+
+        def clear_cache(self):
+            self.clear_count += 1
+            self.profiling_cache.clear()
+
+        def reset_statistics(self):
+            self.reset_count += 1
+
+    tuner = FakeTuner()
+    phase_modes = []
+    phase_entry_cache_sizes = []
+    call_modes = []
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "test-initial-state")
+
+    @contextmanager
+    def fake_autotune(*_args, **_kwargs):
+        mode = os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"]
+        phase_modes.append(mode)
+        phase_entry_cache_sizes.append(len(tuner.profiling_cache))
+        yield
+        if mode == "0":
+            tuner.profiling_cache["noda-profile"] = 1.0
+        else:
+            tuner.profiling_cache.update(
+                {"da-default-profile": 1.0, "da-value-profile": 2.0}
+            )
+            benchmark.da_state.PER_BODY_TACTICS["runtime-key"] = [(64, 7)]
+            benchmark.da_state.BASELINE_GUARD_DECISIONS["runtime-key"] = {
+                "final_policy": "da_singleton"
+            }
+
+    monkeypatch.setattr(benchmark.AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(benchmark, "autotune", fake_autotune)
+    monkeypatch.setattr(benchmark, "_make_routing_input", lambda *_args: object())
+    monkeypatch.setattr(
+        benchmark, "get_hybrid_num_tokens_buckets", lambda *_args: (64,)
+    )
+    monkeypatch.setattr(benchmark, "_make_da_context", lambda *_args: object())
+    monkeypatch.setattr(benchmark.da_core, "upload_bucket", lambda *_args: 64)
+    monkeypatch.setattr(benchmark.da_state, "cache_key", lambda *_args: "runtime-key")
+    monkeypatch.setattr(benchmark.torch.cuda, "synchronize", lambda: None)
+    times = iter((10.0, 12.0, 20.0, 27.0))
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(times))
+    for name in (
+        "PER_TILE_TACTICS",
+        "PER_BODY_TACTICS",
+        "STATIC_FALLBACK_TACTICS",
+        "BUNDLE_EAGER_TACTICS",
+        "BASELINE_GUARD_DECISIONS",
+    ):
+        monkeypatch.setattr(benchmark.da_state, name, {})
+
+    case = SimpleNamespace(
+        name="nvfp4",
+        call=lambda _routing: call_modes.append(
+            os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"]
+        ),
+    )
+    cfg = SimpleNamespace(num_tokens=64, tune_max_num_tokens=64)
+
+    result = benchmark._run_real_autotune(case, cfg, torch.device("cpu"), "routed")
+
+    assert call_modes == ["0", "0", "1"]  # untimed setup, NoDA, then DA
+    assert phase_modes == ["0", "1"]
+    assert phase_entry_cache_sizes == [0, 0]
+    assert tuner.clear_count == tuner.reset_count == 2
+    assert result["autotune_measurement_contract"] == (
+        "independent_fresh_noda_then_one_sweep_da_v1"
+    )
+    assert result["noda_autotune_measured"] is True
+    assert result["noda_profiles"] == result["static_profiles"] == 1
+    assert result["da_profiles"] == result["total_profiles"] == 2
+    assert result["noda_tune_seconds"] == result["static_tune_seconds"] == 2.0
+    assert result["da_tune_seconds"] == 7.0
+    assert result["tune_seconds"] == 9.0
+    assert os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] == "1"
 
 
 def test_benchmark_mode_table_and_all_selector_are_exact():
