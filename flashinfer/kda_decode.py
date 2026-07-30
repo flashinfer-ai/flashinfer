@@ -240,11 +240,13 @@ def fused_kda_decode(
             Per-channel decay bias with ``H * 128`` elements and dtype float32.
         state_indices:
             Cache slot selected by each decode row. Must be a contiguous int32
-            tensor with ``num_rows`` elements.
+            tensor with ``num_rows`` elements. Live indices must be in
+            ``[1, num_slots)``; non-positive indices select the null path.
         state:
             Paged recurrent state with shape
             ``[num_slots, H, 128, 128]`` and dtype float32. Each slot's
-            ``[H, 128, 128]`` contents must be contiguous.
+            ``[H, 128, 128]`` contents must be contiguous. ``state`` and
+            ``conv_state`` must have the same ``num_slots``.
         output_gate:
             Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
             ``[1, num_rows, H, 128]`` and dtype bfloat16.

@@ -21,14 +21,13 @@ launch. It is specialized for the Kimi K3 decode shapes: head dimension 128
 and 12, 24, 48, or 96 heads.
 """
 
+import functools
 from pathlib import Path
-from typing import Any
 
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import SmemAllocator
 import tvm_ffi  # noqa: F401 -- TVM FFI is required for kernel dispatch
 
@@ -462,64 +461,94 @@ def _fused_kda_decode_launch(
     )
 
 
-def _dynamic_tensor(tensor, leading_dim):
-    return from_dlpack(
-        tensor, assumed_align=16, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=leading_dim)
+def _make_compile_inputs():
+    """Build shape- and stride-dynamic inputs for CuTe compilation."""
+    num_rows = cute.sym_int()
+    num_heads = cute.sym_int()
+    conv_slots = cute.sym_int()
+    state_slots = cute.sym_int()
+    hidden_size = num_heads * _HEAD_DIM
+    qkv_size = 3 * hidden_size
 
-
-_COMPILED_KERNELS: dict[tuple[float, float], Any] = {}
-
-
-def _get_compiled_kernel(
-    x,
-    weight,
-    conv_state,
-    raw_gate,
-    raw_beta,
-    A_log,
-    dt_bias,
-    state_indices,
-    state,
-    output_gate,
-    norm_weight,
-    output,
-    lower_bound,
-    norm_eps,
-):
-    key = (float(lower_bound), float(norm_eps))
-    compiled_kernel = _COMPILED_KERNELS.get(key)
-    if compiled_kernel is None:
-        kernel_name = (
-            f"d128_w4_lb{str(float(lower_bound)).replace('.', '_').replace('-', 'm')}"
-            f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
+    def compact(shape, dtype):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            assumed_align=16,
+            stride_order=tuple(reversed(range(len(shape)))),
         )
-        compiled_kernel = build_and_load_cute_dsl_kernel(
-            _CUTE_DSL_MODULE,
-            kernel_name,
-            lambda: cute.compile(
-                _fused_kda_decode_launch,
-                _dynamic_tensor(x, 1),
-                _dynamic_tensor(weight, 2),
-                _dynamic_tensor(conv_state, 1),
-                _dynamic_tensor(raw_gate, 3),
-                _dynamic_tensor(raw_beta, 2),
-                _dynamic_tensor(A_log, 0),
-                _dynamic_tensor(dt_bias, 0),
-                _dynamic_tensor(state_indices, 0),
-                _dynamic_tensor(state, 3),
-                _dynamic_tensor(output_gate, 2),
-                _dynamic_tensor(norm_weight, 0),
-                _dynamic_tensor(output, 3),
-                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                float(lower_bound),
-                float(norm_eps),
-                options="--enable-tvm-ffi --generate-line-info",
-            ),
-            extra_key_files=_SOURCE_FILES,
-        )
-        _COMPILED_KERNELS[key] = compiled_kernel
-    return compiled_kernel
+
+    x = cute.runtime.make_fake_tensor(
+        BF16,
+        shape=(num_rows, qkv_size),
+        stride=(cute.sym_int64(), 1),
+        assumed_align=16,
+    )
+    conv_state = cute.runtime.make_fake_tensor(
+        BF16,
+        shape=(conv_slots, qkv_size, 3),
+        stride=(cute.sym_int64(), 1, qkv_size),
+        assumed_align=16,
+    )
+    raw_beta = cute.runtime.make_fake_tensor(
+        BF16,
+        shape=(1, num_rows, num_heads),
+        stride=(cute.sym_int64(), cute.sym_int64(), 1),
+        assumed_align=16,
+    )
+    state = cute.runtime.make_fake_tensor(
+        F32,
+        shape=(state_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
+        stride=(
+            cute.sym_int64(),
+            _HEAD_DIM * _HEAD_DIM,
+            _HEAD_DIM,
+            1,
+        ),
+        assumed_align=16,
+    )
+    output_gate = cute.runtime.make_fake_tensor(
+        BF16,
+        shape=(num_rows, num_heads, _HEAD_DIM),
+        stride=(cute.sym_int64(), _HEAD_DIM, 1),
+        assumed_align=16,
+    )
+    return (
+        x,
+        compact((3, 4, hidden_size), F32),
+        conv_state,
+        compact((1, num_rows, num_heads, _HEAD_DIM), BF16),
+        raw_beta,
+        compact((num_heads,), F32),
+        compact((hidden_size,), F32),
+        compact((num_rows,), cutlass.Int32),
+        state,
+        output_gate,
+        compact((_HEAD_DIM,), F32),
+        compact((1, num_rows, num_heads, _HEAD_DIM), BF16),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    )
+
+
+@functools.cache
+def _get_compiled_kernel(lower_bound, norm_eps):
+    """Get a shape-dynamic specialization from the two-level CuTe DSL cache."""
+    kernel_name = (
+        f"d128_w4_lb{str(float(lower_bound)).replace('.', '_').replace('-', 'm')}"
+        f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
+    )
+    return build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        kernel_name,
+        lambda: cute.compile(
+            _fused_kda_decode_launch,
+            *_make_compile_inputs(),
+            float(lower_bound),
+            float(norm_eps),
+            options="--enable-tvm-ffi --generate-line-info",
+        ),
+        extra_key_files=_SOURCE_FILES,
+    )
 
 
 def _check_cuda_tensor(name, tensor, dtype):
@@ -622,6 +651,10 @@ def run_fused_kda_decode(
         raise ValueError(
             "state must have shape [slots, H, 128, 128] with contiguous slot contents"
         )
+    if conv_state.shape[0] != state.shape[0]:
+        raise ValueError(
+            "conv_state and state must have the same number of cache slots"
+        )
     if output_gate.ndim == 4:
         if output_gate.shape != (1, num_rows, num_heads, _HEAD_DIM):
             raise ValueError(
@@ -654,22 +687,7 @@ def run_fused_kda_decode(
                 "output must be contiguous with shape [1, num_rows, H, 128]"
             )
 
-    kernel = _get_compiled_kernel(
-        x,
-        weight,
-        conv_state,
-        raw_gate,
-        raw_beta,
-        A_log,
-        dt_bias,
-        state_indices,
-        state,
-        output_gate,
-        norm_weight,
-        output,
-        lower_bound,
-        norm_eps,
-    )
+    kernel = _get_compiled_kernel(float(lower_bound), float(norm_eps))
     kernel(
         x,
         weight,

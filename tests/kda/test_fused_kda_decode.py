@@ -222,3 +222,33 @@ def test_fused_kda_decode_cuda_graph():
 
     assert captured_output.data_ptr() == output.data_ptr()
     assert torch.isfinite(output).all()
+
+
+def test_fused_kda_decode_null_slots():
+    inputs = _make_inputs(num_heads=12, num_rows=3)
+    inputs["state_indices"].copy_(
+        torch.tensor([0, -1, 1], dtype=torch.int32, device=torch.device("cuda"))
+    )
+    conv_state_before = _clone_strided(inputs["conv_state"])
+    state_before = _clone_strided(inputs["state"])
+
+    output = fused_kda_decode(**inputs)
+
+    torch.testing.assert_close(output[:, :2], torch.zeros_like(output[:, :2]))
+    torch.testing.assert_close(inputs["conv_state"][0], conv_state_before[0])
+    torch.testing.assert_close(inputs["state"][0], state_before[0])
+    torch.testing.assert_close(inputs["conv_state"][2:], conv_state_before[2:])
+    torch.testing.assert_close(inputs["state"][2:], state_before[2:])
+    assert not torch.equal(inputs["conv_state"][1], conv_state_before[1])
+    assert not torch.equal(inputs["state"][1], state_before[1])
+
+
+def test_fused_kda_decode_requires_matching_cache_slots():
+    inputs = _make_inputs(num_heads=12, num_rows=3)
+    inputs["state"] = inputs["state"][:-1]
+
+    with pytest.raises(
+        ValueError,
+        match="conv_state and state must have the same number of cache slots",
+    ):
+        fused_kda_decode(**inputs)
