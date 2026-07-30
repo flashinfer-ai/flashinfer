@@ -2195,6 +2195,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lse is None
             and key_block_scales is None
             and value_block_scales is None
+            and skip_softmax_threshold_scale_factor is None
         )
         if use_xqa_mtp_decode_run:
             if self._block_tables is None or self._kv_lens_buffer is None:
