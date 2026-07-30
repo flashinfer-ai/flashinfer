@@ -47,11 +47,17 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
         # Standard attention kernels for SM120 (HMMA, Ampere-compatible)
         enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16")
         enumerate_hmma_flash_kernels(specs, sm=120, dtype="fp16")
-        # DeepSeek MLA (hdim_qk=192, hdim_vo=128)
+        # DeepSeek MLA BF16 and E4M3-output kernels (192/128).
         enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16", head_size_v=128)
         enumerate_qmma_flash_kernels(specs, sm=120, dtype="e4m3_fp32", head_sizes=[192])
+        # E4M3-to-BF16 kernels for standard attention (64/64, 128/128) and
+        # DeepSeek MLA (192/128).
         enumerate_qmma_flash_kernels(
-            specs, sm=120, dtype="e4m3_fp32", head_sizes=[192], output_dtype="bf16"
+            specs,
+            sm=120,
+            dtype="e4m3_fp32",
+            head_sizes=[64, 128, 192],
+            output_dtype="bf16",
         )
 
         # Expand the cartesian product of the list fields "seq_len" and "head_size".
@@ -131,12 +137,19 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
                     and not kspec.warp_specialization
                     and kspec.tiled
                 )
-                # Deepseek MLA (context 192/128 separate-q-k-v)
+                # Standard attention (64/64, 128/128) and DeepSeek MLA (192/128)
+                # with separate Q/K/V. Standard attention is FP8-only.
                 or (
                     kspec.sm in [90, 100, 120]
                     and kspec.dtype in ["bf16", "e4m3", "e4m3_fp32"]
-                    and kspec.head_size == 192
-                    and kspec.head_size_v == 128
+                    and (
+                        (
+                            kspec.head_size in [64, 128]
+                            and kspec.head_size_v == kspec.head_size
+                            and kspec.dtype in ["e4m3", "e4m3_fp32"]
+                        )
+                        or (kspec.head_size == 192 and kspec.head_size_v == 128)
+                    )
                     and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
                     and kspec.sage_block_sizes is None
                     and kspec.version == 2
