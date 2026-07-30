@@ -113,6 +113,11 @@ def test_block_extend_single_prefill_matches_reference(dtype: torch.dtype):
         (64, 33, 97, 17, 0, 32, 8, 128),
         # Offset the KV sequence as well: only a prefix of it is visible.
         (32, 128, 128, 0, 256, 32, 8, 128),
+        # Non-power-of-2 block sizes.
+        (24, 64, 128, 0, 0, 32, 8, 128),
+        (48, 64, 192, 48, 0, 32, 8, 128),
+        (72, 128, 256, 0, 0, 32, 8, 128),
+        (100, 50, 200, 10, 30, 8, 4, 128),
     ]
     for (
         block_size,
@@ -335,4 +340,185 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
                 head_dim,
                 diff,
                 tol,
+            )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_block_extend_non_power_of_two_single(dtype: torch.dtype):
+    """Non-power-of-2 block sizes should produce correct results for single prefill.
+
+    Since we removed the power-of-2 restriction, the kernel must handle arbitrary
+    positive block sizes correctly.  This tests several non-power-of-2 values
+    across both FA2 and FA3 backends.
+    """
+    device = torch.device("cuda:0")
+    sm_scale = 1.0 / math.sqrt(128)
+    tol = tolerance_for(dtype)
+    num_heads, num_kv_heads, head_dim = 32, 8, 128
+
+    # (block_size, qo_len, kv_len, q_offset, kv_offset)
+    configs = [
+        (24, 128, 128, 0, 0),
+        (48, 200, 300, 50, 0),
+        (72, 256, 256, 0, 100),
+        (100, 50, 200, 10, 30),
+        (127, 127, 127, 0, 0),
+        (191, 200, 512, 30, 60),
+    ]
+    for block_size, qo_len, kv_len, q_offset, kv_offset in configs:
+        q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        ref = block_extend_reference(
+            q,
+            k,
+            v,
+            block_size,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            sm_scale=sm_scale,
+        )
+        for backend in get_available_backends(device):
+            out = single_prefill_with_kv_cache(
+                q,
+                k,
+                v,
+                sm_scale=sm_scale,
+                block_extend=True,
+                block_size=block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                backend=backend,
+            )
+            diff = (out.float() - ref.float()).abs().max().item()
+            assert diff < tol, (
+                f"backend={backend} block_size={block_size} "
+                f"qo_len={qo_len} kv_len={kv_len} "
+                f"q_offset={q_offset} kv_offset={kv_offset} "
+                f"diff={diff:.6f} tol={tol:.6f}"
+            )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
+    """Non-power-of-2 block sizes should produce correct results for batch prefill."""
+    device = torch.device("cuda:0")
+    sm_scale = 1.0 / math.sqrt(128)
+    tol = tolerance_for(dtype)
+    num_heads, num_kv_heads, head_dim = 32, 8, 128
+    page_size = 16
+
+    configs = [(24, 128, 128, 0, 0), (48, 200, 300, 50, 0), (100, 50, 200, 10, 30)]
+    for block_size, qo_len, kv_len, q_offset, kv_offset in configs:
+        q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
+
+        # --- Ragged path ---
+        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        ref = block_extend_reference(
+            q,
+            k,
+            v,
+            block_size,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            sm_scale=sm_scale,
+        )
+
+        for backend in get_available_backends(device):
+            workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+            qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+            kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
+            q_offsets = torch.tensor([q_offset], dtype=torch.int32, device=device)
+            kv_offsets = torch.tensor([kv_offset], dtype=torch.int32, device=device)
+
+            wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+                workspace,
+                kv_layout="NHD",
+                backend=backend,
+                block_extend=True,
+                block_size=block_size,
+            )
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                num_qo_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                q_data_type=dtype,
+                sm_scale=sm_scale,
+                q_offsets=q_offsets,
+                kv_offsets=kv_offsets,
+            )
+            out = wrapper.run(q, k, v)
+            diff = (out.float() - ref.float()).abs().max().item()
+            assert diff < tol, (
+                f"ragged backend={backend} block_size={block_size} diff={diff:.6f}"
+            )
+
+        # --- Paged path ---
+        num_pages = (kv_len + page_size - 1) // page_size
+        paged_kv = torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        # Copy K/V into the paged buffer.
+        paged_kv[: kv_len // page_size, 0, :, :, :] = k[
+            : page_size * (kv_len // page_size)
+        ].view(kv_len // page_size, page_size, num_kv_heads, head_dim)
+        paged_kv[: kv_len // page_size, 1, :, :, :] = v[
+            : page_size * (kv_len // page_size)
+        ].view(kv_len // page_size, page_size, num_kv_heads, head_dim)
+        if kv_len % page_size:
+            paged_kv[kv_len // page_size, 0, : kv_len % page_size, :, :] = k[
+                page_size * (kv_len // page_size) :
+            ]
+            paged_kv[kv_len // page_size, 1, : kv_len % page_size, :, :] = v[
+                page_size * (kv_len // page_size) :
+            ]
+
+        for backend in get_available_backends(device):
+            workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+            qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+            paged_kv_indptr = torch.tensor(
+                [0, num_pages], dtype=torch.int32, device=device
+            )
+            paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+            last_page_len_val = kv_len - (num_pages - 1) * page_size
+            paged_kv_last_page_len = torch.tensor(
+                [last_page_len_val], dtype=torch.int32, device=device
+            )
+            q_offsets_t = torch.tensor([q_offset], dtype=torch.int32, device=device)
+            kv_offsets_t = torch.tensor([kv_offset], dtype=torch.int32, device=device)
+
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                kv_layout="NHD",
+                backend=backend,
+                block_extend=True,
+                block_size=block_size,
+            )
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                page_size=page_size,
+                q_data_type=dtype,
+                sm_scale=sm_scale,
+                q_offsets=q_offsets_t,
+                kv_offsets=kv_offsets_t,
+            )
+            out = wrapper.run(q, paged_kv)
+            diff = (out.float() - ref.float()).abs().max().item()
+            assert diff < tol, (
+                f"paged backend={backend} block_size={block_size} diff={diff:.6f}"
             )
