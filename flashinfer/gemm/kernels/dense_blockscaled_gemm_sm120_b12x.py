@@ -188,10 +188,11 @@ class DenseGemmKernel:
             * MXFP8: A/B: Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32,
               mma_k 32, tile_k 128 (needs cutlass-dsl >= 4.6.0 for MmaMXF8Op)
         - Tile shape constraints:
-            * tile_m must be divisible by 128
-            * tile_n must be divisible by 128
+            * FP4: tile_m divisible by 64, tile_n divisible by 16 and <= 128
+              (tile_n < 64 requires swap_ab)
+            * MXFP8: tile_m and tile_n divisible by 64 with tile_n <= 128,
+              plus the small-M tiles (16|32, 64|128)
             * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
-            * MXFP8 additionally allows the decode tiles (16|32, 64|128)
     """
 
     def __init__(

@@ -4885,7 +4885,12 @@ def _b12x_mxfp8_dsl_supported() -> bool:
         dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
     except importlib.metadata.PackageNotFoundError:
         return False
-    return tuple(int(x) for x in dsl_version.split(".")[:2]) >= (4, 6)
+    from packaging import version as pkg_version
+
+    try:
+        return pkg_version.Version(dsl_version).release[:2] >= (4, 6)
+    except pkg_version.InvalidVersion:
+        return False
 
 
 @supported_compute_capability([120, 121])
@@ -5418,7 +5423,8 @@ def _heuristic_func_mm_mxfp8(
 ) -> List[str]:
     # Prefer b12x where eligible, other setups keep the pre-existing order.
     if "b12x" in suitable_backends:
-        return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
+        order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
+        return [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         return ["cutlass"]
