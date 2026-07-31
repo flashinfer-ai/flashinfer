@@ -2,6 +2,7 @@
 
 from .moe_static_kernel import MoEStaticKernel
 from .moe_micro_kernel import MoEMicroKernel
+from .moe_direct_micro_kernel import MoEDirectMicroKernel
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_dispatch import (
     Sm120StaticMoEWorkspace,
@@ -19,6 +20,7 @@ from .moe_dispatch import (
 __all__ = [
     "MoEStaticKernel",
     "MoEMicroKernel",
+    "MoEDirectMicroKernel",
     "MoEDynamicKernel",
     "Sm120StaticMoEWorkspace",
     "Sm120DynamicMoEWorkspace",
