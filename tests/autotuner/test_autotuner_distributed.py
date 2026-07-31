@@ -41,8 +41,8 @@ def test_profile_single_kernel_preserves_collective_cardinality_on_exception():
 
     * ``pure_profile(...)`` is called inside a ``try/except`` whose
       handler sets ``avg_time = float("inf")``.
-    * ``dist.all_reduce`` appears AFTER that ``try/except`` (so it
-      runs on both success and caught-exception paths).
+    * ``_reduce_tactic_time_across_group`` appears AFTER that
+      ``try/except`` (so it runs on both success and caught-exception paths).
     * A ``raise`` follows, so ``choose_one``'s outer handler still
       sees the original failure for logging / OOM fallback.
 
@@ -101,15 +101,15 @@ def test_profile_single_kernel_preserves_collective_cardinality_on_exception():
     # The reduce + reraise must follow the wrapping Try in the function body.
     try_index = func.body.index(wrapping_try)
     post_try = func.body[try_index + 1 :]
-    has_all_reduce = any(
+    has_reduce = any(
         isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "all_reduce"
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_reduce_tactic_time_across_group"
         for stmt in post_try
         for n in ast.walk(stmt)
     )
-    assert has_all_reduce, (
-        "dist.all_reduce must appear AFTER the try/except so every "
+    assert has_reduce, (
+        "_reduce_tactic_time_across_group must appear AFTER the try/except so every "
         "rank reaches exactly one reduce per _profile_single_kernel "
         "call (collective-cardinality invariant)"
     )

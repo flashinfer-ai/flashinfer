@@ -132,8 +132,15 @@ def context_with_offset(
 
 
 def context_supports_knn_capture(context: DAMoeContext) -> bool:
+    if context.device_type != "cuda":
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(context.device_index)
+    except (AssertionError, RuntimeError):
+        return False
     return (
-        context.op_name
+        major == 10
+        and context.op_name
         in {
             "flashinfer::trtllm_bf16_moe",
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",

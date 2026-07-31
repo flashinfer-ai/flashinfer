@@ -312,7 +312,7 @@ inline void check_routing_metadata(Array<Tensor> const& routing_metadata, int64_
   check_tensor_1d_at_least(routing_metadata[kExpandedIdxToPermutedIdx], dl_int32,
                            num_tokens * top_k, "expanded_idx_to_permuted_idx");
   check_tensor_1d_at_least(routing_metadata[kPermutedIdxToTokenIdx], dl_int32,
-                           max_num_padded_tokens, "permuted_idx_to_token_idx");
+                           max_num_padded_tokens + 1, "permuted_idx_to_token_idx");
   check_tensor_1d_at_least(routing_metadata[kExpertCountHistogram], dl_int32,
                            size_of_expert_count_histogram, "expert_count_histogram");
   check_tensor_1d_at_least(routing_metadata[kNumTokensPerExpert], dl_int32, num_experts,
@@ -373,7 +373,7 @@ inline std::tuple<int64_t, int64_t> inferRoutingMetadataExpertDomain(
                                                                                num_experts, tile_N);
   int64_t metadata_num_experts = num_experts;
   if (local_num_experts < num_experts &&
-      routing_metadata[kPermutedIdxToTokenIdx].size(0) < global_max_num_padded_tokens) {
+      routing_metadata[kPermutedIdxToTokenIdx].size(0) < global_max_num_padded_tokens + 1) {
     metadata_num_experts = local_num_experts;
   }
   TVM_FFI_ICHECK(metadata_num_experts == num_experts || metadata_num_experts == local_num_experts)
@@ -3390,7 +3390,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_run_from_routing_metadata_impl(
                                                                                num_experts, tile_N);
   int64_t metadata_num_experts = num_experts;
   if (local_num_experts < num_experts &&
-      routing_metadata[kPermutedIdxToTokenIdx].size(0) < global_max_num_padded_tokens) {
+      routing_metadata[kPermutedIdxToTokenIdx].size(0) < global_max_num_padded_tokens + 1) {
     metadata_num_experts = local_num_experts;
   }
   TVM_FFI_ICHECK(metadata_num_experts == num_experts || metadata_num_experts == local_num_experts)
@@ -3862,7 +3862,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device());
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, topk_ids.device());
+      alloc_tensor({max_num_padded_tokens + 1}, dl_int32, topk_ids.device());
   DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
                                               ? topk_weights.value().dtype()
                                               : dl_bfloat16;
@@ -3980,7 +3980,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_from_logits(
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({num_tokens * top_k}, dl_int32, routing_logits.device());
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
+      alloc_tensor({max_num_padded_tokens + 1}, dl_int32, routing_logits.device());
   Tensor expert_weights_bf16 =
       alloc_tensor({num_tokens, top_k}, dl_bfloat16, routing_logits.device());
   Tensor expert_count_histogram = alloc_tensor({histogram_size}, dl_int32, routing_logits.device());
@@ -4271,6 +4271,8 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
       static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
       tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
+      (input_mode != RoutingInputMode::UnpackedPrecomputed ||
+       unpacked_weights->dtype() == dl_bfloat16) &&
       mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
       top_k <= 8;
   if (!can_use_multi_cluster) {
@@ -4305,7 +4307,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     Tensor expanded_idx_to_permuted_idx =
         alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device());
     Tensor permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens}, dl_int32, topk_ids.device());
+        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, topk_ids.device());
     DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
                                                 ? unpacked_weights->dtype()
                                                 : dl_bfloat16;
@@ -4431,6 +4433,8 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
       // allow_packed_multi_cluster is intentionally false for those wrappers.
       (input_mode == RoutingInputMode::UnpackedPrecomputed ||
        (allow_packed_multi_cluster && input_mode == RoutingInputMode::PackedPrecomputed)) &&
+      (input_mode != RoutingInputMode::UnpackedPrecomputed ||
+       topk_weights.value().dtype() == dl_bfloat16) &&
       num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
       static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
       tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&

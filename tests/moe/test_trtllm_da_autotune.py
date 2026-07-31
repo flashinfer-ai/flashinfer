@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import contextlib
 import csv
 import importlib
+import math
 import os
 import subprocess
 import sys
@@ -663,6 +664,21 @@ def test_fp8_block_lora_delta_remains_excluded_from_da_knn_capture(
     assert da_state.context_supports_knn_capture(no_lora_context)
 
 
+def test_da_knn_capture_rejects_unsupported_cuda_architecture(monkeypatch):
+    """DA rejects non-SM100 contexts before creating conditional graph state."""
+    context = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    assert not da_state.context_supports_knn_capture(context)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    assert da_state.context_supports_knn_capture(context)
+
+
 def test_da_captured_selector_survives_conflicting_context_upload():
     """Captured selectors retain their own context after a conflicting upload."""
     if os.getenv("_FLASHINFER_DA_SELECTOR_LIFETIME_CHILD") != "1":
@@ -939,6 +955,279 @@ def test_da_sparse_register_sort_preserves_zero_tail():
             graph.replay()
             torch.cuda.synchronize()
             assert output.item() == 1
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+        del graph
+        ffi.da_destroy_knn_selector(selector_handle)
+
+
+def test_da_non_power_of_two_expert_count_preserves_zero_sort_tail():
+    """A 17-expert selector ignores the synthetic 32-lane bitonic-sort tail."""
+    if os.getenv("_FLASHINFER_DA_NON_POWER_OF_TWO_SORT_CHILD") != "1":
+        env = os.environ.copy()
+        env["_FLASHINFER_DA_NON_POWER_OF_TWO_SORT_CHILD"] = "1"
+        env["FLASHINFER_DA_FUSED"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{__file__}::test_da_non_power_of_two_expert_count_preserves_zero_sort_tail",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
+    _require_sm100()
+    ffi = _load_moe_ffi_op()
+    injector = object.__new__(da_single_graph.DAInlineGraphInjector)
+    injector._ffi = ffi
+
+    precision = DA_PRECISION_CONTRACTS[0]
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = 17
+    counts = torch.tensor([1024] + [64] * 16, dtype=torch.int32, device=device)
+    num_tokens_bucket = int(counts.sum().item())
+    context = da_state.make_context(
+        precision.op_name,
+        device=device,
+        dtype_act=precision.dtype_act,
+        dtype_weights=precision.dtype_weights,
+        quantization_type=precision.quantization_type,
+        top_k=1,
+        num_experts=num_local_experts,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        hidden_size=1024,
+        intermediate_size=1024,
+        activation_type=int(moe_core.ActivationType.Swiglu),
+        weight_layout=moe_core.WeightLayout.MajorK,
+        use_shuffled_weight=True,
+    )
+    selector_handle = da_state.selector_handle(context)
+    tile_sizes = [16, 32]
+    counts_float = counts.float()
+    exemplars = torch.stack(
+        (
+            counts_float / counts_float.norm(),
+            torch.ones_like(counts_float) / math.sqrt(num_local_experts),
+        )
+    ).flatten()
+    assert int(torch.mv(exemplars.reshape(2, -1), counts_float).argmax()) == 0
+    da_profile.upload_exemplars_for_context(
+        ffi,
+        context,
+        exemplars,
+        [0, 1],
+        tile_sizes,
+        [0, 1],
+        tile_sizes,
+        num_local_experts,
+        0,
+        1,
+        num_tokens_bucket,
+    )
+
+    expert_ids = (
+        torch.arange(num_local_experts, device=device, dtype=torch.int32)
+        .repeat_interleave(counts)
+        .reshape(-1, 1)
+    )
+    output = torch.zeros((), device=device, dtype=torch.int32)
+    side_stream = torch.cuda.Stream(device=device)
+    routing_stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with (
+            torch.cuda.graph(graph),
+            injector.inject(
+                selector_handle=selector_handle,
+                topk_ids=expert_ids,
+                routing_input_mode=int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+                tile_sizes=tile_sizes,
+                num_tokens_bucket=num_tokens_bucket,
+                num_local_experts=num_local_experts,
+                local_expert_offset=0,
+                top_k=1,
+                side_stream=side_stream,
+                routing_stream=routing_stream,
+                pool_handle=torch.cuda.graph_pool_handle(),
+            ) as switch,
+        ):
+            with switch.body(0):
+                output.fill_(1)
+            with switch.body(1):
+                output.fill_(2)
+
+        for _ in range(100):
+            output.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert output.item() == 1
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+        del graph
+        ffi.da_destroy_knn_selector(selector_handle)
+
+
+def test_da_selector_consumes_counts_published_by_multi_tile_routing():
+    """The optional count selector waits for live multi-tile routing counts."""
+    if os.getenv("_FLASHINFER_DA_ROUTING_COUNTS_CHILD") != "1":
+        env = os.environ.copy()
+        env["_FLASHINFER_DA_ROUTING_COUNTS_CHILD"] = "1"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{__file__}::test_da_selector_consumes_counts_published_by_multi_tile_routing",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
+    _require_sm100()
+    ffi = _load_moe_ffi_op()
+    injector = object.__new__(da_single_graph.DAInlineGraphInjector)
+    injector._ffi = ffi
+
+    precision = DA_PRECISION_CONTRACTS[0]
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_tokens = 32
+    num_experts = 8
+    top_k = 1
+    tile_sizes = [16, 32]
+    context = da_state.make_context(
+        precision.op_name,
+        device=device,
+        dtype_act=precision.dtype_act,
+        dtype_weights=precision.dtype_weights,
+        quantization_type=precision.quantization_type,
+        top_k=top_k,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        hidden_size=1024,
+        intermediate_size=1024,
+        activation_type=int(moe_core.ActivationType.Swiglu),
+        weight_layout=moe_core.WeightLayout.MajorK,
+        use_shuffled_weight=True,
+    )
+    selector_handle = da_state.selector_handle(context)
+    exemplars = torch.zeros((2, num_experts), dtype=torch.float32, device=device)
+    exemplars[0, 0] = 1
+    exemplars[1].fill_(1 / math.sqrt(num_experts))
+    da_profile.upload_exemplars_for_context(
+        ffi,
+        context,
+        exemplars.flatten(),
+        [0, 1],
+        tile_sizes,
+        [0, 1],
+        tile_sizes,
+        num_experts,
+        0,
+        top_k,
+        num_tokens,
+    )
+
+    expert_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32, device=device)
+    expert_weights = torch.ones(
+        (num_tokens, top_k), dtype=torch.bfloat16, device=device
+    )
+    metadata_by_tile = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        None,
+        num_experts,
+        top_k,
+        8,
+        4,
+        0,
+        num_experts,
+        None,
+        int(RoutingMethodType.DeepSeekV3),
+        tile_sizes,
+        int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+        expert_weights,
+    )
+    flat_metadata = [tensor for metadata in metadata_by_tile for tensor in metadata]
+    output = torch.zeros((), device=device, dtype=torch.int32)
+    side_stream = torch.cuda.Stream(device=device)
+    routing_stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with (
+            torch.cuda.graph(graph),
+            injector.inject(
+                selector_handle=selector_handle,
+                topk_ids=expert_ids,
+                expert_counts=metadata_by_tile[0][4],
+                routing_input_mode=int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+                tile_sizes=tile_sizes,
+                num_tokens_bucket=num_tokens,
+                num_local_experts=num_experts,
+                local_expert_offset=0,
+                top_k=top_k,
+                side_stream=side_stream,
+                routing_stream=routing_stream,
+                pool_handle=torch.cuda.graph_pool_handle(),
+            ) as switch,
+        ):
+            with switch.routing_branch():
+                ffi.trtllm_moe_populate_routing_metadata_multi_tile(
+                    expert_ids,
+                    None,
+                    num_experts,
+                    top_k,
+                    8,
+                    4,
+                    0,
+                    num_experts,
+                    None,
+                    int(RoutingMethodType.DeepSeekV3),
+                    tile_sizes,
+                    flat_metadata,
+                    int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+                    expert_weights,
+                    False,
+                )
+            with switch.body(0):
+                output.fill_(1)
+            with switch.body(1):
+                output.fill_(2)
+
+        expert_ids.copy_(
+            torch.arange(num_tokens, dtype=torch.int32, device=device)
+            .remainder(num_experts)
+            .reshape(num_tokens, top_k)
+        )
+        for metadata in metadata_by_tile:
+            metadata[4].zero_()
+        output.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            metadata_by_tile[0][4][:num_experts],
+            torch.full(
+                (num_experts,),
+                num_tokens // num_experts,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        assert output.item() == 2
     finally:
         torch.cuda.synchronize()
         graph.reset()
@@ -2438,6 +2727,9 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
     single_tile_references = allocate_single_tile_references()
     graph.replay()
     torch.cuda.synchronize()
+    expected_expert_counts = torch.bincount(
+        expert_ids.flatten().to(torch.long), minlength=num_experts
+    ).to(torch.int32)
 
     expanded_tokens = num_tokens * top_k
     num_filled_experts = min(num_experts, expanded_tokens)
@@ -2450,16 +2742,17 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
     ):
         expected_max_ctas = num_filled_experts + remaining_tokens // tile_tokens_dim
         assert metadata[1].numel() == expanded_tokens
-        assert metadata[2].numel() == expected_max_ctas * tile_tokens_dim
+        assert metadata[2].numel() == expected_max_ctas * tile_tokens_dim + 1
         assert metadata[6].numel() == metadata[7].numel() == expected_max_ctas
         assert metadata[3].data_ptr() == expert_weights.data_ptr()
 
         total_num_padded_tokens = int(reference[0].item())
         num_non_exiting_ctas = int(reference[8].item())
-        assert 0 <= total_num_padded_tokens <= metadata[2].numel()
+        assert 0 <= total_num_padded_tokens < metadata[2].numel()
         assert 0 <= num_non_exiting_ctas <= expected_max_ctas
         assert torch.equal(metadata[0], reference[0])
         assert torch.equal(metadata[1], reference[1])
+        assert torch.equal(metadata[4][:num_experts], expected_expert_counts)
         permuted_indices = reference[1]
         assert torch.equal(
             metadata[2][permuted_indices],
@@ -2479,6 +2772,68 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
     graph.reset()
     del graph
     torch.cuda.synchronize()
+
+
+def test_fp32_unpacked_multi_tile_routing_uses_supported_fallback():
+    """FP32 routing weights fall back to independent single-tile launchers."""
+    _require_sm100()
+    num_tokens = 16
+    num_experts = 128
+    top_k = 8
+    tile_tokens_dims = [64, 96]
+    expert_ids = (
+        torch.arange(num_tokens * top_k, dtype=torch.int32, device="cuda")
+        .remainder(num_experts)
+        .reshape(num_tokens, top_k)
+    )
+    expert_weights = torch.linspace(
+        0.125,
+        0.875,
+        num_tokens * top_k,
+        dtype=torch.float32,
+        device=expert_ids.device,
+    ).reshape(num_tokens, top_k)
+
+    metadata_by_tile = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        None,
+        num_experts,
+        top_k,
+        8,
+        4,
+        0,
+        num_experts,
+        None,
+        int(RoutingMethodType.DeepSeekV3),
+        tile_tokens_dims,
+        int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+        expert_weights,
+    )
+    references = [
+        fused_moe_api.trtllm_moe_allocate_routing_metadata(
+            expert_ids,
+            None,
+            num_experts,
+            top_k,
+            8,
+            4,
+            0,
+            num_experts,
+            None,
+            int(RoutingMethodType.DeepSeekV3),
+            tile,
+            int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+            expert_weights,
+        )
+        for tile in tile_tokens_dims
+    ]
+    torch.cuda.synchronize()
+    for metadata, reference in zip(metadata_by_tile, references, strict=True):
+        assert metadata[3].dtype == torch.float32
+        assert torch.equal(metadata[0], reference[0])
+        assert torch.equal(metadata[1], reference[1])
+        assert torch.equal(metadata[3], reference[3])
+        assert torch.equal(metadata[8], reference[8])
 
 
 def test_nvfp4_unpacked_public_wrapper_metadata_replay_is_bit_exact():
@@ -3137,6 +3492,7 @@ def test_guarded_noda_640_uses_da_bucket_before_graph_mutation():
             da_context=context,
             num_tokens=640,
             tune_max_num_tokens=8192,
+            num_fused_shared_experts=0,
         ),
         backend=SimpleNamespace(
             capture_backend=lambda: pytest.fail(
@@ -3189,6 +3545,8 @@ def test_guarded_noda_bundle_restores_640_da_bucket_policy():
     da_state.PER_TILE_TACTICS[key] = {32: (32, 202)}
     da_state.PER_BODY_TACTICS[key] = [(32, 202)]
     da_state.BUNDLE_EAGER_TACTICS.pop(key, None)
+    old_bundle_has_tactics = da_profile._bundle_has_tactics
+    old_bundle_contexts = set(da_state.BUNDLE_TACTIC_CONTEXTS)
     try:
         uploaded = da_profile.load_knn_v2_bundle(
             bundle,
@@ -3209,11 +3567,16 @@ def test_guarded_noda_bundle_restores_640_da_bucket_policy():
         assert key not in da_state.PER_TILE_TACTICS
         assert key not in da_state.PER_BODY_TACTICS
         assert da_state.BUNDLE_EAGER_TACTICS[key] == ((128, 14), 0.51)
+        assert da_profile.bundle_has_tactics()
+        assert context in da_state.BUNDLE_TACTIC_CONTEXTS
     finally:
         da_state.BASELINE_GUARD_DECISIONS.pop(key, None)
         da_state.PER_TILE_TACTICS.pop(key, None)
         da_state.PER_BODY_TACTICS.pop(key, None)
         da_state.BUNDLE_EAGER_TACTICS.pop(key, None)
+        da_profile._bundle_has_tactics = old_bundle_has_tactics
+        da_state.BUNDLE_TACTIC_CONTEXTS.clear()
+        da_state.BUNDLE_TACTIC_CONTEXTS.update(old_bundle_contexts)
 
 
 @dataclass(frozen=True)

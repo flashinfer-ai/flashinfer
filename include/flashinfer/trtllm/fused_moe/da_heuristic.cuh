@@ -445,6 +445,13 @@ __device__ __forceinline__ void da_knn_finish_selection_from_counts(
 
   int sort_len = static_cast<int>(get_power_of_2_value(static_cast<unsigned int>(sort_items)));
   if (sort_len > kMaxKnnExperts) sort_len = kMaxKnnExperts;
+  // Compaction initializes only the logical expert domain. Bitonic sorting
+  // rounds its working set up to a power of two, so explicitly zero the
+  // synthetic tail for non-power-of-two expert counts.
+  for (int i = threadIdx.x + num_local_experts; i < sort_len; i += blockDim.x) {
+    counts_int[i] = 0;
+  }
+  __syncthreads();
   if (sort_len > 1) {
     if (sort_len <= 32) {
       da_knn_sort_counts_warp_bitonic_desc(counts_int, sort_len);

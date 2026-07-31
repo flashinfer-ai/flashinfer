@@ -408,6 +408,13 @@ __device__ void routingPermutation(KernelParams params,
         }
         count[e] += expertCounts[rank];
       }
+      // The multi-tile DA selector may consume the first metadata bundle's
+      // histogram directly. Publish the cluster-reduced count while it is
+      // already resident in registers instead of launching another histogram
+      // kernel or copying routing state.
+      if (clusterBlockRank == 0 && params.mPtrExpertCounts != nullptr) {
+        params.mPtrExpertCounts[expert] = count[e];
+      }
     }
   }
 

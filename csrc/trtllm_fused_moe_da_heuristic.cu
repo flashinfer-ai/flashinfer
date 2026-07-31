@@ -850,9 +850,16 @@ void da_inline_routing_end_capture(int64_t ctx_id) {
     routing_tails.assign(tail_deps, tail_deps + n_tail_deps);
   }
   if (!routing_tails.empty()) {
-    std::vector<cudaGraphNode_t> switch_deps(routing_tails.size(), ctx->switch_node);
-    DA_CUDA_CHECK(da_cuda_graph_add_dependencies(
-        ctx->outer_graph, routing_tails.data(), switch_deps.data(), nullptr, routing_tails.size()));
+    // The default selector reads top-k IDs directly and remains independent
+    // from routing metadata, so only SWITCH waits for both branches. The
+    // optional global-count selector consumes counts produced by routing and
+    // must itself wait for that branch before selecting a body.
+    cudaGraphNode_t routing_consumer =
+        ctx->select_from_global_counts_kargs ? ctx->decision_node : ctx->switch_node;
+    std::vector<cudaGraphNode_t> routing_deps(routing_tails.size(), routing_consumer);
+    DA_CUDA_CHECK(da_cuda_graph_add_dependencies(ctx->outer_graph, routing_tails.data(),
+                                                 routing_deps.data(), nullptr,
+                                                 routing_tails.size()));
   }
 
   DA_CUDA_CHECK(cudaStreamWaitEvent(ctx->outer_stream, ctx->routing_done_event, 0));

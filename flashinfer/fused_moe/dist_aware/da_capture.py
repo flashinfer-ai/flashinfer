@@ -214,7 +214,7 @@ def lookup_capture_resources(
         minimum_first_dims = (
             1,
             expanded_tokens,
-            max_num_padded_tokens,
+            max_num_padded_tokens + 1,
             num_tokens,
             max(da_context.num_experts * 2, 512),
             da_context.num_experts,

@@ -1302,6 +1302,73 @@ def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatc
     assert tactic_calls[(64, (32, 3))] == 6
 
 
+def test_factorized_value_profile_never_profiles_blocklisted_composed_tactic(
+    monkeypatch,
+):
+    """A rejected composition and its exhaustive fallback both honor blocklists."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+
+    class FactorizedRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=((32, 1), (32, 2), (32, 3)))
+
+        def get_tactic_groups(self, _inputs, profile):
+            if profile.value_buckets == (-1,):
+                return None
+            return [[(32, 1)], [(32, 2)]]
+
+        def compose_tactics(self, _group_winners, _inputs, _profile):
+            return (32, 3)
+
+    runner = FactorizedRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8,),
+                map_to_tuning_buckets=lambda _size: 8,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=(32,),
+                        map_to_value_bucket=lambda _tensor: 32,
+                        tensor_value_generator=lambda bucket, profiled, original: (
+                            original
+                            if bucket == -1
+                            else torch.full_like(profiled, bucket)
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=(-1,),
+    )
+    inputs = [torch.zeros((8,), dtype=torch.float32)]
+    profiled_tactics = []
+
+    original_filter = tuner._blocklist.filter
+
+    def filter_tactics(custom_op, candidate_runner, tactics):
+        allowed = original_filter(custom_op, candidate_runner, tactics)
+        return [tactic for tactic in allowed if tuple(tactic) != (32, 3)]
+
+    monkeypatch.setattr(tuner._blocklist, "filter", filter_tactics)
+
+    def fake_profile(_self, _runner, _profile_inputs, tactic, _config, **_kwargs):
+        profiled_tactics.append(tuple(tactic))
+        return {(32, 1): 0.8, (32, 2): 0.7}[tuple(tactic)]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("factorized_blocklist", [runner], config, inputs)
+
+    assert (32, 3) not in profiled_tactics
+    assert (32, 1) in profiled_tactics
+    assert (32, 2) in profiled_tactics
+
+
 class TileTacticDummyRunner(TunableRunner):
     def __init__(self, supported_tiles: tuple[int, ...], num_tactics_per_tile: int = 2):
         self.supported_tiles = supported_tiles

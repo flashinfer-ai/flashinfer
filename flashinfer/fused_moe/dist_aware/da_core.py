@@ -113,6 +113,7 @@ class DAInvocation:
     routing_input_mode: int
     internal_routing_mode: int
     enable_pdl: bool
+    num_fused_shared_experts: int = 0
 
 
 @dataclass(frozen=True)
@@ -382,7 +383,11 @@ def should_attach_value_specs(execution: DAExecution, tuner: AutoTuner) -> bool:
     already supplies the value-aware plan and therefore suppresses profiling.
     """
 
-    if not execution.config.enabled or torch.cuda.is_current_stream_capturing():
+    if (
+        not execution.config.enabled
+        or execution.invocation.num_fused_shared_experts > 0
+        or torch.cuda.is_current_stream_capturing()
+    ):
         return False
     if not tuner.is_tuning_mode:
         return False
@@ -624,6 +629,10 @@ def maybe_prepare_bundle(execution: DAExecution, tuner: Any) -> None:
     """Load a compatible bundle or register one immutable live profile."""
 
     call = execution.invocation
+    if call.num_fused_shared_experts > 0 or not da_state.context_supports_knn_capture(
+        call.da_context
+    ):
+        return
     backend = _profile_backend(execution)
 
     def register_live_profile() -> None:
@@ -697,6 +706,11 @@ def tune_and_publish_tactic(
 ) -> Any:
     """Run the shared DA-aware tuning and publication lifecycle."""
 
+    # Bundle loading must precede value-spec construction so every precision
+    # can reuse a published plan in a fresh, non-tuning process. FP4 performs
+    # the same preload before its precision-owned tuning flow.
+    maybe_prepare_bundle(execution, tuner)
+
     tuning_kwargs: dict[str, Any] = {}
     value_specs_active = False
     if execution.config.enabled:
@@ -754,6 +768,10 @@ def try_capture_dispatch(
     """Delegate capture dispatch with the execution's immutable configuration."""
 
     call = execution.invocation
+    if call.num_fused_shared_experts > 0 or not da_state.context_supports_knn_capture(
+        call.da_context
+    ):
+        return None
     bucket = upload_bucket(call.num_tokens, call.tune_max_num_tokens)
     decision = da_state.BASELINE_GUARD_DECISIONS.get(
         da_state.cache_key(call.da_context, bucket), {}

@@ -674,11 +674,14 @@ def load_knn_v2_bundle(
                 da_state.cache_key(offset_context, int(bucket_key))
             ] = dict(plan)
         uploaded += 1
+    if uploaded > 0:
+        _bundle_has_tactics = True
+        da_state.BUNDLE_TACTIC_CONTEXTS.add(da_context)
     return uploaded
 
 
 def bundle_has_tactics() -> bool:
-    """Whether the last compatible bundle supplied an explicit tactic table."""
+    """Whether a compatible bundle supplied executable plan tactics."""
     return _bundle_has_tactics
 
 

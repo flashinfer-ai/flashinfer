@@ -1127,6 +1127,23 @@ def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     return _tune_process_group
 
 
+def _reduce_tactic_time_across_group(time_ms: float) -> float:
+    """Average one tactic timing across the configured tuning process group."""
+
+    if _tune_process_group is None:
+        return time_ms
+
+    import torch.distributed as dist
+
+    # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the recommended
+    # choice — uses a CPU tensor.
+    backend = str(dist.get_backend(_tune_process_group)).lower()
+    device = "cuda" if backend == "nccl" else "cpu"
+    time_tensor = torch.tensor([time_ms], dtype=torch.float64, device=device)
+    dist.all_reduce(time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group)
+    return time_tensor.item() / dist.get_world_size(_tune_process_group)
+
+
 @dataclass(frozen=True)
 class ProfilingCacheKey:
     """Immutable key identifying a profiled (op, runner, shape) combination.
@@ -2899,9 +2916,11 @@ class AutoTuner:
                                 value_time_median_ms = None
                                 value_time_max_ms = None
                                 value_times_ms = None
+                                graph_time_needs_reduction = False
                                 try:
                                     if value_input_sets is not None:
                                         if tuning_config.use_cuda_graph:
+                                            graph_time_needs_reduction = True
                                             with _autotune_nvtx_range(
                                                 "profile-tactic:"
                                                 f"op={custom_op}, tokens={num_tokens}, "
@@ -3027,6 +3046,14 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                if graph_time_needs_reduction:
+                                    # Graph-profile measurements bypass
+                                    # _profile_single_kernel, so apply the
+                                    # same exactly-once distributed reduction
+                                    # before any rank performs tactic selection.
+                                    time_measured = _reduce_tactic_time_across_group(
+                                        time_measured
+                                    )
                                 if _AUTOTUNE_DUMP_PATH:
                                     profile_records.append(
                                         {
@@ -3112,6 +3139,14 @@ class AutoTuner:
                                         composed_tactic = r.compose_tactics(
                                             group_winners, tensors, p
                                         )
+                                        allowed_composed = self._blocklist.filter(
+                                            custom_op, r, [composed_tactic]
+                                        )
+                                        if not allowed_composed:
+                                            raise ValueError(
+                                                "composed factorized tactic is blocklisted"
+                                            )
+                                        composed_tactic = allowed_composed[0]
                                         composed_time = profile_tactic(
                                             composed_tactic,
                                             "composed",
@@ -3136,7 +3171,12 @@ class AutoTuner:
                                         "[Autotuner]: Factorized tactic selection failed for "
                                         f"{r}; falling back to exhaustive tactics"
                                     )
-                                    for tac in r.get_valid_tactics(tensors, p):
+                                    fallback_tactics = self._blocklist.filter(
+                                        custom_op,
+                                        r,
+                                        r.get_valid_tactics(tensors, p),
+                                    )
+                                    for tac in fallback_tactics:
                                         time_measured = profile_tactic(
                                             tac,
                                             "exhaustive_fallback",
@@ -3430,19 +3470,7 @@ class AutoTuner:
 
         try:
             if _tune_process_group is not None:
-                import torch.distributed as dist
-
-                # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
-                # recommended choice — uses a CPU tensor.
-                backend = str(dist.get_backend(_tune_process_group)).lower()
-                device = "cuda" if backend == "nccl" else "cpu"
-                time_tensor = torch.tensor(
-                    [avg_time], dtype=torch.float64, device=device
-                )
-                dist.all_reduce(
-                    time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
-                )
-                avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+                avg_time = _reduce_tactic_time_across_group(avg_time)
         finally:
             # Re-raise even if the collective itself failed, so the original
             # profiling error is never masked by a secondary reduce error.

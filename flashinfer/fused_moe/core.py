@@ -3178,6 +3178,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     ),
                     internal_routing_mode=int(RoutingInputMode.PackedPrecomputed),
                     enable_pdl=bool(enable_pdl),
+                    num_fused_shared_experts=int(
+                        num_fused_shared_experts
+                        if num_fused_shared_experts is not None
+                        else 0
+                    ),
                 ),
                 da_config,
             )
@@ -3661,6 +3666,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         else int(RoutingInputMode.PackedPrecomputed)
                     ),
                     enable_pdl=bool(enable_pdl),
+                    num_fused_shared_experts=int(num_fused_shared_experts),
                 ),
                 da_config,
             )
@@ -4114,7 +4120,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         return [
             topk_ids.new_empty((1,)),
             topk_ids.new_empty((expanded_tokens,)),
-            topk_ids.new_empty((max_num_padded_tokens,)),
+            # Shipped routed-BMM cubins may read one route-map element beyond
+            # the logical padded-token extent.
+            topk_ids.new_empty((max_num_padded_tokens + 1,)),
             torch.empty(
                 (num_tokens, top_k),
                 dtype=(
