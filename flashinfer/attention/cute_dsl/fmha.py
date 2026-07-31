@@ -497,10 +497,7 @@ def cute_dsl_fmha_ragged_prefill(
 
     # Skip-softmax threshold (convert scale_factor to log2 domain)
     skip_threshold_log2 = None
-    if (
-        skip_softmax_threshold_scale_factor is not None
-        and skip_softmax_threshold_scale_factor > 0
-    ):
+    if use_skip_softmax:
         threshold = skip_softmax_threshold_scale_factor / max_s_k
         skip_threshold_log2 = Float32(math.log2(threshold))
 

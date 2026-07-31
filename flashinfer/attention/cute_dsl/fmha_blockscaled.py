@@ -45,7 +45,7 @@ from flashinfer.cute_dsl.attention.fmha.compile import (
 logger = logging.getLogger("flashinfer.attention.cute_dsl.fmha_blockscaled")
 
 
-def _reshape_sf_for_kernel(
+def _reshape_swizzled_sf(
     sf: torch.Tensor,
     batch_size: int,
     num_heads: int,
@@ -91,11 +91,7 @@ def _get_variant_name(
     sink_str = "_sink" if enable_sink else ""
     pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return (
-        f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_"
-        f"{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}"
-        f"{pdl_str}{ffi_str}"
-    )
+    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
 
 
 @functools.cache
@@ -135,17 +131,16 @@ def get_cute_dsl_fmha_blockscaled_kernel(
         use_pdl=use_pdl,
     )
 
+    # Check for local .so directory (development mode)
     local_dir = os.environ.get("FLASHINFER_DSL_FMHA_LOCAL_DIR")
     if local_dir:
         logger.info(
-            "Loading block-scaled DSL FMHA kernel from local dir: "
-            f"{local_dir} (tvm_ffi={enable_tvm_ffi})"
+            f"Loading block-scaled DSL FMHA kernel from local dir: {local_dir} (tvm_ffi={enable_tvm_ffi})"
         )
         return _load_from_local(variant_name, local_dir, enable_tvm_ffi=enable_tvm_ffi)
 
     logger.info(
-        "Loading block-scaled DSL FMHA kernel variant: "
-        f"{variant_name} (tvm_ffi={enable_tvm_ffi})"
+        f"Loading block-scaled DSL FMHA kernel variant: {variant_name} (tvm_ffi={enable_tvm_ffi})"
     )
     return _load_from_artifact(variant_name, gpu_arch, enable_tvm_ffi=enable_tvm_ffi)
 
@@ -185,12 +180,15 @@ def cute_dsl_fmha_blockscaled_prefill(
         raise ValueError(
             f"qk_mode must be one of {tuple(_BLOCKSCALED_MODES)}, got {qk_mode!r}"
         )
-    batch_size, s_q, H_q, _ = q.shape
+    batch_size, s_q, H_q, D = q.shape
     _, s_k, H_k, _ = k.shape
-    D = D_v = v.shape[-1]
+    D_v = v.shape[-1]
+    num_store_bits = q.element_size() * 8
+    num_dtype_bits = _BLOCKSCALED_MODES[qk_mode][0].width
+    D *= num_store_bits // num_dtype_bits
     h_r = H_q // H_k
 
-    use_skip = (
+    use_skip_softmax = (
         skip_softmax_threshold_scale_factor is not None
         and skip_softmax_threshold_scale_factor > 0
     )
@@ -211,7 +209,7 @@ def cute_dsl_fmha_blockscaled_prefill(
             is_persistent=False,
             enable_tvm_ffi=True,
             with_lse=lse is not None,
-            enable_skip_softmax=use_skip,
+            enable_skip_softmax=use_skip_softmax,
             use_pdl=enable_pdl,
         )
     except (RuntimeError, FileNotFoundError) as e:
@@ -227,7 +225,7 @@ def cute_dsl_fmha_blockscaled_prefill(
             D,
             is_causal,
             lse is not None,
-            use_skip,
+            use_skip_softmax,
             enable_pdl,
             q.device,
             has_window_left=window_left != -1,
@@ -248,7 +246,7 @@ def cute_dsl_fmha_blockscaled_prefill(
     problem_size = (batch_size, s_q, s_q, s_k, H_q, H_k, D, D_v)
 
     skip_threshold_log2 = None
-    if use_skip:
+    if use_skip_softmax:
         skip_threshold_log2 = Float32(
             math.log2(skip_softmax_threshold_scale_factor / s_k)
         )
@@ -261,8 +259,8 @@ def cute_dsl_fmha_blockscaled_prefill(
     q_5d = q.reshape(batch_size, s_q, H_k, h_r, q.shape[-1])
     k_5d = k.reshape(batch_size, s_k, H_k, 1, k.shape[-1])
     sf_vec_size = _BLOCKSCALED_MODES[qk_mode][2]
-    q_sf_6d = _reshape_sf_for_kernel(q_sf, batch_size, H_q, s_q, D, sf_vec_size)
-    k_sf_6d = _reshape_sf_for_kernel(k_sf, batch_size, H_k, s_k, D, sf_vec_size)
+    q_sf_6d = _reshape_swizzled_sf(q_sf, batch_size, H_q, s_q, D, sf_vec_size)
+    k_sf_6d = _reshape_swizzled_sf(k_sf, batch_size, H_k, s_k, D, sf_vec_size)
     v_5d = v.reshape(batch_size, s_k, H_k, 1, D_v)
     assert o.data_ptr() % 32 == 0, "o must be 32-byte aligned (256-bit stores)"
     o_5d = o.reshape(batch_size, s_q, H_k, h_r, D_v)
