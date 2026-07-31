@@ -1162,9 +1162,9 @@ def pow2_ceil_ue8m0(
     """Round a positive FP32 ``scale`` up to a power of two, bit-exactly.
 
     Returns ``(rounded_fp32, ue8m0_byte)`` with ``ue8m0_byte`` the biased
-    exponent of the rounded value. Integer ops only (no lg2.approx), so
-    unlike ``cvt_f32_to_ue8m0`` it matches the fp8_quant.cuh rounding and
-    scale_convert.cuh fp32_to_ue8m0 references bit-for-bit.
+    exponent of the rounded value. Unlike ``cvt_f32_to_ue8m0``, this matches
+    the fp8_quant.cuh and scale_convert.cuh fp32_to_ue8m0 references
+    bit-for-bit.
     """
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.i32()]),
@@ -1204,8 +1204,7 @@ def pow2_ceil_ue8m0(
 def cvt_e8m0_to_f32(e8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
     """Convert a single E8M0 scale byte to its true f32 value 2**(byte-127).
 
-    Byte 0 maps to 0.0. Returns the unbiased scale so callers can apply it
-    directly in an f32 accumulator.
+    Byte 0 maps to 0.0.
     """
     return Float32(
         llvm.inline_asm(

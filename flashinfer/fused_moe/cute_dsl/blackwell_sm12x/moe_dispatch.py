@@ -1297,9 +1297,9 @@ def launch_sm120_static_moe(
                 raise RuntimeError("compiled direct micro MoE kernel cannot launch")
             use_direct_micro = False
     if use_direct_micro:
-        # The kernel takes multiplier-form scales only; invert into the
-        # persistent workspace planes (zeros stay zero, matching the MMA
-        # kernels). Non-reciprocal scales pass through directly.
+        # The kernel takes multiplier-form scales only; invert reciprocal
+        # inputs into the persistent workspace planes (zeros stay zero,
+        # matching the MMA kernels).
         if input_scales_are_reciprocal:
             workspace.dm_input_gs.copy_(
                 torch.where(input_gs != 0, 1.0 / input_gs, input_gs)

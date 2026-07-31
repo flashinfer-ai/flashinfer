@@ -2,11 +2,8 @@
 
 Unlike MoEMicroKernel (Triton route pre-pass, expert-major packed A), this
 kernel consumes raw per-token topk_ids/topk_weights with no routing
-pre-pass: 16-warp CTAs quantize each token row into shared memory, run FC1
-as software fp4 dot products over f16x2 HFMA, activate, quantize the
-intermediate, cross a resident-grid barrier (or per-token epoch barrier at
-m==1), and run FC2 with a bf16x2 atomic scatter into the token-major
-output.
+pre-pass and computes both GEMMs as software fp4 dot products on CUDA
+cores, targeting tiny decode batches.
 """
 
 from __future__ import annotations

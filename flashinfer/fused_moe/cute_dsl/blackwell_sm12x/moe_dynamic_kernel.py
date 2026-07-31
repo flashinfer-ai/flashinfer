@@ -302,8 +302,8 @@ class MoEDynamicKernel:
         self.cluster_shape_mn = (1, 1)
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
         self.occupancy = 1
-        # Per-tile MMA atom layout and warp count. Smaller tiles need the
-        # matching atom shape so the SF smem layout and V-map stay consistent.
+        # Smaller tiles need a matching MMA atom shape so the SF smem layout
+        # and V-map stay consistent.
         if mma_tiler_mn[0] == 128:
             self.atom_shape = (2, 2, 1)
             self.num_mma_warps = 4
@@ -2496,9 +2496,8 @@ class MoEDynamicKernel:
                 task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
 
-                # gA/gSFA are tiled in 128-row blocks: a sub-128 MMA tile maps
-                # to block task_m_tile_idx // tiles_per_block, and the
-                # fragment partition selects the within-block sub-tile.
+                # gA/gSFA are tiled in 128-row blocks; the fragment partition
+                # selects the within-block sub-tile.
                 sa_block_idx = task_m_tile_idx // Int32(self.sa_tiles_per_block)
                 tAgA_mk = tAgA[(None, sa_block_idx, None, Int32(0))]
                 sfa_block_idx = task_m_tile_idx // Int32(self.sfa_tiles_per_block)
