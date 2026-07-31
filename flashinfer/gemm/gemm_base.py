@@ -6071,10 +6071,31 @@ def _cute_dsl_gemm_fp4_requirement(
     return True
 
 
+def _b12x_short_mainloop_race_window(
+    mma_tiler_mn: Tuple[int, int], m: int, n: int, k: int, sm_count: int
+) -> bool:
+    """True when a b12x launch with this tile can hit the pipeline race.
+
+    The SM120 b12x kernel corrupts output when the mainloop runs no more K
+    iterations than the smem pipeline has stages AND the grid has more work
+    tiles than SMs, so a persistent CTA revisits work tiles. Iterations equal
+    to the stage count still race (measured 2/20 at k=640 on the 5-stage
+    (64, 128) tile), so safety requires strictly more. Stage counts mirror
+    the caps in the kernel's ``_compute_stages`` (the raw stage count can be
+    lower for large tiles, so this is conservative).
+    """
+    stage_cap = 5 if mma_tiler_mn[0] in (16, 64) and mma_tiler_mn[1] == 128 else 4
+    k_iters = -(-k // 128)
+    if k_iters > stage_cap:
+        return False
+    work_tiles = -(-m // mma_tiler_mn[0]) * -(-n // mma_tiler_mn[1])
+    return work_tiles > sm_count
+
+
 @supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
-    b: torch.Tensor,  # unused
+    b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
     alpha: Optional[torch.Tensor] = None,  # unused
@@ -6107,6 +6128,20 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError(
             "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
             f"(TMA 16-byte alignment). Got K={real_k}."
+        )
+    # Short-mainloop race containment (see _b12x_short_mainloop_race_window).
+    # (128, 128) has the fewest work tiles and the lowest stage cap of any
+    # reachable tactic, so a shape is rejected only when even that fallback
+    # tile would race. The runner routes allowed shapes to non-racing tiles.
+    if _b12x_short_mainloop_race_window(
+        (128, 128), a.shape[0], b.shape[1], real_k, get_device_sm_count(a.device)
+    ):
+        if backend != "b12x":
+            return False
+        raise ValueError(
+            "b12x FP4 GEMM does not support short-K launches beyond one work "
+            "tile per SM (a known kernel race; use the cutlass backend). Got "
+            f"K={real_k}, M={a.shape[0]}, N={b.shape[1]}."
         )
     _check_cute_dsl_availability()
     return True
@@ -6493,6 +6528,10 @@ def _b12x_gemm_fp4_runner(
             valid_tactics = []
 
             def _add(mma_tiler_mn, swap_ab):
+                if _b12x_short_mainloop_race_window(
+                    mma_tiler_mn, m, n, real_k, get_device_sm_count(a.device)
+                ):
+                    return
                 # can_implement is M-independent (takes no `m`)
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
@@ -6547,10 +6586,24 @@ def _b12x_gemm_fp4_runner(
                 # Default path: the m-aware plan picks the tile (and swap_ab for
                 # narrow-N) for this shape; expected_m=m since m is the actual size.
                 plan = _default_dense_plan(m, n, real_k, a.device)
+                tile, swap = plan.mma_tiler_mn, plan.swap_ab
+                sm_count = get_device_sm_count(a.device)
+                if _b12x_short_mainloop_race_window(tile, m, n, real_k, sm_count):
+                    # (128, 128) is the safe fallback the requirement
+                    # check guarantees. An unsafe plan tile reaches this
+                    # point only via skip_check=True, which must not corrupt
+                    # silently.
+                    tile, swap = (128, 128), False
+                    if _b12x_short_mainloop_race_window(tile, m, n, real_k, sm_count):
+                        raise RuntimeError(
+                            "b12x FP4 GEMM cannot run short-K launches beyond "
+                            "one work tile per SM (known kernel race). Got "
+                            f"K={real_k}, M={m}, N={n}."
+                        )
                 tactic = (
-                    plan.mma_tiler_mn,
+                    tile,
                     (1, 1),
-                    plan.swap_ab,
+                    swap,
                     False,
                     "sm120",
                     None,
