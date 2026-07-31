@@ -24,8 +24,6 @@ from flashinfer.topk import TopKTieBreak
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
-BENCH_ENABLE_CUPTI = True
-
 
 def set_topk_algo(algo: str):
     """Set environment variable to force specific topk algorithm."""
@@ -69,10 +67,10 @@ def torch_deterministic_algorithms(enabled: bool):
 def bench_median_ms(fn) -> float:
     measurements = bench_gpu_time(
         fn,
-        enable_cupti=BENCH_ENABLE_CUPTI,
+        enable_cupti=True,
         dry_run_iters=10,
         repeat_iters=100,
-        use_cuda_graph=True,
+        use_cuda_graph=False,
     )
     return float(np.median(measurements))
 
@@ -939,8 +937,6 @@ def parse_dtype(dtype_str: str) -> torch.dtype:
 
 @torch.inference_mode()
 def main():
-    global BENCH_ENABLE_CUPTI
-
     parser = argparse.ArgumentParser(description="Benchmark Top-K operations")
     parser.add_argument(
         "--compare-sglang",
@@ -977,11 +973,6 @@ def main():
             "FlashInfer(tie-small/tie-large) columns with slowdown against "
             "the non-deterministic baseline"
         ),
-    )
-    parser.add_argument(
-        "--disable-cupti",
-        action="store_true",
-        help="Use CUDA-event timing instead of CUPTI activity profiling",
     )
     parser.add_argument(
         "--compare-torch-deterministic",
@@ -1043,7 +1034,6 @@ def main():
         help="Query length per request for the varlen prefill (causal) regime (default: 128)",
     )
     args = parser.parse_args()
-    BENCH_ENABLE_CUPTI = not args.disable_cupti
 
     if args.varlen_k <= 0:
         parser.error("--varlen-k must be a positive integer")
