@@ -940,8 +940,11 @@ class MixedCommHandler:
         Parameters
         ----------
         comm_backend : CommBackend
-            Intra-node communication backend used to exchange and synchronize
-            the restored VMM mappings.
+            Intra-node communication backend whose ``Get_rank()`` and
+            ``Get_size()`` match this handler's ``local_rank`` and
+            ``local_size``. Its ``bcast`` and ``barrier`` operations
+            coordinate the Unix-socket handle exchange and synchronize VMM
+            mapping restoration.
         """
         if self.para_info.use_inter:
             raise NotImplementedError(
