@@ -36,18 +36,21 @@ python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch")
   > /install/torch-constraint.txt
 export PIP_CONSTRAINT=/install/torch-constraint.txt
 
-# Keep cuda-python on this image's CUDA major: before requirements.txt (floored
-# >=12.0, else pip takes CUDA-13 and drags torch along) and after (nvshmem4py
-# pins <=12.9).
+# Pick the CUDA-major-matched packages: nvshmem4py-cuXX pins cuda-python to its
+# own major, so mixing them leaves a broken dependency graph. cuda-python is
+# installed before requirements.txt (floored >=12.0, else pip takes CUDA-13 and
+# drags torch along) and again after, since nvshmem4py can pull it back down.
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   CUDA_PYTHON="cuda-python==13.0"
+  NVSHMEM4PY="nvshmem4py-cu13"
 else
   CUDA_PYTHON="cuda-python==12.*"
+  NVSHMEM4PY="nvshmem4py-cu12"
 fi
 
 pip3 install --upgrade "$CUDA_PYTHON"
 pip3 install -r /install/requirements.txt
-pip3 install responses pytest scipy build cuda-python nvshmem4py-cu12
+pip3 install responses pytest scipy build "$NVSHMEM4PY"
 pip3 install --upgrade "$CUDA_PYTHON"
 
 # Install cudnn package based on CUDA version
