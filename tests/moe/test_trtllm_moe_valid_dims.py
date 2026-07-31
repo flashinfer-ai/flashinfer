@@ -794,9 +794,194 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         valid_intermediate_size=vi,
     )[0].to(torch.float)
 
-    assert kernel_output.shape == reference_output.shape == (
-        num_tokens,
-        valid_hidden_size,
+    assert (
+        kernel_output.shape
+        == reference_output.shape
+        == (
+            num_tokens,
+            valid_hidden_size,
+        )
     )
     # FP4 tolerances mirror FP4Moe.get_tolerances().
     check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.92)
+
+
+# Regression test for the GPT-OSS failure reported against this PR: a valid dim that is
+# not a multiple of 128 made trtllm-gen build an invalid TMA descriptor and the driver
+# rejected it with "Failed to initialize the TMA descriptor" during warmup.
+#
+# Why 128: trtllm-gen's makeTmaShapeStrideAbc() takes the TMA descriptor's *shape* from
+# validM/validN/validK and its *stride* from the padded dims, so cuTensorMapEncodeTiled
+# enforces the kernel's dimension rules on the valid dims. GemmOptions.h requires
+# "MxFp4 x Fp8 mmaType ... hiddenDim % 128 == 0" (plus a 16B row rule and a
+# 4*sfBlockSize output rule). GPT-OSS has hidden_size == intermediate_size == 2880 and
+# 2880 % 128 == 64, so both GEMMs tripped it.
+#
+# Every other test in this file keeps its valid dims 128/256-aligned, which is exactly
+# why the bug was not caught. The sizes below use 960, which has the same residue as
+# GPT-OSS (960 % 128 == 64 == 2880 % 128) at a fraction of the cost.
+#
+# The runner now rounds valid dims up to 128 (clamped to the padded dim). Rounding up is
+# only sound if the skipped region is zero, so this test zeroes the padded region and
+# asserts the valid-dims run agrees with the same problem run with valid dims disabled --
+# which is the property the round-up relies on.
+@pytest.mark.parametrize(
+    ("valid_size", "aligned"),
+    [
+        (960, False),  # 960 % 128 == 64 -- the GPT-OSS residue
+        (896, True),  # control: already 128-aligned
+    ],
+)
+@pytest.mark.parametrize("which", ["intermediate", "hidden"])
+def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size, aligned):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
+    if get_compute_capability(torch.device("cuda"))[0] not in [10]:
+        pytest.skip("TRT-LLM MoE tests are only guaranteed on SM100/SM103 GPUs.")
+
+    from flashinfer import ActivationType
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
+    from .trtllm_gen_fused_moe_utils import (
+        FP4Moe,
+        moe_args,
+        routing_reference_renormalize,
+        run_moe_reference_fp4,
+    )
+    from .utils import QuantMode, check_accuracy
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens = 8
+    num_experts = 128
+    top_k = 8
+    padding = 8
+    quant_mode = QuantMode.FP4_MXFP4_MXFP8
+    activation = ActivationType.Swiglu.value
+
+    hidden_size = 1024
+    pi = 1024
+    vi = valid_size if which == "intermediate" else pi
+    vh = valid_size if which == "hidden" else hidden_size
+
+    moe = FP4Moe(quant_mode=quant_mode)
+    moe._cache_permute_indices = {}
+
+    expert_logits = torch.randn(num_tokens, num_experts, device=device).to(
+        torch.bfloat16
+    )
+    hidden_states = 2 * torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    gemm1_weights = torch.randn(
+        num_experts, 2 * pi, hidden_size, device=device, dtype=torch.bfloat16
+    )
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, pi, device=device, dtype=torch.bfloat16
+    )
+
+    # Zero the region the valid dims tell the kernel to skip. This is the contract the
+    # round-up depends on, and it is what TRT-LLM's weight padding / FlashInfer's
+    # mxfp8_quantize column padding already guarantee in production.
+    if which == "intermediate":
+        gemm1_weights[:, vi:pi, :] = 0  # gate rows beyond the valid intermediate
+        gemm1_weights[:, pi + vi :, :] = 0  # up rows beyond the valid intermediate
+        gemm2_weights[:, :, vi:] = 0  # GEMM2 contraction beyond the valid intermediate
+    else:
+        hidden_states[:, vh:] = 0
+        gemm1_weights[:, :, vh:] = 0  # GEMM1 contraction beyond the valid hidden
+        gemm2_weights[:, vh:, :] = 0  # GEMM2 output rows beyond the valid hidden
+
+    permute_info, _ = routing_reference_renormalize(
+        expert_logits, top_k, num_experts, padding
+    )
+
+    weights_data = moe.quantize_weights(gemm1_weights, gemm2_weights, hidden_states)
+    inputs_data = moe.quantize_inputs(
+        hidden_states, weights_data["hidden_states_scale_global"], is_swizzling=True
+    )
+    args_pad = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        pi,
+        top_k,
+        padding,
+        inputs_data["hidden_states"],
+        inputs_data["hidden_states_scale"],
+        weights_data["hidden_states_scale_global"],
+        expert_logits,
+        weights_data["gemm1_weights"],
+        weights_data["gemm1_scales"],
+        weights_data["gemm1_scales_global"],
+        weights_data["gemm2_weights"],
+        weights_data["gemm2_scales"],
+        weights_data["gemm2_scales_global"],
+        permute_info,
+        False,
+        activation,
+    )
+    _, args_dequant_pad = run_moe_reference_fp4(args_pad, quant_mode)
+    static = moe.prepare_static_weights_for_kernel(
+        args_dequant_pad,
+        args_pad,
+        gemm1_weights,
+        gemm2_weights,
+        hidden_size,
+        pi,
+        num_experts,
+        None,
+    )
+    kernel_inputs = moe.quantize_inputs(
+        hidden_states, args_pad.hidden_states_scale_global, is_swizzling=False
+    )
+
+    def run(**valid_kwargs):
+        return trtllm_fp4_block_scale_moe(
+            routing_logits=expert_logits,
+            routing_bias=None,
+            hidden_states=kernel_inputs["hidden_states"],
+            hidden_states_scale=kernel_inputs["hidden_states_scale"],
+            gemm1_weights=static["gemm1_weights_fp4_shuffled"],
+            gemm1_weights_scale=static["gemm1_scales_fp4_shuffled"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=static["gemm2_weights_fp4_shuffled"],
+            gemm2_weights_scale=static["gemm2_scales_fp4_shuffled"],
+            gemm2_bias=None,
+            output1_scale_scalar=static["scale_c_fc1"],
+            output1_scale_gate_scalar=static["scale_gate_fc1"],
+            output2_scale_scalar=static["scale_c_fc2"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=pi,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            activation_type=activation,
+            do_finalize=True,
+            enable_pdl=device_support_pdl(device),
+            **valid_kwargs,
+        )[0].to(torch.float)
+
+    valid_kwargs = (
+        {"valid_intermediate_size": vi}
+        if which == "intermediate"
+        else {"valid_hidden_size": vh}
+    )
+    # The regression itself: this call used to raise
+    # "Failed to initialize the TMA descriptor" for the unaligned sizes.
+    with_valid = run(**valid_kwargs)
+    without_valid = run()
+
+    assert with_valid.shape == without_valid.shape
+    assert torch.isfinite(with_valid).all(), "valid-dims run produced non-finite values"
+    # Same math: the skipped region is zero, so trimming it must not change the result.
+    # Bitwise equality is not guaranteed (different K extent changes accumulation order),
+    # so compare with the FP4 tolerances used elsewhere in this file.
+    check_accuracy(without_valid, with_valid, atol=0.1, rtol=0.85, percent=0.99)
