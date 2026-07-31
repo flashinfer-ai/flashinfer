@@ -234,6 +234,7 @@ class CUDAGraphMoE:
             do_finalize=True,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             norm_topk_prob=self.config.get("norm_topk_prob", True),
+            num_fused_shared_experts=self.config.get("num_fused_shared_experts", 0),
         )
         return output  # Extract tensor from tuple
 
@@ -688,12 +689,15 @@ class FP4Moe(Moe):
             # trtllm-gen clamps the raw accumulator before applying the
             # dequantization factor carried by scale_gate_fc1.
             kernel_gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
+        num_fused_shared_experts = kwargs.get("num_fused_shared_experts", 0)
+        num_routed_experts = num_experts - num_fused_shared_experts
 
         # Create CUDA graph configuration
         config = {
             "hidden_states_scale_global": hidden_states_scale_global,
-            "num_experts": num_experts,
-            "top_k": top_k,
+            "num_experts": num_routed_experts,
+            "top_k": top_k - num_fused_shared_experts,
+            "num_fused_shared_experts": num_fused_shared_experts,
             "n_groups": n_groups,
             "top_k_groups": top_k_groups,
             "intermediate_size": intermediate_size,
