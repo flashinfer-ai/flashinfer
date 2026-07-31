@@ -1264,6 +1264,15 @@ class DenseGemmKernel:
             )
             tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
 
+            tma_store_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_mma_warps * self.num_threads_per_warp,
+            )
+            tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=self.epi_stage,
+                producer_group=tma_store_producer_group,
+            )
+
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
@@ -1628,19 +1637,6 @@ class DenseGemmKernel:
                     epi_tile_n = self.epi_tile[1]
                     mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
                     mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
-                    has_multi_epi_store = cutlass.const_expr(
-                        not (
-                            self.epi_stage == 1 and epi_rest_m == 1 and epi_rest_n == 1
-                        )
-                    )
-                    tma_store_producer_group = pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread,
-                        self.num_mma_warps * self.num_threads_per_warp,
-                    )
-                    tma_store_pipeline = pipeline.PipelineTmaStore.create(
-                        num_stages=self.epi_stage,
-                        producer_group=tma_store_producer_group,
-                    )
 
                     for epi_m in cutlass.range_constexpr(epi_rest_m):
                         for epi_n in cutlass.range_constexpr(epi_rest_n):
@@ -1803,8 +1799,12 @@ class DenseGemmKernel:
                                 epi_buffer = (epi_m * epi_rest_n + epi_n) % cute.size(
                                     tRS_sD, mode=[3]
                                 )
-                                if has_multi_epi_store:
-                                    self.epilog_sync_barrier.arrive_and_wait()
+                                # The TMA store issued from this sC buffer,
+                                # possibly by the previous work tile, may
+                                # still be reading it.
+                                if warp_idx == 0:
+                                    tma_store_pipeline.producer_acquire()
+                                self.epilog_sync_barrier.arrive_and_wait()
                                 cute.copy(
                                     tiled_copy_r2s,
                                     tRS_rD_out,
@@ -1858,9 +1858,10 @@ class DenseGemmKernel:
                                             bSG_sD[(None, epi_buffer)],
                                             bSG_gD[(None, gmem_coord)],
                                         )
-                                        if has_multi_epi_store:
-                                            tma_store_pipeline.producer_commit()
-                                            tma_store_pipeline.producer_acquire()
+                                        # The matching wait sits just before
+                                        # the next sC write, so it overlaps
+                                        # the next work tile's mainloop.
+                                        tma_store_pipeline.producer_commit()
 
                     # Advance to the next work tile
                     if cutlass.const_expr(self.single_work_tile_per_cta):
@@ -1871,10 +1872,12 @@ class DenseGemmKernel:
                     else:
                         tile_sched.advance_to_next_work()
                         work_tile = tile_sched.get_current_work()
-                    if has_multi_epi_store and cutlass.const_expr(
-                        self.split_k_slices == 1
-                    ):
-                        tma_store_pipeline.producer_tail()
+
+            if cutlass.const_expr(not self.swap_ab):
+                # Retire the outstanding store group before PDL may launch
+                # dependent grids below.
+                if warp_idx == 0:
+                    tma_store_pipeline.producer_tail()
 
         elif warp_idx == self.tma_load_warp_id:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
