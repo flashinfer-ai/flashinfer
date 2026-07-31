@@ -575,6 +575,11 @@ class TestAutotuneReplayMemsetContract:
         monkeypatch.setattr(
             fused_moe.AutoTuner, "get", staticmethod(lambda: StubTuner())
         )
+        monkeypatch.setattr(
+            fused_moe,
+            "_require_cute_dsl_arch_for",
+            lambda *_args, **_kwargs: None,
+        )
 
         tensors = {
             "x": torch.empty((2, 8), dtype=torch.uint8),
