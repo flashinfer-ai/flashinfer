@@ -6090,7 +6090,14 @@ def _w4a16_fused_persistent_grid_x(
 
 @torch.library.custom_op(
     "flashinfer::w4a16_fused_moe_launch",
-    mutates_args="unknown",
+    mutates_args=(
+        "fc1_out",
+        "activated",
+        "fc2_out",
+        "fc1_scratch",
+        "fc2_scratch",
+        "workspace",
+    ),
 )
 def _w4a16_fused_moe_launch_op(
     a_input: torch.Tensor,
@@ -6247,7 +6254,15 @@ def _w4a16_fused_moe_launch_fake(
 
 @torch.library.custom_op(
     "flashinfer::w4a16_fused_moe_calibrated_launch",
-    mutates_args="unknown",
+    mutates_args=(
+        "fc1_out",
+        "activated",
+        "fc2_out",
+        "activation_amax",
+        "fc1_scratch",
+        "fc2_scratch",
+        "workspace",
+    ),
 )
 def _w4a16_fused_moe_calibrated_launch_op(
     a_input: torch.Tensor,
@@ -6646,7 +6661,8 @@ def pack_topk_routes_by_expert(
     if num_experts <= 0:
         raise ValueError(f"num_experts must be positive, got {num_experts}")
     _validate_expert_map(expert_map, exact_num_experts=int(num_experts))
-    del stream
+    if stream is not None and int(stream) != int(current_cuda_stream()):
+        raise ValueError("route packing requires the current CUDA stream")
     return _pack_topk_routes_by_expert(
         topk_ids,
         int(block_size),

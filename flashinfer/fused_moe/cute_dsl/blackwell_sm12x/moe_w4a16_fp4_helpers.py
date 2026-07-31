@@ -295,7 +295,7 @@ def quantize_grouped_mxfp8_torch(
         x = input_tensor[group_idx, :valid_rows].float()
         blocked = x.view(valid_rows, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
         block_max = blocked.abs().amax(dim=-1, keepdim=True)
-        rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
+        _rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
         inv = _ue8m0_output_scale_torch(byte)
         q = (
             (blocked * inv)

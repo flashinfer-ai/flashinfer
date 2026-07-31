@@ -300,6 +300,7 @@ def test_pack_topk_routes_single_exact_capacity_buffer_degrades() -> None:
     assert torch.equal(payload.sort().values, reference_payload.sort().values)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_workspace_route_buffers_cover_route_pack_capacity(monkeypatch):
     """The dispatch workspace must size route buffers for the power-of-2
     capacity route packing specializes on, so packing never degrades to
