@@ -847,17 +847,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 w2_weight, route_slots, gemm2_tactic
             ):
                 valid_tactics.append(tactic)
-        if not valid_tactics:
-            from .blackwell.moe_w4a16 import DEFAULT_W4A16_MOE_TACTIC
-
-            logger.warning(
-                "No valid W4A16 tactics found for tokens=%d, experts=%d, top_k=%d. "
-                "Falling back to the default tactic.",
-                num_tokens,
-                self.num_local_experts,
-                self.top_k,
-            )
-            valid_tactics = [DEFAULT_W4A16_MOE_TACTIC]
         return valid_tactics
 
     def forward(  # type: ignore[override]
@@ -881,6 +870,11 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         ) = inputs
         if x.dtype != torch.bfloat16:
             raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
+        if token_final_scales.dtype != torch.float32:
+            raise TypeError(
+                "W4A16 requires token_final_scales.dtype=torch.float32, "
+                f"got {token_final_scales.dtype}"
+            )
         num_tokens = int(token_selected_experts.size(0))
         hidden_size = int(w2_weight.size(1))
         if tuple(x.shape) != (num_tokens, hidden_size):

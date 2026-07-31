@@ -6,12 +6,15 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 
-from flashinfer.cute_dsl.utils import get_max_active_clusters, make_ptr
+from flashinfer.cute_dsl.utils import (
+    current_cuda_stream,
+    get_max_active_clusters,
+    make_ptr,
+)
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
@@ -220,7 +223,7 @@ def _run_grouped_gemm(
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = current_cuda_stream()
     mma_tiler_mnk, cluster_shape_mn, raster_along_m = tactic
     mma_tiler_m, route_tile, _ = mma_tiler_mnk
     max_active_clusters = get_max_active_clusters(

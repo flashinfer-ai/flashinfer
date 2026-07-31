@@ -767,15 +767,13 @@ class CuteDslMoEWrapper:
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
+        runner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner | None
 
         if self.quant_mode in ("nvfp4", "w4a4"):
             use_per_token_activation = per_token_scale is not None
             runner = (
                 self._per_token_runner if use_per_token_activation else self._runner
             )
-            if runner is None:
-                raise RuntimeError("W4A4 runner was not initialized")
-
             inputs = [
                 x,
                 x_sf,
@@ -792,35 +790,18 @@ class CuteDslMoEWrapper:
             if use_per_token_activation:
                 inputs.append(per_token_scale)
             inputs.append(moe_output)
-
-            if tactic is not None:
-                # Use provided tactic
-                return runner(inputs, tactic=tactic)
-
-            _, best_tactic = tuner.choose_one(
-                f"CuteDslMoEWrapper::run::{self.activation_type.name}",
-                [runner],
-                runner.tuning_config,
-                inputs,
-            )
-            # Timed tactic runs retain the default async path; only this
-            # selected-tactic execution is single-stream while tuning.
-            return runner(
-                inputs,
-                tactic=best_tactic,
-                use_async_memset=not tuner.is_tuning_mode,
-            )
-        elif self.quant_mode == "w4a16":
-            if per_token_scale is not None:
+            op_name = f"CuteDslMoEWrapper::run::{self.activation_type.name}"
+        else:
+            if (
+                x_sf is not None
+                or fc2_input_scale is not None
+                or per_token_scale is not None
+            ):
                 raise ValueError(
-                    "per_token_scale is not supported by quant_mode='w4a16'"
+                    "x_sf, fc2_input_scale, and per_token_scale must be None "
+                    "when quant_mode='w4a16'"
                 )
-            if x_sf is not None:
-                raise ValueError("x_sf must be None when quant_mode='w4a16'")
-            if fc2_input_scale is not None:
-                raise ValueError("fc2_input_scale must be None when quant_mode='w4a16'")
-            if self._w4a16_runner is None:
-                raise RuntimeError("W4A16 runner was not initialized")
+            runner = self._w4a16_runner
             inputs = [
                 x,
                 token_selected_experts,
@@ -833,26 +814,31 @@ class CuteDslMoEWrapper:
                 w2_alpha,
                 moe_output,
             ]
-            if tactic is not None:
-                return self._w4a16_runner(inputs, tactic=tactic)
-            _, best_tactic = AutoTuner.get().choose_one(
-                f"CuteDslMoEWrapper::run::W4A16::{self.activation_type.name}",
-                [self._w4a16_runner],
-                self._w4a16_runner.tuning_config,
-                inputs,
-            )
-            return self._w4a16_runner(inputs, tactic=best_tactic)
-        else:
-            raise RuntimeError(f"Unsupported CuTe DSL NVFP4 mode: {self.quant_mode}")
+            op_name = f"CuteDslMoEWrapper::run::W4A16::{self.activation_type.name}"
+
+        if runner is None:
+            raise RuntimeError(f"{self.quant_mode} runner was not initialized")
+        if tactic is not None:
+            return runner(inputs, tactic=tactic)
+
+        _, best_tactic = tuner.choose_one(
+            op_name,
+            [runner],
+            runner.tuning_config,
+            inputs,
+        )
+        runner_kwargs = {}
+        if self.quant_mode != "w4a16":
+            # Timed tactic runs retain the default async path; only this
+            # selected-tactic execution is single-stream while tuning.
+            runner_kwargs["use_async_memset"] = not tuner.is_tuning_mode
+        return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
-        if self.quant_mode in ("nvfp4", "w4a4"):
-            return ALL_MOE_TACTICS
-        elif self.quant_mode == "w4a16":
-            return list(W4A16_MOE_TACTICS)
-        else:
-            raise RuntimeError(f"Unsupported CuTe DSL NVFP4 mode: {self.quant_mode}")
+        return (
+            list(W4A16_MOE_TACTICS) if self.quant_mode == "w4a16" else ALL_MOE_TACTICS
+        )
 
 
 # =============================================================================
@@ -1054,6 +1040,7 @@ def cute_dsl_fused_moe_nvfp4(
         )
 
     tuner = AutoTuner.get()
+    runner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
 
     if quant_mode in ("nvfp4", "w4a4"):
         use_per_token_activation = per_token_scale is not None
@@ -1090,28 +1077,18 @@ def cute_dsl_fused_moe_nvfp4(
             inputs.append(per_token_scale)
         inputs.append(moe_output)
 
-        _, best_tactic = tuner.choose_one(
-            f"CuteDslFusedMoE::run_moe_nvfp4::{activation.name}",
-            [runner],
-            runner.tuning_config,
-            inputs,
-            aux_stream=aux_stream,
-        )
-
-        return runner(
-            inputs,
-            tactic=best_tactic,
-            aux_stream=aux_stream,
-            use_async_memset=not tuner.is_tuning_mode,
-        )
+        op_name = f"CuteDslFusedMoE::run_moe_nvfp4::{activation.name}"
     elif quant_mode == "w4a16":
-        if per_token_scale is not None:
-            raise ValueError("per_token_scale is not supported by quant_mode='w4a16'")
-        if x_sf is not None:
-            raise ValueError("x_sf must be None when quant_mode='w4a16'")
-        if fc2_input_scale is not None:
-            raise ValueError("fc2_input_scale must be None when quant_mode='w4a16'")
-        w4a16_runner = CuteDslFusedMoEW4A16Runner(
+        if (
+            x_sf is not None
+            or fc2_input_scale is not None
+            or per_token_scale is not None
+        ):
+            raise ValueError(
+                "x_sf, fc2_input_scale, and per_token_scale must be None "
+                "when quant_mode='w4a16'"
+            )
+        runner = CuteDslFusedMoEW4A16Runner(
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -1136,18 +1113,23 @@ def cute_dsl_fused_moe_nvfp4(
             w2_alpha,
             moe_output,
         ]
-        _, best_tactic = AutoTuner.get().choose_one(
-            f"CuteDslFusedMoE::run_moe_w4a16::{activation.name}",
-            [w4a16_runner],
-            w4a16_runner.tuning_config,
-            inputs,
-            aux_stream=aux_stream,
-        )
-        return w4a16_runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
+        op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation.name}"
     else:
         raise ValueError(
             f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
         )
+
+    _, best_tactic = tuner.choose_one(
+        op_name,
+        [runner],
+        runner.tuning_config,
+        inputs,
+        aux_stream=aux_stream,
+    )
+    runner_kwargs = {"aux_stream": aux_stream}
+    if quant_mode != "w4a16":
+        runner_kwargs["use_async_memset"] = not tuner.is_tuning_mode
+    return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
 
 __all__ = [

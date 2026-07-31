@@ -198,6 +198,14 @@ class CuteDslNvfp4Runner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
+        if (
+            self.config.quant.variant is QuantVariant.W4A16
+            and self.config.quant.per_token_scale
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per-token W4A16 activation "
+                "scales."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
@@ -227,10 +235,6 @@ class CuteDslNvfp4Runner(MoERunner):
                 use_per_token_activation=bool(config.quant.per_token_scale),
             )
         elif config.quant.variant is QuantVariant.W4A16:
-            if config.quant.per_token_scale:
-                raise ValueError(
-                    "CuteDslNvfp4Runner: per_token_scale is not supported for W4A16"
-                )
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,

@@ -73,12 +73,6 @@ BENCH_VARIANTS = (
 )
 
 
-@dataclass
-class DistributedBenchResult:
-    num_tokens: int
-    e2e_ms: float
-
-
 @dataclass(frozen=True)
 class KernelProfileRow:
     stage: str
@@ -562,7 +556,6 @@ def _run_profile_iteration(stage_calls):
 
 def _run_distributed_iterations(
     args,
-    num_tokens,
     run_once,
     profile_once,
     l2_flush,
@@ -601,7 +594,7 @@ def _run_distributed_iterations(
         e2e_end.record()
         e2e_end.synchronize()
         samples.append(_max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device))
-    return DistributedBenchResult(num_tokens, float(np.median(samples)))
+    return float(np.median(samples))
 
 
 def _benchmark_distributed_ep(
@@ -803,7 +796,6 @@ def _benchmark_distributed_ep(
 
     return _run_distributed_iterations(
         args,
-        num_tokens,
         run_once,
         profile_once,
         l2_flush,
@@ -1142,7 +1134,6 @@ def _benchmark_distributed_tp(
     try:
         return _run_distributed_iterations(
             args,
-            num_tokens,
             run_once,
             profile_once,
             l2_flush,
@@ -1165,16 +1156,12 @@ def _run_parallel_mode(
     selected_variant=None,
 ):
     if rank == 0:
-        if args.mode in _PROFILE_MODES:
-            print(
-                f"\nMode: real {mode.upper()}{world_size}, "
-                "profiling=NVTX stages, cache=cold L2"
-            )
-        else:
-            print(
-                f"\nMode: real {mode.upper()}{world_size}, "
-                "timing=max rank CUDA events, cache=cold L2"
-            )
+        is_profiling = args.mode in _PROFILE_MODES
+        measurement = (
+            "profiling=NVTX stages" if is_profiling else "timing=max rank CUDA events"
+        )
+        print(f"\nMode: real {mode.upper()}{world_size}, {measurement}, cache=cold L2")
+        if not is_profiling:
             if selected_variant is None:
                 print(
                     "global tokens | W4A4 + activation quant (ms) | "
@@ -1231,11 +1218,11 @@ def _run_parallel_mode(
                 reported_backend = True
 
             if rank == 0 and result is not None:
-                row[variant.name] = result.e2e_ms
+                row[variant.name] = result
                 print(
                     "DISTRIBUTED_CSV,"
                     f"{mode},{variant.name},{num_tokens},{world_size},"
-                    f"{result.e2e_ms:.6f}"
+                    f"{result:.6f}"
                 )
             dist.barrier()
             gc.collect()
