@@ -1451,10 +1451,8 @@ def single_prefill_with_kv_cache(
     if block_extend:
         if block_size is None:
             raise ValueError("block_size must be provided when block_extend=True")
-        if block_size <= 0 or (block_size & (block_size - 1)) != 0:
-            raise ValueError(
-                f"block_size must be a positive power of 2, got {block_size}"
-            )
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
         if custom_mask is not None or packed_custom_mask is not None:
             raise ValueError(
                 "custom_mask/packed_custom_mask cannot be combined with block_extend=True"
@@ -1900,10 +1898,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             if block_size is None:
                 raise ValueError("block_size must be provided when block_extend=True")
-            if block_size <= 0 or (block_size & (block_size - 1)) != 0:
-                raise ValueError(
-                    f"block_size must be a positive power of 2, got {block_size}"
-                )
+            if block_size <= 0:
+                raise ValueError(f"block_size must be positive, got {block_size}")
             if jit_args is not None or jit_kwargs is not None:
                 raise ValueError(
                     "jit_args/jit_kwargs cannot be combined with block_extend=True"
@@ -3530,10 +3526,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
             if block_size is None:
                 raise ValueError("block_size must be provided when block_extend=True")
-            if block_size <= 0 or (block_size & (block_size - 1)) != 0:
-                raise ValueError(
-                    f"block_size must be a positive power of 2, got {block_size}"
-                )
+            if block_size <= 0:
+                raise ValueError(f"block_size must be positive, got {block_size}")
             if jit_args is not None or jit_kwargs is not None:
                 raise ValueError(
                     "jit_args/jit_kwargs cannot be combined with block_extend=True"
