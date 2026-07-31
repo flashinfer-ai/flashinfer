@@ -4871,10 +4871,8 @@ def _cudnn_mm_mxfp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-# Minimum contraction dim for the b12x MXFP8 backend: six BK128 tiles, one
-# more than the deepest smem pipeline (5 stages). The kernel races when the
-# mainloop runs no more K iterations than it has stages while the grid
-# exceeds one work tile per SM; see can_implement in the kernel file.
+# Six BK128 tiles, one more than the deepest smem pipeline (5 stages).
+# Shorter mainloops can race the pipeline, see the kernel's can_implement.
 _B12X_MXFP8_MIN_K = 768
 
 
@@ -5418,10 +5416,7 @@ def _heuristic_func_mm_mxfp8(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
 ) -> List[str]:
-    # Prefer b12x when suitable (SM12x only, fastest at decode M and at
-    # parity elsewhere). Its requirement gates on CUDA 13, cutlass-dsl >=
-    # 4.6, and the scale layout, so unsuitable setups keep the pre-existing
-    # selection.
+    # Prefer b12x where eligible, other setups keep the pre-existing order.
     if "b12x" in suitable_backends:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
@@ -6078,13 +6073,11 @@ def _b12x_short_mainloop_race_window(
 ) -> bool:
     """True when a b12x launch with this tile can hit the pipeline race.
 
-    The SM120 b12x kernel corrupts output when the mainloop runs no more K
-    iterations than the smem pipeline has stages AND the grid has more work
-    tiles than SMs, so a persistent CTA revisits work tiles. Iterations equal
-    to the stage count still race (measured 2/20 at k=640 on the 5-stage
-    (64, 128) tile), so safety requires strictly more. Stage counts mirror
-    the caps in the kernel's ``_compute_stages`` (the raw stage count can be
-    lower for large tiles, so this is conservative).
+    The kernel corrupts output when the mainloop runs no more K iterations
+    than the smem pipeline has stages and the grid has more work tiles than
+    SMs. Iterations equal to the stage count still race, so safety requires
+    strictly more. Stage counts mirror the caps in the kernel's
+    ``_compute_stages`` and are conservative for large tiles.
     """
     stage_cap = 5 if mma_tiler_mn[0] in (16, 64) and mma_tiler_mn[1] == 128 else 4
     k_iters = -(-k // 128)
@@ -6131,10 +6124,9 @@ def _b12x_gemm_fp4_requirement(
             "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
             f"(TMA 16-byte alignment). Got K={real_k}."
         )
-    # Short-mainloop race containment (see _b12x_short_mainloop_race_window).
-    # (128, 128) has the fewest work tiles and the lowest stage cap of any
-    # reachable tactic, so a shape is rejected only when even that fallback
-    # tile would race. The runner routes allowed shapes to non-racing tiles.
+    # Reject a shape only when even (128, 128) would race: it has the fewest
+    # work tiles and the lowest stage cap of any reachable tactic. The runner
+    # steers allowed shapes to non-racing tiles.
     if _b12x_short_mainloop_race_window(
         (128, 128), a.shape[0], b.shape[1], real_k, get_device_sm_count(a.device)
     ):
@@ -6591,10 +6583,9 @@ def _b12x_gemm_fp4_runner(
                 tile, swap = plan.mma_tiler_mn, plan.swap_ab
                 sm_count = get_device_sm_count(a.device)
                 if _b12x_short_mainloop_race_window(tile, m, n, real_k, sm_count):
-                    # (128, 128) is the safe fallback the requirement
-                    # check guarantees. An unsafe plan tile reaches this
-                    # point only via skip_check=True, which must not corrupt
-                    # silently.
+                    # The requirement check guarantees (128, 128) is safe.
+                    # Only skip_check=True reaches here with an unsafe tile,
+                    # and it must not corrupt silently.
                     tile, swap = (128, 128), False
                     if _b12x_short_mainloop_race_window(tile, m, n, real_k, sm_count):
                         raise RuntimeError(
@@ -6730,12 +6721,7 @@ def _b12x_gemm_mxfp8_runner(
         )
 
     class B12xMxfp8GemmRunner(TunableRunner):
-        """TunableRunner for b12x block-scaled MXFP8 dense GEMM on SM12x.
-
-        Tactics are tuples:
-            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
-        where kernel_type is always "sm120" and use_tma_store is always None.
-        """
+        """TunableRunner for b12x block-scaled MXFP8 dense GEMM on SM12x."""
 
         def get_valid_tactics(
             self,
@@ -6777,8 +6763,7 @@ def _b12x_gemm_mxfp8_runner(
                     if tac not in valid_tactics:
                         valid_tactics.append(tac)
 
-            # Balanced tiles plus the MXFP8 M-narrow decode tiles. Keep the
-            # grid small so the tuner's bucket representative stays
+            # A small tactic grid keeps the tuner's bucket representative
             # meaningful.
             for mma_tiler_mn in [
                 (16, 128),

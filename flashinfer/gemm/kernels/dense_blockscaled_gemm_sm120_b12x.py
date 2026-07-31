@@ -2404,18 +2404,16 @@ class DenseGemmKernel:
             # cutlass-dsl < 4.6.0 does not expose the MXFP8 warp-MMA atom.
             return False
         if swap_ab:
-            # Upstream also allows swap_ab for MXFP8. This port never swaps
-            # for MXFP8 (its narrow tiles are M-narrow), so the path stays
-            # unported and is rejected rather than accepted unvalidated.
+            # The MXFP8 path never swaps A and B, its narrow tiles are
+            # M-narrow. Reject rather than accept an unvalidated layout.
             if l != 1:
                 return False
             if (ab_dtype, sf_vec_size) != (cutlass.Float4E2M1FN, 16):
                 return False
         if load_path == "cpasync" and (sf_vec_size != 16 or l != 1):
             return False
-        # Narrow M/N tiles are allowed. The scale-factor smem paths still
-        # allocate full 128-element SF blocks, but the live MMA tile may
-        # consume only 16/32 rows or columns.
+        # SF smem still allocates full 128-element blocks even when the live
+        # MMA tile uses only 16 or 32 rows or columns.
         if is_mxfp8:
             # Decode whitelist, else both dims must be multiples of 64
             # (upstream's MXFP8 gate; stricter than the FP4 branch).
@@ -2449,19 +2447,15 @@ class DenseGemmKernel:
         if a_major != "k" or b_major != "k":
             return False
         if is_mxfp8:
-            # MXFP8 runs the full BK128 tile, no ragged-K predication was
-            # ported. Short K is rejected: the kernel has a pre-existing
-            # synchronization race whenever the mainloop runs no more K
-            # iterations than the smem pipeline has stages (up to 5, hence
-            # the six-tile floor). The race exists upstream and in the FP4
-            # path too. Shorter K stays on the CUTLASS backend until it is
-            # fixed.
+            # MXFP8 has no ragged-K predication, and the mainloop can race
+            # the smem pipeline when it runs no more K iterations than there
+            # are stages (up to 5, hence the six-tile floor).
             if k % 128 != 0 or k < 768:
                 return False
         elif k % 32 != 0:
             # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not
             # tile_k: the mainloop predicates the partial tile, so ragged K
-            # works. Mirror gemm_base.py.
+            # works. Keep in sync with gemm_base.py.
             return False
         return True
 
@@ -2557,12 +2551,8 @@ def _select_default_mma_tiler_mn(
 ) -> Tuple[int, int]:
     coarse_tile = (128, 128)
     if is_mxfp8 and n > 1536:
-        # DeepGEMM-style regime hint: when a caller declares expected_m, pick
-        # the per-regime optimal tile and key the compile on it, one kernel
-        # per (N, K, expected_m) reused for every live M in that regime.
-        # Regime boundaries follow the upstream b12x probe sweeps. Upstream's
-        # exact-shape pins for its own serving shapes are dropped, the
-        # autotuner covers exact shapes instead.
+        # expected_m keys the compile: one kernel per (N, K, expected_m)
+        # serves every live M in its regime.
         if expected_m is not None:
             if expected_m == 1:
                 return (16, 64)
@@ -2575,13 +2565,11 @@ def _select_default_mma_tiler_mn(
             return (16, 64)
         if m <= 8:
             return (16, 128)
-        # 64x128 is the best M-independent wide-N tile. 128x128 launches
-        # too few CTAs at small and medium M and loses at every M.
+        # 64x128 keeps the CTA count up at small and medium M, where 128x128
+        # underfills the grid.
         return (64, 128)
     if is_mxfp8:
-        # Narrow-N MXFP8: (64, 64) maximizes CTAs and is M-independent.
-        # Declared prefill regimes take (64, 128), exact M=1 the decode
-        # winner (16, 64).
+        # (64, 64) maximizes CTAs and is M-independent.
         if expected_m == 1 or (expected_m is None and m == 1):
             return (16, 64)
         if expected_m is not None and expected_m > 128:
