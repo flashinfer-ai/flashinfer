@@ -59,6 +59,14 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
             head_sizes=[64, 128, 192],
             output_dtype="bf16",
         )
+        # DeepSeek MLA E4M3-to-FP16 kernel (192/128).
+        enumerate_qmma_flash_kernels(
+            specs,
+            sm=120,
+            dtype="e4m3_fp32",
+            head_sizes=[192],
+            output_dtype="fp16",
+        )
 
         # Expand the cartesian product of the list fields "seq_len" and "head_size".
         specs_expanded = []
