@@ -112,9 +112,11 @@ class ProblemDesc:
             )
         if self.experts <= 0:
             raise ValueError(f"experts must be positive, got {self.experts}.")
-        if self.hidden <= 0 or self.hidden % Nvfp4BlockSize != 0:
+        _hidden_block = Nvfp4BlockSize if self.kind == "nvfp4" else Mxfp8BlockSize
+        if self.hidden <= 0 or self.hidden % _hidden_block != 0:
             raise ValueError(
-                f"hidden ({self.hidden}) must be a positive multiple of {Nvfp4BlockSize}."
+                f"hidden ({self.hidden}) must be a positive multiple of "
+                f"{_hidden_block} (SF block size for kind={self.kind!r})."
             )
         _interleave = Nvfp4Fc1GateUpInterleave if self.kind == "nvfp4" else Mxfp8Fc1GateUpInterleave
         if self.intermediate <= 0 or self.intermediate % (2 * _interleave) != 0:

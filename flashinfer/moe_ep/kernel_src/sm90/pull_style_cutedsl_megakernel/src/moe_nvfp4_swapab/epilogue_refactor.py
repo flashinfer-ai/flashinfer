@@ -465,14 +465,15 @@ class QuantImpl:
     def _amax_lane(self, v: cutlass.Float32) -> cutlass.Float32:
         if cutlass.const_expr(self.sf_vec_size == 32):
             return cute.arch.warp_redux_sync(v, "fmax", abs=True)
-        first_half = (self.lane_idx % cutlass.Int32(32)) < cutlass.Int32(16)
-        vsel = cutlass.Float32(0.0)
-        if first_half:
-            vsel = v
-        amax = cute.arch.warp_redux_sync(vsel, "fmax", abs=True)
-        if not first_half:
-            amax = cute.arch.warp_redux_sync(v, "fmax", abs=True)
-        return amax
+        # 16-lane half-warp reduction. redux.sync requires every thread in its
+        # membermask to execute the same instruction, so branching per half
+        # (as a naive two-pass form would) is UB under divergence. Instead all
+        # 32 lanes issue one redux, each with its own half's membermask
+        # (0x0000FFFF or 0xFFFF0000), selected branchlessly.
+        lane_in_warp = self.lane_idx % cutlass.Int32(32)
+        half_shift = (lane_in_warp // cutlass.Int32(16)) * cutlass.Int32(16)
+        half_mask = cutlass.Int32(0xFFFF) << half_shift
+        return cute.arch.warp_redux_sync(v, "fmax", half_mask, abs=True)
 
     @cute.jit
     def _e8m0(self, amax: cutlass.Float32) -> Tuple[cutlass.Float8E8M0FNU, cutlass.Float32]:

@@ -228,16 +228,12 @@ class MegaKernelBackend(ABC):
         from .workspace_pool import release_workspace
 
         if release_workspace(workspace):
-            # The fused-stage memos key on topk_idx.data_ptr(); the symmetric
-            # heap reuses freed addresses, so evict before the buffer dies.
-            # sys.modules lookup (not an import): if the shim was never
-            # loaded, no memo exists and the heavy import must not happen.
-            import sys
-
-            quant_stage = sys.modules.get(
-                "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
-            )
-            topk_idx = getattr(workspace, "topk_idx", None)
-            if quant_stage is not None and topk_idx is not None:
-                quant_stage.forget_staged_tokens(topk_idx)
+            self._forget_workspace_state(workspace)
             workspace.destroy()
+
+    def _forget_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Backend hook: drop memoized state keyed on this workspace's buffers.
+
+        Called on the last release, just before ``workspace.destroy()`` frees
+        the buffers (whose addresses the symmetric heap may reuse). Default is
+        a no-op; backends with per-workspace memos override this."""

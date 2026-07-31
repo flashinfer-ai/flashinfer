@@ -2602,7 +2602,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if problem.num_topk > 32:
         raise ValueError(
-            f"num_topk ({problem.num_topk}) > 32 is unsupported by the current. Shit inherited from DeepGEMM."
+            f"num_topk ({problem.num_topk}) > 32 is unsupported "
+            "(32-topk limit inherited from the DeepGEMM dispatch path)."
         )
 
     impl = ImplDesc(

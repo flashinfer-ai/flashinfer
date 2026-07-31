@@ -94,7 +94,7 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 reference shared by the single-rank tester
     and the multi-rank MegaMoE reference.
 
@@ -103,8 +103,8 @@ def reference_expert_fc12(
     K-major ``b`` and raw SF formats are identical for the per-expert single-rank
     and gathered multi-rank tensors.  Returns the fc2 fp32 output (``deepgemm``:
     topk pre-multiplied into SwiGLU; ``transformers``: left unweighted for the
-    caller to apply), plus the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
-    fc1-phase ablation.
+    caller to apply), the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
+    fc1-phase ablation, and the raw fc1 fp32 pre-SwiGLU activations.
     """
     intermediate_downproj = intermediate // 2
     fc1_fp32 = ref_scaled_mm(

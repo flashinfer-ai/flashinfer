@@ -13,7 +13,13 @@ except (ImportError, NotImplementedError):  # pragma: no cover -- fallback for w
     try:
         from cutlass.cute import iket  # type: ignore
     except (ImportError, NotImplementedError):
-        print("!!!! Iket is not enabled !!!!")
+        import warnings
+
+        warnings.warn(
+            "cutlass.cute IKET dialect unavailable; in-kernel event "
+            "tracing markers are no-ops.",
+            stacklevel=2,
+        )
         class _IketShim:
             """No-op IKET shim used when the dialect is not available."""
 
