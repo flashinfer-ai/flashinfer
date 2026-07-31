@@ -401,6 +401,10 @@ def _cute_dsl_splitk_mm_bf16_requirement(
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL split-K backend requires bfloat16 output.")
+    if not is_sm100a_supported(a.device):
+        raise ValueError(
+            "The CuTeDSL split-K backend requires SM100/SM103 with CUDA 12.8+."
+        )
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("The CuTeDSL split-K backend requires 2D inputs.")
     if not a.is_contiguous():
@@ -617,18 +621,21 @@ def mm_bf16(
         Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
-        Optional bias tensor, shape (n,). Enabled for TGV and TinyGEMM backends. Defaults to ``None``.
+        Optional bias tensor, shape (n,). Enabled for TGV, TinyGEMM, and
+        CuTeDSL backends. Defaults to ``None``.
 
     pdl: bool
-        Whether to use Programmatic Dependent Launch. Enabled for TGV and TinyGEMM backends. Defaults to ``False``.
+        Whether to use Programmatic Dependent Launch. Enabled for TGV,
+        TinyGEMM, and CuTeDSL backends. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
-        for CUTLASS and cuDNN backends; TinyGEMM requires bf16 output.
+        for CUTLASS and cuDNN backends; TinyGEMM and CuTeDSL require bf16 output.
 
     out_dtype: torch.dtype
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
-        Defaults to ``torch.bfloat16``.
+        TinyGEMM and CuTeDSL require ``torch.bfloat16``. Defaults to
+        ``torch.bfloat16``.
 
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
@@ -1502,11 +1509,15 @@ def _cute_dsl_splitk_bf16_gemm_runner(
         ) -> list[tuple[int, int, int, int]]:
             m, k = inputs[0].shape
             n = inputs[1].shape[1]
+            try:
+                default = default_tactic(m, n, k)
+            except ValueError:
+                return []
             return list(
                 dict.fromkeys(
                     astuple(config)
                     for config in (
-                        default_tactic(m, n, k),
+                        default,
                         *autotune_tactics(m, n, k),
                     )
                 )

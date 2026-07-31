@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
 @pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
@@ -52,6 +52,9 @@ def test_mm_bf16(
             )
 
     if backend == "cute-dsl":
+        if not is_sm100a_supported(torch.device("cuda")):
+            pytest.skip("CuTeDSL split-K backend requires SM100/SM103 with CUDA 12.8+.")
+
         from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
         if not is_cute_dsl_available():

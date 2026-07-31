@@ -134,6 +134,17 @@ def validate_tactic(
     smem_capacity: int = _SMEM_CAPACITY_BYTES,
 ) -> None:
     """Reject a tactic that cannot serve ``(m, n, k)``."""
+    if tactic.mma_m not in _SUPPORTED_MMA_M:
+        raise ValueError(f"unsupported mma_m={tactic.mma_m}")
+    if tactic.mma_n not in _SUPPORTED_MMA_N:
+        raise ValueError(f"unsupported mma_n={tactic.mma_n}")
+    if tactic.split_k not in _SUPPORTED_SPLIT_K:
+        raise ValueError(f"unsupported split_k={tactic.split_k}")
+    if not _MIN_AB_STAGES <= tactic.ab_stages <= _MAX_AB_STAGES:
+        raise ValueError(
+            f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
+            f"got {tactic.ab_stages}"
+        )
     if not 1 <= m <= _MAX_M:
         raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
     if n <= 0:
@@ -176,7 +187,10 @@ def autotune_tactics(
                     for ab_stages in (
                         range(_MIN_AB_STAGES, min(max_stages, 6) + 1)
                         if k <= 4 * _CTA_K
-                        else range(max(5, max_stages - 2), max_stages + 1)
+                        else range(
+                            min(max(5, max_stages - 2), max_stages),
+                            max_stages + 1,
+                        )
                     )
                 )
     return tactics
@@ -743,6 +757,9 @@ class SplitKDenseGemmKernel:
 
         # Peers publish FP32 partials; only rank 0 reduces and stores.
         if cutlass.const_expr(self.split_k > 1):
+            assert cute.size(rmem_layout) == self.mailbox_elements // (
+                (self.split_k - 1) * self.epilog_threads
+            )
             values_per_thread = cutlass.const_expr(cute.size(rmem_layout))
             values_per_peer = cutlass.const_expr(
                 self.epilog_threads * values_per_thread
