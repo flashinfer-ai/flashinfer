@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <iostream>
 
 #include "flashinfer/exception.h"
@@ -31,6 +32,42 @@ namespace kernels {
 namespace trtllmgen_moe {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+namespace {
+
+// trtllm-gen turns validM/validN/validK into the TMA descriptor's globalDim (see
+// makeTmaShapeStrideAbc() in trtllmGen_bmm_export/KernelParams.h: the *shape* comes from the
+// valid dims while the *stride* comes from the padded dims). cuTensorMapEncodeTiled therefore
+// enforces the kernel's dimension constraints on the valid dims directly, and a bad value
+// surfaces only as an opaque "Failed to initialize the TMA descriptor" from the driver.
+//
+// GemmOptions.h documents what those constraints are:
+//   1. outputDim % (4 * sfBlockSize) == 0; as 4x SFs are packed into 4 bytes
+//   2. MxFp4 x Fp8 mmaType requires bespoke TMA load which requires hiddenDim % 128 == 0
+//   3. TMA requires 16B alignment for each row
+// 128 satisfies all three for every dtype this MoE runner supports (sfBlockSize is 32 for
+// mx* and 16 for nvfp4, so 4*sfBlockSize is 128 or 64; the 16B row rule needs at most 16
+// elements; the shuffled-matrix and DeepSeek-FP8 rules also want 128). Rather than encode a
+// per-dtype table that has to track trtllm-gen, use the single conservative value: at most
+// 127 extra elements are contracted, which is negligible next to the padding we skip.
+constexpr int32_t kValidDimAlignment = 128;
+
+// Round a valid dim up to the alignment the TMA descriptor requires, clamped to the padded
+// dim. Rounding *up* (rather than rejecting) is safe: the region between the caller's valid
+// dim and the padded dim is already required to be zero-filled, because without valid dims at
+// all the kernel contracts over the *entire* padded extent. Rounding up therefore relies on
+// strictly less zero-padding than the valid-dims-disabled path does.
+// Returns -1 unchanged (meaning "no valid dim supplied").
+int32_t alignValidDim(int32_t validDim, int32_t paddedDim) {
+  if (validDim < 0) {
+    return -1;
+  }
+  int32_t const aligned =
+      ((validDim + kValidDimAlignment - 1) / kValidDimAlignment) * kValidDimAlignment;
+  return std::min(aligned, paddedDim);
+}
+
+}  // namespace
 
 namespace Routing {
 namespace {
@@ -491,9 +528,13 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
-  int32_t validN =
-      (validIntermediateSize >= 0) ? intermediateSizeFactor * validIntermediateSize : -1;
-  int32_t validK = validHiddenSize;
+  // Align the intermediate before scaling by the gate factor, so that both the per-gate half
+  // and the full N dimension land on the alignment boundary.
+  int32_t const alignedValidIntermediate = alignValidDim(validIntermediateSize, intermediateSize);
+  int32_t validN = (alignedValidIntermediate >= 0)
+                       ? intermediateSizeFactor * alignedValidIntermediate
+                       : -1;
+  int32_t validK = alignValidDim(validHiddenSize, hiddenSize);
   if (mBiasType == batchedGemm::gemm::BiasType::Mn) {
     FLASHINFER_CHECK(ptrBias != nullptr,
                      "PermuteGemm1 configured with BiasType::Mn requires a non-null bias pointer");
@@ -605,8 +646,9 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
   // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
   // hiddenSize] For batched GEMM with transposeMmaOutput: M=numTokens, N=hiddenSize,
   // K=intermediateSize validN = validHiddenSize, validK = validIntermediateSize
-  int32_t validN = validHiddenSize;
-  int32_t validK = validIntermediateSize;
+  // Note hiddenSize here is already the *output* hidden size (hidden_size_output).
+  int32_t validN = alignValidDim(validHiddenSize, hiddenSize);
+  int32_t validK = alignValidDim(validIntermediateSize, intermediateSize);
   mRunner.run(
       numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
       permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
