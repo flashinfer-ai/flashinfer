@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import importlib.metadata
 import logging
 import warnings
 from collections import defaultdict
@@ -4870,6 +4871,13 @@ def _cudnn_mm_mxfp8_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
+# Minimum contraction dim for the b12x MXFP8 backend: six BK128 tiles, one
+# more than the deepest smem pipeline (5 stages). The kernel races when the
+# mainloop runs no more K iterations than it has stages while the grid
+# exceeds one work tile per SM; see can_implement in the kernel file.
+_B12X_MXFP8_MIN_K = 768
+
+
 @supported_compute_capability([120, 121])
 def _b12x_gemm_mxfp8_requirement(
     a: torch.Tensor,
@@ -4895,17 +4903,24 @@ def _b12x_gemm_mxfp8_requirement(
             "b12x mm_mxfp8 requires 1D 128x4-swizzled block scales. "
             "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
         )
-    if a.shape[1] % 128 != 0 or a.shape[1] < 640:
+    if a.shape[1] % 128 != 0 or a.shape[1] < _B12X_MXFP8_MIN_K:
         if backend != "b12x":
             return False
         raise ValueError(
             "b12x mm_mxfp8 requires the contraction dim K to be a multiple of "
-            f"128 and at least 640. Got K={a.shape[1]}."
+            f"128 and at least {_B12X_MXFP8_MIN_K}. Got K={a.shape[1]}."
         )
-    _check_cute_dsl_availability()
-    import cutlass.cute as cute
-
-    if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
+    # Probe the installed distribution instead of importing cutlass.cute here:
+    # the DSL import takes seconds and this runs during auto-mode backend
+    # selection. MmaMXF8Op ships with cutlass-dsl 4.6.0.
+    try:
+        dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        dsl_version = None
+    if dsl_version is None or tuple(int(x) for x in dsl_version.split(".")[:2]) < (
+        4,
+        6,
+    ):
         if backend != "b12x":
             return False
         raise ValueError(
@@ -5401,14 +5416,12 @@ def _heuristic_func_mm_mxfp8(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
 ) -> List[str]:
-    # SM12x: prefer b12x (fastest at decode M, at parity elsewhere); the
-    # requirement function already gates on CUDA 13, cutlass-dsl >= 4.6, and
-    # the swizzled-scale layout, so unsuitable setups fall through to cutlass.
-    major, _ = get_compute_capability(a.device)
-    if major == 12:
-        preferred = [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
-        if preferred:
-            return preferred
+    # Prefer b12x when suitable (SM12x only, fastest at decode M and at
+    # parity elsewhere). Its requirement gates on CUDA 13, cutlass-dsl >=
+    # 4.6, and the scale layout, so unsuitable setups keep the pre-existing
+    # selection.
+    if "b12x" in suitable_backends:
+        return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         return ["cutlass"]
@@ -5484,7 +5497,8 @@ def mm_mxfp8(
         backend when its requirements are met.
         - The ``"b12x"`` backend (SM120/SM121) is a warp-level MMA kernel with
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
-          4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
+          4.6.0, 1D swizzled 128x4 scales, and K divisible by 128 and at
+          least 768.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
@@ -6708,8 +6722,9 @@ def _b12x_gemm_mxfp8_runner(
                     if tac not in valid_tactics:
                         valid_tactics.append(tac)
 
-            # Balanced tiles plus the MXFP8 M-narrow decode tiles; keep the grid
-            # small so the tuner's bucket representative stays meaningful.
+            # Balanced tiles plus the MXFP8 M-narrow decode tiles. Keep the
+            # grid small so the tuner's bucket representative stays
+            # meaningful.
             for mma_tiler_mn in [
                 (16, 128),
                 (32, 128),

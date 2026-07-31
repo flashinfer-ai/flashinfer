@@ -632,6 +632,9 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
+    # Sub-64-row M tiles are consumed only by the b12x dense GEMM path,
+    # whose SF fragment layouts handle them; other callers (MoE, MSA) keep
+    # 64-row-multiple tiles.
     assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
         "tile_shape_mnk[0] must be divisible by 16"
     )

@@ -52,8 +52,12 @@ def _skip_if_unsupported(backend: str = "cutlass"):
             f"capability {compute_capability_number}."
         )
     if backend == "b12x":
-        import cutlass.cute as cute
-
+        if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
+            pytest.skip("b12x mm_mxfp8 requires CUDA 13+")
+        try:
+            import cutlass.cute as cute
+        except ImportError:
+            pytest.skip("nvidia-cutlass-dsl not installed")
         if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
             pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
 
@@ -76,8 +80,8 @@ def _run_mm_mxfp8(
             pytest.skip("trtllm does not support non-multiple of 256")
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
-    if backend == "b12x" and (k % 128 != 0 or k < 640):
-        pytest.skip("b12x requires K % 128 == 0 and K >= 640")
+    if backend == "b12x" and (k % 128 != 0 or k < gemm_base._B12X_MXFP8_MIN_K):
+        pytest.skip("b12x requires K % 128 == 0 above the short-K race floor")
     if backend == "cutlass" and use_8x4_sf_layout_for_a:
         pytest.skip("cutlass doesn't support 8x4 swizzle layout")
 
