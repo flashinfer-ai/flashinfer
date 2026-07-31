@@ -446,6 +446,13 @@ class TestAutotuneReplayMemsetContract:
     ):
         from flashinfer.fused_moe.cute_dsl import fused_moe
 
+        # CPU-only contract test (see class header): stub out the functional
+        # API's arch guard, which otherwise calls torch.cuda.get_device_capability()
+        # on the CPU input tensors and raises "Expected a cuda device, but got: cpu".
+        monkeypatch.setattr(
+            fused_moe, "_require_cute_dsl_arch_for", lambda *a, **k: None
+        )
+
         calls = []
 
         class RecordingRunner:
@@ -468,22 +475,19 @@ class TestAutotuneReplayMemsetContract:
             fused_moe.AutoTuner, "get", staticmethod(lambda: StubTuner())
         )
 
-        # Inputs must live on CUDA: the functional API validates the device
-        # arch (require_cute_dsl_arch -> torch.cuda.get_device_capability).
-        with torch.device("cuda"):
-            tensors = {
-                "x": torch.empty((2, 8), dtype=torch.uint8),
-                "x_sf": torch.empty((2, 1), dtype=torch.uint8),
-                "token_selected_experts": torch.zeros((2, 1), dtype=torch.int32),
-                "token_final_scales": torch.ones((2, 1), dtype=torch.float32),
-                "w1_weight": torch.empty((1, 32, 8), dtype=torch.uint8),
-                "w1_weight_sf": torch.empty((1, 32, 1), dtype=torch.uint8),
-                "w1_alpha": torch.ones(1, dtype=torch.float32),
-                "fc2_input_scale": torch.ones(1, dtype=torch.float32),
-                "w2_weight": torch.empty((1, 16, 8), dtype=torch.uint8),
-                "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
-                "w2_alpha": torch.ones(1, dtype=torch.float32),
-            }
+        tensors = {
+            "x": torch.empty((2, 8), dtype=torch.uint8),
+            "x_sf": torch.empty((2, 1), dtype=torch.uint8),
+            "token_selected_experts": torch.zeros((2, 1), dtype=torch.int32),
+            "token_final_scales": torch.ones((2, 1), dtype=torch.float32),
+            "w1_weight": torch.empty((1, 32, 8), dtype=torch.uint8),
+            "w1_weight_sf": torch.empty((1, 32, 1), dtype=torch.uint8),
+            "w1_alpha": torch.ones(1, dtype=torch.float32),
+            "fc2_input_scale": torch.ones(1, dtype=torch.float32),
+            "w2_weight": torch.empty((1, 16, 8), dtype=torch.uint8),
+            "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
+            "w2_alpha": torch.ones(1, dtype=torch.float32),
+        }
 
         if api == "functional":
             monkeypatch.setattr(
