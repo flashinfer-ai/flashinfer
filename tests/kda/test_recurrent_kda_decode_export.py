@@ -263,6 +263,46 @@ def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
         recurrent_kda(*tensors, backend="unknown")
 
 
+def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():
+    num_sequences = 2
+    q = torch.empty(1, 0, 1, _D, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty(1, 0, 1, _D, dtype=torch.bfloat16)
+    g = torch.empty_like(v)
+    beta = torch.empty(1, 0, 1, dtype=torch.bfloat16)
+    state = torch.empty(num_sequences, 1, _D, _D, dtype=torch.bfloat16)
+    output = torch.empty_like(v)
+    cu_seqlens = torch.zeros(num_sequences + 1, dtype=torch.int32)
+
+    default_output, default_state = recurrent_module.run_recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        output=output,
+    )
+    assert default_output is output
+    assert default_state is state
+
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_module.run_recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            backend="cake",
+        )
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "work", "sm_count", "expected_split"),
     [
@@ -1122,7 +1162,7 @@ def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
         assert frozen_kwargs["out"].data_ptr() == actual_output_buffer.data_ptr()
         assert frozen_kwargs["cu_seqlens"].tolist() == list(range(num_sequences + 1))
         assert frozen_kwargs["ssm_state_indices"].tolist() == list(range(num_sequences))
-        assert frozen_kwargs["num_accepted_tokens"].tolist() == [0] * num_sequences
+        assert frozen_kwargs["num_accepted_tokens"].tolist() == [1] * num_sequences
 
     assert actual_output.data_ptr() == actual_output_buffer.data_ptr()
     assert actual_state_result is actual_state

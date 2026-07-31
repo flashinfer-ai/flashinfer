@@ -1774,6 +1774,10 @@ def run_recurrent_kda(
     # no recurrent update to perform. Output initialization above defines the
     # result while the caller-owned state remains unchanged.
     if cu_seqlens_i32 is not None and q.shape[1] == 0:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' does not support this recurrent_kda decode contract"
+            )
         return (out_buf, state if output_final_state else None)
 
     # Compile-time controls shared by both kernel architectures.
@@ -1858,7 +1862,7 @@ def run_recurrent_kda(
                 ).reshape(grid_seqs, 1)
             nat_key = f"flashkda_t1_num_accepted_tokens_{grid_seqs}"
             if nat_key not in dc:
-                dc[nat_key] = torch.zeros(
+                dc[nat_key] = torch.ones(
                     grid_seqs,
                     dtype=torch.int32,
                     device=device,
