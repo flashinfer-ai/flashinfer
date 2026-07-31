@@ -16,8 +16,8 @@
 
 // clang-format off
 // Generated from a recurrent-KDA Loom schedule.
-// Raw generated body SHA256: eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210
-// Normalized generated SHA256: eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210
+// Raw generated body SHA256: 116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f
+// Normalized generated SHA256: 116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f
 // BEGIN FROZEN GENERATED BODY
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -69,11 +69,13 @@ kernel_flashinfer_recurrent_kda_t1_direct(__nv_bfloat16* __restrict__ q, __nv_bf
     int lane_0 = lane;
     int k_lane = lane_0 & 15;
     int v_lane = lane_0 / 16;
-    int token_pos = cu_seqlens[n];
-    int seq_len = cu_seqlens[n + 1] - token_pos;
+    int raw_token_pos = cu_seqlens[n];
+    int seq_len = cu_seqlens[n + 1] - raw_token_pos;
+    bool has_token = raw_token_pos >= 0 && raw_token_pos < gridDim.y && seq_len > 0;
+    int token_pos = ((has_token) ? raw_token_pos : 0);
     int raw_slot = ssm_state_indices[n];
     int initial_slot = ((raw_slot < 0) ? 0 : raw_slot);
-    bool active = raw_slot >= 0 && seq_len > 0;
+    bool active = raw_slot >= 0 && has_token;
     int tile_row_base = value_tile * 16;
     int elem_start = lane_0 * 4;
     float q_src[4];
@@ -259,7 +261,7 @@ kernel_flashinfer_recurrent_kda_t1_direct(__nv_bfloat16* __restrict__ q, __nv_bf
                 if (k_lane == 0) {
                     out[output_head_base + value_row_1] = base + delta * k_dot_q;
                 }
-            } else if (k_lane == 0) {
+            } else if (has_token && k_lane == 0) {
                 out[output_head_base + value_row_1] = 0.0f;
             }
         }

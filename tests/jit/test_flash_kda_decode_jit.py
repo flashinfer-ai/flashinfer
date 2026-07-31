@@ -43,12 +43,12 @@ FROZEN_GENERATED_BODY_SHA256 = {
         "a38718a0b4383d2f2d2c3ec7eb1746be44e649265b805a3dbcebdd20415612d3",
     ),
     "d128_t1_precomputed_direct_split16": (
-        "c3aa1abed0b115fba4938103d9fdeeac6e9f9ff3666bcef315fc90e998b5a4f7",
-        "c3aa1abed0b115fba4938103d9fdeeac6e9f9ff3666bcef315fc90e998b5a4f7",
+        "9119163b3b5cb6a8760b6a17a7ce01788a0e1c0078f8c812255225f27e5989e5",
+        "9119163b3b5cb6a8760b6a17a7ce01788a0e1c0078f8c812255225f27e5989e5",
     ),
     "d128_t1_precomputed_direct_split8": (
-        "eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210",
-        "eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210",
+        "116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f",
+        "116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f",
     ),
     "d128_t2_precomputed_split1": (
         "4eaf6b81491db3bd7969ddd8f41797bd7d5e472c591b4ed6a9a8fd7172eb6047",
@@ -208,6 +208,9 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     if metadata.direct_impl:
         assert "#define THREADS 32" in generated_body
         assert "kernel_flashinfer_recurrent_kda_t1_direct" in generated_body
+        assert "bool has_token = raw_token_pos >= 0" in generated_body
+        assert "int token_pos = ((has_token) ? raw_token_pos : 0)" in generated_body
+        assert "else if (has_token && k_lane == 0)" in generated_body
         assert "#define GATE_KIND" not in generated_body
         assert "#define DIRECT_PREFIX_CHECKPOINT" not in generated_body
         assert "#define BLOCK_CHECKPOINT_MMA" not in generated_body

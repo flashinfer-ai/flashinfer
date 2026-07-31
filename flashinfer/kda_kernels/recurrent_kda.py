@@ -1497,6 +1497,8 @@ def run_recurrent_kda(
             gate formula instead of softplus. Must be negative.
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
+            The Cake backend's ``T=1`` specialization uses standard dense
+            decode and does not accept explicit ``cu_seqlens`` metadata.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also be
@@ -1617,6 +1619,11 @@ def run_recurrent_kda(
     ):
         raise ValueError(
             "ssm_state_indices is required when num_spec_tokens is set with cu_seqlens"
+        )
+
+    if backend == "cake" and cu_seqlens is not None and num_spec_tokens is None:
+        raise ValueError(
+            "backend='cake' T=1 requires standard decode without explicit cu_seqlens"
         )
 
     # Batched spec-decode shim: auto-converts [B,T,...] to packed [1,B*T,...] format.

@@ -1253,6 +1253,109 @@ def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_ds
         recurrent_kda(**_call_kwargs(case), backend="cake")
 
 
+def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
+    b200, monkeypatch
+):
+    num_sequences = 2
+    case = _make_case(
+        b200,
+        num_sequences=num_sequences,
+        num_heads=16,
+        num_value_heads=32,
+        num_tokens=1,
+        seed=2270,
+    )
+    for name in ("q", "k", "v", "g", "beta", "output"):
+        tensor = case[name]
+        case[name] = tensor.reshape(1, num_sequences, *tensor.shape[2:])
+    case["cu_seqlens"] = torch.arange(num_sequences + 1, dtype=torch.int32, device=b200)
+    case["ssm_state_indices"] = torch.arange(
+        num_sequences, dtype=torch.int32, device=b200
+    )
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail(f"unexpected kernel launch: args={args}, kwargs={kwargs}")
+
+    monkeypatch.setattr(
+        recurrent_module,
+        "_run_flash_kda_decode",
+        unexpected_launch,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_get_grouped_compiled",
+        unexpected_launch,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_get_compiled_kernel",
+        unexpected_launch,
+    )
+    with pytest.raises(
+        ValueError,
+        match="T=1 requires standard decode without explicit cu_seqlens",
+    ):
+        recurrent_kda(**_call_kwargs(case), backend="cake")
+
+
+def test_internal_direct_t1_nonidentity_metadata_is_memory_safe(b200):
+    generator = torch.Generator(device=b200).manual_seed(2271)
+    num_sequences = 2
+    num_heads = 16
+    num_value_heads = 32
+    shape_q = (1, num_sequences, num_heads, _D)
+    shape_v = (1, num_sequences, num_value_heads, _D)
+    q = torch.randn(shape_q, dtype=torch.bfloat16, device=b200, generator=generator)
+    k = torch.randn_like(q)
+    v = torch.randn(shape_v, dtype=torch.bfloat16, device=b200, generator=generator)
+    g = F.logsigmoid(
+        torch.randn(shape_v, dtype=torch.float32, device=b200, generator=generator)
+    ).to(torch.bfloat16)
+    beta = torch.rand(
+        (1, num_sequences, num_value_heads),
+        dtype=torch.bfloat16,
+        device=b200,
+        generator=generator,
+    )
+    state = torch.randn(
+        (num_sequences, num_value_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=b200,
+        generator=generator,
+    )
+    state_before = state.clone()
+    output_sentinel = 17.0
+    out = torch.full(shape_v, output_sentinel, dtype=torch.bfloat16, device=b200)
+    dummy_f32 = torch.zeros(1, dtype=torch.float32, device=b200)
+
+    recurrent_module._run_flash_kda_decode(
+        "d128_t1_precomputed_direct_split16",
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        state=state,
+        out=out,
+        cu_seqlens=torch.tensor([0, 2, 2], dtype=torch.int32, device=b200),
+        ssm_state_indices=torch.arange(num_sequences, dtype=torch.int32, device=b200),
+        num_accepted_tokens=torch.ones(num_sequences, dtype=torch.int32, device=b200),
+        scale=_D**-0.5,
+        A_log=dummy_f32,
+        dt_bias=dummy_f32,
+        lower_bound=0.0,
+    )
+    torch.cuda.synchronize(b200)
+
+    torch.testing.assert_close(
+        out[:, 1],
+        torch.full_like(out[:, 1], output_sentinel),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(state[1], state_before[1], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("num_sequences", _T3_SEQUENCE_COUNTS)
 def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_cute_dsl(
     b200, monkeypatch, num_sequences
