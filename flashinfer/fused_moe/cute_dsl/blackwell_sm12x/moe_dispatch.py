@@ -59,6 +59,8 @@ _MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
 # Micro kernel cutover thresholds (routed pairs)
 _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
+# The micro kernel's per-token staging assumes decode-sized batches.
+_MICRO_MAX_TOKENS = 8
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
@@ -90,6 +92,12 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (512, 175),
     (640, 188),
 )
+# MAC ladder for the prefill band. Entries at or below the static cutover
+# are unreachable at the default cutover of 640 pairs.
+_DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
+    (640, 188),
+    (1024, 147),
+)
 
 
 def _lookup_mac_ladder(
@@ -104,6 +112,20 @@ def _lookup_mac_ladder(
 
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+# The kernels index the packed activation and scale planes with 32-bit
+# offsets, so reject any workspace plane large enough to overflow them.
+_RUNTIME_MEMREF_LIMIT = (1 << 31) - 1
+
+
+def _check_memref_limit(name: str, elements: int) -> None:
+    if elements > _RUNTIME_MEMREF_LIMIT:
+        raise ValueError(
+            f"{name} needs {elements} elements, which exceeds the 2^31-1 "
+            "runtime memref limit. Reduce the token chunk or expert count "
+            "for this launch."
+        )
 
 
 def _first_env(*names: str) -> str | None:
@@ -219,21 +241,41 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
     return cached
 
 
-def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
+def _select_moe_mma_tiler_mn(
+    routed_rows: int,
+    n: int,
+    *,
+    resident_clusters: int | None = None,
+) -> Tuple[int, int]:
     """Select optimal MoE tile shape based on routed rows and N dimension.
 
     Uses narrower 64x128 tiles when routed_rows <= 128 and default 128x128
     would leave SMs idle.
     """
+    override = os.environ.get("FLASHINFER_B12X_MOE_TILE_MN")
+    if override:
+        if override not in ("64x128", "128x128"):
+            raise ValueError(
+                f"FLASHINFER_B12X_MOE_TILE_MN={override!r} is not supported. "
+                "The micro and static kernels only take 64x128 or 128x128."
+            )
+        tile_m, tile_n = override.split("x")
+        return (int(tile_m), int(tile_n))
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
+    if routed_rows <= 32 and n <= 256:
+        return (64, 128)
+    if resident_clusters is not None and resident_clusters < sm_count:
+        return coarse_tile
     coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
         (n + coarse_tile[1] - 1) // coarse_tile[1]
     )
     # Single-token decode often lands exactly on the "half the machine"
     # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
     # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
-    if routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
+    if routed_rows <= 64 or (
+        routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2)
+    ):
         return (64, 128)
     return (128, 128)
 
@@ -309,6 +351,8 @@ def allocate_sm120_static_workspace(
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    _check_memref_limit("static packed_input", state_E * max_rows * (k // 2))
+    _check_memref_limit("static packed_input_scale", state_E * rows_pad_k * cols_pad_k)
     packed_input = torch.empty(
         state_E, max_rows, k // 2, dtype=torch.uint8, device=device
     )
@@ -523,7 +567,7 @@ def _get_static_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
     if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
     cache_key = (
         "static",
@@ -1018,6 +1062,7 @@ def launch_sm120_static_moe(
     and the static kernel otherwise. The micro path runs a Triton pre-pass
     to compact routing IDs before launching.
     """
+    _check_memref_limit("scatter_output", scatter_output.numel())
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -1043,7 +1088,11 @@ def launch_sm120_static_moe(
     micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
     if top_k > 1:
         micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
-    use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
+    use_micro = (
+        activation_precision == "fp4"
+        and num_tokens <= _MICRO_MAX_TOKENS
+        and routed_rows <= micro_cutover
+    )
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -1231,17 +1280,10 @@ class Sm120DynamicMoEWorkspace:
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
     pair_head: torch.Tensor
-    producers_done_count: torch.Tensor
-    all_work_published: torch.Tensor
     task_head: torch.Tensor
     task_tail: torch.Tensor
-    task_ready: torch.Tensor
     task_expert: torch.Tensor
-    task_m_tile: torch.Tensor
-    task_slice_begin: torch.Tensor
-    task_slice_count: torch.Tensor
     task_valid_rows: torch.Tensor
-    tile_write_count: torch.Tensor
 
     # Views
     packed_a_view: torch.Tensor | None = None
@@ -1304,6 +1346,8 @@ def allocate_sm120_dynamic_workspace(
     )
     rows_padded = physical_tiles * tile_m
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    _check_memref_limit("dynamic packed_input", rows_padded * (k // 2))
+    _check_memref_limit("dynamic packed_input_scale", rows_padded * cols_pad_k)
     packed_input = torch.empty(1, rows_padded, k // 2, dtype=torch.uint8, device=device)
 
     workspace = Sm120DynamicMoEWorkspace(
@@ -1330,17 +1374,10 @@ def allocate_sm120_dynamic_workspace(
         expert_write_rows=torch.zeros(state_E, dtype=torch.int32, device=device),
         expert_tile_base=torch.zeros(state_E + 1, dtype=torch.int32, device=device),
         pair_head=torch.zeros(1, dtype=torch.int32, device=device),
-        producers_done_count=torch.zeros(1, dtype=torch.int32, device=device),
-        all_work_published=torch.zeros(1, dtype=torch.int32, device=device),
         task_head=torch.zeros(1, dtype=torch.int32, device=device),
         task_tail=torch.zeros(1, dtype=torch.int32, device=device),
-        task_ready=torch.zeros(max_tasks, dtype=torch.int32, device=device),
         task_expert=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_m_tile=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_slice_begin=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        task_slice_count=torch.zeros(max_tasks, dtype=torch.int32, device=device),
         task_valid_rows=torch.zeros(max_tasks, dtype=torch.int32, device=device),
-        tile_write_count=torch.zeros(physical_tiles, dtype=torch.int32, device=device),
     )
 
     # Finalize views
@@ -1392,17 +1429,10 @@ class _DynamicMoELaunch:
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
         pair_head: cute.Tensor,
-        producers_done_count: cute.Tensor,
-        all_work_published: cute.Tensor,
         task_head: cute.Tensor,
         task_tail: cute.Tensor,
-        task_ready_ptr: cute.Pointer,
         task_expert_ptr: cute.Pointer,
-        task_m_tile_ptr: cute.Pointer,
-        task_slice_begin_ptr: cute.Pointer,
-        task_slice_count_ptr: cute.Pointer,
         task_valid_rows_ptr: cute.Pointer,
-        tile_write_count_ptr: cute.Pointer,
         b_w13: cute.Tensor,
         sfb_w13_ptr: cute.Pointer,
         b_down: cute.Tensor,
@@ -1421,7 +1451,6 @@ class _DynamicMoELaunch:
         max_rows: cutlass.Int32,
         rows_padded: cutlass.Int32,
         max_tasks: cutlass.Int32,
-        max_phys_tiles: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream,
     ):
@@ -1462,27 +1491,11 @@ class _DynamicMoELaunch:
         token_weights_t = cute.make_tensor(
             token_weights_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
         )
-        task_ready = cute.make_tensor(
-            task_ready_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
-        )
         task_expert = cute.make_tensor(
             task_expert_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
         )
-        task_m_tile = cute.make_tensor(
-            task_m_tile_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
-        )
-        task_slice_begin = cute.make_tensor(
-            task_slice_begin_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
-        )
-        task_slice_count = cute.make_tensor(
-            task_slice_count_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
-        )
         task_valid_rows = cute.make_tensor(
             task_valid_rows_ptr, layout=cute.make_layout((max_tasks,), stride=(1,))
-        )
-        tile_write_count = cute.make_tensor(
-            tile_write_count_ptr,
-            layout=cute.make_layout((max_phys_tiles,), stride=(1,)),
         )
         self._kernel(
             a_input,
@@ -1495,17 +1508,10 @@ class _DynamicMoELaunch:
             barrier_count,
             barrier_epoch,
             pair_head,
-            producers_done_count,
-            all_work_published,
             task_head,
             task_tail,
-            task_ready,
             task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
             task_valid_rows,
-            tile_write_count,
             b_w13,
             sfb_w13_ptr,
             b_down,
@@ -1557,7 +1563,9 @@ def _get_dynamic_kernel(
     )
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
-    mac = min(get_max_active_clusters(1), sm_count)
+    base_mac = min(get_max_active_clusters(1), sm_count)
+    tuned_mac = _lookup_mac_ladder(_DYNAMIC_MAC_LADDER, m * num_topk)
+    mac = min(tuned_mac or base_mac, base_mac)
     mma_tiler_mn = (
         _level_tile_m(activation_precision),
         _level_tile_n(activation_precision),
@@ -1648,12 +1656,6 @@ def _get_dynamic_kernel(
     pair_head_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4
     )
-    producers_done_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4
-    )
-    all_work_published_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (1,), assumed_align=4
-    )
     task_head_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (1,), assumed_align=4
     )
@@ -1661,25 +1663,10 @@ def _get_dynamic_kernel(
         cutlass.Int32, (1,), assumed_align=4
     )
 
-    task_ready_fake = make_ptr(
-        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
-    )
     task_expert_fake = make_ptr(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
-    task_m_tile_fake = make_ptr(
-        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
-    )
-    task_slice_begin_fake = make_ptr(
-        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
-    )
-    task_slice_count_fake = make_ptr(
-        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
-    )
     task_valid_rows_fake = make_ptr(
-        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
-    )
-    tile_write_count_fake = make_ptr(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
 
@@ -1736,17 +1723,10 @@ def _get_dynamic_kernel(
         barrier_count_fake,
         barrier_epoch_fake,
         pair_head_fake,
-        producers_done_count_fake,
-        all_work_published_fake,
         task_head_fake,
         task_tail_fake,
-        task_ready_fake,
         task_expert_fake,
-        task_m_tile_fake,
-        task_slice_begin_fake,
-        task_slice_count_fake,
         task_valid_rows_fake,
-        tile_write_count_fake,
         b_w13_fake,
         sfb_w13_fake,
         b_down_fake,
@@ -1761,7 +1741,6 @@ def _get_dynamic_kernel(
         scatter_fake,
         token_map_fake,
         token_weights_fake,
-        1,
         1,
         1,
         1,
@@ -1808,6 +1787,7 @@ def launch_sm120_dynamic_moe(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic launcher"
         )
+    _check_memref_limit("scatter_output", scatter_output.numel())
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
     input_gs_is_shared = input_gs.numel() == 1
@@ -1847,17 +1827,10 @@ def launch_sm120_dynamic_moe(
         workspace.barrier_count,
         workspace.barrier_epoch,
         workspace.pair_head,
-        workspace.producers_done_count,
-        workspace.all_work_published,
         workspace.task_head,
         workspace.task_tail,
-        workspace.task_ready.data_ptr(),
         workspace.task_expert.data_ptr(),
-        workspace.task_m_tile.data_ptr(),
-        workspace.task_slice_begin.data_ptr(),
-        workspace.task_slice_count.data_ptr(),
         workspace.task_valid_rows.data_ptr(),
-        workspace.tile_write_count.data_ptr(),
         weights.w13_fp4,
         weights._w13_sf_storage.data_ptr(),
         weights.down_fp4,
@@ -1876,7 +1849,6 @@ def launch_sm120_dynamic_moe(
         workspace.max_rows,
         workspace.physical_tiles_capacity * _level_tile_m(activation_precision),
         workspace.task_capacity,
-        workspace.physical_tiles_capacity,
     )
     compiled(*runtime_args, current_cuda_stream())
 
@@ -2282,9 +2254,23 @@ _Sm120Workspace = Union[
 ]
 
 # Keyed by (state_E, weight_E, k, n, top_k, device, backend).
-# Stores the workspace with the largest max_rows seen for each key.
-# Grows monotonically — never shrinks within a process.
+# Stores the workspace with the largest max_rows seen for each key and never
+# shrinks within a process. clear_sm120_moe_caches() releases everything.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
+
+
+def clear_sm120_moe_caches() -> None:
+    """Release every module-level SM12x MoE cache.
+
+    References held by callers are unaffected.
+    """
+    _WORKSPACE_CACHE.clear()
+    _WEIGHT_CACHE.clear()
+    _W4A16_WEIGHT_CACHE.clear()
+    _PADDED_WEIGHT_CACHE.clear()
+    _STATIC_KERNEL_CACHE.clear()
+    _MICRO_KERNEL_CACHE.clear()
+    _DYNAMIC_KERNEL_CACHE.clear()
 
 
 def allocate_sm120_moe_workspace(

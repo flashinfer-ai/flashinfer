@@ -257,15 +257,18 @@ def st_global_u32(base_ptr: Int64, value: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
+def get_ptr_as_int64(tensor: cute.Tensor, offset, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64.
+
+    ``offset`` may be Int32 or Int64 and is added to the iterator unchanged,
+    so 64-bit offsets are not truncated.
 
     WARNING: This uses ptrtoint which strips address space information.
     For SMEM tensors, the resulting Int64 is a raw SMEM offset that does NOT
     work with generic-addressing loads (ld.v4.u32). Use only with explicit
     address-space loads (ld.global.*) or for global memory tensors.
     """
-    elem_ptr = tensor.iterator + Int32(offset)
+    elem_ptr = tensor.iterator + offset
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
 
