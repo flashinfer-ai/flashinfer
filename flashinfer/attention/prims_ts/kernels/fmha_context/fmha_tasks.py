@@ -650,6 +650,7 @@ def create_mma_task(
     tmem_sp0: TmemSPResource,
     tmem_sp1: TmemSPResource | None,
     tmem_p0: TmemPResource | None,
+    tmem_p1: TmemPResource | None,
     tmem_o: TmemOResource,
     tmem_vec_done_0: TmemStatsDoneResource,
     tmem_vec_done_1: TmemStatsDoneResource | None,
@@ -898,6 +899,215 @@ def create_mma_task(
 
     if tmem_sp1 is None or tmem_vec_done_1 is None:
         raise ValueError("paired MMA scheduling requires peer-1 resources")
+
+    if smem_q.cfg.uses_qk_pv_interleaved_paired_schedule:
+        if tmem_p0 is None or tmem_p1 is None:
+            raise ValueError(
+                "interleaved paired MMA scheduling requires TmemP pipeline resources"
+            )
+        split_src = _src_resources(
+            smem_q,
+            smem_kv,
+            tmem_p0,
+            tmem_p1,
+            work_queue=work_queue,
+        )
+
+        @schedule
+        def mma_schedule(
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            sp0: TmemSPResource,
+            sp1: TmemSPResource,
+            tp0: TmemPResource,
+            tp1: TmemPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            vd1: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Interleaved ``Qk0_Pv0_Qk1_Pv1`` paired MMA schedule.
+
+            HEAD issues QK(Q0,K0)->S0 and QK(Q1,K0)->S1 with no PV. Each LOOP
+            iter processes V_i and K_{i+1} and issues the four MMAs strictly
+            in order QK0 -> PV0 -> QK1 -> PV1. Under the cross-alias TMEM
+            layout, softmaxi's P store lives in the physical columns that
+            the OTHER peer's S read consumed, so PVi must gate on softmaxi's
+            fresh P via a dedicated ``tpi`` producer/consumer barrier that
+            is independent from ``spi``. Sequencing per iter:
+
+                sp0.acquire ; QK0 ; sp0.commit  (S0 handed off to softmax0)
+                to.acquire ; tp0.wait ; PV0 ; to.commit ; tp0.release
+                sp1.acquire ; QK1 ; sp1.commit  (S1 handed off to softmax1)
+                to.acquire ; tp1.wait ; PV1 ; to.commit ; tp1.release
+
+            V_i is locked once and consumed by both PVs. TAIL processes
+            V_{n-1} with both PV0 and PV1 (no further QK). The intra-warp
+            UMMA async queue preserves the serial issue order, which is
+            what guarantees the QK1 write does not clobber the P0 slot
+            until PV0 has consumed it (and symmetrically for QK0(N+1) vs P1).
+            """
+            sq.init_descriptor_state()
+            skv.init_descriptor_state()
+            sp0.init_mma_state()
+            sp1.init_mma_state()
+            to.init_mma_state()
+            with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
+                # HEAD: consume Q0, Q1, K0 and issue both QKs. No PV -- both
+                # PVs live in LOOP/TAIL to share a single V lock per iter.
+                sq.wait()
+                desc_q0_base = sq.q0_desc(inst_idx=0)
+                skv.wait()
+                desc_k_base = skv.k_desc()
+                if not smem_q.cfg.stats_via_smem:
+                    vd0.acquire()
+                sp0.acquire()
+                sp0.qk_mma(
+                    desc_q_base=desc_q0_base,
+                    desc_k_base=desc_k_base,
+                    section=FmhaStage.Head,
+                )
+                sp0.commit()
+                if not smem_q.cfg.stats_via_smem:
+                    vd0.commit()
+                sq.wait()
+                desc_q1_base = sq.q1_desc(inst_idx=1)
+                if not smem_q.cfg.stats_via_smem:
+                    vd1.acquire()
+                sp1.acquire()
+                sp1.qk_mma(
+                    desc_q_base=desc_q1_base,
+                    desc_k_base=desc_k_base,
+                    section=FmhaStage.Head,
+                )
+                sp1.commit()
+                if not smem_q.cfg.stats_via_smem:
+                    vd1.commit()
+                # Release K0; V_0 is next.
+                skv.release()
+
+                # LOOP: serial QK0 -> PV0 -> QK1 -> PV1. Each PVi waits on
+                # its own tpi (softmax's P0/P1 store) so cross-alias writes
+                # on the shared physical columns cannot race the reads.
+                with domain_loop(loop_start, loop_end, loop_step):
+                    # Wait V_i then K_{i+1} up-front (FIFO w.r.t. load pipe).
+                    skv.wait()
+                    desc_v_base = skv.v_desc()
+                    skv.wait()
+                    desc_k_base = skv.k_desc()
+
+                    # QK0(Q0, K_{i+1}) -> S0.
+                    sp0.acquire()
+                    sp0.qk_mma(
+                        desc_q_base=desc_q0_base,
+                        desc_k_base=desc_k_base,
+                        section=FmhaStage.Loop,
+                    )
+                    sp0.commit()
+                    # PV0(V_i): P0 * V_i -> O0. tp0 gates on softmax0's P0
+                    # store; release tp0 once the UMMA has consumed P0.
+                    to.acquire()
+                    tp0.wait()
+                    to.pv_mma(
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                        inst_idx=0,
+                    )
+                    to.commit()
+                    tp0.release()
+
+                    # QK1(Q1, K_{i+1}) -> S1. Follows PV0 in the MMA queue,
+                    # which is what prevents QK1 from clobbering P0's slot
+                    # before PV0 has drained it.
+                    sp1.acquire()
+                    sp1.qk_mma(
+                        desc_q_base=desc_q1_base,
+                        desc_k_base=desc_k_base,
+                        section=FmhaStage.Loop,
+                    )
+                    sp1.commit()
+                    # PV1(V_i): P1 * V_i -> O1 (same V window as PV0).
+                    to.acquire()
+                    tp1.wait()
+                    to.pv_mma(
+                        desc_v_base=desc_v_base,
+                        section=FmhaStage.Loop,
+                        inst_idx=1,
+                    )
+                    to.commit()
+                    tp1.release()
+
+                    # FIFO release order: V_i first, then K_{i+1}.
+                    skv.release()
+                    skv.release()
+
+                # TAIL: V_{n-1} feeds both PV0 and PV1 (no further QK).
+                #
+                # Softmax's non-causal TAIL emits an extra sp.wait/sp.release
+                # to close its stats slot (see :func:`_paired_softmax_body` —
+                # non-causal else-branch calls ``sp.wait(); sp.release()``
+                # before writing the final stats). That extra wait/release
+                # needs a matching producer acquire+commit from MMA — the
+                # legacy ``Pv0_Qk0_Pv1_Qk1`` schedule provided it implicitly
+                # via the deferred SP-commit pattern (``sp0.commit`` /
+                # ``sp1.commit`` in its TAIL). This schedule handles P via
+                # ``tpi``, so we issue the closing sp acquire+commit here
+                # explicitly, once per instance.
+                skv.wait()
+                desc_v_base = skv.v_desc()
+                sp0.acquire()
+                sp0.commit()
+                to.acquire()
+                tp0.wait()
+                to.pv_mma(
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Tail,
+                    inst_idx=0,
+                    is_tail=True,
+                )
+                to.commit()
+                tp0.release()
+                sp1.acquire()
+                sp1.commit()
+                to.acquire()
+                tp1.wait()
+                to.pv_mma(
+                    desc_v_base=desc_v_base,
+                    section=FmhaStage.Tail,
+                    inst_idx=1,
+                    is_tail=True,
+                )
+                to.commit()
+                tp1.release()
+                skv.release()
+                # Release Q0, Q1 (held live across every K tile).
+                sq.release()
+                sq.release()
+
+        captured_schedule = _schedule_with_work_queue(
+            mma_schedule,
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_sp1,
+            tmem_p0,
+            tmem_p1,
+            tmem_o,
+            tmem_vec_done_0,
+            tmem_vec_done_1,
+            work_queue=work_queue,
+        )
+        return task_class(
+            src_resources=split_src,
+            dst_resources=[tmem_sp0, tmem_sp1, tmem_o]
+            + ([] if smem_q.cfg.stats_via_smem else [tmem_vec_done_0, tmem_vec_done_1]),
+            warp_idx=12,
+            num_warps=1,
+            schedule=captured_schedule,
+            name="MmaTask",
+            num_registers=smem_q.cfg.num_regs_other,
+            **task_kwargs,
+        )
 
     @schedule
     def mma_schedule(
@@ -1524,23 +1734,53 @@ def create_softmax_task(
         )
 
     # Paired QKV instances use separate SP resources. S0S1SequenceResource
-    # orders their P stores, so this path does not need the TMEM P handoff.
+    # orders their P stores across peers. Under the interleaved paired
+    # (``Qk0_Pv0_Qk1_Pv1``) schedule, each softmax also drives a dedicated
+    # ``tp`` producer barrier so that PV(i) can wait on softmax(i)'s exp2_p
+    # store; this is required because softmax(i) writes P(i) into physical
+    # TMEM columns that live inside the OTHER peer's S range (cross-alias
+    # layout).
+    p_pipeline_enabled = tmem_p is not None
+
     if s0s1_seq is not None and index == 1:
         src = _src_resources(tmem_sp, s0s1_seq, work_queue=work_queue)
     else:
         src = _src_resources(tmem_sp, work_queue=work_queue)
     dst = [tmem_vec]
+    if p_pipeline_enabled:
+        dst.append(tmem_p)
     if s0s1_seq is not None and index == 0:
         dst.append(s0s1_seq)
 
-    @schedule
-    def softmax_schedule(
+    def _paired_softmax_body(
         sp: TmemSPResource,
         vec: TmemStatsResource,
+        tp: TmemPResource | None,
         seq: S0S1SequenceResource,
-        wq: WorkQueue | None = None,
+        wq: WorkQueue | None,
     ) -> None:
-        """Captured schedule for one softmax warp group."""
+        """Shared body for the paired softmax schedule.
+
+        Two synchronization layers apply under the interleaved paired
+        schedule (``tp is not None``); both are owned by this body:
+
+        1. Outer producer-consumer pipeline: each ``exp2_p`` /
+           ``masked_exp2_p`` is wrapped in ``tp.acquire`` / ``tp.commit``
+           so PV(i) can gate on softmax(i) finishing its P store.
+        2. Cross-alias TMEM ordering (OrderP01): STTM(P_i) must not run
+           while the peer is still doing LDTM(S_peer) on the same
+           physical columns. This body calls
+           ``sp.order_p01_arrive_if_paired()`` immediately after every
+           ``*_row_max`` (LDTM(S_own) done, peer may start STTM(P_peer))
+           and ``sp.order_p01_wait_if_paired()`` immediately before every
+           ``*_exp2_p`` (block until peer's LDTM(S_peer) done, then
+           STTM(P_own)). Both fold to no-ops at trace time when the
+           schedule is not interleaved (``sp._tp_ref is None``).
+
+        ``invalid_exp2_p`` skips both LDTM and STTM, and MMA elides the
+        matching PV for the invalid peer tail, so it is deliberately
+        unfenced.
+        """
         if tmem_sp.enable_early_tile_sum:
             # The contribution is produced and consumed inside each iteration;
             # do not carry even the scalar tile sum through the persistent loop.
@@ -1590,6 +1830,8 @@ def create_softmax_task(
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                # LDTM(S_own) is complete; signal the OrderP01 peer.
+                sp.order_p01_arrive_if_paired()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1604,11 +1846,18 @@ def create_softmax_task(
                 else:
                     # Softmax1 is the S0-S1 consumer: wait/release sequence.
                     seq.wait()
-                # Apply softmax and write P.
+                # Apply softmax and write P (cross-alias P store under the
+                # interleaved paired schedule): wait for the peer's LDTM(S_peer)
+                # before STTM(P_own).
+                if tp is not None:
+                    tp.acquire()
+                sp.order_p01_wait_if_paired()
                 p_chunk = sp.exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                if tp is not None:
+                    tp.commit()
                 if s0s1_seq is None:
                     pass
                 elif index == 0:
@@ -1637,6 +1886,7 @@ def create_softmax_task(
                     q_offset=q_offset,
                     section=FmhaStage.Tail,
                 )
+                sp.order_p01_arrive_if_paired()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1649,10 +1899,15 @@ def create_softmax_task(
                     seq.acquire()
                 else:
                     seq.wait()
+                if tp is not None:
+                    tp.acquire()
+                sp.order_p01_wait_if_paired()
                 p_chunk = sp.exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                if tp is not None:
+                    tp.commit()
                 if s0s1_seq is None:
                     pass
                 elif index == 0:
@@ -1687,6 +1942,7 @@ def create_softmax_task(
                     row_max=row_max,
                     q_offset=q_offset,
                 )
+                sp.order_p01_arrive_if_paired()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1695,10 +1951,15 @@ def create_softmax_task(
                 vec.commit()
                 if s0s1_seq is not None:
                     seq.acquire()
+                if tp is not None:
+                    tp.acquire()
+                sp.order_p01_wait_if_paired()
                 p_chunk = sp.masked_exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                if tp is not None:
+                    tp.commit()
                 if s0s1_seq is not None:
                     seq.commit()
                 sp.release()
@@ -1721,6 +1982,8 @@ def create_softmax_task(
                     vec.commit()
                     if s0s1_seq is not None:
                         seq.acquire()
+                    # invalid_exp2_p is a no-op; MMA elides the matching PV so
+                    # no tp handshake is needed for this padded peer slot.
                     sp.invalid_exp2_p(row_max=row_max)
                     if s0s1_seq is not None:
                         seq.commit()
@@ -1743,6 +2006,7 @@ def create_softmax_task(
                     row_max=row_max,
                     q_offset=q_offset,
                 )
+                sp.order_p01_arrive_if_paired()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1751,10 +2015,15 @@ def create_softmax_task(
                 vec.commit()
                 if s0s1_seq is not None:
                     seq.wait()
+                if tp is not None:
+                    tp.acquire()
+                sp.order_p01_wait_if_paired()
                 p_chunk = sp.masked_exp2_p(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                if tp is not None:
+                    tp.commit()
                 if s0s1_seq is not None:
                     seq.release()
                 sp.release()
@@ -1790,9 +2059,42 @@ def create_softmax_task(
                 )
                 vec.commit()
 
-    captured_schedule = _schedule_with_work_queue(
-        softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
-    )
+    if p_pipeline_enabled:
+
+        @schedule
+        def softmax_schedule(
+            sp: TmemSPResource,
+            vec: TmemStatsResource,
+            tp: TmemPResource,
+            seq: S0S1SequenceResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Interleaved paired softmax schedule: publishes P through tp."""
+            _paired_softmax_body(sp, vec, tp, seq, wq)
+
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule,
+            tmem_sp,
+            tmem_vec,
+            tmem_p,
+            s0s1_seq,
+            work_queue=work_queue,
+        )
+    else:
+
+        @schedule
+        def softmax_schedule(
+            sp: TmemSPResource,
+            vec: TmemStatsResource,
+            seq: S0S1SequenceResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Legacy paired softmax schedule: P stores are ordered via seq."""
+            _paired_softmax_body(sp, vec, None, seq, wq)
+
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,

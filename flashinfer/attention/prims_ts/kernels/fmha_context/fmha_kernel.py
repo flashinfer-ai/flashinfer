@@ -132,6 +132,7 @@ Entry points:
   - FmhaTs                   -- class with @cute.jit __call__ and kernel
 """
 
+import functools
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -165,6 +166,7 @@ from .fmha_resources import (
     FmhaConfig,
     GmemOResource,
     GmemQKVResource,
+    MmaOrder,
     S0S1SequenceResource,
     SmemKVResource,
     SmemOResource,
@@ -801,6 +803,12 @@ def build_context_task_manager(
         consumer_group=umma_hw_group,
         cta_layout_vmnk=cluster_shape_vmnk,
     )
+    tmem_p1_pipeline_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+        num_stages=cfg.mma_softmax_stage,
+        producer_group=softmax_group,
+        consumer_group=umma_hw_group,
+        cta_layout_vmnk=cluster_shape_vmnk,
+    )
     tmem_o_pipeline_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
         num_stages=cfg.mma_corr_stage,
         producer_group=umma_hw_group,
@@ -1001,11 +1009,29 @@ def build_context_task_manager(
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
+    # OrderP01 mbarriers guard the interleaved paired cross-alias TMEM layout.
+    # Two 8-byte mbarriers packed into one 16-byte SMEM allocation, shared
+    # across softmax0/softmax1.  softmax0 owns the allocation; softmax1 refers
+    # to it via ``order_p01_alloc`` without contributing to placement.
+    order_p01_alloc: SmemAllocation | None = None
+    if (
+        cfg.has_tmem_p_pipeline
+        and not cfg.single_qkv_instance
+        and cfg.mma_order == MmaOrder.Qk0Pv0Qk1Pv1
+    ):
+        order_p01_alloc = SmemAllocation(
+            name="tmem_order_p01",
+            size_bytes=16,
+            alignment=8,
+        )
     if cfg.has_tmem_p_pipeline:
         tmem_p0 = TmemPResource(
             pipeline_config=tmem_p0_pipeline_cfg,
             cfg=cfg,
             tmem_p_offset=cfg.tmem_p0_offset,
+            inst_id=0,
+            order_p01_alloc=order_p01_alloc,
+            owns_order_p01_alloc=order_p01_alloc is not None,
             name="tmem_p0",
         )
     tmem_vec0 = TmemStatsResource(
@@ -1039,6 +1065,7 @@ def build_context_task_manager(
 
     single_qkv_instance = cfg.single_qkv_instance
     tmem_sp1: TmemSPResource | None = None
+    tmem_p1: TmemPResource | None = None
     tmem_vec1: TmemStatsResource | None = None
     smem_o_1: SmemOResource | None = None
     gmem_o_1: GmemOResource | None = None
@@ -1058,6 +1085,22 @@ def build_context_task_manager(
             scale_softmax_log2=scale_softmax_log2,
             name="tmem_sp1",
         )
+        if cfg.has_tmem_p_pipeline:
+            # Interleaved paired cross-alias layout: softmax1 writes P1 into the
+            # physical TMEM columns vacated by softmax0's S0 read (and PV0
+            # reads P0 from the columns vacated by softmax1's S1 read).
+            # Each instance therefore needs its own producer/consumer barrier
+            # so PVi can gate on softmaxi's P store and softmaxi can gate on
+            # the prior PVi consuming it before overwriting.
+            tmem_p1 = TmemPResource(
+                pipeline_config=tmem_p1_pipeline_cfg,
+                cfg=cfg,
+                tmem_p_offset=cfg.tmem_p1_offset,
+                inst_id=1,
+                order_p01_alloc=order_p01_alloc,
+                owns_order_p01_alloc=False,
+                name="tmem_p1",
+            )
         tmem_vec1 = TmemStatsResource(
             pipeline_config=tmem_vec1_pipeline_cfg,
             cfg=cfg,
@@ -1090,6 +1133,19 @@ def build_context_task_manager(
             pipeline_config=tmem_stats_done_1_pipeline_cfg,
             name="tmem_stats_done_1",
         )
+
+    # Wire each softmax's TmemSPResource to its paired TmemPResource so the
+    # OrderP01 mbarrier helpers can reach the peer's barrier via
+    # ``self._tp_ref`` (see
+    # :meth:`TmemSPResource.order_p01_arrive_if_paired`, called from the
+    # paired softmax task body in fmha_tasks.py). Done here, after both
+    # resources are constructed, to avoid reordering the resource builds.
+    # When ``order_p01_alloc is None`` the underlying mbarriers are absent
+    # and the helpers fold to no-ops at trace time.
+    if tmem_p0 is not None:
+        tmem_sp0._tp_ref = tmem_p0
+    if tmem_sp1 is not None and tmem_p1 is not None:
+        tmem_sp1._tp_ref = tmem_p1
 
     tmem_o_kwargs = tmem_o_extra_kwargs or {}
     tmem_o = TmemOResource(
@@ -1143,6 +1199,7 @@ def build_context_task_manager(
         tmem_sp0,
         tmem_sp1,
         tmem_p0,
+        tmem_p1,
         tmem_o,
         tmem_stats_done_0,
         tmem_stats_done_1,
@@ -1169,7 +1226,7 @@ def build_context_task_manager(
             1,
             tmem_sp1,
             tmem_vec1,
-            None,
+            tmem_p1,
             s0s1_seq,
             work_queue,
             **softmax1_domain_kwargs,
@@ -1311,6 +1368,8 @@ def build_context_task_manager(
         )
         if not cfg.stats_via_smem:
             resource_dependency_graph[tmem_stats_done_1] = [tmem_vec1]
+        if tmem_p1 is not None:
+            resource_dependency_graph[tmem_p1] = scheduler_deps(tmem_sp1)
     if work_queue is not None:
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
@@ -1347,6 +1406,8 @@ def build_context_task_manager(
         add_smem_resource(tmem_stats_done_0)
     if tmem_sp1 is not None:
         add_smem_resource(tmem_sp1)
+    if tmem_p1 is not None:
+        add_smem_resource(tmem_p1)
     if tmem_vec1 is not None:
         add_smem_resource(tmem_vec1)
     if s0s1_seq is not None:
@@ -1488,12 +1549,84 @@ def build_context_task_manager(
 def _should_use_tmem_p_pipeline(cfg: FmhaConfig) -> bool:
     """Return whether P readiness needs its own TMEM pipeline resource.
 
-    The TMEM P pipeline belongs to the staged, single-QKV-instance topology.
-    That path stages K/V by 128-wide head-dimension slices and uses a separate
-    P-ready handoff so the MMA task can overlap next-tile QK with previous-tile
-    PV. The paired D128 path keeps P on TmemSPResource.
+    Two topologies need a P-ready handoff separate from TmemSPResource:
+
+    * The staged, single-QKV-instance path (K/V staged by 128-wide head-dim
+      slices) uses it to overlap next-tile QK with previous-tile PV.
+    * The interleaved paired (``Qk0_Pv0_Qk1_Pv1``) schedule uses cross-alias
+      TMEM where softmax0's P0 lives in the physical columns that softmax1's
+      S1 read consumed (and symmetrically for P1/S0). Each instance's PV must
+      wait for its softmax to finish writing P, and softmax must wait for the
+      previous PV to consume it before overwriting.
     """
-    return cfg.single_qkv_instance and cfg.stage_kv_by_head_dim
+    if cfg.single_qkv_instance and cfg.stage_kv_by_head_dim:
+        return True
+    if _should_use_qk_pv_interleaved_paired_schedule(cfg):
+        return True
+    return False
+
+
+@functools.cache
+def _current_sm_major_minor() -> tuple[int, int] | None:
+    """Return the current CUDA device compute capability, or None on failure.
+
+    Runs during host-side kernel construction so it is safe to import torch and
+    query the device. Returns None if torch or the CUDA driver is unavailable
+    (e.g., during unit tests that construct FmhaConfig without a live device);
+    callers must treat None as "arch heuristic does not apply".
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability()
+    except Exception:
+        return None
+
+
+def _should_use_qk_pv_interleaved_paired_schedule(cfg: FmhaConfig) -> bool:
+    """Return whether the paired MMA task should use ``Qk0_Pv0_Qk1_Pv1``.
+
+    Only the paired (``num_qkv_instances == 2``) topology is a candidate.
+    Selection is arch-driven: Blackwell Ultra (SM103a) context kernels with
+    ``head_dim_v >= 128`` opt in to the interleaved schedule.
+
+    Query-paired causal peer0-skip and head-paired mode are intentionally
+    excluded here: their peer0/peer1 tile counts diverge, and the new
+    schedule locks a single V per iter for both instances. Supporting them
+    is a follow-up that has to widen ``pv_mma``'s skip-invalid handling.
+
+    Plain causal (``cfg.is_causal``) is also excluded for now: the causal
+    TAIL under the cross-alias TMEM layout requires an MMA-side QK refresh
+    of S0/S1 with K_{N-1} before softmax's TAIL row_max reads them, plus
+    an OrderP01-elided softmax TAIL branch. Until those land, route causal
+    back to the legacy ``Pv0_Qk0_Pv1_Qk1`` schedule to avoid NaNs from the
+    peer's LOOP-N-2 STTM(P_peer) writes still living in the aliased
+    columns when the causal TAIL re-reads S.
+
+    Paged KV (``cfg.use_paged_kv``) is also excluded for now: every observed
+    non-causal D128 paged case regresses on the interleaved schedule (all
+    three ``paged_dense_k_mask_accuracy[*-d128]`` shapes plus both
+    ``d128_paged_s16k_runtime`` dtypes produce NaNs or L2 ~1.0). Contiguous
+    and packed varlen dense cases stay correct, so the regression appears
+    tied to the paged K/V TMA path interacting with the cross-alias TMEM
+    layout rather than to the varlen dense-K mask itself. Route paged back
+    to the legacy schedule until the paged interaction is root-caused.
+    """
+    if cfg.single_qkv_instance:
+        return False
+    if cfg.head_paired or cfg.skip_causal_invalid_peer0:
+        return False
+    if cfg.is_causal:
+        return False
+    if cfg.use_paged_kv:
+        return False
+    head_dim_v = cfg.pv_mma_tiler[1]
+    if head_dim_v < 128:
+        return False
+    capability = _current_sm_major_minor()
+    return capability == (10, 3)
 
 
 _Q_ROW_SMEM_ALIGNMENT_BYTES = 128
@@ -1516,7 +1649,11 @@ def _context_pipeline_stage_counts(
             else 0
         ),
         "tmem_sp": cfg.mma_softmax_stage * cfg.num_qkv_instances,
-        "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
+        "tmem_p": (
+            cfg.mma_softmax_stage * cfg.num_qkv_instances
+            if cfg.has_tmem_p_pipeline
+            else 0
+        ),
         "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
@@ -1616,9 +1753,33 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
     cfg.q_stage = cfg.num_qkv_instances
     cfg.kv_stage = 3
     cfg.has_tmem_p_pipeline = _should_use_tmem_p_pipeline(cfg)
-    cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
-    cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
-    cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
+    cfg.mma_order = (
+        MmaOrder.Qk0Pv0Qk1Pv1
+        if _should_use_qk_pv_interleaved_paired_schedule(cfg)
+        else MmaOrder.Pv0Qk0Pv1Qk1
+    )
+    # TMEM P offsets: the FmhaConfig class defaults (P0=160 inside S1, P1=32
+    # inside S0) implement the cross-alias layout required by the interleaved
+    # Qk0Pv0Qk1Pv1 schedule (OrderP01 mbarriers serialize the cross-alias
+    # writes). The legacy Pv0Qk0Pv1Qk1 schedule has no such barrier and its
+    # per-iter QK0→S0 write would clobber the peer's P1 slot before PV1 reads
+    # it (and symmetrically QK1→S1 clobbers P0 before PV0 reads it) under the
+    # cross-alias layout. Restore the same-instance aliasing for the legacy
+    # schedule so each peer's P lives inside its own S range, out of the
+    # OTHER peer's QK write path.
+    if cfg.mma_order == MmaOrder.Pv0Qk0Pv1Qk1 and not cfg.single_qkv_instance:
+        cfg.tmem_p0_offset = cfg.tmem_s0_offset + cfg.tmem_x_load_s
+        cfg.tmem_p1_offset = cfg.tmem_s1_offset + cfg.tmem_x_load_s
+    # Stage-scoped stats and the 2-stage SP/corr pipelines belong to the
+    # single-instance staged topology, where next-tile QK overlaps prior-tile
+    # PV inside one MMA instance. The interleaved paired schedule keeps
+    # mma_softmax_stage=1 per instance (one live S/P per peer) even though it
+    # also opts into has_tmem_p_pipeline, so it does not need the split-stage
+    # stats layout.
+    uses_split_sp_staging = cfg.single_qkv_instance and cfg.stage_kv_by_head_dim
+    cfg.stage_scoped_tmem_stats = uses_split_sp_staging
+    cfg.mma_softmax_stage = 2 if uses_split_sp_staging else 1
+    cfg.softmax_corr_stage = 2 if uses_split_sp_staging else 1
     # SMEM-backed D256 removes the independent StatsDone credit and always
     # writes the same physical O0 accumulator. Its MMA->Correction handoff must
     # therefore be single-stage so PV(i+1) cannot overwrite O0 before
