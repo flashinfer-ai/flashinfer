@@ -223,6 +223,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     auto const config = configs[i];
     auto const options = config.mOptions;
     auto const tileSize = getTileTokenDim(options);
+    if (tileSize == 256 && !options.mUseCustomizedMma3xNvFp4) continue;
     if (configMatchesDtypes(options, mOptions) && options.mDtypeC == mOptions.dtypeC &&
         options.mUseDeepSeekFp8 == mOptions.deepSeekFp8 &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
@@ -276,6 +277,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if (!isArchCompatible(sm_version, config.mSm)) continue;
       // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
       if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
+      if (options.mUseCustomizedMma3xNvFp4 || options.mMmaK == 96) {
+        // sm100a not compatible with 3xNvfp4
+        if (sm_version != 103) continue;
+      }
       if (options.mEpilogueTileM == mOptions.epilogueTileM) {
         // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
@@ -360,7 +365,7 @@ void TrtllmGenBatchedGemmRunner::run(
   checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
   bool const transposeMmaOutput = config.mOptions.mTransposeMmaOutput;
-  // printf("running config %d: %s\n", configIndex, config.mFunctionName);
+  printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -398,6 +403,8 @@ void TrtllmGenBatchedGemmRunner::run(
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
+
+  printf("multiProcessorCount: %d\n", multiProcessorCount);
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
