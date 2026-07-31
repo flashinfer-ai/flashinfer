@@ -185,10 +185,13 @@ class DenseGemmKernel:
         - Supported combinations:
             * NVF4: A/B: Float4E2M1FN, SF: Float8E4M3FN, sf_vec_size: 16
             * MXF4: A/B: Float4E2M1FN, SF: Float8E8M0FNU, sf_vec_size: 32
+            * MXFP8: A/B: Float8E4M3FN, SF: Float8E8M0FNU, sf_vec_size: 32,
+              mma_k 32, tile_k 128 (needs cutlass-dsl >= 4.6.0 for MmaMXF8Op)
         - Tile shape constraints:
             * tile_m must be divisible by 128
             * tile_n must be divisible by 128
             * tile_k must be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
+            * MXFP8 additionally allows the decode tiles (16|32, 64|128)
     """
 
     def __init__(
@@ -282,20 +285,26 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
-        # FP4-only target (NVF4 sf_vec_size=16 / MXF4 sf_vec_size=32). The MXFP8
-        # warp-MMA path was dropped: FlashInfer only drives this kernel for FP4,
-        # and cute.nvgpu.warp.MmaMXF8Op is absent in the public cutlass-dsl build.
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
+        if self.is_mxfp8:
+            # m16n8k32 .kind::mxf8 atom; only cutlass-dsl >= 4.6.0 exposes it,
+            # callers gate on hasattr(cute.nvgpu.warp, "MmaMXF8Op").
+            mma_op = cute.nvgpu.warp.MmaMXF8Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
         atom_shape = self.atom_shape
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.mma_tile_shape_mnk,
             self.sf_vec_size,
-            False,  # is_mxfp8: FP4-only
+            self.is_mxfp8,
         )
         self.tiled_mma = cute.make_tiled_mma(
             mma_op,
@@ -397,6 +406,7 @@ class DenseGemmKernel:
         self.b_dtype = b.element_type
         self.c_dtype = c.element_type
         self.sf_dtype = sfa.element_type
+        self.is_mxfp8 = self.a_dtype == cutlass.Float8E4M3FN
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.b_layout = utils.LayoutEnum.from_tensor(b)
@@ -569,9 +579,16 @@ class DenseGemmKernel:
         assert cute.rank(sfa_tensor) >= 2
 
         atom_shape_mnk = tiled_mma.shape_mnk
-        atom_sfa_layout = cute.make_layout(
-            shape=((2, 2, 8), 64), stride=((8, 0, 1), 16)
-        )
+        # Atom TV layouts per instruction K (cutlass-dsl 4.6.0
+        # blackwell_helpers.thrfrg_SFA): m16n8k64 FP4 vs m16n8k32 MXFP8.
+        if cute.size(atom_shape_mnk[2]) == 32:
+            atom_sfa_layout = cute.make_layout(
+                shape=((2, 2, 8), (32, 1)), stride=((8, 0, 1), (16, 0))
+            )
+        else:
+            atom_sfa_layout = cute.make_layout(
+                shape=((2, 2, 8), 64), stride=((8, 0, 1), 16)
+            )
         permutation_mnk = tiled_mma.permutation_mnk
         thr_layout_vmnk = tiled_mma.thr_layout_vmnk
 
@@ -604,7 +621,12 @@ class DenseGemmKernel:
         assert cute.rank(sfb_tensor) >= 2
 
         atom_shape_mnk = tiled_mma.shape_mnk
-        atom_sfb_layout = cute.make_layout(shape=((4, 8), 64), stride=((0, 1), 8))
+        if cute.size(atom_shape_mnk[2]) == 32:
+            atom_sfb_layout = cute.make_layout(
+                shape=((4, 8), (32, 1)), stride=((0, 1), (8, 0))
+            )
+        else:
+            atom_sfb_layout = cute.make_layout(shape=((4, 8), 64), stride=((0, 1), 8))
         permutation_mnk = tiled_mma.permutation_mnk
         thr_layout_vmnk = tiled_mma.thr_layout_vmnk
 
@@ -2375,20 +2397,28 @@ class DenseGemmKernel:
             return False
         if load_path not in _DENSE_LOAD_PATHS:
             return False
-        # FP4-only target (NVF4/MXF4). The MXFP8 warp-MMA path was dropped.
-        if ab_dtype != cutlass.Float4E2M1FN:
+        if ab_dtype not in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN):
+            return False
+        is_mxfp8 = ab_dtype == cutlass.Float8E4M3FN
+        if is_mxfp8 and not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
+            # cutlass-dsl < 4.6.0 does not expose the MXFP8 warp-MMA atom.
             return False
         if swap_ab:
             if l != 1:
                 return False
-            if sf_vec_size != 16:
+            if (ab_dtype, sf_vec_size) not in (
+                (cutlass.Float4E2M1FN, 16),
+                (cutlass.Float8E4M3FN, 32),
+            ):
                 return False
         if load_path == "cpasync" and (sf_vec_size != 16 or l != 1):
             return False
-        # FP4 experiments allow narrow N tiles. The scale-factor smem paths
-        # still allocate full 128-element SF blocks, but the live MMA tile may
-        # consume only 16/32 columns.
-        if (
+        # Narrow M/N tiles are allowed. The scale-factor smem paths still
+        # allocate full 128-element SF blocks, but the live MMA tile may
+        # consume only 16/32 rows or columns.
+        if is_mxfp8 and mma_tiler_mn in ((16, 64), (16, 128), (32, 64), (32, 128)):
+            pass
+        elif (
             mma_tiler_mn[0] % 64 != 0
             or mma_tiler_mn[1] % 16 != 0
             or mma_tiler_mn[1] > 128
@@ -2402,15 +2432,23 @@ class DenseGemmKernel:
             return False
         if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
             return False
+        # MXFP8 pairs only with UE8M0 scales at vector size 32.
+        if is_mxfp8 and sf_vec_size != 32:
+            return False
         # Public output is 16-bit; split-K internally uses FP32 partial output.
         if c_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
             return False
         # A must be K-major, B must be K-major
         if a_major != "k" or b_major != "k":
             return False
-        # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k: the
-        # mainloop predicates the partial tile, so ragged K works. Mirror gemm_base.py.
-        if k % 32 != 0:
+        if is_mxfp8:
+            # MXFP8 runs the full BK128 tile; no ragged-K predication ported.
+            if k % 128 != 0:
+                return False
+        elif k % 32 != 0:
+            # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not
+            # tile_k: the mainloop predicates the partial tile, so ragged K
+            # works. Mirror gemm_base.py.
             return False
         return True
 
@@ -2500,12 +2538,41 @@ def _select_default_mma_tiler_mn(
     n: int,
     sm_count: int,
     *,
+    is_mxfp8: bool = False,
     expected_m: Optional[int] = None,
     k: Optional[int] = None,
 ) -> Tuple[int, int]:
-    # FP4-only tile selector. The MXFP8 regimes (16x64/16x128/32x128 decode
-    # tiles, narrow-N 64x64) were dropped along with the MXFP8 warp-MMA path.
     coarse_tile = (128, 128)
+    if is_mxfp8 and n > 1536:
+        # DeepGEMM-style regime hint: when a caller declares expected_m, pick
+        # the per-regime optimal tile and key the compile on it, one kernel per
+        # (N,K,expected_m) reused for every live M in that regime. Regime
+        # boundaries follow the upstream b12x probe sweeps; upstream's
+        # exact-shape pins for its own serving shapes are dropped here, the
+        # autotuner covers exact shapes instead.
+        if expected_m is not None:
+            if expected_m == 1:
+                return (16, 64)
+            if expected_m <= 8:
+                return (16, 128)
+            if expected_m <= 128:
+                return (32, 128)
+            return (64, 128)
+        if m == 1:
+            return (16, 64)
+        if m <= 8:
+            return (16, 128)
+        # 64x128 is the best M-independent wide-N tile; 128x128 launches too
+        # few CTAs at small/medium M and loses at every M.
+        return (64, 128)
+    if is_mxfp8:
+        # Narrow-N MXFP8: (64,64) maximizes CTAs and is M-independent; declared
+        # prefill regimes take (64,128), exact M=1 the decode winner (16,64).
+        if expected_m == 1 or (expected_m is None and m == 1):
+            return (16, 64)
+        if expected_m is not None and expected_m > 128:
+            return (64, 128)
+        return (64, 64)
     plan_m = expected_m if expected_m is not None else m
     if plan_m == 1 and k is not None:
         # Flushed M=1 FP4 probe (benchmarks/probe_dense_fp4_tile_load_sweep.py)
@@ -2553,19 +2620,23 @@ def _select_default_dense_gemm_plan(
     k: int,
     sm_count: int,
     *,
+    is_mxfp8: bool = False,
     expected_m: Optional[int] = None,
 ) -> _DenseGemmPlan:
     tile = _select_default_mma_tiler_mn(
         m,
         n,
         sm_count,
+        is_mxfp8=is_mxfp8,
         expected_m=expected_m,
         k=k,
     )
+    # MXFP8 never auto-swaps: its narrow tiles are M-narrow (16/32 rows), not
+    # N-narrow like the FP4 (64,32) tile.
     return _DenseGemmPlan(
         mma_tiler_mn=tile,
         load_path="tma",
-        swap_ab=(tile[1] < 64),
+        swap_ab=(not is_mxfp8 and tile[1] < 64),
     )
 
 
