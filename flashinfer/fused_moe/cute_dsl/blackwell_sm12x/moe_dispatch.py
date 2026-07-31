@@ -92,8 +92,8 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (512, 175),
     (640, 188),
 )
-# MAC ladder for the prefill band. Entries at or below the static cutover
-# are unreachable at the default cutover of 640 pairs.
+# Workloads at or below the static cutover (640 routed pairs by default)
+# take the static kernel, so only the 1024 entry is normally reachable.
 _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
