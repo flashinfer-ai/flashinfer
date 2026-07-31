@@ -352,14 +352,14 @@ class TrtllmFp4RoutedRunner(MoERunner):
         if variant in self.supported_quant_variants:
             from ..utils import get_compute_capability
 
-            # Direct-runner guard: NVFP4/MXFP4 support SM100/SM103. W4A16
-            # remains SM100-only, matching the upstream SM103 xfail in #1754.
+            # Direct-runner guard: #4280 relanded the SM107 cubins removed by
+            # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
+            # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
-            supported = (
-                compute_capability in ((10, 0), (10, 3))
-                if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
-                else compute_capability == (10, 0)
-            )
+            if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+                supported = compute_capability in ((10, 0), (10, 3), (10, 7))
+            else:
+                supported = compute_capability in ((10, 0), (10, 7))
             if not supported:
                 raise NotImplementedError(
                     f"TRTLLM {variant.name} is unsupported on "
@@ -1329,11 +1329,10 @@ class TrtllmBf16RoutedRunner(MoERunner):
 
         major, minor = get_compute_capability(self.device)
         arch = major * 10 + minor
-        if arch not in (100, 103):
+        if arch not in (100, 103, 107):
             raise NotImplementedError(
-                f"{type(self).__name__} is enabled only on validated "
-                f"SM100/SM103 targets, got sm{arch}. SM107 enablement was "
-                "reverted by #4171; SM120/SM121 are unsupported."
+                f"{type(self).__name__} is enabled only on routed-MoE cubin "
+                f"targets SM100/SM103/SM107, got sm{arch}."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):

@@ -70,6 +70,7 @@ from flashinfer.fused_moe.api import (
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
+from flashinfer.utils import get_compute_capability
 
 # Reuse the canonical reference implementation + accuracy helpers from the
 # existing CuteDSL test — keeps tolerance bounds consistent across tests.
@@ -77,7 +78,6 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,
-    is_sm100_family,
 )
 # ---------------------------------------------------------------------------
 # Enum repr round-trip
@@ -671,8 +671,42 @@ class TestMoERunnerSupport:
         runner.config = cfg
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (12, 0))
-        with pytest.raises(NotImplementedError, match="SM100/SM103"):
+        with pytest.raises(NotImplementedError, match="SM100/SM103/SM107"):
             runner.check_support()
+
+    def test_bf16_sm107_supported_after_reland(self, monkeypatch):
+        import flashinfer.utils as utils
+
+        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=QuantVariant.BF16))
+        runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
+        runner.config = cfg
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
+        runner.check_support()
+
+    @pytest.mark.parametrize(
+        ("variant", "supported"),
+        [
+            (QuantVariant.NVFP4, True),
+            (QuantVariant.MXFP4, True),
+            (QuantVariant.W4A16, True),
+        ],
+    )
+    def test_fp4_sm107_variant_support_after_reland(
+        self, monkeypatch, variant, supported
+    ):
+        import flashinfer.utils as utils
+
+        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = cfg
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
+        if supported:
+            runner.check_support()
+        else:
+            with pytest.raises(NotImplementedError, match=rf"{variant.name}.*SM107"):
+                runner.check_support()
 
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
@@ -976,9 +1010,15 @@ class TestRunnerBoundaryValidation:
             _validate_logits_inputs(pack, 4, 16, "T")
 
 
+def _is_unified_nvfp4_arch() -> bool:
+    return torch.cuda.is_available() and get_compute_capability(
+        torch.device("cuda")
+    ) in ((10, 0), (10, 3), (10, 7))
+
+
 sm100_required = pytest.mark.skipif(
-    not is_sm100_family(),
-    reason="Unified NVFP4 MoE requires SM100 family (Blackwell SM100/SM103)",
+    not _is_unified_nvfp4_arch(),
+    reason="Unified NVFP4 MoE requires SM100, SM103, or SM107",
 )
 
 

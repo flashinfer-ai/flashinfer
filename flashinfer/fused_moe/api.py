@@ -230,14 +230,22 @@ class ExecutionConfig:
 # claiming them here makes the batched-GEMM runner abort at dispatch (#4107).
 _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 
-# The FP8 kernels are validated on the SM100 family only — the outer JIT module
-# compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
+# The pinned Rubin artifact contains SM107 FP8 cubins, but unified FP8 remains
+# gated to the validated SM100 family until SM107 runtime correctness is covered.
+# The outer JIT module compiles for major 12 as well, but those cubins fail at
+# runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
-    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes."""
+    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
+
+    ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
+    restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
+    NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
+    and remains disabled on SM103.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -441,9 +449,8 @@ class TrtllmMxInt4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
         # Same trtllm-gen routed batched-GEMM path as the FP4/BF16 backends, so it
-        # inherits the same manifest coverage.  Whether sm107a MxE2m1 cubins exist
-        # is not verifiable from this repo; this only narrows the previous
-        # ``arch >= 100``, leaving SM100/103/107 behaviour unchanged.
+        # inherits the same manifest coverage. The pinned Rubin manifest includes
+        # MxInt4 sm107a kernels, although unified MxInt4 still has no runner.
         return arch in _TRTLLM_ROUTED_ARCHS
 
     def __repr__(self) -> str:
