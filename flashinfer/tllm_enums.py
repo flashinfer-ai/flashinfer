@@ -228,6 +228,13 @@ def deduce_trtllm_gen_tensor_dtype(
             expected_shape = (*x.shape[:-1], logical_cols // vec_size)
             if tuple(scale.shape) == expected_shape:
                 return dtype
+            # Dtype inference owns the packed matrix layout, not the
+            # expert-major batch extent. Let the MoE launcher report a
+            # mismatched expert count with its more specific validation.
+            if scale.ndim == x.ndim and tuple(scale.shape[-2:]) == tuple(
+                expected_shape[-2:]
+            ):
+                return dtype
 
         matching_vec_sizes = []
         for vec_size in (16, 32):
