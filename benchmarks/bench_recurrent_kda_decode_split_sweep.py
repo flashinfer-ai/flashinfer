@@ -19,11 +19,10 @@ D128, H16, HV32 precomputed-gate T=1/2/4/5/6 contracts. T=1 uses the standard
 decode ABI; the other token counts use packed speculative decode. For every
 coordinate, it:
 
-1. computes a reference with the public ``recurrent_kda`` selector forced to
-   the existing CuTe fallback;
+1. computes a reference with the explicit public ``backend="cute-dsl"`` path;
 2. checks the output and the complete mutated state from every forced frozen
    specialization against that reference; and
-3. measures the fallback and frozen public-API calls with CUPTI, cold L2, and
+3. measures the CuTe-DSL and Cake public-API calls with CUPTI, cold L2, and
    one public call per timed sample.
 
 All selector and launch-tracking monkeypatches are restored in ``finally``
@@ -235,7 +234,7 @@ def _assert_route(
     if variant is None:
         if launched_variants:
             raise AssertionError(
-                f"forced CuTe fallback unexpectedly launched {launched_variants}"
+                f"explicit CuTe-DSL route unexpectedly launched {launched_variants}"
             )
         return
     expected = [variant] * public_calls
@@ -253,9 +252,11 @@ def _run_once(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     state = initial_state.clone()
     output = case["output_template"].clone()
+    backend = "cute-dsl" if variant is None else "cake"
     with _forced_variant(variant) as launched_variants:
         actual_output, final_state = recurrent_kda(
-            **_call_kwargs(case, state=state, output=output)
+            **_call_kwargs(case, state=state, output=output),
+            backend=backend,
         )
     torch.cuda.synchronize()
     _assert_route(variant, launched_variants, public_calls=1)
@@ -295,7 +296,7 @@ def _check_correctness(
     state_max_abs_error = float((actual_state - expected_state).abs().max().item())
     return {
         "passed": True,
-        "reference": "public_recurrent_kda_forced_cute_fallback",
+        "reference": "public_recurrent_kda_backend_cute_dsl",
         "output_allclose": True,
         "all_state_allclose": True,
         "atol": 1e-2,
@@ -317,13 +318,16 @@ def _benchmark_route(
     measured_output = case["output_template"].clone()
     warmup_state = initial_state.clone()
     warmup_output = case["output_template"].clone()
+    backend = "cute-dsl" if variant is None else "cake"
     measured_run = functools.partial(
         recurrent_kda,
         **_call_kwargs(case, state=measured_state, output=measured_output),
+        backend=backend,
     )
     warmup_run = functools.partial(
         recurrent_kda,
         **_call_kwargs(case, state=warmup_state, output=warmup_output),
+        backend=backend,
     )
 
     # Prime compilation/module loading and the T=1 metadata cache on disjoint
@@ -480,7 +484,7 @@ def main() -> None:
                 initial_state=initial_state,
                 variant=None,
             )
-            fallback_timing = _benchmark_route(
+            cute_dsl_timing = _benchmark_route(
                 case,
                 initial_state=initial_state,
                 variant=None,
@@ -505,7 +509,7 @@ def main() -> None:
                     rounds=args.rounds,
                     warmup=args.warmup,
                 )
-                speedup = fallback_timing["median_ms"] / frozen_timing["median_ms"]
+                speedup = cute_dsl_timing["median_ms"] / frozen_timing["median_ms"]
                 row = {
                     "record_type": "split_result",
                     "case": case["name"],
@@ -519,9 +523,9 @@ def main() -> None:
                     "value_split": value_split,
                     "variant": variant,
                     "correctness": correctness,
-                    "fallback": fallback_timing,
+                    "cute_dsl": cute_dsl_timing,
                     "frozen": frozen_timing,
-                    "speedup_vs_forced_cute_fallback": speedup,
+                    "speedup_vs_cute_dsl": speedup,
                     "data_seed": DATA_SEED + 1000 * num_tokens + num_sequences,
                     "source_sha": actual_source_sha,
                     "cupti_python_version": cupti_python_version,
@@ -548,11 +552,9 @@ def main() -> None:
                 "gate_mode": case["gate_mode"],
                 "best_value_split": best_row["value_split"],
                 "best_variant": best_row["variant"],
-                "fallback_median_ms": best_row["fallback"]["median_ms"],
+                "cute_dsl_median_ms": best_row["cute_dsl"]["median_ms"],
                 "best_frozen_median_ms": best_row["frozen"]["median_ms"],
-                "best_speedup_vs_forced_cute_fallback": best_row[
-                    "speedup_vs_forced_cute_fallback"
-                ],
+                "best_speedup_vs_cute_dsl": best_row["speedup_vs_cute_dsl"],
                 "source_sha": actual_source_sha,
             }
             best_by_t_n.append(best)

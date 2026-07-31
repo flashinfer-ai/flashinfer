@@ -36,7 +36,7 @@ which amortizes token preprocessing across its V-column tile.
 
 import functools
 import math
-from typing import Callable, Optional, cast
+from typing import Callable, Literal, Optional, cast
 
 import cutlass
 import cutlass.cute as cute
@@ -1155,19 +1155,25 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     return lhs_begin < rhs_end and rhs_begin < lhs_end
 
 
-def _select_flash_kda_decode_value_split(work: int, sm_count: int) -> int:
-    """Select one frozen D128 value-row split by its CTA-wave envelope."""
+def _select_flash_kda_decode_value_split(
+    num_tokens: int, work: int, sm_count: int
+) -> int:
+    """Reproduce Cake's D128 auto-dispatch across frozen value-row splits."""
 
-    three_wave_ctas = 3 * sm_count
-    if 8 * work <= three_wave_ctas:
-        return 8
-    if 2 * work <= sm_count:
-        return 2
-    if 4 * work <= three_wave_ctas:
-        return 4
-    if 2 * work <= three_wave_ctas:
-        return 2
-    return 1
+    if num_tokens in (1, 2, 4):
+        return 1
+    if num_tokens in (5, 6):
+        three_wave_ctas = 3 * sm_count
+        if 8 * work <= three_wave_ctas:
+            return 8
+        if 2 * work <= sm_count:
+            return 2
+        if 4 * work <= three_wave_ctas:
+            return 4
+        if 2 * work <= three_wave_ctas:
+            return 2
+        return 1
+    raise ValueError(f"unsupported precomputed token count: {num_tokens}")
 
 
 def _select_flash_kda_decode_variant(
@@ -1193,13 +1199,12 @@ def _select_flash_kda_decode_variant(
     initial_state_source: Optional[torch.Tensor],
     beta_is_logit: bool,
 ) -> Optional[FlashKDADecodeVariant]:
-    """Select a frozen B200 decode schedule, or preserve the CuTe fallback.
+    """Select a frozen B200 decode schedule for the strict Cake contract.
 
     The exported family covers D128/T=1..6. T=3 preserves its measured
     lower-bound contract; T=1/2/4/5/6 use precomputed gates. The T3 route is
-    limited to its measured N1/2/4/8/16, H=HV=16 coordinates. Any other
-    public-API feature, tensor layout, or aliasing pattern stays on the
-    existing CuTe DSL implementation.
+    limited to its measured N1/2/4/8/16, H=HV=16 coordinates. ``None`` denotes
+    an unsupported Cake contract and causes the explicit Cake backend to raise.
     """
 
     f32_max = torch.finfo(torch.float32).max
@@ -1355,7 +1360,7 @@ def _select_flash_kda_decode_variant(
 
     work = num_sequences * num_value_heads
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    value_split = _select_flash_kda_decode_value_split(work, sm_count)
+    value_split = _select_flash_kda_decode_value_split(num_tokens, work, sm_count)
     variant_prefixes = {
         1: "d128_t1_precomputed_split",
         2: "d128_t2_precomputed_split",
@@ -1431,6 +1436,8 @@ def run_recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    *,
+    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
@@ -1516,6 +1523,10 @@ def run_recurrent_kda(
         beta_is_logit (bool):
             If True, apply sigmoid to ``beta`` inside the recurrent kernel.
             Default False preserves the pre-sigmoided input contract.
+        backend (Literal["cute-dsl", "cake"]):
+            ``"cute-dsl"`` preserves the existing implementation.
+            ``"cake"`` strictly selects one exported Cake specialization and
+            raises rather than falling back when its contract is unsupported.
 
     Returns:
         Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1539,6 +1550,9 @@ def run_recurrent_kda(
           ``ssm_state_indices == -1``). This caller contract is not validated
           at runtime to preserve CUDA graph compatibility.
     """
+    if backend not in ("cute-dsl", "cake"):
+        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
+
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
     device = q.device
@@ -1797,8 +1811,8 @@ def run_recurrent_kda(
     # The frozen family uses one packed token axis and explicit sequence
     # metadata for every T. Standard decode exposes [B, 1, ...] and no
     # metadata, so normalize its exact dense contract with views plus cached
-    # identity tensors. Calls that would require a copy or indexed copy-back
-    # remain on the existing CuTe path.
+    # identity tensors. An explicit Cake request raises if normalization cannot
+    # satisfy the frozen ABI.
     frozen_q = q
     frozen_k = k
     frozen_v = v
@@ -1809,7 +1823,8 @@ def run_recurrent_kda(
     frozen_ssi = ssi
     frozen_num_accepted_tokens = num_accepted_tokens_i32
     if (
-        NUM_TOKENS == 1
+        backend == "cake"
+        and NUM_TOKENS == 1
         and cu_seqlens_i32 is None
         and initial_state_indices is None
         and copy_back_indices is None
@@ -1853,28 +1868,36 @@ def run_recurrent_kda(
             frozen_num_accepted_tokens = dc[nat_key]
 
     effective_scale = scale if scale is not None else 1.0 / math.sqrt(K)
-    flash_kda_decode_variant = _select_flash_kda_decode_variant(
-        q=frozen_q,
-        k=frozen_k,
-        v=frozen_v,
-        g=frozen_g,
-        beta=frozen_beta,
-        state=state,
-        out=frozen_out,
-        cu_seqlens=frozen_cu_seqlens,
-        ssm_state_indices=frozen_ssi,
-        num_accepted_tokens=frozen_num_accepted_tokens,
-        scale=effective_scale,
-        num_tokens=NUM_TOKENS,
-        num_spec_tokens=num_spec_tokens,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        initial_state_source=initial_state_source,
-        beta_is_logit=beta_is_logit,
+    flash_kda_decode_variant = (
+        _select_flash_kda_decode_variant(
+            q=frozen_q,
+            k=frozen_k,
+            v=frozen_v,
+            g=frozen_g,
+            beta=frozen_beta,
+            state=state,
+            out=frozen_out,
+            cu_seqlens=frozen_cu_seqlens,
+            ssm_state_indices=frozen_ssi,
+            num_accepted_tokens=frozen_num_accepted_tokens,
+            scale=effective_scale,
+            num_tokens=NUM_TOKENS,
+            num_spec_tokens=num_spec_tokens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state_source=initial_state_source,
+            beta_is_logit=beta_is_logit,
+        )
+        if backend == "cake"
+        else None
     )
+    if backend == "cake" and flash_kda_decode_variant is None:
+        raise ValueError(
+            "backend='cake' does not support this recurrent_kda decode contract"
+        )
     if flash_kda_decode_variant is not None:
         _run_flash_kda_decode(
             flash_kda_decode_variant,

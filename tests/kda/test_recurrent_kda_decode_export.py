@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from flashinfer.kda_decode import recurrent_kda
 
+kda_decode_module = importlib.import_module("flashinfer.kda_decode")
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
 
 _D = 128
@@ -120,18 +121,22 @@ def _fake_selector_kwargs():
     def tensor(shape, dtype=torch.bfloat16, **kwargs):
         return _fake_tensor(shape, dtype, next(address), **kwargs)
 
-    q = tensor((1, _T, 1, _D))
+    num_sequences = 8
+    num_heads = 16
+    num_value_heads = 32
+    total_tokens = num_sequences * _T
+    q = tensor((1, total_tokens, num_heads, _D))
     return {
         "q": q,
         "k": tensor(q.shape),
-        "v": tensor((1, _T, 1, _D)),
-        "g": tensor((1, _T, 1, _D)),
-        "beta": tensor((1, _T, 1)),
-        "state": tensor((_T, 1, _D, _D)),
-        "out": tensor((1, _T, 1, _D)),
-        "cu_seqlens": tensor((2,), torch.int32),
-        "ssm_state_indices": tensor((_T,), torch.int32),
-        "num_accepted_tokens": tensor((1,), torch.int32),
+        "v": tensor((1, total_tokens, num_value_heads, _D)),
+        "g": tensor((1, total_tokens, num_value_heads, _D)),
+        "beta": tensor((1, total_tokens, num_value_heads)),
+        "state": tensor((total_tokens + 6, num_value_heads, _D, _D)),
+        "out": tensor((1, total_tokens, num_value_heads, _D)),
+        "cu_seqlens": tensor((num_sequences + 1,), torch.int32),
+        "ssm_state_indices": tensor((total_tokens,), torch.int32),
+        "num_accepted_tokens": tensor((num_sequences,), torch.int32),
         "scale": _D**-0.5,
         "num_tokens": _T,
         "num_spec_tokens": _T - 1,
@@ -145,22 +150,24 @@ def _fake_selector_kwargs():
     }
 
 
-def _fake_precomputed_selector_kwargs(num_tokens, *, num_sequences=1):
+def _fake_precomputed_selector_kwargs(
+    num_tokens, *, num_sequences=8, num_heads=16, num_value_heads=32
+):
     address = iter(range(0x200000000000, 0x300000000000, 0x100000000))
 
     def tensor(shape, dtype=torch.bfloat16, **kwargs):
         return _fake_tensor(shape, dtype, next(address), **kwargs)
 
     total_tokens = num_sequences * num_tokens
-    q = tensor((1, total_tokens, 1, _D))
+    q = tensor((1, total_tokens, num_heads, _D))
     return {
         "q": q,
         "k": tensor(q.shape),
-        "v": tensor((1, total_tokens, 1, _D)),
-        "g": tensor((1, total_tokens, 1, _D)),
-        "beta": tensor((1, total_tokens, 1)),
-        "state": tensor((total_tokens, 1, _D, _D)),
-        "out": tensor((1, total_tokens, 1, _D)),
+        "v": tensor((1, total_tokens, num_value_heads, _D)),
+        "g": tensor((1, total_tokens, num_value_heads, _D)),
+        "beta": tensor((1, total_tokens, num_value_heads)),
+        "state": tensor((total_tokens + 6, num_value_heads, _D, _D)),
+        "out": tensor((1, total_tokens, num_value_heads, _D)),
         "cu_seqlens": tensor((num_sequences + 1,), torch.int32),
         "ssm_state_indices": tensor((total_tokens,), torch.int32),
         "num_accepted_tokens": tensor((num_sequences,), torch.int32),
@@ -220,21 +227,71 @@ def _patch_cpu_selector_environment(monkeypatch, *, sm_count=148, cc=(10, 0)):
 
 
 @pytest.mark.parametrize(
-    ("work", "sm_count", "expected_split"),
+    ("backend", "pass_explicitly"),
     [
-        (55, 148, 8),
-        (56, 148, 2),
-        (74, 148, 2),
-        (75, 148, 4),
-        (111, 148, 4),
-        (112, 148, 2),
-        (222, 148, 2),
-        (223, 148, 1),
+        ("cute-dsl", False),
+        ("cute-dsl", True),
+        ("cake", True),
     ],
 )
-def test_auto_value_split_boundaries(work, sm_count, expected_split):
+def test_public_backend_option_forwards_to_kernel_layer_cpu(
+    monkeypatch, backend, pass_explicitly
+):
+    calls = []
+    expected = (object(), object())
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(kda_decode_module, "_run_recurrent_kda", run)
+    tensors = [object() for _ in range(5)]
+    kwargs = {"backend": backend} if pass_explicitly else {}
+    assert recurrent_kda(*tensors, **kwargs) is expected
+    assert len(calls) == 1
+    assert calls[0]["backend"] == backend
+
+
+def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
+    monkeypatch.setattr(
+        kda_decode_module,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail(f"unexpected kernel call: {kwargs}"),
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.raises(ValueError, match="backend must be"):
+        recurrent_kda(*tensors, backend="unknown")
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "work", "sm_count", "expected_split"),
+    [
+        (1, 1, 148, 1),
+        (1, 4096, 148, 1),
+        (2, 1, 148, 1),
+        (2, 4096, 148, 1),
+        (4, 1, 148, 1),
+        (4, 4096, 148, 1),
+        (5, 55, 148, 8),
+        (5, 56, 148, 2),
+        (5, 74, 148, 2),
+        (5, 75, 148, 4),
+        (5, 111, 148, 4),
+        (5, 112, 148, 2),
+        (5, 222, 148, 2),
+        (5, 223, 148, 1),
+        (6, 55, 148, 8),
+        (6, 56, 148, 2),
+        (6, 75, 148, 4),
+        (6, 112, 148, 2),
+        (6, 223, 148, 1),
+    ],
+)
+def test_cake_value_split_boundaries(num_tokens, work, sm_count, expected_split):
     assert (
-        recurrent_module._select_flash_kda_decode_value_split(work, sm_count)
+        recurrent_module._select_flash_kda_decode_value_split(
+            num_tokens, work, sm_count
+        )
         == expected_split
     )
 
@@ -243,15 +300,29 @@ def test_exact_cpu_contract_selects_frozen_variant(monkeypatch):
     _patch_cpu_selector_environment(monkeypatch)
     assert recurrent_module._select_flash_kda_decode_variant(
         **_fake_selector_kwargs()
-    ) == (_VARIANT_PREFIX + "8")
+    ) == (_VARIANT_PREFIX + "1")
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 6])
-def test_precomputed_token_family_selects_frozen_variant(monkeypatch, num_tokens):
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_variant"),
+    [
+        (1, _PRECOMPUTED_VARIANT_PREFIXES[1] + "1"),
+        (2, _PRECOMPUTED_VARIANT_PREFIXES[2] + "1"),
+        (4, _PRECOMPUTED_VARIANT_PREFIXES[4] + "1"),
+        (5, _PRECOMPUTED_VARIANT_PREFIXES[5] + "1"),
+        (6, _PRECOMPUTED_VARIANT_PREFIXES[6] + "1"),
+    ],
+)
+def test_precomputed_token_family_reproduces_cake_dispatch(
+    monkeypatch, num_tokens, expected_variant
+):
     _patch_cpu_selector_environment(monkeypatch)
-    assert recurrent_module._select_flash_kda_decode_variant(
-        **_fake_precomputed_selector_kwargs(num_tokens)
-    ) == (_PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + "8")
+    assert (
+        recurrent_module._select_flash_kda_decode_variant(
+            **_fake_precomputed_selector_kwargs(num_tokens)
+        )
+        == expected_variant
+    )
 
 
 @pytest.mark.parametrize("num_sequences", _T3_SEQUENCE_COUNTS)
@@ -387,7 +458,9 @@ def test_t3_lower_bound_route_rejects_gate_tensor_aliases(monkeypatch, mutation)
         ("scale", float("inf")),
     ],
 )
-def test_public_contract_mismatches_strictly_fall_back_cpu(monkeypatch, field, value):
+def test_public_contract_mismatches_are_rejected_by_cake_selector_cpu(
+    monkeypatch, field, value
+):
     _patch_cpu_selector_environment(monkeypatch)
     kwargs = _fake_selector_kwargs()
     kwargs[field] = value
@@ -471,7 +544,7 @@ def _replace_fake(kwargs, name, **changes):
         ),
     ],
 )
-def test_tensor_layout_and_alias_mismatches_strictly_fall_back_cpu(
+def test_tensor_layout_and_alias_mismatches_are_rejected_by_cake_selector_cpu(
     monkeypatch, mutation
 ):
     _patch_cpu_selector_environment(monkeypatch)
@@ -479,7 +552,7 @@ def test_tensor_layout_and_alias_mismatches_strictly_fall_back_cpu(
     assert recurrent_module._select_flash_kda_decode_variant(**kwargs) is None
 
 
-def test_non_sm100a_strictly_falls_back_cpu(monkeypatch):
+def test_non_sm100a_is_rejected_by_cake_selector_cpu(monkeypatch):
     _patch_cpu_selector_environment(monkeypatch, cc=(10, 3))
     assert (
         recurrent_module._select_flash_kda_decode_variant(**_fake_selector_kwargs())
@@ -903,33 +976,13 @@ def _clone_state_with_layout(state):
     return clone
 
 
-def _representative_num_sequences(sm_count, num_value_heads, split):
-    if split == 8:
-        target_work = 1
-    elif split == 4:
-        target_work = sm_count // 2 + 1
-    elif split == 1:
-        target_work = 3 * sm_count // 2 + 1
-    elif split == 2:
-        target_work = 3 * sm_count // 8 + 1
-    else:
-        raise ValueError(f"unexpected split: {split}")
-    return max(1, math.ceil(target_work / num_value_heads))
-
-
 @pytest.mark.parametrize("split", [8, 2, 4, 1])
-def test_public_recurrent_kda_exact_routes_match_upstream_cute(
+def test_public_recurrent_kda_forced_t5_splits_match_upstream_cute(
     b200, monkeypatch, split
 ):
-    sm_count = torch.cuda.get_device_properties(b200).multi_processor_count
     num_value_heads = 32
-    num_sequences = _representative_num_sequences(sm_count, num_value_heads, split)
-    assert (
-        recurrent_module._select_flash_kda_decode_value_split(
-            num_sequences * num_value_heads, sm_count
-        )
-        == split
-    )
+    num_sequences = 8
+    variant = _VARIANT_PREFIX + str(split)
     case = _make_case(
         b200,
         num_sequences=num_sequences,
@@ -943,15 +996,10 @@ def test_public_recurrent_kda_exact_routes_match_upstream_cute(
     baseline_output = torch.empty_like(case["output"])
     actual_output_buffer = torch.empty_like(case["output"])
 
-    with monkeypatch.context() as baseline_patch:
-        baseline_patch.setattr(
-            recurrent_module,
-            "_select_flash_kda_decode_variant",
-            lambda **kwargs: None,
-        )
-        expected_output, expected_state = recurrent_kda(
-            **_call_kwargs(case, state=baseline_state, output=baseline_output)
-        )
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(case, state=baseline_state, output=baseline_output),
+        backend="cute-dsl",
+    )
 
     frozen_calls = []
     run_frozen = recurrent_module._run_flash_kda_decode
@@ -960,12 +1008,18 @@ def test_public_recurrent_kda_exact_routes_match_upstream_cute(
         frozen_calls.append(variant)
         return run_frozen(variant, **kwargs)
 
+    monkeypatch.setattr(
+        recurrent_module,
+        "_select_flash_kda_decode_variant",
+        lambda **kwargs: variant,
+    )
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
     actual_output, actual_state_result = recurrent_kda(
-        **_call_kwargs(case, state=actual_state, output=actual_output_buffer)
+        **_call_kwargs(case, state=actual_state, output=actual_output_buffer),
+        backend="cake",
     )
 
-    assert frozen_calls == [_VARIANT_PREFIX + str(split)]
+    assert frozen_calls == [variant]
     assert actual_output.data_ptr() == actual_output_buffer.data_ptr()
     assert actual_state_result is actual_state
     torch.testing.assert_close(
@@ -976,15 +1030,24 @@ def test_public_recurrent_kda_exact_routes_match_upstream_cute(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 6])
-def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 6])
+def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
     b200, monkeypatch, num_tokens
 ):
-    num_sequences = 5
+    num_sequences = 8
     accepted_tokens = (
         None
         if num_tokens == 1
-        else [0, 1, num_tokens, num_tokens + 7, max(1, num_tokens - 1)]
+        else [
+            0,
+            1,
+            num_tokens,
+            num_tokens + 7,
+            max(1, num_tokens - 1),
+            0,
+            1,
+            num_tokens,
+        ]
     )
     case = _make_case(
         b200,
@@ -1020,17 +1083,10 @@ def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
     baseline_output = torch.empty_like(case["output"])
     actual_output_buffer = torch.empty_like(case["output"])
 
-    # This is the same public API and input contract, with only the exported
-    # selector disabled, so it is the strongest existing-backend reference.
-    with monkeypatch.context() as baseline_patch:
-        baseline_patch.setattr(
-            recurrent_module,
-            "_select_flash_kda_decode_variant",
-            lambda **kwargs: None,
-        )
-        expected_output, expected_state = recurrent_kda(
-            **_call_kwargs(case, state=baseline_state, output=baseline_output)
-        )
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(case, state=baseline_state, output=baseline_output),
+        backend="cute-dsl",
+    )
 
     frozen_calls = []
     frozen_call_kwargs = []
@@ -1043,17 +1099,12 @@ def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
 
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
     actual_output, actual_state_result = recurrent_kda(
-        **_call_kwargs(case, state=actual_state, output=actual_output_buffer)
+        **_call_kwargs(case, state=actual_state, output=actual_output_buffer),
+        backend="cake",
     )
 
-    if num_tokens in _PRECOMPUTED_VARIANT_PREFIXES:
-        split = recurrent_module._select_flash_kda_decode_value_split(
-            num_sequences * 32,
-            torch.cuda.get_device_properties(b200).multi_processor_count,
-        )
-        assert frozen_calls == [_PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + str(split)]
-    else:
-        assert frozen_calls == []
+    expected_variant = _PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + "1"
+    assert frozen_calls == [expected_variant]
 
     if num_tokens == 1:
         frozen_kwargs = frozen_call_kwargs[0]
@@ -1112,8 +1163,45 @@ def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
         )
 
 
+def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_dsl(
+    b200, monkeypatch
+):
+    case = _make_case(
+        b200,
+        num_sequences=4,
+        num_heads=16,
+        num_value_heads=32,
+        num_tokens=3,
+        seed=2260,
+    )
+
+    def unexpected_cake_launch(*args, **kwargs):
+        pytest.fail(f"unexpected Cake launch: args={args}, kwargs={kwargs}")
+
+    def unexpected_cute_compile(*args, **kwargs):
+        pytest.fail(f"unexpected CuTe compile: args={args}, kwargs={kwargs}")
+
+    monkeypatch.setattr(
+        recurrent_module,
+        "_run_flash_kda_decode",
+        unexpected_cake_launch,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_get_grouped_compiled",
+        unexpected_cute_compile,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_get_compiled_kernel",
+        unexpected_cute_compile,
+    )
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(**_call_kwargs(case), backend="cake")
+
+
 @pytest.mark.parametrize("num_sequences", _T3_SEQUENCE_COUNTS)
-def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_forced_fallback(
+def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_cute_dsl(
     b200, monkeypatch, num_sequences
 ):
     frozen_calls = []
@@ -1142,19 +1230,14 @@ def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_forced_fallba
         baseline_output = torch.empty_like(case["output"])
         actual_output_buffer = torch.empty_like(case["output"])
 
-        with monkeypatch.context() as baseline_patch:
-            baseline_patch.setattr(
-                recurrent_module,
-                "_select_flash_kda_decode_variant",
-                lambda **kwargs: None,
-            )
-            expected_output, expected_state = recurrent_kda(
-                **_call_kwargs(
-                    case,
-                    state=baseline_state,
-                    output=baseline_output,
-                )
-            )
+        expected_output, expected_state = recurrent_kda(
+            **_call_kwargs(
+                case,
+                state=baseline_state,
+                output=baseline_output,
+            ),
+            backend="cute-dsl",
+        )
 
         frozen_calls.clear()
         actual_output, actual_state_result = recurrent_kda(
@@ -1162,7 +1245,8 @@ def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_forced_fallba
                 case,
                 state=actual_state,
                 output=actual_output_buffer,
-            )
+            ),
+            backend="cake",
         )
 
         assert frozen_calls == [_T3_VARIANT]
@@ -1222,7 +1306,7 @@ def test_public_recurrent_kda_t3_lower_bound_measured_routes_match_forced_fallba
 
 
 def test_public_route_supports_padded_slots_nat_and_outer_strides(b200, monkeypatch):
-    accepted_tokens = [0, 1, _T, _T + 7]
+    accepted_tokens = [0, 1, _T, _T + 7, _T - 1]
     case = _make_case(
         b200,
         num_sequences=len(accepted_tokens),
@@ -1245,15 +1329,10 @@ def test_public_route_supports_padded_slots_nat_and_outer_strides(b200, monkeypa
     actual_state = _clone_state_with_layout(initial)
     baseline_output = torch.empty_like(case["output"])
     actual_output_buffer = torch.empty_like(case["output"])
-    with monkeypatch.context() as baseline_patch:
-        baseline_patch.setattr(
-            recurrent_module,
-            "_select_flash_kda_decode_variant",
-            lambda **kwargs: None,
-        )
-        expected_output, expected_state = recurrent_kda(
-            **_call_kwargs(case, state=baseline_state, output=baseline_output)
-        )
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(case, state=baseline_state, output=baseline_output),
+        backend="cute-dsl",
+    )
 
     frozen_calls = []
     run_frozen = recurrent_module._run_flash_kda_decode
@@ -1264,10 +1343,12 @@ def test_public_route_supports_padded_slots_nat_and_outer_strides(b200, monkeypa
 
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
     actual_output, actual_state_result = recurrent_kda(
-        **_call_kwargs(case, state=actual_state, output=actual_output_buffer)
+        **_call_kwargs(case, state=actual_state, output=actual_output_buffer),
+        backend="cake",
     )
 
     expected_split = recurrent_module._select_flash_kda_decode_value_split(
+        _T,
         len(accepted_tokens) * 32,
         torch.cuda.get_device_properties(b200).multi_processor_count,
     )
@@ -1292,7 +1373,7 @@ def test_public_route_supports_padded_slots_nat_and_outer_strides(b200, monkeypa
 def test_frozen_decode_cuda_graph_on_non_default_stream(b200, monkeypatch):
     case = _make_case(
         b200,
-        num_sequences=1,
+        num_sequences=5,
         num_heads=16,
         num_value_heads=32,
         seed=2060,
@@ -1300,15 +1381,10 @@ def test_frozen_decode_cuda_graph_on_non_default_stream(b200, monkeypatch):
     initial = case["initial_state"].clone()
     baseline_state = initial.clone()
     baseline_output = torch.empty_like(case["output"])
-    with monkeypatch.context() as baseline_patch:
-        baseline_patch.setattr(
-            recurrent_module,
-            "_select_flash_kda_decode_variant",
-            lambda **kwargs: None,
-        )
-        expected_output, expected_state = recurrent_kda(
-            **_call_kwargs(case, state=baseline_state, output=baseline_output)
-        )
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(case, state=baseline_state, output=baseline_output),
+        backend="cute-dsl",
+    )
 
     frozen_calls = []
     run_frozen = recurrent_module._run_flash_kda_decode
@@ -1329,16 +1405,16 @@ def test_frozen_decode_cuda_graph_on_non_default_stream(b200, monkeypatch):
     capture_stream = torch.cuda.Stream(device=b200)
     capture_stream.wait_stream(torch.cuda.current_stream(b200))
     with torch.cuda.stream(capture_stream):
-        recurrent_kda(**graph_kwargs)
+        recurrent_kda(**graph_kwargs, backend="cake")
         graph_state.copy_(initial)
         graph_output.zero_()
     capture_stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        captured_output, captured_state = recurrent_kda(**graph_kwargs)
+        captured_output, captured_state = recurrent_kda(**graph_kwargs, backend="cake")
 
-    expected_variant = _VARIANT_PREFIX + "8"
+    expected_variant = _VARIANT_PREFIX + "2"
     assert [variant for variant, _stream in frozen_calls] == [
         expected_variant,
         expected_variant,

@@ -201,6 +201,7 @@ def test_recurrent_kda_fi_trace():
         initial_state_source=source,
         initial_state_indices=source_indices,
         beta_is_logit=True,
+        backend="cake",
     )
 
     _check_defn(defn, "kda", "flashinfer.kda_decode.recurrent_kda")

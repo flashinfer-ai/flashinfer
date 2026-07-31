@@ -41,16 +41,15 @@ from flashinfer.kda_decode import recurrent_kda
 from flashinfer.testing import bench_gpu_time
 
 
-UPSTREAM_MAIN_SHA = "a02d94de5796650ead1c6be27b834c3a063bf45d"
+UPSTREAM_MAIN_SHA = "39f2ce47663243e25b311a7e64681d742905f974"
 EVOLUTION_PEER_SHA = "cea7f46ffc190cabf82c95a39cd0d2aa6c888c17"
 DATA_SEED = 42
 PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 T3_LOWER_BOUND_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
 
-# Keep all route names in one place. These benchmark coordinates select split1;
-# a benchmark run can still inject an alternate tuned route with repeatable
-# ``--expected-variant TOKEN_COUNT=VARIANT`` flags without weakening the
-# public-API frozen-route assertion.
+# Keep Cake's source-side auto-dispatch routes in one place. The benchmark
+# coordinates use split1 for every precomputed token count; T3 has one exact
+# lower-bound split4 specialization.
 EXPECTED_VARIANTS_BY_T = {
     1: "d128_t1_precomputed_split1",
     2: "d128_t2_precomputed_split1",
@@ -275,7 +274,7 @@ def _assert_frozen_route(
 
     recurrent_module._run_flash_kda_decode = track_frozen_route
     try:
-        recurrent_kda(**kwargs)
+        recurrent_kda(**kwargs, backend="cake")
     finally:
         recurrent_module._run_flash_kda_decode = run_frozen
         kwargs["initial_state"].copy_(initial_state)
@@ -386,9 +385,12 @@ def main() -> None:
         selected_variant = None
         if args.mode == "frozen":
             selected_variant = _assert_frozen_route(spec, kwargs, expected_variants)
+        call_kwargs = dict(kwargs)
+        if args.mode == "frozen":
+            call_kwargs["backend"] = "cake"
         initial_state = kwargs["initial_state"].clone()
-        measured_run = functools.partial(recurrent_kda, **kwargs)
-        warmup_kwargs = dict(kwargs)
+        measured_run = functools.partial(recurrent_kda, **call_kwargs)
+        warmup_kwargs = dict(call_kwargs)
         warmup_kwargs["initial_state"] = initial_state.clone()
         warmup_kwargs["output"] = torch.empty_like(kwargs["output"])
         warmup_run = functools.partial(recurrent_kda, **warmup_kwargs)
@@ -454,6 +456,7 @@ def main() -> None:
             "cases_for_t": cases_per_t[spec["T"]],
             "expected_variant": expected_variants[spec["T"]],
             "selected_variant": selected_variant,
+            "selected_backend": ("cake" if args.mode == "frozen" else "source-default"),
             "median_ms": median_ms,
             "samples_ms": samples_ms,
             "timing_backend": "CUPTI",
