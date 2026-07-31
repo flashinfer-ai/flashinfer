@@ -29,6 +29,7 @@ import torch
 
 import flashinfer.fused_moe as fused_moe_api
 from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotuner as autotuner_module
 from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
 from flashinfer.fused_moe import (
     ActivationType,
@@ -57,7 +58,7 @@ from flashinfer.fused_moe.dist_aware.da_utils import (
     generate_da_distribution_assignments,
     get_da_distribution_specs,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, read_env_bool
 from tests.moe import test_trtllm_gen_fused_moe as gen_moe_tests
 from tests.moe import trtllm_gen_fused_moe_utils as gen_moe_utils
 from tests.moe.test_trtllm_gen_fused_moe import (
@@ -1250,6 +1251,36 @@ def test_effective_expert_streams_are_scoped_per_cuda_device():
     streams = moe_utils._EFF_EXPERTS_STREAMS
     assert set(streams) >= {0, 1}
     assert int(streams[0].cuda_stream) != int(streams[1].cuda_stream)
+
+
+def test_routing_metadata_ffi_selects_the_tensor_device():
+    """Routing allocation works when the ambient CUDA device differs."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+
+    target = torch.device("cuda:1")
+    topk_ids = torch.zeros((32, 1), dtype=torch.int32, device=target)
+    topk_weights = torch.ones((32, 1), dtype=torch.bfloat16, device=target)
+    with torch.cuda.device(0):
+        metadata = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+            topk_ids,
+            None,
+            8,
+            1,
+            None,
+            None,
+            0,
+            8,
+            None,
+            int(RoutingMethodType.TopK),
+            [16, 32],
+            int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+            topk_weights,
+        )
+        assert torch.cuda.current_device() == 0
+
+    assert metadata
+    assert all(tensor.device == target for bundle in metadata for tensor in bundle)
 
 
 def test_effective_expert_stream_cache_keys_concrete_devices(
@@ -3579,6 +3610,77 @@ def test_guarded_noda_bundle_restores_640_da_bucket_policy():
         da_state.BUNDLE_TACTIC_CONTEXTS.update(old_bundle_contexts)
 
 
+def test_bundle_validation_is_transactional_across_buckets():
+    """A malformed later bucket cannot publish an earlier valid selector."""
+    config = da_profile.DAConfig(baseline_guard=True)
+    context = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+    )
+    sentinel_key = da_state.cache_key(context, 32)
+    sentinel_tactics = {16: (16, 7)}
+    old_bundle_has_tactics = da_profile._bundle_has_tactics
+    old_bundle_contexts = set(da_state.BUNDLE_TACTIC_CONTEXTS)
+    da_state.PER_TILE_TACTICS[sentinel_key] = sentinel_tactics
+    bundle = {
+        "meta": {
+            "schema_version": context.schema_version,
+            "device_type": context.device_type,
+            "device_index": context.device_index,
+            "profile_signature": list(config.profile_signature),
+            "baseline_guard_signature": da_profile.baseline_guard_signature(config),
+            "default_profile_contract": da_profile.DEFAULT_PROFILE_CONTRACT,
+            "num_local": context.num_local_experts,
+            "num_global_experts": context.num_experts,
+            "local_offset": context.local_expert_offset,
+            "top_k": context.top_k,
+        },
+        "plans": {
+            "64": {"policy": "da_singleton"},
+            # This later guarded plan is structurally invalid because it has
+            # no baseline tactic.
+            "128": {"final_policy": "noda_baseline_guard"},
+        },
+        "exemplars": {
+            "64": [
+                {
+                    "norm_vec": [1.0] + [0.0] * 7,
+                    "tile_shape": 16,
+                    "kernel_id": 7,
+                }
+            ]
+        },
+        "eager_tactics": {"64": {"tactic": (16, 7), "time_ms": 0.1}},
+    }
+    try:
+        assert (
+            da_profile.load_knn_v2_bundle(
+                bundle,
+                "unused.pkl",
+                config=config,
+                backend=SimpleNamespace(
+                    get_ffi_moe_op=lambda: pytest.fail(
+                        "an invalid transaction reached selector publication"
+                    )
+                ),
+                da_context=context,
+            )
+            == 0
+        )
+        assert da_state.PER_TILE_TACTICS[sentinel_key] is sentinel_tactics
+        assert da_state.cache_key(context, 64) not in da_state.PER_BODY_TACTICS
+        assert da_state.cache_key(context, 128) not in da_state.BASELINE_GUARD_DECISIONS
+        assert da_profile._bundle_has_tactics == old_bundle_has_tactics
+        assert old_bundle_contexts == da_state.BUNDLE_TACTIC_CONTEXTS
+    finally:
+        da_state.PER_TILE_TACTICS.pop(sentinel_key, None)
+        da_state.BUNDLE_EAGER_TACTICS.pop(da_state.cache_key(context, 64), None)
+        da_profile._bundle_has_tactics = old_bundle_has_tactics
+        da_state.BUNDLE_TACTIC_CONTEXTS.clear()
+        da_state.BUNDLE_TACTIC_CONTEXTS.update(old_bundle_contexts)
+
+
 @dataclass(frozen=True)
 class _BaselineLookupContext:
     hidden_size: int = 7168
@@ -3655,6 +3757,87 @@ def test_da_baseline_lookup_restores_bundle_default_profile_tactic():
         da_context=context,
     ) == ((32, 9), 0.75)
     da_state.BUNDLE_EAGER_TACTICS.clear()
+
+
+def test_da_baseline_lookup_retries_after_profiles_are_published():
+    """A pre-autotune miss must not poison the later baseline lookup."""
+    op = "flashinfer::trtllm_fp4_block_scale_moe"
+    context = _BaselineLookupContext()
+    shapes = ((64, 7168), (64, 64), (64, 8))
+    key = (op, "MoERunner", 7, shapes, ())
+    tuner = _baseline_lookup_tuner([])
+    da_state.STATIC_FALLBACK_TACTICS.clear()
+    assert (
+        da_profile.best_static_tactic_from_profiles(
+            tuner, op, "MoERunner", 7, 64, da_context=context
+        )
+        is None
+    )
+    assert not da_state.STATIC_FALLBACK_TACTICS
+
+    tuner.profiling_cache[key] = ((32, 9), None)
+    tuner.profiling_time_cache[key] = 0.75
+    assert da_profile.best_static_tactic_from_profiles(
+        tuner, op, "MoERunner", 7, 64, da_context=context
+    ) == ((32, 9), 0.75)
+
+
+def test_da_capture_resources_require_explicit_lifecycle_release():
+    """Context-scoped release preserves unrelated graph storage generations."""
+    first = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+        device="cuda:0",
+    )
+    second = _da_test_context(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        moe_core.DtypeTrtllmGen.E2m1,
+        moe_core.DtypeTrtllmGen.E2m1,
+        device="cuda:0",
+        hidden_size=2048,
+    )
+    first_key = (first, 64, 2, (16,), 2)
+    second_key = (second, 64, 2, (16,), 2)
+    da_capture.CAPTURE_RESOURCES[first_key] = object()
+    da_capture.CAPTURE_RESOURCES[second_key] = object()
+    da_state.CAPTURE_KEEPALIVE[first] = [torch.empty(1)]
+    da_state.CAPTURE_KEEPALIVE[second] = [torch.empty(1)]
+    try:
+        da_capture.release_capture_resources(first)
+        assert first_key not in da_capture.CAPTURE_RESOURCES
+        assert first not in da_state.CAPTURE_KEEPALIVE
+        assert second_key in da_capture.CAPTURE_RESOURCES
+        assert second in da_state.CAPTURE_KEEPALIVE
+
+        da_capture.release_capture_resources()
+        assert not da_capture.CAPTURE_RESOURCES
+        assert not da_state.CAPTURE_KEEPALIVE
+    finally:
+        da_capture.CAPTURE_RESOURCES.clear()
+        da_state.CAPTURE_KEEPALIVE.clear()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1", True),
+        ("TRUE", True),
+        (" yes ", True),
+        ("0", False),
+        ("False", False),
+        ("off", False),
+        (" none ", False),
+    ],
+)
+def test_da_and_autotuner_share_boolean_environment_semantics(
+    monkeypatch, value, expected
+):
+    """The DA dispatcher and value-aware autotuner cannot disagree."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", value)
+    assert read_env_bool("FLASHINFER_DIST_AWARE_AUTOTUNE") is expected
+    assert da_profile.DAConfig().enabled is expected
+    assert autotuner_module._is_value_aware_autotune() is expected
 
 
 def _capture_and_replay_da_graph(
@@ -3975,11 +4158,13 @@ def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
     return reference, output, execution[0]
 
 
-def _call_recorded_public_moe(execution):
+def _call_recorded_public_moe(execution, activation_overrides=None):
     """Call the public wrapper recorded by run_moe_test without retuning it."""
     moe_impl, static_data, hidden_states, hidden_scale, kwargs = execution
     replay_kwargs = dict(kwargs)
     replay_kwargs["enable_autotune"] = False
+    if activation_overrides:
+        replay_kwargs.update(activation_overrides)
     if isinstance(moe_impl, FP8BlockScaleMoe):
         # FP8BlockScaleMoe.call_moe contains an eager-only ``isnan().any()``
         # test assertion. Keep that assertion in run_moe_test, then exercise
@@ -4015,6 +4200,9 @@ def _call_recorded_public_moe(execution):
                 fp8_quantization_type=quantization_type,
                 activation_type=replay_kwargs["activation_type"],
                 norm_topk_prob=replay_kwargs.get("norm_topk_prob", True),
+                gemm1_alpha=replay_kwargs.get("gemm1_alpha"),
+                gemm1_beta=replay_kwargs.get("gemm1_beta"),
+                gemm1_clamp_limit=replay_kwargs.get("gemm1_clamp_limit"),
             )
         return output[0].to(torch.float) if isinstance(output, list) else output.float()
     return moe_impl.call_moe(
@@ -4129,6 +4317,79 @@ def test_factorized_da_public_wrapper_graph_matches_independent_reference(
         torch.cuda.synchronize()
         _assert_precision_reference(precision, reference, graph_output)
         _assert_published_runtime_plan(precision)
+    finally:
+        if graph is not None:
+            graph.reset()
+            del graph
+        _clear_da_test_state(tuner)
+
+
+@pytest.mark.parametrize(
+    "precision",
+    [
+        precision
+        for precision in DA_PRECISION_CONTRACTS
+        if precision.name in {"bf16", "mxfp8"}
+    ],
+    ids=lambda item: item.name,
+)
+def test_optional_gemm1_activation_parameters_bypass_da_without_changing_results(
+    monkeypatch, tmp_path, precision
+):
+    """Unsupported activation tensors use the public monolithic graph path."""
+    child_precision = os.getenv("_FLASHINFER_DA_OPTIONAL_ACTIVATION_CHILD")
+    if child_precision != precision.name:
+        # Conditional graph tests intentionally retain process-global CUDA
+        # state. Run this independent public-wrapper contract in a fresh CUDA
+        # context so a prior graph cannot turn its first allocation into a
+        # delayed illegal-access report.
+        env = os.environ.copy()
+        env["_FLASHINFER_DA_OPTIONAL_ACTIVATION_CHILD"] = precision.name
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"{__file__}::{test_optional_gemm1_activation_parameters_bypass_da_without_changing_results.__name__}[{precision.name}]",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
+
+    tuner = _reset_tuner_and_da(monkeypatch)
+    graph = None
+    try:
+        reference, _, execution = _run_factorized_public_reference_case(
+            monkeypatch, tmp_path, precision
+        )
+        kwargs = execution[-1]
+        device = kwargs["expert_logits"].device
+        num_experts = kwargs["num_experts"]
+        overrides = {
+            "gemm1_alpha": torch.ones(num_experts, dtype=torch.float32, device=device),
+            "gemm1_beta": torch.zeros(num_experts, dtype=torch.float32, device=device),
+            "gemm1_clamp_limit": torch.full(
+                (num_experts,), 1.0e9, dtype=torch.float32, device=device
+            ),
+        }
+
+        prepared = _call_recorded_public_moe(execution, overrides)
+        torch.cuda.synchronize()
+        _assert_precision_reference(precision, reference, prepared)
+
+        fused_moe_api.reset_da_fast_path_stats()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = _call_recorded_public_moe(execution, overrides)
+        assert fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"] == 0
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_precision_reference(precision, reference, graph_output)
     finally:
         if graph is not None:
             graph.reset()

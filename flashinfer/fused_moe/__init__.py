@@ -75,6 +75,7 @@ from .core import (
 
 from .dist_aware.da_capture import (
     fast_path_stats as get_da_fast_path_stats,
+    release_capture_resources as release_da_capture_resources,
     reset_fast_path_stats as reset_da_fast_path_stats,
 )
 
@@ -178,6 +179,7 @@ __all__ = [
     "gen_cutlass_fused_moe_sm90_module",
     "gen_trtllm_gen_fused_moe_sm100_module",
     "get_da_fast_path_stats",
+    "release_da_capture_resources",
     "reset_da_fast_path_stats",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",

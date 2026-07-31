@@ -534,10 +534,6 @@ def load_knn_v2_bundle(
     exemplars_by_bucket = bundle.get("exemplars", {})
     plans_by_bucket = bundle.get("plans", {}) or {}
     global _bundle_has_tactics
-    tactic_table = bundle.get("tactic_table", {}) or {}
-    if tactic_table:
-        _bundle_has_tactics = True
-        da_state.BUNDLE_TACTIC_CONTEXTS.add(da_context)
 
     offsets = list(range(0, max(num_global, num_local), max(1, num_local)))
     if local_offset not in offsets:
@@ -549,10 +545,13 @@ def load_knn_v2_bundle(
         da_state.context_with_offset(da_context, int(offset))
         for offset in sorted(set(offsets))
     }
-    for eager_key in tuple(da_state.BUNDLE_EAGER_TACTICS):
-        if eager_key[1] in offset_contexts:
-            da_state.BUNDLE_EAGER_TACTICS.pop(eager_key, None)
 
+    # Build and validate the complete transaction before publishing any Python
+    # tactic map or C++ selector.  A malformed later bucket must not leave
+    # earlier buckets from a rejected bundle visible to replay.
+    staged_eager: Dict[
+        Tuple[int, da_state.DAMoeContext], Tuple[Tuple[int, int], float]
+    ] = {}
     eager_tactics = bundle.get("eager_tactics", {}) or {}
     if eager_tactics and bundle_default_profile_contract_matches(meta):
         for bucket_key, record in eager_tactics.items():
@@ -565,11 +564,12 @@ def load_knn_v2_bundle(
             except (KeyError, TypeError, ValueError):
                 continue
             for offset_context in offset_contexts:
-                da_state.BUNDLE_EAGER_TACTICS[
-                    da_state.cache_key(offset_context, bucket)
-                ] = (tactic, time_ms)
+                staged_eager[da_state.cache_key(offset_context, bucket)] = (
+                    tactic,
+                    time_ms,
+                )
 
-    uploaded = 0
+    staged_guarded: List[Tuple[int, Dict[str, Any]]] = []
     for bucket_key, raw_plan in sorted(
         plans_by_bucket.items(), key=lambda item: int(item[0])
     ):
@@ -593,14 +593,9 @@ def load_knn_v2_bundle(
         plan["policy"] = "noda_baseline_guard"
         plan["final_policy"] = "noda_baseline_guard"
         plan["final_tactics"] = [baseline_tactic]
-        for offset in sorted(set(offsets)):
-            offset_context = da_state.context_with_offset(da_context, int(offset))
-            offset_key = da_state.cache_key(offset_context, bucket)
-            da_state.BASELINE_GUARD_DECISIONS[offset_key] = dict(plan)
-            da_state.PER_TILE_TACTICS.pop(offset_key, None)
-            da_state.PER_BODY_TACTICS.pop(offset_key, None)
-        uploaded += 1
+        staged_guarded.append((bucket, plan))
 
+    staged_selectors: List[Dict[str, Any]] = []
     for bucket_key, exemplars in sorted(exemplars_by_bucket.items()):
         if not exemplars:
             continue
@@ -653,30 +648,73 @@ def load_knn_v2_bundle(
         tile_map: Dict[int, Tuple[int, int]] = {}
         for tactic in per_body:
             tile_map.setdefault(tactic[0], tactic)
+        validate_selector_upload(
+            flat_tensor,
+            body_indices,
+            tile_shapes,
+            kernel_ids,
+            tile_sizes,
+            num_local,
+        )
+        staged_selectors.append(
+            {
+                "bucket": int(bucket_key),
+                "flat_tensor": flat_tensor,
+                "body_indices": body_indices,
+                "tile_shapes": tile_shapes,
+                "kernel_ids": kernel_ids,
+                "tile_sizes": tile_sizes,
+                "tile_map": tile_map,
+                "per_body": per_body,
+                "plan": plan,
+            }
+        )
+
+    uploaded = len(staged_guarded) + len(staged_selectors)
+    if uploaded <= 0:
+        return 0
+
+    for eager_key in tuple(da_state.BUNDLE_EAGER_TACTICS):
+        if eager_key[1] in offset_contexts:
+            da_state.BUNDLE_EAGER_TACTICS.pop(eager_key, None)
+    da_state.BUNDLE_EAGER_TACTICS.update(staged_eager)
+
+    for bucket, plan in staged_guarded:
         for offset in sorted(set(offsets)):
             offset_context = da_state.context_with_offset(da_context, int(offset))
-            upload_and_publish_selector_tactics(
-                backend.get_ffi_moe_op(),
-                offset_context,
-                flat_tensor,
-                body_indices,
-                tile_shapes,
-                kernel_ids,
-                tile_sizes,
-                num_local,
-                int(offset),
-                top_k,
-                int(bucket_key),
-                per_tile_tactics=tile_map,
-                per_body_tactics=per_body,
-            )
-            da_state.BASELINE_GUARD_DECISIONS[
-                da_state.cache_key(offset_context, int(bucket_key))
-            ] = dict(plan)
-        uploaded += 1
-    if uploaded > 0:
-        _bundle_has_tactics = True
-        da_state.BUNDLE_TACTIC_CONTEXTS.add(da_context)
+            offset_key = da_state.cache_key(offset_context, bucket)
+            da_state.BASELINE_GUARD_DECISIONS[offset_key] = dict(plan)
+            da_state.PER_TILE_TACTICS.pop(offset_key, None)
+            da_state.PER_BODY_TACTICS.pop(offset_key, None)
+
+    if staged_selectors:
+        ffi_moe_op = backend.get_ffi_moe_op()
+        for staged in staged_selectors:
+            for offset in sorted(set(offsets)):
+                offset_context = da_state.context_with_offset(da_context, int(offset))
+                upload_and_publish_selector_tactics(
+                    ffi_moe_op,
+                    offset_context,
+                    staged["flat_tensor"],
+                    staged["body_indices"],
+                    staged["tile_shapes"],
+                    staged["kernel_ids"],
+                    staged["tile_sizes"],
+                    num_local,
+                    int(offset),
+                    top_k,
+                    staged["bucket"],
+                    per_tile_tactics=staged["tile_map"],
+                    per_body_tactics=staged["per_body"],
+                )
+                da_state.BASELINE_GUARD_DECISIONS[
+                    da_state.cache_key(offset_context, staged["bucket"])
+                ] = dict(staged["plan"])
+
+    # Publication is monotonic across context-scoped bundle loads. Loading one
+    # valid context must not hide tactics already published for another.
+    _bundle_has_tactics = True
+    da_state.BUNDLE_TACTIC_CONTEXTS.add(da_context)
     return uploaded
 
 
@@ -1023,7 +1061,11 @@ def best_static_tactic_from_profiles(
 
     best = best_exact or best_compatible
 
-    da_state.STATIC_FALLBACK_TACTICS[cache_key] = best
+    # A miss is transient: ordinary autotuning may publish the matching
+    # shape-only profile later in the same process.  Caching ``None`` here
+    # would permanently suppress baseline-guard discovery.
+    if best is not None:
+        da_state.STATIC_FALLBACK_TACTICS[cache_key] = best
     return best
 
 

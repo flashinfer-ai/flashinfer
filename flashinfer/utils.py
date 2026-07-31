@@ -34,6 +34,18 @@ from .jit.spdlog import gen_spdlog_module
 logger = logging.getLogger(__name__)
 
 
+def read_env_bool(name: str, default: bool = False) -> bool:
+    """Read a conventional boolean environment variable.
+
+    Environment-backed feature gates should use this shared parser so runtime
+    orchestration and lower-level subsystems cannot disagree about values such
+    as ``true`` or ``off``.
+    """
+
+    value = os.environ.get(name, str(int(default))).strip().lower()
+    return value not in ("", "0", "false", "no", "off", "none")
+
+
 class PosEncodingMode(Enum):
     NONE = 0
     ROPE_LLAMA = 1

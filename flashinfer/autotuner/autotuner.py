@@ -37,6 +37,7 @@ from flashinfer.utils import (
     next_positive_power_of_2,
     is_confidential_compute,
     get_globaltimer_kernel,
+    read_env_bool,
 )
 
 from flashinfer.jit.core import logger
@@ -55,7 +56,7 @@ _nvfp4_cutlass_version = "0.1"
 # Re-read at every call (not at import) so harnesses that toggle this env
 # var mid-process see the change.
 def _is_value_aware_autotune() -> bool:
-    return os.environ.get("FLASHINFER_DIST_AWARE_AUTOTUNE", "0") == "1"
+    return read_env_bool("FLASHINFER_DIST_AWARE_AUTOTUNE")
 
 
 _AUTOTUNE_DUMP_PATH = os.environ.get("FLASHINFER_AUTOTUNE_DUMP", "")

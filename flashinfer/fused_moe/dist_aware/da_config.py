@@ -6,14 +6,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ...utils import read_env_bool
 from .da_utils import DADistributionSpec, get_da_distribution_specs
-
-
-def _env_bool(env: str, default: bool) -> bool:
-    """Read a conventional boolean environment variable."""
-
-    value = os.environ.get(env, str(int(default)))
-    return value.lower() not in ("", "0", "false")
 
 
 def _env_positive_int(env: str, default: int) -> int:
@@ -91,11 +85,11 @@ class DAConfig:
 
     # Enables value-aware distribution autotuning and capture dispatch.
     enabled: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", False)
+        default_factory=lambda: read_env_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", False)
     )
     # Enables combined-index M+N tactic search for DA profiling.
     factorized_autotune: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_FACTORIZED_AUTOTUNE", True)
+        default_factory=lambda: read_env_bool("FLASHINFER_DA_FACTORIZED_AUTOTUNE", True)
     )
     # Synthetic routing distributions used for value-aware autotuning.
     distributions: tuple[DADistributionSpec, ...] = field(
@@ -123,7 +117,7 @@ class DAConfig:
     )
     # Merges exemplar rows that choose the same body tactic.
     merge_same_tactic_exemplars: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_KNN_MERGE", False)
+        default_factory=lambda: read_env_bool("FLASHINFER_DA_KNN_MERGE", False)
     )
     # Optional local-expert offsets represented in bundle exemplars.
     exemplar_offsets: tuple[int, ...] = field(default_factory=_env_offsets)
@@ -135,13 +129,13 @@ class DAConfig:
     )
     # Selects a DA body using routing counts rather than synthesized routing.
     select_from_routing_counts: bool = field(
-        default_factory=lambda: _env_bool(
+        default_factory=lambda: read_env_bool(
             "FLASHINFER_DA_KNN_SELECT_FROM_ROUTING_COUNTS", False
         )
     )
     # Emits human-readable DA diagnostics.
     verbose: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_VERBOSE", False)
+        default_factory=lambda: read_env_bool("FLASHINFER_DA_VERBOSE", False)
     )
     # Optional worker-local path for DA diagnostics.
     debug_file: Optional[str] = field(
@@ -149,7 +143,7 @@ class DAConfig:
     )
     # Enables the NoDA baseline guard for DA selector publication.
     baseline_guard: bool = field(
-        default_factory=lambda: _env_bool("FLASHINFER_DA_BASELINE_GUARD", True)
+        default_factory=lambda: read_env_bool("FLASHINFER_DA_BASELINE_GUARD", True)
     )
     # Pre-recorded combined routing-metadata + selector + conditional SWITCH
     # critical-path overhead in microseconds. Routing and selector overlap, so

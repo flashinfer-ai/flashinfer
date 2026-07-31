@@ -472,6 +472,15 @@ def test_fp8_moe_autotune(
                 **common_kwargs,
             )
 
+    # Even this deliberately tiny workload must enumerate and profile tactics.
+    # DA policy must not change ordinary/NoDA autotuner admission globally.
+    tuner = AutoTuner.get()
+    assert any(
+        getattr(key, "custom_op", key[0] if isinstance(key, tuple) else None)
+        == "flashinfer::trtllm_fp8_block_scale_moe"
+        for key in tuner.profiling_cache
+    )
+
 
 @pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
 def test_fp8_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_experts):

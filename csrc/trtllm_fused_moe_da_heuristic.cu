@@ -117,6 +117,7 @@ struct DAKnnState {
   unsigned int* d_block_done = nullptr;
   DAKnnParams h_params{};
   int top_k = 0;
+  int device_id = -1;
 
   ~DAKnnState() {
     if (d_params) cudaFree(d_params);
@@ -132,9 +133,11 @@ constexpr int64_t kDefaultSelectorHandle = 0;
 struct DAKnnStateKey {
   int64_t selector_handle;
   int num_tokens_bucket;
+  int device_id;
 
   bool operator==(const DAKnnStateKey& other) const {
-    return selector_handle == other.selector_handle && num_tokens_bucket == other.num_tokens_bucket;
+    return selector_handle == other.selector_handle &&
+           num_tokens_bucket == other.num_tokens_bucket && device_id == other.device_id;
   }
 };
 
@@ -145,6 +148,7 @@ struct DAKnnStateKeyHash {
       seed ^= std::hash<int>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     };
     combine(key.num_tokens_bucket);
+    combine(key.device_id);
     return seed;
   }
 };
@@ -152,8 +156,8 @@ struct DAKnnStateKeyHash {
 static std::unordered_map<DAKnnStateKey, std::unique_ptr<DAKnnState>, DAKnnStateKeyHash>
     g_da_knn_states;
 
-static DAKnnStateKey make_state_key(int64_t selector_handle, int num_tokens_bucket) {
-  return {selector_handle, num_tokens_bucket};
+static DAKnnStateKey make_state_key(int64_t selector_handle, int num_tokens_bucket, int device_id) {
+  return {selector_handle, num_tokens_bucket, device_id};
 }
 
 static bool validate_knn_state_topology(const DAKnnState& state, int64_t top_k,
@@ -189,6 +193,9 @@ void da_upload_knn_exemplars_with_handle(int64_t selector_handle,
                                          tvm::ffi::Array<int64_t> tile_sizes,
                                          int64_t num_local_experts, int64_t local_expert_offset,
                                          int64_t top_k, int64_t num_tokens_bucket) {
+  TVM_FFI_ICHECK_EQ(exemplar_norm_flat.device().device_type, kDLCUDA)
+      << "exemplar_norm_flat must be a CUDA tensor";
+  ffi::CUDADeviceGuard device_guard(exemplar_norm_flat.device().device_id);
   int n_exemplars = static_cast<int>(exemplar_body_idx.size());
   TVM_FFI_ICHECK(static_cast<int>(exemplar_tile_shapes.size()) == n_exemplars)
       << "exemplar_tile_shapes size mismatch";
@@ -204,19 +211,13 @@ void da_upload_knn_exemplars_with_handle(int64_t selector_handle,
       << static_cast<int64_t>(n_exemplars) * num_local_experts;
   TVM_FFI_ICHECK(encode_dlpack_dtype(exemplar_norm_flat.dtype()) == float32_code)
       << "exemplar_norm_flat must be float32";
-  if (exemplar_norm_flat.device().device_type == kDLCUDA) {
-    int current_device = -1;
-    DA_CUDA_CHECK(cudaGetDevice(&current_device));
-    TVM_FFI_ICHECK(current_device == exemplar_norm_flat.device().device_id)
-        << "exemplar_norm_flat is on cuda:" << exemplar_norm_flat.device().device_id
-        << " but the active upload device is cuda:" << current_device;
-  }
-
-  DAKnnStateKey key = make_state_key(selector_handle, static_cast<int>(num_tokens_bucket));
+  DAKnnStateKey key = make_state_key(selector_handle, static_cast<int>(num_tokens_bucket),
+                                     exemplar_norm_flat.device().device_id);
 
   auto& state = g_da_knn_states[key];
   if (!state) {
     state = std::make_unique<DAKnnState>();
+    state->device_id = exemplar_norm_flat.device().device_id;
     DA_CUDA_CHECK(cudaMalloc(&state->d_params, sizeof(DAKnnParams)));
     DA_CUDA_CHECK(cudaMalloc(&state->d_selected_tile_idx, sizeof(int32_t)));
     DA_CUDA_CHECK(cudaMalloc(&state->d_selected_tile_n, sizeof(int32_t)));
@@ -426,6 +427,7 @@ static bool fused_knn_enabled() {
 // only handles graph bookkeeping.
 // ---------------------------------------------------------------------------
 struct DAInlineContext {
+  int device_id = -1;
   cudaGraph_t outer_graph = nullptr;  // vLLM's captured graph
   cudaGraphNode_t decision_node{};
   cudaGraphNode_t switch_node{};
@@ -464,6 +466,7 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
                                            int64_t num_local_experts, int64_t local_expert_offset,
                                            tvm::ffi::Array<int64_t> tile_sizes_arr,
                                            int64_t side_stream_handle) {
+  ffi::CUDADeviceGuard device_guard(topk_ids_tv.device().device_id);
   cudaStream_t outer_stream = get_stream(topk_ids_tv.device());
 
   // Fetch the outer in-progress capture graph + current tail dependencies.
@@ -478,7 +481,8 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
                    "da_inline_switch_begin requires the caller stream to be capturing");
 
   // Look up uploaded DAKNNv2 state for this selector context and token bucket.
-  DAKnnStateKey state_key = make_state_key(selector_handle, static_cast<int>(num_tokens_bucket));
+  DAKnnStateKey state_key = make_state_key(selector_handle, static_cast<int>(num_tokens_bucket),
+                                           topk_ids_tv.device().device_id);
   auto knn_state_it = g_da_knn_states.find(state_key);
   FLASHINFER_CHECK(knn_state_it != g_da_knn_states.end(),
                    "No DAKNNv2 selector state uploaded for bucket=", num_tokens_bucket,
@@ -501,6 +505,7 @@ static int64_t da_inline_switch_begin_impl(TensorView topk_ids_tv,
   }
 
   auto ctx = std::make_unique<DAInlineContext>();
+  ctx->device_id = topk_ids_tv.device().device_id;
   ctx->outer_graph = outer_graph;
   ctx->outer_stream = outer_stream;
   ctx->side_stream = reinterpret_cast<cudaStream_t>(side_stream_handle);
@@ -804,6 +809,7 @@ void da_inline_routing_begin_capture(int64_t ctx_id, int64_t stream_handle) {
   auto it = g_inline_ctxs.find(ctx_id);
   FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
   auto& ctx = it->second;
+  ffi::CUDADeviceGuard device_guard(ctx->device_id);
   if (ctx->direct_mode) return;
   FLASHINFER_CHECK(ctx->active_body == -1,
                    "cannot capture routing while a conditional body is capturing");
@@ -826,6 +832,7 @@ void da_inline_routing_end_capture(int64_t ctx_id) {
   auto it = g_inline_ctxs.find(ctx_id);
   FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
   auto& ctx = it->second;
+  ffi::CUDADeviceGuard device_guard(ctx->device_id);
   if (ctx->direct_mode) return;
   FLASHINFER_CHECK(ctx->routing_capture_active, "no routing capture is active");
   FLASHINFER_CHECK(ctx->active_routing_stream != nullptr, "routing stream is not set");
@@ -871,6 +878,7 @@ void da_inline_body_begin_capture(int64_t ctx_id, int64_t body_index) {
   auto it = g_inline_ctxs.find(ctx_id);
   FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
   auto& ctx = it->second;
+  ffi::CUDADeviceGuard device_guard(ctx->device_id);
   if (ctx->direct_mode) return;
   FLASHINFER_CHECK(body_index >= 0 && body_index < ctx->num_bodies,
                    "body_index out of range: ", body_index);
@@ -887,6 +895,7 @@ void da_inline_body_end_capture(int64_t ctx_id) {
   auto it = g_inline_ctxs.find(ctx_id);
   FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
   auto& ctx = it->second;
+  ffi::CUDADeviceGuard device_guard(ctx->device_id);
   if (ctx->direct_mode) return;
   FLASHINFER_CHECK(ctx->active_body != -1, "no body capture in progress");
   cudaGraph_t _unused = nullptr;
@@ -898,6 +907,7 @@ void da_inline_switch_end(int64_t ctx_id) {
   auto it = g_inline_ctxs.find(ctx_id);
   FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
   auto& ctx = it->second;
+  ffi::CUDADeviceGuard device_guard(ctx->device_id);
   if (ctx->direct_mode) return;
   FLASHINFER_CHECK(ctx->active_body == -1,
                    "da_inline_switch_end called while a body capture is in progress");
@@ -917,13 +927,21 @@ int64_t da_inline_is_direct_mode(int64_t ctx_id) {
   return it->second->direct_mode ? 1 : 0;
 }
 
-void da_inline_destroy(int64_t ctx_id) { g_inline_ctxs.erase(ctx_id); }
+void da_inline_destroy(int64_t ctx_id) {
+  auto it = g_inline_ctxs.find(ctx_id);
+  FLASHINFER_CHECK(it != g_inline_ctxs.end(), "Unknown inline ctx: ", ctx_id);
+  ffi::CUDADeviceGuard device_guard(it->second->device_id);
+  g_inline_ctxs.erase(it);
+}
 
 int64_t da_get_static_knn_tile_with_handle(int64_t selector_handle, int64_t num_tokens_bucket,
                                            int64_t top_k, int64_t num_local_experts,
                                            int64_t local_expert_offset,
                                            tvm::ffi::Array<int64_t> tile_sizes_arr) {
-  DAKnnStateKey key = make_state_key(selector_handle, static_cast<int>(num_tokens_bucket));
+  int device_id = -1;
+  DA_CUDA_CHECK(cudaGetDevice(&device_id));
+  DAKnnStateKey key =
+      make_state_key(selector_handle, static_cast<int>(num_tokens_bucket), device_id);
   auto it = g_da_knn_states.find(key);
   if (it == g_da_knn_states.end()) return -1;
   if (!validate_knn_state_topology(*it->second, top_k, num_local_experts, local_expert_offset)) {
@@ -951,6 +969,7 @@ int64_t da_get_static_knn_tile(int64_t num_tokens_bucket, int64_t top_k, int64_t
 void da_destroy_knn_selector(int64_t selector_handle) {
   for (auto it = g_da_knn_states.begin(); it != g_da_knn_states.end();) {
     if (it->first.selector_handle == selector_handle) {
+      ffi::CUDADeviceGuard device_guard(it->second->device_id);
       it = g_da_knn_states.erase(it);
     } else {
       ++it;

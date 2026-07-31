@@ -3313,6 +3313,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_run_from_routing_metadata_impl(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     bool do_finalize, bool enable_pdl, int64_t act_type, TensorView output,
     Array<int64_t> config_index, Optional<TensorView> per_token_scales) {
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   TVM_FFI_ICHECK_GE(config_index.size(), 2) << "config_index must contain [tile_N, config].";
   int64_t tile_N = config_index[0];
   int64_t config = config_index[1];
@@ -3483,6 +3484,7 @@ Array<Tensor> trtllm_bf16_moe_run_from_routing_metadata(
     int64_t local_expert_offset, int64_t local_num_experts, bool use_shuffled_weight,
     int64_t weight_layout, bool do_finalize, bool enable_pdl, TensorView output,
     Array<int64_t> config_index, int64_t activation_type) {
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16)
       << "BF16 MoE: hidden_states must be bfloat16.";
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_bfloat16)
@@ -3515,6 +3517,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe_run_from_routing_metadata(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     bool use_routing_scales_on_input, bool do_finalize, bool enable_pdl, TensorView output,
     Array<int64_t> config_index, int64_t activation_type) {
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   auto const activation = validateAndCastActivationType(activation_type);
   std::vector<int32_t> supported_tile_n(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                         Fp8PerTensorLauncher::mSupportedTileNums.end());
@@ -3541,6 +3544,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe_run_from_routing_metadata(
     int64_t local_expert_offset, int64_t local_num_experts, bool use_shuffled_weight,
     int64_t weight_layout, bool do_finalize, bool enable_pdl, TensorView output,
     Array<int64_t> config_index, Fp8QuantizationType quantization_type, int64_t act_type) {
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   auto const activation_type = validateAndCastActivationType(act_type);
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
       activation_type != ActivationType::Swiglu) {
@@ -3573,6 +3577,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe_run_from_routing_metadata(
     TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     bool do_finalize, bool enable_pdl, TensorView output, Array<int64_t> config_index) {
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   std::vector<int32_t> supported_tile_n(MxInt4BlockScaleLauncher::mSupportedTileNums.begin(),
                                         MxInt4BlockScaleLauncher::mSupportedTileNums.end());
   auto setup = prepareRoutingMetadataRun(routing_metadata, hidden_states, output, num_experts,
@@ -3803,6 +3808,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t local_expert_offset,
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
     int64_t tile_tokens_dim, int64_t routing_input_mode, Optional<TensorView> topk_weights) {
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dim must be positive.";
   TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
   TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "topk_ids must be int32.";
@@ -3928,6 +3934,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_from_logits(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, int64_t tile_tokens_dim, bool norm_topk_prob,
     bool use_routing_scales_on_input, TensorView packed_topk_ids) {
+  ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dim must be positive.";
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
@@ -4033,6 +4040,7 @@ void trtllm_moe_populate_routing_metadata_from_logits(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, int64_t tile_tokens_dim, bool norm_topk_prob,
     bool use_routing_scales_on_input, TensorView packed_topk_ids, Array<Tensor> routing_metadata) {
+  ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dim must be positive.";
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
@@ -4114,6 +4122,7 @@ void trtllm_deepseek_moe_compute_routing_packed_only(
     int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, TensorView packed_topk_ids, TensorView expert_weights_bf16) {
+  ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "routing_logits must be float32 or bfloat16 for DeepSeek-V3 routing.";
@@ -4219,6 +4228,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
     Array<int64_t> tile_tokens_dims, int64_t routing_input_mode,
     Optional<TensorView> topk_weights) {
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
   for (int64_t tile_tokens_dim : tile_tokens_dims) {
     TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";
@@ -4387,6 +4397,7 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
     Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata,
     int64_t routing_input_mode, Optional<TensorView> topk_weights,
     bool allow_packed_multi_cluster) {
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
   for (int64_t tile_tokens_dim : tile_tokens_dims) {
     TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";

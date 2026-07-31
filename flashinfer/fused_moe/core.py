@@ -1601,16 +1601,22 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             profile: OptimizationProfile,
         ) -> List[int]:
             moe_inputs = MoeRunnerInputs.from_list(inputs)
-            num_tokens = int(
-                profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
+            is_da_tactic_profile = (
+                bool(profile.value_buckets)
+                and int(profile.value_buckets[0])
+                != da_core.DEFAULT_PROFILE_VALUE_BUCKET
             )
-            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
-            if (
-                num_tokens * (self.top_k + self.num_fused_shared_experts)
-                < 2 * (self.num_local_experts + self.num_fused_shared_experts)
-                and major == 10
-            ):
-                return []
+            if is_da_tactic_profile:
+                num_tokens = int(
+                    profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
+                )
+                major, _ = get_compute_capability(moe_inputs.hidden_states.device)
+                if (
+                    num_tokens * (self.top_k + self.num_fused_shared_experts)
+                    < 2 * (self.num_local_experts + self.num_fused_shared_experts)
+                    and major == 10
+                ):
+                    return []
             instance_key = self._tactics_instance_key(moe_inputs, profile)
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
@@ -1621,11 +1627,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     )
                     return []
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
-            if (
-                profile.value_buckets
-                and int(profile.value_buckets[0])
-                != da_core.DEFAULT_PROFILE_VALUE_BUCKET
-            ):
+            if is_da_tactic_profile:
                 target_tile = int(profile.value_buckets[0])
                 return [
                     tactic
@@ -2227,6 +2229,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             da_state.is_dist_aware_autotune(da_config)
             and do_finalize
             and gemm1_lora_delta is None
+            and gemm1_alpha is None
+            and gemm1_beta is None
+            and gemm1_clamp_limit is None
         ):
             da_topk_ids = topk_ids
             da_expert_weights = expert_weights
@@ -3222,6 +3227,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             da_state.is_dist_aware_autotune(da_config)
             and do_finalize
             and gemm1_lora_delta is None
+            and gemm1_alpha is None
+            and gemm1_beta is None
+            and gemm1_clamp_limit is None
         ):
             da_topk_ids = topk_ids
             da_expert_weights = expert_weights

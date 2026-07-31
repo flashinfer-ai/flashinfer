@@ -92,6 +92,9 @@ def _capture_resource_key(
 
 
 def store_capture_resources(resources: DACaptureResources) -> None:
+    # Replacing a key must not free storage referenced by an older live CUDA
+    # graph.  The tensor keepalive registry owns all generations until the
+    # framework explicitly releases them after destroying its graphs.
     CAPTURE_RESOURCES[
         _capture_resource_key(
             resources.da_context,
@@ -101,6 +104,41 @@ def store_capture_resources(resources: DACaptureResources) -> None:
             resources.input_routing_mode,
         )
     ] = resources
+
+
+def release_capture_resources(
+    da_context: Optional[da_state.DAMoeContext] = None,
+) -> None:
+    """Release DA capture storage after the owning CUDA graphs are destroyed.
+
+    CUDA graph executables retain raw device pointers rather than Python tensor
+    owners, so automatic LRU eviction could turn an otherwise live graph into a
+    use-after-free.  Framework integrations must destroy affected graphs first,
+    then call this explicit lifecycle boundary.  Passing no context releases all
+    DA capture generations.
+    """
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("cannot release DA capture resources during capture")
+    contexts = (
+        {da_context}
+        if da_context is not None
+        else {
+            *(key[0] for key in CAPTURE_RESOURCES),
+            *da_state.CAPTURE_KEEPALIVE,
+        }
+    )
+    for context in contexts:
+        if context.device_type == "cuda":
+            with torch.cuda.device(context.device_index):
+                torch.cuda.synchronize()
+    for key in tuple(CAPTURE_RESOURCES):
+        if da_context is None or key[0] == da_context:
+            CAPTURE_RESOURCES.pop(key, None)
+    if da_context is None:
+        da_state.CAPTURE_KEEPALIVE.clear()
+    else:
+        da_state.CAPTURE_KEEPALIVE.pop(da_context, None)
 
 
 def prepare_capture_resources(
