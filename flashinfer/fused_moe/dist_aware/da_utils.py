@@ -194,7 +194,11 @@ def pack_expert_assignments(
     weights: torch.Tensor | None = None,
     top_k: int = 1,
 ) -> torch.Tensor:
-    """Pack expert ids and bfloat16 weights into TRT-LLM routed format."""
+    """Pack expert ids and bfloat16 weights into TRT-LLM routed format.
+
+    The BF16-to-int16 dtype view is same-width and therefore preserves a
+    strided input without materializing a contiguous copy.
+    """
 
     if weights is None:
         weights = torch.full(
