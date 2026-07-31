@@ -24,6 +24,8 @@ from flashinfer.topk import TopKTieBreak
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
+BENCH_ENABLE_CUPTI = True
+
 
 def set_topk_algo(algo: str):
     """Set environment variable to force specific topk algorithm."""
@@ -67,7 +69,7 @@ def torch_deterministic_algorithms(enabled: bool):
 def bench_median_ms(fn) -> float:
     measurements = bench_gpu_time(
         fn,
-        enable_cupti=True,
+        enable_cupti=BENCH_ENABLE_CUPTI,
         dry_run_iters=10,
         repeat_iters=100,
         use_cuda_graph=True,
@@ -174,7 +176,7 @@ def bench_top_k_from_scores(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
@@ -183,7 +185,7 @@ def bench_top_k_from_scores(
                 lambda tie_break: flashinfer.top_k(
                     scores,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
                 ),
                 baseline_ms,
@@ -431,9 +433,6 @@ def bench_page_table_transform(
         .expand(batch_size, -1)
         .contiguous()
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_page_table_transform(
@@ -462,16 +461,11 @@ def bench_page_table_transform(
 
     # FlashInfer clusters
     set_topk_algo("clusters")
-    measurements = bench_gpu_time(
+    fast_topk_ms = bench_median_ms(
         lambda: flashinfer.top_k_page_table_transform(
             scores, src_page_table, lengths, k
-        ),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
+        )
     )
-    fast_topk_ms = np.median(measurements)
     result["fast_topk_us"] = fast_topk_ms * 1e3
     result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
     set_topk_algo("auto")
@@ -488,7 +482,7 @@ def bench_page_table_transform(
         result["speedup_vs_sglang"] = sg_ms / fi_ms
 
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
@@ -499,7 +493,7 @@ def bench_page_table_transform(
                     src_page_table,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
                 ),
                 baseline_ms,
@@ -525,9 +519,6 @@ def bench_ragged_transform(
     offsets = torch.arange(
         0, batch_size * seq_len, seq_len, device="cuda", dtype=torch.int32
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_ragged_transform(
@@ -556,14 +547,9 @@ def bench_ragged_transform(
 
     # FlashInfer clusters
     set_topk_algo("clusters")
-    measurements = bench_gpu_time(
+    fast_topk_ms = bench_median_ms(
         lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
     )
-    fast_topk_ms = np.median(measurements)
     result["fast_topk_us"] = fast_topk_ms * 1e3
     result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
     set_topk_algo("auto")
@@ -588,7 +574,7 @@ def bench_ragged_transform(
                     offsets,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
                 ),
                 baseline_ms,
@@ -915,13 +901,13 @@ def bench_varlen_transform(
     set_topk_algo("auto")
 
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
         result.update(
             bench_tie_break_variants(
-                lambda tie_break: run(True, tie_break),
+                lambda tie_break: run(deterministic, tie_break),
                 baseline_ms,
             )
         )
@@ -953,6 +939,8 @@ def parse_dtype(dtype_str: str) -> torch.dtype:
 
 @torch.inference_mode()
 def main():
+    global BENCH_ENABLE_CUPTI
+
     parser = argparse.ArgumentParser(description="Benchmark Top-K operations")
     parser.add_argument(
         "--compare-sglang",
@@ -985,9 +973,15 @@ def main():
         "--tie-break",
         action="store_true",
         help=(
-            "Also benchmark deterministic tie-break variants and report "
-            "FlashInfer(tie-small/tie-large) columns with slowdown aligned to DetSlowdown baseline"
+            "Also benchmark tie-break variants and report "
+            "FlashInfer(tie-small/tie-large) columns with slowdown against "
+            "the non-deterministic baseline"
         ),
+    )
+    parser.add_argument(
+        "--disable-cupti",
+        action="store_true",
+        help="Use CUDA-event timing instead of CUPTI activity profiling",
     )
     parser.add_argument(
         "--compare-torch-deterministic",
@@ -1049,6 +1043,7 @@ def main():
         help="Query length per request for the varlen prefill (causal) regime (default: 128)",
     )
     args = parser.parse_args()
+    BENCH_ENABLE_CUPTI = not args.disable_cupti
 
     if args.varlen_k <= 0:
         parser.error("--varlen-k must be a positive integer")
@@ -1056,12 +1051,6 @@ def main():
         parser.error("--varlen-q-len must be a positive integer")
 
     dtype = parse_dtype(args.dtype)
-
-    if args.tie_break and not args.deterministic:
-        print(
-            "NOTE: --tie-break requires deterministic kernels; enabling --deterministic."
-        )
-        args.deterministic = True
 
     if args.compare_sglang and not HAS_SGL_KERNEL:
         print("WARNING: sgl_kernel not found, skipping SGLang comparison")
@@ -1167,8 +1156,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print(
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
@@ -1293,8 +1282,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1418,8 +1407,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1523,8 +1512,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1663,8 +1652,8 @@ def main():
                 )
             if args.tie_break:
                 print(
-                    "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                    "slowdowns align with the same baseline as DetSlowdown"
+                    f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                    "slowdowns use the non-deterministic baseline"
                 )
             print(
                 "NOTE: Clusters column omitted under deterministic/tie-break "

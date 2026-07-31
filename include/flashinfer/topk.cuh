@@ -2417,7 +2417,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
           dst_values[i] = DType(0);
         }
       } else if constexpr (DETERMINISTIC) {
-        // In deterministic mode the page-table/ragged transform happens in SortTopKByIndexKernel
+        // Defer the page-table/ragged transform to the lightweight finalizer.
         dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
       } else if constexpr (MODE == FilteredTopKMode::PageTable) {
         dst[i] = (i < length) ? src_page_entry[page_table_row_start + i] : static_cast<IdType>(-1);
@@ -2909,7 +2909,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     if constexpr (MODE == FilteredTopKMode::Plain) {
       dst[base] = static_cast<IdType>(idx);
       dst_values[base] = score[idx];
-    } else if constexpr (DETERMINISTIC) {  // transform in SortTopKByIndexKernel
+    } else if constexpr (DETERMINISTIC) {
       dst[base] = static_cast<IdType>(idx);
     } else if constexpr (MODE == FilteredTopKMode::PageTable) {
       dst[base] = src_page_entry[page_table_row_start + idx];
@@ -2955,12 +2955,12 @@ struct SortTopKByIndexBlockRadixSort<false, BLOCK_THREADS, ITEMS_PER_THREAD, DTy
   using Type = cub::BlockRadixSort<uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
 };
 
-template <FilteredTopKMode MODE, uint32_t BLOCK_THREADS, uint32_t ITEMS_PER_THREAD, typename DType,
-          typename IdType>
+template <bool SORT_OUTPUT_BY_INDEX, FilteredTopKMode MODE, uint32_t BLOCK_THREADS,
+          uint32_t ITEMS_PER_THREAD, typename DType, typename IdType>
 __global__ void __launch_bounds__(BLOCK_THREADS)
-    SortTopKByIndexKernel(IdType* output_indices, DType* output_values, const IdType* aux_input,
-                          int64_t aux_stride, const IdType* page_table_row_starts,
-                          const IdType* row_to_batch, uint32_t top_k, uint32_t max_len) {
+    FinalizeTopKByIndexKernel(IdType* output_indices, DType* output_values, const IdType* aux_input,
+                              int64_t aux_stride, const IdType* page_table_row_starts,
+                              const IdType* row_to_batch, uint32_t top_k, uint32_t max_len) {
   constexpr bool WITH_VALUES = (MODE == FilteredTopKMode::Plain);
   using BlockRadixSortT = typename SortTopKByIndexBlockRadixSort<WITH_VALUES, BLOCK_THREADS,
                                                                  ITEMS_PER_THREAD, DType>::Type;
@@ -2990,11 +2990,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     }
   }
 
-  int end_bit = 32 - __clz(max_len);
-  if constexpr (MODE == FilteredTopKMode::Plain) {
-    BlockRadixSortT(temp_storage).Sort(keys, values, 0, end_bit);
-  } else {
-    BlockRadixSortT(temp_storage).Sort(keys, 0, end_bit);
+  if constexpr (SORT_OUTPUT_BY_INDEX) {
+    int end_bit = 32 - __clz(max_len);
+    if constexpr (MODE == FilteredTopKMode::Plain) {
+      BlockRadixSortT(temp_storage).Sort(keys, values, 0, end_bit);
+    } else {
+      BlockRadixSortT(temp_storage).Sort(keys, 0, end_bit);
+    }
   }
 
   const IdType* src_page_entry = nullptr;
@@ -3027,12 +3029,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   }
 }
 
-template <FilteredTopKMode MODE, typename DType, typename IdType>
-cudaError_t LaunchSortTopKByIndex(IdType* output_indices, DType* output_values,
-                                  const IdType* aux_input, int64_t aux_stride,
-                                  const IdType* page_table_row_starts, const IdType* row_to_batch,
-                                  uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
-                                  cudaStream_t stream = 0) {
+template <bool SORT_OUTPUT_BY_INDEX, FilteredTopKMode MODE, typename DType, typename IdType>
+cudaError_t LaunchFinalizeTopKByIndex(IdType* output_indices, DType* output_values,
+                                      const IdType* aux_input, int64_t aux_stride,
+                                      const IdType* page_table_row_starts,
+                                      const IdType* row_to_batch, uint32_t num_rows,
+                                      uint32_t top_k_val, uint32_t max_len,
+                                      cudaStream_t stream = 0) {
   // Block-local sort variants cover at most 256 * 8 = 2048 elements.
   if (top_k_val > 2048) {
     return cudaErrorInvalidValue;
@@ -3056,17 +3059,23 @@ cudaError_t LaunchSortTopKByIndex(IdType* output_indices, DType* output_values,
 
   cudaError_t status;
   if (top_k_val <= 128) {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 32, 4, DType, IdType>, 32);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 32, 4, DType, IdType>, 32);
   } else if (top_k_val <= 256) {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 32, 8, DType, IdType>, 32);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 32, 8, DType, IdType>, 32);
   } else if (top_k_val <= 512) {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 64, 8, DType, IdType>, 64);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 64, 8, DType, IdType>, 64);
   } else if (top_k_val <= 576) {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 64, 9, DType, IdType>, 64);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 64, 9, DType, IdType>, 64);
   } else if (top_k_val <= 1024) {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 128, 8, DType, IdType>, 128);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 128, 8, DType, IdType>, 128);
   } else {
-    status = launch_sort(SortTopKByIndexKernel<MODE, 256, 8, DType, IdType>, 256);
+    status = launch_sort(
+        FinalizeTopKByIndexKernel<SORT_OUTPUT_BY_INDEX, MODE, 256, 8, DType, IdType>, 256);
   }
   return status;
 }
@@ -3169,6 +3178,7 @@ cudaError_t LaunchFilteredTopKUnified(DType* input, IdType* output, DType* aux_o
                                       cudaStream_t stream = 0, bool dsa_graph_safe = false) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
+  const bool deterministic_selection = deterministic || tie_break != TopKTieBreak::None;
 
   dim3 grid(num_rows);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
@@ -3189,20 +3199,18 @@ cudaError_t LaunchFilteredTopKUnified(DType* input, IdType* output, DType* aux_o
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream)); \
   } while (0)
 
-#define DISPATCH_VEC_SIZE(VS)                                  \
-  if (vec_size == VS) {                                        \
-    if (!deterministic) {                                      \
-      LAUNCH_FILTERED_KERNEL(VS, false, TopKTieBreak::None);   \
-    } else {                                                   \
-      if (tie_break == TopKTieBreak::Small) {                  \
-        LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::Small); \
-      } else if (tie_break == TopKTieBreak::Large) {           \
-        LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::Large); \
-      } else {                                                 \
-        LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::None);  \
-      }                                                        \
-    }                                                          \
-    return cudaSuccess;                                        \
+#define DISPATCH_VEC_SIZE(VS)                                \
+  if (vec_size == VS) {                                      \
+    if (!deterministic_selection) {                          \
+      LAUNCH_FILTERED_KERNEL(VS, false, TopKTieBreak::None); \
+    } else if (tie_break == TopKTieBreak::Small) {           \
+      LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::Small); \
+    } else if (tie_break == TopKTieBreak::Large) {           \
+      LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::Large); \
+    } else {                                                 \
+      LAUNCH_FILTERED_KERNEL(VS, true, TopKTieBreak::None);  \
+    }                                                        \
+    return cudaSuccess;                                      \
   }
 
   DISPATCH_VEC_SIZE(1)
@@ -3372,9 +3380,6 @@ cudaError_t TopKPageTableTransformDispatch(
     page_table_row_starts = row_starts;
   }
   const bool require_filtered = dsa_graph_safe || tie_break != TopKTieBreak::None;
-  if (tie_break != TopKTieBreak::None) {
-    deterministic = true;
-  }
   if (require_filtered && (top_k_val > FILTERED_TOPK_MAX_K || !CanImplementFilteredTopK())) {
     return cudaErrorNotSupported;
   }
@@ -3385,9 +3390,15 @@ cudaError_t TopKPageTableTransformDispatch(
         page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break, stream,
         dsa_graph_safe)));
     if (deterministic) {
-      FLASHINFER_CUDA_CALL((LaunchSortTopKByIndex<FilteredTopKMode::PageTable, uint8_t, IdType>(
-          output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
-          page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream)));
+      FLASHINFER_CUDA_CALL(
+          (LaunchFinalizeTopKByIndex<true, FilteredTopKMode::PageTable, uint8_t, IdType>(
+              output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
+              page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream)));
+    } else if (tie_break != TopKTieBreak::None) {
+      FLASHINFER_CUDA_CALL(
+          (LaunchFinalizeTopKByIndex<false, FilteredTopKMode::PageTable, uint8_t, IdType>(
+              output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
+              page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream)));
     }
     return cudaSuccess;
   }
@@ -3405,9 +3416,6 @@ cudaError_t TopKRaggedTransformDispatch(DType* input, IdType* output_indices, co
                                         TopKTieBreak tie_break = TopKTieBreak::None,
                                         cudaStream_t stream = 0, bool dsa_graph_safe = false) {
   const bool require_filtered = dsa_graph_safe || tie_break != TopKTieBreak::None;
-  if (tie_break != TopKTieBreak::None) {
-    deterministic = true;
-  }
   if (require_filtered && (top_k_val > FILTERED_TOPK_MAX_K || !CanImplementFilteredTopK())) {
     return cudaErrorNotSupported;
   }
@@ -3417,9 +3425,15 @@ cudaError_t TopKRaggedTransformDispatch(DType* input, IdType* output_indices, co
         input, output_indices, offsets, lengths, row_starts, num_rows, top_k_val, max_len,
         deterministic, tie_break, stream, dsa_graph_safe)));
     if (deterministic) {
-      FLASHINFER_CUDA_CALL((LaunchSortTopKByIndex<FilteredTopKMode::Ragged, uint8_t, IdType>(
-          output_indices, static_cast<uint8_t*>(nullptr), offsets, 0, nullptr, nullptr, num_rows,
-          top_k_val, max_len, stream)));
+      FLASHINFER_CUDA_CALL(
+          (LaunchFinalizeTopKByIndex<true, FilteredTopKMode::Ragged, uint8_t, IdType>(
+              output_indices, static_cast<uint8_t*>(nullptr), offsets, 0, nullptr, nullptr,
+              num_rows, top_k_val, max_len, stream)));
+    } else if (tie_break != TopKTieBreak::None) {
+      FLASHINFER_CUDA_CALL(
+          (LaunchFinalizeTopKByIndex<false, FilteredTopKMode::Ragged, uint8_t, IdType>(
+              output_indices, static_cast<uint8_t*>(nullptr), offsets, 0, nullptr, nullptr,
+              num_rows, top_k_val, max_len, stream)));
     }
     return cudaSuccess;
   }
@@ -3435,9 +3449,6 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
                          bool deterministic = false, TopKTieBreak tie_break = TopKTieBreak::None,
                          cudaStream_t stream = 0, bool dsa_graph_safe = false) {
   const bool require_filtered = dsa_graph_safe || tie_break != TopKTieBreak::None;
-  if (tie_break != TopKTieBreak::None) {
-    deterministic = true;
-  }
   if (require_filtered && (top_k_val > FILTERED_TOPK_MAX_K || !CanImplementFilteredTopK())) {
     return cudaErrorNotSupported;
   }
@@ -3447,7 +3458,7 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
                                                       num_rows, top_k_val, max_len, deterministic,
                                                       tie_break, stream, dsa_graph_safe)));
     if (deterministic) {
-      FLASHINFER_CUDA_CALL((LaunchSortTopKByIndex<FilteredTopKMode::Plain, DType, IdType>(
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKByIndex<true, FilteredTopKMode::Plain, DType, IdType>(
           output_indices, output_values, nullptr, 0, nullptr, nullptr, num_rows, top_k_val, max_len,
           stream)));
     }
