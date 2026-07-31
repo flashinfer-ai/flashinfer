@@ -576,6 +576,9 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
         if has_sm107:
             jit_specs.append(gen_fp4_quantization_sm107_module())
+            jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
@@ -606,8 +609,17 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has

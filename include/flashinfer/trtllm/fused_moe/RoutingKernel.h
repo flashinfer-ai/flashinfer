@@ -211,6 +211,7 @@ struct Data : public DataBase {
   int32_t mNumLimitedGroups;
 
   float mRouteScale;
+  float mSumEpsilon{0.0f};
   bool mUseRoutingSoftmax;
 };
 
@@ -239,6 +240,7 @@ struct KernelParams
 
   trtllm::dev::IntFastDiv mTopK;
   float mRouteScale = 0.f;
+  float mSumEpsilon = 0.f;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -254,6 +256,7 @@ struct KernelParams
     params.mNumLimitedGroups = data.mNumLimitedGroups;
     params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
     params.mRouteScale = data.mRouteScale;
+    params.mSumEpsilon = data.mSumEpsilon;
 
     return params;
   }

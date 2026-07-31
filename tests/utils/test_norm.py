@@ -363,6 +363,8 @@ def test_layernorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
+    # The check bounds the fraction of drifting elements, so fix the seed.
+    torch.manual_seed(0)
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
     gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
     beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")

@@ -194,6 +194,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
     routingData.mUseRoutingSoftmax = false;
 
     int32_t const numDevices = (localNumExperts > 0) ? numExperts / localNumExperts : 1;
@@ -357,6 +358,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
       return ActType::SwiGlu;
     case ActivationType::Geglu:
       return ActType::GeGlu;
+    case ActivationType::Situ:
+      return ActType::SiTuGlu;
     default:
       FLASHINFER_CHECK(false, "Unsupported gated activation type ",
                        serializeActivationType(actType), " of enum ",
@@ -425,6 +428,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -449,6 +455,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -560,6 +569,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
+      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                            : btg::Dtype::Fp32)
+                                            : btg::Dtype::Void,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }

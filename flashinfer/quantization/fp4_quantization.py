@@ -1347,8 +1347,9 @@ def nvfp4_quantize(
     ----------
     a : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/float8_e4m3fn.
-    a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+    a_global_sf : float or torch.Tensor
+        Global scale factor. The CuTe-DSL backend accepts a host-side float
+        or, for backward compatibility, a single-element tensor.
     sfLayout : SfLayout
         Scale-factor layout.  Defaults to ``SfLayout.layout_128x4``.
     do_shuffle : bool
@@ -1517,7 +1518,7 @@ def nvfp4_quantize(
             sf_layout_int = _sf_layout_map[sfLayout]
 
         a_fp4, a_sf = nvfp4_quantize_cute_dsl(
-            a.cuda(), a_global_sf.cuda(), sf_layout=sf_layout_int, enable_pdl=enable_pdl
+            a.cuda(), a_global_sf, sf_layout=sf_layout_int, enable_pdl=enable_pdl
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
