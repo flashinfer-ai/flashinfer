@@ -1,9 +1,5 @@
 """dLLM Extend: BBE/V2 vs Baselines Speedup
 
-Unlike the step-by-step prefill pipeline, in the extend scenario the KV cache
-is already fully populated and Q only processes a small segment (corresponding
-to dLLM re-sampling / verification of an intermediate block).
-
 Key property: Q_end << KV_end → block_extend plan optimization takes effect.
 
 Compares 4 approaches:
