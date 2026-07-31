@@ -119,23 +119,32 @@ def _dtype_to_str(dtype: torch.dtype) -> str:
 
 
 def _get_variant_name(
-    in_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
     is_persistent: bool = True,
     varlen: bool = False,
     with_lse: bool = False,
+    enable_tvm_ffi: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
-    enable_tvm_ffi: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
-    in_str = _dtype_to_str(in_dtype)
+    qk_str = _dtype_to_str(qk_dtype)
+    pv_str = _dtype_to_str(pv_dtype)
     out_str = _dtype_to_str(out_dtype)
-    # Only include out_dtype in name when it differs from in_dtype (mixed precision)
-    dtype_str = f"{in_str}_{out_str}" if in_dtype != out_dtype else in_str
+    # Include all three dtypes for partially quantized kernels.  Preserve the
+    # compact legacy names when QK and PV use the same dtype.
+    dtype_str = (
+        f"{qk_str}_{pv_str}_{out_str}"
+        if qk_dtype != pv_dtype
+        else f"{qk_str}_{out_str}"
+        if qk_dtype != out_dtype
+        else qk_str
+    )
     causal_str = "causal" if is_causal else "nocausal"
     persist_str = "persistent" if is_persistent else "nonpersistent"
     varlen_str = "_varlen" if varlen else ""
@@ -229,7 +238,8 @@ def _load_from_local(variant_name: str, local_dir: str, enable_tvm_ffi: bool = F
 @functools.cache
 def get_cute_dsl_fmha_kernel(
     gpu_arch: str,
-    in_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     head_dim: int,
     is_causal: bool,
@@ -251,10 +261,14 @@ def get_cute_dsl_fmha_kernel(
     gpu_arch : str
         GPU architecture string (e.g. 'sm_100a'), used both for selecting the
         correct artifact and as part of the cache key.
-    in_dtype : torch.dtype
-        Input data type (torch.float16, torch.bfloat16, or torch.float8_e4m3fn).
+    qk_dtype : torch.dtype
+        Query/key data type (torch.float16, torch.bfloat16, or
+        torch.float8_e4m3fn).
+    pv_dtype : torch.dtype
+        Value data type (torch.float16, torch.bfloat16, or
+        torch.float8_e4m3fn).
     out_dtype : torch.dtype
-        Output data type. Same as in_dtype for non-mixed precision.
+        Output data type. Same as qk_dtype for non-mixed precision.
     head_dim : int
         Head dimension (e.g., 64, 128, 192). Note: 192 only supports FP8.
     is_causal : bool
@@ -275,17 +289,18 @@ def get_cute_dsl_fmha_kernel(
         The compiled kernel function.
     """
     variant_name = _get_variant_name(
-        in_dtype,
+        qk_dtype,
+        pv_dtype,
         out_dtype,
         head_dim,
         is_causal,
         is_persistent,
-        varlen,
-        with_lse,
-        enable_skip_softmax,
-        enable_sink,
-        use_pdl,
-        enable_tvm_ffi,
+        varlen=varlen,
+        with_lse=with_lse,
+        enable_tvm_ffi=enable_tvm_ffi,
+        enable_skip_softmax=enable_skip_softmax,
+        enable_sink=enable_sink,
+        use_pdl=use_pdl,
     )
 
     # Check for local .so directory (development mode)
@@ -407,8 +422,6 @@ def cute_dsl_fmha_ragged_prefill(
                 f"cute-dsl FMHA requires q.dtype == k.dtype, got {q.dtype} and {k.dtype}"
             )
         try:
-            if k.dtype != v.dtype:
-                raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
             if window_left != -1 or window_right != -1:
                 # The exported artifact matrix has no window axis: every
                 # prebuilt variant is traced with window_size_left=None (and
@@ -419,6 +432,7 @@ def cute_dsl_fmha_ragged_prefill(
             kernel_fn = get_cute_dsl_fmha_kernel(
                 gpu_arch,
                 q.dtype,
+                v.dtype,
                 o.dtype,
                 D,
                 is_causal,
@@ -534,9 +548,10 @@ def cute_dsl_fmha_ragged_prefill(
         )
     else:
         # CuTe native ABI: convert to cute tensors and pass with explicit stream.
-        is_fp8_in = q.dtype == torch.float8_e4m3fn
+        is_fp8_qk = q.dtype == torch.float8_e4m3fn
+        is_fp8_pv = v.dtype == torch.float8_e4m3fn
         is_fp8_out = o.dtype == torch.float8_e4m3fn
-        if is_fp8_in:
+        if is_fp8_qk:
             q_cute = from_dlpack(
                 q_5d.view(torch.int8), assumed_align=16
             ).mark_layout_dynamic(leading_dim=4)
@@ -545,10 +560,6 @@ def cute_dsl_fmha_ragged_prefill(
                 k_5d.view(torch.int8), assumed_align=16
             ).mark_layout_dynamic(leading_dim=4)
             k_cute.element_type = cutlass.Float8E4M3FN
-            v_cute = from_dlpack(
-                v_5d.view(torch.int8), assumed_align=16
-            ).mark_layout_dynamic(leading_dim=4)
-            v_cute.element_type = cutlass.Float8E4M3FN
         else:
             q_cute = from_dlpack(q_5d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=4
@@ -556,6 +567,12 @@ def cute_dsl_fmha_ragged_prefill(
             k_cute = from_dlpack(k_5d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=4
             )
+        if is_fp8_pv:
+            v_cute = from_dlpack(
+                v_5d.view(torch.int8), assumed_align=16
+            ).mark_layout_dynamic(leading_dim=4)
+            v_cute.element_type = cutlass.Float8E4M3FN
+        else:
             v_cute = from_dlpack(v_5d, assumed_align=16).mark_layout_dynamic(
                 leading_dim=4
             )
