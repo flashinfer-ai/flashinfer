@@ -42,6 +42,11 @@ from .batched_gemm_config import (
     SfSmemToTmemCopy,
     TMEM_SF_PACK_SIZE_BYTES,
 )
+from .gmem_ab_resources import (
+    metadata_token_tile,
+    nonnegative_div,
+    nonnegative_mod,
+)
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -156,7 +161,7 @@ class SmemSfAResource(MemoryResource):
             if cutlass.const_expr(self.cfg.is_mx_mma):
                 cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = (cta_rank // Int32(self.cfg.cluster_m)) * Int32(
+                lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
                     self.cfg.cluster_m
                 )
                 barrier = prims.mapa(barrier, lead_cta_rank)
@@ -173,7 +178,7 @@ class SmemSfAResource(MemoryResource):
                 return
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = (cta_rank // Int32(self.cfg.cluster_m)) * Int32(
+            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
                 self.cfg.cluster_m
             )
             barrier = prims.mapa(barrier, lead_cta_rank)
@@ -333,7 +338,7 @@ class SmemSfBResource(MemoryResource):
             if cutlass.const_expr(self.cfg.is_mx_mma):
                 cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = (cta_rank // Int32(self.cfg.cluster_m)) * Int32(
+                lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
                     self.cfg.cluster_m
                 )
                 barrier = prims.mapa(barrier, lead_cta_rank)
@@ -350,7 +355,7 @@ class SmemSfBResource(MemoryResource):
                 return
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = (cta_rank // Int32(self.cfg.cluster_m)) * Int32(
+            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
                 self.cfg.cluster_m
             )
             barrier = prims.mapa(barrier, lead_cta_rank)
@@ -540,8 +545,9 @@ class SmemSfGatherResource(MemoryResource):
         token_tile = coord_mn // Int32(tile_rows)
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
+            metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
+                self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
@@ -978,11 +984,12 @@ class SmemSfLdgstsResource(MemoryResource):
         tidx, _, _ = cute.arch.thread_idx()
         local_tid = tidx - Int32(load_warp_idx * 32)
         if cutlass.const_expr(is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
-            tile_limit_idx = coord_mn // Int32(tile_rows)
+            tile_limit_idx = nonnegative_div(coord_mn, tile_rows)
         else:
             tile_limit_idx = coord_mn
+        metadata_tile = metadata_token_tile(self.cfg, tile_limit_idx, tile_rows)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
+            self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
             tile_limit_idx,
             tile_rows,
         )
@@ -991,7 +998,7 @@ class SmemSfLdgstsResource(MemoryResource):
             thread_base = local_tid * Int32(elts_per_load) + Int32(
                 li * num_threads * elts_per_load
             )
-            row_in_tile = thread_base // Int32(sf_k)
+            row_in_tile = nonnegative_div(thread_base, sf_k)
             if cutlass.const_expr(
                 is_b and self.cfg.has_routed_sfs and self.cfg.is_swap_ab
             ):
@@ -1059,8 +1066,8 @@ class SmemSfLdgstsResource(MemoryResource):
             thread_base = local_tid * Int32(elts_per_load) + Int32(
                 li * num_threads * elts_per_load
             )
-            row_in_tile = thread_base // Int32(sf_k)
-            col_in_tile = thread_base % Int32(sf_k)
+            row_in_tile = nonnegative_div(thread_base, sf_k)
+            col_in_tile = nonnegative_mod(thread_base, sf_k)
 
             is_valid = (
                 (local_tid >= Int32(0))
@@ -1075,21 +1082,21 @@ class SmemSfLdgstsResource(MemoryResource):
             gmem_src = self.sf_gmem_ptr.data_ptr() + gmem_offset
 
             if cutlass.const_expr(use_r128c4):
-                data_blk_row = row_in_tile // Int32(128)
-                data_blk_col = col_in_tile // Int32(4)
-                row_in_blk = row_in_tile % Int32(128)
-                col_in_blk = col_in_tile % Int32(4)
-                row_in_blk0 = row_in_blk % Int32(32)
-                row_in_blk1 = row_in_blk // Int32(32)
+                data_blk_row = nonnegative_div(row_in_tile, 128)
+                data_blk_col = nonnegative_div(col_in_tile, 4)
+                row_in_blk = nonnegative_mod(row_in_tile, 128)
+                col_in_blk = nonnegative_mod(col_in_tile, 4)
+                row_in_blk0 = nonnegative_mod(row_in_blk, 32)
+                row_in_blk1 = nonnegative_div(row_in_blk, 32)
                 row_in_blk_shuffled = row_in_blk0 * Int32(4) + row_in_blk1
                 data_blk_idx = data_blk_row * Int32(num_col_blocks) + data_blk_col
                 idx_in_blk = row_in_blk_shuffled * Int32(4) + col_in_blk
                 smem_offset = data_blk_idx * Int32(512) + idx_in_blk
             else:
-                data_blk_row = row_in_tile // Int32(8)
-                data_blk_col = col_in_tile // Int32(4)
-                row_in_blk = row_in_tile % Int32(8)
-                col_in_blk = col_in_tile % Int32(4)
+                data_blk_row = nonnegative_div(row_in_tile, 8)
+                data_blk_col = nonnegative_div(col_in_tile, 4)
+                row_in_blk = nonnegative_mod(row_in_tile, 8)
+                col_in_blk = nonnegative_mod(col_in_tile, 4)
                 data_blk_idx = data_blk_row * Int32(num_col_blocks) + data_blk_col
                 idx_in_blk = row_in_blk * Int32(4) + col_in_blk
                 smem_offset = data_blk_idx * Int32(32) + idx_in_blk

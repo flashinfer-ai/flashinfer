@@ -72,7 +72,7 @@ def _resolve_routing_inputs(
         return (
             routing_logits,
             torch.empty(0, dtype=torch.int32, device=hidden_states.device),
-            torch.empty(0, dtype=routing_logits.dtype, device=hidden_states.device),
+            torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device),
         )
 
     if topk_ids is None:

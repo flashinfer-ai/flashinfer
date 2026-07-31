@@ -1787,6 +1787,10 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
+            if cutlass.const_expr(cfg.metadata_tile_n > cfg.tile_n):
+                num_non_exiting_ctas_value *= cutlass.Int32(
+                    cfg.metadata_tile_n // cfg.tile_n
+                )
         clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
@@ -2410,39 +2414,88 @@ def batched_gemm_kernel_bf16(
     ):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-    _batched_gemm_kernel_bf16_body(
-        tma_a_desc,
-        tma_b_desc,
-        tma_c_desc,
-        tma_sfa_desc,
-        tma_sfb_desc,
-        c_tensor,
-        sf_c_tensor,
-        bias_tensor,
-        scale_c_tensor,
-        scale_gate_tensor,
-        gemm1_alpha_tensor,
-        gemm1_beta_tensor,
-        gemm1_clamp_limit_tensor,
-        per_token_sf_a_tensor,
-        per_token_sf_b_tensor,
-        tile_idx_tensor,
-        route_map_tensor,
-        mn_limit_tensor,
-        num_non_exiting_ctas_tensor,
-        total_num_padded_tokens_tensor,
-        act_tensor,
-        sfa_gmem_tensor,
-        sfb_gmem_tensor,
-        problem_m,
-        problem_n,
-        problem_k,
-        num_tokens,
-        num_experts,
-        tile_sched_params,
-        cfg,
-        early_exit_max_token_ctas,
-    )
+    if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
+        # Dynamic-batch kernels launch a max token-CTA grid for
+        # CUDA graph reuse and skip inactive CTAs before touching routing tables.
+        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
+        num_non_exiting_ctas = num_non_exiting_ctas_view.load(
+            idx=Int32(0), vector_size=1
+        )[0]
+        if cutlass.const_expr(cfg.metadata_tile_n > cfg.tile_n):
+            num_non_exiting_ctas *= cutlass.Int32(cfg.metadata_tile_n // cfg.tile_n)
+        block_m, block_n, _ = cute.arch.block_idx()
+        if cutlass.const_expr(cfg.is_swap_ab):
+            token_cta_idx = block_n
+        else:
+            token_cta_idx = block_m
+        if token_cta_idx < num_non_exiting_ctas:
+            _batched_gemm_kernel_bf16_body(
+                tma_a_desc,
+                tma_b_desc,
+                tma_c_desc,
+                tma_sfa_desc,
+                tma_sfb_desc,
+                c_tensor,
+                sf_c_tensor,
+                bias_tensor,
+                scale_c_tensor,
+                scale_gate_tensor,
+                gemm1_alpha_tensor,
+                gemm1_beta_tensor,
+                gemm1_clamp_limit_tensor,
+                per_token_sf_a_tensor,
+                per_token_sf_b_tensor,
+                tile_idx_tensor,
+                route_map_tensor,
+                mn_limit_tensor,
+                num_non_exiting_ctas_tensor,
+                total_num_padded_tokens_tensor,
+                act_tensor,
+                sfa_gmem_tensor,
+                sfb_gmem_tensor,
+                problem_m,
+                problem_n,
+                problem_k,
+                num_tokens,
+                num_experts,
+                tile_sched_params,
+                cfg,
+                early_exit_max_token_ctas,
+            )
+    else:
+        _batched_gemm_kernel_bf16_body(
+            tma_a_desc,
+            tma_b_desc,
+            tma_c_desc,
+            tma_sfa_desc,
+            tma_sfb_desc,
+            c_tensor,
+            sf_c_tensor,
+            bias_tensor,
+            scale_c_tensor,
+            scale_gate_tensor,
+            gemm1_alpha_tensor,
+            gemm1_beta_tensor,
+            gemm1_clamp_limit_tensor,
+            per_token_sf_a_tensor,
+            per_token_sf_b_tensor,
+            tile_idx_tensor,
+            route_map_tensor,
+            mn_limit_tensor,
+            num_non_exiting_ctas_tensor,
+            total_num_padded_tokens_tensor,
+            act_tensor,
+            sfa_gmem_tensor,
+            sfb_gmem_tensor,
+            problem_m,
+            problem_n,
+            problem_k,
+            num_tokens,
+            num_experts,
+            tile_sched_params,
+            cfg,
+            early_exit_max_token_ctas,
+        )
 
 
 # ---------------------------------------------------------------------------

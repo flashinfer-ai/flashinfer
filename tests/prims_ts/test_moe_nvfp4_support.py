@@ -15,16 +15,22 @@
 import pytest
 import torch
 
+from flashinfer.fused_moe.backends.prims_ts.fp4_op import _resolve_routing_inputs
+from flashinfer.fused_moe.shared.inputs import RoutingInputMode
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     DType,
     RouteImpl,
     TileScheduler,
+    make_config,
+    validate_config,
 )
 from flashinfer.prims_ts.moe.config_mapper import (
     _DType,
     _make_json_moe_config_pair,
+    map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_nvfp4_moe_tactics,
 )
+from flashinfer.prims_ts.moe.runner import _split_token_tile_metadata
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import is_sm100a_supported
 
@@ -135,3 +141,72 @@ def test_bs1_deepseek_persistent_pair_gpu_correctness(
         early_exit_max_token_ctas=early_exit_max_token_ctas,
         **cfg,
     )
+
+
+def test_from_logits_uses_bf16_routed_weight_storage():
+    logits = torch.empty((4, 16), dtype=torch.float32)
+    hidden_states = torch.empty((4, 32), dtype=torch.bfloat16)
+
+    resolved_logits, resolved_ids, resolved_weights = _resolve_routing_inputs(
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+        topk_ids=None,
+        topk_weights=None,
+        hidden_states=hidden_states,
+    )
+
+    assert resolved_logits is logits
+    assert resolved_ids.dtype == torch.int32
+    assert resolved_weights.dtype == torch.bfloat16
+
+
+def test_nvfp4_tile256_pair_reuses_metadata_for_tile128_fc1():
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [256, 0],
+        num_tokens=8192,
+        top_k=8,
+        num_local_experts=256,
+        activation_type=int(ActivationType.Swiglu),
+    )
+
+    fc1 = pair.fc1.cfg.build()
+    fc2 = pair.fc2.cfg.build()
+    assert fc1.tile_n == 128
+    assert fc1.metadata_tile_n == 256
+    assert fc2.tile_n == 256
+    assert fc2.metadata_tile_n == 256
+    assert fc1.num_stages_a == 3
+    assert fc2.num_stages_a == 4
+
+
+def test_split_token_tile_metadata_reuses_input_tensors():
+    tile_idx = torch.arange(4, dtype=torch.int32)
+    mn_limit = torch.arange(4, dtype=torch.int32)
+    num_non_exiting_ctas = torch.ones(1, dtype=torch.int32)
+
+    result = _split_token_tile_metadata(
+        tile_idx=tile_idx,
+        mn_limit=mn_limit,
+        num_non_exiting_ctas=num_non_exiting_ctas,
+        source_tile_n=256,
+        target_tile_n=128,
+    )
+
+    assert result[0] is tile_idx
+    assert result[1] is mn_limit
+    assert result[2] is num_non_exiting_ctas
+
+
+def test_validation_rejects_nonintegral_metadata_tile_ratio():
+    cfg = make_config(
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        tile_k=64,
+        mma_k=16,
+        tile_n=128,
+        metadata_tile_n=192,
+    )
+
+    with pytest.raises(ValueError, match="metadata_tile_n must be a positive multiple"):
+        validate_config(cfg)

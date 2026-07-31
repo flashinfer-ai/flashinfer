@@ -32,6 +32,11 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from .batched_gemm_config import BatchedGemmConfig, DType
+from .gmem_ab_resources import (
+    metadata_token_tile,
+    nonnegative_div,
+    nonnegative_mod,
+)
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -203,7 +208,7 @@ class SmemAResource(MemoryResource):
         elif cutlass.const_expr(self.cfg.has_cluster):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = (cta_rank // Int32(self.cfg.cluster_m)) * Int32(
+            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
                 self.cfg.cluster_m
             )
             barrier = prims.mapa(barrier, lead_cta_rank)
@@ -417,7 +422,7 @@ class SmemBResource(MemoryResource):
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
             if cutlass.const_expr(self.cfg.split_b_across_ctas):
-                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
+                lead_cta_rank = nonnegative_div(cta_rank, 2) * Int32(2)
                 barrier = prims.mapa(barrier, lead_cta_rank)
                 # TODO-NVVM: remove cvta_to once mbarrier intrinsics accept AS7.
                 barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
@@ -623,8 +628,9 @@ class SmemGatherResource(MemoryResource):
             coord_tile = tile_coord_m * Int32(tile_rows)
             token_tile = tile_coord_m
 
+        metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=token_tile, vector_size=1)[0],
+            self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
             token_tile,
             tile_rows,
         )
@@ -648,8 +654,10 @@ class SmemGatherResource(MemoryResource):
         is_task_thread = (local_tid >= Int32(0)) & (local_tid < Int32(num_threads))
         for ci in cutlass.range_constexpr(routed_row_count):
             my_copy = local_tid + Int32(ci * num_threads)
-            copy_in_box = my_copy % Int32(tile_rows_per_cta * copies_per_row_box)
-            row_in_tile = copy_in_box // Int32(copies_per_row_box)
+            copy_in_box = nonnegative_mod(
+                my_copy, tile_rows_per_cta * copies_per_row_box
+            )
+            row_in_tile = nonnegative_div(copy_in_box, copies_per_row_box)
             logical_row = coord_tile + cta_row_offset + row_in_tile
             is_valid = (
                 is_task_thread
@@ -750,17 +758,18 @@ class SmemGatherResource(MemoryResource):
         for ci in cutlass.range_constexpr(copies_per_thread):
             my_copy = local_tid + Int32(ci * num_threads)
 
-            k_box = my_copy // Int32(tile_rows_per_cta * copies_per_row_box)
-            copy_in_box = my_copy % Int32(tile_rows_per_cta * copies_per_row_box)
-            row_in_tile = copy_in_box // Int32(copies_per_row_box)
-            col_chunk = copy_in_box % Int32(copies_per_row_box)
+            copies_per_box = tile_rows_per_cta * copies_per_row_box
+            k_box = nonnegative_div(my_copy, copies_per_box)
+            copy_in_box = nonnegative_mod(my_copy, copies_per_box)
+            row_in_tile = nonnegative_div(copy_in_box, copies_per_row_box)
+            col_chunk = nonnegative_mod(copy_in_box, copies_per_row_box)
 
             # SMEM destination with s128b swizzle
             smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * row_box_bytes)
             smem_row_bytes = row_in_tile * Int32(row_box_bytes)
             smem_col_bytes = col_chunk * Int32(copy_bytes)
             smem_off_bytes = smem_kbox_bytes + smem_row_bytes + smem_col_bytes
-            swizzle_mask = (row_in_tile % Int32(8)) * Int32(copy_bytes)
+            swizzle_mask = nonnegative_mod(row_in_tile, 8) * Int32(copy_bytes)
             swizzled_off = smem_off_bytes ^ swizzle_mask
             smem_ptr = stage_base.subview(swizzled_off)
 
@@ -770,8 +779,9 @@ class SmemGatherResource(MemoryResource):
                 if in_bounds:
                     phys_row = self.routed_rows[0 if reuse_route_across_k_boxes else ci]
                     # GMEM source: byte offset from activation base
-                    gmem_col_bytes = (
-                        (coord_k + k_box * Int32(box_k)) * Int32(dtype_bits) // Int32(8)
+                    gmem_col_bits = (coord_k + k_box * Int32(box_k)) * Int32(dtype_bits)
+                    gmem_col_bytes = nonnegative_div(
+                        gmem_col_bits, 8
                     ) + col_chunk * Int32(copy_bytes)
                     gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
@@ -1125,8 +1135,9 @@ class SmemTmaGatherResource(MemoryResource):
 
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
+            metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
+                self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )

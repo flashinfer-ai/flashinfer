@@ -290,7 +290,7 @@
             "per_token_sf_dtype": "fp32",
             "tile_scheduler": "persistent",
             "use_clc_fast_drain": true,
-            "use_work_throttle": true,
+            "use_work_throttle": false,
             "fuse_sf_copy_to_mma": true,
             "fuse_operand_sf_loads": true,
             "use_unroll_loop_2x_for_mma": true,
@@ -298,6 +298,7 @@
             "num_stages_tmem_acc": 2,
             "mma_n": 128,
             "tile_n": 128,
+            "moe_tile_n": [128, 256],
             "epi_tile_n": 32,
             "tile_k": 512,
             "num_stages_a": 3,
@@ -417,7 +418,7 @@
             "num_stages_tmem_acc": 1,
             "use_max_tmem_overlap": true,
             "mma_n,tile_n,epi_tile_n,tile_k,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb,sf_layout_b": [
-                [256, 256, 64, 256, 5, 5, 5, 5, 5, 5, "128x4"]
+                [256, 256, 64, 256, 4, 4, 4, 4, 4, 4, "128x4"]
             ]
         },
         {

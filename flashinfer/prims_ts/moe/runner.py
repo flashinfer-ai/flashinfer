@@ -160,7 +160,14 @@ def _select_expert_weights(
     moe_inputs: MoeRunnerInputs,
     routed_expert_weights: torch.Tensor | None,
 ) -> torch.Tensor:
-    if moe_inputs.expert_weights is not None and moe_inputs.expert_weights.numel() > 0:
+    has_precomputed_routing = (
+        moe_inputs.routing_logits is None or moe_inputs.routing_logits.numel() == 0
+    )
+    if (
+        has_precomputed_routing
+        and moe_inputs.expert_weights is not None
+        and moe_inputs.expert_weights.numel() > 0
+    ):
         return moe_inputs.expert_weights
     if routed_expert_weights is None:
         raise RuntimeError("routing did not return expert weights")
@@ -279,6 +286,32 @@ def _routed_token_capacity(
     if capacity <= 0:
         raise ValueError("routed token capacity is empty")
     return capacity
+
+
+def _split_token_tile_metadata(
+    *,
+    tile_idx: torch.Tensor,
+    mn_limit: torch.Tensor,
+    num_non_exiting_ctas: torch.Tensor,
+    source_tile_n: int,
+    target_tile_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse wider routing metadata for a narrower FC1 compute tile."""
+
+    if source_tile_n == target_tile_n:
+        return tile_idx, mn_limit, num_non_exiting_ctas
+    if source_tile_n != 2 * target_tile_n:
+        raise ValueError(
+            "Mixed Prims-TS MoE token tiles currently require "
+            f"source_tile_n == 2 * target_tile_n, got {source_tile_n} and "
+            f"{target_tile_n}"
+        )
+
+    # The FC1 kernel maps each compute tile back to the corresponding metadata
+    # tile through cfg.metadata_tile_n and scales the CLC early-exit count
+    # inside the kernel. No duplicated metadata tensors or CUDA-graph nodes
+    # are needed here.
+    return tile_idx, mn_limit, num_non_exiting_ctas
 
 
 def _nvfp4_per_token_global_scale_inv() -> float:
@@ -914,16 +947,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-        routing_logits_for_routing = moe_inputs.routing_logits
-        if (
-            routing_logits_for_routing is not None
-            and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
-        ):
-            routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
-
         routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
-            routing_logits_for_routing,
+            moe_inputs.routing_logits,
             kwargs["routing_bias"],
             moe_inputs.topk_ids,
             moe_inputs.expert_weights,
@@ -987,6 +1012,17 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         )
         fc1_cfg = pair.fc1.cfg.build()
         fc2_cfg = pair.fc2.cfg.build()
+        (
+            fc1_tile_idx,
+            fc1_mn_limit,
+            fc1_num_non_exiting_ctas,
+        ) = _split_token_tile_metadata(
+            tile_idx=tile_idx,
+            mn_limit=mn_limit,
+            num_non_exiting_ctas=num_non_exiting_ctas,
+            source_tile_n=pair.tile_n,
+            target_tile_n=fc1_cfg.tile_n,
+        )
 
         if uses_per_token_scaling and not fc1_cfg.has_epilogue_quant:
             gemm1_output = torch.empty(
@@ -1025,7 +1061,16 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             hidden_size=self.hidden_size,
             per_token_sf_b=moe_inputs.per_token_scale,
         )
-        fc1_io = build_nvfp4_launch_io(fc="fc1", cfg=fc1_cfg, **common_io_kwargs)
+        fc1_io = build_nvfp4_launch_io(
+            fc="fc1",
+            cfg=fc1_cfg,
+            **{
+                **common_io_kwargs,
+                "tile_idx": fc1_tile_idx,
+                "mn_limit": fc1_mn_limit,
+                "num_non_exiting_ctas": fc1_num_non_exiting_ctas,
+            },
+        )
         fc1_hash = stable_config_hash(fc1_io["cfg"])
         fc1_fn = get_compiled_gemm(fc1_hash, "nvfp4_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))

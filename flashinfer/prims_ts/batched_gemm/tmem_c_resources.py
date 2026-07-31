@@ -59,6 +59,7 @@ from .batched_gemm_config import (
     TMEM_SF_UTCCP_COLS_PER_COPY,
     TMEM_SF_PACK_SIZE_BYTES,
 )
+from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -758,7 +759,7 @@ class TmemCResource(MemoryResource):
             # column chunk.  Tile256 generated kernels use two 4-warp groups,
             # so one schedule call covers 128 columns without over-unrolling.
             warpgroup_count = max(1, self.cfg.num_epilogue_warps // 4)
-            warpgroup_idx = warp_in_group // Int32(4)
+            warpgroup_idx = nonnegative_div(warp_in_group, 4)
             cols_per_call = self.cfg.epi_tile_n * warpgroup_count
             if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
                 cols_per_call = self.cfg.epi_tile_n
@@ -779,7 +780,7 @@ class TmemCResource(MemoryResource):
                 # 0,1,2,3 corrupts multi-N FC1 shapes because epilogue stores
                 # stale C data for output tiles 1..3.
                 offset_idx_n = actual_idx_n + Int32(num_epilogue_tiles_n - 1)
-                wrapped_idx_n = offset_idx_n % Int32(num_epilogue_tiles_n)
+                wrapped_idx_n = nonnegative_mod(offset_idx_n, num_epilogue_tiles_n)
                 local_set_is_zero = self._epi_local_idx == Int32(0)
                 # Do not assign Python locals inside staged if/else here.
                 # PyIR keeps the original local value live after the staged

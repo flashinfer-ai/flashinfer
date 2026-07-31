@@ -53,6 +53,33 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
 )
 
+
+def nonnegative_div(value, divisor: int):
+    """Divide an index by a positive constant without signed correction code."""
+
+    if divisor > 0 and divisor & (divisor - 1) == 0:
+        return value >> Int32(divisor.bit_length() - 1)
+    return value // Int32(divisor)
+
+
+def nonnegative_mod(value, divisor: int):
+    """Modulo an index by a positive constant without signed correction code."""
+
+    if divisor > 0 and divisor & (divisor - 1) == 0:
+        return value & Int32(divisor - 1)
+    return value % Int32(divisor)
+
+
+def metadata_token_tile(cfg, token_tile, token_rows: int):
+    """Map a compute token tile to its external routing-metadata entry."""
+
+    metadata_rows = cfg.metadata_tile_n or token_rows
+    ratio = metadata_rows // token_rows
+    if ratio > 1:
+        return nonnegative_div(token_tile, ratio)
+    return token_tile
+
+
 Constexpr = cutlass.Constexpr
 
 
@@ -113,9 +140,12 @@ class GmemAResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+        metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
+        self.tile_expert_idx = self.tile_idx_view.load(
+            idx=metadata_tile, vector_size=1
+        )[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
+            self.mn_limit_view.load(idx=metadata_tile, vector_size=1)[0],
             token_tile,
             token_rows,
         )
@@ -223,9 +253,12 @@ class GmemBResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+        metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
+        self.tile_expert_idx = self.tile_idx_view.load(
+            idx=metadata_tile, vector_size=1
+        )[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
+            self.mn_limit_view.load(idx=metadata_tile, vector_size=1)[0],
             token_tile,
             token_rows,
         )

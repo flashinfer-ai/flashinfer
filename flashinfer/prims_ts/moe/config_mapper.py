@@ -163,6 +163,7 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "mma_m",
         "mma_n",
         "mma_regs",
+        "moe_tile_n",
         "num_epilogue_warps",
         "num_load_a_warps",
         "num_load_b_warps",
@@ -631,7 +632,7 @@ def _json_config_matches_moe(
         return False
     if not _bool_value(options.get("transpose_mma_output", True)):
         return False
-    if int(options.get("tile_n", -1)) != int(tile_n):
+    if int(options.get("moe_tile_n", options.get("tile_n", -1))) != int(tile_n):
         return False
 
     route_active = _json_route_value(options.get("route_act", False)) != int(
@@ -888,6 +889,7 @@ def _json_config_kwargs(
         "cluster_m": int(options.get("cluster_m", 1)),
         "tile_m": int(options.get("tile_m", 128)),
         "tile_n": int(options["tile_n"]),
+        "metadata_tile_n": int(options.get("moe_tile_n", options["tile_n"])),
         "tile_k": int(options["tile_k"]),
         "epi_tile_m": int(options.get("epi_tile_m", 128)),
         "epi_tile_n": int(options["epi_tile_n"]),
