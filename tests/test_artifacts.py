@@ -4,6 +4,7 @@ from flashinfer.artifacts import (
     get_subdir_file_list,
 )
 
+import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
@@ -297,6 +298,50 @@ def test_get_available_cubin_files_non_200_response():
         source, retries=1, delay=0, timeout=5
     )
     assert available_cubin_files == ()
+
+
+def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
+    """An artifact pin whose checksums.txt cannot be fetched must fail loudly.
+
+    Guards the diagnosis path exercised by #4280: a pin added to `cubin_dirs`
+    without a published (or, in tests, mocked) manifest used to surface as a bare
+    FileNotFoundError on a local cache path, which reads like a corrupt cache
+    rather than an unreachable pin. `download_file` is stubbed rather than mocked
+    over HTTP so the test does not pay its 4 retries of exponential backoff.
+    """
+    from flashinfer import artifacts
+
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    # The pin must be named -- that is the whole point of the error.
+    assert artifact_paths.DEEPGEMM_RUBIN in str(excinfo.value)
+
+
+def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
+    """A failed refresh must not invalidate an already-cached manifest.
+
+    Offline / FLASHINFER_NO_DOWNLOAD setups rely on the on-disk copy.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
+    cached.parent.mkdir(parents=True)
+    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+
+    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    assert checksums == {
+        safe_urljoin(
+            artifact_paths.DEEPGEMM_RUBIN,
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+        ): "abc123"
+    }
 
 
 @responses.activate
