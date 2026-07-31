@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cstring>
 #include <numeric>
+#include <string>
 
 #include "tvm_ffi_utils.h"
 
@@ -291,14 +292,15 @@ static inline void determine_launch_params(
  * - Backward-compatible 192x128 input type: E4M3 or BF16
  * - Accumulator type: FP32
  * - Layout: Separate Q, K, V tensors
- * - Q/K dimension: 128 or 192, V dimension: 128
- * - Output type: BF16 or FP16 for the backward-compatible 192x128 path
+ * - Standard Q/K/V dimensions: 64x64 or 128x128
+ * - Backward-compatible Q/K/V dimensions: 192x128
+ * - Output type: BF16 for standard paths; BF16 or FP16 for the 192x128 path
  * - Target architecture: SM120/SM121 (Blackwell)
  *
  * @param q Query tensor [batch, q_seqlen, num_heads, head_dim]
  * @param k Key tensor [batch, kv_seqlen, num_kv_heads, head_dim]
- * @param v Value tensor [batch, kv_seqlen, num_kv_heads, 128]
- * @param o Output tensor [batch, q_seqlen, num_heads, 128]
+ * @param v Value tensor [batch, kv_seqlen, num_kv_heads, head_dim_v]
+ * @param o Output tensor [batch, q_seqlen, num_heads, head_dim_v]
  * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
  * @param cum_seq_lens Persistent device tensor [batch + 1] with uniform sequence offsets
  * @param scale_bmm1_d Optional persistent device tensor containing the FP8 QK scale
@@ -332,7 +334,7 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   assert(head_dim == q.shape()[3] &&
          "head_dim must be equal to the head dimension in the query tensor");
   // head_dim_v
-  const int head_dim_v = v.shape()[3];  // Should be 128
+  const int head_dim_v = v.shape()[3];  // Matches Q/K for standard paths; 128 for 192x128.
 
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
@@ -438,7 +440,11 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
         params, launch_params, stream);
   } else {
-    throw std::runtime_error("Unsupported data type");
+    throw std::runtime_error(
+        "Unsupported FMHAv2 configuration: head_dim=" + std::to_string(head_dim) + ", head_dim_v=" +
+        std::to_string(head_dim_v) + ", data_type=" + std::to_string(static_cast<int>(data_type)) +
+        ", output_dtype=" + std::to_string(static_cast<int>(output_dtype)) +
+        ", acc_type=" + std::to_string(static_cast<int>(acc_type)));
   }
 }
 
