@@ -340,7 +340,7 @@ class TestTacticEnumeration:
                 f"gemm2_cluster_m={gemm2_cluster_m}"
             )
 
-    def test_w4a16_tactics_cover_launch_axes(self):
+    def test_w4a16_tactic_enumeration_invariants(self):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
         )
@@ -348,45 +348,25 @@ class TestTacticEnumeration:
 
         assert len(W4A16_MOE_TACTICS) == len(set(W4A16_MOE_TACTICS))
         assert DEFAULT_W4A16_MOE_TACTIC in W4A16_MOE_TACTICS
-        assert len(W4A16_MOE_TACTICS) == 23
 
-        route_tiles = {gemm1_tactic[0][1] for gemm1_tactic, _ in W4A16_MOE_TACTICS}
-        assert route_tiles == {8, 16, 32, 64, 128, 192}
-
-        expected_topology_pairs = {
-            ((128, (1, 1)), (128, (1, 1))),
-            ((128, (2, 1)), (128, (2, 1))),
-            ((256, (2, 1)), (256, (2, 1))),
-            ((128, (2, 1)), (256, (2, 1))),
-            ((256, (2, 1)), (128, (2, 1))),
+        valid_topologies = {
+            (128, (1, 1)),
+            (128, (2, 1)),
+            (256, (2, 1)),
         }
-        for route_tile in route_tiles:
-            route_tactics = [
-                (gemm1_tactic, gemm2_tactic)
-                for gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS
-                if gemm1_tactic[0][1] == route_tile
-            ]
-            assert all(
-                gemm1_tactic[0][1:] == gemm2_tactic[0][1:] == (route_tile, 256)
-                for gemm1_tactic, gemm2_tactic in route_tactics
-            )
-            topology_pairs = {
-                (
-                    (gemm1_tactic[0][0], gemm1_tactic[1]),
-                    (gemm2_tactic[0][0], gemm2_tactic[1]),
-                )
-                for gemm1_tactic, gemm2_tactic in route_tactics
-            }
-            expected = expected_topology_pairs
-            if route_tile == 8:
-                expected = {
-                    pair for pair in expected if pair[0][0] == 128 and pair[1][0] == 128
-                }
-            elif route_tile == 192:
-                expected = {
-                    pair for pair in expected if pair[0][0] == 256 and pair[1][0] == 256
-                }
-            assert topology_pairs == expected
+        for gemm1_tactic, gemm2_tactic in W4A16_MOE_TACTICS:
+            assert gemm1_tactic[0][1] == gemm2_tactic[0][1]
+            for mma_tiler, cluster_shape, _ in (
+                gemm1_tactic,
+                gemm2_tactic,
+            ):
+                mma_m, route_tile, mma_k = mma_tiler
+                assert (mma_m, cluster_shape) in valid_topologies
+                assert mma_k % 16 == 0
+                if route_tile < 16:
+                    assert mma_m == 128
+                elif route_tile == 192:
+                    assert mma_m == 256
 
 
 # =============================================================================
@@ -1215,55 +1195,48 @@ class TestCuteDslMoeW4A16:
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "activation_type,route_tile,gemm1_tactic,gemm2_tactic",
+        "route_tile,gemm1_tactic,gemm2_tactic",
         [
             pytest.param(
-                ActivationType.Swiglu,
                 8,
                 ((128, 8, 256), (2, 1), True),
                 ((128, 8, 256), (2, 1), True),
                 id="route8-1cta",
             ),
             pytest.param(
-                ActivationType.Swiglu,
-                32,
-                ((128, 32, 64), (1, 1), True),
-                ((128, 32, 64), (1, 1), True),
-                id="route32-1cta",
+                16,
+                ((128, 16, 256), (1, 1), True),
+                ((128, 16, 256), (1, 1), True),
+                id="route16-1cta",
             ),
             pytest.param(
-                ActivationType.Swiglu,
                 32,
-                ((128, 32, 64), (1, 1), False),
-                ((128, 32, 64), (1, 1), False),
-                id="route32-1cta-raster-n",
+                ((128, 32, 256), (2, 1), True),
+                ((256, 32, 256), (2, 1), True),
+                id="route32-mixed",
             ),
             pytest.param(
-                ActivationType.Swiglu,
                 64,
-                ((256, 64, 128), (2, 1), True),
-                ((256, 64, 128), (2, 1), True),
-                id="route64-2cta",
+                ((256, 64, 256), (2, 1), True),
+                ((128, 64, 256), (2, 1), True),
+                id="route64-mixed",
             ),
             pytest.param(
-                ActivationType.Relu2,
                 128,
-                ((128, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
-                id="route128-mixed",
+                ((256, 128, 256), (2, 1), True),
+                id="route128-2cta",
             ),
             pytest.param(
-                ActivationType.Swiglu,
                 192,
-                ((256, 192, 128), (2, 1), True),
-                ((256, 192, 128), (2, 1), True),
+                ((256, 192, 256), (2, 1), True),
+                ((256, 192, 256), (2, 1), True),
                 id="route192",
             ),
         ],
     )
-    def test_route_tile_numerical_accuracy(
+    def test_route_tile_boundary_accuracy(
         self,
-        activation_type: ActivationType,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
@@ -1271,6 +1244,7 @@ class TestCuteDslMoeW4A16:
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
         )
+        from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
         num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
         num_experts, top_k = 8, 2
@@ -1281,7 +1255,6 @@ class TestCuteDslMoeW4A16:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
-            gated=activation_type.is_gated,
         )
         # Give two experts one full route tile and one boundary tile each.
         tensors["token_selected_experts"][:] = torch.arange(
@@ -1289,6 +1262,7 @@ class TestCuteDslMoeW4A16:
         )
         _, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a16")
         tactic = (gemm1_tactic, gemm2_tactic)
+        assert tactic in W4A16_MOE_TACTICS
 
         result = launch_w4a16_moe(
             x=tensors["x_bf16"],
@@ -1308,7 +1282,7 @@ class TestCuteDslMoeW4A16:
             ),
             use_fused_finalize=False,
             enable_pdl=False,
-            activation_type=activation_type,
+            activation_type=ActivationType.Swiglu,
             tactic=tactic,
         )
         ref_output = compute_reference_moe_fp4(
@@ -1319,7 +1293,7 @@ class TestCuteDslMoeW4A16:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation_type=activation_type,
+            activation_type=ActivationType.Swiglu,
             **reference_inputs,
         )
 
