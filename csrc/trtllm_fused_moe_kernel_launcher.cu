@@ -3129,10 +3129,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
           << "FP8 per-tensor currently supports gated activations only, "
           << "got act_type=" << act_type << ".";
     }
-    return Fp8PerTensorLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, use_shuffled_weight, weight_layout, dtype_act, dtype_weights,
-        use_per_token_scaling);
+    return Fp8PerTensorLauncher::getValidConfigs(top_k, hidden_size, hidden_size_output,
+                                                 intermediate_size, num_local_experts, num_tokens,
+                                                 act_type, use_shuffled_weight, weight_layout,
+                                                 dtype_act, dtype_weights, use_per_token_scaling);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     if (has_gemm1_lora_delta) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)

@@ -531,9 +531,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
   // Align the intermediate before scaling by the gate factor, so that both the per-gate half
   // and the full N dimension land on the alignment boundary.
   int32_t const alignedValidIntermediate = alignValidDim(validIntermediateSize, intermediateSize);
-  int32_t validN = (alignedValidIntermediate >= 0)
-                       ? intermediateSizeFactor * alignedValidIntermediate
-                       : -1;
+  int32_t validN =
+      (alignedValidIntermediate >= 0) ? intermediateSizeFactor * alignedValidIntermediate : -1;
   int32_t validK = alignValidDim(validHiddenSize, hiddenSize);
   if (mBiasType == batchedGemm::gemm::BiasType::Mn) {
     FLASHINFER_CHECK(ptrBias != nullptr,
