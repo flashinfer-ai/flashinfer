@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from ..api_logging import flashinfer_api
-
 # world sizes for which the fused-transpose NVLink kernel is instantiated;
 # lives here (the policy layer) so the dependency direction stays
 # ulysses.py -> ulysses_topology.py with no cycle
@@ -72,7 +70,6 @@ class UlyssesBackendDecision:
     reason: str
 
 
-@flashinfer_api
 def probe_ulysses_rank_topology(
     device: Optional[Union[torch.device, str, int]], rank: int
 ) -> UlyssesRankTopology:
@@ -164,7 +161,6 @@ def probe_ulysses_rank_topology(
     return topo
 
 
-@flashinfer_api
 def decide_ulysses_backend(
     requested: str,
     topologies: List[UlyssesRankTopology],
@@ -267,7 +263,6 @@ def decide_ulysses_backend(
     )
 
 
-@flashinfer_api
 def resolve_ulysses_backend(
     backend: str = "auto",
     group: Optional[dist.ProcessGroup] = None,
