@@ -539,7 +539,8 @@ class MoEMicroKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
-        atom_layout = cute.make_layout((2, 2, 1))
+        atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -552,7 +553,6 @@ class MoEMicroKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        atom_shape = (2, 2, 1)
         self.num_m_tiles = self.tile_shape_mnk[0] // (16 * atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64

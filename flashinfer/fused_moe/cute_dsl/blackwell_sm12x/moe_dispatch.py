@@ -899,6 +899,7 @@ def _get_micro_kernel(
     quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
+    quant_mode = _normalize_quant_mode(quant_mode)
     sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
@@ -2839,6 +2840,7 @@ def _pad_intermediate_to_tile(
         m_pad = ((m + 127) // 128) * 128
         sw = sw.reshape(E, m_pad, -1)
         cb = (k + sf_vec_size - 1) // sf_vec_size
+        # MXFP4 logical scales remain raw UE8M0 bytes.
         if quant_mode == "mxfp4":
             cols_padded = ((cb + 3) // 4) * 4
             return torch.stack(
@@ -2852,6 +2854,7 @@ def _pad_intermediate_to_tile(
                 ],
                 0,
             )
+        # NVFP4 logical scales are decoded float32 magnitudes.
         return torch.stack(
             [unswizzle_block_scale(sw[e], rows=m, cols_blocks=cb) for e in range(E)], 0
         )

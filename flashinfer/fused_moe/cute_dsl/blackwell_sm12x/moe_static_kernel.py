@@ -513,7 +513,8 @@ class MoEStaticKernel:
                 self.acc_dtype,
                 self.sf_dtype,
             )
-        atom_layout = cute.make_layout((2, 2, 1))
+        atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -526,7 +527,6 @@ class MoEStaticKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        atom_shape = (2, 2, 1)
         self.num_m_tiles = self.tile_shape_mnk[0] // (16 * atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
@@ -1071,7 +1071,7 @@ class MoEStaticKernel:
             row = _ld_shared_i32(ctrl_base_addr + Int32(4))
 
             # Distribute quantization across ALL CTA threads, not just leader.
-            # Each FP4 block (16 elements) is independent — perfect parallelism.
+            # Each scale vector can be quantized and packed independently.
             gs_value = input_global_scale[expert_id].to(cutlass.Float32)
             if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(0.0):
                 if self.fast_math:
