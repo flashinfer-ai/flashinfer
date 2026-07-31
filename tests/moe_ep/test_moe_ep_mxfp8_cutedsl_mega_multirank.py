@@ -583,7 +583,7 @@ def _all_gather_stack(t):
     return stacked.view(tc.dtype) if byte_wire else stacked
 
 
-def _run_mega_torch_oracle(rank, world_size):
+def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = False):
     """Real-EP kernel launch vs the drop's torch GLOBAL reference.
 
     Parity alone cannot catch a kernel that is wrong but self-consistent at
@@ -599,6 +599,10 @@ def _run_mega_torch_oracle(rank, world_size):
     ``(num_ranks, tokens_per_rank, ...)`` operands and computes
     ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
     its own output slice within the single-GPU oracle's tolerances.
+
+    ``in_kernel_fc2_reduce`` runs the REDG in-flight combine variant (torch
+    reference unchanged; the compare widens by the bf16 K-term accumulation
+    band, see ``_assert_ikr_close``).
     """
     import torch
     import torch.distributed as dist
@@ -637,7 +641,9 @@ def _run_mega_torch_oracle(rank, world_size):
     )
     problem["topk_ids"][0, : forced.numel()] = forced
 
-    kernel = create_mega_kernel(_megakernel_config(problem))
+    kernel = create_mega_kernel(
+        _megakernel_config(problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+    )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
@@ -655,6 +661,7 @@ def _run_mega_torch_oracle(rank, world_size):
             world_size,
             kind=problem["kind"],
             gate_up_clamp=problem["gate_up_clamp"],
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
         stage_mega_moe_inputs(
             problem["hidden_states"],
@@ -720,15 +727,33 @@ def _run_mega_torch_oracle(rank, world_size):
         yk = y_kernel.to(torch.float32)
         rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
         print(
-            f"[mxfp8 multirank oracle rank {rank}] rel_l2={rel_l2.item():.4g} "
+            f"[mxfp8 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
+            f"rel_l2={rel_l2.item():.4g} "
             f"max|d|={(yk - y_ref).abs().max().item():.4g} "
             f"amax(ref)={y_ref.abs().max().item():.4g}"
         )
         # Single-GPU oracle tolerances: random unscaled bf16 weights yield
         # |y|~1e2–1e3; kernel vs torch ref can differ by ~1 bf16 ULP (|d|≈8)
         # on a handful of cells.
-        torch.testing.assert_close(yk, y_ref, atol=8.0, rtol=0.05)
-        assert rel_l2.item() < 0.02
+        if in_kernel_fc2_reduce:
+            # The REDG reduce accumulates the K per-topk bf16 terms in
+            # nondeterministic order vs the reference's fp32 sum; widen the
+            # band by the bf16 K-term accumulation band per row (same bound
+            # as _assert_ikr_close).
+            diff = (yk - y_ref).abs()
+            row_scale = torch.maximum(yk.abs(), y_ref.abs()).amax(dim=1, keepdim=True)
+            tol = (
+                8.0 + 0.05 * y_ref.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
+            )
+            worst = (diff - tol).max().item()
+            assert worst <= 0.0, (
+                f"ikr oracle output outside the widened band "
+                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+            )
+            assert rel_l2.item() < 0.03
+        else:
+            torch.testing.assert_close(yk, y_ref, atol=8.0, rtol=0.05)
+            assert rel_l2.item() < 0.02
         return rank
     finally:
         finalize_moe_ep_runtime(runtime)
@@ -736,14 +761,20 @@ def _run_mega_torch_oracle(rank, world_size):
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle():
+@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
+def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     """Real cross-rank EP kernel vs the drop's torch global math (see helper doc)."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_torch_oracle(rank, world_size)
-    print(f"rank {rank}: mxfp8_cutedsl mega kernel matches the multi-rank torch oracle")
+    rank = _run_mega_torch_oracle(
+        rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+    )
+    print(
+        f"rank {rank}: mxfp8_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}) "
+        "matches the multi-rank torch oracle"
+    )
 
 
 @pytest.mark.arch_blackwell

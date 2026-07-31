@@ -78,8 +78,10 @@ from .shim import (
 # backend + verification tests still reach them only through this boundary (the
 # access happens inside their functions).  See ``shim/kernel_helpers.py``.
 _LAZY_HELPERS = (
+    "CombineFormat",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
+    "combine_roundtrip_to_fp32",
     "compute_megamoe_reference_mxfp8",
 )
 
@@ -96,6 +98,7 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    "CombineFormat",
     "MegaMoEMxfp8SymmBuffer",
     "MegaMoESymmBuffer",
     "Mxfp8BlockSize",
@@ -107,6 +110,7 @@ __all__ = [
     "autotune_nvfp4_mega_moe",
     "bootstrap_paths",
     "ceil_div",
+    "combine_roundtrip_to_fp32",
     "compute_megamoe_reference_mxfp8",
     "create_dummy_inputs",
     "create_dummy_mxfp8_inputs",

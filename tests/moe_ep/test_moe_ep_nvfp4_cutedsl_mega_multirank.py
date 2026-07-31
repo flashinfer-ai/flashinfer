@@ -732,7 +732,13 @@ def _identity_epilogue_params(num_local_experts: int):
     return ones, ones.clone(), ones.clone()
 
 
-def _run_mega_torch_oracle(rank, world_size):
+def _run_mega_torch_oracle(
+    rank,
+    world_size,
+    *,
+    in_kernel_fc2_reduce: bool = False,
+    combine_dtype: str = "bf16",
+):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
     Parity tests alone cannot catch a kernel that is wrong but self-consistent
@@ -748,6 +754,14 @@ def _run_mega_torch_oracle(rank, world_size):
     (``_torch_nvfp4_mega_reference``): y[t] = Σ_k w_k · expert_{id_k}(x_t) is
     per-token math, so the local token shard against global weights is the
     full ground truth for this rank's output slice.
+
+    Variants: ``in_kernel_fc2_reduce`` runs the REDG in-flight combine (torch
+    reference unchanged; the compare widens by the bf16 K-term accumulation
+    band, see ``_assert_ikr_close``).  A quantized ``combine_dtype`` runs the
+    low-precision combine wire; the oracle models the wire exactly via
+    ``combine_roundtrip_to_fp32`` on each per-topk fc2 term (mirroring the
+    device combine encoder + topk_reduce), so the tolerance band stays the
+    single-GPU one.  The two knobs are mutually exclusive (shim contract).
     """
     import torch
     import torch.distributed as dist
@@ -794,7 +808,14 @@ def _run_mega_torch_oracle(rank, world_size):
     )
     problem["topk_ids"][0, : forced.numel()] = forced
 
-    kernel = create_mega_kernel(_megakernel_config(problem, epilogue_via_config=True))
+    kernel = create_mega_kernel(
+        _megakernel_config(
+            problem,
+            epilogue_via_config=True,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            combine_dtype=combine_dtype,
+        )
+    )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
@@ -811,6 +832,8 @@ def _run_mega_torch_oracle(rank, world_size):
             rank,
             world_size,
             gate_up_clamp=problem["gate_up_clamp"],
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
@@ -862,6 +885,23 @@ def _run_mega_torch_oracle(rank, world_size):
         fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
         fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
 
+        # Model the quantized combine wire in the reference: each per-topk fc2
+        # term goes bf16 → wire quantize → dequantize exactly as the device
+        # combine encoder + topk_reduce do.
+        term_transform = None
+        if combine_dtype != "bf16":
+            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+                CombineFormat,
+                combine_roundtrip_to_fp32,
+            )
+
+            wire = CombineFormat.parse(
+                {"nvfp4": "16e2m1xbf16", "mxfp8": "32e4m3xe8m0"}[combine_dtype]
+            )
+
+            def term_transform(t):
+                return combine_roundtrip_to_fp32(t.to(torch.bfloat16).float(), wire)
+
         y_ref = _torch_nvfp4_mega_reference(
             act_packed=x_local,
             act_sf=x_sf_local,
@@ -874,6 +914,7 @@ def _run_mega_torch_oracle(rank, world_size):
             hidden=problem["hidden"],
             intermediate=problem["intermediate"],
             gate_up_clamp=problem["gate_up_clamp"],
+            term_transform=term_transform,
         )
 
         assert torch.isfinite(y_kernel).all()
@@ -881,7 +922,8 @@ def _run_mega_torch_oracle(rank, world_size):
         yr = y_ref.to(torch.float32)
         rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
         print(
-            f"[nvfp4 multirank oracle rank {rank}] rel_l2={rel_l2.item():.4g} "
+            f"[nvfp4 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce} "
+            f"combine={combine_dtype}] rel_l2={rel_l2.item():.4g} "
             f"max|d|={(yk - yr).abs().max().item():.4g} "
             f"amax(ref)={yr.abs().max().item():.4g}"
         )
@@ -889,8 +931,23 @@ def _run_mega_torch_oracle(rank, world_size):
         # fc1-out + accumulation-order noise; atol scales with the output
         # range (random unscaled weights put |y|~1e4 here).
         atol = 2e-3 * yr.abs().max().item()
-        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
-        assert rel_l2.item() < 0.02
+        if in_kernel_fc2_reduce:
+            # The REDG reduce accumulates the K per-topk bf16 terms in
+            # nondeterministic order vs the reference's fp32 sum; widen the
+            # quant band by the bf16 K-term accumulation band per row (same
+            # bound as _assert_ikr_close).
+            diff = (yk - yr).abs()
+            row_scale = torch.maximum(yk.abs(), yr.abs()).amax(dim=1, keepdim=True)
+            tol = atol + 0.05 * yr.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
+            worst = (diff - tol).max().item()
+            assert worst <= 0.0, (
+                f"ikr oracle output outside the widened band "
+                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+            )
+            assert rel_l2.item() < 0.03
+        else:
+            torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+            assert rel_l2.item() < 0.02
         return rank
     finally:
         finalize_moe_ep_runtime(runtime)
@@ -898,15 +955,34 @@ def _run_mega_torch_oracle(rank, world_size):
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle():
+@pytest.mark.parametrize(
+    "in_kernel_fc2_reduce,combine_dtype",
+    [
+        (False, "bf16"),
+        (True, "bf16"),
+        (False, "nvfp4"),
+        (False, "mxfp8"),
+    ],
+)
+def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
+    in_kernel_fc2_reduce, combine_dtype
+):
     """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
     _require_cuda()
     pytest.importorskip("triton")
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_torch_oracle(rank, world_size)
-    print(f"rank {rank}: nvfp4_cutedsl mega kernel matches the multi-rank torch oracle")
+    rank = _run_mega_torch_oracle(
+        rank,
+        world_size,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        combine_dtype=combine_dtype,
+    )
+    print(
+        f"rank {rank}: nvfp4_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
+        f"combine={combine_dtype}) matches the multi-rank torch oracle"
+    )
 
 
 @pytest.mark.arch_blackwell

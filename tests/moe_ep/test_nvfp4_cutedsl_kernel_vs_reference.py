@@ -198,6 +198,7 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
@@ -205,6 +206,10 @@ def _torch_nvfp4_mega_reference(
     SwiGLU fold (+clamp) → per-token topk weight folded in BEFORE the fc1-out
     NVFP4 round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is
     bounded by NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
+
+    ``term_transform``, when set, is applied to each per-(token, topk) fc2
+    output term before the topk sum; the multirank oracle uses it to model the
+    quantized cross-rank combine wire (``combine_roundtrip_to_fp32``).
     """
     import torch
 
@@ -254,7 +259,10 @@ def _torch_nvfp4_mega_reference(
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        out[tokens, slots] = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        if term_transform is not None:
+            fc2_out = term_transform(fc2_out)
+        out[tokens, slots] = fc2_out
 
     return out.sum(dim=1).to(torch.bfloat16)
 

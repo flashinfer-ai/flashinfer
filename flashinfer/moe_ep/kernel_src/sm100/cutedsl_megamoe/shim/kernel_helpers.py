@@ -44,6 +44,11 @@ _LAZY = {
         "moe_mxfp8_glu.mega_reference_mxfp8",
         "compute_megamoe_reference_mxfp8",
     ),
+    "CombineFormat": ("src.token_comm", "CombineFormat"),
+    "combine_roundtrip_to_fp32": (
+        "moe_nvfp4_swapab.mega_reference",
+        "combine_roundtrip_to_fp32",
+    ),
 }
 
 
@@ -68,7 +73,9 @@ __all__ = [
     "to_blocked",
     "_stack_byte_reinterpretable_tensors",
     # lazy (resolved via PEP 562 __getattr__ above)
+    "CombineFormat",  # noqa: F822
     "_make_e8m0_scale_tensor",  # noqa: F822
     "_make_fp8_tensor",  # noqa: F822
+    "combine_roundtrip_to_fp32",  # noqa: F822
     "compute_megamoe_reference_mxfp8",  # noqa: F822
 ]
