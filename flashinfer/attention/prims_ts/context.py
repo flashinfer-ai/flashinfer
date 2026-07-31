@@ -220,9 +220,10 @@ def _validate_device(device: torch.device) -> int:
 def _validate_mask(mask_type: str) -> None:
     if not isinstance(mask_type, str):
         raise TypeError("mask_type must be a string")
-    if mask_type not in ("dense", "causal"):
+    if mask_type not in ("dense", "causal", "variable_window"):
         raise ValueError(
-            f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}"
+            "mask_type must be exactly 'dense', 'causal', or "
+            f"'variable_window', got {mask_type!r}"
         )
 
 
@@ -238,6 +239,40 @@ def _validate_window_left(window_left: int, mask_type: str) -> int:
     if window_left > 0 and mask_type != "causal":
         raise ValueError("a positive window_left requires mask_type='causal'")
     return window_left
+
+
+def _validate_variable_window_bounds(
+    starts: Optional[torch.Tensor],
+    ends: Optional[torch.Tensor],
+    *,
+    geometry: _ContextGeometry,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate inclusive per-query K bounds for contiguous attention."""
+    if starts is None or ends is None:
+        raise ValueError(
+            "variable_window_token_starts and variable_window_token_ends are "
+            "required for mask_type='variable_window'"
+        )
+    if geometry.packed:
+        raise NotImplementedError(
+            "variable_window currently requires fixed [B, S, H, D] tensors"
+        )
+    expected_shape = (geometry.batch_size, geometry.max_seq_len_q)
+    for tensor, name in (
+        (starts, "variable_window_token_starts"),
+        (ends, "variable_window_token_ends"),
+    ):
+        _validate_tensor(tensor, name)
+        if tensor.device != geometry.device:
+            raise ValueError(f"{name} must be on {geometry.device}, got {tensor.device}")
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        _validate_compact(tensor, name, "[B, Sq]")
+    return starts.flatten(), ends.flatten()
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -1010,6 +1045,7 @@ def _get_compiled_context(
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     is_causal = mask_type == "causal"
+    has_variable_window = mask_type == "variable_window"
     # Construct the scheduler-independent topology first. Immutable
     # single-instance domains can use the lower-overhead static persistent
     # queue; paired or live-ragged domains are reconstructed with CLC.
@@ -1021,6 +1057,7 @@ def _get_compiled_context(
         d=head_dim,
         is_persistent=True,
         is_causal=is_causal,
+        has_variable_window=has_variable_window,
         balance_causal_workload=_uses_heavy_first_static_causal_raster(
             mask_type=mask_type,
             window_left=window_left,
@@ -1067,6 +1104,7 @@ def _get_compiled_context(
             d=head_dim,
             is_persistent=True,
             is_causal=is_causal,
+            has_variable_window=has_variable_window,
             is_clc_dynamic=True,
             head_paired=head_paired,
             window_size_left=window_left if window_left > 0 else 0,
@@ -1083,6 +1121,7 @@ def _get_compiled_context(
             d=head_dim,
             is_persistent=False,
             is_causal=is_causal,
+            has_variable_window=has_variable_window,
             is_clc_dynamic=False,
             head_paired=head_paired,
             window_size_left=window_left if window_left > 0 else 0,
@@ -1116,6 +1155,8 @@ def _get_compiled_context(
         output_scale: cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
+        variable_window_token_starts: cute.Tensor,
+        variable_window_token_ends: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1138,6 +1179,8 @@ def _get_compiled_context(
                 kv_indptr,
                 cutlass.Int32(static_max_seq_len_q),
                 cutlass.Int32(static_max_seq_len_k),
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
             )
         else:
             fmha(
@@ -1149,6 +1192,8 @@ def _get_compiled_context(
                 output_scale,
                 static_max_active_clusters,
                 stream,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1182,6 +1227,15 @@ def _get_compiled_context(
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     qo_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
     kv_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
+    variable_window_shape = (
+        (batch_size * max_seq_len_q,) if has_variable_window else (1,)
+    )
+    variable_window_starts_fake = fake_compact(
+        cutlass.Int32, variable_window_shape, 4
+    )
+    variable_window_ends_fake = fake_compact(
+        cutlass.Int32, variable_window_shape, 4
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1197,6 +1251,8 @@ def _get_compiled_context(
             output_scale_fake,
             qo_indptr_fake,
             kv_indptr_fake,
+            variable_window_starts_fake,
+            variable_window_ends_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -1580,8 +1636,10 @@ class BatchPrefillTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
-        mask_type: Literal["dense", "causal"] = "dense",
+        mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
@@ -1625,6 +1683,28 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
+        if mask_type == "variable_window":
+            planned_window_starts, planned_window_ends = (
+                _validate_variable_window_bounds(
+                    variable_window_token_starts,
+                    variable_window_token_ends,
+                    geometry=geometry,
+                )
+            )
+        else:
+            if (
+                variable_window_token_starts is not None
+                or variable_window_token_ends is not None
+            ):
+                raise ValueError(
+                    "variable-window bounds require mask_type='variable_window'"
+                )
+            planned_window_starts = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_ends = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -1663,6 +1743,8 @@ class BatchPrefillTSWrapper:
         self._kv_indptr = planned_kv_indptr
         self._scale_softmax_log2 = scale_tensor
         self._output_scale = output_scale_tensor
+        self._variable_window_token_starts = planned_window_starts
+        self._variable_window_token_ends = planned_window_ends
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -1701,6 +1783,8 @@ class BatchPrefillTSWrapper:
                 ("kv_indptr", self._kv_indptr),
                 ("scale_softmax_log2", self._scale_softmax_log2),
                 ("output_scale", self._output_scale),
+                ("variable_window_token_starts", self._variable_window_token_starts),
+                ("variable_window_token_ends", self._variable_window_token_ends),
             )
         self._compiled(
             q,
@@ -1711,6 +1795,8 @@ class BatchPrefillTSWrapper:
             self._output_scale,
             self._qo_indptr,
             self._kv_indptr,
+            self._variable_window_token_starts,
+            self._variable_window_token_ends,
         )
         return out
 
@@ -1936,8 +2022,10 @@ def batch_prefill(
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     kv_indptr: Optional[torch.Tensor] = None,
-    mask_type: Literal["dense", "causal"] = "dense",
+    mask_type: Literal["dense", "causal", "variable_window"] = "dense",
     window_left: int = -1,
+    variable_window_token_starts: Optional[torch.Tensor] = None,
+    variable_window_token_ends: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
@@ -1985,6 +2073,8 @@ def batch_prefill(
         kv_indptr=kv_indptr,
         mask_type=mask_type,
         window_left=window_left,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=resolved_out_dtype,
