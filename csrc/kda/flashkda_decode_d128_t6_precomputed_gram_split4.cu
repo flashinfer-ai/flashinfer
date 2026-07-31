@@ -16,8 +16,8 @@
 
 // clang-format off
 // Generated from a recurrent-KDA Loom schedule.
-// Raw generated body SHA256: dfe440270a6cd5fcda89993f581b82742a6376e4eca6c5a6834efe24a0208756
-// Normalized generated SHA256: d55362f36ead2b97b109eab79e04561944aa46f0ad19e0ec902401d5ec70d60a
+// Raw generated body SHA256: f38dc82927095886ce8b030becd0761124d9a0aab3a8373efd17818f7f760463
+// Normalized generated SHA256: bcd1f00f81fbeb45803def145b3dd11517a8427925a2cc383667d7934cd7da64
 // BEGIN FROZEN GENERATED BODY
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -303,35 +303,35 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
                     }
                 }
                 {
-                    __nv_bfloat16 _bval_1100873440 = __float2bfloat16_rn(prefix * r_k[i_3]);
-                    uint16_t _bits_1100873440 = *(uint16_t*)&_bval_1100873440;
-                    uint32_t _addr_1100873440 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
-                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_1100873440), "h"(_bits_1100873440) : "memory");
+                    __nv_bfloat16 _bval_474681680 = __float2bfloat16_rn(prefix * r_k[i_3]);
+                    uint16_t _bits_474681680 = *(uint16_t*)&_bval_474681680;
+                    uint32_t _addr_474681680 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + token * 2 ^ (k_idx_1 * 32 + token * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_474681680), "h"(_bits_474681680) : "memory");
                 }
                 int c_col = 4 + token;
                 {
                     c_col = 8 + token;
                 }
                 {
-                    __nv_bfloat16 _bval_1100870752 = __float2bfloat16_rn(prefix * r_q[i_3]);
-                    uint16_t _bits_1100870752 = *(uint16_t*)&_bval_1100870752;
-                    uint32_t _addr_1100870752 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
-                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_1100870752), "h"(_bits_1100870752) : "memory");
+                    __nv_bfloat16 _bval_474681056 = __float2bfloat16_rn(prefix * r_q[i_3]);
+                    uint16_t _bits_474681056 = *(uint16_t*)&_bval_474681056;
+                    uint32_t _addr_474681056 = static_cast<uint32_t>((sVec_addr + (unsigned int)(k_idx_1 * 32 + c_col * 2 ^ (k_idx_1 * 32 + c_col * 2 >> 7 & 7) << 4)));
+                    asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_474681056), "h"(_bits_474681056) : "memory");
                 }
                 {
                     if (k_idx_1 < 64) {
                         {
-                            __nv_bfloat16 _bval_1100860960 = __float2bfloat16_rn(r_k[i_3] / prefix);
-                            uint16_t _bits_1100860960 = *(uint16_t*)&_bval_1100860960;
-                            uint32_t _addr_1100860960 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
-                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_1100860960), "h"(_bits_1100860960) : "memory");
+                            __nv_bfloat16 _bval_474684272 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_474684272 = *(uint16_t*)&_bval_474684272;
+                            uint32_t _addr_474684272 = static_cast<uint32_t>((sGramA0_addr + (unsigned int)(token * 128 + k_idx_1 * 2 ^ (token * 128 + k_idx_1 * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_474684272), "h"(_bits_474684272) : "memory");
                         }
                     } else {
                         {
-                            __nv_bfloat16 _bval_1100860960 = __float2bfloat16_rn(r_k[i_3] / prefix);
-                            uint16_t _bits_1100860960 = *(uint16_t*)&_bval_1100860960;
-                            uint32_t _addr_1100860960 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
-                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_1100860960), "h"(_bits_1100860960) : "memory");
+                            __nv_bfloat16 _bval_474684272 = __float2bfloat16_rn(r_k[i_3] / prefix);
+                            uint16_t _bits_474684272 = *(uint16_t*)&_bval_474684272;
+                            uint32_t _addr_474684272 = static_cast<uint32_t>((sGramA1_addr + (unsigned int)(token * 128 + (k_idx_1 - 64) * 2 ^ (token * 128 + (k_idx_1 - 64) * 2 >> 7 & 7) << 4)));
+                            asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_474684272), "h"(_bits_474684272) : "memory");
                         }
                     }
                 }
@@ -631,6 +631,12 @@ kernel_flashinfer_recurrent_kda_wy_vtile_short(__nv_bfloat16* __restrict__ q, __
             #pragma unroll
             for (int source_token_2 = 0; source_token_2 < 6; source_token_2++) {
                 float coef4 = sR[24 + source_token_2];
+                {
+                    coef4 = 0.0f;
+                    if (source_token_2 <= 4) {
+                        coef4 = sR[24 + source_token_2];
+                    }
+                }
                 out4_lo += coef4 * u_lo[source_token_2];
                 out4_hi += coef4 * u_hi[source_token_2];
             }
