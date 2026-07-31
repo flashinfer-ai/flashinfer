@@ -252,15 +252,6 @@ def _select_moe_mma_tiler_mn(
     Uses narrower 64x128 tiles when routed_rows <= 128 and default 128x128
     would leave SMs idle.
     """
-    override = os.environ.get("FLASHINFER_B12X_MOE_TILE_MN")
-    if override:
-        if override not in ("64x128", "128x128"):
-            raise ValueError(
-                f"FLASHINFER_B12X_MOE_TILE_MN={override!r} is not supported. "
-                "The micro and static kernels only take 64x128 or 128x128."
-            )
-        tile_m, tile_n = override.split("x")
-        return (int(tile_m), int(tile_n))
     sm_count = get_num_sm(torch.device("cuda"))
     coarse_tile = (128, 128)
     if routed_rows <= 32 and n <= 256:
