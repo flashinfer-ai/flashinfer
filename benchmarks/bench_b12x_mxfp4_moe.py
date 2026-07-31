@@ -127,6 +127,15 @@ def main():
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
 
+    if (
+        any(num_tokens <= 0 for num_tokens in args.tokens)
+        or args.hidden_size <= 0
+        or args.intermediate_size <= 0
+        or args.num_experts <= 0
+        or args.top_k <= 0
+    ):
+        parser.error("tokens, dimensions, num-experts, and top-k must be positive")
+
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) not in ((12, 0), (12, 1)):
         raise RuntimeError(f"b12x MXFP4 MoE requires SM120/SM121, got SM{major}{minor}")
