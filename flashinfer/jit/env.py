@@ -21,6 +21,9 @@ limitations under the License.
 import logging
 import os
 import pathlib
+from dataclasses import dataclass
+from typing import FrozenSet, Tuple
+
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
 
@@ -110,39 +113,106 @@ def _get_cubin_dir():
 FLASHINFER_CUBIN_DIR: pathlib.Path = _get_cubin_dir()
 
 
-def _get_aot_dir():
+@dataclass(frozen=True)
+class AOTProvider:
+    """Installed package that owns a set of architecture-specific AOT modules."""
+
+    provider_id: str
+    distribution: str
+    version: str
+    jit_cache_dir: pathlib.Path
+    cuda_architectures: FrozenSet[str]
+    modules: FrozenSet[str]
+
+
+def _check_jit_cache_version(distribution: str, package_version: str) -> None:
+    # NOTE(Zihao): jit-cache versions contain a CUDA local-version suffix,
+    # for example 0.3.1+cu129, so compare the FlashInfer version prefix.
+    if (
+        not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+        and flashinfer_version != "0.0.0+unknown"
+        and not package_version.startswith(flashinfer_version)
+    ):
+        raise RuntimeError(
+            f"{distribution} version ({package_version}) does not match "
+            f"flashinfer version ({flashinfer_version}). "
+            "Please install the same version of both packages. "
+            "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
+        )
+
+
+def _get_aot_locations() -> Tuple[pathlib.Path, Tuple[AOTProvider, ...]]:
     """
-    Get the AOT directory path with the following priority:
-    1. flashinfer-jit-cache package if installed
-    2. Default fallback to _package_root / "data" / "aot"
+    Get the legacy AOT directory and any installed binary provider packages.
+
+    ``flashinfer-jit-cache`` historically owned one directory containing every
+    module. Newer shim builds discover separately installable providers while
+    retaining that directory as a compatibility fallback.
     """
-    # First check if flashinfer-jit-cache package is installed
     if has_flashinfer_jit_cache():
         import flashinfer_jit_cache
 
         flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
-        # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
-        # contains the CUDA version suffix: e.g. 0.3.1+cu129.
-        # Allow bypassing version check with environment variable
-        if (
-            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
-            and flashinfer_version != "0.0.0+unknown"
-            and not flashinfer_jit_cache_version.startswith(flashinfer_version)
-        ):
-            raise RuntimeError(
-                f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
-                f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages. "
-                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
-            )
+        _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache_version)
 
-        return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
+        providers = []
+        get_providers = getattr(flashinfer_jit_cache, "get_jit_cache_providers", None)
+        if get_providers is not None:
+            for provider in get_providers():
+                _check_jit_cache_version(provider.distribution, provider.version)
+                providers.append(
+                    AOTProvider(
+                        provider_id=provider.provider_id,
+                        distribution=provider.distribution,
+                        version=provider.version,
+                        jit_cache_dir=pathlib.Path(provider.jit_cache_dir),
+                        cuda_architectures=frozenset(provider.cuda_architectures),
+                        modules=frozenset(provider.modules),
+                    )
+                )
 
-    # Fall back to default directory
-    return _package_root / "data" / "aot"
+        return (
+            pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir()),
+            tuple(providers),
+        )
+
+    return _package_root / "data" / "aot", ()
 
 
-FLASHINFER_AOT_DIR: pathlib.Path = _get_aot_dir()
+FLASHINFER_AOT_DIR, FLASHINFER_AOT_PROVIDERS = _get_aot_locations()
+FLASHINFER_AOT_DIRS: Tuple[pathlib.Path, ...] = (FLASHINFER_AOT_DIR,) + tuple(
+    provider.jit_cache_dir for provider in FLASHINFER_AOT_PROVIDERS
+)
+
+
+def _target_cuda_architectures() -> FrozenSet[str]:
+    compilation_context = CompilationContext()
+    return frozenset(
+        f"sm{major}{minor}" for major, minor in compilation_context.TARGET_CUDA_ARCHS
+    )
+
+
+def get_aot_path(module_name: str) -> pathlib.Path:
+    """Resolve an AOT module from the legacy wheel or a compatible provider."""
+    legacy_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    if legacy_path.exists():
+        return legacy_path
+
+    target_architectures = _target_cuda_architectures()
+    if not target_architectures:
+        return legacy_path
+    for provider in FLASHINFER_AOT_PROVIDERS:
+        if module_name not in provider.modules:
+            continue
+        if not target_architectures.issubset(provider.cuda_architectures):
+            continue
+        provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
+        if provider_path.exists():
+            return provider_path
+
+    # JitSpec uses this stable path for existence checks and diagnostics when
+    # no compatible prebuilt module is installed.
+    return legacy_path
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
