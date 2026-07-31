@@ -468,19 +468,22 @@ class TestAutotuneReplayMemsetContract:
             fused_moe.AutoTuner, "get", staticmethod(lambda: StubTuner())
         )
 
-        tensors = {
-            "x": torch.empty((2, 8), dtype=torch.uint8),
-            "x_sf": torch.empty((2, 1), dtype=torch.uint8),
-            "token_selected_experts": torch.zeros((2, 1), dtype=torch.int32),
-            "token_final_scales": torch.ones((2, 1), dtype=torch.float32),
-            "w1_weight": torch.empty((1, 32, 8), dtype=torch.uint8),
-            "w1_weight_sf": torch.empty((1, 32, 1), dtype=torch.uint8),
-            "w1_alpha": torch.ones(1, dtype=torch.float32),
-            "fc2_input_scale": torch.ones(1, dtype=torch.float32),
-            "w2_weight": torch.empty((1, 16, 8), dtype=torch.uint8),
-            "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
-            "w2_alpha": torch.ones(1, dtype=torch.float32),
-        }
+        # Inputs must live on CUDA: the functional API validates the device
+        # arch (require_cute_dsl_arch -> torch.cuda.get_device_capability).
+        with torch.device("cuda"):
+            tensors = {
+                "x": torch.empty((2, 8), dtype=torch.uint8),
+                "x_sf": torch.empty((2, 1), dtype=torch.uint8),
+                "token_selected_experts": torch.zeros((2, 1), dtype=torch.int32),
+                "token_final_scales": torch.ones((2, 1), dtype=torch.float32),
+                "w1_weight": torch.empty((1, 32, 8), dtype=torch.uint8),
+                "w1_weight_sf": torch.empty((1, 32, 1), dtype=torch.uint8),
+                "w1_alpha": torch.ones(1, dtype=torch.float32),
+                "fc2_input_scale": torch.ones(1, dtype=torch.float32),
+                "w2_weight": torch.empty((1, 16, 8), dtype=torch.uint8),
+                "w2_weight_sf": torch.empty((1, 16, 1), dtype=torch.uint8),
+                "w2_alpha": torch.ones(1, dtype=torch.float32),
+            }
 
         if api == "functional":
             monkeypatch.setattr(
