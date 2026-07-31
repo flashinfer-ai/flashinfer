@@ -361,7 +361,7 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def aot_path(self) -> Path:
-        return jit_env.FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
+        return jit_env.get_aot_path(self.name)
 
     @property
     def is_aot(self) -> bool:

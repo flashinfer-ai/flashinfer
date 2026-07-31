@@ -1,0 +1,6 @@
+build/
+dist/
+*.egg-info/
+flashinfer_jit_cache_provider/_build_meta.py
+flashinfer_jit_cache_provider/manifest.json
+flashinfer_jit_cache_provider/jit_cache/
