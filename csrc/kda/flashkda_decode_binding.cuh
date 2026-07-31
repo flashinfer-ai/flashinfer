@@ -45,4 +45,8 @@
 #undef LoomTensorMapPack
 #undef CUtensorMap
 
+#ifdef FLASHKDA_DECODE_DIRECT_IMPL
+#include "flashkda_decode_binding_direct_impl.cuh"
+#else
 #include "flashkda_decode_binding_impl.cuh"
+#endif

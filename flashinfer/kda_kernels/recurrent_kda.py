@@ -1158,10 +1158,14 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 def _select_flash_kda_decode_value_split(
     num_tokens: int, work: int, sm_count: int
 ) -> int:
-    """Reproduce Cake's D128 auto-dispatch across frozen value-row splits."""
+    """Select the measured public-export route across frozen value-row splits."""
 
-    if num_tokens in (1, 2, 4):
-        return 1
+    if num_tokens == 1:
+        return 16 if work <= 2 * sm_count else 8
+    if num_tokens == 2:
+        return 4
+    if num_tokens == 4:
+        return 2
     if num_tokens in (5, 6):
         three_wave_ctas = 3 * sm_count
         if 8 * work <= three_wave_ctas:
@@ -1202,9 +1206,10 @@ def _select_flash_kda_decode_variant(
     """Select a frozen B200 decode schedule for the strict Cake contract.
 
     The exported family covers D128/T=1..6. T=3 preserves its measured
-    lower-bound contract; T=1/2/4/5/6 use precomputed gates. The T3 route is
-    limited to its measured N1/2/4/8/16, H=HV=16 coordinates. ``None`` denotes
-    an unsupported Cake contract and causes the explicit Cake backend to raise.
+    lower-bound contract; T=1/2/4/5/6 use precomputed gates, with T1 routed to
+    measured one-warp direct-state schedules. The T3 route is limited to its
+    measured N1/2/4/8/16, H=HV=16 coordinates. ``None`` denotes an unsupported
+    Cake contract and causes the explicit Cake backend to raise.
     """
 
     f32_max = torch.finfo(torch.float32).max
@@ -1361,8 +1366,13 @@ def _select_flash_kda_decode_variant(
     work = num_sequences * num_value_heads
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     value_split = _select_flash_kda_decode_value_split(num_tokens, work, sm_count)
+    if num_tokens == 1:
+        return cast(
+            FlashKDADecodeVariant,
+            f"d128_t1_precomputed_direct_split{value_split}",
+        )
+
     variant_prefixes = {
-        1: "d128_t1_precomputed_split",
         2: "d128_t2_precomputed_split",
         4: "d128_t4_precomputed_split",
         5: "d128_t5_precomputed_gram_split",

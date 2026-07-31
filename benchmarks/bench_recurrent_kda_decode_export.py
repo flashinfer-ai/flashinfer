@@ -48,16 +48,23 @@ DATA_SEED = 42
 PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 T3_LOWER_BOUND_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
 
-# Keep Cake's source-side auto-dispatch routes in one place. The benchmark
-# coordinates use split1 for every precomputed token count; T3 has one exact
-# lower-bound split4 specialization.
+# Keep the measured public-export routes in one place. T1 uses a direct
+# register-state body with split16 at N8 and split8 at N16+; the exported split
+# sweep selects split4 for T2 and split2 for T4. T3 has one exact lower-bound
+# split4 specialization.
 EXPECTED_VARIANTS_BY_T = {
-    1: "d128_t1_precomputed_split1",
-    2: "d128_t2_precomputed_split1",
+    2: "d128_t2_precomputed_split4",
     3: "d128_t3_lower_bound_split4",
-    4: "d128_t4_precomputed_split1",
+    4: "d128_t4_precomputed_split2",
     5: "d128_t5_precomputed_gram_split1",
     6: "d128_t6_precomputed_gram_split1",
+}
+EXPECTED_T1_VARIANTS_BY_N = {
+    8: "d128_t1_precomputed_direct_split16",
+    16: "d128_t1_precomputed_direct_split8",
+    32: "d128_t1_precomputed_direct_split8",
+    64: "d128_t1_precomputed_direct_split8",
+    128: "d128_t1_precomputed_direct_split8",
 }
 
 
@@ -239,7 +246,7 @@ def _make_case(spec: dict, device: torch.device) -> dict:
 
 
 def _parse_expected_variant_overrides(values: list[str]) -> dict[int, str]:
-    expected_variants = dict(EXPECTED_VARIANTS_BY_T)
+    expected_variants = {}
     for value in values:
         token_text, separator, variant = value.partition("=")
         if not separator or not token_text or not variant:
@@ -252,7 +259,7 @@ def _parse_expected_variant_overrides(values: list[str]) -> dict[int, str]:
             raise ValueError(
                 f"invalid token count {token_text!r} in expected variant {value!r}"
             ) from error
-        if num_tokens not in EXPECTED_VARIANTS_BY_T:
+        if num_tokens not in range(1, 7):
             raise ValueError(
                 f"expected variant token count must be in 1..6, got {num_tokens}"
             )
@@ -260,11 +267,24 @@ def _parse_expected_variant_overrides(values: list[str]) -> dict[int, str]:
     return expected_variants
 
 
+def _expected_variant_for_spec(
+    spec: dict,
+    expected_variant_overrides: dict[int, str],
+) -> str:
+    num_tokens = spec["T"]
+    if num_tokens in expected_variant_overrides:
+        return expected_variant_overrides[num_tokens]
+    if num_tokens == 1:
+        return EXPECTED_T1_VARIANTS_BY_N[spec["N"]]
+    return EXPECTED_VARIANTS_BY_T[num_tokens]
+
+
 def _assert_frozen_route(
-    spec: dict, kwargs: dict, expected_variants: dict[int, str]
+    spec: dict,
+    kwargs: dict,
+    expected_variant: str,
 ) -> str:
     recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
-    expected_variant = expected_variants[spec["T"]]
     selected = []
     run_frozen = recurrent_module._run_flash_kda_decode
     initial_state = kwargs["initial_state"].clone()
@@ -434,8 +454,9 @@ def main() -> None:
         case_ordinal_by_t[spec["T"]] += 1
         kwargs = _make_case(spec, device)
         selected_variant = None
+        expected_variant = _expected_variant_for_spec(spec, expected_variants)
         if args.mode == "frozen":
-            selected_variant = _assert_frozen_route(spec, kwargs, expected_variants)
+            selected_variant = _assert_frozen_route(spec, kwargs, expected_variant)
         call_kwargs = dict(kwargs)
         if args.mode == "frozen":
             call_kwargs["backend"] = "cake"
@@ -510,7 +531,7 @@ def main() -> None:
             "data_seed": DATA_SEED,
             "case_ordinal_within_t": case_ordinal_by_t[spec["T"]],
             "cases_for_t": cases_per_t[spec["T"]],
-            "expected_variant": expected_variants[spec["T"]],
+            "expected_variant": expected_variant,
             "selected_variant": selected_variant,
             "selected_backend": ("cake" if args.mode == "frozen" else "source-default"),
             "correctness": correctness,

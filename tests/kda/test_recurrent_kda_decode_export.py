@@ -33,7 +33,7 @@ _T3 = 3
 _T3_VARIANT = "d128_t3_lower_bound_split4"
 _T3_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
 _PRECOMPUTED_VARIANT_PREFIXES = {
-    1: "d128_t1_precomputed_split",
+    1: "d128_t1_precomputed_direct_split",
     2: "d128_t2_precomputed_split",
     4: "d128_t4_precomputed_split",
     5: _VARIANT_PREFIX,
@@ -306,12 +306,14 @@ def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():
 @pytest.mark.parametrize(
     ("num_tokens", "work", "sm_count", "expected_split"),
     [
-        (1, 1, 148, 1),
-        (1, 4096, 148, 1),
-        (2, 1, 148, 1),
-        (2, 4096, 148, 1),
-        (4, 1, 148, 1),
-        (4, 4096, 148, 1),
+        (1, 1, 148, 16),
+        (1, 296, 148, 16),
+        (1, 297, 148, 8),
+        (1, 4096, 148, 8),
+        (2, 1, 148, 4),
+        (2, 4096, 148, 4),
+        (4, 1, 148, 2),
+        (4, 4096, 148, 2),
         (5, 55, 148, 8),
         (5, 56, 148, 2),
         (5, 74, 148, 2),
@@ -344,22 +346,26 @@ def test_exact_cpu_contract_selects_frozen_variant(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "expected_variant"),
+    ("num_tokens", "num_sequences", "expected_variant"),
     [
-        (1, _PRECOMPUTED_VARIANT_PREFIXES[1] + "1"),
-        (2, _PRECOMPUTED_VARIANT_PREFIXES[2] + "1"),
-        (4, _PRECOMPUTED_VARIANT_PREFIXES[4] + "1"),
-        (5, _PRECOMPUTED_VARIANT_PREFIXES[5] + "1"),
-        (6, _PRECOMPUTED_VARIANT_PREFIXES[6] + "1"),
+        (1, 8, _PRECOMPUTED_VARIANT_PREFIXES[1] + "16"),
+        (1, 16, _PRECOMPUTED_VARIANT_PREFIXES[1] + "8"),
+        (2, 8, _PRECOMPUTED_VARIANT_PREFIXES[2] + "4"),
+        (4, 8, _PRECOMPUTED_VARIANT_PREFIXES[4] + "2"),
+        (5, 8, _PRECOMPUTED_VARIANT_PREFIXES[5] + "1"),
+        (6, 8, _PRECOMPUTED_VARIANT_PREFIXES[6] + "1"),
     ],
 )
-def test_precomputed_token_family_reproduces_cake_dispatch(
-    monkeypatch, num_tokens, expected_variant
+def test_precomputed_token_family_uses_tuned_export_dispatch(
+    monkeypatch, num_tokens, num_sequences, expected_variant
 ):
     _patch_cpu_selector_environment(monkeypatch)
     assert (
         recurrent_module._select_flash_kda_decode_variant(
-            **_fake_precomputed_selector_kwargs(num_tokens)
+            **_fake_precomputed_selector_kwargs(
+                num_tokens,
+                num_sequences=num_sequences,
+            )
         )
         == expected_variant
     )
@@ -1070,11 +1076,13 @@ def test_public_recurrent_kda_forced_t5_splits_match_upstream_cute(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 6])
+@pytest.mark.parametrize(
+    ("num_tokens", "num_sequences"),
+    [(1, 8), (1, 16), (2, 8), (4, 8), (5, 8), (6, 8)],
+)
 def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
-    b200, monkeypatch, num_tokens
+    b200, monkeypatch, num_tokens, num_sequences
 ):
-    num_sequences = 8
     accepted_tokens = (
         None
         if num_tokens == 1
@@ -1143,7 +1151,14 @@ def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
         backend="cake",
     )
 
-    expected_variant = _PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + "1"
+    expected_split = (
+        (16 if num_sequences == 8 else 8)
+        if num_tokens == 1
+        else {2: 4, 4: 2, 5: 1, 6: 1}[num_tokens]
+    )
+    expected_variant = _PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + str(
+        expected_split
+    )
     assert frozen_calls == [expected_variant]
 
     if num_tokens == 1:

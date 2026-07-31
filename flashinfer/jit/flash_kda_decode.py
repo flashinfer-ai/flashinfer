@@ -27,6 +27,8 @@ FlashKDADecodeVariant = Literal[
     "d128_t1_precomputed_split2",
     "d128_t1_precomputed_split4",
     "d128_t1_precomputed_split8",
+    "d128_t1_precomputed_direct_split16",
+    "d128_t1_precomputed_direct_split8",
     "d128_t2_precomputed_split1",
     "d128_t2_precomputed_split2",
     "d128_t2_precomputed_split4",
@@ -51,6 +53,8 @@ FLASH_KDA_DECODE_VARIANTS: tuple[FlashKDADecodeVariant, ...] = (
     "d128_t1_precomputed_split2",
     "d128_t1_precomputed_split4",
     "d128_t1_precomputed_split8",
+    "d128_t1_precomputed_direct_split16",
+    "d128_t1_precomputed_direct_split8",
     "d128_t2_precomputed_split1",
     "d128_t2_precomputed_split2",
     "d128_t2_precomputed_split4",
@@ -77,6 +81,7 @@ class FlashKDADecodeVariantMetadata(NamedTuple):
     gate_kind: int
     value_split: int
     launch_threads: int
+    direct_impl: bool
 
 
 def _variant_metadata(
@@ -84,6 +89,7 @@ def _variant_metadata(
     gate_kind: int,
     value_split: int,
     coefficient_gram: bool = False,
+    direct_impl: bool = False,
 ) -> FlashKDADecodeVariantMetadata:
     """Derive the exact launch geometry used by the frozen Loom schedule."""
 
@@ -99,6 +105,7 @@ def _variant_metadata(
         gate_kind,
         value_split,
         launch_threads,
+        direct_impl,
     )
 
 
@@ -109,6 +116,12 @@ FLASH_KDA_DECODE_VARIANT_METADATA: dict[
     "d128_t1_precomputed_split2": _variant_metadata(1, 0, 2),
     "d128_t1_precomputed_split4": _variant_metadata(1, 0, 4),
     "d128_t1_precomputed_split8": _variant_metadata(1, 0, 8),
+    "d128_t1_precomputed_direct_split16": _variant_metadata(
+        1, 0, 16, direct_impl=True
+    ),
+    "d128_t1_precomputed_direct_split8": _variant_metadata(
+        1, 0, 8, direct_impl=True
+    ),
     "d128_t2_precomputed_split1": _variant_metadata(2, 0, 1),
     "d128_t2_precomputed_split2": _variant_metadata(2, 0, 2),
     "d128_t2_precomputed_split4": _variant_metadata(2, 0, 4),
@@ -179,6 +192,9 @@ def _get_binding_cu(
     """Render the generic binding translation unit for one frozen body."""
 
     body_file = f"flashkda_decode_{variant}.cu"
+    direct_impl_define = (
+        "#define FLASHKDA_DECODE_DIRECT_IMPL 1\n" if metadata.direct_impl else ""
+    )
     return f"""\
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
@@ -202,6 +218,7 @@ def _get_binding_cu(
 #define FLASHKDA_DECODE_GATE_KIND {metadata.gate_kind}
 #define FLASHKDA_DECODE_VALUE_SPLIT {metadata.value_split}
 #define FLASHKDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}
+{direct_impl_define}
 
 #include "flashkda_decode_binding.cuh"
 """

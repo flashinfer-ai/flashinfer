@@ -37,8 +37,9 @@ struct VariantTraits {
   static_assert(HeadDim == 64 || HeadDim == 128);
   static_assert(Tokens >= 1);
   static_assert(GateKind == 0 || GateKind == 1);
-  static_assert(ValueSplit == 1 || ValueSplit == 2 || ValueSplit == 4 || ValueSplit == 8);
-  static_assert(HeadDim % (16 * ValueSplit) == 0);
+  static_assert(ValueSplit == 1 || ValueSplit == 2 || ValueSplit == 4 || ValueSplit == 8 ||
+                ValueSplit == 16);
+  static_assert(HeadDim % ValueSplit == 0);
 
   static constexpr int32_t kHeadDim = HeadDim;
   static constexpr int32_t kTokens = Tokens;

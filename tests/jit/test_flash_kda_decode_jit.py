@@ -42,6 +42,14 @@ FROZEN_GENERATED_BODY_SHA256 = {
         "7b613b50ac99df6cc55bb349deb8dc01adf0f49b049636775a486a41df2a77ae",
         "a38718a0b4383d2f2d2c3ec7eb1746be44e649265b805a3dbcebdd20415612d3",
     ),
+    "d128_t1_precomputed_direct_split16": (
+        "c3aa1abed0b115fba4938103d9fdeeac6e9f9ff3666bcef315fc90e998b5a4f7",
+        "c3aa1abed0b115fba4938103d9fdeeac6e9f9ff3666bcef315fc90e998b5a4f7",
+    ),
+    "d128_t1_precomputed_direct_split8": (
+        "eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210",
+        "eeb66e2c7c175bd7a131ad57646f3590bb6f4e815d70d885791a33c0dadba210",
+    ),
     "d128_t2_precomputed_split1": (
         "4eaf6b81491db3bd7969ddd8f41797bd7d5e472c591b4ed6a9a8fd7172eb6047",
         "ab378468d5b81e203e09405adc49004f30a0e178ec29986f40e31583de1dd291",
@@ -197,9 +205,16 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     assert after_body.strip() == "// clang-format on"
     metadata = flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA[variant]
     expected_gate_kind = metadata.gate_kind
-    assert f"#define GATE_KIND {expected_gate_kind}" in generated_body
-    assert "#define DIRECT_PREFIX_CHECKPOINT 0" in generated_body
-    assert "#define BLOCK_CHECKPOINT_MMA 0" in generated_body
+    if metadata.direct_impl:
+        assert "#define THREADS 32" in generated_body
+        assert "kernel_flashinfer_recurrent_kda_t1_direct" in generated_body
+        assert "#define GATE_KIND" not in generated_body
+        assert "#define DIRECT_PREFIX_CHECKPOINT" not in generated_body
+        assert "#define BLOCK_CHECKPOINT_MMA" not in generated_body
+    else:
+        assert f"#define GATE_KIND {expected_gate_kind}" in generated_body
+        assert "#define DIRECT_PREFIX_CHECKPOINT 0" in generated_body
+        assert "#define BLOCK_CHECKPOINT_MMA 0" in generated_body
 
     binding_text = spec.sources[0].read_text()
     assert (
@@ -214,6 +229,9 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
         f"#define FLASHKDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}"
         in binding_text
     )
+    assert (
+        "#define FLASHKDA_DECODE_DIRECT_IMPL 1" in binding_text
+    ) is metadata.direct_impl
     assert '#include "flashkda_decode_binding.cuh"' in binding_text
 
 
@@ -222,12 +240,17 @@ def test_flash_kda_decode_binding_contract():
     binding = (csrc_dir / "flashkda_decode_binding.cuh").read_text()
     common = (csrc_dir / "flashkda_decode_binding_common.cuh").read_text()
     impl = (csrc_dir / "flashkda_decode_binding_impl.cuh").read_text()
+    direct_impl = (csrc_dir / "flashkda_decode_binding_direct_impl.cuh").read_text()
 
     assert "FLASHKDA_DECODE_BODY_FILE" in binding
     assert "#include FLASHKDA_DECODE_BODY_FILE" in binding
+    assert "#ifdef FLASHKDA_DECODE_DIRECT_IMPL" in binding
+    assert '#include "flashkda_decode_binding_direct_impl.cuh"' in binding
     assert "CheckExactSm100a" in common
     assert "struct VariantTraits" in common
     assert "static_assert(Tokens >= 1)" in common
+    assert "ValueSplit == 16" in common
+    assert "HeadDim % ValueSplit == 0" in common
     assert "state.stride(0) >= num_value_heads * head_dim * head_dim" in common
     assert "gate.stride(1) >= num_value_heads * head_dim" in common
     assert "g must be compact in its [HV, K] trailing dimensions" in common
@@ -240,6 +263,9 @@ def test_flash_kda_decode_binding_contract():
     assert "VALUE_SPLIT" in impl
     assert "FLASHKDA_DECODE_EXPECTED_SMEM" not in impl
     assert "SMEM_TOTAL > 0" in impl
+    assert "kernel_flashinfer_recurrent_kda_t1_direct" in direct_impl
+    assert "SMEM_TOTAL" not in direct_impl
+    assert "cuda_stream" in direct_impl
 
 
 def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
@@ -248,6 +274,8 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "d128_t1_precomputed_split2",
         "d128_t1_precomputed_split4",
         "d128_t1_precomputed_split8",
+        "d128_t1_precomputed_direct_split16",
+        "d128_t1_precomputed_direct_split8",
         "d128_t2_precomputed_split1",
         "d128_t2_precomputed_split2",
         "d128_t2_precomputed_split4",
@@ -280,6 +308,8 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "d128_t1_precomputed_split2": 128,
         "d128_t1_precomputed_split4": 64,
         "d128_t1_precomputed_split8": 32,
+        "d128_t1_precomputed_direct_split16": 32,
+        "d128_t1_precomputed_direct_split8": 32,
         "d128_t2_precomputed_split1": 256,
         "d128_t2_precomputed_split2": 128,
         "d128_t2_precomputed_split4": 64,
@@ -297,6 +327,16 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "d128_t6_precomputed_gram_split2": 192,
         "d128_t6_precomputed_gram_split4": 192,
         "d128_t6_precomputed_gram_split8": 192,
+    }
+    assert {
+        variant
+        for variant, metadata in (
+            flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA.items()
+        )
+        if metadata.direct_impl
+    } == {
+        "d128_t1_precomputed_direct_split16",
+        "d128_t1_precomputed_direct_split8",
     }
     for removed_variant in (
         "d128_t4_precomputed",
