@@ -247,6 +247,45 @@ def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
     pytest.fail("GPT-OSS low-latency MXFP4xMXFP8 FC1 config is missing")
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "tile_n", "num_stages"),
+    [
+        (256, 16, 6),
+        (1024, 32, 5),
+    ],
+)
+def test_config_mapper_exposes_gpt_oss_mid_batch_fc2(num_tokens, tile_n, num_stages):
+    kwargs = dict(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=num_tokens,
+        top_k=4,
+        num_local_experts=128,
+        fc1_has_bias=True,
+        fc2_has_bias=True,
+        enable_pdl=True,
+    )
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != tile_n:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc2 = pair.fc2.cfg.kwargs
+        if not (
+            fc2["tile_k"] == 256
+            and fc2["num_stages_a"] == num_stages
+            and fc2["use_unroll_loop_2x_for_mma"]
+        ):
+            continue
+
+        assert fc2["tile_scheduler"] == 1
+        assert fc2["num_stages_tmem_acc"] == 2
+        assert fc2["use_clc_fast_drain"] == 1
+        assert fc2["use_work_throttle"] == 1
+        return
+
+    pytest.fail(f"GPT-OSS mid-batch MXFP4xMXFP8 FC2 tile-N{tile_n} config is missing")
+
+
 def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
     kwargs = dict(
         activation_type=int(ActivationType.Swiglu),

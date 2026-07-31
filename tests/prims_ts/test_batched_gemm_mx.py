@@ -215,7 +215,7 @@ def _run_mx_fc1(cfg, *, num_tokens=128, problem_n=128, problem_k=None):
     assert result
 
 
-def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
+def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None, problem_k=None):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
     )
@@ -226,7 +226,7 @@ def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
         num_tokens=num_tokens,
         top_k=1,
         problem_n=problem_n,
-        problem_k=cfg["tile_k"],
+        problem_k=problem_k or cfg["tile_k"],
         **cfg,
     )
     assert result
@@ -788,6 +788,39 @@ class TestMxFc2LowLatency:
             "num_stages_tmem_acc": 2,
         }
         _run_mx_fc2(cfg, num_tokens=256)
+
+    @pytest.mark.parametrize(
+        ("tile_n", "stages", "num_tokens"),
+        [
+            (16, 6, 256),
+            (32, 5, 1024),
+        ],
+    )
+    def test_mxfp4_mxfp8_mid_batch_cluster_persistent_u2(
+        self, tile_n, stages, num_tokens
+    ):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            TileScheduler,
+        )
+
+        cfg = {
+            **_mx_fc2_base(
+                dtype_a=DType.MXE2M1,
+                dtype_b=DType.MXE4M3,
+            ),
+            "tile_n": tile_n,
+            "mma_n": tile_n,
+            "epi_tile_n": tile_n,
+            "tile_k": 256,
+            "mma_m": 256,
+            "cluster_m": 2,
+            **uniform_pipeline_stage_overrides(stages),
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "num_stages_tmem_acc": 2,
+            "use_unroll_loop_2x_for_mma": 1,
+        }
+        _run_mx_fc2(cfg, num_tokens=num_tokens, problem_k=3072)
 
     def test_mxfp8_mxfp8_tile32_cluster_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
