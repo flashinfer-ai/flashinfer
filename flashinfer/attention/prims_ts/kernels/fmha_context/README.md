@@ -164,6 +164,10 @@ natural 32-lane window or the ordinary per-tile path. This is an internal
 consequence of the task topology, static geometry, and resource capacity; it
 is not a user-selectable tuning parameter.
 
+On Blackwell Ultra (SM103a) with `head_dim_v >= 128`, the paired
+(two-instance) MMA task uses the `Qk0_Pv0_Qk1_Pv1` interleaved schedule:
+each iter runs `Qk0 -> Pv0 -> Qk1 -> Pv1` and both PVs share the same V.
+
 | Source | Responsibility |
 | --- | --- |
 | [`../../context.py`](../../context.py) | Public validation, metadata translation, automatic scheduling, JIT caching, and launch adaptation |
