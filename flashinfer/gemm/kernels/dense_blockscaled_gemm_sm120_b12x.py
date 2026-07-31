@@ -579,8 +579,9 @@ class DenseGemmKernel:
         assert cute.rank(sfa_tensor) >= 2
 
         atom_shape_mnk = tiled_mma.shape_mnk
-        # Atom TV layouts per instruction K (cutlass-dsl 4.6.0
-        # blackwell_helpers.thrfrg_SFA): m16n8k64 FP4 vs m16n8k32 MXFP8.
+        # The scale-factor layout must match the MMA instruction's K width:
+        # 32 for the MXFP8 atom, 64 for the FP4 atom. Both layouts come from
+        # blackwell_helpers.thrfrg_SFA in cutlass-dsl 4.6.0.
         if cute.size(atom_shape_mnk[2]) == 32:
             atom_sfa_layout = cute.make_layout(
                 shape=((2, 2, 8), (32, 1)), stride=((8, 0, 1), (16, 0))
@@ -621,6 +622,7 @@ class DenseGemmKernel:
         assert cute.rank(sfb_tensor) >= 2
 
         atom_shape_mnk = tiled_mma.shape_mnk
+        # Same K-width split as _thrfrg_SFA, from blackwell_helpers.thrfrg_SFB.
         if cute.size(atom_shape_mnk[2]) == 32:
             atom_sfb_layout = cute.make_layout(
                 shape=((4, 8), (32, 1)), stride=((0, 1), (8, 0))
@@ -2415,8 +2417,8 @@ class DenseGemmKernel:
         # SF smem still allocates full 128-element blocks even when the live
         # MMA tile uses only 16 or 32 rows or columns.
         if is_mxfp8:
-            # Decode whitelist, else both dims must be multiples of 64
-            # (upstream's MXFP8 gate; stricter than the FP4 branch).
+            # Outside the small-M whitelist, both tile dims must be
+            # multiples of 64.
             if mma_tiler_mn not in ((16, 64), (16, 128), (32, 64), (32, 128)) and (
                 mma_tiler_mn[0] % 64 != 0
                 or mma_tiler_mn[1] % 64 != 0

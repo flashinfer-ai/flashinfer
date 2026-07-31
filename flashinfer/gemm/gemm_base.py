@@ -6846,7 +6846,7 @@ def _b12x_gemm_mxfp8_runner(
                 swap_ab=swap_ab,
             )
 
-            # swap_ab is device-internal (applied in the kernel ctor); public C
+            # swap_ab is applied inside the kernel, so the public C tensor
             # stays row-major (m, n).
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _B12X_MM_MXFP8_KERNEL_CACHE,
