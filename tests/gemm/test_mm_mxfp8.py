@@ -80,8 +80,8 @@ def _run_mm_mxfp8(
             pytest.skip("trtllm does not support non-multiple of 256")
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
-    if backend == "b12x" and (k % 128 != 0 or k < gemm_base._B12X_MXFP8_MIN_K):
-        pytest.skip("b12x requires K % 128 == 0 above the short-K race floor")
+    if backend == "b12x" and k % 128 != 0:
+        pytest.skip("b12x requires K % 128 == 0")
     if backend == "cutlass" and use_8x4_sf_layout_for_a:
         pytest.skip("cutlass doesn't support 8x4 swizzle layout")
 
@@ -240,6 +240,26 @@ def test_mm_mxfp8_b12x_low_m(m, k):
         auto_tuning=False,
         provide_out=True,
     )
+
+
+@pytest.mark.parametrize("m,n,k", [(2048, 1024, 128), (2048, 1024, 256)])
+def test_mm_mxfp8_b12x_short_k_multi_wave(m, n, k):
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles. m=2048 keeps the
+    # launch multi-wave on the largest SM120 parts and misses the
+    # autotuner cache the parametrized suite fills. Repeats, since a bad
+    # handoff shows up as a timing-dependent mismatch.
+    for _ in range(3):
+        _run_mm_mxfp8(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            torch.bfloat16,
+            "b12x",
+            auto_tuning=False,
+            provide_out=True,
+        )
 
 
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 64])

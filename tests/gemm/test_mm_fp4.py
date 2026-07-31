@@ -10,12 +10,10 @@ from flashinfer import (
 )
 from flashinfer.utils import (
     get_compute_capability,
-    get_device_sm_count,
     is_sm12x_supported,
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm import gemm_base
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
@@ -50,10 +48,6 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
         if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x backend requires CUDA 13+.")
-        if gemm_base._b12x_short_mainloop_race_window(
-            (128, 128), m, n, k, get_device_sm_count(torch.device("cuda"))
-        ):
-            pytest.skip("b12x rejects short-K launches beyond one work tile per SM")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
@@ -215,62 +209,37 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
-def _skip_unless_short_k_guarded(m, n, k):
+def test_mm_fp4_b12x_short_k_multi_wave():
+    # One K tile and more work tiles than SMs stress the epilogue smem
+    # handoff between a persistent CTA's work tiles, a regime the
+    # parametrized shapes never reach. Repeats, since a bad handoff shows
+    # up as a timing-dependent mismatch.
     device = torch.device("cuda")
     if not (
         is_sm12x_supported(device) and version_at_least(torch.version.cuda, "13.0")
     ):
         pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
-    if not gemm_base._b12x_short_mainloop_race_window(
-        (128, 128), m, n, k, get_device_sm_count(device)
-    ):
-        pytest.skip("shape has a race-free tile on this device")
-
-
-def test_mm_fp4_b12x_short_k_large_launch_raises():
     m, n, k = 1024, 4096, 128
-    _skip_unless_short_k_guarded(m, n, k)
-    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
-    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="short-K"):
-        mm_fp4(
+    for _ in range(3):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+        res = mm_fp4(
             a_fp4,
             b_fp4.T,
             a_s,
             b_s.T,
             alpha,
             torch.bfloat16,
-            res,
+            None,
             block_size=16,
             use_8x4_sf_layout=False,
             backend="b12x",
             use_nvfp4=True,
-            skip_check=False,
         )
-
-
-def test_mm_fp4_b12x_short_k_auto_falls_back():
-    m, n, k = 1024, 4096, 128
-    _skip_unless_short_k_guarded(m, n, k)
-    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
-    res = mm_fp4(
-        a_fp4,
-        b_fp4.T,
-        a_s,
-        b_s.T,
-        alpha,
-        torch.bfloat16,
-        None,
-        block_size=16,
-        use_8x4_sf_layout=False,
-        backend="auto",
-        use_nvfp4=True,
-    )
-    reference = torch.mm(a, b.T)
-    cos_sim = F.cosine_similarity(
-        reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
-    ).item()
-    assert cos_sim > 0.97
+        reference = torch.mm(a, b.T)
+        cos_sim = F.cosine_similarity(
+            reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
+        ).item()
+        assert cos_sim > 0.97
 
 
 def test_mm_fp4_cute_dsl_misaligned_n_raises():

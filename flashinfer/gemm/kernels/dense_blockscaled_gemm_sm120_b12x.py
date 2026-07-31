@@ -2453,10 +2453,8 @@ class DenseGemmKernel:
         if a_major != "k" or b_major != "k":
             return False
         if is_mxfp8:
-            # MXFP8 has no ragged-K predication, and the mainloop can race
-            # the smem pipeline when it runs no more K iterations than there
-            # are stages (up to 5, hence the six-tile floor).
-            if k % 128 != 0 or k < 768:
+            # MXFP8 has no ragged-K predication, so K must be whole BK128 tiles.
+            if k % 128 != 0:
                 return False
         elif k % 32 != 0:
             # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not
