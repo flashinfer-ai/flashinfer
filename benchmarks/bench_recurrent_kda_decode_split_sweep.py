@@ -15,7 +15,7 @@
 """Sweep frozen recurrent-KDA decode value splits through the public API.
 
 This B200-only harness forces every split1/2/4/8 specialization for the
-D128, H16, HV32 precomputed-gate T=1/2/4/6 contracts. T=1 uses the standard
+D128, H16, HV32 precomputed-gate T=1/2/4/5/6 contracts. T=1 uses the standard
 decode ABI; the other token counts use packed speculative decode. For every
 coordinate, it:
 
@@ -55,13 +55,14 @@ DATA_SEED = 4242
 HEAD_DIM = 128
 NUM_HEADS = 16
 NUM_VALUE_HEADS = 32
-TOKEN_COUNTS = (1, 2, 4, 6)
+TOKEN_COUNTS = (1, 2, 4, 5, 6)
 SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 VALUE_SPLITS = (1, 2, 4, 8)
 VARIANT_PREFIXES = {
     1: "d128_t1_precomputed_split",
     2: "d128_t2_precomputed_split",
     4: "d128_t4_precomputed_split",
+    5: "d128_t5_precomputed_gram_split",
     6: "d128_t6_precomputed_gram_split",
 }
 
