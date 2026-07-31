@@ -4878,6 +4878,18 @@ def _cudnn_mm_mxfp8_requirement(
 _B12X_MXFP8_MIN_K = 768
 
 
+@functools.cache
+def _b12x_mxfp8_dsl_supported() -> bool:
+    # Probe distribution metadata rather than import cutlass.cute, which
+    # takes seconds. Cached because the lookup hits the filesystem and this
+    # runs on every call.
+    try:
+        dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return tuple(int(x) for x in dsl_version.split(".")[:2]) >= (4, 6)
+
+
 @supported_compute_capability([120, 121])
 def _b12x_gemm_mxfp8_requirement(
     a: torch.Tensor,
@@ -4910,17 +4922,7 @@ def _b12x_gemm_mxfp8_requirement(
             "b12x mm_mxfp8 requires the contraction dim K to be a multiple of "
             f"128 and at least {_B12X_MXFP8_MIN_K}. Got K={a.shape[1]}."
         )
-    # Probe the installed distribution instead of importing cutlass.cute here:
-    # the DSL import takes seconds and this runs during auto-mode backend
-    # selection. MmaMXF8Op ships with cutlass-dsl 4.6.0.
-    try:
-        dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
-    except importlib.metadata.PackageNotFoundError:
-        dsl_version = None
-    if dsl_version is None or tuple(int(x) for x in dsl_version.split(".")[:2]) < (
-        4,
-        6,
-    ):
+    if not _b12x_mxfp8_dsl_supported():
         if backend != "b12x":
             return False
         raise ValueError(
