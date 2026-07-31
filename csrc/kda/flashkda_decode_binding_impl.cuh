@@ -31,10 +31,6 @@
 #ifndef FLASHKDA_DECODE_LAUNCH_THREADS
 #error "FLASHKDA_DECODE_LAUNCH_THREADS must be defined by the binding translation unit"
 #endif
-#ifndef FLASHKDA_DECODE_EXPECTED_SMEM
-#error "FLASHKDA_DECODE_EXPECTED_SMEM must be defined by the binding translation unit"
-#endif
-
 namespace flashinfer {
 namespace flash_kda_decode {
 
@@ -42,7 +38,7 @@ using ActiveVariant = VariantTraits<FLASHKDA_DECODE_HEAD_DIM, FLASHKDA_DECODE_TO
                                     FLASHKDA_DECODE_GATE_KIND, FLASHKDA_DECODE_VALUE_SPLIT>;
 
 static_assert(THREADS == 256);
-static_assert(SMEM_TOTAL == FLASHKDA_DECODE_EXPECTED_SMEM);
+static_assert(SMEM_TOTAL > 0);
 static_assert(GATE_KIND == FLASHKDA_DECODE_GATE_KIND);
 static_assert(DIRECT_PREFIX_CHECKPOINT == 0);
 static_assert(BLOCK_CHECKPOINT_MMA == 0);

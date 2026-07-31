@@ -36,7 +36,7 @@ which amortizes token preprocessing across its V-column tile.
 
 import functools
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
 
 import cutlass
 import cutlass.cute as cute
@@ -1156,7 +1156,7 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
 
 
 def _select_flash_kda_decode_value_split(work: int, sm_count: int) -> int:
-    """Select the D128/T5 coefficient-Gram schedule by its CTA-wave envelope."""
+    """Select one frozen D128 value-row split by its CTA-wave envelope."""
 
     three_wave_ctas = 3 * sm_count
     if 8 * work <= three_wave_ctas:
@@ -1195,11 +1195,11 @@ def _select_flash_kda_decode_variant(
 ) -> Optional[FlashKDADecodeVariant]:
     """Select a frozen B200 decode schedule, or preserve the CuTe fallback.
 
-    The production family covers measured D128 speculative-decode contracts.
-    The D128/T3 lower-bound specialization is limited to its measured
-    N1/2/4/8/16, H=HV=16 coordinates, while the D128/T5 specialization covers
-    the precomputed-gate contract. Any other public-API feature, tensor layout,
-    or aliasing pattern stays on the existing CuTe DSL implementation.
+    The exported family covers D128/T=1..6. T=3 preserves its measured
+    lower-bound contract; T=1/2/4/5/6 use precomputed gates. The T3 route is
+    limited to its measured N1/2/4/8/16, H=HV=16 coordinates. Any other
+    public-API feature, tensor layout, or aliasing pattern stays on the
+    existing CuTe DSL implementation.
     """
 
     f32_max = torch.finfo(torch.float32).max
@@ -1213,9 +1213,12 @@ def _select_flash_kda_decode_variant(
         and A_log is not None
         and dt_bias is not None
     )
-    is_t5_precomputed = (
-        num_spec_tokens == 4
-        and num_tokens == 5
+    is_precomputed = (
+        num_tokens in (1, 2, 4, 5, 6)
+        and (
+            (num_tokens == 1 and num_spec_tokens is None)
+            or (num_tokens > 1 and num_spec_tokens == num_tokens - 1)
+        )
         and not use_gate_in_kernel
         and lower_bound is None
         and A_log is None
@@ -1224,7 +1227,7 @@ def _select_flash_kda_decode_variant(
     if (
         not q.is_cuda
         or get_compute_capability(q.device) != (10, 0)
-        or not (is_t3_lower_bound or is_t5_precomputed)
+        or not (is_t3_lower_bound or is_precomputed)
         or cu_seqlens is None
         or ssm_state_indices is None
         or initial_state_source is not None
@@ -1353,13 +1356,17 @@ def _select_flash_kda_decode_variant(
     work = num_sequences * num_value_heads
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     value_split = _select_flash_kda_decode_value_split(work, sm_count)
-    variants: dict[int, FlashKDADecodeVariant] = {
-        1: "d128_t5_precomputed_gram_split1",
-        2: "d128_t5_precomputed_gram_split2",
-        4: "d128_t5_precomputed_gram_split4",
-        8: "d128_t5_precomputed_gram_split8",
+    variant_prefixes = {
+        1: "d128_t1_precomputed_split",
+        2: "d128_t2_precomputed_split",
+        4: "d128_t4_precomputed_split",
+        5: "d128_t5_precomputed_gram_split",
+        6: "d128_t6_precomputed_gram_split",
     }
-    return variants[value_split]
+    return cast(
+        FlashKDADecodeVariant,
+        f"{variant_prefixes[num_tokens]}{value_split}",
+    )
 
 
 def _run_flash_kda_decode(
@@ -1787,18 +1794,76 @@ def run_recurrent_kda(
     else:
         num_accepted_tokens_i32 = dc["i32_1"]
 
+    # The frozen family uses one packed token axis and explicit sequence
+    # metadata for every T. Standard decode exposes [B, 1, ...] and no
+    # metadata, so normalize its exact dense contract with views plus cached
+    # identity tensors. Calls that would require a copy or indexed copy-back
+    # remain on the existing CuTe path.
+    frozen_q = q
+    frozen_k = k
+    frozen_v = v
+    frozen_g = g
+    frozen_beta = beta
+    frozen_out = out_buf
+    frozen_cu_seqlens = cu_seqlens_i32
+    frozen_ssi = ssi
+    frozen_num_accepted_tokens = num_accepted_tokens_i32
+    if (
+        NUM_TOKENS == 1
+        and cu_seqlens_i32 is None
+        and initial_state_indices is None
+        and copy_back_indices is None
+    ):
+        try:
+            frozen_q = q.view(1, grid_seqs, H, K)
+            frozen_k = k.view(1, grid_seqs, H, K)
+            frozen_v = v.view(1, grid_seqs, HV, V)
+            frozen_beta = beta.view(1, grid_seqs, HV)
+            frozen_out = out_buf.view(1, grid_seqs, HV, V)
+            frozen_g = g.as_strided(
+                (1, grid_seqs, HV, K),
+                (grid_seqs * g.stride(0), g.stride(0), g.stride(2), g.stride(3)),
+            )
+        except RuntimeError:
+            pass
+        else:
+            cu_key = f"flashkda_t1_cu_seqlens_{grid_seqs}"
+            if cu_key not in dc:
+                dc[cu_key] = torch.arange(
+                    grid_seqs + 1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            ssi_key = f"flashkda_t1_state_indices_{grid_seqs}"
+            if ssi_key not in dc:
+                dc[ssi_key] = torch.arange(
+                    grid_seqs,
+                    dtype=torch.int32,
+                    device=device,
+                ).reshape(grid_seqs, 1)
+            nat_key = f"flashkda_t1_num_accepted_tokens_{grid_seqs}"
+            if nat_key not in dc:
+                dc[nat_key] = torch.zeros(
+                    grid_seqs,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            frozen_cu_seqlens = dc[cu_key]
+            frozen_ssi = dc[ssi_key].view(-1)
+            frozen_num_accepted_tokens = dc[nat_key]
+
     effective_scale = scale if scale is not None else 1.0 / math.sqrt(K)
     flash_kda_decode_variant = _select_flash_kda_decode_variant(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
+        q=frozen_q,
+        k=frozen_k,
+        v=frozen_v,
+        g=frozen_g,
+        beta=frozen_beta,
         state=state,
-        out=out_buf,
-        cu_seqlens=cu_seqlens_i32,
-        ssm_state_indices=ssi,
-        num_accepted_tokens=num_accepted_tokens_i32,
+        out=frozen_out,
+        cu_seqlens=frozen_cu_seqlens,
+        ssm_state_indices=frozen_ssi,
+        num_accepted_tokens=frozen_num_accepted_tokens,
         scale=effective_scale,
         num_tokens=NUM_TOKENS,
         num_spec_tokens=num_spec_tokens,
@@ -1813,16 +1878,16 @@ def run_recurrent_kda(
     if flash_kda_decode_variant is not None:
         _run_flash_kda_decode(
             flash_kda_decode_variant,
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
+            q=frozen_q,
+            k=frozen_k,
+            v=frozen_v,
+            g=frozen_g,
+            beta=frozen_beta,
             state=state,
-            out=out_buf,
-            cu_seqlens=cu_seqlens_i32,
-            ssm_state_indices=ssi,
-            num_accepted_tokens=num_accepted_tokens_i32,
+            out=frozen_out,
+            cu_seqlens=frozen_cu_seqlens,
+            ssm_state_indices=frozen_ssi,
+            num_accepted_tokens=frozen_num_accepted_tokens,
             scale=effective_scale,
             A_log=A_log if A_log is not None else dc["f32_1"],
             dt_bias=dt_bias if dt_bias is not None else dc["f32_1"],

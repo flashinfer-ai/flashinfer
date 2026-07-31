@@ -35,7 +35,7 @@ namespace flash_kda_decode {
 template <int32_t HeadDim, int32_t Tokens, int32_t GateKind, int32_t ValueSplit>
 struct VariantTraits {
   static_assert(HeadDim == 64 || HeadDim == 128);
-  static_assert(Tokens >= 2);
+  static_assert(Tokens >= 1);
   static_assert(GateKind == 0 || GateKind == 1);
   static_assert(ValueSplit == 1 || ValueSplit == 2 || ValueSplit == 4 || ValueSplit == 8);
   static_assert(HeadDim % (16 * ValueSplit) == 0);

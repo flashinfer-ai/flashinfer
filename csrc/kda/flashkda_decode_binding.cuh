@@ -14,17 +14,17 @@
  * limitations under the License.
  */
 
+#pragma once
+
+#ifndef FLASHKDA_DECODE_BODY_FILE
+#error "FLASHKDA_DECODE_BODY_FILE must be defined by the binding translation unit"
+#endif
+
 #include "flashkda_decode_binding_common.cuh"
 
-#define FLASHKDA_DECODE_HEAD_DIM 128
-#define FLASHKDA_DECODE_TOKENS 3
-#define FLASHKDA_DECODE_GATE_KIND 1
-#define FLASHKDA_DECODE_VALUE_SPLIT 4
-#define FLASHKDA_DECODE_LAUNCH_THREADS 96
-// The generated allocator rounds the 15,868-byte live extent to 15,872 bytes.
-// Launch the exact SMEM_TOTAL declared by the frozen body.
-#define FLASHKDA_DECODE_EXPECTED_SMEM 15872
-
+// Frozen Loom bodies provide private fixed-width aliases. Rename them while
+// including the body so CUDA's standard integer typedefs remain unambiguous in
+// the TVM-FFI binding.
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
 #define uint32_t flashkda_generated_uint32_t
@@ -34,7 +34,7 @@
 #define LoomTensorMap flashkda_generated_LoomTensorMap
 #define LoomTensorMapPack flashkda_generated_LoomTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#include "flashkda_decode_d128_t3_lower_bound_split4.cu"
+#include FLASHKDA_DECODE_BODY_FILE
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
