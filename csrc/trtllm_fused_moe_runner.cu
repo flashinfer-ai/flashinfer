@@ -793,9 +793,18 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     finalizeData.topK = totalExpertsPerToken;
     // Fuse unpadding into finalize: hiddenDim is the logical output width, while
     // hiddenDimPadded remains the full GEMM2 output stride.
+    //
+    // Use the *aligned* valid hidden size, matching what GEMM2 actually computed for its N
+    // dimension (see alignValidDim in Gemm2::Runner::run). The output buffer is allocated
+    // roundUp(valid_hidden_size, 128) wide -- both the Python API and set_valid_moe_dims
+    // enforce that -- so writing only the unaligned valid_hidden_size columns would leave
+    // [valid_hidden_size, roundUp(valid_hidden_size, 128)) as uninitialized torch.empty
+    // memory in the tensor handed back to the caller. GEMM2 produced real values for that
+    // span, so write the whole aligned width.
     auto const hiddenSizeOutput = args.hidden_size_output.value_or(args.hidden_size);
-    auto const validHiddenSize = args.valid_hidden_size.value_or(hiddenSizeOutput);
-    finalizeData.hiddenDim = validHiddenSize;
+    auto const validHiddenSize =
+        alignValidDim(args.valid_hidden_size.value_or(-1), hiddenSizeOutput);
+    finalizeData.hiddenDim = validHiddenSize >= 0 ? validHiddenSize : hiddenSizeOutput;
     finalizeData.hiddenDimPadded = hiddenSizeOutput;
     finalizeData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
   }

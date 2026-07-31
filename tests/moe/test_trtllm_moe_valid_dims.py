@@ -19,7 +19,10 @@ import torch
 
 from flashinfer import RoutingMethodType
 from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
-from flashinfer.fused_moe.core import _infer_trtllm_moe_output_hidden_size
+from flashinfer.fused_moe.core import (
+    _infer_trtllm_moe_output_hidden_size,
+    _round_up,
+)
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
 
@@ -858,14 +861,16 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
 # asserts the valid-dims run agrees with the same problem run with valid dims disabled --
 # which is the property the round-up relies on.
 @pytest.mark.parametrize(
-    ("valid_size", "aligned"),
+    ("which", "valid_size"),
     [
-        (960, False),  # 960 % 128 == 64 -- the GPT-OSS residue
-        (896, True),  # control: already 128-aligned
+        # 960 % 128 == 64 -- the same residue as GPT-OSS's 2880.
+        ("intermediate", 960),
+        ("intermediate", 896),  # control: already 128-aligned
+        ("hidden", 960),
+        ("hidden", 1024),  # control: already 128-aligned
     ],
 )
-@pytest.mark.parametrize("which", ["intermediate", "hidden"])
-def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size, aligned):
+def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
     if get_compute_capability(torch.device("cuda"))[0] not in [10]:
@@ -895,6 +900,17 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size, aligned):
     pi = 1024
     vi = valid_size if which == "intermediate" else pi
     vh = valid_size if which == "hidden" else hidden_size
+
+    # valid_hidden_size sets hidden_size_output = roundUp(vh, 128), and the caller must
+    # supply GEMM2 weights of exactly that width. This test builds a single set of GEMM2
+    # weights at hidden_size for both the with- and without-valid-dims runs, so the hidden
+    # arms are restricted to sizes whose round-up lands back on hidden_size. (An arm with
+    # roundUp(vh,128) < hidden_size would need its own narrower, separately shuffled GEMM2
+    # weights -- worth covering, but it is a different test.)
+    assert _round_up(vh, 128) == hidden_size, (
+        f"hidden arm requires roundUp(vh,128) == hidden_size, got {vh} -> "
+        f"{_round_up(vh, 128)} vs {hidden_size}"
+    )
 
     moe = FP4Moe(quant_mode=quant_mode)
     moe._cache_permute_indices = {}
