@@ -4895,12 +4895,12 @@ def _b12x_gemm_mxfp8_requirement(
             "b12x mm_mxfp8 requires 1D 128x4-swizzled block scales. "
             "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
         )
-    if a.shape[1] % 128 != 0:
+    if a.shape[1] % 128 != 0 or a.shape[1] < 256:
         if backend != "b12x":
             return False
         raise ValueError(
             "b12x mm_mxfp8 requires the contraction dim K to be a multiple of "
-            f"128 (one full BK128 tile). Got K={a.shape[1]}."
+            f"128 and at least 256 (two BK128 tiles). Got K={a.shape[1]}."
         )
     _check_cute_dsl_availability()
     import cutlass.cute as cute

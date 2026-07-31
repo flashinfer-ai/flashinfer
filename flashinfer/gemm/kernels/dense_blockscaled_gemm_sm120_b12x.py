@@ -2443,7 +2443,12 @@ class DenseGemmKernel:
             return False
         if is_mxfp8:
             # MXFP8 runs the full BK128 tile; no ragged-K predication ported.
-            if k % 128 != 0:
+            # Single-K-tile shapes (k == 128) are rejected: the kernel has a
+            # pre-existing synchronization race when the mainloop runs exactly
+            # one K iteration with m >= 1024 (present upstream and in the FP4
+            # path too); keep those shapes on the CUTLASS backend until the
+            # race is fixed.
+            if k % 128 != 0 or k < 256:
                 return False
         elif k % 32 != 0:
             # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not
