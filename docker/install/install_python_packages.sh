@@ -23,7 +23,8 @@ pip3 install --upgrade "setuptools>=77" "pip>=24"
 
 # Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
 CUDA_VERSION=${1:-cu128}
-CUDA_MAJOR="${CUDA_VERSION:2:2}"  # cu129 -> 12, cu130 -> 13
+CUDA_TAG="${CUDA_VERSION##*/}"    # cu129 -> cu129, nightly/cu132 -> cu132
+CUDA_MAJOR="${CUDA_TAG:2:2}"      # cu129 -> 12, cu132 -> 13
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
 # This is to ensure that the torch version is compatible with the CUDA version.
@@ -32,9 +33,11 @@ pip3 install --force-reinstall torch --index-url https://download.pytorch.org/wh
 # Pin the +cuXXX torch: it is unpinned in requirements.txt, so a dependency
 # conflict lets pip swap it for the PyPI build of a different CUDA major.
 # Pin the dist version: the PyPI wheel installs as "2.13.0", not "2.13.0+cu130".
+# mktemp, not /install: the .dev images run this as a non-root USER.
+TORCH_CONSTRAINT="$(mktemp)"
 python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch"))' \
-  > /install/torch-constraint.txt
-export PIP_CONSTRAINT=/install/torch-constraint.txt
+  > "$TORCH_CONSTRAINT"
+export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
 
 # Pick the CUDA-major-matched packages: nvshmem4py-cuXX pins cuda-python to its
 # own major, so mixing them leaves a broken dependency graph. cuda-python is
