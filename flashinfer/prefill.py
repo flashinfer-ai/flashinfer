@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -5054,7 +5055,10 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-_fmha_v2_sm120_cum_seq_lens_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+_FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE = 256
+_fmha_v2_sm120_cum_seq_lens_cache: OrderedDict[Tuple[int, int, int], torch.Tensor] = (
+    OrderedDict()
+)
 
 
 def _get_fmha_v2_sm120_cum_seq_lens(
@@ -5065,21 +5069,25 @@ def _get_fmha_v2_sm120_cum_seq_lens(
     )
     cache_key = (device_index, batch_size, seq_len)
     cum_seq_lens = _fmha_v2_sm120_cum_seq_lens_cache.get(cache_key)
-    if cum_seq_lens is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "fmha_v2_prefill_sm120 metadata must be initialized before CUDA "
-                "Graph capture; warm up once or pass cum_seq_lens explicitly."
-            )
-        cum_seq_lens = (
-            torch.arange(
-                batch_size + 1,
-                dtype=torch.int32,
-                device=torch.device("cuda", device_index),
-            )
-            * seq_len
+    if cum_seq_lens is not None:
+        _fmha_v2_sm120_cum_seq_lens_cache.move_to_end(cache_key)
+        return cum_seq_lens
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "fmha_v2_prefill_sm120 metadata must be initialized before CUDA "
+            "Graph capture; warm up once or pass cum_seq_lens explicitly."
         )
-        _fmha_v2_sm120_cum_seq_lens_cache[cache_key] = cum_seq_lens
+    cum_seq_lens = (
+        torch.arange(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=torch.device("cuda", device_index),
+        )
+        * seq_len
+    )
+    _fmha_v2_sm120_cum_seq_lens_cache[cache_key] = cum_seq_lens
+    if len(_fmha_v2_sm120_cum_seq_lens_cache) > _FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE:
+        _fmha_v2_sm120_cum_seq_lens_cache.popitem(last=False)
     return cum_seq_lens
 
 
@@ -5332,6 +5340,8 @@ def fmha_v2_prefill_deepseek(
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     if query.shape[1] != seq_len:
         raise ValueError("query sequence length must match seq_len.")
+    if return_lse and lse is None:
+        raise ValueError("lse must be provided when return_lse=True.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
@@ -5346,12 +5356,12 @@ def fmha_v2_prefill_deepseek(
         scale_softmax,
         scale_bmm1,
         scale_bmm2,
-        True,
-        return_lse,
-        lse,
-        cum_seq_lens,
-        scale_bmm1_d,
-        scale_bmm2_d,
+        causal=True,
+        return_lse=return_lse,
+        lse=lse,
+        cum_seq_lens=cum_seq_lens,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
     )
 
 

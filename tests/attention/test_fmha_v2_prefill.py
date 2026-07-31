@@ -5,6 +5,7 @@ import time
 from typing import Optional, Tuple, Union
 
 import flashinfer
+import flashinfer.prefill as flashinfer_prefill
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
 from tests.utils_fp8 import to_float8
@@ -766,6 +767,48 @@ def test_fmha_v2_prefill_deepseek_validates_seq_len():
             seq_len=7,
             scale_softmax=0.0,
         )
+    with pytest.raises(ValueError, match="lse must be provided"):
+        fmha_v2_prefill_deepseek(
+            q,
+            k,
+            v,
+            out,
+            num_heads=4,
+            head_dim=192,
+            seq_len=8,
+            scale_softmax=0.0,
+            return_lse=True,
+        )
+
+
+def test_fmha_v2_prefill_sm120_metadata_cache_is_bounded():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    cache = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_cache
+    cache.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache_size = flashinfer_prefill._FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE
+    try:
+        for seq_len in range(1, cache_size + 2):
+            flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
+                device, batch_size=1, seq_len=seq_len
+            )
+        assert len(cache) == cache_size
+        assert (device.index, 1, 1) not in cache
+    finally:
+        cache.clear()
+
+
+def test_fmha_v2_prefill_sm120_metadata_cache_capture_miss(monkeypatch):
+    cache = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_cache
+    cache.clear()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="must be initialized before CUDA Graph"):
+        flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
+            torch.device("cuda", 0), batch_size=1, seq_len=17
+        )
+    assert not cache
 
 
 @pytest.mark.parametrize("causal", [False, True])

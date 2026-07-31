@@ -1216,10 +1216,11 @@ def _fmha_v2_prefill_sm120_init(
     torch.manual_seed(seed)
 
     def quantize(x):
-        scale = (x.abs().amax().float() / torch.finfo(torch.float8_e4m3fn).max).clamp(
-            min=1.0e-12
-        )
-        return (x / scale).to(torch.float8_e4m3fn), scale.item()
+        fp8_dtype = torch.float8_e4m3fn
+        finfo = torch.finfo(fp8_dtype)
+        scale = (x.abs().amax().float() / finfo.max).clamp(min=1.0e-12)
+        quantized = (x / scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)
+        return quantized, scale.item()
 
     shape = (batch_size, seq_len, num_heads, head_dim)
     q, q_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
@@ -1259,6 +1260,7 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
+        "scale_size": Var(),
     },
     inputs={
         "query": Tensor(["batch_size", "seq_len", "num_heads", "head_dim"]),
@@ -1275,12 +1277,12 @@ fmha_v2_prefill_deepseek_trace = TraceTemplate(
         "scale_bmm1": Scalar("float32", optional=True),
         "scale_bmm2": Scalar("float32", optional=True),
         "scale_bmm1_d": Tensor(
-            [],
+            ["scale_size"],
             optional=True,
             description="Persistent FP32 CUDA QK-scale model weight.",
         ),
         "scale_bmm2_d": Tensor(
-            [],
+            ["scale_size"],
             optional=True,
             description="Persistent FP32 CUDA V dequantization model weight.",
         ),

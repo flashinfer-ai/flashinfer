@@ -1536,9 +1536,9 @@ if torch.cuda.get_device_capability() == (12, 0):
     _fmha_q_scale = max(_fmha_q.abs().max().float().item() / 448.0, 1.0e-12)
     _fmha_k_scale = max(_fmha_k.abs().max().float().item() / 448.0, 1.0e-12)
     _fmha_v_scale = max(_fmha_v.abs().max().float().item() / 448.0, 1.0e-12)
-    _fmha_q = (_fmha_q / _fmha_q_scale).to(torch.float8_e4m3fn)
-    _fmha_k = (_fmha_k / _fmha_k_scale).to(torch.float8_e4m3fn)
-    _fmha_v = (_fmha_v / _fmha_v_scale).to(torch.float8_e4m3fn)
+    _fmha_q = (_fmha_q / _fmha_q_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    _fmha_k = (_fmha_k / _fmha_k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    _fmha_v = (_fmha_v / _fmha_v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     _fmha_out = torch.empty(_fmha_shape, dtype=torch.bfloat16, device=device)
     _fmha_scale_bmm2_d = torch.tensor(
         [_fmha_v_scale], dtype=torch.float32, device=device
