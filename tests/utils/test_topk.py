@@ -2201,17 +2201,29 @@ def test_top_k_tie_break_modes_transform_apis(
     "tie_break",
     [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
 )
-def test_top_k_tie_break_explicit_deterministic_order(tie_break, set_topk_algo):
+@pytest.mark.parametrize(
+    ("algo", "batch_size", "vocab_size", "k"),
+    [
+        ("filtered", 2, 128 * 1024, 2048),
+        ("filtered", 1, 1024 * 1024, 1024),
+        ("filtered", 74, 16 * 1024, 512),
+    ],
+    ids=[
+        "filtered_b2_l128k_k2048",
+        "filtered_b1_l1m_k1024",
+        "filtered_b74_l16k_k512",
+    ],
+)
+def test_top_k_tie_break_explicit_deterministic_order(
+    tie_break, algo, batch_size, vocab_size, k, set_topk_algo
+):
     """Explicit deterministic mode should retain canonical tie-break output order."""
     if not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
-    set_topk_algo("filtered")
+    set_topk_algo(algo)
     device = "cuda"
-    num_rows = 2
-    max_len = 8192
-    k = 512
-    scores = torch.ones((num_rows, max_len), device=device, dtype=torch.float32)
+    scores = torch.ones((batch_size, vocab_size), device=device, dtype=torch.float32)
 
     values_a, indices_a = flashinfer.top_k(
         scores, k, deterministic=True, tie_break=tie_break
@@ -2220,11 +2232,11 @@ def test_top_k_tie_break_explicit_deterministic_order(tie_break, set_topk_algo):
         scores, k, deterministic=True, tie_break=tie_break
     )
 
-    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else max_len - k
+    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else vocab_size - k
     expected_indices = (
         torch.arange(start, start + k, device=device, dtype=torch.int64)
         .unsqueeze(0)
-        .expand(num_rows, -1)
+        .expand(batch_size, -1)
     )
     torch.testing.assert_close(values_a, torch.ones_like(values_a))
     assert torch.equal(values_a, values_b)
@@ -2236,28 +2248,40 @@ def test_top_k_tie_break_explicit_deterministic_order(tie_break, set_topk_algo):
     "tie_break",
     [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
 )
+@pytest.mark.parametrize(
+    ("algo", "num_rows", "max_len", "k"),
+    [
+        ("filtered", 2, 128 * 1024, 2048),
+        ("filtered", 1, 1024 * 1024, 1024),
+        ("filtered", 74, 16 * 1024, 512),
+    ],
+    ids=[
+        "filtered_rows2_l128k_k2048",
+        "filtered_rows1_l1m_k1024",
+        "filtered_rows74_l16k_k512",
+    ],
+)
 def test_top_k_tie_break_explicit_deterministic_transform_order(
-    tie_break, set_topk_algo
+    tie_break, algo, num_rows, max_len, k, set_topk_algo
 ):
     """Deterministic transform APIs should sort local indices before remapping."""
     if not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
-    set_topk_algo("filtered")
+    set_topk_algo(algo)
     device = "cuda"
-    num_rows = 2
-    max_len = 8192
-    length = 4096
-    k = 512
     scores = torch.ones((num_rows, max_len), device=device, dtype=torch.float32)
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    row_starts = 7 + 13 * row_ids
+    page_table_row_starts = 23 + 17 * row_ids
+    length = max_len - (23 + 17 * (num_rows - 1))
     lengths = torch.full((num_rows,), length, device=device, dtype=torch.int32)
-    row_starts = torch.tensor([7, 13], device=device, dtype=torch.int32)
-    page_table_row_starts = torch.tensor([23, 31], device=device, dtype=torch.int32)
-    row_to_batch = torch.tensor([1, 0], device=device, dtype=torch.int32)
-    src_page_table = torch.arange(max_len, device=device, dtype=torch.int32).unsqueeze(
-        0
-    ) * 3 + torch.tensor([[100_000], [200_000]], device=device, dtype=torch.int32)
-    offsets = torch.tensor([300_000, 400_000], device=device, dtype=torch.int32)
+    row_to_batch = torch.arange(num_rows - 1, -1, -1, device=device, dtype=torch.int32)
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32).unsqueeze(0)
+        + 100_000 * (row_ids + 1).unsqueeze(1)
+    ).contiguous()
+    offsets = 300_000 + 100_000 * row_ids
 
     page_output = flashinfer.top_k_page_table_transform(
         scores,
