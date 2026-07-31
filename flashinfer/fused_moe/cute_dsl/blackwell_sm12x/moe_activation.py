@@ -54,7 +54,11 @@ def normalize_swiglu_alpha_for_activation(
 ) -> float:
     activation = normalize_moe_activation(activation)
     if activation != SWIGLUOAI_UNINTERLEAVE:
-        if swiglu_alpha is not None and float(swiglu_alpha) != 1.0:
+        # Accept the module default so callers can pass it unconditionally.
+        if swiglu_alpha is not None and float(swiglu_alpha) not in (
+            1.0,
+            SWIGLUOAI_DEFAULT_ALPHA,
+        ):
             raise ValueError(
                 "swiglu_alpha is only configurable for swigluoai_uninterleave"
             )
@@ -71,7 +75,11 @@ def normalize_swiglu_beta_for_activation(
 ) -> float:
     activation = normalize_moe_activation(activation)
     if activation != SWIGLUOAI_UNINTERLEAVE:
-        if swiglu_beta is not None and float(swiglu_beta) != 0.0:
+        # Accept the module default so callers can pass it unconditionally.
+        if swiglu_beta is not None and float(swiglu_beta) not in (
+            0.0,
+            SWIGLUOAI_DEFAULT_BETA,
+        ):
             raise ValueError(
                 "swiglu_beta is only configurable for swigluoai_uninterleave"
             )
@@ -83,7 +91,7 @@ def normalize_swiglu_beta_for_activation(
 
 
 def is_gated_activation(activation: str) -> bool:
-    return activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+    return activation in GATED_MOE_ACTIVATIONS
 
 
 def gated_activation_f32(

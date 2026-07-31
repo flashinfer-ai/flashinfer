@@ -375,6 +375,8 @@ class MoEDirectMicroKernel:
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.sf_vec_size = sf_vec_size
+        # Accepted for call compatibility with the MMA micro kernels; this
+        # CUDA-core body has no fast-math variant, so the flag is a no-op.
         del fast_math
         self.activation = activation
         self.is_gated = is_gated_moe_activation(activation)

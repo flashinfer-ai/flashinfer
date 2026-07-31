@@ -31,7 +31,7 @@ from .moe_direct_micro_kernel import (
     compile_direct_micro_kernel,
     compiled_direct_micro_accepts_block_dim,
 )
-from .moe_dynamic_kernel import MoEDynamicKernel
+from .moe_dynamic_kernel import _TASK_SLICE_CHUNK, MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
 from .moe_w4a16_fp4_helpers import swizzle_block_scale
@@ -55,7 +55,9 @@ from .moe_w4a16_prepare import (
 _NVFP4_BLOCK_SIZE = 16
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
-_DYNAMIC_SLICE_CHUNK = 1
+# Must equal the kernel's task materialization granularity or the task
+# queue is mis-sized.
+_DYNAMIC_SLICE_CHUNK = _TASK_SLICE_CHUNK
 SF_VEC_SIZE = 16
 _FORCE_MOE_W4A16_ENV = "FLASHINFER_B12X_FORCE_MOE_W4A16"
 _MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
@@ -67,8 +69,11 @@ _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
 # The micro kernel's per-token staging assumes decode-sized batches.
 _MICRO_MAX_TOKENS = 8
-# Direct micro takes the tiny-decode band ahead of the MMA micro kernel.
-_DIRECT_MICRO_CUTOVER_PAIRS = 64
+# Direct micro takes the smallest decode batches ahead of the MMA micro
+# kernel, and only at small intermediate sizes where its CUDA-core dots
+# keep up with per-token work. Measured on GB10, pending other GPUs.
+_DIRECT_MICRO_CUTOVER_PAIRS = 32
+_DIRECT_MICRO_MAX_N = 512
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
@@ -1255,6 +1260,7 @@ def launch_sm120_static_moe(
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
         and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
+        and n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
     )
     if _FORCED_BACKEND is not None:

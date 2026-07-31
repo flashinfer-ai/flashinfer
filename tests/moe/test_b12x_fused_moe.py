@@ -1873,6 +1873,8 @@ class TestMicroKernel:
             ("silu", 8, 8),
             ("gelu_tanh", 1, 2),
             ("gelu_tanh", 8, 2),
+            ("swigluoai_uninterleave", 1, 2),
+            ("swigluoai_uninterleave", 8, 2),
         ],
     )
     def test_direct_micro_forced_accuracy(
@@ -1890,6 +1892,7 @@ class TestMicroKernel:
 
         hidden_size, intermediate_size = 256, 512
         num_experts = 256
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -1914,6 +1917,7 @@ class TestMicroKernel:
             num_experts=num_experts,
             top_k=top_k,
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1933,6 +1937,7 @@ class TestMicroKernel:
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
