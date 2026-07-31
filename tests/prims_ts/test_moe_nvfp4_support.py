@@ -179,6 +179,46 @@ def test_nvfp4_tile256_pair_reuses_metadata_for_tile128_fc1():
     assert fc2.num_stages_a == 4
 
 
+def test_nvfp4_bs256_has_matching_gen_tile32_pair():
+    tactics = valid_prims_ts_nvfp4_moe_tactics(
+        num_tokens=256,
+        top_k=8,
+        num_local_experts=256,
+        activation_type=int(ActivationType.Swiglu),
+    )
+
+    for tactic in tactics:
+        pair = map_trtllm_nvfp4_moe_tactic(
+            tactic,
+            num_tokens=256,
+            top_k=8,
+            num_local_experts=256,
+            activation_type=int(ActivationType.Swiglu),
+        )
+        fc1 = pair.fc1.cfg.build()
+        fc2 = pair.fc2.cfg.build()
+        if (
+            fc1.tile_n == 32
+            and fc1.tile_k == 512
+            and fc1.route_act == int(RouteImpl.LDGSTS)
+            and fc1.route_sfs_act == int(RouteImpl.LDGSTS)
+            and fc1.num_stages_a == 4
+            and fc2.tile_n == 32
+            and fc2.tile_k == 512
+            and fc2.cluster_m == 2
+            and fc2.num_stages_a == 4
+            and fc2.use_unroll_loop_2x_for_mma
+        ):
+            break
+    else:
+        pytest.fail("missing the Gen-matched NVFP4 BS=256 tile-32 config pair")
+
+    assert fc1.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert fc1.use_clc_fast_drain
+    assert fc2.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert fc2.use_clc_fast_drain
+
+
 def test_split_token_tile_metadata_reuses_input_tensors():
     tile_idx = torch.arange(4, dtype=torch.int32)
     mn_limit = torch.arange(4, dtype=torch.int32)
