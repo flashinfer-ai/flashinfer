@@ -1003,6 +1003,26 @@ def ulysses_a2a(
     tensors of the same dtype (float32/float16/bfloat16). All ranks must call
     with consistent geometry in the same order; a mismatch is a collective
     failure (hang or corruption), as with any collective.
+
+    Parameters
+    ----------
+    fa : int
+        Opaque backend handle returned by :func:`init_ulysses_a2a`.
+    inp : torch.Tensor
+        Contiguous 4-D CUDA input tensor.
+    out : torch.Tensor
+        Contiguous 4-D CUDA output tensor written in place.
+    B : int
+        Batch size.
+    S_local : int
+        Local sequence length per rank.
+    H : int
+        Global head count.
+    D : int
+        Head dimension.
+    mode : int
+        ``0`` for scatter-heads input all-to-all, ``1`` for gather-heads
+        output all-to-all.
     """
     if type(fa) is not int or fa == 0:
         raise ValueError(

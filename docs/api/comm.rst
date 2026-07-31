@@ -256,6 +256,12 @@ Topology Probing and Backend Selection
     UlyssesRankTopology
     UlyssesBackendError
 
+.. autofunction:: resolve_ulysses_backend
+
+.. autofunction:: decide_ulysses_backend
+
+.. autofunction:: probe_ulysses_rank_topology
+
 Raw Kernel Entry Points (advanced)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -268,12 +274,6 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
     init_ulysses_a2a
     dispose_ulysses_a2a
     ulysses_a2a
-
-.. autofunction:: resolve_ulysses_backend
-
-.. autofunction:: decide_ulysses_backend
-
-.. autofunction:: probe_ulysses_rank_topology
 
 MNNVL (Multi-Node NVLink)
 -------------------------
