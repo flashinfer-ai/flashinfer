@@ -314,3 +314,25 @@
 
 # FlashInfer-only (no refcheck, perf focus)
 --routine selective_state_update --batch_size 128 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer -vv --generate_repro_command --case_tag "mamba2_stp_perf"
+
+## GDN (Gated Delta Net, SM90+)
+# Decode T=1, Qwen3-Next config (q=k=16, v=32, d=128), pretranspose layout, FlashInfer vs Triton
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_decode_pretrans"
+
+# Decode T=1, nontranspose layout
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_layout nontranspose --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_decode_nontrans"
+
+# Decode T=1, BF16 state kernel
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_decode_bf16_state"
+
+# Decode T=1, BF16 state, split pool (speculative-decoding shape)
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --pool_mode split --backends flashinfer -vv --generate_repro_command --case_tag "gdn_decode_bf16_split"
+
+# MTP T=4, fp32 state pool, FlashInfer vs Triton
+--routine gated_delta_rule_mtp --batch_size 128 --seq_len 4 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_mtp4_fp32"
+
+# MTP T=4, BF16 state
+--routine gated_delta_rule_mtp --batch_size 128 --seq_len 4 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_mtp4_bf16"
+
+# Prefill, 4 x 2048 tokens, Qwen3.5-35B head config
+--routine chunk_gated_delta_rule --batch_size 4 --s_qo 2048 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_prefill_4x2048"

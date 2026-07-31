@@ -194,25 +194,32 @@ def pack_strided_memory(
     segment_stride: int,
     num_segments: int,
     dtype: torch.dtype,
-    dev_id,
-):
-    """
-    Pack GPU memory into a PyTorch tensor with specified stride.
+    dev_id: int,
+) -> torch.Tensor:
+    r"""Pack a strided device allocation as a PyTorch tensor view.
 
-    Parameters:
-        ptr: GPU memory address obtained from cudaMalloc
-        segment_size: Memory size of each segment in bytes
-        segment_stride: Memory stride size between segments in bytes
-        num_segments: Number of segments
-        dtype: PyTorch data type for the resulting tensor
-        dev_id: CUDA device ID
+    A fresh DLPack capsule is created on every call, so each tensor returned
+    by this function consumes its own capsule.
 
-    Returns:
-        PyTorch tensor that references the provided memory
+    Parameters
+    ----------
+    ptr : int
+        Device pointer (e.g. one returned by ``cudaMalloc``).
+    segment_size : int
+        Size of each segment in bytes.
+    segment_stride : int
+        Stride between consecutive segments in bytes.
+    num_segments : int
+        Number of segments to expose.
+    dtype : torch.dtype
+        Element dtype of the resulting tensor.
+    dev_id : int
+        CUDA device ID hosting ``ptr``.
 
-    Note:
-        This function creates a new DLPack capsule each time it's called,
-        even with the same pointer. Each capsule is consumed only once.
+    Returns
+    -------
+    torch.Tensor
+        A tensor that views the provided device memory.
     """
     # Create a new capsule each time
     capsule_wrapper = create_dlpack_capsule(

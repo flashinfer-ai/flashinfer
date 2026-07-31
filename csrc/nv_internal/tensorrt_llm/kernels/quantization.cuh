@@ -55,8 +55,10 @@ __device__ __forceinline__ void loadPackedVec(VecT& val, VecT const* ptr) {
     defined(__CUDACC_VER_MINOR__) &&                                                      \
     ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9) || (__CUDACC_VER_MAJOR__ >= 13))
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16;
+constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 16;
 #else
 constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
+constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 8;
 #endif
 inline int runtimeBlocksPerSM(int blockThreads) {
   int device = -1;
@@ -212,7 +214,6 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 // FP4/MXFP8 Quantization Constants
 
 constexpr int CVT_FP4_SF_VEC_SIZE = 16;
-constexpr int CVT_FP16_TO_MXFP8_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
@@ -240,6 +241,9 @@ quantize_with_block_size(
 
   using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
   using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+  // MXFP8 packs 1 e4m3 per element, so each thread emits ELTS_PER_THREAD bytes:
+  // 8 e4m3 -> uint64_t (8 B), 16 e4m3 -> uint4 (16 B).
+  using MxFp8OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint4, uint64_t>;
   static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
   static_assert(!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value ||
@@ -348,9 +352,10 @@ quantize_with_block_size(
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
-                                 quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+              reinterpret_cast<MxFp8OutT*>(out)[outOffset] = MxFp8OutT{};
             }
           }
 
@@ -376,7 +381,7 @@ quantize_with_block_size(
                   cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
                       in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-              reinterpret_cast<uint64_t*>(out)[outOffset] =
+              reinterpret_cast<MxFp8OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
             }
           }
@@ -772,15 +777,21 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
 
   using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
   __shared__ typename BlockReduce::TempStorage tempStorage;
-  float globalAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
+  float rowAmax = BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
+  __shared__ float rowAmaxSmem;
+  if (threadIdx.x == 0) {
+    rowAmaxSmem = rowAmax;
+  }
+  __syncthreads();
+  rowAmax = rowAmaxSmem;
 
   float perTokenScale;
   float globalEncodeScale;
   if constexpr (IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value && DISABLE_FP4_QUANT_FAST_MATH) {
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
-      if (globalAmax != 0.0f) {
-        float const rowEncodeScale = fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX);
+      if (rowAmax != 0.0f) {
+        float const rowEncodeScale = fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX);
         if (rowEncodeScale != 0.0f) {
           perTokenScaleOutput[rowIdx] = rowEncodeScale;
         } else {
@@ -806,7 +817,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     if (threadIdx.x == 0) {
       float const globalScale = __fdiv_rn(1.0f, globalScaleInv);
       float const rowEncodeScale =
-          globalAmax != 0.0f ? fminf(__fdiv_rn(globalScale, globalAmax), FLT_MAX) : FLT_MAX;
+          rowAmax != 0.0f ? fminf(__fdiv_rn(globalScale, rowAmax), FLT_MAX) : FLT_MAX;
       perTokenScaleOutput[rowIdx] = rowEncodeScale != 0.0f ? rowEncodeScale : 1.0f;
     }
     __syncthreads();
@@ -817,7 +828,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
   } else {
-    perTokenScale = globalAmax * globalScaleInv;
+    perTokenScale = rowAmax * globalScaleInv;
     if (threadIdx.x == 0) {
       perTokenScaleOutput[rowIdx] = perTokenScale;
     }
@@ -844,7 +855,7 @@ __global__ void nvfp4QuantAndPerTokenScaleKernel(
     uint8_t fp8Scale;
     auto fp4Vals =
         cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, SF_VEC_SIZE, false, DISABLE_FP4_QUANT_FAST_MATH,
-                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale);
+                             NVFP4_4OVER6_CONFIG>(vec_in, globalEncodeScale, &fp8Scale, rowAmax);
     reinterpret_cast<PackedFp4Type*>(weightOutput)[vecOffset] = fp4Vals;
 
     int64_t sfOffset;

@@ -116,18 +116,22 @@ _workspace_keepalive: Dict[int, MnnvlMemory] = {}
 
 @flashinfer_api
 def decode_cp_a2a_workspace_size(cp_size: int) -> int:
-    """Return the workspace size **in bytes** per rank for the given CP group size.
+    r"""Return the workspace size (in bytes) per rank for the given CP group size.
 
-    Args:
-        cp_size: Context-parallel group size (number of ranks).
+    Parameters
+    ----------
+    cp_size : int
+        Context-parallel group size (number of ranks).
 
-    Returns:
+    Returns
+    -------
+    int
         Workspace size in bytes per rank.
 
-    Example::
-
-        >>> decode_cp_a2a_workspace_size(4)
-        16778240
+    Examples
+    --------
+    >>> decode_cp_a2a_workspace_size(4)
+    16778240
     """
     return get_dcp_alltoall_module().get_workspace_size_per_rank(cp_size)
 
@@ -138,24 +142,30 @@ def decode_cp_a2a_allocate_mnnvl_workspace(
     *,
     mnnvl_config: Optional[MnnvlConfig] = None,
 ) -> torch.Tensor:
-    """Allocate an MNNVL-backed workspace of shape ``[cp_size, ws_elems_per_rank]``.
+    r"""Allocate an MNNVL-backed workspace of shape ``[cp_size, ws_elems_per_rank]``.
 
     The DCP A2A kernel requires a single unified VA spanning all CP ranks
     (see module docstring), so workspace allocation must go through MNNVL
-    fabric memory. This function is the only supported allocator.
+    fabric memory.  This function is the only supported allocator.
 
-    After allocation, call :func:`decode_cp_a2a_init_workspace` followed by a
-    cross-rank barrier before the first :func:`decode_cp_a2a_alltoall` call.
+    After allocation, call :func:`decode_cp_a2a_init_workspace` followed by
+    a cross-rank barrier before the first :func:`decode_cp_a2a_alltoall`
+    call.
 
-    Args:
-        mapping: Mapping object for MNNVL allocation. Carries ``cp_size`` and
-            ``cp_rank``. The communicator is split using ``mapping.pp_rank``,
-            ``mapping.cp_rank``, and ``mapping.tp_rank``.
-        mnnvl_config: Configuration for the MNNVL communication backend.
-            Required when using MNNVL with ``torch.distributed`` (pass
-            ``MnnvlConfig(comm_backend=TorchDistBackend(group))``).
+    Parameters
+    ----------
+    mapping : Mapping
+        Mapping object for MNNVL allocation.  Carries ``cp_size`` and
+        ``cp_rank``.  The communicator is split using ``mapping.pp_rank``,
+        ``mapping.cp_rank``, and ``mapping.tp_rank``.
+    mnnvl_config : MnnvlConfig, optional
+        Configuration for the MNNVL communication backend.  Required when
+        using MNNVL with ``torch.distributed`` (pass
+        ``MnnvlConfig(comm_backend=TorchDistBackend(group))``).
 
-    Returns:
+    Returns
+    -------
+    torch.Tensor
         ``torch.int64`` tensor of shape ``[cp_size, ws_elems_per_rank]``.
     """
     ws_bytes = decode_cp_a2a_workspace_size(mapping.cp_size)
@@ -182,25 +192,29 @@ def decode_cp_a2a_init_workspace(
     cp_rank: int,
     cp_size: int,
 ) -> None:
-    """Initialize the workspace FIFO buffers. Call once before the first alltoall.
+    r"""Initialize the workspace FIFO buffers (call once before the first alltoall).
 
     Resets the FIFO buffers in the **local** workspace row
-    (``workspace[cp_rank]``). This function is **synchronous**: when it
+    (``workspace[cp_rank]``).  This function is **synchronous**: when it
     returns, the GPU memset is guaranteed to have completed.
 
     .. important::
         With MNNVL workspaces, **all ranks** must complete
         ``decode_cp_a2a_init_workspace`` and execute a cross-rank barrier
         (e.g. ``dist.barrier(group)``) before **any** rank calls
-        :func:`decode_cp_a2a_alltoall`. Without the barrier, a rank may
+        :func:`decode_cp_a2a_alltoall`.  Without the barrier, a rank may
         start writing to a peer's FIFO before that peer has finished
-        initializing → deadlock.
+        initializing - deadlock.
 
-    Args:
-        workspace: ``[cp_size, ws_elems_per_rank]`` int64 tensor from
-            :func:`decode_cp_a2a_allocate_mnnvl_workspace`.
-        cp_rank: This rank's position in the CP group.
-        cp_size: Context-parallel group size.
+    Parameters
+    ----------
+    workspace : torch.Tensor
+        ``[cp_size, ws_elems_per_rank]`` ``int64`` tensor from
+        :func:`decode_cp_a2a_allocate_mnnvl_workspace`.
+    cp_rank : int
+        This rank's position in the CP group.
+    cp_size : int
+        Context-parallel group size.
     """
     get_dcp_alltoall_module().initialize_workspace(workspace, cp_rank, cp_size)
     # CRITICAL: The C++ op uses cudaMemsetAsync. Without this sync, a
@@ -218,27 +232,37 @@ def decode_cp_a2a_alltoall(
     cp_size: int,
     enable_pdl: Optional[bool] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Perform the DCP all-to-all exchange.
+    r"""Perform the DCP all-to-all exchange.
 
     Each rank sends its ``partial_o[..., peer, :]`` slice to the
     corresponding peer and receives all peers' contributions into the
     output tensors.
 
-    Args:
-        partial_o: ``[..., cp_size, D]`` — half or bfloat16.
-            ``D * element_size`` must be 16-byte aligned.
-        softmax_stats: ``[..., cp_size, S]`` — float32, ``S >= 2`` and even.
-            Batch dimensions must match ``partial_o``.
-        workspace: ``[cp_size, ws_elems_per_rank]`` int64 tensor from
-            :func:`decode_cp_a2a_allocate_mnnvl_workspace`, already initialized.
-        cp_rank: This rank's position in the CP group.
-        cp_size: Context-parallel group size.
-        enable_pdl: Enable Programmatic Dependent Launch (SM90+).
-            Defaults to ``True`` on SM90+ GPUs, ``False`` otherwise.
+    Parameters
+    ----------
+    partial_o : torch.Tensor
+        ``[..., cp_size, D]`` ``half`` or ``bfloat16`` tensor.
+        ``D * element_size`` must be 16-byte aligned.
+    softmax_stats : torch.Tensor
+        ``[..., cp_size, S]`` ``float32`` tensor with ``S >= 2`` and even.
+        Batch dimensions must match ``partial_o``.
+    workspace : torch.Tensor
+        ``[cp_size, ws_elems_per_rank]`` ``int64`` tensor from
+        :func:`decode_cp_a2a_allocate_mnnvl_workspace`, already
+        initialized.
+    cp_rank : int
+        This rank's position in the CP group.
+    cp_size : int
+        Context-parallel group size.
+    enable_pdl : bool, optional
+        Enable Programmatic Dependent Launch (SM90+).  Defaults to ``True``
+        on SM90+ GPUs and ``False`` otherwise.
 
-    Returns:
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
         ``(partial_o_out, softmax_stats_out)`` with the same shapes and
-        dtypes as the inputs. Each output contains the gathered data from
+        dtypes as the inputs.  Each output contains the gathered data from
         all peers for this rank.
     """
     if enable_pdl is None:

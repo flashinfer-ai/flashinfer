@@ -109,6 +109,8 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        # ​cudaError_t cudaIpcCloseMemHandle ( void* devPtr )
+        Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -190,16 +192,47 @@ class CudaRTLibrary:
         )
         return devPtr
 
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))
 
-cudart = CudaRTLibrary()
+
+class _LazyCudaRTLibrary:
+    _library: Optional[CudaRTLibrary] = None
+
+    def _get_library(self) -> CudaRTLibrary:
+        if self._library is None:
+            self._library = CudaRTLibrary()
+        return self._library
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._get_library(), name)
+
+
+cudart = _LazyCudaRTLibrary()
 
 
 def create_shared_buffer(
     size_in_bytes: int, group: Optional[ProcessGroup] = None
 ) -> List[int]:
-    """
-    Creates a shared buffer and returns a list of pointers
-    representing the buffer on all processes in the group.
+    r"""Allocate a buffer and share it across the process group via CUDA IPC.
+
+    The local rank performs ``cudaMalloc`` followed by
+    ``cudaIpcGetMemHandle``; other ranks open the resulting handle to obtain
+    a pointer mapped into their address space.
+
+    Parameters
+    ----------
+    size_in_bytes : int
+        Size of the buffer to allocate per rank.
+    group : torch.distributed.ProcessGroup, optional
+        Process group to exchange IPC handles across.  Defaults to
+        ``dist.group.WORLD``.
+
+    Returns
+    -------
+    list[int]
+        Per-rank device pointers (rank-local at position ``rank``, IPC-mapped
+        for the others).
     """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
@@ -207,8 +240,6 @@ def create_shared_buffer(
         group = dist.group.WORLD
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
 
@@ -226,12 +257,33 @@ def create_shared_buffer(
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Frees a shared buffer.
+    r"""Free a shared buffer previously created by :func:`create_shared_buffer`.
+
+    Collective: every rank in the group must call this together. Callers must
+    ensure no kernel is still using the buffers (synchronize the streams that
+    touched them) before calling.
+
+    Teardown order matters for CUDA IPC: every rank first closes the peer
+    mappings it opened with ``cudaIpcOpenMemHandle``, a barrier confirms all
+    mappings are closed everywhere, and only then does each rank ``cudaFree``
+    its own allocation — freeing memory still IPC-mapped in a peer process is
+    undefined behavior.
+
+    Parameters
+    ----------
+    pointers : list[int]
+        Per-rank pointer list returned by :func:`create_shared_buffer`.
+    group : torch.distributed.ProcessGroup, optional
+        Process group used during allocation.  Defaults to
+        ``dist.group.WORLD``.
     """
     if group is None:
         group = dist.group.WORLD
     rank = dist.get_rank(group=group)
+    for i, ptr in enumerate(pointers or []):
+        if i != rank and ptr is not None:
+            cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+    dist.barrier(group=group)
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)

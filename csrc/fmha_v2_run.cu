@@ -262,9 +262,15 @@ static inline void determine_launch_params(
 
 #if 0
   // threshold for adopting flash attention or warp_specialized kernels.
+  // For Q_PAGED_KV layouts, flash attention is required regardless of
+  // seqlen — the paged KV dispatch path only supports flash attention
+  // kernels, and `s` is the padded max_kv_len (not per-request seq_lens,
+  // which the kernel predicates on separately). Falling back to the
+  // non-flash path produces silently wrong output when max_kv_len < 16.
+  bool const is_paged_kv = input_layout == Attention_input_layout::Q_PAGED_KV;
   launch_params.flash_attention =
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
-      (s >= 16 && d >= 16) && !force_non_flash_attention;
+      (is_paged_kv || (s >= 16 && d >= 16)) && !force_non_flash_attention;
 #else
   // Currently only flash attention kernels are generated in FlashInfer
   launch_params.flash_attention = true;
@@ -438,6 +444,19 @@ void fmha_v2_run(
   if (chunked_attention_size > 0) {
     assert((chunked_attention_size & (chunked_attention_size - 1)) == 0 &&
            "chunked_attention_size has to be a power of 2");
+    // Chunked-causal masking is only implemented by the warp-specialized (SM90)
+    // kernels (see fmha/warpspec/{epilogue,dma,compute}.h, which branch on
+    // log2_chunked_attention_size). The non-warp-specialized "tiled" kernels used
+    // on SM120 honor sliding_window_size only and ignore log2_chunked_attention_size,
+    // so reject chunked attention here rather than silently returning wrong results.
+    // Sliding-window causal IS supported on SM120 (via window_left).
+    if (sm == 120) {
+      throw std::invalid_argument(
+          "Chunked-causal attention (chunked_attention_size > 0) is not supported for "
+          "FMHAv2 on SM120 (Blackwell). The SM120 tiled kernels implement sliding-window "
+          "causal only. Use window_left for sliding-window masking, or run chunked "
+          "attention on SM90 (Hopper).");
+    }
     attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
   }
   size_t sliding_window_size = size_t(INT_MAX);
@@ -611,6 +630,11 @@ void fmha_v2_run(
       scale_softmax, scale_bmm2, softcapping_scale_bmm1, false, false, false, has_alibi,
       skip_softmax_threshold_scale_factor);
 
+  // All Q lengths are equal iff they sum to b * max_q_len (each one is <= max_q_len).
+  // Padded batches decompose tiles from the padded seqlen, so aren't marked uniform.
+  params_v2.is_uniform_q =
+      !params_v2.is_s_padded && b > 0 && total_q_tokens == static_cast<uint32_t>(b * s_q);
+
   // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride,
   // and enable shared page index mode so the kernel transforms page_idx → pool offsets on-the-fly.
   if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
@@ -620,6 +644,9 @@ void fmha_v2_run(
 
   // Total number of Q tokens is needed to set TMA desc on the host.
   launch_params.total_q_seqlen = total_q_tokens;
+  // Upper bound on total KV tokens (includes past KV, unlike total_q_seqlen); used by the
+  // head-first scheduling L2 gate in the warp-specialized launcher.
+  launch_params.total_kv_seqlen = static_cast<int>(b * s_kv);
   // set enable_attn_logit_softcapping to select the right kernel.
   launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
 

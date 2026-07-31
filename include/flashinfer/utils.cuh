@@ -122,6 +122,11 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -354,6 +359,22 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   return std::make_pair(major, minor);
 }
 
+// Largest thread-block cluster the current device can launch for `kernel`
+// (1 when clusters are unsupported, e.g. pre-SM90). Query once and
+// cache per call site; assumes each process handles a single GPU.
+inline int GetMaxClusterSize(const void* kernel, int block_dim) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = 8;
+  config.blockDim = block_dim;
+  int cluster_size = 0;
+  cudaError_t status = cudaOccupancyMaxPotentialClusterSize(&cluster_size, kernel, &config);
+  if (status != cudaSuccess || cluster_size < 1) {
+    (void)cudaGetLastError();
+    return 1;
+  }
+  return cluster_size;
+}
+
 // This function is thread-safe and cached the sm_count.
 // But it will only check the current CUDA device, thus assuming each process handles single GPU.
 inline int GetCudaMultiProcessorCount() {
@@ -382,6 +403,12 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (head_dim >= 512) {
+    if (avg_packed_qo_len <= 32) {
+      return 16;  // decode / short-q (incl. speculative decode): lean CTA16
+    }
+    return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
   } else {

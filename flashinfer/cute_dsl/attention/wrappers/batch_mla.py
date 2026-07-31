@@ -20,9 +20,12 @@ import torch
 from cutlass import Float32, Int32
 
 from flashinfer.api_logging import flashinfer_api
+
+from ...utils import require_cute_dsl_arch as _require_dsl_arch
 from flashinfer.trace.templates.attention import cute_dsl_batch_mla_run_trace
 from flashinfer.utils import device_support_pdl
 from flashinfer.cute_dsl.utils import (
+    _as_cute_dsl_workspace_i8,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
@@ -373,10 +376,16 @@ class BatchMLADecodeCuteDSLWrapper:
 
     @flashinfer_api
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
-        assert workspace_buffer.dtype == torch.int8, (
-            f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
-        )
-        self._workspace_buffer = workspace_buffer
+        r"""Bind the wrapper to a user-provided workspace buffer.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            Pre-allocated workspace buffer on the target CUDA device.  Must have
+            dtype ``torch.int8`` or ``torch.uint8``; the size determines the
+            maximum batch this wrapper can handle without re-allocation.
+        """
+        self._workspace_buffer = _as_cute_dsl_workspace_i8(workspace_buffer)
         self._device = workspace_buffer.device
         self._compiled_kernel: Optional[Callable] = None
 
@@ -417,6 +426,8 @@ class BatchMLADecodeCuteDSLWrapper:
             Attention variant (ALiBi, SoftCapping, AttentionWithSink, etc.).
             None uses standard softmax attention.
         """
+
+        _require_dsl_arch(self._device)
         self._kv_lora_rank = kv_lora_rank
         self._qk_rope_head_dim = qk_rope_head_dim
         self._num_heads = num_heads
@@ -701,7 +712,7 @@ def cute_dsl_mla_decode(
     kv_cache : torch.Tensor
         [num_pages, page_size, D_ckv + D_kpe] (3D) or [num_pages, 1, page_size, D_ckv + D_kpe] (4D)
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer (int8). Required size depends on batch size
+        Pre-allocated workspace buffer (int8 or uint8). Required size depends on batch size
         and split_kv (auto-computed from B, q_len, and number of SMs):
 
         - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
@@ -807,13 +818,12 @@ def cute_dsl_mla_decode(
     )
 
     # Prepare workspace
-    assert workspace_buffer.dtype == torch.int8, (
-        f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
-    )
-    assert workspace_buffer.numel() >= workspace_size, (
-        f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
-        f"need {workspace_size} bytes"
-    )
+    workspace_buffer = _as_cute_dsl_workspace_i8(workspace_buffer)
+    if workspace_buffer.numel() < workspace_size:
+        raise ValueError(
+            f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
+            f"need {workspace_size} bytes"
+        )
     is_workspace_size_zero = workspace_size == 0
     if is_workspace_size_zero:
         workspace_bytes = None

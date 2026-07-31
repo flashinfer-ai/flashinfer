@@ -707,7 +707,17 @@ void x_vec32(bool const to, T* src_dst, int h, int total, int mats, int d = 64) 
 
 struct CudaDevice {
   CudaDevice() {
-    FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, 0));
+    // Cache device properties on first use. cudaGetDeviceProperties is a
+    // synchronous, expensive call (~1.7 ms/call on H200); querying it on every
+    // CudaDevice construction added that cost to every fmha_v2 forward. The
+    // properties of device 0 never change at runtime, so query once via a
+    // function-local static (thread-safe initialization per C++11) and reuse.
+    static const cudaDeviceProp cached_props = [] {
+      cudaDeviceProp p{};
+      FMHA_CHECK_CUDA(cudaGetDeviceProperties(&p, 0));
+      return p;
+    }();
+    props = cached_props;
     sm = props.major * 10 + props.minor;
   }
 

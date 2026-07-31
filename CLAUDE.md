@@ -18,6 +18,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
 | Run linting | `pre-commit run -a` |
+| Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
@@ -29,6 +30,10 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
+| Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
+| Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
+| Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
+| Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
 
 ## Quick Start for Development
 
@@ -179,17 +184,32 @@ Install hooks to run on every commit:
 pre-commit install
 ```
 
+## Code Review
+
+When reviewing a diff (as an agent or a human), follow the shared focus areas, kernel-review
+policy, and effort calibration in [`docs/code_review_guidance.md`](docs/code_review_guidance.md).
+Note: unlike human review, agents keep **kernel implementation details in scope** — read the
+kernel logic and report bugs, labeling findings by confidence.
+
+→ **For the complete review rule set, see [`docs/code_review_guidance.md`](docs/code_review_guidance.md)**
+
 ## Architecture: JIT Compilation System
 
 FlashInfer's JIT system has three layers:
 
 ### Layer 1: JitSpec (flashinfer/jit/core.py)
 
-`JitSpec` defines compilation metadata:
+`JitSpec` is an abstract base class defining the kernel-module lifecycle
+(`try_load()` / `build()` / `load()`, with the shared `build_and_load()`
+template method handling caching, locking, and `FLASHINFER_DISABLE_JIT`).
+One subclass per compilation toolchain:
 
-- `name`: Unique identifier (URI hash from parameters)
-- `sources`: List of .cu/.cpp files to compile
-- `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecNvcc` (nvcc/ninja modules, returned by `gen_jit_spec()`) defines:
+  - `name`: Unique identifier (URI hash from parameters)
+  - `sources`: List of .cu/.cpp files to compile
+  - `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
+- `JitSpecCuteDsl` (flashinfer/jit/cute_dsl_core.py) caches CuTe-DSL kernels
+  (see "CuTe-DSL kernels" under Module Caching below)
 
 ### JIT Directory Rules
 
@@ -208,6 +228,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
+- CuTe-DSL FP4 MM compilation parallelism can be controlled with `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
@@ -250,7 +271,7 @@ def gen_some_module(dtype_in, dtype_out, ...):
 
 ### Layer 3: Compilation and Loading
 
-`JitSpec` methods:
+`JitSpecNvcc` methods:
 
 - `write_ninja()` - Generates `build.ninja` file
 - `build()` - Executes `ninja` to compile sources
@@ -360,7 +381,7 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
 **Example implementations:**
-- **Simple**: `flashinfer/norm.py` (RMSNorm) - no Jinja, good starting point
+- **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
 - **Complex**: `flashinfer/decode.py` - plan-run pattern, advanced workspace
 
@@ -384,6 +405,20 @@ URI computed as: `hash(operation_type + parameters + source_hashes + flags + cud
 **Cache management:**
 - Clear cache: `rm -rf ~/.cache/flashinfer/`
 - Override location: `export FLASHINFER_WORKSPACE_BASE="/scratch"`
+
+**CuTe-DSL kernels** (`flashinfer/jit/cute_dsl_core.py`): `cute.compile()` has no
+persistent cache, so `JitSpecCuteDsl` (a `JitSpec` subclass, wrapped by the
+`build_and_load_cute_dsl_kernel()` helper) exports compiled kernels as
+object files (`export_to_c()`) and reloads them with `cute.runtime.load_module(...,
+enable_tvm_ffi=True)`. Artifacts live in `cached_ops/` next to the nvcc modules, one
+directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
+`nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
+specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
+current device) since the artifacts are single-arch, unlike nvcc fatbins.
+Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
+`flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
 
 ### Dispatch Macros
 
@@ -464,6 +499,84 @@ export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory
 ```
 
+#### Full Environment Variable Reference
+
+Already covered above (Quick Reference / Debugging): `FLASHINFER_LOGLEVEL`,
+`FLASHINFER_LOGDEST`, `FLASHINFER_JIT_VERBOSE`, `FLASHINFER_JIT_DEBUG`,
+`FLASHINFER_CUDA_ARCH_LIST`, `FLASHINFER_NVCC_THREADS`,
+`FLASHINFER_WORKSPACE_BASE`, `MAX_JOBS`.
+
+The remaining `FLASHINFER_*` knobs read by the code are listed below. Defaults
+match what the code uses today; values are strings unless noted.
+
+##### JIT / Build Toolchain
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+| `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
+| `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
+| `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
+| `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
+| `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
+| `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
+| `FLASHINFER_FMHA_V2_VERBOSE` | unset | `flashinfer/jit/attention/fmha_v2/fmha_library.py` (FMHA v2 codegen, C++ side) | When set, the FMHA-v2 codegen / runtime prints verbose dispatcher diagnostics. Leave unset for normal runs. |
+| `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
+| `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
+| `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
+
+##### Cubin / Artifact Loader
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_CUBIN_DIR` | `<FLASHINFER_WORKSPACE_BASE>/.cache/flashinfer/cubins` | `flashinfer/jit/env.py` (exposed via `flashinfer/__main__.py show-config`) | Local directory used to cache downloaded cubins. Override to share a cache between users. |
+| `FLASHINFER_CUBINS_REPOSITORY` | `https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local` | `flashinfer/jit/cubin_loader.py` | Base URL the loader downloads cubins from. Point to a mirror for offline or air-gapped setups. |
+| `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | unset | `flashinfer/jit/cubin_loader.py` | If set, skip SHA checksum verification of downloaded cubins. Debug aid only. |
+| `FLASHINFER_CUBIN_DOWNLOAD_THREADS` | `4` | `flashinfer/artifacts.py` | Thread-pool size used by `flashinfer artifacts download`. |
+| `FLASHINFER_NO_DOWNLOAD` | unset | `flashinfer/jit/cubin_loader.py` | Hard-fail if a cubin is missing locally instead of attempting to download. Useful in CI / locked-down environments. |
+| `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
+| `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
+
+##### API Dump / Logging Extensions
+
+These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in `flashinfer/api_logging.py`.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FLASHINFER_DUMP_DIR` | `flashinfer_dumps` | Directory where `@flashinfer_api` writes per-call tensor dumps when logging is enabled. |
+| `FLASHINFER_DUMP_INCLUDE` | `""` | Comma-separated allow-list of API names; only matching calls are dumped. Wildcards (`*`) supported. |
+| `FLASHINFER_DUMP_EXCLUDE` | `""` | Comma-separated deny-list of API names; matching calls skip the (expensive) stats / dump path. |
+| `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
+| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `_DUMP_MAX_SIZE_GB` in `flashinfer/api_logging.py`). |
+| `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
+
+##### Trace Capture
+
+Used by `flashinfer.trace` / `fi_trace`.
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_TRACE_DUMP` | unset | `flashinfer/fi_trace.py` | If set, decorated APIs auto-dump benchmark-definition JSON for each call (the "fi_trace" feature). |
+| `FLASHINFER_TRACE_DUMP_DIR` | cwd | `flashinfer/fi_trace.py` | Directory where the trace JSON files are written. |
+| `FLASHINFER_TRACE_APPLY` | `0` | `flashinfer/__init__.py`, `flashinfer/trace_apply/config.py` | Set to `1` to enable Trace Apply (runtime kernel substitution) when FlashInfer is imported. |
+| `FLASHINFER_TRACE_APPLY_PATH` | unset | `flashinfer/trace_apply/config.py` | Directory from which deployment-configured solutions are loaded for Trace Apply. |
+
+##### Validation / Autotuning / Routing / Kernel Selection
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
+| `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
+| `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
+| `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
+| `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
+| `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k algorithm (otherwise the dispatcher chooses based on shape). Used for benchmarking / regression bisection. |
+| `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
+| `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
+| `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
+| `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
+| `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
+
 ## Development Workflow
 
 ### Typical Development Loop
@@ -522,7 +635,7 @@ While FlashInfer currently provides PyTorch bindings, the underlying kernels are
 
 ## Supported GPU Architectures
 
-FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM103, SM110, SM120, and SM121.
+FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM100, SM103, SM110, SM120, and SM121.
 
 ## Release Versioning
 

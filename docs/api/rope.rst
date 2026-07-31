@@ -20,3 +20,6 @@ Kernels for applying rotary embeddings.
     apply_llama31_rope_pos_ids_inplace
     apply_rope_with_cos_sin_cache
     apply_rope_with_cos_sin_cache_inplace
+    rope_quantize_fp8
+    rope_quantize_fp8_append_paged_kv_cache
+    mla_rope_quantize_fp8

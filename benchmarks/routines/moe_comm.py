@@ -109,6 +109,10 @@ from .moe_utils import (
     quantize_and_pack_nvfp4,
 )
 
+# Number of distinct LoRA adapter IDs when --use_lora is enabled.
+# Matches issue #3109's "up to 8 concurrent adapter IDs" target.
+NUM_LORA_ADAPTERS = 8
+
 
 @contextmanager
 def cuda_event_timer(events_list: list, enabled: bool = True):
@@ -242,6 +246,11 @@ def parse_moe_comm_args(line, parser):
         "--per_phase_timing",
         action="store_true",
         help="Enable per-phase timing (dispatch/combine). Adds slight overhead from CUDA events.",
+    )
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Enable per-token LoRA adapter ID payload.",
     )
 
     args = parser.parse_args(line)
@@ -454,11 +463,13 @@ def _create_moe_inputs(
     quant_dtype: Optional[str],
     device: torch.device,
     comm: MPI.Comm,
+    use_lora: bool = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     List[torch.Tensor],
@@ -475,15 +486,17 @@ def _create_moe_inputs(
         quant_dtype: None, "fp8", "nvfp4", or "fp8_block_scale"
         device: CUDA device
         comm: MPI communicator for syncing global scale
+        use_lora: If True, append per-token LoRA adapter ID as an extra dispatch payload
 
     Returns:
-        Tuple of (hidden_states, hidden_states_original, token_selected_experts, token_final_scales, scale_factor, global_scale, input_payloads)
+        Tuple of (hidden_states, hidden_states_original, token_selected_experts, token_final_scales, scale_factor, global_scale, lora_ids, input_payloads)
         - hidden_states: The tensor to communicate (may be quantized)
         - hidden_states_original: The original unquantized hidden states for validation purpose
         - token_selected_experts: Expert indices
         - token_final_scales: Routing weights
         - scale_factor: Block scale factor tensor for NVFP4 (in A2A payloads), None otherwise
         - global_scale: Global/per-tensor scale factor for quantized dtype (synced via MPI max, same across ranks), None otherwise
+        - lora_ids: [num_tokens] int32 per-token LoRA adapter IDs when use_lora=True, None otherwise
         - input_payloads: List of all payloads for dispatch
     """
     # Generate original hidden states in input_dtype
@@ -554,6 +567,15 @@ def _create_moe_inputs(
     if scale_factor is not None:
         input_payloads.append(scale_factor)
 
+    # Per-token LoRA adapter IDs
+    lora_ids = None
+    if use_lora:
+        lora_ids = torch.randint(
+            0, NUM_LORA_ADAPTERS, (num_tokens,), dtype=torch.int32, device=device
+        )
+        # Dispatch kernel requires 2D payloads [num_tokens, elements_per_token]
+        input_payloads.append(lora_ids.unsqueeze(-1))
+
     return (
         hidden_states,
         hidden_states_original,
@@ -561,6 +583,7 @@ def _create_moe_inputs(
         token_final_scales,
         scale_factor,
         global_scale,
+        lora_ids,
         input_payloads,
     )
 
@@ -572,6 +595,7 @@ def _calculate_exact_comm_traffic(
     hidden_size: int,
     input_dtype: torch.dtype,
     quant_dtype: Optional[str] = None,
+    use_lora: bool = False,
 ) -> Tuple[int, int]:
     """
     Calculate exact inter-rank traffic from actual expert assignments.
@@ -589,6 +613,7 @@ def _calculate_exact_comm_traffic(
         hidden_size: Hidden dimension size
         input_dtype: Data type of hidden states (before quantization)
         quant_dtype: None, "fp8", or "nvfp4"
+        use_lora: If True, include per-token int32 LoRA ID bytes in dispatch traffic
 
     Returns:
         Tuple of (dispatch_bytes, combine_bytes) for actual inter-rank traffic
@@ -609,6 +634,9 @@ def _calculate_exact_comm_traffic(
         element_size = torch.tensor([], dtype=input_dtype).element_size()
         hidden_bytes_per_token = hidden_size * element_size
         scale_bytes_per_token = 0
+
+    # Per-token LoRA adapter ID (int32) travels alongside hidden states (once per src→dst pair)
+    lora_bytes_per_token = 4 if use_lora else 0
 
     # Activation dtype element size for combine phase
     combine_element_bytes = torch.tensor([], dtype=input_dtype).element_size()
@@ -647,6 +675,7 @@ def _calculate_exact_comm_traffic(
                 total_dispatch_bytes += (
                     hidden_bytes_per_token
                     + scale_bytes_per_token
+                    + lora_bytes_per_token
                     + num_experts_to_dst * token_topk_id_and_weight_bytes
                 )
                 # Combine: one output per token per dst_rank
@@ -665,6 +694,7 @@ def _calculate_comm_bandwidth(
     quant_dtype: Optional[str] = None,
     phase: str = "dispatch_combine",
     actual_traffic: Optional[Tuple[int, int]] = None,
+    use_lora: bool = False,
 ) -> float:
     """
     Calculate memory bandwidth for MoE A2A communication in TB/sec.
@@ -721,6 +751,7 @@ def _calculate_comm_bandwidth(
             + num_tokens * top_k * 4  # token_selected_experts (int32)
             + num_tokens * top_k * 4  # token_final_scales (float32)
             + scale_bytes
+            + (num_tokens * 4 if use_lora else 0)  # LoRA adapter ID payload
         )
 
         # Combine phase: receive processed hidden_states back
@@ -750,13 +781,16 @@ def fake_moe(
     is_ep: bool = False,
     ep_rank: Optional[int] = None,
     num_experts_per_rank: Optional[int] = None,
+    lora_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Apply a deterministic fake MoE transformation for validation.
 
     Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
+    When lora_ids is provided, the LoRA adapter ID adds an integer step: scale += lora_id + 1.0
     This allows verifying that communication correctly routes tokens to experts
     and combines results.
+
 
     Args:
         hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
@@ -765,6 +799,7 @@ def fake_moe(
         is_ep: If True, only process experts assigned to this rank
         ep_rank: Rank for expert parallel filtering
         num_experts_per_rank: Number of experts per rank
+        lora_ids: Per-token LoRA adapter IDs [num_tokens] int32, or None
 
     Returns:
         Processed tensor with same shape as hidden_states
@@ -795,6 +830,8 @@ def fake_moe(
 
             # Deterministic scale based on expert_id
             scale = (expert_id + 1.0) / num_experts + 0.5
+            if lora_ids is not None:
+                scale += lora_ids[token_idx].item() + 1.0
             results.append(hidden_states[token_idx].to(torch.float32) * scale)
 
         # Sum results with higher precision to match actual implementation
@@ -823,6 +860,7 @@ def _validate_moe_a2a(
     rank: int,
     comm,
     verbose: int = 0,
+    lora_ids: Optional[torch.Tensor] = None,
 ) -> bool:
     """
     Validate MoE A2A communication correctness with a round-trip test.
@@ -872,7 +910,13 @@ def _validate_moe_a2a(
     recv_hidden = recv_tensors[0]
     recv_experts = recv_tensors[1]
     _ = recv_tensors[2]  # recv_token_final_scales
-    recv_scale_factor = recv_tensors[3] if len(recv_tensors) > 3 else None
+    # When use_lora, the LoRA ID payload is appended after the scale_factor (or directly
+    # after the 3 base payloads when there is no quant scale factor).
+    use_lora = lora_ids is not None
+    has_scale_factor = quant_dtype in ("nvfp4", "fp8_block_scale")
+    recv_scale_factor = recv_tensors[3] if has_scale_factor else None
+    lora_id_payload_index = (4 if has_scale_factor else 3) if use_lora else None
+    recv_lora_ids = recv_tensors[lora_id_payload_index].flatten() if use_lora else None
 
     # Note: For quantized dispatch, recv_tensors[0] is quantized.
     # Per-tensor scale factor is part of model ckpts, not in A2A payloads.
@@ -925,6 +969,7 @@ def _validate_moe_a2a(
         is_ep=True,
         ep_rank=rank,
         num_experts_per_rank=num_experts_per_rank,
+        lora_ids=recv_lora_ids,
     )
 
     # Get combine payload workspace
@@ -964,12 +1009,20 @@ def _validate_moe_a2a(
         np.concatenate(all_token_selected_experts, axis=0)
     ).to(token_selected_experts.device)
 
+    global_lora_ids = None
+    if use_lora:
+        all_lora_ids = comm.allgather(lora_ids.cpu().numpy())
+        global_lora_ids = torch.from_numpy(np.concatenate(all_lora_ids, axis=0)).to(
+            lora_ids.device
+        )
+
     # Compute expected result locally
     expected = fake_moe(
         global_hidden_states,
         global_token_selected_experts,
         num_experts,
         is_ep=False,
+        lora_ids=global_lora_ids,
     )
 
     # Extract this rank's portion
@@ -1063,6 +1116,7 @@ def test_moe_a2a_dispatch_combine(args):
     max_num_tokens = args.max_num_tokens
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     quant_dtype = args.quant_dtype
+    use_lora = getattr(args, "use_lora", False)
 
     res = []
 
@@ -1082,13 +1136,22 @@ def test_moe_a2a_dispatch_combine(args):
         world_size=world_size,
     )
 
-    # Create MoeAlltoAll instance
+    # Create MoeAlltoAll instance — when use_lora, size workspace with an extra
+    # int32 per token for the LoRA ID payload.
+    extra_payload_bytes = 4 if use_lora else 0
+    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        ep_size,
+        top_k,
+        max_num_tokens,
+        hidden_size,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
     moe_a2a = MoeAlltoAll(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_experts=num_experts,
-        hidden_size=hidden_size,
+        workspace_size_per_rank=workspace_size_per_rank,
     )
 
     # Synchronize all_num_tokens across ranks
@@ -1105,6 +1168,7 @@ def test_moe_a2a_dispatch_combine(args):
         token_final_scales,
         scale_factor,
         global_scale,
+        lora_ids,
         input_payloads,
     ) = _create_moe_inputs(
         num_tokens,
@@ -1115,6 +1179,7 @@ def test_moe_a2a_dispatch_combine(args):
         quant_dtype,
         device,
         comm,
+        use_lora=use_lora,
     )
 
     # Run validation if requested
@@ -1139,6 +1204,7 @@ def test_moe_a2a_dispatch_combine(args):
             rank=rank,
             comm=comm,
             verbose=args.verbose,
+            lora_ids=lora_ids,
         )
         if not validation_passed:
             if rank == 0:
@@ -1154,6 +1220,7 @@ def test_moe_a2a_dispatch_combine(args):
         hidden_size,
         input_dtype,
         quant_dtype,
+        use_lora=use_lora,
     )
     # Compute total active experts across all ranks
     total_active_experts = int(

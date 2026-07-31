@@ -16,6 +16,14 @@ limitations under the License.
 
 from typing import List
 
+import torch
+
+
+def _is_nvfp4_kv_dtype(dtype: torch.dtype) -> bool:
+    return dtype == torch.uint8 or (
+        hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2
+    )
+
 
 def generate_additional_params(
     additional_tensor_names: List[str],

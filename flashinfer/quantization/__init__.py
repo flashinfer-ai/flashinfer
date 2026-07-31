@@ -18,7 +18,11 @@ from .packbits import packbits, segment_packbits
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
-from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
+from .fp8_quantization import (
+    mxfp8_quantize,
+    mxfp8_grouped_quantize,
+    mxfp8_dequantize_host,
+)
 
 # Re-export FP4 quantization (all public symbols)
 from .fp4_quantization import (
@@ -32,9 +36,14 @@ from .fp4_quantization import (
     mxfp4_quantize,
     nvfp4_quantize,
     nvfp4_batched_quantize,
+    nvfp4_quantize_paged_kv_cache,
+    nvfp4_kv_quantize,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,  # Used by activation.py
 )
 
@@ -48,7 +57,10 @@ try:
     if is_cute_dsl_available():
         from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
         from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
-        from .kernels.nvfp4_quantize import nvfp4_quantize_cute_dsl
+        from .kernels.nvfp4_quantize import (
+            nvfp4_quantize_cute_dsl,
+            nvfp4_quantize_per_token_cute_dsl,
+        )
 
         _cute_dsl_available = True
 except ImportError:
@@ -62,6 +74,7 @@ __all__ = [
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     # FP4
     "SfLayout",
@@ -74,9 +87,14 @@ __all__ = [
     "mxfp4_quantize",
     "nvfp4_quantize",
     "nvfp4_batched_quantize",
+    "nvfp4_quantize_paged_kv_cache",
+    "nvfp4_kv_quantize",
+    "nvfp4_kv_dequantize",
+    "nvfp4_kv_dequantize_paged",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
+    "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
 ]
 
@@ -85,4 +103,5 @@ if _cute_dsl_available:
         "mxfp8_quantize_cute_dsl",
         "mxfp4_quantize_cute_dsl",
         "nvfp4_quantize_cute_dsl",
+        "nvfp4_quantize_per_token_cute_dsl",
     ]

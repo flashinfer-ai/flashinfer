@@ -117,6 +117,13 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
   const index_t col_in_tile = warp_n * THREADS_PER_WARP + lane;
   const index_t c = bidn * THREADS_PER_ROW + col_in_tile;
 
+  // Per-lane validity for the partial tail LDG: at it == LDGS_FULL, this lane
+  // touches vec column LDGS_FULL * VEC_COLS_PER_LDG + c, which is in-bounds
+  // iff c < TAIL_VEC_COLS. For non-tail iterations all lanes are valid.
+  // When HAS_TAIL_LDG == 0 the per-iteration check is statically true and
+  // gets dead-code-eliminated.
+  const bool tail_lane_valid = (c < static_cast<index_t>(Ktraits::TAIL_VEC_COLS));
+
   Stats stats(params, bidm, bidn, warp_m, warp_n, tidx, lane, shared->smem_stats, smemBar);
 
   // Unused when USE_GAMMA_SMEM is true and will be optimized out
@@ -158,8 +165,17 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
 // APEX LN_fwd engines
 #pragma unroll 128
     for (int it = 0; it < LDGS; it++) {
+      // Compile-time true unless we are on a partial tail LDG, in which case
+      // only lanes with c < TAIL_VEC_COLS may dereference params.gamma/beta.
+      // OOB lanes skip the load; their gamma_smem / gamma_regs slots remain
+      // uninitialized but are never read by lanes whose z stores survive
+      // the matching predicate below.
+      bool iter_valid = true;
+      if constexpr (Ktraits::HAS_TAIL_LDG) {
+        iter_valid = (it < Ktraits::LDGS_FULL) || tail_lane_valid;
+      }
       if constexpr (USE_GAMMA_SMEM) {
-        if (warp_m == 0) {
+        if (warp_m == 0 && iter_valid) {
           const index_t cur_gamma_smem_base_idx = (b * LDGS + it) * THREADS_PER_ROW * NUM_ELTS +
                                                   warp_n * THREADS_PER_WARP * NUM_ELTS + lane;
           if constexpr (Ktraits::hasGamma) {
@@ -182,11 +198,13 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
           }
         }
       } else if constexpr (!GAMMA_ON_DEMAND) {
-        if constexpr (Ktraits::hasGamma) {
-          gamma_regs[b][it].load_from(params.gamma, idx);
-        }
-        if constexpr (Ktraits::hasBeta) {
-          beta_regs[b][it].load_from(params.beta, idx);
+        if (iter_valid) {
+          if constexpr (Ktraits::hasGamma) {
+            gamma_regs[b][it].load_from(params.gamma, idx);
+          }
+          if constexpr (Ktraits::hasBeta) {
+            beta_regs[b][it].load_from(params.beta, idx);
+          }
         }
       }
       idx += VEC_COLS_PER_LDG;
@@ -228,16 +246,29 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
        row += row_increment_step, batch_idx += batch_increment_step, remainder += step_remainder) {
     index_t idx = static_cast<index_t>(row) * VEC_COLS + c;
 
-    // Load x and convert to compute type per row per thread
+    // Load x and convert to compute type per row per thread.
+    // For partial tail LDG, OOB lanes skip the load and write zero into xf,
+    // which is the identity for sum / sum-of-squares (rn = 1/COLS uses the
+    // true C, so the RMS computation remains exact).
     compute_t xf[LDGS * NUM_ELTS];
 #pragma unroll 128
     for (int it = 0; it < LDGS; it++) {
-      Ivec x_it{};
-      x_it.load_from(params.x, idx);
+      bool iter_valid = true;
+      if constexpr (Ktraits::HAS_TAIL_LDG) {
+        iter_valid = (it < Ktraits::LDGS_FULL) || tail_lane_valid;
+      }
+      if (iter_valid) {
+        Ivec x_it;
+        x_it.load_from(params.x, idx);
 #pragma unroll
-      for (int jt = 0; jt < NUM_ELTS; jt++) {
-        compute_t x_ij = compute_t(x_it.data.elt[jt]);
-        xf[it * NUM_ELTS + jt] = x_ij;
+        for (int jt = 0; jt < NUM_ELTS; jt++) {
+          xf[it * NUM_ELTS + jt] = compute_t(x_it.data.elt[jt]);
+        }
+      } else {
+#pragma unroll
+        for (int jt = 0; jt < NUM_ELTS; jt++) {
+          xf[it * NUM_ELTS + jt] = compute_t(0);
+        }
       }
       idx += VEC_COLS_PER_LDG;
     }
@@ -277,14 +308,20 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
     index_t gamma_idx = c + (batch_idx * LDGS) * VEC_COLS_PER_LDG;
 #pragma unroll 128
     for (int it = 0; it < LDGS; it++) {
+      bool iter_valid = true;
+      if constexpr (Ktraits::HAS_TAIL_LDG) {
+        iter_valid = (it < Ktraits::LDGS_FULL) || tail_lane_valid;
+      }
       Cvec z_math;
       [[maybe_unused]] Wvec g_wt;
       [[maybe_unused]] Wvec b_wt;
       if constexpr (GAMMA_ON_DEMAND && Ktraits::hasGamma && !USE_GAMMA_SMEM) {
-        g_wt.load_from(params.gamma, gamma_idx);
+        if (iter_valid) {
+          g_wt.load_from(params.gamma, gamma_idx);
 
-        if constexpr (Ktraits::hasBeta) {
-          b_wt.load_from(params.beta, gamma_idx);
+          if constexpr (Ktraits::hasBeta) {
+            b_wt.load_from(params.beta, gamma_idx);
+          }
         }
       }
 #pragma unroll
@@ -334,7 +371,11 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
         y_ij = __fdividef(y_ij, 1.0f + __expf(-y_ij));
 
         if constexpr (isFP8Out) {
-          if (hasAmax) {
+          // Skip amax update on partial-tail OOB lanes: their y_ij is derived
+          // from uninitialized gamma/beta and would poison amax with garbage
+          // or NaN. The matching z store is already predicated, so dropping
+          // these samples is safe.
+          if (hasAmax && iter_valid) {
             __builtin_assume(amax >= 0);
             amax = fmaxf(amax, fabsf(y_ij));
           }
@@ -398,9 +439,16 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
           }
         }
       } else {
-        Ovec z;
-        z_math.to(z);
-        z.store_to(params.z, idx);
+        // OOB lanes in the partial tail LDG skip the store. The bf16/fp8
+        // paths do not require warp-level cooperation here, so per-lane
+        // divergence is safe. (BlockScale path above keeps the original
+        // codegen; the Python knob selector forbids tail-needing knobs
+        // for nvfp4.)
+        if (iter_valid) {
+          Ovec z;
+          z_math.to(z);
+          z.store_to(params.z, idx);
+        }
       }
       idx += VEC_COLS_PER_LDG;
       gamma_idx += VEC_COLS_PER_LDG;

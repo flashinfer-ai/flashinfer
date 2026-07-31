@@ -1,5 +1,10 @@
 import torch
 
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    nvfp4_e4m3_max,
+)
 import flashinfer.utils as utils
 
 FLOAT4_E2M1_MAX = 6.0
@@ -90,20 +95,16 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
 
 def nvfp4_global_encode_scale_te(
     global_amax: torch.Tensor,
-    use_4over6: bool = False,
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> torch.Tensor:
     """Return the effective NVFP4 global encode scale."""
     global_amax = global_amax.to(torch.float32)
     float4_e2m1_max = torch.tensor(6.0, device=global_amax.device, dtype=torch.float32)
-    if use_4over6 and use_256:
-        float8_e4m3_max = torch.tensor(
-            256.0, device=global_amax.device, dtype=torch.float32
-        )
-    else:
-        float8_e4m3_max = torch.tensor(
-            448.0, device=global_amax.device, dtype=torch.float32
-        )
+    float8_e4m3_max = torch.tensor(
+        nvfp4_e4m3_max(nvfp4_4over6_config),
+        device=global_amax.device,
+        dtype=torch.float32,
+    )
     global_encode_scale = torch.div(float8_e4m3_max * float4_e2m1_max, global_amax)
     global_encode_scale = torch.min(
         global_encode_scale,
@@ -131,14 +132,11 @@ def nvfp4_global_encode_scale_te(
 
 def nvfp4_global_decode_scale_te(
     global_amax: torch.Tensor,
-    use_4over6: bool = False,
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> torch.Tensor:
     return torch.div(
         1.0,
-        nvfp4_global_encode_scale_te(
-            global_amax, use_4over6=use_4over6, use_256=use_256
-        ),
+        nvfp4_global_encode_scale_te(global_amax, nvfp4_4over6_config),
     )
 
 
@@ -225,16 +223,85 @@ def _ref_fp4_quant_te_with_decode_scale(
     return cast_to_fp4(clipped_x)
 
 
+def _ref_nvfp4_4over6_fp16_candidate(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Decode E2M1 x E4M3 with fp16 product semantics.
+
+    The CuTe-DSL implementation uses PTX to decode E2M1x2 and E4M3 to f16,
+    multiply in f16x2, then widen the product to f32 for error accumulation.
+    """
+    # Stage 1: express the decoded E2M1 input as sign and integer significand:
+    # q = (-1)^q_sign * q_sig * 2^-1.
+    q_float = q.to(torch.float32)
+    q_sign = (q_float < 0).to(torch.int32)
+    q_sig = (torch.abs(q_float) * 2).to(torch.int32)
+
+    # Stage 2: decode the E4M3 scale byte as sign and integer significand:
+    # scale = (-1)^scale_sign * scale_sig * 2^scale_exp2.
+    scale_code = scale.contiguous().view(torch.uint8).to(torch.int32)
+    scale_sign = scale_code >> 7
+    scale_exp_field = (scale_code >> 3) & 0xF
+    scale_mantissa = scale_code & 0x7
+    scale_sig = torch.where(
+        scale_exp_field == 0,
+        scale_mantissa,
+        scale_mantissa + 8,
+    )
+    scale_exp2 = torch.where(
+        scale_exp_field == 0,
+        scale_exp_field - 9,
+        scale_exp_field - 10,
+    )
+
+    # Stage 3: multiply the dyadic significands exactly in integer space:
+    # product = (-1)^product_sign * product_sig * 2^product_exp2.
+    product_sign = q_sign ^ scale_sign
+    product_sig = q_sig * scale_sig
+    product_exp2 = scale_exp2 - 1
+
+    # Stage 4: pack that exact dyadic product into fp16 bits. These products
+    # are exactly representable in fp16, so RN does not need a tie path here.
+    log2_sig = torch.zeros_like(product_sig)
+    for threshold in (2, 4, 8, 16, 32, 64, 128, 256):
+        log2_sig = log2_sig + (product_sig >= threshold).to(torch.int32)
+
+    floor_exp = log2_sig + product_exp2
+    normal_bits = ((floor_exp + 15) << 10) | (
+        torch.bitwise_left_shift(product_sig, 10 - log2_sig) - 1024
+    )
+    subnormal_bits = torch.bitwise_left_shift(product_sig, product_exp2 + 24)
+    magnitude_bits = torch.where(floor_exp < -14, subnormal_bits, normal_bits)
+    prod_bits = (product_sign << 15) | magnitude_bits
+    prod_bits = torch.where(product_sig == 0, product_sign << 15, prod_bits)
+    prod_bits = torch.where(
+        (scale_code & 0x7F) == 0x7F,
+        torch.full_like(prod_bits, 0x7E00),
+        prod_bits,
+    )
+
+    # Stage 5: decode the fp16 bit pattern to fp32 without using fp16 math.
+    sign_f32 = torch.where(
+        (prod_bits & 0x8000) != 0,
+        torch.tensor(-1.0, device=prod_bits.device, dtype=torch.float32),
+        torch.tensor(1.0, device=prod_bits.device, dtype=torch.float32),
+    )
+    fp16_exp = (prod_bits >> 10) & 0x1F
+    fp16_frac = prod_bits & 0x3FF
+    normal_f32 = torch.ldexp((fp16_frac + 1024).to(torch.float32), fp16_exp - 25)
+    subnormal_f32 = torch.ldexp(fp16_frac.to(torch.float32), fp16_exp - 24)
+    return sign_f32 * torch.where(fp16_exp == 0, subnormal_f32, normal_f32)
+
+
 def ref_fp4_quant_4over6_te(
     x: torch.Tensor,
     global_amax: torch.Tensor,
     block_size: int = 16,
-    *,
     per_token_rowwise: bool = False,
-    err_mode: str = "MAE",
-    use_256: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 4over6 reference: TE quantization plus fouroversix error selection.
+    """NVFP4 4over6 reference for FlashInfer's candidate-error contract.
 
     Returns unpacked E2M1 values, E4M3 block scales in linear layout, the
     effective global/per-token decode scale, and the chosen candidate mask.
@@ -244,9 +311,9 @@ def ref_fp4_quant_4over6_te(
             f"ref_fp4_quant_4over6_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
         )
     assert block_size == 16
-    err_mode = err_mode.upper()
-    if err_mode not in ("MAE", "MSE"):
-        raise ValueError("err_mode must be 'MAE' or 'MSE'.")
+    if nvfp4_4over6_config is None:
+        nvfp4_4over6_config = NVFP44Over6Config()
+    nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode
 
     m, n = x.shape
     x_blocks = x.view(m, n // block_size, block_size).to(torch.float32)
@@ -254,10 +321,16 @@ def ref_fp4_quant_4over6_te(
 
     e2m1_max = torch.tensor(FLOAT4_E2M1_MAX, device=x.device, dtype=torch.float32)
 
+    float8_e4m3_max = torch.tensor(
+        nvfp4_e4m3_max(nvfp4_4over6_config),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
     if per_token_rowwise:
         global_amax = global_amax.to(torch.float32).view(m)
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax, use_4over6=True, use_256=use_256
+            global_amax, nvfp4_4over6_config
         )
         global_decode_scale = torch.where(
             global_amax == 0.0,
@@ -266,28 +339,33 @@ def ref_fp4_quant_4over6_te(
         )
         global_encode_scale = global_encode_scale.view(m, 1, 1)
         global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
+        error_row_amax = global_amax.view(m, 1)
+        error_global_decode_scale = None
         per_token_scale = global_decode_scale
     else:
+        global_amax = global_amax.to(torch.float32)
         global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax.to(torch.float32), use_4over6=True, use_256=use_256
+            global_amax, nvfp4_4over6_config
         )
         global_decode_scale = torch.div(1.0, global_encode_scale)
         global_decode_scale_blocks = global_decode_scale
+        error_row_amax = None
+        error_global_decode_scale = global_decode_scale
         per_token_scale = global_decode_scale.reshape(())
 
     # Candidate scale construction follows the original 4over6 reference.
     sf6_high_precision = torch.where(
         vec_max == 0.0,
         torch.zeros_like(vec_max),
-        vec_max * torch.div(global_encode_scale, e2m1_max),
+        torch.div(vec_max, e2m1_max) * global_encode_scale,
     )
     sf4_high_precision = sf6_high_precision * 1.5
-    float8_e4m3_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
+    float8_e4m3_clamp_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
     sf4_high_precision = torch.clamp(
-        sf4_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+        sf4_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
     )
     sf6_high_precision = torch.clamp(
-        sf6_high_precision, min=-float8_e4m3_max, max=float8_e4m3_max
+        sf6_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
     )
     sf4_fp8 = sf4_high_precision.to(torch.float8_e4m3fn)
     sf6_fp8 = sf6_high_precision.to(torch.float8_e4m3fn)
@@ -308,20 +386,49 @@ def ref_fp4_quant_4over6_te(
         global_decode_scale_blocks,
     )
 
-    # Error dequantization and strict less-than comparison follow 4over6.
-    dq4 = q4 * sf4 * global_decode_scale_blocks
-    dq6 = q6 * sf6 * global_decode_scale_blocks
     err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
     err6 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
-    for i in range(block_size):
-        diff4 = dq4[:, :, i] - x_blocks[:, :, i]
-        diff6 = dq6[:, :, i] - x_blocks[:, :, i]
-        if err_mode == "MSE":
-            err4 += diff4 * diff4
-            err6 += diff6 * diff6
-        else:
-            err4 += torch.abs(diff4)
-            err6 += torch.abs(diff6)
+    if nvfp4_4over6_config.err_use_fast_math:
+        original_scaled = x_blocks * global_encode_scale
+        candidate4_scaled = _ref_nvfp4_4over6_fp16_candidate(q4, sf4_fp8)
+        candidate6_scaled = _ref_nvfp4_4over6_fp16_candidate(q6, sf6_fp8)
+        for i in range(block_size):
+            diff4 = candidate4_scaled[:, :, i] - original_scaled[:, :, i]
+            diff6 = candidate6_scaled[:, :, i] - original_scaled[:, :, i]
+            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                err4 += diff4 * diff4
+                err6 += diff6 * diff6
+            else:
+                err4 += torch.abs(diff4)
+                err6 += torch.abs(diff6)
+    else:
+        # Per-token strict scoring uses the row amax that is already computed
+        # online. Per-tensor strict scoring intentionally uses the normal
+        # global-decode-scale expression to avoid an additional tensor amax.
+        denom = e2m1_max * float8_e4m3_max
+        sf4 = sf4.squeeze(-1)
+        sf6 = sf6.squeeze(-1)
+        for i in range(block_size):
+            val4 = q4[:, :, i] * sf4
+            if per_token_rowwise:
+                val4 = val4 * error_row_amax
+                val4 = val4 / denom
+            else:
+                val4 = val4 * error_global_decode_scale
+            diff4 = val4 - x_blocks[:, :, i]
+            val6 = q6[:, :, i] * sf6
+            if per_token_rowwise:
+                val6 = val6 * error_row_amax
+                val6 = val6 / denom
+            else:
+                val6 = val6 * error_global_decode_scale
+            diff6 = val6 - x_blocks[:, :, i]
+            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                err4 += diff4 * diff4
+                err6 += diff6 * diff6
+            else:
+                err4 += torch.abs(diff4)
+                err6 += torch.abs(diff6)
     pick_four = err4 < err6
 
     q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6).reshape(m, n)

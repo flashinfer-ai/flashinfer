@@ -848,30 +848,42 @@ def mxfp8_quantize_cute_dsl(
     enable_pdl: bool | None = None,
     is_sf_8x4_layout: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to MXFP8 format using CuTe-DSL kernel.
+    r"""Quantize input tensor to MXFP8 format using the CuTe-DSL kernel.
 
-    This is a GPU implementation with dual-path optimization:
-    - LINEAR layout: SF-block based iteration (fast)
-    - SWIZZLED layout: Row-based iteration with padding fast path (optimized)
+    GPU implementation with dual-path optimization:
 
-    The kernel is compiled once per (K, dtype, pdl, sf_layout) combination and
-    handles varying M (batch size) at runtime without recompilation.
+    - **LINEAR layout**: SF-block based iteration (fast).
+    - **SWIZZLED layout**: row-based iteration with a padding fast path.
 
-    Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16
-        is_sf_swizzled_layout: Whether to use a swizzled layout (True) or linear (False).
-            When True, layout is 128x4 by default; pass ``is_sf_8x4_layout=True`` for 8x4.
-        alignment: Alignment for K dimension (default 32, must be multiple of SF_VEC_SIZE)
-        enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0).
-        is_sf_8x4_layout: When ``is_sf_swizzled_layout`` is True, selects 8x4 swizzling
-            instead of the default 128x4. Ignored for the linear layout.
+    The kernel is compiled once per ``(K, dtype, pdl, sf_layout)`` tuple
+    and handles varying ``M`` (batch size) at runtime without
+    recompilation.
 
-    Returns:
-        Tuple of:
-            - fp8_tensor: Quantized tensor of shape [M, padded_K] with dtype float8_e4m3fn
-            - scale_tensor: Scale factors as uint8 tensor
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+    is_sf_swizzled_layout : bool
+        Whether to use a swizzled layout (``True``) or linear (``False``).
+        When ``True``, the layout is 128x4 by default; pass
+        ``is_sf_8x4_layout=True`` for 8x4.
+    alignment : int
+        Alignment for the K dimension (default 32; must be a multiple of
+        ``SF_VEC_SIZE``).
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
+    is_sf_8x4_layout : bool
+        When ``is_sf_swizzled_layout`` is ``True``, selects 8x4 swizzling
+        instead of the default 128x4.  Ignored for the linear layout.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fp8_tensor, scale_tensor)`` where ``fp8_tensor`` is the
+        quantized tensor of shape ``[M, padded_K]`` with dtype
+        ``float8_e4m3fn`` and ``scale_tensor`` is the UE8M0 scale-factor
+        tensor (``uint8``).
     """
     from ...utils import device_support_pdl
 

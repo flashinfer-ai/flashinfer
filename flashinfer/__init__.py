@@ -73,11 +73,17 @@ from .quantization.fp4_quantization import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
-from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import (
+    mxfp8_dequantize_host,
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -88,9 +94,10 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
-# CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
+# CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
@@ -98,13 +105,18 @@ with contextlib.suppress(ImportError):
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
-from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
+from .gemm import svdquant_linear as svdquant_linear
+from .gemm import mm_bf16_fp4 as mm_bf16_fp4
+from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -115,14 +127,33 @@ from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
 from .kda_decode import recurrent_kda as recurrent_kda
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
+from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
+from .norm import layernorm_quant as layernorm_quant
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
+from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
+)
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_quantize_qkv as nvfp4_attention_sm120_quantize_qkv,
+)
+from .norm import (
+    fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
+)
+from .norm import (
+    fused_dit_gate_residual_layernorm_scale_shift as fused_dit_gate_residual_layernorm_scale_shift,
+)
+from .norm import (
+    fused_dit_gate_residual_layernorm_gamma_beta as fused_dit_gate_residual_layernorm_gamma_beta,
+)
 
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
@@ -133,6 +164,12 @@ from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
+from .page import (
+    nvfp4_quantize_append_paged_kv_cache as nvfp4_quantize_append_paged_kv_cache,
+)
+from .page import (
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 from .prefill import (
@@ -146,6 +183,9 @@ from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
+from .prefill import (
+    trtllm_sage_attention_quantize as trtllm_sage_attention_quantize,
+)
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope
@@ -176,7 +216,12 @@ from .sampling import (
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
-from .tllm_enums import SfLayout, ActivationType, RoutingMethodType
+from .tllm_enums import (
+    SfLayout,
+    ActivationType,
+    RoutingMethodType,
+    is_gated_activation as is_gated_activation,
+)
 from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
@@ -194,3 +239,26 @@ from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
 from .fi_trace import fi_trace as fi_trace
+
+# ---------------------------------------------------------------------------
+# Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
+# Activated only when FLASHINFER_TRACE_APPLY=1. This is the single edit to
+# existing flashinfer code required by the Trace Apply design — the package
+# itself lives in flashinfer/trace_apply/. Failures here must never break a
+# normal import, so the install is best-effort.
+# ---------------------------------------------------------------------------
+import os as _os
+
+if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "False"):
+    try:
+        from . import trace_apply as trace_apply
+
+        trace_apply._enable_apply_from_env()
+    except Exception as _trace_apply_err:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger("flashinfer.trace_apply").warning(
+            "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
+            "(continuing without Trace Apply).",
+            _trace_apply_err,
+        )

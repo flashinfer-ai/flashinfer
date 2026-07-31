@@ -77,3 +77,38 @@ def assert_close_with_mismatch_tolerance(
             f"Greatest absolute difference: {torch.max(abs_diff).item():.4g} (atol={atol})\n"
             f"Greatest relative difference: {torch.max(rel_diff).item():.4g} (rtol={rtol})"
         )
+
+
+def assert_close_chunked(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+    chunk_rows: int = 4096,
+    **kwargs,
+):
+    """Memory-frugal drop-in for torch.testing.assert_close on large tensors.
+
+    torch.testing.assert_close allocates several full-size temporaries inside
+    torch.isclose; on multi-GiB operands that transient spike is enough to OOM
+    a 24 GB CI GPU. Comparing in row chunks along dim 0 bounds the transient
+    to the chunk size while keeping identical pass/fail semantics. Extra
+    keyword arguments (e.g. equal_nan, check_dtype) are forwarded to
+    torch.testing.assert_close.
+    """
+    if actual.shape != expected.shape:
+        raise AssertionError(f"shape mismatch: {actual.shape} vs {expected.shape}")
+    if actual.ndim == 0 or actual.numel() == 0:
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, **kwargs)
+        return
+    for start in range(0, actual.shape[0], chunk_rows):
+        end = min(start + chunk_rows, actual.shape[0])
+        torch.testing.assert_close(
+            actual[start:end],
+            expected[start:end],
+            rtol=rtol,
+            atol=atol,
+            msg=lambda m, s=start, e=end: f"rows [{s}:{e}]: {m}",
+            **kwargs,
+        )

@@ -213,8 +213,8 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   static constexpr int SF_VEC_SIZE = 32;
 
   // Grid, Block size.
-  // Each thread converts 8 values.
-  dim3 block(std::min(int(padded_n / CVT_FP16_TO_MXFP8_ELTS_PER_THREAD), 512));
+  // Each thread converts 8/16 values.
+  dim3 block(128);
   // Get number of blocks per SM (assume we can fully utilize the SM).
   int const numBlocksPerSM = std::max(1u, 2048u / block.x);
   int effectiveRows = computeEffectiveRows(m, layout);
@@ -355,6 +355,7 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, cudaStream_t stream) {
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
+  // currently, nvfp4 per-token quantization kernel is only used on sm100f so always load 256bit.
   constexpr uint32_t ELTS_PER_THREAD = std::is_same_v<T, float> ? 8 : 16;
   constexpr uint32_t BLOCK_SIZE = 128;
   uint32_t smem_size;

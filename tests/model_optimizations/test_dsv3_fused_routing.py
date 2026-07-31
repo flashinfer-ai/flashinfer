@@ -116,9 +116,11 @@ accumulating more numerical error.
 ================================================================================
 """
 
-import torch
 import pytest
+import torch
+
 from flashinfer.dsv3_ops import fused_topk_deepseek
+
 # from flashinfer.utils import get_compute_capability
 
 

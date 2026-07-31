@@ -83,6 +83,33 @@ def mhc_post(
 
     ``out[..., new_hc, h] = x[..., h] * post_layer_mix[..., new_hc]
     + sum_old residual[..., old_hc, h] * comb_res_mix[..., old_hc, new_hc]``
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Layer output tensor, shape ``[..., H]`` (matches ``residual``'s
+        outer dimensions and ``H = residual.shape[-1]``).
+    residual : torch.Tensor
+        Multi-head residual tensor, shape ``[..., HC=4, H]``. The
+        ``HC=4`` axis must equal 4 (mHC is currently hard-wired to 4 sub-heads).
+    post_layer_mix : torch.Tensor
+        Layer-output mixing weights, shape ``[..., HC=4]`` or
+        ``[..., HC=4, 1]`` (both accepted). Provides the per-new-head
+        coefficient applied to ``x`` (the ``post_layer_mix`` factor in the
+        formula above). See mHC paper / reference implementation for the
+        exact training-time derivation.
+    comb_res_mix : torch.Tensor
+        Residual combination matrix, shape ``[..., HC=4, HC=4]``. Each
+        ``[old_hc, new_hc]`` entry is the coefficient mixing
+        ``residual[..., old_hc, :]`` into the new head ``new_hc`` (the
+        ``comb_res_mix`` factor above). See mHC paper / reference
+        implementation for the training-time derivation.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor with the same shape as ``residual``
+        (``[..., HC=4, H]``).
     """
 
     hc, hidden_size, _ = _check_mhc_post_inputs(
@@ -168,6 +195,65 @@ def mhc_pre_big_fuse(
     residual-square sums used for RMS normalization. When ``num_splits > 1``,
     both inputs have a leading split dimension that is reduced inside the CUDA
     kernel.
+
+    Parameters
+    ----------
+    dot_mix : torch.Tensor
+        Raw projection logits, shape ``[..., 24]`` when ``num_splits=1`` or
+        ``[num_splits, ..., 24]`` when ``num_splits > 1``. The trailing
+        ``24 = 4 (pre) + 4 (post) + 16 (comb)`` slots are partitioned and
+        re-shaped to per-head ``pre / post / comb`` factors inside the kernel.
+        See mHC paper / reference implementation for the projection
+        derivation.
+    sqrsum : torch.Tensor
+        Pre-computed per-token residual square-sum used for RMS
+        normalization. Shape ``[...]`` matching ``dot_mix`` outer dims, or
+        ``[num_splits, ...]`` when ``num_splits > 1`` (the kernel reduces
+        the split axis internally). dtype is implementation-defined.
+    residual : torch.Tensor
+        Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+        Same layout as :func:`mhc_post`'s ``residual``.
+    mhc_scale : torch.Tensor
+        mHC scaling tensor consumed by the Sinkhorn / mix step. Shape and
+        dtype are implementation-defined; see mHC paper / reference
+        implementation for the exact semantics.
+    mhc_base : torch.Tensor
+        mHC bias / base tensor consumed by the Sinkhorn / mix step. Shape
+        and dtype are implementation-defined; see mHC paper / reference
+        implementation for the exact semantics.
+    k : int
+        mHC algorithm parameter ``k`` passed to the CUDA kernel. See mHC
+        paper / reference implementation for the precise semantics.
+    rms_eps : float
+        RMSNorm epsilon for numerical stability. Default ``1e-6``. Must be
+        strictly positive.
+    mhc_pre_eps : float
+        Numerical-stability epsilon used in the mHC pre-map step.
+        Default ``1e-6``. Must be strictly positive.
+    mhc_sinkhorn_eps : float
+        Numerical-stability epsilon used in the Sinkhorn iteration step.
+        Default ``1e-6``. Must be strictly positive.
+    mhc_post_mult_value : float
+        Post-mix multiplicative factor applied to the mHC post outputs.
+        Default ``1.0``.
+    sinkhorn_repeat : int
+        Number of Sinkhorn iterations. Default ``20``.
+    num_splits : int
+        Split factor along the leading dimension. Must be one of
+        ``{1, 2, 4, 8, 16}``. When > 1, ``dot_mix`` and ``sqrsum`` carry a
+        leading split axis that is reduced inside the kernel. Default
+        ``1``.
+    block_size : int
+        CUDA block-size hint forwarded to the kernel (``0`` selects the
+        kernel's default). Default ``0``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(post_mix, comb_mix, layer_input)`` tensors with shapes
+        ``[..., HC=4, 1]``, ``[..., HC=4, HC=4]`` and ``[..., H]``
+        respectively. See mHC paper / reference implementation for how
+        downstream layers consume them.
     """
 
     if num_splits not in (1, 2, 4, 8, 16):
@@ -262,6 +348,52 @@ def mhc_pre_big_fuse_with_prenorm(
     This matches the Agentic ``mhc_pre_finalize`` boundary when no precomputed
     ``sqrsum`` is supplied. ``dot_mix`` may be shaped ``[..., 24]`` or
     ``[1, ..., 24]``.
+
+    Parameters
+    ----------
+    dot_mix : torch.Tensor
+        Raw projection logits, shape ``[..., 24]`` or ``[1, ..., 24]``. The
+        trailing ``24 = 4 (pre) + 4 (post) + 16 (comb)`` slots are
+        partitioned and re-shaped to per-head factors inside the kernel.
+        See mHC paper / reference implementation for the projection
+        derivation.
+    residual : torch.Tensor
+        Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+        ``sqrsum`` is computed from this tensor inside the kernel; same
+        layout as :func:`mhc_post`'s ``residual``.
+    mhc_scale : torch.Tensor
+        mHC scaling tensor consumed by the Sinkhorn / mix step. Shape and
+        dtype are implementation-defined; see mHC paper / reference
+        implementation for the exact semantics.
+    mhc_base : torch.Tensor
+        mHC bias / base tensor consumed by the Sinkhorn / mix step. Shape
+        and dtype are implementation-defined; see mHC paper / reference
+        implementation for the exact semantics.
+    rms_eps : float
+        RMSNorm epsilon for numerical stability. Default ``1e-6``. Must be
+        strictly positive.
+    mhc_pre_eps : float
+        Numerical-stability epsilon used in the mHC pre-map step.
+        Default ``1e-6``. Must be strictly positive.
+    mhc_sinkhorn_eps : float
+        Numerical-stability epsilon used in the Sinkhorn iteration step.
+        Default ``1e-6``. Must be strictly positive.
+    mhc_post_mult_value : float
+        Post-mix multiplicative factor applied to the mHC post outputs.
+        Default ``1.0``.
+    sinkhorn_repeat : int
+        Number of Sinkhorn iterations. Default ``20``.
+    block_size : int
+        CUDA block-size hint forwarded to the kernel (``0`` selects the
+        kernel's default). Default ``0``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(post_mix, comb_mix, layer_input)`` tensors with shapes
+        ``[..., HC=4, 1]``, ``[..., HC=4, HC=4]`` and ``[..., H]``
+        respectively. See mHC paper / reference implementation for how
+        downstream layers consume them.
     """
 
     _check_positive_eps("rms_eps", rms_eps)

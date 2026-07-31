@@ -20,12 +20,21 @@ from flashinfer.gemm import (
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     get_num_sm,
+    is_cute_dsl_arch_supported,
     is_cute_dsl_available,
 )
+from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
 
 
 @pytest.mark.skipif(
     not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
 )
 @pytest.mark.parametrize("lm", [(1, 1024), (2, 512), (4, 256)])
 @pytest.mark.parametrize("kn", [(7168, 4096), (2048, 7168)])
@@ -81,7 +90,7 @@ def test_blockscaled_gemm_python_interface(
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     device_ver = torch.cuda.get_device_capability(device)
-    supported_device_vers = [(10, 0), (10, 3)]
+    supported_device_vers = [(10, 0), (10, 3), (10, 7)]
     if device_ver not in supported_device_vers:
         pytest.skip(
             f"Cute-dsl backend is only supported on {supported_device_vers}, skipping {device_ver}."
@@ -257,6 +266,138 @@ def test_blockscaled_gemm_python_interface(
                 atol=tolerance,
                 rtol=1e-02,
             )
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+def test_grouped_gemm_nt_masked_scheduler_empty_experts():
+    """Regression test for draining MaskedScheduler past empty experts."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+        pytest.skip("NVFP4 grouped GEMM requires SM100")
+
+    sf_vec = 16
+    m, n, k, num_experts = 128, 128, 256, 4
+    k_packed, num_m_tiles, num_k_sf = k // 2, m // 128, k // sf_vec
+    num_k_sf_tiles = num_k_sf // 4
+    sf_shape = (32, 4, num_m_tiles, 4, num_k_sf_tiles, num_experts)
+
+    a = torch.full((m, k_packed, num_experts), 0x11, dtype=torch.uint8, device=dev)
+    b = torch.full((n, k_packed, num_experts), 0x11, dtype=torch.uint8, device=dev)
+    sfa = torch.ones(sf_shape, dtype=torch.float8_e4m3fn, device=dev)
+    sfb = torch.ones(sf_shape, dtype=torch.float8_e4m3fn, device=dev)
+    sentinel = 13.0
+
+    def run(masked_m_values):
+        output = torch.full(
+            (num_experts, m, n), sentinel, dtype=torch.bfloat16, device=dev
+        ).permute(1, 2, 0)
+        masked_m = torch.tensor(masked_m_values, dtype=torch.int32, device=dev)
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, sfb),
+            output,
+            masked_m,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=sf_vec,
+        )
+        # Surface asynchronous illegal memory accesses in the test process.
+        torch.cuda.synchronize()
+        return output.permute(2, 0, 1).clone()
+
+    full = run([m] * num_experts)
+    trailing_empty = run([m, 0, 0, 0])
+    torch.testing.assert_close(trailing_empty[0], full[0], atol=0.0, rtol=0.0)
+    assert torch.all(trailing_empty[1:] == sentinel)
+
+    all_empty = run([0] * num_experts)
+    assert torch.all(all_empty == sentinel)
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+def test_grouped_gemm_nt_masked_output_layout_contract():
+    """Regression test for issue #3103.
+
+    grouped_gemm_nt_masked builds the C tensor with a canonical ordered layout
+    derived from c_major (it ignores the output's actual strides) and stores it
+    via TMA over (M, N) tiles. An output whose contiguous dim is the expert/batch
+    (L) dim cannot be stored correctly and previously caused SILENT cross-expert
+    output corruption. It must now be rejected, and a compliant (N-contiguous)
+    output must not leak across experts.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    # cute-dsl grouped GEMM is SM100-only (SM110 is explicitly unsupported).
+    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+        pytest.skip("NVFP4 grouped GEMM requires SM100")
+
+    sf_vec = 16
+    m, n, k, E = 128, 128, 256, 2
+    k_packed, rm, k_sf = k // 2, m // 128, k // sf_vec
+    rk = k_sf // 4
+    sf_shape = (32, 4, rm, 4, rk, E)
+
+    def run(out, scale_byte):
+        aq = torch.full((m, k_packed, E), 0x11, dtype=torch.uint8, device=dev)
+        w = torch.full((n, k_packed, E), 0x11, dtype=torch.uint8, device=dev)
+        w_bs = torch.ones(E, n, k_sf, dtype=torch.float8_e4m3fn, device=dev)
+        masked_m = torch.full((E,), m, dtype=torch.int32, device=dev)
+        alpha = torch.ones(1, 1, E, dtype=torch.float32, device=dev)
+        sf = torch.ones(sf_shape, dtype=torch.float8_e4m3fn, device=dev)
+        raw = sf.view(torch.uint8)
+        raw[0, 0, 0, 0, 0, 0] = scale_byte  # perturb expert 0 only
+        sf = raw.view(torch.float8_e4m3fn).reshape(sf_shape)
+        out.zero_()
+        grouped_gemm_nt_masked(
+            (aq, sf),
+            (w, w_bs),
+            out,
+            masked_m,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=sf_vec,
+            alpha=alpha,
+            alpha_dtype="float32",
+        )
+        torch.cuda.synchronize()
+        return out.permute(2, 0, 1).clone()  # [E, m, n]
+
+    # Compliant output (N contiguous, expert dim outermost): no cross-expert leak.
+    def canonical_out():
+        return torch.zeros(E, m, n, dtype=torch.bfloat16, device=dev).permute(1, 2, 0)
+
+    base = run(canonical_out(), 0x3C)  # all scales = 1.0
+    perturbed = run(canonical_out(), 0x7F)  # expert 0 scale = NaN
+    assert not torch.isnan(perturbed[1]).any(), "NaN leaked into expert 1"
+    torch.testing.assert_close(base[1], perturbed[1], atol=0.0, rtol=0.0)
+
+    # Non-compliant output (expert dim innermost) must be rejected, not silently
+    # corrupt results across experts.
+    with pytest.raises(ValueError, match="cross-expert|c_major|contiguous"):
+        run(torch.zeros(m, n, E, dtype=torch.bfloat16, device=dev), 0x7F)
 
 
 if __name__ == "__main__":

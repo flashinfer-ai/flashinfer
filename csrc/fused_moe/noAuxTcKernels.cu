@@ -348,7 +348,7 @@ void NoAuxTc(TensorView scores, TensorView bias, int64_t n_group, int64_t topk_g
   TVM_FFI_ICHECK(topk_values.dtype() == data_type)
       << "topk_values must have the same dtype as scores";
   TVM_FFI_ICHECK(encode_dlpack_dtype(topk_indices.dtype()) == int32_code)
-      << "topk_indices must have the same dtype as scores";
+      << "topk_indices must be int32 dtype";
 
   // Validate and extract routing_replay_out
   // NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer

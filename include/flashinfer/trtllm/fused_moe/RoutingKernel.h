@@ -104,6 +104,12 @@ struct DataBase {
   int32_t mLocalExpertsStrideLog2;
   int32_t mNumLocalExperts;
 
+  /// For fused shared expert
+  int32_t mNumFusedSharedExperts{0};
+  int32_t mSharedExpertTokenOffset{0};
+  int32_t mSharedExpertNumTokens{0};
+  int32_t mTotalExpertsPerToken{0};
+
   // optional: if nullptr, no routing replay recording occurs
   // dim: [mNumTokens, mTopK]
   // Records the selected expert IDs per token for replay
@@ -144,6 +150,11 @@ struct KernelParamsBase {
   int32_t mLocalExpertsStrideLog2 = 0;
   int32_t mNumLocalExperts = 0;
 
+  int32_t mNumFusedSharedExperts = 0;
+  int32_t mSharedExpertTokenOffset = 0;
+  int32_t mSharedExpertNumTokens = 0;
+  int32_t mTotalExpertsPerToken = 0;
+
   // NOTE: placed at end to preserve field offsets for existing routing kernels
   int16_t* mPtrRoutingReplayOut = nullptr;
 
@@ -173,6 +184,11 @@ struct KernelParamsBase {
     mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
     mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
     mNumLocalExperts = data.mNumLocalExperts;
+
+    mNumFusedSharedExperts = data.mNumFusedSharedExperts;
+    mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
+    mSharedExpertNumTokens = data.mSharedExpertNumTokens;
+    mTotalExpertsPerToken = data.mTotalExpertsPerToken;
   }
 };
 
@@ -195,6 +211,7 @@ struct Data : public DataBase {
   int32_t mNumLimitedGroups;
 
   float mRouteScale;
+  float mSumEpsilon{0.0f};
   bool mUseRoutingSoftmax;
 };
 
@@ -223,6 +240,7 @@ struct KernelParams
 
   trtllm::dev::IntFastDiv mTopK;
   float mRouteScale = 0.f;
+  float mSumEpsilon = 0.f;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -238,6 +256,7 @@ struct KernelParams
     params.mNumLimitedGroups = data.mNumLimitedGroups;
     params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
     params.mRouteScale = data.mRouteScale;
+    params.mSumEpsilon = data.mSumEpsilon;
 
     return params;
   }

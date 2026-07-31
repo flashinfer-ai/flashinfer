@@ -237,9 +237,12 @@ fused_add_rmsnorm_trace = TraceTemplate(
         "weight": Tensor(["hidden_size"]),
     },
     outputs={
-        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+        "output": Tensor(
+            ["batch_size", "hidden_size"], param="input", dtype_from="input"
+        ),
         "residual": Tensor(
             ["batch_size", "hidden_size"],
+            param="residual",
             dtype_from="input",
             description="Updated residual (in-place: residual += hidden_states).",
         ),
@@ -583,6 +586,92 @@ layernorm_trace = TraceTemplate(
 )
 
 
+# ── LayerNorm + FP8 Quantize ──────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _layernorm_quant_reference(hidden_states, weight, bias, scale):
+    """LayerNorm followed by per-tensor FP8 (e4m3fn) quantization.
+
+    ``out = clamp(layernorm(input, gamma, beta) / scale, fp8_min, fp8_max).to(fp8_e4m3fn)``.
+    Epsilon is fixed at 1e-6.
+    """
+    EPS = 1e-6
+    x = hidden_states.to(torch.float32)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    y = (x - mean) / torch.sqrt(var + EPS)
+    y = y * weight.to(torch.float32) + bias.to(torch.float32)
+    s = (
+        scale.to(torch.float32).reshape(())
+        if isinstance(scale, torch.Tensor)
+        else float(scale)
+    )
+    y = y / s
+    fp8_max = 448.0  # float8_e4m3fn max finite value
+    y = y.clamp(-fp8_max, fp8_max)
+    return y.to(torch.float8_e4m3fn)
+
+
+def _layernorm_quant_init(
+    *,
+    batch_size: int,
+    hidden_size: int = 768,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.layernorm_quant``.
+
+    Default ``hidden_size=768`` matches GPT-2/BERT base. ``gemma`` (gamma) and
+    ``beta`` are float32 as required by the API.
+    """
+    torch.manual_seed(seed)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    return {
+        "out": out,
+        "input": x,
+        "gemma": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
+        "scale": torch.tensor(1.0, dtype=torch.float32, device=device),
+    }
+
+
+layernorm_quant_trace = TraceTemplate(
+    op_type="layernorm",
+    name_prefix="layernorm_quant",
+    description="LayerNorm + FP8 quantization. out = quantize(layernorm(input, gemma, beta), scale).",
+    axes={
+        "batch_size": Var(),
+        "hidden_size": Const(abbrev="h"),
+    },
+    inputs={
+        "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
+        "weight": Tensor(
+            ["hidden_size"], param="gemma", description="Scale (gamma) tensor, float32."
+        ),
+        "bias": Tensor(
+            ["hidden_size"], param="beta", description="Bias (beta) tensor, float32."
+        ),
+        "scale": Scalar(
+            "float32", description="Per-tensor quantization scale, shape (1,)."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["batch_size", "hidden_size"],
+            dtype_from="out",
+            dtype="float8_e4m3fn",
+            description="Quantized output (dtype matches pre-allocated out tensor).",
+        ),
+    },
+    tags=["status:verified", "quantization:fp8"],
+    reference=_layernorm_quant_reference,
+    check=_rmsnorm_quant_check,
+    init=_layernorm_quant_init,
+)
+
+
 # ── Fused RMSNorm + SiLU ──────────────────────────────────────────────────────
 
 
@@ -879,7 +968,11 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
     name_prefix="add_rmsnorm_fp4quant",
     description=(
         "CuTe-DSL fused (residual + input) → RMSNorm → FP4 quantize. "
-        "Mutates the residual buffer in-place with the prenorm sum."
+        "Mutates the residual buffer in-place with the prenorm sum. "
+        "Note: the optional output variants of the runtime API "
+        "(``output_both_sf_layouts`` and ``y_out``) are not modeled by this "
+        "trace template — it captures the core FP4-quantize signature only; "
+        "dump/replay of those extra mutated buffers is unsupported."
     ),
     axes=_RMSNORM_FP4_AXES,
     inputs={
@@ -904,4 +997,26 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
 )
 add_rmsnorm_fp4quant_trace.axes["scalar"] = Var(
     description="global_scale tensor length (typically 1).",
+)
+
+
+def add_rmsnorm_fp4quant_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select the trace template for ``add_rmsnorm_fp4quant``.
+
+    The static template models only the core FP4-quantize signature. The
+    optional output variants — ``y_out`` (an extra normed bf16/fp16 store)
+    and ``output_both_sf_layouts`` (a second scale-factor buffer) — add
+    mutated outputs the template does not represent. Refuse to emit a trace
+    for those calls (return ``None``) instead of silently dumping an
+    incomplete definition that dump/replay tooling would mis-handle.
+    """
+    if kwargs.get("y_out") is not None or kwargs.get("output_both_sf_layouts"):
+        return None
+    return add_rmsnorm_fp4quant_trace
+
+
+# Published so ``@flashinfer_api`` can auto-register the underlying template
+# for trace discovery even though the decorator receives the dispatch fn.
+add_rmsnorm_fp4quant_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    add_rmsnorm_fp4quant_trace,
 )

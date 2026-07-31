@@ -16,9 +16,10 @@ limitations under the License.
 
 import ctypes
 import functools
+import os
 import importlib.util
 import warnings
-from typing import Union, Tuple
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
@@ -35,10 +36,130 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def is_cute_dsl_available() -> bool:
+    r"""Return ``True`` when the optional CuTe DSL stack is importable.
+
+    Probes for ``cutlass`` and ``cutlass.cute`` via :func:`importlib.util.find_spec`.
+    Used by higher-level wrappers to decide whether to dispatch to a CuTe-DSL
+    backend (e.g. :func:`flashinfer.quantization.mxfp4_quantize`,
+    :class:`flashinfer.cute_dsl.attention.wrappers.BatchDecodeCuteDSLWrapper`)
+    or fall back to a plain-CUDA implementation.
+
+    Returns
+    -------
+    bool
+        ``True`` if both ``cutlass`` and ``cutlass.cute`` are importable in the
+        current Python environment.
+    """
     return (
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
     )
+
+
+@functools.cache
+def is_cute_dsl_arch_supported(
+    major: int, minor: int, native_only: bool = False
+) -> bool:
+    r"""Return ``True`` when the installed CuTe DSL can target compute
+    capability ``(major, minor)``.
+
+    :func:`is_cute_dsl_available` only checks that the package is importable;
+    the installed DSL may still lack the *device's* architecture (its
+    ``cutlass.base_dsl.arch.Arch`` enum resolves names like ``sm_107a`` and
+    raises ``KeyError`` for unknown members — e.g. a DSL release that
+    predates the device). Dispatchers must consult this before selecting a
+    CuTe-DSL backend so unsupported devices get a clean fallback/skip instead
+    of a ``KeyError`` from deep inside kernel compilation.
+
+    When the device's own architecture is missing but the DSL has the
+    family-conditional target for its major line (e.g. ``sm_100f`` for an
+    sm_107 device), kernels restricted to family-portable features still
+    compile and run correctly; this probe then pins the DSL's default target
+    via the ``CUTE_DSL_ARCH`` environment variable and reports the arch
+    supported. Pass ``native_only=True`` for kernels that require
+    architecture-specific instructions (e.g. block-scaled ``tcgen05.mma``
+    kinds, which the DSL only accepts for ``sm_100a``/``sm_103a`` targets).
+    """
+    if not is_cute_dsl_available():
+        return False
+    try:
+        from cutlass.base_dsl.arch import Arch
+
+        for name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+            try:
+                Arch[name]
+                return True
+            except KeyError:
+                continue
+        if native_only:
+            return False
+        family = _family_fallback_arch(major, minor)
+        if family is not None:
+            # The device's native arch is absent, but the DSL has the
+            # family-conditional target (e.g. ``sm_100f`` for an sm_107
+            # device); family-portable kernels compile and run correctly
+            # when the DSL targets it. Ground truth is the target the DSL
+            # captured at first ``cutlass`` import (from ``CUTE_DSL_ARCH``),
+            # not ``os.environ`` now: an env var set after that import does
+            # not retarget the DSL, so checking the environment here would
+            # report supported while ``cute.compile`` still fails.
+            target = _dsl_captured_arch()
+            if target is None:
+                # Internal API unavailable: fall back to the env-var proxy.
+                target = os.environ.get("CUTE_DSL_ARCH", "")
+            if target.replace("_", "").lower() == family.replace("_", "").lower():
+                return True
+        return False
+    except Exception:
+        # Arch module layout changed or import failed: fall back to
+        # "package available" semantics rather than disabling the backend.
+        return True
+
+
+def _family_fallback_arch(major: int, minor: int) -> Optional[str]:
+    r"""Return the DSL's family-conditional target covering ``(major,
+    minor)`` (e.g. ``"sm_100f"`` for an sm_107 device), or ``None``."""
+    try:
+        from cutlass.base_dsl.arch import Arch
+
+        name = f"sm_{major}0f"
+        Arch[name]
+        return name
+    except Exception:
+        return None
+
+
+def _dsl_captured_arch() -> Optional[str]:
+    r"""Return the compile target the DSL captured when ``cutlass`` was first
+    imported (e.g. ``"sm_100f"`` when ``CUTE_DSL_ARCH`` was exported before
+    the process started), or ``None`` if the internal API is unavailable."""
+    try:
+        from cutlass.cutlass_dsl import CuTeDSL
+
+        return str(CuTeDSL._get_dsl().envar.arch)
+    except Exception:
+        return None
+
+
+def require_cute_dsl_arch(device, native_only: bool = False) -> None:
+    r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
+    target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(device)
+    if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
+        hint = ""
+        if not native_only:
+            family = _family_fallback_arch(major, minor)
+            if family is not None:
+                hint = (
+                    f"; family-portable CuTe-DSL kernels can run on this device "
+                    f"when CUTE_DSL_ARCH={family} is exported in the environment "
+                    f"before the process starts (see the release notes)"
+                )
+        raise NotImplementedError(
+            f"the installed CuTe DSL does not support sm_{major}{minor} on this device{hint}"
+        )
 
 
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
@@ -66,6 +187,21 @@ def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
     if dtype not in dtype_map:
         raise TypeError(f"{dtype} is not supported by cutlass")
     return dtype_map[dtype]
+
+
+def _as_cute_dsl_workspace_i8(
+    workspace_buffer: torch.Tensor,
+    *,
+    name: str = "workspace_buffer",
+) -> torch.Tensor:
+    if workspace_buffer.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(
+            f"{name} must be a torch.int8 or torch.uint8 byte tensor, "
+            f"got {workspace_buffer.dtype}"
+        )
+    if not workspace_buffer.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return workspace_buffer.view(-1).view(torch.int8)
 
 
 def cutlass_to_torch_dtype(cutlass_dtype):
@@ -571,8 +707,8 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[1] must be divisible by 64"
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (

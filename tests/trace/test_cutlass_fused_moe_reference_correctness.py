@@ -8,6 +8,8 @@ from tests.trace.reference_utils import (
     _skip_if_not_sm100,
 )
 
+pytestmark = pytest.mark.solo
+
 
 @pytest.mark.parametrize(
     "shape_kwargs",

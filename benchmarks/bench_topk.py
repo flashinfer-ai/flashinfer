@@ -3,11 +3,15 @@ Benchmark for Top-K operations including:
 - top_k: Basic radix-based top-k selection
 - top_k_page_table_transform: Fused top-k + page table gather (for sparse attention)
 - top_k_ragged_transform: Fused top-k + offset addition (for sparse attention)
+- varlen: Variable-length segment transforms that model production sparse-attention
+  workloads, where each row selects top-k over a per-row valid window whose length is
+  drawn from a realistic decode/prefill distribution (rather than a fixed seq_len)
 
 Optional comparison with SGLang's sgl_kernel implementation.
 """
 
 import argparse
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +22,7 @@ import torch
 import flashinfer
 from flashinfer.topk import TopKTieBreak
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.utils import get_compute_capability
 
 
 def set_topk_algo(algo: str):
@@ -593,6 +598,345 @@ def bench_ragged_transform(
     return result
 
 
+# ===================== Variable-Length Segment Benchmark =====================
+#
+# Production sparse-attention top-k does NOT operate on fixed-size segments: each
+# row selects top-k over a per-row valid window described by ``lengths`` (and, for
+# the page-table case, a ``row_to_batch`` mapping). The transform benchmarks above
+# always pass ``lengths == seq_len`` for every row, which hides load imbalance, the
+# trivial ``length <= k`` short-circuit, and multi-CTA scheduling behavior.
+#
+# This section models two realistic regimes:
+#   - decode  : one row per request; ``lengths`` are independent context lengths
+#               drawn from a distribution (uniform / lognormal / bimodal).
+#   - prefill : ``q_len`` rows per request with causal-monotonic ``lengths`` that
+#               grow across query positions (the chunked-prefill pattern), wired via
+#               a ``row_to_batch`` mapping.
+
+
+@dataclass(frozen=True)
+class VarLenCase:
+    name: str
+    regime: str  # "decode" or "prefill"
+    length_dist: str  # "uniform" | "lognormal" | "bimodal" | "causal"
+    num_requests: int
+    q_len: int  # 1 for decode, >1 for prefill
+    max_len: int  # padded width of the dense scores matrix
+    k: int
+
+
+def sample_request_lengths(
+    num_requests: int,
+    max_len: int,
+    k: int,
+    length_dist: str,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample per-request valid context lengths for the decode regime."""
+    if length_dist == "uniform":
+        lengths = torch.randint(
+            1,
+            max_len + 1,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+    elif length_dist == "lognormal":
+        # Skewed toward shorter contexts with a long tail, typical of a serving
+        # mix; median ~ max_len / 8.
+        mu = math.log(max(2.0, max_len / 8.0))
+        samples = torch.empty(num_requests, device=device, dtype=torch.float32)
+        samples.log_normal_(mean=mu, std=1.0, generator=generator)
+        lengths = samples.to(torch.int64)
+    elif length_dist == "bimodal":
+        # Half short (< k, hits the trivial copy path) and half long (near
+        # max_len): stresses load imbalance and the trivial short-circuit.
+        short_high = max(2, k)
+        short = torch.randint(
+            1,
+            short_high,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        long_low = max(short_high, max_len // 2)
+        long_seq = torch.randint(
+            long_low,
+            max_len + 1,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        pick_short = torch.rand(num_requests, generator=generator, device=device) < 0.5
+        lengths = torch.where(pick_short, short, long_seq)
+    else:
+        raise ValueError(f"Unsupported decode length_dist: {length_dist}")
+    return lengths.clamp_(1, max_len).to(torch.int32)
+
+
+def build_causal_prefill_lengths(
+    num_requests: int,
+    q_len: int,
+    max_len: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build causal-monotonic lengths for the prefill regime.
+
+    Each request contributes ``q_len`` consecutive rows; query position ``p``
+    attends to ``[0, ctx_start + p]`` so its valid length is ``ctx_start + p + 1``.
+    Returns ``(lengths, row_to_batch)`` flattened over ``num_requests * q_len`` rows.
+    """
+    high = max(q_len + 1, max_len - q_len + 1)
+    ctx_starts = torch.randint(
+        q_len,
+        high,
+        (num_requests,),
+        generator=generator,
+        device=device,
+        dtype=torch.int64,
+    )
+    positions = torch.arange(q_len, device=device, dtype=torch.int64)
+    lengths = (ctx_starts.unsqueeze(1) + positions.unsqueeze(0) + 1).clamp(1, max_len)
+    lengths = lengths.reshape(-1).to(torch.int32)
+    row_to_batch = torch.arange(
+        num_requests, device=device, dtype=torch.int32
+    ).repeat_interleave(q_len)
+    return lengths, row_to_batch
+
+
+def summarize_lengths(lengths: torch.Tensor, k: int) -> tuple[int, float, int, float]:
+    """Return ``(min, mean, max, fraction-of-rows-with-length<=k)``."""
+    len_min = int(lengths.min().item())
+    len_max = int(lengths.max().item())
+    len_mean = float(lengths.to(torch.float64).mean().item())
+    trivial_frac = float((lengths <= k).to(torch.float64).mean().item())
+    return len_min, len_mean, len_max, trivial_frac
+
+
+def build_masked_scores(scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Mask positions beyond each row's valid length with -inf.
+
+    Gives ``torch.topk`` (which has no length argument) the same valid window as the
+    length-aware kernel. Built once, outside the timed region, so the comparison is
+    selection-cost vs selection-cost.
+    """
+    max_len = scores.size(1)
+    col = torch.arange(max_len, device=scores.device).unsqueeze(0)
+    invalid = col >= lengths.unsqueeze(1)
+    if scores.dtype == torch.float32:
+        neg_inf = float("-inf")
+    else:
+        neg_inf = torch.finfo(scores.dtype).min
+    return scores.masked_fill(invalid, neg_inf)
+
+
+def generate_varlen_inputs(
+    case: VarLenCase,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    device: torch.device,
+) -> dict:
+    """Build scores + length/offset/page-table tensors for a variable-length case."""
+    max_len = case.max_len
+    if case.regime == "decode":
+        num_requests = case.num_requests
+        lengths = sample_request_lengths(
+            num_requests, max_len, case.k, case.length_dist, generator, device
+        )
+        row_to_batch = None
+        num_rows = num_requests
+    elif case.regime == "prefill":
+        num_requests = case.num_requests
+        lengths, row_to_batch = build_causal_prefill_lengths(
+            num_requests, case.q_len, max_len, generator, device
+        )
+        num_rows = num_requests * case.q_len
+    else:
+        raise ValueError(f"Unsupported regime: {case.regime}")
+
+    scores = torch.randn(
+        num_rows, max_len, device=device, dtype=dtype, generator=generator
+    )
+
+    # Ragged offsets model a tightly packed KV buffer: offsets[i] = sum(lengths[:i]).
+    # The absolute offset value is perf-irrelevant (it is just added to the output
+    # index); the per-row ``lengths`` drive the actual work.
+    offsets = torch.zeros(num_rows, device=device, dtype=torch.int32)
+    if num_rows > 1:
+        offsets[1:] = torch.cumsum(lengths[:-1].to(torch.int64), dim=0).to(torch.int32)
+
+    # Page table is per request: (num_requests, max_len).
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(num_requests, max_len)
+        .contiguous()
+    )
+    return {
+        "scores": scores,
+        "lengths": lengths,
+        "offsets": offsets,
+        "src_page_table": src_page_table,
+        "row_to_batch": row_to_batch,
+        "num_requests": num_requests,
+    }
+
+
+def build_varlen_cases(
+    length_dists: list[str],
+    max_lens: list[int],
+    k_values: list[int],
+    decode_batches: list[int],
+    prefill_requests: list[int],
+    q_len: int,
+) -> list[VarLenCase]:
+    cases: list[VarLenCase] = []
+    decode_dists = [d for d in length_dists if d in ("uniform", "lognormal", "bimodal")]
+    for dist in decode_dists:
+        for num_requests in decode_batches:
+            for max_len in max_lens:
+                for k in k_values:
+                    if k >= max_len:
+                        continue
+                    cases.append(
+                        VarLenCase(
+                            name=f"decode_{dist}_b{num_requests}_l{max_len}_k{k}",
+                            regime="decode",
+                            length_dist=dist,
+                            num_requests=num_requests,
+                            q_len=1,
+                            max_len=max_len,
+                            k=k,
+                        )
+                    )
+    if "causal" in length_dists:
+        for num_requests in prefill_requests:
+            for max_len in max_lens:
+                for k in k_values:
+                    if k >= max_len:
+                        continue
+                    cases.append(
+                        VarLenCase(
+                            name=f"prefill_causal_r{num_requests}_q{q_len}_l{max_len}_k{k}",
+                            regime="prefill",
+                            length_dist="causal",
+                            num_requests=num_requests,
+                            q_len=q_len,
+                            max_len=max_len,
+                            k=k,
+                        )
+                    )
+    return cases
+
+
+def bench_varlen_transform(
+    case: VarLenCase,
+    transform: str,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    has_clusters: bool,
+    deterministic: bool = False,
+    compare_tie_break: bool = False,
+) -> dict:
+    """Benchmark a transform API on realistic variable-length segments."""
+    device = torch.device("cuda")
+    inputs = generate_varlen_inputs(case, dtype, generator, device)
+    scores = inputs["scores"]
+    lengths = inputs["lengths"]
+    offsets = inputs["offsets"]
+    src_page_table = inputs["src_page_table"]
+    row_to_batch = inputs["row_to_batch"]
+    num_rows = scores.size(0)
+    k = case.k
+
+    def run(deterministic_mode, tie_break=TopKTieBreak.NONE):
+        if transform == "page_table":
+            return flashinfer.top_k_page_table_transform(
+                scores,
+                src_page_table,
+                lengths,
+                k,
+                row_to_batch=row_to_batch,
+                deterministic=deterministic_mode,
+                tie_break=tie_break,
+            )
+        return flashinfer.top_k_ragged_transform(
+            scores,
+            offsets,
+            lengths,
+            k,
+            deterministic=deterministic_mode,
+            tie_break=tie_break,
+        )
+
+    set_topk_algo("default")
+    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(run, deterministic)
+
+    len_min, len_mean, len_max, trivial_frac = summarize_lengths(lengths, k)
+    result = {
+        "regime": case.regime,
+        "length_dist": case.length_dist,
+        "transform": transform,
+        "num_rows": num_rows,
+        "num_requests": inputs["num_requests"],
+        "max_len": case.max_len,
+        "k": k,
+        "len_min": len_min,
+        "len_mean": len_mean,
+        "len_max": len_max,
+        "trivial_frac": trivial_frac,
+        "flashinfer_us": fi_ms * 1e3,
+    }
+    if fi_nondeterministic_ms is not None:
+        result["flashinfer_nondeterministic_us"] = fi_nondeterministic_ms * 1e3
+        result["deterministic_slowdown_vs_nondeterministic"] = (
+            fi_ms / fi_nondeterministic_ms
+        )
+
+    # clusters is a non-deterministic SM100 path; it also only dispatches for
+    # page_table when row_to_batch is None (the prefill regime sets row_to_batch and
+    # falls back to the default path). Only measure/report it when it would actually
+    # run, otherwise the "clusters" timing would just be the default path relabeled.
+    can_run_clusters = (
+        has_clusters
+        and not (deterministic or compare_tie_break)
+        and not (transform == "page_table" and row_to_batch is not None)
+    )
+    if can_run_clusters:
+        set_topk_algo("clusters")
+        clusters_ms = bench_median_ms(lambda: run(False))
+        result["clusters_us"] = clusters_ms * 1e3
+        result["speedup_clusters_vs_default"] = fi_ms / clusters_ms
+    set_topk_algo("auto")
+
+    if compare_tie_break:
+        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: run(True, tie_break),
+                baseline_ms,
+            )
+        )
+
+    # torch reference operates on a pre-masked tensor (mask built outside timing) so
+    # we compare selection cost against the length-aware kernel.
+    masked_scores = build_masked_scores(scores, lengths)
+    with torch_deterministic_algorithms(deterministic):
+        torch_ms = bench_median_ms(lambda: torch.topk(masked_scores, k, dim=-1))
+    result["torch_us"] = torch_ms * 1e3
+    result["speedup_vs_torch"] = torch_ms / fi_ms
+
+    return result
+
+
 def parse_dtype(dtype_str: str) -> torch.dtype:
     """Parse dtype string to torch.dtype."""
     dtype_map = {
@@ -617,7 +961,7 @@ def main():
     )
     parser.add_argument(
         "--op",
-        choices=["all", "top_k", "dsa_topk", "page_table", "ragged"],
+        choices=["all", "top_k", "dsa_topk", "page_table", "ragged", "varlen"],
         default="all",
         help="Which operation to benchmark",
     )
@@ -683,7 +1027,33 @@ def main():
         default=2048,
         help="Top-k for DSA workload (default: 2048, matching DeepSeek DSA config)",
     )
+    parser.add_argument(
+        "--length-dist",
+        choices=["all", "uniform", "lognormal", "bimodal", "causal"],
+        default="all",
+        help=(
+            "Variable-length segment distribution for --op varlen: "
+            "uniform | lognormal | bimodal (decode regimes) | causal (prefill regime) | all"
+        ),
+    )
+    parser.add_argument(
+        "--varlen-k",
+        type=int,
+        default=2048,
+        help="Top-k for the varlen benchmark (default: 2048, matching DeepSeek DSA config)",
+    )
+    parser.add_argument(
+        "--varlen-q-len",
+        type=int,
+        default=128,
+        help="Query length per request for the varlen prefill (causal) regime (default: 128)",
+    )
     args = parser.parse_args()
+
+    if args.varlen_k <= 0:
+        parser.error("--varlen-k must be a positive integer")
+    if args.varlen_q_len <= 0:
+        parser.error("--varlen-q-len must be a positive integer")
 
     dtype = parse_dtype(args.dtype)
 
@@ -1240,6 +1610,176 @@ def main():
                             torch.cuda.empty_cache()
                         else:
                             raise
+
+    if args.op in ["all", "varlen"]:
+        device = torch.device("cuda")
+        cap = get_compute_capability(device)
+        has_clusters = cap[0] == 10
+        length_dists = (
+            ["uniform", "lognormal", "bimodal", "causal"]
+            if args.length_dist == "all"
+            else [args.length_dist]
+        )
+        varlen_max_lens = [16384, 65536, 131072]
+        varlen_k_values = [args.varlen_k]
+        varlen_decode_batches = [16, 128]
+        varlen_prefill_requests = [4, 16]
+        varlen_cases = build_varlen_cases(
+            length_dists,
+            varlen_max_lens,
+            varlen_k_values,
+            varlen_decode_batches,
+            varlen_prefill_requests,
+            args.varlen_q_len,
+        )
+        # A torch.Generator drives the (otherwise random) length/score draws. It is
+        # re-seeded per case in the loop below so the page_table and ragged runs for a
+        # given case use identical inputs (and stays reproducible across runs).
+        generator = torch.Generator(device=device)
+
+        show_det_or_tie = args.deterministic or args.tie_break
+        # clusters is a non-deterministic SM100 path; omit it under deterministic/tie-break.
+        show_clusters = has_clusters and not show_det_or_tie
+
+        print("\n" + "=" * 100)
+        print(
+            "varlen: Variable-length segment top-k transforms (production-realistic) "
+            f"(dtype={dtype_str}, length_dist={args.length_dist}, k={args.varlen_k}, "
+            f"deterministic={args.deterministic}, tie_break={args.tie_break})"
+        )
+        print(
+            "NOTE: lengths model per-row valid windows; decode = independent context "
+            f"lengths, prefill(causal) = monotonic growth within a request (q_len={args.varlen_q_len})"
+        )
+        print(
+            "NOTE: torch(mask) masks invalid positions once (outside timing) then "
+            "torch.topk, isolating selection cost vs the length-aware kernel"
+        )
+        if show_det_or_tie:
+            if args.deterministic:
+                print(
+                    "NOTE: deterministic mode also benchmarks FlashInfer(non-det) "
+                    "for direct comparison"
+                )
+            if args.tie_break:
+                print(
+                    "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                    "slowdowns align with the same baseline as DetSlowdown"
+                )
+            print(
+                "NOTE: Clusters column omitted under deterministic/tie-break "
+                "(clusters requires the non-deterministic path)"
+            )
+        elif not has_clusters:
+            print(
+                "NOTE: clusters path requires SM100 (Blackwell); omitting Clusters "
+                f"column on this device (SM{cap[0]}{cap[1]})"
+            )
+        print("=" * 100)
+
+        base_header = (
+            f"{'regime':>8} {'dist':>10} {'transform':>11} {'rows':>8} {'reqs':>6} "
+            f"{'max_len':>9} {'k':>6} | {'len_min':>8} {'len_mean':>9} {'len_max':>8} "
+            f"{'triv%':>6} | "
+        )
+        if show_det_or_tie:
+            header = (
+                base_header
+                + f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
+            )
+            header = append_tie_break_header(header, args.tie_break)
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        else:
+            header = base_header + f"{'FlashInfer':>12}"
+            if show_clusters:
+                header += f" {'Clusters':>12} {'vsClusters':>10}"
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        print(header)
+        print("-" * len(header))
+
+        for case_idx, case in enumerate(varlen_cases):
+            for transform in ["page_table", "ragged"]:
+                # Re-seed per case so page_table and ragged see identical inputs,
+                # keeping the per-case transform comparison and length stats equivalent.
+                generator.manual_seed(1234 + case_idx)
+                needs_cache_cleanup = False
+                try:
+                    result = bench_varlen_transform(
+                        case,
+                        transform,
+                        dtype,
+                        generator,
+                        has_clusters,
+                        deterministic=args.deterministic,
+                        compare_tie_break=args.tie_break,
+                    )
+                    base_line = (
+                        f"{result['regime']:>8} {result['length_dist']:>10} "
+                        f"{result['transform']:>11} {result['num_rows']:>8} "
+                        f"{result['num_requests']:>6} {result['max_len']:>9} "
+                        f"{result['k']:>6} | {result['len_min']:>8} "
+                        f"{result['len_mean']:>9.1f} {result['len_max']:>8} "
+                        f"{100.0 * result['trivial_frac']:>5.1f}% | "
+                    )
+                    if show_det_or_tie:
+                        nondet_us = result.get("flashinfer_nondeterministic_us")
+                        if nondet_us is None:
+                            nondet_us = result["flashinfer_us"]
+                        det_us = result["flashinfer_us"] if args.deterministic else None
+                        det_us_str = (
+                            f"{det_us:>12.2f}us"
+                            if det_us is not None
+                            else f"{'n/a':>14}"
+                        )
+                        det_slowdown = result.get(
+                            "deterministic_slowdown_vs_nondeterministic"
+                        )
+                        det_slowdown_str = (
+                            f"{det_slowdown:>10.2f}x"
+                            if det_slowdown is not None
+                            else f"{'n/a':>11}"
+                        )
+                        line = (
+                            base_line
+                            + f"{nondet_us:>10.2f}us {det_us_str} {det_slowdown_str}"
+                        )
+                        line = append_tie_break_columns(line, result, args.tie_break)
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
+                    else:
+                        line = base_line + f"{result['flashinfer_us']:>10.2f}us"
+                        if show_clusters:
+                            # prefill page_table falls back to the default path, so it
+                            # has no clusters timing; pad to keep columns aligned.
+                            if "clusters_us" in result:
+                                line += (
+                                    f" {result['clusters_us']:>10.2f}us "
+                                    f"{result['speedup_clusters_vs_default']:>9.2f}x"
+                                )
+                            else:
+                                line += f" {'n/a':>12} {'n/a':>10}"
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
+                    print(line)
+                except RuntimeError as e:
+                    error_label = classify_benchmark_runtime_error(e)
+                    if error_label is None:
+                        raise
+                    print(
+                        f"{case.regime:>8} {case.length_dist:>10} "
+                        f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
+                    )
+                    needs_cache_cleanup = True
+                # Reclaim cached memory only after the except block exits. While the
+                # handler is active, the in-flight exception keeps bench_varlen_transform's
+                # frame (and its large GPU tensors) alive, so empty_cache() inside the
+                # handler would be a no-op; releasing here lets the next case start clean.
+                if needs_cache_cleanup:
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

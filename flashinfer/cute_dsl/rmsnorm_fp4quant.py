@@ -32,6 +32,7 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ..api_logging import flashinfer_api
+from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ..trace.templates.norm import rmsnorm_fp4quant_trace
 from ..utils import device_support_pdl
 from .fp4_common import (
@@ -839,6 +840,12 @@ def rmsnorm_fp4quant(
         ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
+    enable_pdl : bool, optional
+        Whether to launch with Programmatic Dependent Launch (PDL). When
+        ``None`` (default) or ``True``, PDL is enabled only if the current
+        device supports it (probed via :func:`device_support_pdl`). Pass
+        ``False`` to force-disable. See
+        https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
 
     Returns
     -------
@@ -855,6 +862,7 @@ def rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    _require_cute_dsl_arch_for(input.device)
     # Handle 2D vs 3D input
     is_3d = input.dim() == 3
     if is_3d:

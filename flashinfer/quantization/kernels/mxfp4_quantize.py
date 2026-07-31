@@ -96,6 +96,22 @@ _4T_SF_BLOCKS_PER_TB = _LINEAR_WARPS_PER_BLOCK * _4T_SF_PER_WARP  # 128
 _LOW_SM_THRESHOLD = 80
 
 
+def _mxfp4_scale_output_shape(
+    m: int,
+    k: int,
+    sf_layout: int,
+) -> tuple[int, int]:
+    """Return the physical ``(rows, columns)`` of an MXFP4 scale buffer."""
+    num_sf_blocks_per_row = k // MXFP4_SF_VEC_SIZE
+    if sf_layout == SF_LAYOUT_LINEAR:
+        return m, num_sf_blocks_per_row
+    row_tile_size = 8 if sf_layout == SF_LAYOUT_8x4 else ROW_TILE_SIZE
+    return (
+        ((m + row_tile_size - 1) // row_tile_size) * row_tile_size,
+        ((num_sf_blocks_per_row + 3) // 4) * 4,
+    )
+
+
 def _compute_optimal_threads(K: int, threads_per_sf: int = 1) -> int:
     """
     Compute optimal thread count for 100% utilization in the swizzled kernel.
@@ -867,31 +883,38 @@ def mxfp4_quantize_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to MXFP4 format using CuTe-DSL kernel.
+    r"""Quantize input tensor to MXFP4 format using the CuTe-DSL kernel.
 
-    This is a GPU implementation with dual-path optimization:
-    - LINEAR layout: flat SF-block based iteration with adaptive 1T/4T per SF
-      block dispatch — uses 4T/SF on low-SM GPUs (<=80 SMs) for coalesced
-      memory access, and 1T/SF on high-SM GPUs where enough SMs generate
-      sufficient outstanding memory requests
-    - SWIZZLED layout: row-based iteration with padding fast path (optimized)
+    GPU implementation with dual-path optimization:
 
-    The kernel is compiled once per (K, dtype, sf_layout, pdl, use_4t)
-    combination and handles varying M (batch size) at runtime without
+    - **LINEAR layout**: flat SF-block iteration with adaptive 1T/4T per
+      SF block.  4T/SF is used on low-SM GPUs (<=80 SMs) for coalesced
+      memory access; 1T/SF on high-SM GPUs where enough SMs generate
+      sufficient outstanding memory requests.
+    - **SWIZZLED layout**: row-based iteration with a padding fast path.
+
+    The kernel is compiled once per ``(K, dtype, sf_layout, pdl, use_4t)``
+    tuple and handles varying ``M`` (batch size) at runtime without
     recompilation.
 
-    Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16
-        sf_layout: Scale factor layout (0=128x4, 1=8x4, 2=linear).
-        enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0).
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+    sf_layout : int
+        Scale-factor layout (``0=128x4``, ``1=8x4``, ``2=linear``).
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
 
-    Returns:
-        Tuple of:
-            - fp4_tensor: Quantized tensor of shape [M, K/2] with dtype uint8
-            - scale_tensor: Scale factors as uint8 tensor
-              reshaped to [padded_rows, K/32]
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fp4_tensor, scale_tensor)`` where ``fp4_tensor`` is the
+        quantized tensor of shape ``[M, K/2]`` with dtype ``uint8`` and
+        ``scale_tensor`` are the UE8M0 scale factors (``uint8``). Linear
+        output has shape ``[M, K/32]``; swizzled output has shape
+        ``[padded_rows, padded_scale_columns]``.
     """
     from ...utils import device_support_pdl
 
@@ -924,6 +947,7 @@ def mxfp4_quantize_cute_dsl(
     target_grid = num_sm * _BLOCKS_PER_SM
 
     num_sf_blocks_per_row = k // MXFP4_SF_VEC_SIZE
+    padded_m, padded_sf_cols = _mxfp4_scale_output_shape(m, k, sf_layout)
 
     # Use 4T/SF on low-SM-count GPUs for better memory coalescing.
     # On GPUs with many SMs (B200, RTX 5090), 1T/SF is faster because
@@ -937,8 +961,6 @@ def mxfp4_quantize_cute_dsl(
     )
 
     if sf_layout == SF_LAYOUT_LINEAR:
-        padded_m = m
-        padded_sf_cols = num_sf_blocks_per_row
         total_sf_blocks = m * num_sf_blocks_per_row
         scale_output_size = total_sf_blocks
 
@@ -955,9 +977,6 @@ def mxfp4_quantize_cute_dsl(
 
         kernel_fn(input, fp4_output, scale_output, m, total_sf_blocks, num_blocks)
     else:
-        row_tile_size = 8 if sf_layout == SF_LAYOUT_8x4 else ROW_TILE_SIZE
-        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
-        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
         rows_per_block = block_unit
@@ -973,7 +992,7 @@ def mxfp4_quantize_cute_dsl(
 
         kernel_fn(input, fp4_output, scale_output, m, padded_m, num_blocks)
 
-    scale_output = scale_output.reshape(-1, num_sf_blocks_per_row)
+    scale_output = scale_output.reshape(padded_m, padded_sf_cols)
 
     return fp4_output, scale_output
 

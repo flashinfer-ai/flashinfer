@@ -646,6 +646,17 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     def __init__(
         self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
     ) -> None:
+        r"""Allocate workspace for shared-prefix batch decode attention.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            User-provided float workspace buffer (e.g. 128 MiB) on the same CUDA device as
+            the inputs.  Shared with the underlying :class:`BatchDecodeWithPagedKVCacheWrapper`.
+        kv_layout : str
+            Layout of the KV-cache tensors, either ``"NHD"`` or ``"HND"``.  Defaults to
+            ``"NHD"``.
+        """
         self._batch_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             float_workspace_buffer, kv_layout
         )
@@ -686,13 +697,16 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
         Parameters
         ----------
-        indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
-        indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
-        last_page_len : torch.Tensor
-            The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+        unique_kv_indptr : torch.Tensor
+            CSR-style page offsets into ``unique_kv_indices`` for the *per-request*
+            (non-shared) suffix of each KV cache, shape ``[batch_size + 1]``, dtype
+            ``int32``.
+        unique_kv_indices : torch.Tensor
+            Page indices of the non-shared suffix of the paged KV cache,
+            shape ``[unique_kv_indptr[-1]]``, dtype ``int32``.
+        unique_kv_last_page_len : torch.Tensor
+            Number of valid entries on the last page of each request's unique
+            suffix, shape ``[batch_size]``, dtype ``int32``.
         num_qo_heads : int
             The number of query/output heads
         num_kv_heads : int
@@ -1013,7 +1027,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
-        v_shared ; torch.Tensor
+        v_shared : torch.Tensor
             The shared prefix value tensor, shape:
             ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if

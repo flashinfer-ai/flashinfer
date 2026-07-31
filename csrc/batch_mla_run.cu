@@ -32,7 +32,7 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
                                TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
                                TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                int64_t num_heads, int64_t page_size, double sm_scale,
-                               bool return_lse_base_on_e) {
+                               bool return_lse_base_on_e, double ckv_scale, double kpe_scale) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -115,6 +115,8 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
         params.o_stride_h = o_stride_h;
 
         params.sm_scale = sm_scale;
+        params.ckv_scale = static_cast<float>(ckv_scale);
+        params.kpe_scale = static_cast<float>(kpe_scale);
         params.return_lse_base_on_e = return_lse_base_on_e;
 
         cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(

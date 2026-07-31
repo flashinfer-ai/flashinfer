@@ -17,4 +17,9 @@ Kernels for normalization layers.
     gemma_rmsnorm
     gemma_fused_add_rmsnorm
     layernorm
+    layernorm_quant
     fused_rmsnorm_silu
+    fused_qk_rmsnorm_rope
+    fused_dit_residual_layernorm_scale_shift
+    fused_dit_gate_residual_layernorm_scale_shift
+    fused_dit_gate_residual_layernorm_gamma_beta

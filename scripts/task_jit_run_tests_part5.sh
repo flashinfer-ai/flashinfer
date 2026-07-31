@@ -18,3 +18,4 @@ pytest -s tests/utils/test_logits_processor.py
 pytest -s tests/cli/test_cli_cmds.py
 pytest -s tests/cli/test_cli_cmds_gpu.py
 pytest -s tests/moe/test_bgmv_moe.py
+pytest -s tests/moe/test_bgmv_moe_lora_delta.py

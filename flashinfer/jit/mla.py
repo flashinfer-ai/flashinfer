@@ -20,13 +20,36 @@ from .core import JitSpec, gen_jit_spec, current_compilation_context
 
 def gen_mla_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_binding.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_sparse_mla_sm120_module() -> JitSpec:
+    """Sparse-MLA paged attention for SM120.
+
+    Monolithic module: runtime dispatch on model type, head count, top-k,
+    page block size, and optional extra page block size happens inside the
+    orchestrator.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_sm120",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv4.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_prefill.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_jit_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )

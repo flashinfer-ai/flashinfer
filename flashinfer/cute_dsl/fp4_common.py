@@ -284,6 +284,33 @@ def get_smem_ptr_as_int32(
 
 
 @dsl_user_op
+def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from shared memory via ld.shared.v2.u32.
+
+    Args:
+        smem_addr: 32-bit shared memory address (from get_smem_ptr_as_int32).
+                   Caller is responsible for ensuring 8-byte alignment.
+
+    Returns:
+        2 Uint32 values (8 bytes total).
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1)
+
+
+@dsl_user_op
 def ld_shared_v4_u32(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
@@ -372,6 +399,78 @@ def rcp_rn(a: Float32, *, loc=None, ip=None) -> Float32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def fadd_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 addition."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fsub_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 subtraction."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "sub.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fmul_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 multiplication."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fdiv_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 division."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -789,8 +888,39 @@ def cvt_f32x2_to_half2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def cvt_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    """Pack two float32 values into the low and high bfloat16 lanes, respectively."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .b16 h0, h1;
+                cvt.rn.bf16.f32 h0, $1;
+                cvt.rn.bf16.f32 h1, $2;
+                mov.b32 $0, {h0, h1};
+            }
+            """,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 AND compute reciprocal."""
+    """Convert FP8 E4M3 to float32 AND compute reciprocal (0 stays 0).
+
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -798,21 +928,17 @@ def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             """
             {
                 .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
+                .reg .f32 fp8_float, result;
 
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 fp8_float, h_lo;
                 rcp.approx.ftz.f32 result, fp8_float;
+                setp.eq.f32 p_zero, fp8_float, 0f00000000;
                 selp.f32 $0, 0f00000000, result, p_zero;
             }
             """,
@@ -1735,33 +1861,26 @@ def scatter_add_v4_bf16x2(
 
 @dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32."""
+    """Convert FP8 E4M3 to float32.
+
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg;
-                .reg .u32 sign_u, exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
 
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 sign_u, $1, 0x80;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                neg.f32 fp8_neg, fp8_float;
-                setp.ne.u32 p_neg, sign_u, 0;
-                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
-                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 $0, h_lo;
             }
             """,
             "=f,r",
@@ -1915,6 +2034,35 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             }
             """,
             "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_s0e5m3_to_f16x2_broadcast(fp8_val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert one S0E5M3 scale byte to an f16x2 with the scale in both lanes.
+
+    S0E5M3 (sign-0, 5-exp, 3-mantissa) is a host-side reformat of the per-block
+    E4M3 scale, rebiased to fp16's bias (exp 7->15, i.e. byte += 0x40) so the
+    bits line up with fp16 directly: ``f16(byte) = byte << 7`` (exp -> bits 14-10,
+    the 3 mantissa bits -> bits 9-7, low mantissa and sign = 0).  Broadcasting to
+    both f16x2 lanes is then ``byte * 0x00800080`` = ``(byte<<7) | (byte<<23)`` --
+    a single ``mul.lo.u32`` (the two shifted copies never overlap, so the mul is
+    exactly the OR).  Replaces the 3-op E4M3 path (cvt.u16 + cvt.f16x2.e4m3x2 +
+    prmt) with 1 op, and the per-block scale stays 1 byte (memory-neutral).
+    Numerically exact for normal E4M3 scales (both formats carry 3 mantissa bits).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
+            "mul.lo.u32 $0, $1, 0x00800080;",
+            "=r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -2272,7 +2420,10 @@ def quantize_block_fp4(
     quantized_scale = fp8_e4m3_to_f32(scale_u32)
     packed64 = Uint64(0)
     if quantized_scale != Float32(0.0) and global_scale_val != Float32(0.0):
-        packed64 = quantize_and_pack_16(values, quantized_scale * global_scale_val)
+        # 1/(qs*gs): precise counterpart of the fast path's rcp(qs)*rcp(gs).
+        packed64 = quantize_and_pack_16(
+            values, Float32(1.0) / (quantized_scale * global_scale_val)
+        )
     return packed64, scale_byte
 
 

@@ -65,9 +65,10 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // The warpGrpThreadIdx.
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
-  // The seqOffsetQ.
-  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxNumCtasQ
-                                                            : params.ptrCumSeqLensQ[batchIdx]};
+  // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
+  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr
+                               ? batchIdx * params.mMaxNumCtasQ * params.mNumTokensPerCtaQ
+                               : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
   int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
                             ? params.mMaxSeqLenQ
@@ -82,8 +83,15 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     return;
   }
 
-  // The actual number of seqLenKv.
-  int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
+  // The actual number of seqLenKv. Block-sparse attention uses per-KV-head sequence lengths
+  // laid out as [numHeadsKv, batchSize].
+  int32_t seqLenKv;
+  if (params.mUseBlockSparseAttention) {
+    int32_t const headIdxKv{headIdxO / params.mNumHeadsQPerKv};
+    seqLenKv = params.ptrSeqLensKv[headIdxKv * params.mBatchSize + batchIdx];
+  } else {
+    seqLenKv = params.ptrSeqLensKv[batchIdx];
+  }
   // Consider the causal-mask speculative decoding.
   seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
   // Consider sparseAttnTopK and variable sparse MLA topK lengths.
@@ -126,8 +134,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // Whether to store the softmax stats.
   bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
 
-  // The softmaxScaleLog2.
-  float const softmaxScaleLog2 = params.mScaleSoftmaxLog2;
+  // The softmaxScaleLog2. Prefer the device-side scale when supplied.
+  float const softmaxScaleLog2 = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2
+                                                                       : params.mScaleSoftmaxLog2;
 
   int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
   static_assert(NumBytesPerPartialElt == 2,
