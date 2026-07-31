@@ -16,9 +16,11 @@
 
 Run this script in separate processes with ``PYTHONPATH`` pointing at the
 pinned current-upstream, evolution-peer, or candidate checkout. Every mode
-calls ``flashinfer.kda_decode.recurrent_kda`` with identical D128/T3
-lower-bound and D128/T5 precomputed-gate inputs. The caller can alternate mode
-order across processes to form paired rounds.
+calls ``flashinfer.kda_decode.recurrent_kda`` with an identical, deterministic
+D128/T=1..6 matrix. T=1 uses the standard decode ABI, T=3 uses the measured
+lower-bound contract, and the remaining token counts use packed speculative
+decode with precomputed gates. The caller can alternate mode order across
+processes to form paired rounds.
 """
 
 import argparse
@@ -41,32 +43,54 @@ from flashinfer.testing import bench_gpu_time
 
 UPSTREAM_MAIN_SHA = "a02d94de5796650ead1c6be27b834c3a063bf45d"
 EVOLUTION_PEER_SHA = "cea7f46ffc190cabf82c95a39cd0d2aa6c888c17"
+DATA_SEED = 42
+PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 T3_LOWER_BOUND_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
-T5_PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
+
+# Keep all route names in one place. These benchmark coordinates select split1;
+# a benchmark run can still inject an alternate tuned route with repeatable
+# ``--expected-variant TOKEN_COUNT=VARIANT`` flags without weakening the
+# public-API frozen-route assertion.
+EXPECTED_VARIANTS_BY_T = {
+    1: "d128_t1_precomputed_split1",
+    2: "d128_t2_precomputed_split1",
+    3: "d128_t3_lower_bound_split4",
+    4: "d128_t4_precomputed_split1",
+    5: "d128_t5_precomputed_gram_split1",
+    6: "d128_t6_precomputed_gram_split1",
+}
+
+
+def _case_specs_for_tokens(num_tokens: int) -> tuple[dict, ...]:
+    is_t3_lower_bound = num_tokens == 3
+    sequence_counts = (
+        T3_LOWER_BOUND_SEQUENCE_COUNTS
+        if is_t3_lower_bound
+        else PRECOMPUTED_SEQUENCE_COUNTS
+    )
+    gate_mode = "lower_bound" if is_t3_lower_bound else "precomputed"
+    api_mode = "standard_decode" if num_tokens == 1 else "spec_decode"
+    num_value_heads = 16 if is_t3_lower_bound else 32
+    return tuple(
+        {
+            "name": (
+                f"d128_t{num_tokens}_b{num_sequences}_h16_"
+                f"hv{num_value_heads}_{api_mode}_{gate_mode}"
+            ),
+            "D": 128,
+            "T": num_tokens,
+            "N": num_sequences,
+            "H": 16,
+            "HV": num_value_heads,
+            "api_mode": api_mode,
+            "gate_mode": gate_mode,
+        }
+        for num_sequences in sequence_counts
+    )
+
+
 CASES = tuple(
-    {
-        "name": f"d128_t3_b{batch_size}_h16_hv16_lower_bound",
-        "D": 128,
-        "T": 3,
-        "N": batch_size,
-        "H": 16,
-        "HV": 16,
-        "gate_mode": "lower_bound",
-        "expected_variant": "d128_t3_lower_bound_split4",
-    }
-    for batch_size in T3_LOWER_BOUND_SEQUENCE_COUNTS
-) + tuple(
-    {
-        "name": f"d128_t5_b{batch_size}_h16_hv32_precomputed",
-        "D": 128,
-        "T": 5,
-        "N": batch_size,
-        "H": 16,
-        "HV": 32,
-        "gate_mode": "precomputed",
-        "expected_variant": "d128_t5_precomputed_gram_split1",
-    }
-    for batch_size in T5_PRECOMPUTED_SEQUENCE_COUNTS
+    spec for num_tokens in range(1, 7) for spec in _case_specs_for_tokens(num_tokens)
 )
 
 
@@ -77,28 +101,35 @@ def _make_case(spec: dict, device: torch.device) -> dict:
     num_heads = spec["H"]
     num_value_heads = spec["HV"]
     total_tokens = num_sequences * num_tokens
-    generator = torch.Generator(device=device).manual_seed(42)
+    is_standard_decode = spec["api_mode"] == "standard_decode"
+    if is_standard_decode != (num_tokens == 1):
+        raise ValueError(
+            f"{spec['name']} has inconsistent T={num_tokens} and "
+            f"api_mode={spec['api_mode']}"
+        )
+    token_shape = (num_sequences, 1) if is_standard_decode else (1, total_tokens)
+    generator = torch.Generator(device=device).manual_seed(DATA_SEED)
 
     q = torch.rand(
-        (1, total_tokens, num_heads, head_dim),
+        (*token_shape, num_heads, head_dim),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     k = torch.rand(
-        (1, total_tokens, num_heads, head_dim),
+        (*token_shape, num_heads, head_dim),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     v = torch.rand(
-        (1, total_tokens, num_value_heads, head_dim),
+        (*token_shape, num_value_heads, head_dim),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     beta_logits = torch.randn(
-        (1, total_tokens, num_value_heads),
+        (*token_shape, num_value_heads),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
@@ -107,7 +138,7 @@ def _make_case(spec: dict, device: torch.device) -> dict:
     if spec["gate_mode"] == "precomputed":
         g = F.logsigmoid(
             torch.randn(
-                (1, total_tokens, num_value_heads, head_dim),
+                (*token_shape, num_value_heads, head_dim),
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -119,7 +150,7 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         lower_bound = None
     elif spec["gate_mode"] == "lower_bound":
         g = torch.randn(
-            (1, total_tokens, num_value_heads, head_dim),
+            (*token_shape, num_value_heads, head_dim),
             dtype=torch.bfloat16,
             device=device,
             generator=generator,
@@ -143,28 +174,37 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         lower_bound = -5.0
     else:
         raise ValueError(f"unknown gate mode: {spec['gate_mode']}")
-    cu_seqlens = torch.arange(
-        0,
-        total_tokens + 1,
-        num_tokens,
-        dtype=torch.int32,
-        device=device,
-    )
-    ssm_state_indices = torch.arange(
-        1,
-        num_sequences * num_tokens + 1,
-        dtype=torch.int32,
-        device=device,
-    ).reshape(num_sequences, num_tokens)
-    num_accepted_tokens = torch.ones(
-        num_sequences,
-        dtype=torch.int32,
-        device=device,
-    )
+    if is_standard_decode:
+        cu_seqlens = None
+        ssm_state_indices = None
+        num_accepted_tokens = None
+        num_spec_tokens = None
+        state_slots = num_sequences
+    else:
+        cu_seqlens = torch.arange(
+            0,
+            total_tokens + 1,
+            num_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        ssm_state_indices = torch.arange(
+            1,
+            num_sequences * num_tokens + 1,
+            dtype=torch.int32,
+            device=device,
+        ).reshape(num_sequences, num_tokens)
+        num_accepted_tokens = torch.ones(
+            num_sequences,
+            dtype=torch.int32,
+            device=device,
+        )
+        num_spec_tokens = num_tokens - 1
+        state_slots = num_sequences * num_tokens + 6
     state = (
         torch.randn(
             (
-                num_sequences * num_tokens + 6,
+                state_slots,
                 num_value_heads,
                 head_dim,
                 head_dim,
@@ -192,40 +232,58 @@ def _make_case(spec: dict, device: torch.device) -> dict:
         "lower_bound": lower_bound,
         "cu_seqlens": cu_seqlens,
         "ssm_state_indices": ssm_state_indices,
-        "num_spec_tokens": num_tokens - 1,
+        "num_spec_tokens": num_spec_tokens,
         "num_accepted_tokens": num_accepted_tokens,
         "output": output,
     }
 
 
-def _assert_frozen_route(spec: dict, kwargs: dict) -> None:
+def _parse_expected_variant_overrides(values: list[str]) -> dict[int, str]:
+    expected_variants = dict(EXPECTED_VARIANTS_BY_T)
+    for value in values:
+        token_text, separator, variant = value.partition("=")
+        if not separator or not token_text or not variant:
+            raise ValueError(
+                f"invalid expected variant {value!r}; expected TOKEN_COUNT=VARIANT"
+            )
+        try:
+            num_tokens = int(token_text)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid token count {token_text!r} in expected variant {value!r}"
+            ) from error
+        if num_tokens not in EXPECTED_VARIANTS_BY_T:
+            raise ValueError(
+                f"expected variant token count must be in 1..6, got {num_tokens}"
+            )
+        expected_variants[num_tokens] = variant
+    return expected_variants
+
+
+def _assert_frozen_route(
+    spec: dict, kwargs: dict, expected_variants: dict[int, str]
+) -> str:
     recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
-    selected = recurrent_module._select_flash_kda_decode_variant(
-        q=kwargs["q"],
-        k=kwargs["k"],
-        v=kwargs["v"],
-        g=kwargs["g"],
-        beta=kwargs["beta"],
-        state=kwargs["initial_state"],
-        out=kwargs["output"],
-        cu_seqlens=kwargs["cu_seqlens"],
-        ssm_state_indices=kwargs["ssm_state_indices"].view(-1),
-        num_accepted_tokens=kwargs["num_accepted_tokens"],
-        scale=kwargs["scale"],
-        num_tokens=spec["T"],
-        num_spec_tokens=spec["T"] - 1,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=kwargs["use_gate_in_kernel"],
-        lower_bound=kwargs["lower_bound"],
-        A_log=kwargs["A_log"],
-        dt_bias=kwargs["dt_bias"],
-        initial_state_source=None,
-        beta_is_logit=False,
-    )
-    if selected != spec["expected_variant"]:
+    expected_variant = expected_variants[spec["T"]]
+    selected = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+    initial_state = kwargs["initial_state"].clone()
+
+    def track_frozen_route(variant, **run_kwargs):
+        selected.append(variant)
+        return run_frozen(variant, **run_kwargs)
+
+    recurrent_module._run_flash_kda_decode = track_frozen_route
+    try:
+        recurrent_kda(**kwargs)
+    finally:
+        recurrent_module._run_flash_kda_decode = run_frozen
+        kwargs["initial_state"].copy_(initial_state)
+    if selected != [expected_variant]:
         raise AssertionError(
-            f"{spec['name']} expected {spec['expected_variant']}, got {selected}"
+            f"{spec['name']} expected one {expected_variant} launch, got {selected}"
         )
+    return selected[0]
 
 
 def _check_source(args: argparse.Namespace) -> str:
@@ -282,10 +340,21 @@ def main() -> None:
     parser.add_argument("--expected-source-sha", required=True)
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--expected-variant",
+        action="append",
+        default=[],
+        metavar="TOKEN_COUNT=VARIANT",
+        help=("override one frozen route assertion; repeat for multiple token counts"),
+    )
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
     if args.rounds <= 0 or args.warmup <= 0:
         parser.error("--rounds and --warmup must be positive")
+    try:
+        expected_variants = _parse_expected_variant_overrides(args.expected_variant)
+    except ValueError as error:
+        parser.error(str(error))
 
     try:
         from cupti import cupti  # noqa: F401
@@ -306,10 +375,17 @@ def main() -> None:
         raise RuntimeError("this benchmark requires exact B200 / sm_100a")
 
     rows = []
+    cases_per_t = {
+        num_tokens: sum(spec["T"] == num_tokens for spec in CASES)
+        for num_tokens in range(1, 7)
+    }
+    case_ordinal_by_t = {num_tokens: 0 for num_tokens in range(1, 7)}
     for spec in CASES:
+        case_ordinal_by_t[spec["T"]] += 1
         kwargs = _make_case(spec, device)
+        selected_variant = None
         if args.mode == "frozen":
-            _assert_frozen_route(spec, kwargs)
+            selected_variant = _assert_frozen_route(spec, kwargs, expected_variants)
         initial_state = kwargs["initial_state"].clone()
         measured_run = functools.partial(recurrent_kda, **kwargs)
         warmup_kwargs = dict(kwargs)
@@ -373,6 +449,11 @@ def main() -> None:
         row = {
             **spec,
             "mode": args.mode,
+            "data_seed": DATA_SEED,
+            "case_ordinal_within_t": case_ordinal_by_t[spec["T"]],
+            "cases_for_t": cases_per_t[spec["T"]],
+            "expected_variant": expected_variants[spec["T"]],
+            "selected_variant": selected_variant,
             "median_ms": median_ms,
             "samples_ms": samples_ms,
             "timing_backend": "CUPTI",
@@ -380,6 +461,10 @@ def main() -> None:
             "cold_l2": True,
             "cuda_graph": False,
             "timing_scope": "public_recurrent_kda_gpu_activity",
+            "single_public_api_call_per_sample": True,
+            "gpu_activity_count_asserted": False,
+            "state_output_reset_per_round": True,
+            "warmup_uses_disjoint_state_output": True,
             "upstream_main_sha": UPSTREAM_MAIN_SHA,
             "evolution_peer_sha": EVOLUTION_PEER_SHA,
             "source_sha": actual_source_sha,
@@ -392,6 +477,17 @@ def main() -> None:
         rows.append(row)
         print(f"{args.mode:<14} {spec['name']:<43} {median_ms * 1000.0:10.3f} us")
         torch.cuda.empty_cache()
+
+    print("\nPer-T case timing summary (absolute timings; compare matching JSON rows):")
+    for num_tokens in range(1, 7):
+        t_medians = [row["median_ms"] for row in rows if row["T"] == num_tokens]
+        t_geomean_ms = math.exp(
+            sum(math.log(value) for value in t_medians) / len(t_medians)
+        )
+        print(
+            f"{args.mode:<14} T={num_tokens} cases={len(t_medians)} "
+            f"case-geomean={t_geomean_ms * 1000.0:.3f} us"
+        )
 
     args.json.write_text(json.dumps(rows, indent=2) + "\n")
 

@@ -26,9 +26,57 @@ from flashinfer.jit import flash_kda_decode
 # The normalization removes only identity-derived temporary suffixes; all
 # schedule-relevant source text remains covered by the stable digest.
 FROZEN_GENERATED_BODY_SHA256 = {
+    "d128_t1_precomputed_split1": (
+        "c50a65997603f729d1558bfd9e14ce8d3415add9dc32aab2f958ab414307a3b4",
+        "a12ff529c81d7dc375e31bf57137d348b1eb39a93a6206d6aacc99515dae26f4",
+    ),
+    "d128_t1_precomputed_split2": (
+        "227b3b95337bb231798e7b5c2509a2d117a7337a6a6279010be6b71d3c8e0fb1",
+        "f0c24746584b0f6a19b5aefa977b71852cb920c9d1a626c73616dbb458ebd13e",
+    ),
+    "d128_t1_precomputed_split4": (
+        "30ff1318b9a7bc9904202e7bed93234378b6a7f231fa67ec00a39d2ae5e98f72",
+        "f7eba8a6b9ac933d7b54bcd333400fd640b90a54bf7dcb12c308f588a6533d6b",
+    ),
+    "d128_t1_precomputed_split8": (
+        "7b613b50ac99df6cc55bb349deb8dc01adf0f49b049636775a486a41df2a77ae",
+        "a38718a0b4383d2f2d2c3ec7eb1746be44e649265b805a3dbcebdd20415612d3",
+    ),
+    "d128_t2_precomputed_split1": (
+        "4eaf6b81491db3bd7969ddd8f41797bd7d5e472c591b4ed6a9a8fd7172eb6047",
+        "ab378468d5b81e203e09405adc49004f30a0e178ec29986f40e31583de1dd291",
+    ),
+    "d128_t2_precomputed_split2": (
+        "3d08321d288f816d21bfffc93bf25b7df4631b9f500799a4a7036a226c4250b2",
+        "54eadc2257ca591d7af94d8176f6562a564b4e72bc90e959a18b85a7a1af597a",
+    ),
+    "d128_t2_precomputed_split4": (
+        "e0cf2ece1b50e851579df8822fa2f03262a3399e25643a6bd3df03c875cc5ea2",
+        "bd7a8ae1bd202df4fc534f628be755db3c515a6755770b3a9fea9cae08cba780",
+    ),
+    "d128_t2_precomputed_split8": (
+        "b420190365e5f60432301956dec4ecfbd1b6dcba3c6034a5d1847f8c300a1501",
+        "1cee7e4aee0953f701e09f39c7edfdf1dac2abb6037628b291bec71bb34fd2af",
+    ),
     "d128_t3_lower_bound_split4": (
         "70c838b717a9eb7765bf9291db786b2b7a0387fbf80a3c337d5c04e7a553fe21",
         "76976b198f567bd68ed246343d9e795b9ca2883dce89033e20e2125cb4a84b82",
+    ),
+    "d128_t4_precomputed_split1": (
+        "d9eb05f21e8c76a92b25d1ce288db603c9ed8454e271cca1c11171b6d818a326",
+        "996815363f81f0d79dd517fcc7ed20216ea9509c87073275bda6d2ecf70a4c58",
+    ),
+    "d128_t4_precomputed_split2": (
+        "6ee50e300a2f20f305252a49e3e84fde957542ccb97b7fcb7ba7f075c7733077",
+        "581c722ec4d490853a382dfaa6204c909aa778637818de960627f1aa1e2b3fc0",
+    ),
+    "d128_t4_precomputed_split4": (
+        "1fa5ac877060a9c7a003e454eb6d69a4fb9a7720871c89a7aaf403de186fd934",
+        "da9042cd0bd0ad972ecf423ac7f56eaa2b8d37718a8a273552ac003f8c7aceb2",
+    ),
+    "d128_t4_precomputed_split8": (
+        "1a648fba1d1e3d899582d0ef85af869754fb8e2276d25cfc2b4d01c3480fe967",
+        "e0f65928fe3fc77bebf664bc369d8f35e0ecfde0cd1db539f1702bf805d320b3",
     ),
     "d128_t5_precomputed_gram_split1": (
         "7d44765cc20864dca2fc5f96ed2ae653e4d421f963c20fed5ba825d4989c8b4e",
@@ -45,6 +93,22 @@ FROZEN_GENERATED_BODY_SHA256 = {
     "d128_t5_precomputed_gram_split8": (
         "2307b896466dd58ff1daba770763b0a7142451e73225e940e9e9461a21bb9452",
         "1de157a38002ebc51ab603e79545eeea92d6fc13d53ed307e595ee29d04a8a02",
+    ),
+    "d128_t6_precomputed_gram_split1": (
+        "682b028f7c0836972405362cf455c6b5d9e3fddcaedae2c6e2e7dfb002f7b767",
+        "e4cfa4051ae4a466979ac0ec8eefd8c6afb89e9c74fab55a9aac263173690b49",
+    ),
+    "d128_t6_precomputed_gram_split2": (
+        "f63702eb8a3f0171b881edc6b3a847977dc98dc8646633fb2268f3920a57bab3",
+        "4b3fe6a6b81007e27563817a84eff8dc7b676d1716e5f11d10b7a77d63759501",
+    ),
+    "d128_t6_precomputed_gram_split4": (
+        "dfe440270a6cd5fcda89993f581b82742a6376e4eca6c5a6834efe24a0208756",
+        "d55362f36ead2b97b109eab79e04561944aa46f0ad19e0ec902401d5ec70d60a",
+    ),
+    "d128_t6_precomputed_gram_split8": (
+        "ca07bc3096faa56bf360fefb077d99f96ecb5d2a2afb3ba5ed2a79a5f2d7479a",
+        "4a0ef1735f1bdcd8eee7324d229539d68bb1c5124077a49ccf57bb213812242c",
     ),
 }
 
@@ -71,12 +135,19 @@ def _normalize_generated_body(source):
     ("variant", "body_hashes"),
     FROZEN_GENERATED_BODY_SHA256.items(),
 )
-def test_flash_kda_decode_jit_spec_and_frozen_body(monkeypatch, variant, body_hashes):
+def test_flash_kda_decode_jit_spec_and_frozen_body(
+    monkeypatch, tmp_path, variant, body_hashes
+):
     raw_sha256, normalized_sha256 = body_hashes
     monkeypatch.setattr(
         jit_core.current_compilation_context,
         "TARGET_CUDA_ARCHS",
         {(10, "0a")},
+    )
+    monkeypatch.setattr(
+        flash_kda_decode.jit_env,
+        "FLASHINFER_GEN_SRC_DIR",
+        tmp_path,
     )
     flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
 
@@ -86,7 +157,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(monkeypatch, variant, body_ha
     assert uri == f"flash_kda_decode_{variant}_sm100a"
     assert spec.name == uri
     assert len(spec.sources) == 1
-    assert spec.sources[0].name == f"flashkda_decode_{variant}_binding.cu"
+    assert spec.sources[0] == tmp_path / uri / "flashkda_decode_binding.cu"
     assert spec.sources[0].is_file()
     assert "-gencode=arch=compute_100a,code=sm_100a" in spec.extra_cuda_cflags
     assert "-use_fast_math" in spec.extra_cuda_cflags
@@ -96,7 +167,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(monkeypatch, variant, body_ha
         for flag in spec.extra_cuda_cflags
     )
 
-    frozen_source = spec.sources[0].parent / f"flashkda_decode_{variant}.cu"
+    frozen_source = flash_kda_decode._get_csrc_dir() / f"flashkda_decode_{variant}.cu"
     frozen_text = frozen_source.read_text()
     assert "Generated from a recurrent-KDA Loom schedule." in frozen_text
     assert f"Raw generated body SHA256: {raw_sha256}" in frozen_text
@@ -124,27 +195,39 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(monkeypatch, variant, body_ha
     assert f"Raw generated body SHA256: {raw_sha256}" in before_body
     assert f"Normalized generated SHA256: {normalized_sha256}" in before_body
     assert after_body.strip() == "// clang-format on"
-    expected_gate_kind = 1 if variant == "d128_t3_lower_bound_split4" else 0
+    metadata = flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA[variant]
+    expected_gate_kind = metadata.gate_kind
     assert f"#define GATE_KIND {expected_gate_kind}" in generated_body
     assert "#define DIRECT_PREFIX_CHECKPOINT 0" in generated_body
     assert "#define BLOCK_CHECKPOINT_MMA 0" in generated_body
 
-    split = int(variant.rpartition("split")[2])
     binding_text = spec.sources[0].read_text()
-    expected_tokens = 3 if variant == "d128_t3_lower_bound_split4" else 5
-    assert "#define FLASHKDA_DECODE_HEAD_DIM 128" in binding_text
-    assert f"#define FLASHKDA_DECODE_TOKENS {expected_tokens}" in binding_text
+    assert (
+        f'#define FLASHKDA_DECODE_BODY_FILE "flashkda_decode_{variant}.cu"'
+        in binding_text
+    )
+    assert f"#define FLASHKDA_DECODE_HEAD_DIM {metadata.head_dim}" in binding_text
+    assert f"#define FLASHKDA_DECODE_TOKENS {metadata.tokens}" in binding_text
     assert f"#define FLASHKDA_DECODE_GATE_KIND {expected_gate_kind}" in binding_text
-    assert f"#define FLASHKDA_DECODE_VALUE_SPLIT {split}" in binding_text
+    assert f"#define FLASHKDA_DECODE_VALUE_SPLIT {metadata.value_split}" in binding_text
+    assert (
+        f"#define FLASHKDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}"
+        in binding_text
+    )
+    assert '#include "flashkda_decode_binding.cuh"' in binding_text
 
 
 def test_flash_kda_decode_binding_contract():
     csrc_dir = flash_kda_decode._get_csrc_dir()
+    binding = (csrc_dir / "flashkda_decode_binding.cuh").read_text()
     common = (csrc_dir / "flashkda_decode_binding_common.cuh").read_text()
     impl = (csrc_dir / "flashkda_decode_binding_impl.cuh").read_text()
 
+    assert "FLASHKDA_DECODE_BODY_FILE" in binding
+    assert "#include FLASHKDA_DECODE_BODY_FILE" in binding
     assert "CheckExactSm100a" in common
     assert "struct VariantTraits" in common
+    assert "static_assert(Tokens >= 1)" in common
     assert "state.stride(0) >= num_value_heads * head_dim * head_dim" in common
     assert "gate.stride(1) >= num_value_heads * head_dim" in common
     assert "g must be compact in its [HV, K] trailing dimensions" in common
@@ -155,11 +238,66 @@ def test_flash_kda_decode_binding_contract():
     assert "torch.cuda.current_stream" not in impl
     assert "cuda_stream" in impl
     assert "VALUE_SPLIT" in impl
+    assert "FLASHKDA_DECODE_EXPECTED_SMEM" not in impl
+    assert "SMEM_TOTAL > 0" in impl
 
 
 def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
-    expected_variants = tuple(FROZEN_GENERATED_BODY_SHA256)
+    expected_variants = (
+        "d128_t1_precomputed_split1",
+        "d128_t1_precomputed_split2",
+        "d128_t1_precomputed_split4",
+        "d128_t1_precomputed_split8",
+        "d128_t2_precomputed_split1",
+        "d128_t2_precomputed_split2",
+        "d128_t2_precomputed_split4",
+        "d128_t2_precomputed_split8",
+        "d128_t3_lower_bound_split4",
+        "d128_t4_precomputed_split1",
+        "d128_t4_precomputed_split2",
+        "d128_t4_precomputed_split4",
+        "d128_t4_precomputed_split8",
+        "d128_t5_precomputed_gram_split1",
+        "d128_t5_precomputed_gram_split2",
+        "d128_t5_precomputed_gram_split4",
+        "d128_t5_precomputed_gram_split8",
+        "d128_t6_precomputed_gram_split1",
+        "d128_t6_precomputed_gram_split2",
+        "d128_t6_precomputed_gram_split4",
+        "d128_t6_precomputed_gram_split8",
+    )
     assert expected_variants == flash_kda_decode.FLASH_KDA_DECODE_VARIANTS
+    assert expected_variants == tuple(
+        flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA
+    )
+    assert {
+        variant: metadata.launch_threads
+        for variant, metadata in (
+            flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA.items()
+        )
+    } == {
+        "d128_t1_precomputed_split1": 256,
+        "d128_t1_precomputed_split2": 128,
+        "d128_t1_precomputed_split4": 64,
+        "d128_t1_precomputed_split8": 32,
+        "d128_t2_precomputed_split1": 256,
+        "d128_t2_precomputed_split2": 128,
+        "d128_t2_precomputed_split4": 64,
+        "d128_t2_precomputed_split8": 64,
+        "d128_t3_lower_bound_split4": 96,
+        "d128_t4_precomputed_split1": 256,
+        "d128_t4_precomputed_split2": 128,
+        "d128_t4_precomputed_split4": 128,
+        "d128_t4_precomputed_split8": 128,
+        "d128_t5_precomputed_gram_split1": 256,
+        "d128_t5_precomputed_gram_split2": 160,
+        "d128_t5_precomputed_gram_split4": 160,
+        "d128_t5_precomputed_gram_split8": 160,
+        "d128_t6_precomputed_gram_split1": 256,
+        "d128_t6_precomputed_gram_split2": 192,
+        "d128_t6_precomputed_gram_split4": 192,
+        "d128_t6_precomputed_gram_split8": 192,
+    }
     for removed_variant in (
         "d128_t4_precomputed",
         "d128_t5_precomputed",
@@ -175,7 +313,7 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "load_flash_kda_decode_module",
         lambda variant: (sentinel, variant),
     )
-    for variant in FROZEN_GENERATED_BODY_SHA256:
+    for variant in expected_variants:
         assert flash_kda_decode.get_flash_kda_decode_module(variant) == (
             sentinel,
             variant,

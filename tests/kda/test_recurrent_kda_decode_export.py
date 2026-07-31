@@ -31,6 +31,13 @@ _VARIANT_PREFIX = "d128_t5_precomputed_gram_split"
 _T3 = 3
 _T3_VARIANT = "d128_t3_lower_bound_split4"
 _T3_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
+_PRECOMPUTED_VARIANT_PREFIXES = {
+    1: "d128_t1_precomputed_split",
+    2: "d128_t2_precomputed_split",
+    4: "d128_t4_precomputed_split",
+    5: _VARIANT_PREFIX,
+    6: "d128_t6_precomputed_gram_split",
+}
 
 
 @pytest.fixture
@@ -138,6 +145,38 @@ def _fake_selector_kwargs():
     }
 
 
+def _fake_precomputed_selector_kwargs(num_tokens, *, num_sequences=1):
+    address = iter(range(0x200000000000, 0x300000000000, 0x100000000))
+
+    def tensor(shape, dtype=torch.bfloat16, **kwargs):
+        return _fake_tensor(shape, dtype, next(address), **kwargs)
+
+    total_tokens = num_sequences * num_tokens
+    q = tensor((1, total_tokens, 1, _D))
+    return {
+        "q": q,
+        "k": tensor(q.shape),
+        "v": tensor((1, total_tokens, 1, _D)),
+        "g": tensor((1, total_tokens, 1, _D)),
+        "beta": tensor((1, total_tokens, 1)),
+        "state": tensor((total_tokens, 1, _D, _D)),
+        "out": tensor((1, total_tokens, 1, _D)),
+        "cu_seqlens": tensor((num_sequences + 1,), torch.int32),
+        "ssm_state_indices": tensor((total_tokens,), torch.int32),
+        "num_accepted_tokens": tensor((num_sequences,), torch.int32),
+        "scale": _D**-0.5,
+        "num_tokens": num_tokens,
+        "num_spec_tokens": None if num_tokens == 1 else num_tokens - 1,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": False,
+        "lower_bound": None,
+        "A_log": None,
+        "dt_bias": None,
+        "initial_state_source": None,
+        "beta_is_logit": False,
+    }
+
+
 def _fake_t3_selector_kwargs(*, num_sequences=4, num_heads=16, num_value_heads=16):
     address = iter(range(0x400000000000, 0x500000000000, 0x100000000))
 
@@ -205,6 +244,14 @@ def test_exact_cpu_contract_selects_frozen_variant(monkeypatch):
     assert recurrent_module._select_flash_kda_decode_variant(
         **_fake_selector_kwargs()
     ) == (_VARIANT_PREFIX + "8")
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 6])
+def test_precomputed_token_family_selects_frozen_variant(monkeypatch, num_tokens):
+    _patch_cpu_selector_environment(monkeypatch)
+    assert recurrent_module._select_flash_kda_decode_variant(
+        **_fake_precomputed_selector_kwargs(num_tokens)
+    ) == (_PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + "8")
 
 
 @pytest.mark.parametrize("num_sequences", _T3_SEQUENCE_COUNTS)
@@ -986,10 +1033,12 @@ def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
         )
 
     frozen_calls = []
+    frozen_call_kwargs = []
     run_frozen = recurrent_module._run_flash_kda_decode
 
     def track_frozen_call(variant, **kwargs):
         frozen_calls.append(variant)
+        frozen_call_kwargs.append(kwargs)
         return run_frozen(variant, **kwargs)
 
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
@@ -997,14 +1046,32 @@ def test_public_recurrent_kda_multi_token_matrix_matches_forced_fallback(
         **_call_kwargs(case, state=actual_state, output=actual_output_buffer)
     )
 
-    if num_tokens == _T:
+    if num_tokens in _PRECOMPUTED_VARIANT_PREFIXES:
         split = recurrent_module._select_flash_kda_decode_value_split(
             num_sequences * 32,
             torch.cuda.get_device_properties(b200).multi_processor_count,
         )
-        assert frozen_calls == [_VARIANT_PREFIX + str(split)]
+        assert frozen_calls == [_PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + str(split)]
     else:
         assert frozen_calls == []
+
+    if num_tokens == 1:
+        frozen_kwargs = frozen_call_kwargs[0]
+        assert frozen_kwargs["q"].shape == (1, num_sequences, 16, _D)
+        assert frozen_kwargs["k"].shape == (1, num_sequences, 16, _D)
+        assert frozen_kwargs["v"].shape == (1, num_sequences, 32, _D)
+        assert frozen_kwargs["g"].shape == (1, num_sequences, 32, _D)
+        assert frozen_kwargs["beta"].shape == (1, num_sequences, 32)
+        assert frozen_kwargs["out"].shape == (1, num_sequences, 32, _D)
+        assert frozen_kwargs["q"].data_ptr() == case["q"].data_ptr()
+        assert frozen_kwargs["k"].data_ptr() == case["k"].data_ptr()
+        assert frozen_kwargs["v"].data_ptr() == case["v"].data_ptr()
+        assert frozen_kwargs["g"].data_ptr() == case["g"].data_ptr()
+        assert frozen_kwargs["beta"].data_ptr() == case["beta"].data_ptr()
+        assert frozen_kwargs["out"].data_ptr() == actual_output_buffer.data_ptr()
+        assert frozen_kwargs["cu_seqlens"].tolist() == list(range(num_sequences + 1))
+        assert frozen_kwargs["ssm_state_indices"].tolist() == list(range(num_sequences))
+        assert frozen_kwargs["num_accepted_tokens"].tolist() == [0] * num_sequences
 
     assert actual_output.data_ptr() == actual_output_buffer.data_ptr()
     assert actual_state_result is actual_state
