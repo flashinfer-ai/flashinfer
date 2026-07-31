@@ -1321,7 +1321,11 @@ def build_batched_gemm_task_manager(
         explicit_early_exit_max_token_ctas=early_exit_max_token_ctas,
     )
     cfg = make_config(**cfg_overrides)
-    num_k_tiles = max(2, compute_num_k_tiles(cfg))
+    # The validation-only config has no concrete problem K, so
+    # compute_num_k_tiles() sees a single tile.  Validate at four tiles to
+    # cover the maximum three-stage LDGSTS producer prefetch and the 2x MMA
+    # unroll without reporting a false unmatched producer commit.
+    num_k_tiles = max(4, compute_num_k_tiles(cfg))
     task_list, dep_graph, smem_alloc, tmem_alloc = _build_schedule_validate(
         cfg,
         num_k_tiles=num_k_tiles,

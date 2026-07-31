@@ -2052,7 +2052,7 @@ class GmemCResource(MemoryResource):
         return selected.to(cutlass.Int8)
 
     @cute.jit
-    def _store_swap_ab_fp4_sf_epi32(
+    def _store_swap_ab_quant_sf_epi32(
         self,
         sf_values,
         m_tile_base,
@@ -2063,7 +2063,7 @@ class GmemCResource(MemoryResource):
         lane_id,
         warp_in_epi4,
     ):
-        """Store an epi-N32 SF-C fragment with one coalesced warp store.
+        """Store an epi-N32 quantization SF-C fragment with one warp store.
 
         Each group of four lanes selects one of the eight scale values, matching
         TRT-LLM Gen's ``threadIdxInGroup`` mapping.  The previous path emitted
@@ -2532,7 +2532,7 @@ class GmemCResource(MemoryResource):
                 if cutlass.const_expr(
                     not self.cfg.uses_mx_output_quant and self.cfg.epi_tile_n == 32
                 ):
-                    self._store_swap_ab_fp4_sf_epi32(
+                    self._store_swap_ab_quant_sf_epi32(
                         fp4_sf_c_vals,
                         m_tile_base,
                         n_tile_base,
@@ -2616,7 +2616,24 @@ class GmemCResource(MemoryResource):
                                 warp_in_epi4,
                                 m_local_row0_2,
                                 tmem_col_even2,
-                                True,
+                                self.cfg.epi_tile_n != 32,
+                            )
+                    if cutlass.const_expr(self.cfg.epi_tile_n == 32):
+                        # MX output scale reduction pairs adjacent M16 warps.
+                        # Only the even warp owns the resulting M32 scale row.
+                        # Select one of its eight scale registers per four-lane
+                        # group and emit one coalesced store, matching Gen,
+                        # instead of eight separately predicated stores.
+                        if (warp_in_epi4 % Int32(2)) == Int32(0):
+                            self._store_swap_ab_quant_sf_epi32(
+                                mx_sf_c_vals,
+                                m_tile_base,
+                                n_tile_base,
+                                n_subtile_offset,
+                                token_limit,
+                                output_m,
+                                lane_id,
+                                warp_in_epi4,
                             )
                     prims.barrier_cta_sync(
                         barrier_id=9,

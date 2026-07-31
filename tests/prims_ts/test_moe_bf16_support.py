@@ -247,6 +247,58 @@ def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
     pytest.fail("GPT-OSS low-latency MXFP4xMXFP8 FC1 config is missing")
 
 
+def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
+    kwargs = dict(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=8192,
+        top_k=4,
+        num_local_experts=128,
+        fc1_has_bias=True,
+        fc2_has_bias=True,
+        enable_pdl=True,
+    )
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 128:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc1 = pair.fc1.cfg.kwargs
+        fc2 = pair.fc2.cfg.kwargs
+        if not (
+            fc1["route_act"] == 2
+            and fc1["tile_k"] == 256
+            and fc1["use_clc_fast_drain"]
+            and not fc1["use_work_throttle"]
+            and fc2["tile_k"] == 256
+            and fc2.get("num_stages_c_smem") == 1
+        ):
+            continue
+
+        assert fc1["route_sfs_act"] == 2
+        assert fc1["num_stages_tmem_sfa"] == 1
+        assert fc1["fuse_operand_sf_loads"] == 1
+        assert fc2["use_unroll_loop_2x_for_mma"] == 1
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+            build_batched_gemm_task_manager,
+        )
+
+        manager = build_batched_gemm_task_manager(
+            num_experts=128,
+            num_tokens=8192,
+            top_k=4,
+            verbose=False,
+            **fc1,
+        )
+        assert {task.name for task in manager.tasks} >= {
+            "MmaTask0",
+            "FusedGatherSfBTask",
+            "WorkScheduleTask",
+        }
+        return
+
+    pytest.fail("GPT-OSS high-throughput MXFP4xMXFP8 config pair is missing")
+
+
 def test_runner_filter_drops_unbuildable_json_tactics():
     valid_pair = _first_buildable_pair(
         map_trtllm_bf16_moe_tactic,
