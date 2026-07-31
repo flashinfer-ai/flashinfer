@@ -20,7 +20,8 @@ calls ``flashinfer.kda_decode.recurrent_kda`` with an identical, deterministic
 D128/T=1..6 matrix. T=1 uses the standard decode ABI, T=3 uses the measured
 lower-bound contract, and the remaining token counts use packed speculative
 decode with precomputed gates. The caller can alternate mode order across
-processes to form paired rounds.
+processes to form paired rounds. Candidate rows compare complete output and
+mutated state against the explicit CuTe-DSL backend before timing.
 """
 
 import argparse
@@ -328,6 +329,56 @@ def _check_source(args: argparse.Namespace) -> str:
     return actual_source_sha
 
 
+def _check_cake_correctness(kwargs: dict, initial_state: torch.Tensor) -> dict:
+    """Compare one Cake public call with the explicit CuTe-DSL backend."""
+
+    reference_state = initial_state.clone()
+    cake_state = initial_state.clone()
+    reference_output = torch.empty_like(kwargs["output"])
+    cake_output = torch.empty_like(kwargs["output"])
+    reference_kwargs = dict(kwargs)
+    reference_kwargs["initial_state"] = reference_state
+    reference_kwargs["output"] = reference_output
+    cake_kwargs = dict(kwargs)
+    cake_kwargs["initial_state"] = cake_state
+    cake_kwargs["output"] = cake_output
+
+    actual_reference_output, _ = recurrent_kda(
+        **reference_kwargs,
+        backend="cute-dsl",
+    )
+    actual_cake_output, _ = recurrent_kda(
+        **cake_kwargs,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        actual_cake_output.float(),
+        actual_reference_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        cake_state.float(),
+        reference_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    return {
+        "checked": True,
+        "reference_backend": "cute-dsl",
+        "candidate_backend": "cake",
+        "output_allclose": True,
+        "all_state_allclose": True,
+        "atol": 1e-2,
+        "rtol": 1e-2,
+        "output_max_abs_error": float(
+            (actual_cake_output - actual_reference_output).abs().max().item()
+        ),
+        "state_max_abs_error": float((cake_state - reference_state).abs().max().item()),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -389,6 +440,11 @@ def main() -> None:
         if args.mode == "frozen":
             call_kwargs["backend"] = "cake"
         initial_state = kwargs["initial_state"].clone()
+        correctness = (
+            _check_cake_correctness(kwargs, initial_state)
+            if args.mode == "frozen"
+            else None
+        )
         measured_run = functools.partial(recurrent_kda, **call_kwargs)
         warmup_kwargs = dict(call_kwargs)
         warmup_kwargs["initial_state"] = initial_state.clone()
@@ -457,6 +513,7 @@ def main() -> None:
             "expected_variant": expected_variants[spec["T"]],
             "selected_variant": selected_variant,
             "selected_backend": ("cake" if args.mode == "frozen" else "source-default"),
+            "correctness": correctness,
             "median_ms": median_ms,
             "samples_ms": samples_ms,
             "timing_backend": "CUPTI",
