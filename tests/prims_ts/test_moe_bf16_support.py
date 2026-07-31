@@ -26,6 +26,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
+    valid_prims_ts_mxfp4_mxfp8_moe_tactics,
 )
 from flashinfer.prims_ts.moe.runner import _filter_valid_moe_tactics
 from flashinfer.prims_ts.moe import support
@@ -217,6 +218,33 @@ def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     assert pair.tile_n == 8
     assert pair.fc1.cfg.kwargs["act_kind"] == 2
     assert pair.fc2.cfg.kwargs["act_kind"] == 0
+
+
+def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
+    kwargs = dict(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=1,
+        top_k=4,
+        num_local_experts=128,
+        fc1_has_bias=True,
+        fc2_has_bias=True,
+        enable_pdl=True,
+    )
+
+    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
+        if tactic[0] != 8:
+            continue
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
+        fc1 = pair.fc1.cfg.kwargs
+        if not fc1["use_work_throttle"]:
+            continue
+
+        assert fc1["route_act"] == 2
+        assert fc1["route_sfs_act"] == 2
+        assert fc1["use_clc_fast_drain"] == 1
+        return
+
+    pytest.fail("GPT-OSS low-latency MXFP4xMXFP8 FC1 config is missing")
 
 
 def test_runner_filter_drops_unbuildable_json_tactics():
