@@ -15,6 +15,14 @@ Weights: the CuTeDSL kernel consumes NVFP4 expert weights in kernel-ready
 :class:`~flashinfer.moe_ep.MoEWeightPack`; the layer quantizes them at init via
 ``preprocess_weights=True`` (see ``preprocess_mega_weights``). To supply
 pre-quantized NVFP4 weights instead, pass ``w13``/``w2`` plus ``w13_scale``/``w2_scale``.
+
+Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
+self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
+ownership, cross-rank combine), because both sides run the same CUDA kernel.
+``test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle`` closes that gap with
+the sm90_pull_fp8 twin's methodology: each rank all-gathers the actual plain
+quantized weight legs and checks its real-EP kernel output slice against the
+single-GPU pure-torch oracle run on its staged tokens + the global expert set.
 """
 
 from __future__ import annotations
@@ -689,6 +697,216 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_quantized_combine(combine_dtype):
         f"rank {rank}: nvfp4_cutedsl mega layer (combine_dtype={combine_dtype}) "
         "matches reference"
     )
+
+
+def _all_gather_stack(t):
+    """all_gather a per-rank tensor and stack it on a new leading rank dim.
+
+    FP4/FP8 payloads and scale planes travel as uint8 bytes (NCCL supports
+    none of the sub-byte/8-bit float dtypes) and are reinterpreted after the
+    stack.
+    """
+    import torch
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size()
+    tc = t.contiguous()
+    byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
+    wire = tc.view(torch.uint8) if byte_wire else tc
+    gathered = [torch.empty_like(wire) for _ in range(world_size)]
+    dist.all_gather(gathered, wire)
+    stacked = torch.stack(gathered)
+    return stacked.view(tc.dtype) if byte_wire else stacked
+
+
+def _identity_epilogue_params(num_local_experts: int):
+    """Identity per-expert epilogue scalars (fc1_alpha/fc2_alpha/norm_const=1).
+
+    The pure-torch oracle models the alpha_swiglu_clamp epilogue only at its
+    identity point (like ``bench_moe_ep_mega``'s accuracy column), so the
+    oracle test pins the scalars to 1.0 instead of ``make_dummy_epilogue_params``.
+    """
+    import torch
+
+    ones = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+    return ones, ones.clone(), ones.clone()
+
+
+def _run_mega_torch_oracle(rank, world_size):
+    """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
+
+    Parity tests alone cannot catch a kernel that is wrong but self-consistent
+    at ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
+    peer-token dequant, cross-rank combine), because both sides run the same
+    CUDA kernel; this closes that gap (sm90_pull_fp8 twin methodology).
+
+    Every rank stages its own bf16 shard, runs the fused kernel with real
+    cross-rank NVSHMEM traffic, then all-gathers the ACTUAL plain (pre-swizzle)
+    fp4 weight legs of all ranks (no reliance on cross-rank RNG determinism)
+    and feeds its own staged activations + routing plus the gathered global
+    expert set to the single-GPU pure-torch oracle
+    (``_torch_nvfp4_mega_reference``): y[t] = Σ_k w_k · expert_{id_k}(x_t) is
+    per-token math, so the local token shard against global weights is the
+    full ground truth for this rank's output slice.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEWeightPack,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        get_symm_buffer_for_mega_moe,
+        nvfp4_mega_moe,
+    )
+
+    from .test_nvfp4_cutedsl_kernel_vs_reference import (
+        _plain_nvfp4_from_bf16,
+        _torch_nvfp4_mega_reference,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(rank, world_size)
+    num_local = problem["num_experts"] // world_size
+    # Identity epilogue scalars: the torch oracle has no alpha/norm-const legs.
+    (
+        problem["fc1_alpha"],
+        problem["fc2_alpha"],
+        problem["fc1_norm_const"],
+    ) = _identity_epilogue_params(num_local)
+    # Guarantee cross-rank traffic by construction: token 0 routes one expert
+    # per EP rank (contiguous block ownership: rank r owns [r*L, (r+1)*L)).
+    forced = (
+        torch.arange(min(problem["topk"], world_size), device="cuda", dtype=torch.int64)
+        * num_local
+    )
+    problem["topk_ids"][0, : forced.numel()] = forced
+
+    kernel = create_mega_kernel(_megakernel_config(problem, epilogue_via_config=True))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap,
+        kernel.runtime_requirements(bootstrap),
+    )
+    try:
+        n = problem["num_tokens"]
+
+        symm_buffer = get_symm_buffer_for_mega_moe(
+            problem["num_experts"],
+            problem["max_tokens"],
+            problem["topk"],
+            problem["hidden"],
+            2 * problem["intermediate"],
+            rank,
+            world_size,
+            gate_up_clamp=problem["gate_up_clamp"],
+            fc1_alpha=problem["fc1_alpha"],
+            fc2_alpha=problem["fc2_alpha"],
+            fc1_norm_const=problem["fc1_norm_const"],
+        )
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x[:n],
+            symm_buffer.x_sf[:n],
+            symm_buffer.topk_idx[:n],
+            symm_buffer.topk_weights[:n],
+        )
+        # Snapshot exactly what the kernel consumes (this rank's shard).
+        x_local = symm_buffer.x[:n].clone()
+        x_sf_local = symm_buffer.x_sf[:n].clone()
+        idx_local = symm_buffer.topk_idx[:n].clone()
+        w_local = symm_buffer.topk_weights[:n].clone()
+
+        transformed_l1, transformed_l2 = preprocess_mega_weights(
+            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            intermediate_size=problem["intermediate"],
+            hidden_size=problem["hidden"],
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+
+        y_kernel = torch.empty(
+            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+        )
+        nvfp4_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=n,
+            gate_up_clamp=problem["gate_up_clamp"],
+            fast_math=problem["fast_math"],
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        symm_buffer.destroy()
+
+        # Reassemble the global expert set from each rank's ACTUAL plain
+        # (pre-swizzle) quantized weight legs; (R, E_local, ...) → (E, ...)
+        # rank-major matches the global expert id convention.
+        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
+        fc1_w_g = _all_gather_stack(fc1_plain).flatten(0, 1)
+        fc1_sf_g = _all_gather_stack(fc1_sf).flatten(0, 1)
+        fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
+        fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
+
+        y_ref = _torch_nvfp4_mega_reference(
+            act_packed=x_local,
+            act_sf=x_sf_local,
+            topk_idx=idx_local,
+            topk_weights=w_local,
+            fc1_weight=fc1_w_g,
+            fc1_sf=fc1_sf_g,
+            fc2_weight=fc2_w_g,
+            fc2_sf=fc2_sf_g,
+            hidden=problem["hidden"],
+            intermediate=problem["intermediate"],
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+
+        assert torch.isfinite(y_kernel).all()
+        yk = y_kernel.to(torch.float32)
+        yr = y_ref.to(torch.float32)
+        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+        print(
+            f"[nvfp4 multirank oracle rank {rank}] rel_l2={rel_l2.item():.4g} "
+            f"max|d|={(yk - yr).abs().max().item():.4g} "
+            f"amax(ref)={yr.abs().max().item():.4g}"
+        )
+        # Single-GPU oracle tolerances: the residual is NVFP4 RTNE flips at
+        # fc1-out + accumulation-order noise; atol scales with the output
+        # range (random unscaled weights put |y|~1e4 here).
+        atol = 2e-3 * yr.abs().max().item()
+        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+        assert rel_l2.item() < 0.02
+        return rank
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle():
+    """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
+    _require_cuda()
+    pytest.importorskip("triton")
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_torch_oracle(rank, world_size)
+    print(f"rank {rank}: nvfp4_cutedsl mega kernel matches the multi-rank torch oracle")
 
 
 @pytest.mark.arch_blackwell

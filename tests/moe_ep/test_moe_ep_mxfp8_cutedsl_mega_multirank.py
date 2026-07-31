@@ -15,6 +15,15 @@ Weights: the CuTeDSL kernel consumes MXFP8 expert weights in kernel-ready
 :class:`~flashinfer.moe_ep.MoEWeightPack`; the layer quantizes them at init via
 ``preprocess_weights=True``. To supply pre-quantized MXFP8 weights instead, pass
 kernel-layout ``w13``/``w2`` plus ``w13_scale``/``w2_scale``.
+
+Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
+self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
+ownership, cross-rank combine), because both sides run the same CUDA kernel.
+``test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle`` closes that gap with
+the sm90_pull_fp8 twin's methodology: every rank all-gathers the actual staged
+MXFP8 payloads, routing, and plain weight legs, runs the multi-rank-native
+``compute_megamoe_reference_mxfp8`` on the global problem, and checks its own
+rank's slice against the real-EP kernel output.
 """
 
 from __future__ import annotations
@@ -553,6 +562,188 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
         },
     )
     print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
+
+
+def _all_gather_stack(t):
+    """all_gather a per-rank tensor and stack it on a new leading rank dim.
+
+    FP8 payloads and E8M0 scale planes travel as uint8 bytes (NCCL supports
+    neither dtype) and are reinterpreted after the stack.
+    """
+    import torch
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size()
+    tc = t.contiguous()
+    byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
+    wire = tc.view(torch.uint8) if byte_wire else tc
+    gathered = [torch.empty_like(wire) for _ in range(world_size)]
+    dist.all_gather(gathered, wire)
+    stacked = torch.stack(gathered)
+    return stacked.view(tc.dtype) if byte_wire else stacked
+
+
+def _run_mega_torch_oracle(rank, world_size):
+    """Real-EP kernel launch vs the drop's torch GLOBAL reference.
+
+    Parity alone cannot catch a kernel that is wrong but self-consistent at
+    ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
+    cross-rank combine), because both sides run the same CUDA kernel; this
+    closes that gap (sm90_pull_fp8 twin methodology).
+
+    Every rank stages its own bf16 shard, runs the fused kernel with real
+    cross-rank NVSHMEM traffic, then all-gathers the ACTUAL staged MXFP8
+    activations + routing + plain (pre-swizzle) weight legs (no reliance on
+    cross-rank RNG determinism) and feeds the global problem to
+    ``compute_megamoe_reference_mxfp8`` — which is multi-rank native: it takes
+    ``(num_ranks, tokens_per_rank, ...)`` operands and computes
+    ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
+    its own output slice within the single-GPU oracle's tolerances.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEWeightPack,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        compute_megamoe_reference_mxfp8,
+        get_symm_buffer_for_mxfp8_mega_moe,
+        mxfp8_mega_moe,
+    )
+
+    from .test_mxfp8_cutedsl_preprocess_vs_reference import _plain_mxfp8_from_bf16
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(rank, world_size)
+    num_local = problem["num_experts"] // world_size
+    # Guarantee cross-rank traffic by construction: token 0 routes one expert
+    # per EP rank (contiguous block ownership: rank r owns [r*L, (r+1)*L)).
+    forced = (
+        torch.arange(min(problem["topk"], world_size), device="cuda", dtype=torch.int64)
+        * num_local
+    )
+    problem["topk_ids"][0, : forced.numel()] = forced
+
+    kernel = create_mega_kernel(_megakernel_config(problem))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap,
+        kernel.runtime_requirements(bootstrap),
+    )
+    try:
+        n = problem["num_tokens"]
+
+        symm_buffer = get_symm_buffer_for_mxfp8_mega_moe(
+            problem["num_experts"],
+            problem["max_tokens"],
+            problem["topk"],
+            problem["hidden"],
+            problem["intermediate"],
+            rank,
+            world_size,
+            kind=problem["kind"],
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            kind=problem["kind"],
+        )
+        # Snapshot exactly what the kernel consumes (this rank's shard).
+        x_local = symm_buffer.x[:n].clone()
+        x_sf_local = symm_buffer.x_sf[:n].clone()
+        idx_local = symm_buffer.topk_idx[:n].clone()
+        w_local = symm_buffer.topk_weights[:n].clone()
+
+        transformed_l1, transformed_l2 = preprocess_mega_weights(
+            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            intermediate_size=problem["intermediate"],
+            hidden_size=problem["hidden"],
+            kind=problem["kind"],
+            gate_up_clamp=problem["gate_up_clamp"],
+        )
+
+        y_kernel = torch.empty(
+            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+        )
+        mxfp8_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=n,
+            gate_up_clamp=problem["gate_up_clamp"],
+            fast_math=problem["fast_math"],
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        symm_buffer.destroy()
+
+        # Reassemble the global problem from the operands each rank staged;
+        # the reference consumes (num_ranks, ...) stacks directly.
+        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
+        combine_ref = compute_megamoe_reference_mxfp8(
+            input_activation=_all_gather_stack(x_local),
+            input_activation_sf=_all_gather_stack(x_sf_local),
+            input_topk_idx=_all_gather_stack(idx_local),
+            input_topk_weights=_all_gather_stack(w_local),
+            fc1_weight=_all_gather_stack(fc1_plain),
+            fc1_weight_sf=_all_gather_stack(fc1_sf),
+            fc2_weight=_all_gather_stack(fc2_plain),
+            fc2_weight_sf=_all_gather_stack(fc2_sf),
+            ab_dtype=torch.float8_e4m3fn,
+            gate_up_clamp=problem["gate_up_clamp"],
+            apply_topk_in_fc1=True,
+        )
+        # The topk weight is already folded before the fc1-out round-trip, so
+        # the per-topk terms reduce with a plain sum; compare this rank's slice.
+        y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+        assert torch.isfinite(y_kernel).all()
+        yk = y_kernel.to(torch.float32)
+        rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+        print(
+            f"[mxfp8 multirank oracle rank {rank}] rel_l2={rel_l2.item():.4g} "
+            f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+            f"amax(ref)={y_ref.abs().max().item():.4g}"
+        )
+        # Single-GPU oracle tolerances: random unscaled bf16 weights yield
+        # |y|~1e2–1e3; kernel vs torch ref can differ by ~1 bf16 ULP (|d|≈8)
+        # on a handful of cells.
+        torch.testing.assert_close(yk, y_ref, atol=8.0, rtol=0.05)
+        assert rel_l2.item() < 0.02
+        return rank
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle():
+    """Real cross-rank EP kernel vs the drop's torch global math (see helper doc)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_torch_oracle(rank, world_size)
+    print(f"rank {rank}: mxfp8_cutedsl mega kernel matches the multi-rank torch oracle")
 
 
 @pytest.mark.arch_blackwell
