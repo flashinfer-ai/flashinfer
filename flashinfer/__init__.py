@@ -288,7 +288,9 @@ def _log_import_version() -> None:
         except Exception:
             _short = "unknown"
         _line = f"FlashInfer {__version__} (commit {_short})\n"
-        _dest = _os.environ.get("FLASHINFER_LOGDEST", "stdout")
+        _dest = _os.environ.get("FLASHINFER_LOGDEST", "stdout").replace(
+            "%i", str(_os.getpid())
+        )
         if _dest == "stderr":
             import sys as _sys
 
