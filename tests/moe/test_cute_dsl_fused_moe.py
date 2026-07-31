@@ -468,6 +468,13 @@ class TestAutotuneReplayMemsetContract:
             fused_moe.AutoTuner, "get", staticmethod(lambda: StubTuner())
         )
 
+        # `_require_cute_dsl_arch_for` in `cute_dsl_fused_moe_nvfp4`
+        # reads `torch.cuda.get_device_capability(x.device)`,
+        # which rejects a CPU device.
+        monkeypatch.setattr(
+            fused_moe, "_require_cute_dsl_arch_for", lambda *args, **kwargs: None
+        )
+
         tensors = {
             "x": torch.empty((2, 8), dtype=torch.uint8),
             "x_sf": torch.empty((2, 1), dtype=torch.uint8),
