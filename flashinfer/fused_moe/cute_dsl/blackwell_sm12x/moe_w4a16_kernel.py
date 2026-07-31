@@ -5723,7 +5723,7 @@ def compile_w4a16_fused_moe(
             1,
             cache_key,
         ),
-        dsl_compile_options=OptLevel(2),
+        dsl_compile_options=OptLevel(3),
     )
     result = W4A16FusedMoeCompileResult(
         compiled=compiled,
