@@ -799,8 +799,6 @@ class MoEStaticKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        # Keep the predicate in DSL IR. A Python conditional would turn the
-        # device value into a host bool at trace time.
         is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
