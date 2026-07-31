@@ -1397,7 +1397,7 @@ __device__ __forceinline__ void logits_transform(
 
 #ifdef FP16_QK_REDUCTION_SUPPORTED
         if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
-          logits = std::bit_cast<float>(fp16_ieee_to_fp32_value(s_frag[mma_q][mma_kv][reg_id]));
+          logits = fp16_ieee_to_fp32_value(std::bit_cast<uint16_t>(s_frag[mma_q][mma_kv][reg_id]));
         } else if constexpr (!std::is_same<DTypeQKAccum, __half>::value) {
           logits = s_frag[mma_q][mma_kv][reg_id];
         }
