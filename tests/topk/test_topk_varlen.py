@@ -186,10 +186,12 @@ def _make_varlen_inputs(seq_len_list, N, dtype, seed):
 def _radix_ctas(N, dtype, batch_size):
     """ctas_per_group the radix (CuTe DSL) backend will use for this shape."""
     from flashinfer.topk_varlen import _radix_get_chunk_config
-    from flashinfer.utils import get_device_sm_count
+    from flashinfer.utils import get_device_sm_count, get_shared_bytes_per_block_optin
 
-    num_sms = get_device_sm_count(torch.device("cuda"))
-    ctas, _chunk = _radix_get_chunk_config(N, dtype, batch_size, num_sms)
+    device = torch.device("cuda")
+    num_sms = get_device_sm_count(device)
+    smem_capacity = get_shared_bytes_per_block_optin(device)
+    ctas, _chunk = _radix_get_chunk_config(N, dtype, batch_size, num_sms, smem_capacity)
     return ctas
 
 
@@ -405,6 +407,26 @@ def test_no_pre_idx_selects_radix():
     _check_correct(indices, logits, seq_lens, top_k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_skip_check_auto_backend():
+    """skip_check=True with backend="auto" must not raise TypeError.
+
+    When skip_check=True the decorator still calls heuristic_func with positional
+    args (*args from the caller).  The heuristic's old **kwargs signature caused
+    TypeError because the positional logits/seq_lens/top_k arguments overflowed
+    the single 'suitable_backends' slot.  Spelling out the full signature fixes it.
+    """
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
+    logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=77)
+    # Must not raise TypeError regardless of hardware.
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=None, backend="auto", skip_check=True
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (batch_size, top_k)
+    _check_correct(indices, logits, seq_lens, top_k)
+
+
 # ---------------------------------------------------------------------------
 # Radix-backend tests (run on any GPU, backend="radix_cutlass" forced explicitly)
 # ---------------------------------------------------------------------------
@@ -530,41 +552,120 @@ def test_lb_config_validation():
 # ---------------------------------------------------------------------------
 
 
-def _make_ragged_gvr_inputs(top_k, dtype=torch.bfloat16):
-    """4 long rows (> 64K threshold) + 12 short rows: a ragged batch."""
+def _make_ragged_gvr_inputs(top_k, dtype=torch.bfloat16, next_n=1):
+    """4 long requests (> 64K threshold) + 12 short requests: a ragged batch.
+
+    With ``next_n > 1``, each request contributes ``next_n`` logit rows, so
+    ``logits`` has shape ``(batch_size * next_n, N)``.
+    """
     N = 128 * 1024
     seq_len_list = [N] * 4 + [2048] * 12
     batch_size = len(seq_len_list)
+    num_rows = batch_size * next_n
     torch.manual_seed(7)
-    logits = (torch.randn(batch_size, N, dtype=torch.float32, device="cuda") * 2.0).to(
+    logits = (torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0).to(
         dtype
     )
     seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
     logits_f32 = logits.to(torch.float32)
     pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
     for r in range(batch_size):
-        pre_idx[r, 0] = int(logits_f32[r, : seq_len_list[r]].argmax().item())
+        # Primary row (nn=0): effective range is [0, seq_len - next_n + 1).
+        effective_len = seq_len_list[r] - next_n + 1
+        pre_idx[r, 0] = int(logits_f32[r * next_n, :effective_len].argmax().item())
     pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
     return logits, seq_lens, pre_idx
 
 
 @requires_blackwell
-@pytest.mark.parametrize("load_balance", [True, False])
-def test_load_balance_modes(load_balance):
-    """load_balance=True/False both produce correct GVR top-K on a ragged batch."""
+@pytest.mark.parametrize(
+    "load_balance,next_n", [(True, 1), (False, 1), (True, 2), (False, 2)]
+)
+def test_load_balance_modes(load_balance, next_n):
+    """load_balance=True/False, next_n=1/2 all produce correct GVR top-K on a ragged batch.
+
+    The next_n=2, load_balance=False combination specifically exercises _run_gvr
+    (the single-CTA path) whose order_row was previously constructed with a
+    [::next_n] slice bug that made it too short when next_n > 1.
+    """
     top_k = 512
-    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k, next_n=next_n)
+    num_rows = logits.shape[0]
     indices, _ = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
         pre_idx=pre_idx,
+        next_n=next_n,
         backend="gvr",
         load_balance=load_balance,
     )
     torch.cuda.synchronize()
-    assert indices.shape == (seq_lens.shape[0], top_k)
-    _check_correct(indices, logits, seq_lens, top_k)
+    assert indices.shape == (num_rows, top_k)
+    _check_correct(indices, logits, seq_lens, top_k, next_n=next_n)
+
+
+@requires_blackwell
+def test_gvr_lb_workspace_reuse():
+    """Caller-provided workspace buffers are reused across GVR LB calls.
+
+    Verifies that passing a pre-allocated workspace dict produces the same
+    correct results as the default (locally-allocated) path, and that the
+    same buffers can be safely reused across multiple calls.
+    """
+    top_k, batch_size = 512, 8
+    logits, seq_lens, pre_idx = _make_ragged_gvr_inputs(top_k)
+    batch_size = seq_lens.shape[0]
+
+    # Compute max_batch_size: smallest power-of-2 in [64, 1024] >= batch_size.
+    max_batch_size = next(m for m in (64, 128, 256, 512, 1024) if m >= batch_size)
+    workspace = {
+        "gvr_order_row": torch.empty(max_batch_size, dtype=torch.int32, device="cuda"),
+        "gvr_counters": torch.empty(2, dtype=torch.int32, device="cuda"),
+    }
+
+    # First call — workspace gets populated.
+    indices0, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", workspace=workspace
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices0, logits, seq_lens, top_k)
+
+    # Second call with same workspace — must give identical correct results.
+    indices1, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", workspace=workspace
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices1, logits, seq_lens, top_k)
+    assert torch.equal(indices0, indices1), "workspace reuse changed the result"
+
+
+@requires_blackwell
+def test_gvr_no_lb_next_n():
+    """load_balance=False with next_n=2: order_row must be request-level, not row-level.
+
+    Regression test for the [::next_n] slice bug: seq_lens already has shape
+    (num_requests,), so slicing it with [::next_n] produced an order_row that was
+    next_n times too short, causing out-of-bounds kernel accesses when next_n > 1.
+    """
+    top_k, next_n, N = 512, 2, 8192
+    batch_size = 8  # requests
+    num_rows = batch_size * next_n
+    logits, pre_idx, seq_lens = _make_inputs(
+        num_rows, N, top_k, torch.bfloat16, seed=11, next_n=next_n
+    )
+    indices, _ = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=pre_idx,
+        next_n=next_n,
+        backend="gvr",
+        load_balance=False,
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (num_rows, top_k)
+    _check_correct(indices, logits, seq_lens, top_k, next_n=next_n)
 
 
 # ---------------------------------------------------------------------------
@@ -577,11 +678,12 @@ def test_load_balance_modes(load_balance):
     "dtype,align", [(torch.bfloat16, 8), (torch.float16, 8), (torch.float32, 4)]
 )
 def test_gvr_row_width_alignment(dtype, align):
-    """GVR raises ValueError when N is not a multiple of 16//itemsize.
+    """GVR rejects misaligned N for explicit backend="gvr" and auto-routes past it.
 
-    GVR uses 128-bit vectorized loads, so each row (and thus N*itemsize) must be
-    16-byte aligned. A misaligned N would otherwise fault with a cryptic CUDA
-    'misaligned address' error; the API validates it up front instead.
+    GVR uses 128-bit vectorized loads, so each row must be 16-byte aligned.
+    The suitability check catches this and:
+      - raises ValueError for explicit backend="gvr"
+      - falls back to radix_cutlass for backend="auto" (pre_idx provided)
     """
     top_k, batch_size = 512, 4
     N_bad = 4096 + 1  # not a multiple of 4 or 8 for any supported dtype
@@ -590,10 +692,19 @@ def test_gvr_row_width_alignment(dtype, align):
     pre_idx = torch.zeros(batch_size, top_k, dtype=torch.int32, device="cuda")
     pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(ValueError, match=f"multiple of {align}"):
+    # Explicit backend="gvr" must fail (alignment check fires in the suitability
+    # function; the decorator raises the generic problem-size error).
+    with pytest.raises(ValueError, match="not supported"):
         flashinfer.top_k_varlen(
             logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", load_balance=False
         )
+
+    # backend="auto" must succeed by routing to radix_cutlass (no alignment constraint).
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="auto"
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (batch_size, top_k)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -749,23 +860,68 @@ def test_radix_next_n(dtype, top_k):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("top_k", [512, 1024])
-def test_radix_compress_ratio(top_k):
-    """radix backend: compress_ratio=4 (seq_lens in uncompressed-token space)."""
+@pytest.mark.parametrize("top_k,next_n", [(512, 1), (1024, 1), (512, 2), (1024, 2)])
+def test_radix_compress_ratio(top_k, next_n):
+    """radix backend: compress_ratio=4, varied top_k and next_n.
+
+    Tests both axes independently covered by test_radix_compress_ratio and
+    test_radix_next_n, plus their interaction (next_n > 1 with compress_ratio > 1)
+    which is where _run_radix's kernel length formula must apply compress_ratio
+    after the next_n adjustment, not before.
+    """
     dtype, compress_ratio, N, batch_size = torch.bfloat16, 4, 4096, 8
+    num_rows = batch_size * next_n
     logits, _, seq_lens = _make_inputs(
-        batch_size, N, top_k, dtype, seed=55, compress_ratio=compress_ratio
+        num_rows, N, top_k, dtype, seed=55, next_n=next_n, compress_ratio=compress_ratio
     )
     indices, _ = flashinfer.top_k_varlen(
         logits,
         seq_lens,
         top_k,
         pre_idx=None,
+        next_n=next_n,
         compress_ratio=compress_ratio,
         backend="radix",
     )
     torch.cuda.synchronize()
-    _check_correct(indices, logits, seq_lens, top_k, compress_ratio=compress_ratio)
+    assert indices.shape == (num_rows, top_k)
+    _check_correct(
+        indices, logits, seq_lens, top_k, next_n=next_n, compress_ratio=compress_ratio
+    )
+
+
+@requires_blackwell
+def test_radix_next_n_compress_ratio():
+    """radix backend: next_n=2 combined with compress_ratio=4.
+
+    Regression test: the next_n per-row adjustment (in token units) must happen
+    before dividing by compress_ratio, not after. Pre-dividing seq_lens and then
+    subtracting next_n in compressed-index units gives the wrong column bound
+    (off by up to compress_ratio-1 columns per row).
+    """
+    dtype, top_k, next_n, compress_ratio = torch.bfloat16, 512, 2, 4
+    # N=4096 logit columns = 16384 uncompressed tokens per column.
+    # Use seq_lens near a compress_ratio boundary (e.g. 16385) so the
+    # integer-division order matters: (16385-2+0+1)//4=4096 vs (16385//4)-2+0+1=4095.
+    N, batch_size = 4096, 8
+    num_rows = batch_size * next_n
+    logits, _, seq_lens = _make_inputs(
+        num_rows, N, top_k, dtype, seed=17, next_n=next_n, compress_ratio=compress_ratio
+    )
+    indices, _ = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        pre_idx=None,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        backend="radix",
+    )
+    torch.cuda.synchronize()
+    assert indices.shape == (num_rows, top_k)
+    _check_correct(
+        indices, logits, seq_lens, top_k, next_n=next_n, compress_ratio=compress_ratio
+    )
 
 
 @requires_blackwell
@@ -789,8 +945,15 @@ def test_radix_return_values(dtype):
 
 
 @requires_blackwell
-def test_radix_preallocated_outputs():
-    """radix backend: out_indices / out_values written in-place."""
+@pytest.mark.parametrize("return_values", [True, False])
+def test_radix_preallocated_outputs(return_values):
+    """radix backend: out_indices written in-place; out_values honoured iff return_values=True.
+
+    Covers the return_values=False + out_values-supplied case: _run_radix must pass
+    None to the kernel (compiled with return_output_values=False) even when the caller
+    has pre-allocated a values buffer.  Before the fix, the real tensor was forwarded
+    unconditionally into a kernel compiled to expect None.
+    """
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 4
     logits, _, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=11)
     out_i = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
@@ -801,14 +964,53 @@ def test_radix_preallocated_outputs():
         top_k,
         pre_idx=None,
         out_indices=out_i,
-        return_values=True,
+        return_values=return_values,
         out_values=out_v,
         backend="radix",
     )
     torch.cuda.synchronize()
     assert ret_i is out_i
-    assert ret_v is out_v
+    if return_values:
+        assert ret_v is out_v
+    else:
+        assert ret_v is None
     _check_correct(out_i, logits, seq_lens, top_k)
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "backend,load_balance",
+    [
+        ("radix", None),
+        ("radix_cutlass", None),
+        ("gvr", True),
+        ("gvr", False),
+    ],
+)
+def test_out_values_ignored_when_return_values_false(backend, load_balance):
+    """out_values supplied but return_values=False must not corrupt the kernel call.
+
+    _compile_radix specialises the kernel on return_output_values: when False the
+    compiled signature has None for the values slot.  Passing a real tensor there
+    (without the 'out_values if return_output_values else None' guard) causes a
+    type mismatch.  Covers all three backends plus both GVR load-balance paths.
+    """
+    dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 4
+    logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=99)
+    # Pre-allocate a values buffer but deliberately do NOT set return_values=True.
+    out_v = torch.full((batch_size, top_k), float("nan"), dtype=dtype, device="cuda")
+
+    kwargs = dict(return_values=False, out_values=out_v, backend=backend)
+    if backend == "gvr":
+        kwargs["pre_idx"] = pre_idx
+        kwargs["load_balance"] = load_balance
+
+    ret_i, ret_v = flashinfer.top_k_varlen(logits, seq_lens, top_k, **kwargs)
+    torch.cuda.synchronize()
+    # return_values=False → second element must be None regardless of out_values.
+    assert ret_v is None
+    # Indices must still be correct.
+    _check_correct(ret_i, logits, seq_lens, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -975,11 +1177,16 @@ def test_backend_heuristic_priority():
     """
     from flashinfer.topk_varlen import _top_k_varlen_heuristic
 
-    assert _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"])[0] == "gvr"
-    assert _top_k_varlen_heuristic(["radix", "radix_cutlass"])[0] == "radix"
-    assert _top_k_varlen_heuristic(["radix_cutlass"])[0] == "radix_cutlass"
+    # The heuristic only uses suitable_backends; pass None for the tensor/scalar
+    # args required by the full signature (needed so skip_check=True works).
+    dummy = (None, None, None)
+    assert (
+        _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"], *dummy)[0] == "gvr"
+    )
+    assert _top_k_varlen_heuristic(["radix", "radix_cutlass"], *dummy)[0] == "radix"
+    assert _top_k_varlen_heuristic(["radix_cutlass"], *dummy)[0] == "radix_cutlass"
     # order is preserved regardless of the suitable-set ordering
-    assert _top_k_varlen_heuristic(["radix_cutlass", "radix", "gvr"]) == [
+    assert _top_k_varlen_heuristic(["radix_cutlass", "radix", "gvr"], *dummy) == [
         "gvr",
         "radix",
         "radix_cutlass",

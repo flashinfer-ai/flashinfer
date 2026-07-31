@@ -35,25 +35,29 @@ Backend choices
 """
 
 import functools
+import importlib.util
 import math
 from typing import Literal, Optional, Tuple
 
-import cutlass
-import cutlass.cute as cute
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.topk import top_k_varlen_trace
-from .cute_dsl.top_k.config import GvrTopKConfig, GvrTopKLBConfig
-from .cute_dsl.utils import (
-    is_cute_dsl_available,
-    torch_to_cutlass_dtype,
-)
 from .topk import get_topk_module
+
+# Check for the Python CuTe DSL package without importing it (and without
+# importing cute_dsl/utils.py, which has top-level `import cutlass`).
+# This mirrors what is_cute_dsl_available() does internally.
+_CUTE_DSL_AVAILABLE = (
+    importlib.util.find_spec("cutlass") is not None
+    and importlib.util.find_spec("cutlass.cute") is not None
+)
+
 from .utils import (
     _get_cache_buf,
     backend_requirement,
     get_device_sm_count,
+    get_shared_bytes_per_block_optin,
     supported_compute_capability,
 )
 
@@ -64,8 +68,15 @@ from .utils import (
 # All SM tiers FlashInfer ships kernels for.
 _ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
 
-# GVR requires Blackwell sm_100a or newer.
+# CuTe DSL radix backend: all Blackwell-plus tiers.
 _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
+
+# GVR validated tiers: B200-class only (SM100/103).
+# GVR LB uses cluster_size=4 CTA clusters (programmatic multicast); SM120/121
+# only support a 1×1×1 cluster shape (no multicast) so the clustered path
+# would be incorrect there.  The non-LB path (cluster_size=1) is also
+# restricted to the same tiers for consistency — let radix serve SM110+.
+_GVR_CCS = [100, 103]
 
 # ---------------------------------------------------------------------------
 # Backend requirement checkers
@@ -85,12 +96,13 @@ def _radix_cutlass_top_k_varlen_check(
     out_values=None,
     backend="auto",
     load_balance=True,
+    workspace=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
 
 
-@supported_compute_capability(_BLACKWELL_PLUS_CCS)
+@supported_compute_capability(_GVR_CCS)
 def _gvr_top_k_varlen_check(
     logits,
     seq_lens,
@@ -103,13 +115,55 @@ def _gvr_top_k_varlen_check(
     out_values=None,
     backend="auto",
     load_balance=True,
-):  # extra kwargs mirror the public signature; unused by the check
-    """GVR LB: requires Blackwell hardware, CuTe DSL, and a pre_idx hint."""
-    return is_cute_dsl_available() and pre_idx is not None
+    workspace=None,
+):
+    """Return True only when GVR can run on this exact configuration.
+
+    Used by backend="auto" routing: returning False here causes the heuristic to
+    fall back to radix or radix_cutlass rather than reaching GVR and crashing.
+    """
+    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+        return False
+    # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
+    # raise inside the kernel's __init__ during compilation.
+    if top_k not in (512, 1024, 2048):
+        return False
+    # GvrTopKLBPrepareKernel asserts compress_ratio in (1, 4).
+    if compress_ratio not in (1, 4):
+        return False
+    # GVR uses 128-bit vectorized loads — each row must be 16-byte aligned.
+    N = logits.shape[1]
+    elem_align = 16 // logits.element_size()
+    if N % elem_align != 0:
+        return False
+    # LB prepare kernel caps batch_size at 1024 (max_batch_size must be a power
+    # of 2 in [64, 1024]); the single-CTA path (load_balance=False) has no cap.
+    if load_balance and seq_lens.shape[0] > 1024:
+        return False
+    return True
 
 
-def _top_k_varlen_heuristic(suitable_backends, **kwargs):
-    """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs)."""
+def _top_k_varlen_heuristic(
+    suitable_backends,
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    pre_idx=None,
+    compress_ratio: int = 1,
+    next_n: int = 1,
+    return_values: bool = False,
+    out_indices=None,
+    out_values=None,
+    backend: str = "auto",
+    load_balance: bool = True,
+    workspace=None,
+):
+    """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs).
+
+    The full signature must be spelled out (not **kwargs) so that the decorator can
+    call this function with positional args on the skip_check=True path without
+    raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
+    """
     return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
 
 
@@ -117,7 +171,11 @@ def _top_k_varlen_heuristic(suitable_backends, **kwargs):
 # Internal: compiled-kernel cache
 # ---------------------------------------------------------------------------
 
-if is_cute_dsl_available():
+if _CUTE_DSL_AVAILABLE:
+    import cutlass
+    import cutlass.cute as cute
+    from .cute_dsl.top_k.config import GvrTopKConfig, GvrTopKLBConfig
+    from .cute_dsl.utils import torch_to_cutlass_dtype
     from .cute_dsl.top_k import (
         GvrTopKKernel,
         GvrTopKLBKernel,
@@ -316,10 +374,6 @@ def _compile_gvr(
 # FlashInfer picks the same SMEM-bounded chunk_size and CTA count.
 
 _RADIX_NUM_COPY_BITS = 256  # 256-bit vectorized SMEM loads (matches the kernel)
-# sm_100a opt-in dynamic SMEM capacity (bytes). Same value cutlass reports via
-# get_smem_capacity_in_bytes("sm_100"); inlined to avoid a device query on the
-# hot path.
-_SM100_SMEM_CAPACITY = 232448
 # Fixed per-CTA SMEM before shared_ordered, 128-byte-padded to match the
 # kernel's SmemAllocator layout (radix_topk.py):
 #   local_histogram[256] int32  = 1024
@@ -336,13 +390,17 @@ def _radix_ordered_elem_size(torch_dtype) -> int:
 
 
 def _radix_compute_max_chunk(
-    torch_dtype, num_copy_bits: int = _RADIX_NUM_COPY_BITS
+    torch_dtype, smem_capacity: int, num_copy_bits: int = _RADIX_NUM_COPY_BITS
 ) -> int:
-    """Largest chunk_size (elements) a single CTA can stage in SMEM, vec-aligned."""
+    """Largest chunk_size (elements) a single CTA can stage in SMEM, vec-aligned.
+
+    ``smem_capacity`` is the opt-in dynamic shared memory per block for the
+    target device, obtained from ``get_shared_bytes_per_block_optin``.
+    """
     ordered_elem_size = _radix_ordered_elem_size(torch_dtype)
     dtype_width_bits = 32 if torch_dtype == torch.float32 else 16
     vec_size = num_copy_bits // dtype_width_bits  # 8 fp32, 16 half
-    max_chunk = (_SM100_SMEM_CAPACITY - _RADIX_SMEM_OVERHEAD) // ordered_elem_size
+    max_chunk = (smem_capacity - _RADIX_SMEM_OVERHEAD) // ordered_elem_size
     max_chunk -= max_chunk % vec_size  # floor to a whole vector
     return max_chunk
 
@@ -352,6 +410,7 @@ def _radix_get_chunk_config(
     torch_dtype,
     num_rows: int,
     num_sms: int,
+    smem_capacity: int,
     num_copy_bits: int = _RADIX_NUM_COPY_BITS,
 ) -> Tuple[int, int]:
     """Return ``(ctas_per_group, chunk_size)`` — SM-aware, mirrors TRT-LLM.
@@ -371,7 +430,7 @@ def _radix_get_chunk_config(
     """
     dtype_width_bits = 32 if torch_dtype == torch.float32 else 16
     vec_size = num_copy_bits // dtype_width_bits
-    max_chunk = _radix_compute_max_chunk(torch_dtype, num_copy_bits)
+    max_chunk = _radix_compute_max_chunk(torch_dtype, smem_capacity, num_copy_bits)
 
     ideal_ctas_per_group = max(1, num_sms // max(num_rows, 1))
     if ideal_ctas_per_group <= 1:
@@ -404,6 +463,7 @@ def _compile_radix(
     cute_dtype,
     top_k,
     next_n,
+    compress_ratio,
     N,
     return_output_values,
     ctas_per_group,
@@ -417,11 +477,13 @@ def _compile_radix(
     # re-derived here (the old N/ctas division could exceed the SMEM cap).
     # num_rows (batch) and sym_groups are dynamic — one compiled kernel serves all
     # batch sizes at this (dtype, top_k, N, ctas_per_group, chunk_size) specialization.
+    # compress_ratio is a const_expr in the kernel so it is a cache key here too.
     kernel = SinglePassMultiCTARadixTopKKernel(
         dtype=cute_dtype,
         chunk_size=chunk_size,
         top_k=top_k,
         next_n=next_n,
+        compress_ratio=compress_ratio,
         ctas_per_group=ctas_per_group,
         num_sms=num_sms,
     )
@@ -528,6 +590,8 @@ def _run_gvr_lb(
     return_output_values: bool,
     out_indices: Optional[torch.Tensor],
     out_values: Optional[torch.Tensor],
+    order_row: Optional[torch.Tensor] = None,
+    counters: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """LB prepare (sort rows by length) + GVR decode."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
@@ -535,8 +599,12 @@ def _run_gvr_lb(
     max_batch_size = _lb_max_batch_size(batch_size)
     lb_cfg = GvrTopKLBConfig(max_batch_size=max_batch_size)
 
-    order_row = torch.empty(max_batch_size, dtype=torch.int32, device=logits.device)
-    counters = torch.zeros(2, dtype=torch.int32, device=logits.device)
+    # The prepare kernel overwrites both tensors before they are read, so
+    # torch.empty is correct (no zero-initialization needed).
+    if order_row is None:
+        order_row = torch.empty(max_batch_size, dtype=torch.int32, device=logits.device)
+    if counters is None:
+        counters = torch.empty(2, dtype=torch.int32, device=logits.device)
     _compile_gvr_lb_prepare(max_batch_size, lb_cfg.long_threshold, compress_ratio)(
         seq_lens, order_row, counters, cutlass.Int32(batch_size)
     )
@@ -584,7 +652,9 @@ def _run_gvr(
 
     # Sort requests longest-first (LJF) so early waves process the heaviest rows;
     # short rows fill the tail, eliminating the load-imbalance tail penalty.
-    order_row = torch.argsort(seq_lens[::next_n], descending=True).to(torch.int32)
+    # seq_lens is already request-level with shape (num_rows // next_n,); slicing
+    # with [::next_n] would produce a tensor that's next_n times too short.
+    order_row = torch.argsort(seq_lens, descending=True).to(torch.int32)
 
     # Shape-aware launch config from GvrTopKConfig.auto().
     num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)
@@ -622,8 +692,11 @@ def _run_radix_cutlass(
     out_indices: Optional[torch.Tensor],
     out_values: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Masked-radix fallback: mask logits to seq_lens, then call the radix kernel directly."""
-    _, N = logits.shape
+    """Masked-radix fallback: uses radix_topk_ragged_transform to pass per-row
+    lengths directly into the kernel, avoiding a full (num_rows, N) masked copy
+    and a double-allocation for indices.
+    """
+    num_rows, N = logits.shape
     if next_n > 1:
         row_seq_lens = seq_lens.repeat_interleave(next_n)
         row_offsets = torch.arange(
@@ -631,12 +704,11 @@ def _run_radix_cutlass(
         ).repeat(seq_lens.shape[0])
         row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
     else:
-        row_seq_lens = (seq_lens // compress_ratio).clamp(max=N)
+        row_seq_lens = seq_lens // compress_ratio
+    lengths = row_seq_lens.clamp(max=N).to(torch.int32)
 
-    col_idx = torch.arange(N, device=logits.device).unsqueeze(0)
-    masked_logits = logits.masked_fill(
-        col_idx >= row_seq_lens.unsqueeze(1), float("-inf")
-    )
+    # offsets=zeros: output indices are local column indices (0..N-1), no shift.
+    offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
     row_states_buffer = _get_cache_buf(
         f"radix_topk_row_states_{logits.device}",
@@ -644,18 +716,23 @@ def _run_radix_cutlass(
         logits.device,
         zero_init=True,
     )
-    out_i_int32 = get_topk_module().radix_topk(
-        masked_logits,
+    # Write directly into out_indices — no second allocation or copy_ needed.
+    get_topk_module().radix_topk_ragged_transform(
+        logits,
+        out_indices,
+        offsets,
+        lengths,
+        row_states_buffer,
         top_k,
-        False,  # sorted
         False,  # deterministic
         0,  # tie_break = TopKTieBreak.NONE
-        row_states_buffer,
-        out_values,
         False,  # dsa_graph_safe
     )
 
-    out_indices.copy_(out_i_int32)
+    if return_output_values:
+        # Gather values at selected indices — O(num_rows*top_k) vs O(num_rows*N).
+        out_values.copy_(torch.gather(logits, 1, out_indices.long()))
+
     return out_indices, (out_values if return_output_values else None)
 
 
@@ -677,9 +754,10 @@ def _radix_top_k_varlen_check(
     out_values=None,
     backend="auto",
     load_balance=True,
+    workspace=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return is_cute_dsl_available()
+    return _CUTE_DSL_AVAILABLE
 
 
 def _run_radix(
@@ -695,28 +773,29 @@ def _run_radix(
     """CuTe DSL multi-CTA radix top-k: native varlen, no logit masking needed."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
     num_rows, N = logits.shape
-    # Note: the row->request mapping (num_rows // next_n) is handled inside the
-    # compiled kernel (row_idx // next_n indexes seq_lens; see radix_topk.py),
-    # so next_n only needs to be forwarded to _compile_radix below.
-
-    # Adjust seq_lens for compress_ratio (match _run_radix_cutlass semantics).
-    if compress_ratio > 1:
-        seq_lens = (seq_lens // compress_ratio).clamp(max=N).to(torch.int32)
+    # The kernel handles both the next_n per-row adjustment and compress_ratio
+    # division internally (length = (seq_len - next_n + nn + 1) // compress_ratio),
+    # so seq_lens is passed through unmodified in uncompressed (token) units.
 
     num_sms = get_device_sm_count(logits.device)
+    # Opt-in dynamic SMEM capacity for this device (cached after the first
+    # query per device). Used to bound chunk_size so each CTA's shared_ordered
+    # buffer fits in SMEM; the correct value varies across SM100/SM120/SM121.
+    smem_capacity = get_shared_bytes_per_block_optin(logits.device)
     # SM-aware chunk/CTA config: rows that fit in SMEM stay single-CTA
     # (ctas_per_group=1); longer rows split across a CTA group so each CTA's
     # chunk fits in shared memory. This both avoids the SMEM-overflow fault at
     # large N and activates the kernel's multi-CTA path (parallelism over one
     # long row) instead of serializing it on one CTA.
     ctas_per_group, chunk_size = _radix_get_chunk_config(
-        N, logits.dtype, num_rows, num_sms
+        N, logits.dtype, num_rows, num_sms, smem_capacity
     )
 
     compiled = _compile_radix(
         cute_dtype,
         top_k,
         next_n,
+        compress_ratio,
         N,
         return_output_values,
         ctas_per_group,
@@ -758,7 +837,7 @@ def _run_radix(
         row_states,
         seq_lens,
         out_indices,
-        out_values,
+        out_values if return_output_values else None,
     )
     return out_indices, (out_values if return_output_values else None)
 
@@ -789,6 +868,7 @@ def top_k_varlen(
     out_values: Optional[torch.Tensor] = None,
     backend: Literal["radix", "gvr", "radix_cutlass", "auto"] = "auto",
     load_balance: bool = True,
+    workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -869,6 +949,24 @@ def top_k_varlen(
 
         Both settings are CUDA-graph safe (no host branch on device data).
 
+    workspace : dict, optional
+        Reusable workspace buffers for the GVR ``load_balance=True`` path.
+        When provided, the LB prepare and decode kernels read/write these
+        tensors instead of allocating fresh ones per call — useful in decode
+        loops where the same batch size is reused at every step.
+
+        Required keys (both ``int32`` on the same device as ``logits``):
+
+        * ``"gvr_order_row"``: shape ``(M,)`` where ``M`` is the smallest
+          power of 2 in ``[64, 1024]`` that is ``>= seq_lens.shape[0]``.
+        * ``"gvr_counters"``: shape ``(2,)``.
+
+        .. warning::
+            Do **not** share the same workspace dict across concurrent CUDA
+            streams — each stream must have its own workspace to avoid races
+            on the device tensors.  When ``workspace`` is ``None`` (default)
+            buffers are allocated locally and are safe for any concurrency.
+
     Returns
     -------
     (indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -941,15 +1039,6 @@ def top_k_varlen(
             out_values,
         )
     elif backend == "gvr":
-        # GVR requires each logits row to be 16-byte aligned (128-bit loads).
-        N = logits.shape[1]
-        elem_align = 16 // logits.element_size()
-        if N % elem_align != 0:
-            raise ValueError(
-                f"GVR: logits row width N={N} must be a multiple of {elem_align} "
-                f"for {logits.dtype} (16-byte row alignment). "
-                f"Pad N or use backend='radix_cutlass'."
-            )
         use_lb = bool(load_balance)
         if use_lb:
             out_i, out_v = _run_gvr_lb(
@@ -962,6 +1051,8 @@ def top_k_varlen(
                 return_values,
                 out_indices,
                 out_values,
+                order_row=workspace.get("gvr_order_row") if workspace else None,
+                counters=workspace.get("gvr_counters") if workspace else None,
             )
         else:
             out_i, out_v = _run_gvr(

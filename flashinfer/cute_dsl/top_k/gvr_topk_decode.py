@@ -36,7 +36,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from .pdl_utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import warp_scan
 
 

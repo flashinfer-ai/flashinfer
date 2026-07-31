@@ -28,7 +28,7 @@ from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from .block_scan import block_prefix_sum_kernel
-from .pdl_utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 _ENABLE_PDL = True
 
@@ -186,6 +186,7 @@ class SinglePassMultiCTARadixTopKKernel:
         chunk_size: int,
         top_k: int,
         next_n: int = 1,
+        compress_ratio: int = 1,
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
@@ -194,6 +195,7 @@ class SinglePassMultiCTARadixTopKKernel:
         self.chunk_size = chunk_size
         self.top_k = top_k
         self.next_n = next_n
+        self.compress_ratio = compress_ratio
         self.ctas_per_group = ctas_per_group
         self.num_sms = num_sms
         self.num_copy_bits = num_copy_bits
@@ -1094,6 +1096,7 @@ class SinglePassMultiCTARadixTopKKernel:
         chunk_size = cutlass.const_expr(self.chunk_size)
         top_k = cutlass.const_expr(self.top_k)
         next_n = cutlass.const_expr(self.next_n)
+        compress_ratio = cutlass.const_expr(self.compress_ratio)
         num_threads = cutlass.const_expr(self.num_threads)
 
         group_id = bidx // ctas_per_group
@@ -1156,7 +1159,10 @@ class SinglePassMultiCTARadixTopKKernel:
         while row_idx < num_rows:
             # Compute effective length from seqlen
             seq_len = seqlen[row_idx // next_n]
-            length = seq_len - next_n + (row_idx % next_n) + 1
+            # Compute effective column count in compressed (logit) index space.
+            # next_n adjustment is in token units, so it must happen before
+            # dividing by compress_ratio; when compress_ratio=1 this is a no-op.
+            length = (seq_len - next_n + (row_idx % next_n) + 1) // compress_ratio
 
             # My chunk boundaries
             chunk_start = cta_in_group * chunk_size

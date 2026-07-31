@@ -15,9 +15,8 @@
 """Kernel-level configuration dataclasses for GVR Top-K kernels.
 
 These are internal tuning knobs that most callers should not need to touch.
-The public API (``top_k_varlen``) accepts an optional
-``config`` argument; when ``None`` (the default) it runs heuristic
-auto-selection based on hardware and problem shape.
+The public API (``top_k_varlen``) selects all knobs automatically based on
+hardware and problem shape via heuristics.
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ from dataclasses import dataclass
 class GvrTopKConfig:
     """Kernel-level configuration for :func:`flashinfer.top_k_varlen`.
 
-    All fields have sensible defaults. Most callers should leave this at its
-    defaults or omit the ``config`` argument entirely (which triggers
-    hardware-aware auto-selection of every knob).
+    All fields have sensible defaults selected automatically by the heuristic
+    in ``GvrTopKConfig.auto()``. Most callers should not need to instantiate
+    this class directly.
 
     Parameters
     ----------
@@ -157,8 +156,8 @@ class GvrTopKConfig:
 
 @dataclass
 class GvrTopKLBConfig:
-    """Kernel-level configuration for :func:`flashinfer.gvr_topk_lb_prepare`
-    and :func:`flashinfer.gvr_topk_lb_decode`.
+    """Kernel-level configuration for
+    :func:`flashinfer.top_k_varlen` with ``backend="gvr"`` and ``load_balance=True``.
 
     Parameters
     ----------
