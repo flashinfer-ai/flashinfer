@@ -292,11 +292,16 @@ def _make_decode_scratch(
 
 _DSV4_DECODE_CONFIGS = [
     (8, 128),
+    (8, 192),
     (8, 512),
     (8, 1024),
     (16, 128),
+    (16, 192),
+    (32, 192),
     (32, 512),
+    (64, 192),
     (64, 1024),
+    (128, 192),
     (128, 1024),
 ]
 
@@ -368,12 +373,14 @@ def test_sparse_mla_sm120_decode_dsv4(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
+@pytest.mark.parametrize("topk,topk_len", [(192, 133), (512, 128)])
+def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
+    topk: int, topk_len: int
+) -> None:
     """DSv4 decode honors topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads, topk, num_tokens = 32, 512, 16
-    topk_len = 128
+    num_heads, num_tokens = 32, 16
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
@@ -890,8 +897,12 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 _DSV4_PREFILL_CONFIGS = [
     (16, 128),
+    (16, 192),
+    (32, 192),
     (32, 512),
+    (64, 192),
     (64, 1024),
+    (128, 192),
     (128, 1024),
 ]
 
@@ -954,6 +965,57 @@ def test_sparse_mla_sm120_prefill_dsv4(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_prefill_dsv4_topk_length_truncation() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, topk, topk_len, num_tokens = 32, 192, 133, 128
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    topk_length = torch.full((num_tokens,), topk_len, dtype=torch.int32, device=device)
+
+    sm_scale = d_qk**-0.5
+    ref_indices = indices.clone()
+    ref_indices[:, topk_len:] = -1
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, ref_indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        topk_length=topk_length,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

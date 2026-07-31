@@ -79,18 +79,23 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 192),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 192),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 192),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 192),
         (64, 512),
         (64, 1024),
         (128, 128),
+        (128, 192),
         (128, 512),
         (128, 1024),
     }
@@ -1228,8 +1233,8 @@ def sparse_mla_sm120_decode_dsv4(
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
-        ``[T, topk]`` int32. ``topk`` must be one of {128, 512, 1024}; ``-1``
-        marks invalid slots.
+        ``[T, topk]`` int32. ``topk`` must be one of {128, 192, 512, 1024};
+        ``-1`` marks invalid slots.
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
         ceil(topk / 64) + ceil(extra_topk / 64)``.
