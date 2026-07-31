@@ -17,7 +17,11 @@ limitations under the License.
 # Centralized version information to avoid circular imports
 try:
     from ._build_meta import __version__ as __version__
-    from ._build_meta import __git_version__ as __git_version__
+    from ._build_meta import __git_commit__ as __git_commit__
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
-    __git_version__ = "unknown"
+    __git_commit__ = "unknown"
+
+# Backward-compat alias: __git_version__ was the original name before it was
+# renamed to the clearer __git_commit__.
+__git_version__: str = __git_commit__
