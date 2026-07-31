@@ -592,10 +592,21 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
         "valid_hidden_size",
         "padded_intermediate_size",
         "valid_intermediate_size",
+        "num_experts",
+        "top_k",
     ),
     [
-        (1024, 512, 1024, 512),
-        (1024, 768, 768, 512),
+        (1024, 512, 1024, 512, 128, 8),
+        (1024, 768, 768, 512, 128, 8),
+        # GPT-OSS 120B production geometry: hidden_size == intermediate_size == 2880,
+        # input hidden padded to 512-alignment (3072), intermediate and w2-hidden padded
+        # to 128-alignment (2944). valid_hidden_size 2880 is NOT 128-aligned
+        # (2880 % 128 == 64), so hidden_size_output == roundUp(2880,128) == 2944 differs
+        # from both the padded GEMM1 K (3072) and the valid hidden (2880). This is the
+        # exact configuration that raised "Failed to initialize the TMA descriptor".
+        # Expert count is reduced from 128 to 8 to keep the float reference tractable;
+        # the TMA alignment behaviour depends on hidden/intermediate, not expert count.
+        (3072, 2880, 2944, 2880, 8, 4),
     ],
 )
 def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
@@ -603,6 +614,8 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     valid_hidden_size,
     padded_intermediate_size,
     valid_intermediate_size,
+    num_experts,
+    top_k,
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRT-LLM MoE kernels.")
@@ -629,13 +642,16 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     torch.manual_seed(0)
     device = torch.device("cuda:0")
     num_tokens = 8
-    num_experts = 128
-    top_k = 8
     padding = 8
     quant_mode = QuantMode.FP4_MXFP4_MXFP8
     activation = ActivationType.Swiglu.value
     pi = padded_intermediate_size
     vi = valid_intermediate_size
+    vh = valid_hidden_size
+    # GEMM2's output width is hidden_size_output = roundUp(valid_hidden_size, 128), which
+    # equals valid_hidden_size only when the latter is already 128-aligned. Keep them
+    # distinct so the unaligned (GPT-OSS) geometry is expressible.
+    ho = _round_up(vh, 128)
     sf_vec_size = 32  # mxfp4
 
     moe = FP4Moe(quant_mode=quant_mode)
@@ -647,7 +663,7 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     hidden_states = 2 * torch.randn(
         num_tokens, padded_hidden_size, device=device, dtype=torch.bfloat16
     )
-    # GEMM1 K = padded_hidden_size; GEMM2 output = valid_hidden_size (hidden_size_output).
+    # GEMM1 K = padded_hidden_size; GEMM2 output = ho = roundUp(valid_hidden_size, 128).
     gemm1_weights = torch.randn(
         num_experts,
         2 * pi,
@@ -657,11 +673,14 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     )
     gemm2_weights = torch.randn(
         num_experts,
-        valid_hidden_size,
+        ho,
         pi,
         device=device,
         dtype=torch.bfloat16,
     )
+    # Rows beyond the valid hidden size are padding: zero them so the reference (which
+    # only covers [0, vh)) and the kernel output agree there too.
+    gemm2_weights[:, vh:, :] = 0
 
     permute_info, _ = routing_reference_renormalize(
         expert_logits, top_k, num_experts, padding
@@ -702,7 +721,7 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         ],
         dim=1,
     ).contiguous()
-    w2_valid = gemm2_weights[:, :, :vi].contiguous()
+    w2_valid = gemm2_weights[:, :vh, :vi].contiguous()
     hidden_valid = hidden_states[:, :valid_hidden_size].contiguous()
     args_valid = build_args(
         w1_valid, w2_valid, hidden_valid, valid_hidden_size, vi, swizzle_inputs=True
@@ -711,7 +730,7 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     reference_output = reference_output.to(torch.float)
 
     # Kernel weights: asymmetric shuffle (GEMM1 at padded_hidden, GEMM2 at
-    # hidden_size_output == valid_hidden_size). Mirrors FP4Moe.prepare_static_weights_for_kernel.
+    # hidden_size_output == ho). Mirrors FP4Moe.prepare_static_weights_for_kernel.
     args_pad = build_args(
         gemm1_weights, gemm2_weights, hidden_states, padded_hidden_size, pi, True
     )
@@ -725,10 +744,10 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         num_experts, 2 * pi, padded_hidden_size // sf_vec_size
     )
     g2_fp4 = args_pad.gemm2_weights.view(torch.float8_e4m3fn).reshape(
-        num_experts, valid_hidden_size, pi // 2
+        num_experts, ho, pi // 2
     )
     g2_sf_linear = g2_sf_linear.view(torch.float8_e4m3fn).reshape(
-        num_experts, valid_hidden_size, pi // sf_vec_size
+        num_experts, ho, pi // sf_vec_size
     )
 
     g1_w_shuf, g1_s_shuf, g2_w_shuf, g2_s_shuf = [], [], [], []
@@ -777,7 +796,7 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
     gemm2_scales_shuffled = (
         torch.stack(g2_s_shuf)
         .view(torch.float8_e4m3fn)
-        .reshape(num_experts, valid_hidden_size, pi // sf_vec_size)
+        .reshape(num_experts, ho, pi // sf_vec_size)
     )
     # mxfp4 x mxfp8: c_global_sf and all per-tensor global scales are 1.0, so the
     # epilogue scale scalars are all 1.0 (one per expert).
@@ -823,14 +842,11 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         valid_intermediate_size=vi,
     )[0].to(torch.float)
 
-    assert (
-        kernel_output.shape
-        == reference_output.shape
-        == (
-            num_tokens,
-            valid_hidden_size,
-        )
-    )
+    # The kernel emits hidden_size_output (= ho) columns; the float reference only covers
+    # the valid [0, vh) region. Compare on that, which is what a caller consumes.
+    assert kernel_output.shape == (num_tokens, ho)
+    assert reference_output.shape == (num_tokens, vh)
+    kernel_output = kernel_output[:, :vh]
     # FP4 tolerances mirror FP4Moe.get_tolerances().
     ok, pct_within, atol = check_accuracy(
         kernel_output, reference_output, percent_threshold=0.92
