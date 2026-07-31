@@ -116,12 +116,8 @@ FLASH_KDA_DECODE_VARIANT_METADATA: dict[
     "d128_t1_precomputed_split2": _variant_metadata(1, 0, 2),
     "d128_t1_precomputed_split4": _variant_metadata(1, 0, 4),
     "d128_t1_precomputed_split8": _variant_metadata(1, 0, 8),
-    "d128_t1_precomputed_direct_split16": _variant_metadata(
-        1, 0, 16, direct_impl=True
-    ),
-    "d128_t1_precomputed_direct_split8": _variant_metadata(
-        1, 0, 8, direct_impl=True
-    ),
+    "d128_t1_precomputed_direct_split16": _variant_metadata(1, 0, 16, direct_impl=True),
+    "d128_t1_precomputed_direct_split8": _variant_metadata(1, 0, 8, direct_impl=True),
     "d128_t2_precomputed_split1": _variant_metadata(2, 0, 1),
     "d128_t2_precomputed_split2": _variant_metadata(2, 0, 2),
     "d128_t2_precomputed_split4": _variant_metadata(2, 0, 4),

@@ -1156,9 +1156,7 @@ def test_public_recurrent_kda_precomputed_matrix_matches_cute_dsl(
         if num_tokens == 1
         else {2: 4, 4: 2, 5: 1, 6: 1}[num_tokens]
     )
-    expected_variant = _PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + str(
-        expected_split
-    )
+    expected_variant = _PRECOMPUTED_VARIANT_PREFIXES[num_tokens] + str(expected_split)
     assert frozen_calls == [expected_variant]
 
     if num_tokens == 1:
