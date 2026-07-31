@@ -1623,7 +1623,8 @@ def run_recurrent_kda(
 
     if backend == "cake" and cu_seqlens is not None and num_spec_tokens is None:
         raise ValueError(
-            "backend='cake' T=1 requires standard decode without explicit cu_seqlens"
+            "backend='cake' does not support explicit T=1 cu_seqlens; "
+            "use standard decode without explicit cu_seqlens"
         )
 
     # Batched spec-decode shim: auto-converts [B,T,...] to packed [1,B*T,...] format.

@@ -1293,7 +1293,7 @@ def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
     )
     with pytest.raises(
         ValueError,
-        match="T=1 requires standard decode without explicit cu_seqlens",
+        match="does not support explicit T=1 cu_seqlens",
     ):
         recurrent_kda(**_call_kwargs(case), backend="cake")
 
