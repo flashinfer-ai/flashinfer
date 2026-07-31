@@ -298,8 +298,8 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
-  // In expert-parallel EP deployments all tokens may be routed to experts
-  // outside the local shard, leaving numBatches==0.  Nothing to compute.
+  // In EP deployments all tokens may be routed to experts outside the local
+  // shard, leaving numBatches==0.  Nothing to compute.
   if (numBatches == 0) {
     return;
   }
