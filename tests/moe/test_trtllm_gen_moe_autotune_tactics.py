@@ -1,9 +1,3 @@
-# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
-# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
-# extend its axes/adapters. This file exists for the quant x routing x layout
-# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
-# as deliberate regression anchors.
-
 """
 Copyright (c) 2026 by FlashInfer team.
 
@@ -339,12 +333,102 @@ def _enumerate_valid_tactics(
     )
 
 
-# Per-tactic enumeration is expensive (every valid tactic runs per case); keep the
-# odd-token anchor (23) + one production shape point per axis. The fuzzer's
-# autotune-ON leg covers winner-correctness breadth.
+def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
+    """Every advertised small-shape tactic must honor the output-SF contract."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    num_tokens = 32
+    hidden_size = intermediate_size = 1024
+    num_experts = 16
+    top_k = 2
+    inputs = _build_fp4_routed_moe_inputs(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        num_experts=num_experts,
+        quant_mode="NvFP4xNvFP4",
+        routing_method_type=RoutingMethodType.Renormalize,
+        device=device,
+    )
+    profile_shapes = _moe_profile_shapes(inputs, num_tokens, num_tokens)
+
+    def _run(tactic: list[int] | None) -> torch.Tensor:
+        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        output = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=inputs["packed_topk"],
+            routing_bias=None,
+            hidden_states=inputs["hidden_states"],
+            hidden_states_scale=inputs["hidden_states_scale"],
+            gemm1_weights=inputs["w13"],
+            gemm1_weights_scale=inputs["w13_scale"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=inputs["w2"],
+            gemm2_weights_scale=inputs["w2_scale"],
+            gemm2_bias=None,
+            output1_scale_scalar=inputs["output1_scale_scalar"],
+            output1_scale_gate_scalar=inputs["output1_scale_gate_scalar"],
+            output2_scale_scalar=inputs["output2_scale_scalar"],
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            do_finalize=True,
+            enable_pdl=device_support_pdl(device),
+            activation_type=ActivationType.Swiglu.value,
+            tune_max_num_tokens=num_tokens,
+        )[0]
+        torch.cuda.synchronize()
+        return output
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_tokens,
+    )
+    assert valid_tactics
+    assert any(tactic[0] == 8 for tactic in valid_tactics), (
+        "the regression shape no longer exercises tile-N 8 tactics"
+    )
+    reference = _run(None).float()
+    ref_max = reference.abs().max().item()
+    assert torch.isfinite(reference).all(), "heuristic reference output is not finite"
+
+    failures = []
+    for tactic in valid_tactics:
+        failure = _check_tactic(_run, tactic, reference, ref_max, n_iters=2)
+        if failure is not None:
+            failures.append(failure)
+    assert not failures, (
+        f"{len(failures)} per-tensor NVFP4 tactics failed correctness; "
+        f"first failures: {failures[:10]}"
+    )
+    assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+        "the forced regression tactic was not dispatched through the autotuner cache"
+    )
+
+
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("num_tokens", [23, 128])
-@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("num_tokens", [16, 23, 128])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 384])
 @pytest.mark.parametrize("top_k", [4, 6])

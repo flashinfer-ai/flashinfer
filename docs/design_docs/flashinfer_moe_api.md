@@ -869,10 +869,14 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`): a filed-and-tracked bug is `xfail`ed
-by `(backend_key, predicate)` — the case is **still run**, so the suite stays
-green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
-A crash is never tolerated, only a wrong answer.
+**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`): two
+escape hatches with opposite semantics. *Tolerated wrong-answer* entries
+(`quarantine=False`) are **still run** — a wrong answer is xfailed so the suite
+stays green, but an unexpected pass hard-fails (`xpass` → "remove this entry")
+so entries cannot outlive their bug. *Crash-class* entries (`quarantine=True` —
+device-side assert / IMA / device-state corruption) are xfailed **before kernel
+launch** so the CUDA context is never poisoned. Because a quarantined case never
+runs, the tracking issue (not an xpass) is the re-enable signal.
 
 **CI gate (now default-ON).** The suite was initially opt-in
 (`FLASHINFER_UMOE_FUZZ=1`) because a single-process run on SM100 once hit
@@ -892,12 +896,12 @@ non-SM100+ arches every config skips at the no-wired-backend check.
 
 **Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
 exercised end-to-end):
-- **gh #3547** — `trtllm_fp4_routed` returns all-zeros for EP shards
-  (`local_expert_offset > 0`): the offset is applied twice (pre-subtracted in
-  `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` is correct
-  (passes global ids + offset, kernel localizes once). Encoded as the current
-  ledger `Finding` entry. Fix = stop pre-subtracting (pass global ids), then
-  delete the ledger entry so the case flips to passing.
+- **gh #3547** *(fixed)* — `trtllm_fp4_routed` returned all-zeros for EP shards
+  (`local_expert_offset > 0`): the offset was applied twice (pre-subtracted in
+  `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` was correct
+  (passes global ids + offset, kernel localizes once). Fixed by passing global
+  expert ids without pre-subtraction; the ledger entry was removed once the
+  EP-offset configs started passing.
 - **gh #3548** — activation **global-scale** gap: `prepare_*_weights` hardcodes
   `gs=1.0`/`fc2_input_scale=1.0`/`alpha=ones` and `MoEActivationPack` has no
   global-scale field, so calibrated-checkpoint scales are silently dropped

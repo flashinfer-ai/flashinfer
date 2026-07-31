@@ -461,10 +461,12 @@ def test_deepseekv3_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "activation_type",
+    ("activation_type", "alpha_value", "beta_value", "clamp_value"),
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Swiglu, None, None, None, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, None, None, None, id="Geglu"),
+        pytest.param(ActivationType.Situ, None, None, None, id="Situ_Defaults"),
+        pytest.param(ActivationType.Situ, 4.0, 25.0, None, id="Situ_kimi-k3"),
     ],
 )
 @pytest.mark.parametrize(
@@ -482,10 +484,29 @@ def test_topk_routing(
     routing_config,
     weight_processing,
     activation_type,
+    alpha_value,
+    beta_value,
+    clamp_value,
     routing_logits_dtype,
     cache_permute_indices,
 ):
     """Test TopK routing configuration."""
+    num_experts = routing_config["num_experts"]
+    gemm1_alpha = (
+        None
+        if alpha_value is None
+        else torch.full((num_experts,), alpha_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_beta = (
+        None
+        if beta_value is None
+        else torch.full((num_experts,), beta_value, device="cuda", dtype=torch.float32)
+    )
+    gemm1_clamp_limit = (
+        None
+        if clamp_value is None
+        else torch.full((num_experts,), clamp_value, device="cuda", dtype=torch.float32)
+    )
     run_moe_test(
         num_tokens,
         hidden_size,
@@ -496,6 +517,9 @@ def test_topk_routing(
         activation_type,
         cache_permute_indices,
         routing_logits_dtype,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -585,11 +609,17 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
-def test_mxfp4_moe_gemm_bias(
-    num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
+@pytest.mark.parametrize(
+    "quant_mode",
+    [
+        pytest.param(QuantMode.FP4_MXFP4_MXFP8, id="MxFP4xMxFP8"),
+        pytest.param(QuantMode.FP4_NVFP4_NVFP4, id="NvFP4xNvFP4"),
+    ],
+)
+def test_fp4_moe_gemm_bias(
+    num_tokens, hidden_size, intermediate_size, bias, quant_mode, cache_permute_indices
 ):
-    """Test MXFP4 MoE with GEMM bias support."""
-    # TODO NVFP4 is currently broken
+    """Test FP4 MoE with GEMM bias support."""
     num_experts = 8
     top_k = 2
     device = "cuda"
@@ -609,7 +639,7 @@ def test_mxfp4_moe_gemm_bias(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+        moe_impl=FP4Moe(quant_mode=quant_mode),
         routing_config={
             "num_experts": num_experts,
             "top_k": top_k,

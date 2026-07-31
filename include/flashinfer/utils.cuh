@@ -359,6 +359,22 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   return std::make_pair(major, minor);
 }
 
+// Largest thread-block cluster the current device can launch for `kernel`
+// (1 when clusters are unsupported, e.g. pre-SM90). Query once and
+// cache per call site; assumes each process handles a single GPU.
+inline int GetMaxClusterSize(const void* kernel, int block_dim) {
+  cudaLaunchConfig_t config = {};
+  config.gridDim = 8;
+  config.blockDim = block_dim;
+  int cluster_size = 0;
+  cudaError_t status = cudaOccupancyMaxPotentialClusterSize(&cluster_size, kernel, &config);
+  if (status != cudaSuccess || cluster_size < 1) {
+    (void)cudaGetLastError();
+    return 1;
+  }
+  return cluster_size;
+}
+
 // This function is thread-safe and cached the sm_count.
 // But it will only check the current CUDA device, thus assuming each process handles single GPU.
 inline int GetCudaMultiProcessorCount() {

@@ -114,7 +114,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "fp4_gemm_cutlass",
@@ -206,29 +206,34 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
                 )
                 write_if_different(dest_path, source)
 
-    with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass.jinja") as f:
-        kernel_inst_templ = jinja2.Template(f.read())
-        dtype_list = ["__nv_bfloat16", "half"]
-        cta_m_n_k_list = [
-            (128, 64, 128),
-            (128, 256, 128),
-            (128, 128, 256),
-            (128, 256, 256),
-        ]
-        for cta_m, cta_n, cta_k in cta_m_n_k_list:
-            for dtype in dtype_list:
-                dest_path = (
-                    gen_directory
-                    / f"fp4_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
-                )
-                source_paths.append(dest_path)
-                source = kernel_inst_templ.render(
-                    type=dtype,
-                    cta_m=cta_m,
-                    cta_n=cta_n,
-                    cta_k=cta_k,
-                )
-                write_if_different(dest_path, source)
+    dtype_list = ["__nv_bfloat16", "half"]
+    generic_cta_m_n_k_list = [
+        (128, 64, 128),
+        (128, 256, 128),
+        (128, 128, 256),
+        (128, 256, 256),
+    ]
+    generic_templates = [
+        ("fp4_gemm_cutlass.jinja", ""),
+        ("fp4_gemm_cutlass_sm103_generic_store256.jinja", "_store256"),
+    ]
+    for template_name, file_suffix in generic_templates:
+        with open(jit_env.FLASHINFER_CSRC_DIR / template_name) as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+            for cta_m, cta_n, cta_k in generic_cta_m_n_k_list:
+                for dtype in dtype_list:
+                    dest_path = (
+                        gen_directory
+                        / f"fp4_gemm_cutlass{file_suffix}_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                    )
+                    source_paths.append(dest_path)
+                    source = kernel_inst_templ.render(
+                        type=dtype,
+                        cta_m=cta_m,
+                        cta_n=cta_n,
+                        cta_k=cta_k,
+                    )
+                    write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 11]
@@ -336,7 +341,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -386,7 +391,7 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -435,7 +440,7 @@ def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
                 write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "mxfp8_gemm_cutlass",
@@ -572,7 +577,7 @@ def gen_gemm_sm100_module() -> JitSpec:
         write_if_different(dest_path, source)
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "gemm_sm100",
@@ -712,16 +717,28 @@ def gen_gemm_sm120_module() -> JitSpec:
     )
 
 
-def gen_trtllm_gen_gemm_module() -> JitSpec:
+def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
-    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    gemm_path = (
+        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_GEMM
+    )
+    gemm_checksum = (
+        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_GEMM
+    )
+    module_name = "trtllm_gemm_sm107" if enable_rubin else "trtllm_gemm"
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{gemm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum_path = f"{gemm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, gemm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -740,29 +757,30 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "gemm"
-        / "trtllmGen_gemm_export"
-    )
+    # Per-module export-header root: the Blackwell and Rubin variants must not
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
+    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
-        "trtllm_gemm",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_gemm_runner.cu",
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            gen_root,
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
@@ -889,13 +907,27 @@ def gen_gemm_sm90_module() -> JitSpec:
     )
 
 
-def gen_trtllm_low_latency_gemm_module() -> JitSpec:
-    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
+    gemm_path = (
+        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else ArtifactPath.TRTLLM_GEN_GEMM
+    )
+    gemm_checksum = (
+        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
+        if enable_rubin
+        else CheckSumHash.TRTLLM_GEN_GEMM
+    )
+    module_name = (
+        "trtllm_low_latency_gemm_sm107" if enable_rubin else "trtllm_low_latency_gemm"
+    )
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    include_path = f"{gemm_path}/include"
     header_name = "flashinferMetaInfo"
 
     # Check if checksums.txt exists in the cubin directory
-    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
-    checksum = get_artifact(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    checksum_path = f"{gemm_path}/checksums.txt"
+    checksum = get_artifact(checksum_path, gemm_checksum)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
 
@@ -914,29 +946,30 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "gemm"
-        / "trtllmGen_gemm_export"
-    )
+    # Per-module export-header root: the Blackwell and Rubin variants must not
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
+    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
 
     return gen_jit_spec(
-        "trtllm_low_latency_gemm",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_low_latency_gemm_runner.cu",
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
             "-DTLLM_GEN_EXPORT_FLASHINFER",
+            *rubin_flags,
             "-DTLLM_ENABLE_CUDA",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
         + sm100a_nvcc_flags,
         extra_include_paths=[
+            gen_root,
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
