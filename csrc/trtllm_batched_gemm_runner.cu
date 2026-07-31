@@ -298,7 +298,11 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
-  FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
+  // In EP deployments all tokens may be routed to experts outside the local
+  // shard, leaving numBatches==0.  Nothing to compute.
+  if (numBatches == 0) {
+    return;
+  }
   if (!mOptions.staticBatch) {
     FLASHINFER_CHECK(totalNumPaddedTokens,
                      "Batched GEMM with dynamic batching requires totalNumPaddedTokens");
