@@ -183,6 +183,10 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
         expert_logits, top_k, num_experts, padding
     )
     ref_args = SimpleNamespace(
+        # Upstream's reference readers dereference these unconditionally.
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
         num_tokens=num_tokens,
         num_experts=num_experts,
         hidden_size=valid_hidden_size,
@@ -209,7 +213,13 @@ def test_trtllm_mxint4_moe_valid_hidden_size_matches_dequant_reference(
         kernel_output.shape == reference_output.shape == (num_tokens, valid_hidden_size)
     )
     # MxInt4 tolerances mirror MxInt4BlockScaleMoe.get_tolerances().
-    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.925)
+    ok, pct_within, atol = check_accuracy(
+        kernel_output, reference_output, percent_threshold=0.925
+    )
+    assert ok, (
+        f"only {pct_within:.4f} of elements within tolerance (atol={atol:.4g}), "
+        f"need >= 0.925"
+    )
 
 
 # Numerical test for valid_intermediate_size.
@@ -345,6 +355,10 @@ def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
         expert_logits, top_k, num_experts, padding
     )
     ref_args = SimpleNamespace(
+        # Upstream's reference readers dereference these unconditionally.
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
         num_tokens=num_tokens,
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -369,7 +383,13 @@ def test_trtllm_mxint4_moe_valid_intermediate_size_matches_dequant_reference(
 
     assert kernel_output.shape == reference_output.shape == (num_tokens, hidden_size)
     # MxInt4 tolerances mirror MxInt4BlockScaleMoe.get_tolerances().
-    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.925)
+    ok, pct_within, atol = check_accuracy(
+        kernel_output, reference_output, percent_threshold=0.925
+    )
+    assert ok, (
+        f"only {pct_within:.4f} of elements within tolerance (atol={atol:.4g}), "
+        f"need >= 0.925"
+    )
 
 
 # Numerical test for the FP4 (mxfp4 x mxfp8) path with a padded intermediate_size --
@@ -541,7 +561,13 @@ def test_trtllm_fp4_mxfp4_moe_valid_intermediate_size_matches_dequant_reference(
 
     assert kernel_output.shape == reference_output.shape == (num_tokens, hidden_size)
     # FP4 tolerances mirror FP4Moe.get_tolerances().
-    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.92)
+    ok, pct_within, atol = check_accuracy(
+        kernel_output, reference_output, percent_threshold=0.92
+    )
+    assert ok, (
+        f"only {pct_within:.4f} of elements within tolerance (atol={atol:.4g}), "
+        f"need >= 0.92"
+    )
 
 
 # Numerical test for the FP4 (mxfp4 x mxfp8) path with BOTH hidden_size and
@@ -803,7 +829,13 @@ def test_trtllm_fp4_mxfp4_moe_valid_dims_matches_dequant_reference(
         )
     )
     # FP4 tolerances mirror FP4Moe.get_tolerances().
-    check_accuracy(reference_output, kernel_output, atol=0.1, rtol=0.85, percent=0.92)
+    ok, pct_within, atol = check_accuracy(
+        kernel_output, reference_output, percent_threshold=0.92
+    )
+    assert ok, (
+        f"only {pct_within:.4f} of elements within tolerance (atol={atol:.4g}), "
+        f"need >= 0.92"
+    )
 
 
 # Regression test for the GPT-OSS failure reported against this PR: a valid dim that is
@@ -979,9 +1011,19 @@ def test_trtllm_fp4_mxfp4_moe_unaligned_valid_dims(which, valid_size, aligned):
     with_valid = run(**valid_kwargs)
     without_valid = run()
 
-    assert with_valid.shape == without_valid.shape
+    # valid_hidden_size narrows the finalized output to roundUp(vh, 128), while the
+    # no-valid-dims run always emits the full hidden_size. Compare on the common prefix.
+    out_width = with_valid.shape[1]
+    assert out_width <= without_valid.shape[1]
+    without_valid = without_valid[:, :out_width]
     assert torch.isfinite(with_valid).all(), "valid-dims run produced non-finite values"
     # Same math: the skipped region is zero, so trimming it must not change the result.
     # Bitwise equality is not guaranteed (different K extent changes accumulation order),
     # so compare with the FP4 tolerances used elsewhere in this file.
-    check_accuracy(without_valid, with_valid, atol=0.1, rtol=0.85, percent=0.99)
+    ok, pct_within, atol = check_accuracy(
+        with_valid, without_valid, percent_threshold=0.99
+    )
+    assert ok, (
+        f"trimming a zero region changed the result: only {pct_within:.4f} of "
+        f"elements within tolerance (atol={atol:.4g})"
+    )
