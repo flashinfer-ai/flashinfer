@@ -60,16 +60,23 @@ from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
+from flashinfer.utils import is_confidential_compute
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import _initialize_allreduce_fusion_protocol
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 from .trtllm_ar import trtllm_moe_allreduce_fusion
 from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import (
+    CommBackend,
+    SymmDeviceMemory,
+    all_ranks_support_mnnvl,
+    is_multicast_supported,
+)
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -125,7 +132,9 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """
         super().__init__(tp_size, tp_rank)
 
-        # Call the actual workspace creation function
+        # NVIDIA Confidential Computing requires multicast-free IPC workspaces so needs to disable symmetric device memory
+        use_symm_dev_mem = not is_confidential_compute()
+
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -135,19 +144,32 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
-            use_symm_dev_mem=True,
+            use_symm_dev_mem=use_symm_dev_mem,
         )
 
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
-        workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
-            self._internal_workspace,
-        )
-        self.ipc_handles = workspace_tuple[0]
-        self.workspace_tensor = workspace_tuple[1]
-        self.mem_handles = workspace_tuple[2]
-        self.metadata = workspace_tuple[3]
+        if use_symm_dev_mem:
+            # use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles, metadata)
+            symm_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = symm_workspace_tuple[0]
+            self.workspace_tensor = symm_workspace_tuple[1]
+            self.mem_handles = symm_workspace_tuple[2]
+            self.metadata = symm_workspace_tuple[3]
+        else:
+            # use_symm_dev_mem=False: (ipc_handles, workspace_tensor, metadata)
+            ipc_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = ipc_workspace_tuple[0]
+            self.workspace_tensor = ipc_workspace_tuple[1]
+            self.metadata = ipc_workspace_tuple[2]
+            # No symmetric-memory handles for the multicast-free IPC path.
+            self.mem_handles = []
 
     @property
     def backend(self) -> str:
@@ -177,6 +199,67 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         except ValueError as e:
             logger.warning("Workspace is insufficient for problem size. %s", e)
             return False
+
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach physical backing; repeated successful calls are no-ops."""
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if not any(mapped):
+            return
+        if not all(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+
+        for handle in self.mem_handles:
+            handle._unmap_and_release_handles()
+        # Do not return until every rank has released all workspace handles.
+        self.mem_handles[0].comm_backend.barrier()
+
+    @flashinfer_api
+    def checkpoint_restore(self, comm_backend: CommBackend) -> None:
+        """Restore physical backing; repeated successful calls are no-ops.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Communication backend used to recreate and exchange workspace
+            memory handles. It must have the same rank and world size as the
+            original allocation.
+        """
+        if not self.mem_handles or not all(
+            isinstance(handle, SymmDeviceMemory) for handle in self.mem_handles
+        ):
+            raise NotImplementedError(
+                "Stable-VA checkpointing is unavailable for workspaces backed "
+                "by torch symmetric memory"
+            )
+
+        mapped = [handle.mapped for handle in self.mem_handles]
+        if all(mapped):
+            return
+        if any(mapped):
+            raise RuntimeError("TRT-LLM symmetric-memory handle state is inconsistent")
+        for handle in self.mem_handles:
+            handle._create_and_map_handles(comm_backend)
+
+        _initialize_allreduce_fusion_protocol(
+            ipc_handles=self.ipc_handles,
+            tp_rank=self.rank,
+            flag_size=self.metadata["flag_size"],
+            lamport_buffer_size=self.metadata["lamport_buffer_size"],
+            lamport_comm_size=self.metadata["lamport_comm_size"],
+            use_fp32_lamport=self.metadata["use_fp32_lamport"],
+            control_flag_ptr=self.metadata["control_flag_ptr"],
+        )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
@@ -210,22 +293,6 @@ def _trtllm_workspace_check(
     - Up to 16 ranks supported.
     """
     return world_size <= 16
-
-
-def _mnnvl_workspace_check(
-    backend: str,
-    world_size: int,
-    rank: int,
-    max_token_num: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-) -> bool:
-    """
-    Check if mnnvl backend CAN be used for workspace creation.
-
-    """
-
-    return True
 
 
 # ============================================================================
@@ -399,13 +466,9 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
         ):
             suitable_backends.append("trtllm")
-        if _mnnvl_workspace_check(
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
+        local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
+        if all_ranks_support_mnnvl(
+            local_mnnvl_supported, world_size, comm_backend, group
         ):
             suitable_backends.append("mnnvl")
 
@@ -439,6 +502,12 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
+        if is_confidential_compute():
+            raise ValueError(
+                "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
+                "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
+                "Use backend='trtllm' instead."
+            )
         mapping = Mapping(
             world_size=world_size,
             rank=rank,
@@ -532,7 +601,11 @@ def allreduce_fusion(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[token_num, hidden_dim]``.
+        Input tensor of shape ``[token_num, hidden_dim]`` for standard
+        allreduce patterns. For ``kMoEFinalizeARResidualRMSNorm``, this is
+        the permuted/padded MoE expert output of shape
+        ``[num_permuted_rows, hidden_dim]``; the token output shape is
+        determined by ``residual_in``.
     workspace : AllReduceFusionWorkspace
         Workspace object created by :func:`create_allreduce_fusion_workspace`.
         Its concrete type (TRT-LLM vs MNNVL) determines the backend.
@@ -549,9 +622,18 @@ def allreduce_fusion(
         * ``kMoEFinalizeARResidualRMSNorm = 7`` (TRT-LLM only)
         * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8`` (TRT-LLM only)
         * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
+        * ``kARResidualRMSNormDynamicFP8Quant = 10``
+        * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
 
-        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5). MoE
-        and packed group quant patterns remain TRT-LLM only.
+        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
+        dynamic FP8 patterns (10-11). MoE and packed group quant patterns
+        remain TRT-LLM only.
+
+        ``kMoEFinalizeARResidualRMSNorm`` is an explicit TRT-LLM fused
+        implementation of MoE finalize + AllReduce + RMSNorm and does not
+        use the MNNVL backend. Fusion is not always the fastest path for every
+        workload; benchmark this pattern on the target hardware, model,
+        tensor-parallel size, and serving mode before enabling it by default.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch.
     trigger_completion_at_end : bool
@@ -573,8 +655,10 @@ def allreduce_fusion(
         ``[token_num, hidden_dim]`` and NVFP4 uses shape
         ``[token_num, hidden_dim / 2]``.
     scale_out : Optional[torch.Tensor]
-        Pre-allocated NVFP4 scale-factor buffer. Not used by per-tensor
-        FP8 quantization.
+        Pre-allocated quantization scale-factor buffer. Dynamic FP8 uses
+        shape ``[token_num, 1]`` and dtype ``torch.float32``. NVFP4 uses
+        the layout selected by ``layout_code``. Per-tensor FP8 does not use
+        ``scale_out``.
     residual_in : Optional[torch.Tensor]
         Residual tensor to add, shape ``[token_num, hidden_dim]``.
     rms_gamma : Optional[torch.Tensor]
@@ -661,6 +745,11 @@ def allreduce_fusion(
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
+        if any(
+            isinstance(handle, SymmDeviceMemory) and not handle.mapped
+            for handle in workspace.mem_handles
+        ):
+            raise RuntimeError("TRT-LLM symmetric-memory handles are not attached")
 
         # ---- MOE Reduction pattern ----
         if pattern == AllReduceFusionPattern.kMoEReductionARResidualRMSNorm:
@@ -775,12 +864,13 @@ def allreduce_fusion(
 
             return norm_out
 
+        # Extract shape from 2D input for the standard TRT-LLM fusion patterns.
+        token_num, hidden_dim = input.shape
+
         if pattern in [
             AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
             AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
         ]:
-            token_num, hidden_dim = input.shape
-
             if block_quant_group_size is None:
                 raise ValueError(
                     f"block_quant_group_size is required for pattern: {pattern}"
@@ -814,12 +904,53 @@ def allreduce_fusion(
                     f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
                 )
 
-        # ---- Standard patterns ----
-        # Extract shape from 2D input
-        token_num, hidden_dim = input.shape
+        dynamic_fp8_patterns = (
+            AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+            AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant,
+        )
+        if pattern in dynamic_fp8_patterns:
+            if residual_in is None:
+                raise ValueError("residual_in is required for dynamic FP8 patterns")
+            if residual_out is None:
+                raise ValueError("residual_out is required for dynamic FP8 patterns")
+            if rms_gamma is None:
+                raise ValueError("rms_gamma is required for dynamic FP8 patterns")
+            if quant_out is None:
+                raise ValueError("quant_out is required for dynamic FP8 patterns")
+            if scale_out is None:
+                raise ValueError("scale_out is required for dynamic FP8 patterns")
+            if quant_out.shape != input.shape:
+                raise ValueError(
+                    "quant_out must have shape [token_num, hidden_dim] for dynamic FP8 patterns"
+                )
+            if quant_out.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "quant_out must have dtype torch.float8_e4m3fn for dynamic FP8 patterns"
+                )
+            if scale_out.dtype != torch.float32:
+                raise ValueError(
+                    "scale_out must have dtype torch.float32 for dynamic FP8 patterns"
+                )
+            if not scale_out.is_contiguous():
+                raise ValueError(
+                    "scale_out must be contiguous for dynamic FP8 patterns"
+                )
+            if scale_out.shape != (token_num, 1):
+                raise ValueError(
+                    "scale_out must have shape [token_num, 1] for dynamic FP8 patterns"
+                )
+            if (
+                pattern == AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant
+                and norm_out is None
+            ):
+                raise ValueError(
+                    "norm_out is required for kARResidualRMSNormOutDynamicFP8Quant"
+                )
 
-        # Allocate output if needed (keep 2D shape)
-        if output is None:
+        # Dynamic FP8 patterns do not materialize allreduce_out, so avoid
+        # allocating an unused tensor. This keeps the preallocated dynamic path
+        # compatible with CUDA Graph capture.
+        if output is None and pattern not in dynamic_fp8_patterns:
             output = torch.empty_like(input)
 
         # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
@@ -832,7 +963,7 @@ def allreduce_fusion(
             return t.view(-1)
 
         input_flat = _flatten_checked(input, "input")
-        output_flat = _flatten_checked(output, "output")
+        output_flat = _flatten_checked(output, "output") if output is not None else None
         residual_in_flat = (
             _flatten_checked(residual_in, "residual_in")
             if residual_in is not None
@@ -914,6 +1045,14 @@ def allreduce_fusion(
                 MNNVLQuantType.NVFP4,
                 True,
             ),
+            AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant: (
+                MNNVLQuantType.DYNAMIC_FP8,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant: (
+                MNNVLQuantType.DYNAMIC_FP8,
+                True,
+            ),
         }
         if pattern not in (
             AllReduceFusionPattern.kAllReduce,
@@ -989,7 +1128,25 @@ def allreduce_fusion(
                 )
 
             quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
-            if has_norm_out and norm_out is None:
+            is_dynamic_fp8 = quant_type == MNNVLQuantType.DYNAMIC_FP8
+            if is_dynamic_fp8:
+                if residual_out is None:
+                    raise ValueError(
+                        "residual_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if quant_out is None:
+                    raise ValueError(
+                        "quant_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if scale_out is None:
+                    raise ValueError(
+                        "scale_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if has_norm_out and norm_out is None:
+                    raise ValueError(
+                        "norm_out is required for MNNVL dynamic FP8 norm-out pattern"
+                    )
+            elif has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)
             if residual_out is None:
                 residual_out = torch.empty_like(input)

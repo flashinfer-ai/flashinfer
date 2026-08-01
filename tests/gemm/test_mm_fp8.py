@@ -69,7 +69,7 @@ def test_mm_fp8_rejects_non_sm10x():
     b = torch.randn([1, 256, 128], device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    with pytest.raises(NotImplementedError, match="datacenter Blackwell"):
+    with pytest.raises(NotImplementedError, match="supported SM10x GPU"):
         mm_fp8(a, b)
 
 

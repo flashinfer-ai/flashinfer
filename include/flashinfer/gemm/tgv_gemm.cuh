@@ -143,13 +143,16 @@ struct WorkTileInfo {
   int32_t M_idx = 0;
   int32_t N_idx = 0;
   int32_t L_idx = 0;
+  // this cta is responsible for the kblock range [K_idx_start, K_idx_end)
+  int32_t K_idx_start = 0;
+  int32_t K_idx_end = 0;
   bool is_valid_tile = false;
 
   CUTLASS_HOST_DEVICE
   bool is_valid() const { return is_valid_tile; }
 
   CUTLASS_HOST_DEVICE
-  static WorkTileInfo invalid_work_tile() { return {-1, -1, -1, false}; }
+  static WorkTileInfo invalid_work_tile() { return {-1, -1, -1, -1, -1, false}; }
 };
 
 // The shared memory buffers for A and B matrices.
@@ -202,11 +205,6 @@ CUTLASS_DEVICE void DMA_A_warp(
     // pass by value, it will live on local memory (i.e. the stack) and the tma unit cannot access
     // the local memory
     TmaAtomA const* tma_atom_A, TiledMMA tiled_mma, int pdl_count) {
-  // exit warp if the tile is invalid
-  if (!work_tile_info.is_valid()) {
-    return;
-  }
-
   // Represent the SMEM buffers for A, in the view of mma shape
   // Note: Partitioned tensors use tXgY naming convention:
   //  tXgY -> The partitioning pattern (give the same tensor a new view) tX applied to tensor gY
@@ -244,7 +242,7 @@ CUTLASS_DEVICE void DMA_A_warp(
   //   Simply put, the TMA will be responsible for everything in mode-0 with a single call to
   //   cute::copy. The tma_partition reorders and offsets mode-0 according to the tma_x atom and the
   //   multicast info.
-  auto [tAgA, tAsA] = tma_partition(*tma_atom_A, Int<0>{},  // cta_coord: 1x1 cga
+  auto [tAgA, tAsA] = tma_partition(*tma_atom_A, Int<0>{},  // cta_coord: 1x1 cluster
                                     Layout<_1>{},  // cta_layout: CTA coord -> logical multicast id,
                                                    // no multicast, just identity layout
                                     group_modes<0, 3>(tCsA), group_modes<0, 3>(tCgA));
@@ -283,8 +281,10 @@ CUTLASS_DEVICE void DMA_A_warp(
   // ...
   int tma_mma_empty_barrier_phase_bit = 1;
 
+  int k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start;
+
   // iterate over kblock
-  for (int k_tile = 0; k_tile < size<3>(tCgA); ++k_tile) {
+  for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
     // wait_barrier's input argument is the old phase bit
     // it waits for the smem slot to be empty to start loading the next tile
     wait_barrier(shared_storage.tma_mma_empty_barrier[k_tile % DMA_Stage],
@@ -301,7 +301,7 @@ CUTLASS_DEVICE void DMA_A_warp(
                                     tma_transaction_bytes);
       // load A tile into smem (CTA_M, CTA_K)
       copy(tma_atom_A->with(shared_storage.tma_mma_full_barrier[k_tile % DMA_Stage]),
-           tAgA(_, k_tile), tAsA(_, k_tile % DMA_Stage));
+           tAgA(_, k_tile + work_tile_info.K_idx_start), tAsA(_, k_tile % DMA_Stage));
     }
 
     // for every DMA_Stage number of iterations, we flip the phase bit such that we reuse the empty
@@ -331,11 +331,6 @@ CUTLASS_DEVICE void DMA_B_warp(
     // pass by value, it will live on local memory (i.e. the stack) and the tma unit cannot access
     // the local memory
     TmaAtomB const* tma_atom_B, TiledMMA tiled_mma) {
-  // exit warp if the tile is invalid
-  if (!work_tile_info.is_valid()) {
-    return;
-  }
-
   // similar to DMA_A_warp
   Tensor tCsB = shared_storage.tensor_sB();  // ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
   Tensor gB = local_tile(
@@ -343,7 +338,7 @@ CUTLASS_DEVICE void DMA_B_warp(
       make_coord(work_tile_info.N_idx, _, work_tile_info.L_idx));  // (CTA_N, CTA_K, Tiles_K)
   ThrMMA cta_mma = tiled_mma.get_slice(0);  // 1 sm mma only has 1 thread in tiled_mma
   Tensor tCgB = cta_mma.partition_B(gB);    // ((Mma_N, Mma_K), NumMma_N, NumMma_K, Tiles_K)
-  auto [tBgB, tBsB] = tma_partition(*tma_atom_B, Int<0>{},  // cta_coord: 1x1 cga
+  auto [tBgB, tBsB] = tma_partition(*tma_atom_B, Int<0>{},  // cta_coord: 1x1 cluster
                                     Layout<_1>{},  // cta_layout: CTA coord -> logical multicast id,
                                                    // no multicast, just identity layout
                                     group_modes<0, 3>(tCsB), group_modes<0, 3>(tCgB));
@@ -365,11 +360,13 @@ CUTLASS_DEVICE void DMA_B_warp(
 
   int tma_mma_empty_barrier_phase_bit = 1;
 
+  int k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start;
+
   // only do griddepcontrol.wait on B loading, B is activation
   cutlass::arch::wait_on_dependent_grids();
 
   // iterate over kblock
-  for (int k_tile = 0; k_tile < size<3>(tCgB); ++k_tile) {
+  for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
     wait_barrier(shared_storage.tma_mma_empty_barrier[k_tile % DMA_Stage],
                  tma_mma_empty_barrier_phase_bit);
 
@@ -382,7 +379,7 @@ CUTLASS_DEVICE void DMA_B_warp(
                                     tma_transaction_bytes);
       // load B tile into smem (CTA_N, CTA_K)
       copy(tma_atom_B->with(shared_storage.tma_mma_full_barrier[k_tile % DMA_Stage]),
-           tBgB(_, k_tile), tBsB(_, k_tile % DMA_Stage));
+           tBgB(_, k_tile + work_tile_info.K_idx_start), tBsB(_, k_tile % DMA_Stage));
     }
 
     if ((k_tile % DMA_Stage) == (DMA_Stage - 1)) {
@@ -396,13 +393,8 @@ CUTLASS_DEVICE void DMA_B_warp(
 
 template <class SharedStorage, class CTensor, class TiledMMA, int CTA_M, int CTA_N, int DMA_Stage>
 CUTLASS_DEVICE void MMA_warp(SharedStorage& shared_storage, WorkTileInfo work_tile_info, CTensor mC,
-                             TiledMMA tiled_mma, int k_tile_count,
+                             TiledMMA tiled_mma,
                              cutlass::arch::NamedBarrier& tmem_allocation_result_barrier) {
-  // exit warp if the tile is invalid
-  if (!work_tile_info.is_valid()) {
-    return;
-  }
-
   // get the local slice of C
   Tensor gC = local_tile(mC, make_shape(Int<CTA_M>{}, Int<CTA_N>{}),
                          make_coord(work_tile_info.M_idx, work_tile_info.N_idx,
@@ -433,13 +425,16 @@ CUTLASS_DEVICE void MMA_warp(SharedStorage& shared_storage, WorkTileInfo work_ti
 
   using TmemAllocator = cute::TMEM::Allocator1Sm;
   TmemAllocator tmem_allocator{};
-  // only use half of tmem to allow overlapping
+  // we allocate number of tmem column based on CTA_N, so CTA_N must be a power of 2, since each
+  // tmem allocation needs to be power of 2 columns
+  static_assert((CTA_N & (CTA_N - 1)) == 0, "CTA_N must be a power of 2");
+  // only allocate enough tmem to allow overlapping
   // tmem has 128 lane, 512 column, each word is 4B, 256KB in total, our accumulator can only use 64
-  // lanes if CTA_M=64
-  static_assert(CTA_N * 4 < TmemAllocator::Sm100TmemCapacityColumns * 4 / 2,
-                "Accumulator is too large to fit in half of tmem");
-  tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns / 2,
-                          &shared_storage.tmem_base_ptr);
+  // lanes if CTA_M=64. min allocation granularity is 32 columns
+  int constexpr Acc_col = cute::max(CTA_N, TmemAllocator::ColumnsPerAllocationSlice);
+  static_assert(Acc_col < TmemAllocator::Sm100TmemCapacityColumns,
+                "Accumulator is too large to fit in tmem");
+  tmem_allocator.allocate(Acc_col, &shared_storage.tmem_base_ptr);
   // notify epilog warp that tmem allocation is complete
   tmem_allocation_result_barrier.arrive();
 
@@ -476,6 +471,8 @@ CUTLASS_DEVICE void MMA_warp(SharedStorage& shared_storage, WorkTileInfo work_ti
   // Set mma accumulate option to zero so that the first MMA instruction will clear the TMEM
   // accumulator. UMMA::ScaleOut::Zero means C = A * B UMMA::ScaleOut::One means C += A * B
   tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
+
+  int k_tile_count = work_tile_info.K_idx_end - work_tile_info.K_idx_start;
 
   // this is not sol mma loop implementation, put it here for educational purpose since it's more
   // clean
@@ -588,6 +585,16 @@ CUTLASS_DEVICE void MMA_warp(SharedStorage& shared_storage, WorkTileInfo work_ti
 
   // notify the epilog warp that the MMA is done, the tmem slot is now full and can be consumed
   cutlass::arch::umma_arrive(&shared_storage.mma_epilog_full_barrier);
+
+  // wait for tmem deallocation signal from epilog warp:
+  // the epilog warps arrive on tmem_allocation_result_barrier after their tcgen05.ld finishes
+  // (paired with fence_view_async_tmem_load). Together with this MMA-side arrive, the 32 (MMA) +
+  // 128 (EPILOG) = 160 named-barrier arrivals are reached, both sides are released, and it is now
+  // safe for the MMA warp to free TMEM without racing against an in-flight tcgen05.ld.
+  tmem_allocation_result_barrier.arrive_and_wait();
+
+  // deallocate TMEM
+  tmem_allocator.free(shared_storage.tmem_base_ptr, Acc_col);
 }
 
 template <class SharedStorage, class CTensor, class BiasTensor, class TiledMMA, int CTA_M,
@@ -595,11 +602,6 @@ template <class SharedStorage, class CTensor, class BiasTensor, class TiledMMA, 
 CUTLASS_DEVICE void EPILOG_warp(SharedStorage& shared_storage, WorkTileInfo work_tile_info,
                                 CTensor mC, BiasTensor mBias, TiledMMA tiled_mma,
                                 cutlass::arch::NamedBarrier& tmem_allocation_result_barrier) {
-  // exit warp if the tile is invalid
-  if (!work_tile_info.is_valid()) {
-    return;
-  }
-
   // get the local slice of C
   Tensor gC = local_tile(mC, make_shape(Int<CTA_M>{}, Int<CTA_N>{}),
                          make_coord(work_tile_info.M_idx, work_tile_info.N_idx,
@@ -632,9 +634,14 @@ CUTLASS_DEVICE void EPILOG_warp(SharedStorage& shared_storage, WorkTileInfo work
   // cutlass/include/cutlass/epilogue/collective/builders/sm100_builder.inl for M=64, M/N major
   // output, we want SM100_TMEM_LOAD_16dp256b1x we need to use the 16dp version because M=64, each
   // sub partition uses 16 lane of tmem in mma, the other 16 lane of tmem is not used, there are 32
-  // lane per sub partition other tcgen05.ld layout works too, the code will always functional, it's
-  // just a matter of good/bad performance
-  TiledCopy tiled_t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_16dp256b1x{}, tCtAcc);
+  // lane per sub partition. Other tcgen05.ld layouts work too, the code will always be functional,
+  // it's just a matter of good/bad performance. We use the cutlass utility op_repeater to
+  // automatically pick the tcgen05.ld repeat count based on the accumulator column bit-width,
+  // i.e. tcgen05.ld.16dp256b.x1 for CTA_N=8, .x2 for CTA_N=16, .x4 for CTA_N=32, .x8 for CTA_N=64.
+  using AccType = typename decltype(tCtAcc)::value_type;
+  constexpr int acc_col_bits = CTA_N * sizeof_bits_v<AccType>;
+  TiledCopy tiled_t2r_copy =
+      make_tmem_copy(TMEM::op_repeater<SM100_TMEM_LOAD_16dp256b1x, acc_col_bits>(), tCtAcc);
   // epilog tid is from 128 to 255, need to offset by -128 when getting the per thread slice
   ThrCopy thr_t2r_copy = tiled_t2r_copy.get_slice(threadIdx.x - 128);
 
@@ -687,7 +694,6 @@ CUTLASS_DEVICE void EPILOG_warp(SharedStorage& shared_storage, WorkTileInfo work
   // coordinate space
   Tensor tDgC = thr_t2r_copy.partition_D(
       tCgC);  // (CpyD, NumCpy_M, NumCpy_N), per thread slice of the output tensor
-  using AccType = typename decltype(tCtAcc)::value_type;
   // allocate per thread rmem space for the accumulator, the shape is the same as the post partition
   // shape of the output tensor
   Tensor tDrAcc = make_tensor<AccType>(
@@ -830,6 +836,13 @@ CUTLASS_DEVICE void EPILOG_warp(SharedStorage& shared_storage, WorkTileInfo work
   // load tmem -> rmem
   copy(tiled_t2r_copy, tDtAcc, tDrAcc);
 
+  // wait for tcgen05.ld to finish, so that the MMA warp can start deallocating TMEM. The fence
+  // makes the in-flight async tcgen05.ld observable to the subsequent arrive on
+  // tmem_allocation_result_barrier; the matching arrive from the MMA warp (after its outer-K loop)
+  // releases both sides and the MMA warp then issues the free.
+  cutlass::arch::fence_view_async_tmem_load();
+  tmem_allocation_result_barrier.arrive();
+
   // 4. optionally accumulate the bias with accumulator
   if constexpr (!NO_BIAS) {
     // accumulate the bias with accumulator
@@ -872,11 +885,19 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
   //     printf("[%d, %d, %d] gemm_device\n", blockIdx.x, blockIdx.y, blockIdx.z);
   // }
 
-  // WorkTileInfo, for non persistent static scheduler, cta id is the work tile info
+  // WorkTileInfo, for non persistent static scheduler, cta id is the work tile info. K_idx_start /
+  // K_idx_end carry over from the split-K interface; for the dense GEMM here every CTA reduces the
+  // full K range (= ceil(K/CTA_K) tiles).
   WorkTileInfo work_tile_info{.M_idx = (int32_t)blockIdx.x,
                               .N_idx = (int32_t)blockIdx.y,
                               .L_idx = (int32_t)blockIdx.z,
+                              .K_idx_start = 0,
+                              .K_idx_end = cutlass::ceil_div(size<1>(mA), CTA_K),
                               .is_valid_tile = true};
+
+  if (!work_tile_info.is_valid()) {
+    return;
+  }
 
   // Allocate SMEM
   extern __shared__ char shared_memory[];
@@ -893,7 +914,7 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
   //    it is more sw programmable than named barrier
   //    it can be used for multiple purposes
   //    (a) synchronization between threads in a cta like named barrier
-  //    (b) synchronization within a CGA
+  //    (b) synchronization within a cluster
   //    (c) support transaction count, i.e. synchronization between TMA and SM
   //
   // phase initialize to 0, expected arrive count is 1, arrival count initialize to 0
@@ -924,13 +945,13 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
     cutlass::arch::detail::initialize_barrier_array_aligned<cutlass::arch::ClusterBarrier, 1>(
         &shared_storage.mma_epilog_full_barrier, /* arrival count */ 1);
   }
-  // Sync tmem allocation status between MMA and epilogue warps within CTA
-  // 32 threads (mma) + 128 threads (epilog) to sync
+  // Sync tmem allocation status between MMA and epilogue warps within CTA. Used twice:
+  // (1) after MMA allocates TMEM, to signal the epilog warps that the TMEM ptr is set;
+  // (2) after the epilog warps' tcgen05.ld + fence_view_async_tmem_load, to signal MMA that it is
+  //     safe to free TMEM.
+  // 32 threads (mma) + 128 threads (epilog) to sync.
   cutlass::arch::NamedBarrier tmem_allocation_result_barrier(
       32 + 128, cutlass::arch::ReservedNamedBarriers::TmemAllocBarrier);
-
-  // handle the case where K is not divisible by CTA_K
-  int k_tile_count = cutlass::ceil_div(size<1>(mA), CTA_K);
 
   /*if (thread0() && (blockIdx.x == 0) && (blockIdx.y == 0) && (blockIdx.z == 0)) {
       // Represent the SMEM buffers for A
@@ -940,7 +961,6 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
 
       printf("tCsA:\t"); print(tCsA); print("\n");
       printf("tCsB:\t"); print(tCsB); print("\n");
-      printf("k_tile_count:\t%d\n", k_tile_count);
   }*/
 
   // barrier initialization needs to be visible to all warps
@@ -956,20 +976,10 @@ __global__ void tgv_gemm_device(ATensor mA, BTensor mB, CTensor mC, BiasTensor m
         shared_storage, work_tile_info, mB, &tma_atom_B, tiled_mma);
   } else if (warp_idx == 2) {
     MMA_warp<SharedStorage, CTensor, TiledMMA, CTA_M, CTA_N, DMA_Stage>(
-        shared_storage, work_tile_info, mC, tiled_mma, k_tile_count,
-        tmem_allocation_result_barrier);
+        shared_storage, work_tile_info, mC, tiled_mma, tmem_allocation_result_barrier);
   } else if (warp_idx >= 4) {
     EPILOG_warp<SharedStorage, CTensor, BiasTensor, TiledMMA, CTA_M, CTA_N, NO_BIAS>(
         shared_storage, work_tile_info, mC, mBias, tiled_mma, tmem_allocation_result_barrier);
-  }
-
-  __syncthreads();
-
-  // deallocate TMEM
-  if (warp_idx == 0) {
-    using TmemAllocator = cute::TMEM::Allocator1Sm;
-    TmemAllocator tmem_allocator{};
-    tmem_allocator.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns / 2);
   }
 }
 

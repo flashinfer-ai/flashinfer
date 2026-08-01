@@ -136,9 +136,9 @@ class Runner {
   explicit Runner(int32_t tileTokensDim);
 
   void run(void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts,
-           int32_t topK, int32_t nGroups, int32_t topkGroups, int32_t localExpertOffset,
-           int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
-           int32_t* expertCountHistogram, int32_t* permutedIdxSize,
+           int32_t topK, int32_t numFusedSharedExpert, int32_t nGroups, int32_t topkGroups,
+           int32_t localExpertOffset, int32_t localNumExperts, float routedScalingFactor,
+           int32_t* routingExpertIndexes, int32_t* expertCountHistogram, int32_t* permutedIdxSize,
            int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
            int32_t* permutedIdxToTokenIdx, int32_t* expertIds, void* expertWeights,
            int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
@@ -146,7 +146,7 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
-           int16_t* routing_replay_out = nullptr);
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
 
  private:
   friend class MoE::Runner;
@@ -168,7 +168,8 @@ enum class ActivationType : int64_t {
   SwigluStep = 7,
   GegluTanh = 8,
   Identity = 9,
-  InvalidType = 10,  // Must be last
+  Situ = 10,
+  InvalidType = 11,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -193,6 +194,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "SwigluStep";
     case ActivationType::GegluTanh:
       return "GegluTanh";
+    case ActivationType::Situ:
+      return "Situ";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -202,7 +205,7 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
 }
 
 }  // namespace MoE
@@ -324,6 +327,7 @@ struct MoERunnerArgs {
 
   int32_t num_tokens{0};
   int32_t num_experts{0};
+  int32_t num_fused_shared_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
   // Hidden dimension output of MoE block. It is not padded.
@@ -442,13 +446,17 @@ class Runner {
                                                            int32_t numLocalExperts,
                                                            int32_t numTokens) const;
 
+  [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numLocalExperts,
+                                        int32_t numTokens) const;
+
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts,
                                                    int32_t numTokens) const;
 
  private:
-  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+  void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,
                   moe::dev::convertsf::Data& convertSfData,
                   moe::dev::activation::Data& activationData,
                   moe::dev::finalize::Data& finalizeData);

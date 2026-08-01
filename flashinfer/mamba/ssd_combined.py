@@ -285,10 +285,16 @@ class SSDCombined:
         from ..utils import get_compute_capability
 
         major, minor = get_compute_capability(torch.device("cuda"))
-        if major < 10:
+        # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
+        # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
+        # Blackwell (SM120/SM121) lacks tcgen05, so reject it here with a clear message
+        # instead of a cryptic cute-dsl "expects ... sm_100a ... got sm_120a" OpError.
+        # SM107 (Rubin) shares major=10 but is not yet supported by this kernel, so
+        # reject it explicitly rather than letting it slip through the major check.
+        if major not in (10, 11) or (major, minor) == (10, 7):
             raise ValueError(
-                f"SSDCombined requires SM100+ (Blackwell or newer). "
-                f"Got SM{major}{minor}."
+                f"SSDCombined requires datacenter Blackwell (SM100/SM103/SM110) "
+                f"for tcgen05 MMA. Got SM{major}{minor}."
             )
 
         self.chunk_size = chunk_size

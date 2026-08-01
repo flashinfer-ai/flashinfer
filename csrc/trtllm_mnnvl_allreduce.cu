@@ -78,9 +78,10 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || rmsnorm_fusion)
         << "MNNVL quantization fusion requires rmsnorm_fusion=true";
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone ||
+                   quant_type_enum == QuantType::kDynamicFP8 ||
                    (output_scale.has_value() &&
                     encode_dlpack_dtype(output_scale.value().dtype()) == float32_code))
-        << "output_scale must be provided for MNNVL quantization fusion and must be float32";
+        << "output_scale must be provided for static MNNVL quantization fusion and must be float32";
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || quant_out.has_value())
         << "quant_out must be provided when quantization fusion is enabled";
 
@@ -132,6 +133,22 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         TVM_FFI_ICHECK(sf_out.value().numel() >= num_tokens * token_dim / 16)
             << "sf_out is too small for FP4: expected at least " << num_tokens * token_dim / 16
             << " elements but got " << sf_out.value().numel();
+        break;
+      case QuantType::kDynamicFP8:
+        TVM_FFI_ICHECK(quant_out.value().size(0) == num_tokens &&
+                       quant_out.value().size(1) == token_dim)
+            << "quant_out shape mismatch for dynamic FP8: expected (" << num_tokens << ", "
+            << token_dim << ") but got (" << quant_out.value().size(0) << ", "
+            << quant_out.value().size(1) << ")";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(quant_out.value().dtype()) == float8_e4m3fn_code)
+            << "quant_out for dynamic FP8 must have dtype float8_e4m3fn";
+        TVM_FFI_ICHECK(sf_out.has_value())
+            << "scale_out must be provided for dynamic FP8 MNNVL quantization fusion";
+        TVM_FFI_ICHECK(sf_out.value().size(0) == num_tokens && sf_out.value().size(1) == 1)
+            << "scale_out shape mismatch for dynamic FP8: expected (" << num_tokens
+            << ", 1) but got (" << sf_out.value().size(0) << ", " << sf_out.value().size(1) << ")";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(sf_out.value().dtype()) == float32_code)
+            << "scale_out for dynamic FP8 must have dtype float32";
         break;
       default:
         TVM_FFI_LOG_AND_THROW(NotImplementedError)

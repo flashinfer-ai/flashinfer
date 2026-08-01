@@ -62,7 +62,8 @@
 
 // ===== Forward declarations =====
 
-template <int feat_in, int feat_out, typename in_T, typename out_T, typename W_T>
+template <int feat_in, int feat_out, typename in_T, typename out_T, typename W_T,
+          bool PER_PAIR_INPUT = false>
 void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
                             W_T** __restrict__ w_ptr, const int64_t* __restrict__ sorted_token_ids,
                             const int64_t* __restrict__ expert_ids,
@@ -70,7 +71,7 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
                             int64_t num_slices, int64_t num_experts, int64_t num_tokens,
                             int64_t lora_stride, float scale);
 
-template <int feat_in, int feat_out, typename in_T, typename W_T>
+template <int feat_in, int feat_out, typename in_T, typename W_T, bool FINALIZE = true>
 void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
                             W_T** __restrict__ w_ptr, const int64_t* __restrict__ sorted_token_ids,
                             const int64_t* __restrict__ expert_ids,

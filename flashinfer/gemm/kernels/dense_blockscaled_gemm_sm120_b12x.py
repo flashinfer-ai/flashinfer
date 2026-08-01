@@ -42,6 +42,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import logging
 from cutlass import Int32, Int64
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -531,6 +532,7 @@ class DenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
         return
 
@@ -744,7 +746,7 @@ class DenseGemmKernel:
         tCc: cute.Tensor,
         row_limit: Int32,
     ) -> cute.Tensor:
-        tPred = cute.make_fragment(
+        tPred = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     cute.size(tCc, mode=[0, 1]),
@@ -796,7 +798,7 @@ class DenseGemmKernel:
         tC: cute.Tensor,
         row_limit: Int32,
     ) -> None:
-        tP = cute.make_fragment(cute.make_layout(tS.shape), cutlass.Boolean)
+        tP = cute.make_rmem_tensor(cute.make_layout(tS.shape), cutlass.Boolean)
         for i in cutlass.range_constexpr(cute.size(tP)):
             tP[i] = cute.elem_less(tC[i][0][0][0], row_limit)
         for rest_m in cutlass.range_constexpr(cute.size(tS.shape[1])):
@@ -1131,6 +1133,9 @@ class DenseGemmKernel:
         else:
             cute.arch.sync_threads()
 
+        if cutlass.const_expr(self.enable_pdl):
+            griddepcontrol_wait()
+
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
         block_idx = cute.arch.block_idx()
         k_tile_start = Int32(0)
@@ -1355,15 +1360,17 @@ class DenseGemmKernel:
                 tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                 tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
 
+                # The fragments hold a full stage of scale factors, so copy
+                # them once per stage.
                 cute.copy(
                     smem_tiled_copy_SFA,
-                    tCsSFA_p_filtered[None, None, 0],
-                    tCrSFA_copy_view_filtered[None, None, 0],
+                    tCsSFA_p_filtered,
+                    tCrSFA_copy_view_filtered,
                 )
                 cute.copy(
                     smem_tiled_copy_SFB,
-                    tCsSFB_p_filtered[None, None, 0],
-                    tCrSFB_copy_view_filtered[None, None, 0],
+                    tCsSFB_p_filtered,
+                    tCrSFB_copy_view_filtered,
                 )
 
                 for _k_tile in range(0, k_tile_iter_cnt - 1, 1, unroll=2):  # type: ignore[call-overload]
@@ -1426,24 +1433,27 @@ class DenseGemmKernel:
                             tCrB_copy_view[None, None, k_block_next],
                         )
 
-                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(
-                            tCrSFA_tile_copy_view
-                        )
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(
-                            tCrSFB_tile_copy_view
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFA,
-                            tCsSFA_p_filtered[None, None, k_block_next],
-                            tCrSFA_copy_view_filtered[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, k_block_next],
-                            tCrSFB_copy_view_filtered[None, None, k_block_next],
-                        )
+                        if k_block_idx == num_k_blocks - 1:
+                            # The MMAs have already read the old scale
+                            # factors, so the new stage can overwrite them.
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                tCrSFA_tile_copy_view
+                            )
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                tCrSFB_tile_copy_view
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered,
+                                tCrSFA_copy_view_filtered,
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFB,
+                                tCsSFB_p_filtered,
+                                tCrSFB_copy_view_filtered,
+                            )
 
                 # Hoist out last k_tile
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1465,24 +1475,6 @@ class DenseGemmKernel:
                             smem_tiled_copy_B,
                             tCsB_p[None, None, k_block_next],
                             tCrB_copy_view[None, None, k_block_next],
-                        )
-                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(
-                            tCrSFA_tile_copy_view
-                        )
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(
-                            tCrSFB_tile_copy_view
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFA,
-                            tCsSFA_p_filtered[None, None, k_block_next],
-                            tCrSFA_copy_view_filtered[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, k_block_next],
-                            tCrSFB_copy_view_filtered[None, None, k_block_next],
                         )
                     # Manual atom unroll: avoids hasAuxTensor address space bug
                     for _mt in range(self.num_m_tiles):
@@ -2163,6 +2155,9 @@ class DenseGemmKernel:
                     work_tile = tile_sched.get_current_work()
 
             mainloop_pipeline.producer_tail(mainloop_producer_state)
+
+        if cutlass.const_expr(self.enable_pdl):
+            griddepcontrol_launch_dependents()
         return
 
     @staticmethod
@@ -2413,9 +2408,9 @@ class DenseGemmKernel:
         # A must be K-major, B must be K-major
         if a_major != "k" or b_major != "k":
             return False
-        # Alignment: K must be divisible by tile_k
-        tile_k = sf_vec_size * 8
-        if k % tile_k != 0:
+        # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k: the
+        # mainloop predicates the partial tile, so ragged K works. Mirror gemm_base.py.
+        if k % 32 != 0:
             return False
         return True
 

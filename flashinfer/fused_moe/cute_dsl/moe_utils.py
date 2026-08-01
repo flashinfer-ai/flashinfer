@@ -16,11 +16,12 @@ limitations under the License.
 
 import functools
 from enum import IntEnum
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
+from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -33,6 +34,24 @@ def _get_cuda_stream_ptr() -> int:
 
 
 # ============================ Helper Functions ============================
+
+
+SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+)
+
+
+def normalize_cute_dsl_moe_activation_type(
+    activation_type: Union[int, ActivationType],
+) -> Tuple[ActivationType, bool]:
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
+        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+        raise ValueError(
+            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+        )
+    return activation_type, is_gated_activation(activation_type)
 
 
 def get_max_num_tiles(
@@ -218,6 +237,7 @@ def moe_unpermute(
     num_tokens: int,
     top_k: int,
     enable_pdl: bool = False,
+    input_is_expanded: bool = False,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -239,6 +259,8 @@ def moe_unpermute(
         top_k: Number of experts per token.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
+        input_is_expanded: Whether input rows use expanded (token, top-k slot)
+            order instead of expert-permuted order.
 
     Note:
         Output is the weighted sum of expert contributions:
@@ -270,7 +292,9 @@ def moe_unpermute(
         num_tokens,
         hidden_size,
         top_k,
+        input_is_expanded,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 

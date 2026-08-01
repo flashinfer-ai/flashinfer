@@ -1,5 +1,5 @@
 # Exclude bulky / host-specific paths from the docker build context.
-# Submodules are still copied (they're needed for BUILD_NVEP=1).
+# Submodules are still copied (needed for the default NIXL-EP build).
 
 # Python venvs / build trees
 .venv/

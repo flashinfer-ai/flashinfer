@@ -268,6 +268,18 @@ def parse_moe_args(line, parser):
             "eliminates per-call allocation overhead."
         ),
     )
+    parser.add_argument(
+        "--b12x_quant_mode",
+        type=str,
+        required=False,
+        default="nvfp4",
+        choices=["nvfp4", "w4a16"],
+        help=(
+            "Quantization mode for b12x_fused_moe: nvfp4 (W4A4, FP4 weights + "
+            "FP4 activations) or w4a16 (FP4 weights + BF16 activations). "
+            "Default: nvfp4"
+        ),
+    )
 
     # CUTLASS fused MoE specific
     parser.add_argument(
@@ -1642,11 +1654,13 @@ def testCuteDslFp4BlockScaleMoe(args):
 
 def testB12xFusedMoe(args):
     """
-    Test b12x_fused_moe (SM120/SM121 CuTe DSL NVFP4 MoE).
+    Test b12x_fused_moe (SM120/SM121 CuTe DSL FP4-weight MoE).
 
-    The b12x MoE takes **bf16** hidden states (the kernel fuses the
-    quantization internally) and NVFP4-quantized weights. Supports both
-    SwiGLU (gated) and ReLU2 (non-gated) activations.
+    The b12x MoE takes **bf16** hidden states and NVFP4-quantized weights.
+    ``--b12x_quant_mode`` selects the activation precision: ``nvfp4``
+    (W4A4, the kernel fuses activation quantization internally) or
+    ``w4a16`` (BF16 activations). Supports both SwiGLU (gated) and ReLU2
+    (non-gated) activations.
 
     This test:
     1. Creates NVFP4-quantized weights and bf16 inputs for b12x kernels
@@ -1727,6 +1741,7 @@ def testB12xFusedMoe(args):
         print(f"[VVERBOSE] w2_weight.shape = {tensors['w2_weight'].shape}")
 
     use_functional = getattr(args, "use_functional_api", False)
+    quant_mode = getattr(args, "b12x_quant_mode", "nvfp4")
     x_input = tensors["x_bf16"]
 
     if use_functional:
@@ -1747,6 +1762,7 @@ def testB12xFusedMoe(args):
             num_local_experts=local_num_experts,
             output=moe_output,
             activation=activation_str,
+            quant_mode=quant_mode,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1772,6 +1788,7 @@ def testB12xFusedMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             activation=activation_str,
+            quant_mode=quant_mode,
         )
         runner = moe.run
 
@@ -1835,6 +1852,16 @@ def testB12xFusedMoe(args):
                 run_b12x_moe(*autotune_args)
         del autotune_args
 
+    # Cold-L2 rotation clones the weights inside CUDA-graph capture, but
+    # W4A16 packs weights on first use and cannot pack during capture.
+    # Keep L2 warm for that combination.
+    cold_l2_cache = not (quant_mode == "w4a16" and is_cuda_graph_compatible)
+    if not cold_l2_cache and args.verbose >= 1:
+        print(
+            "[INFO] w4a16 + CUDA graph: cold-L2 buffer rotation disabled "
+            "(W4A16 packed-weight cache cannot be populated during capture)"
+        )
+
     # Benchmark timing
     times = bench_gpu_time(
         fn=run_b12x_moe,
@@ -1843,7 +1870,7 @@ def testB12xFusedMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
-        cold_l2_cache=True,
+        cold_l2_cache=cold_l2_cache,
         input_args=input_args,
     )
 
@@ -1895,7 +1922,8 @@ def testB12xFusedMoe(args):
         cur_res["local_num_experts"] = local_num_experts
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
-        cur_res["fp4_mode"] = "nvfp4"
+        cur_res["fp4_mode"] = quant_mode
+        cur_res["cold_l2_cache"] = cold_l2_cache
         cur_res["activation_type"] = activation_type.name
         res.append(cur_res)
 
@@ -2555,14 +2583,20 @@ def testUnifiedNvfp4Moe(args):
     # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
     # for the Pack (runner re-applies unsqueeze in pack_inputs).
     x_sf = cute_dsl_data["x_sf"].squeeze(-1)
+    # The local-only proxy generates ids in [0, local_num_experts); the runners
+    # expect GLOBAL ids (the kernel maps them to the local shard via the
+    # separately passed local_expert_offset), so lift the pack ids to global.
+    # The reference oracle below keeps the LOCAL ids: it indexes the local
+    # weight slices directly.
+    local_topk_ids = cute_dsl_data["token_selected_experts"]
     act_pack = MoEActivationPack(
         hidden_states_q=cute_dsl_data["x"],
         hidden_states_scale=x_sf,
-        selected_experts=cute_dsl_data["token_selected_experts"],
-        final_scales=cute_dsl_data["token_final_scales"],
+        topk_ids=local_topk_ids + local_expert_offset,
+        topk_weights=cute_dsl_data["token_final_scales"],
     )
 
-    num_active_experts = int(act_pack.selected_experts.unique().numel())
+    num_active_experts = int(local_topk_ids.unique().numel())
 
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
@@ -2572,7 +2606,10 @@ def testUnifiedNvfp4Moe(args):
     config = MoEConfig(
         routing=RoutingConfig(
             num_experts=num_experts,
-            top_k=top_k,
+            # top_k must match the pack's column count: the tensors above were
+            # generated with routing_top_k (clamped to local_num_experts for
+            # the local-only EP proxy), not the raw CLI top_k.
+            top_k=routing_top_k,
             n_group=args.n_group,
             topk_group=args.topk_group,
             routed_scaling_factor=args.routed_scaling_factor,
@@ -2610,11 +2647,11 @@ def testUnifiedNvfp4Moe(args):
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
             gemm1_weights=w1_bf16.float().to(device),
             gemm2_weights=w2_bf16.float().to(device),
-            token_selected_experts=act_pack.selected_experts,
-            token_final_scales=act_pack.final_scales,
+            token_selected_experts=local_topk_ids,
+            token_final_scales=act_pack.topk_weights,
             num_tokens=num_tokens,
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=routing_top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=cute_dsl_data["fc2_input_scale"],

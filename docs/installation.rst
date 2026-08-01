@@ -42,8 +42,10 @@ FlashInfer provides three packages:
 
 .. code-block:: bash
 
-    pip install flashinfer-python flashinfer-cubin
-    # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+    pip install flashinfer-python
+    # cubin package
+    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+    # JIT cache package (replace cu129 with your CUDA version: cu129 or cu130)
     pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
 
 This eliminates compilation and downloading overhead at runtime.
@@ -107,7 +109,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl

@@ -215,6 +215,7 @@ include/flashinfer/attention/hopper/kernel_traits.cuh
 include/flashinfer/attention/hopper/named_barrier.cuh
 include/flashinfer/attention/hopper/tile_scheduler.cuh
 include/flashinfer/attention/hopper/utils.cuh
+flashinfer/cute_dsl/sparse/blk64/tile_scheduler.hpp
 
 BSD 3-Clause "New" License
 --------------------------

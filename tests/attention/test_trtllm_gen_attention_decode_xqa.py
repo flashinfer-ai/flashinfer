@@ -24,6 +24,8 @@ from tests.attention.test_trtllm_gen_attention_decode import (
     _test_trtllm_batch_decode,
 )
 
+pytestmark = pytest.mark.long_running
+
 
 @pytest.mark.parametrize("backend", ["xqa"])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])

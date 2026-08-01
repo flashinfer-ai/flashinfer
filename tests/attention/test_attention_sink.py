@@ -26,6 +26,8 @@ from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
 
+pytestmark = pytest.mark.solo
+
 
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),

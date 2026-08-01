@@ -37,7 +37,7 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -69,10 +69,14 @@ def b12x_fused_moe(
     w1_alpha: torch.Tensor,
     w2_alpha: torch.Tensor,
     fc2_input_scale: Optional[torch.Tensor] = None,
+    input_global_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: Optional[float] = None,
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
@@ -114,6 +118,12 @@ def b12x_fused_moe(
         Global scale for FC2 input quantization.  Required for
         ``quant_mode="nvfp4"``; accepted but ignored for
         ``quant_mode="w4a16"``.
+    input_global_scale : Optional[torch.Tensor]
+        Global scale for FC1 input quantization, scalar or
+        ``[num_experts]``.  Lets ``w1_alpha`` carry the exact fp32 weight
+        scale; folded into the output multiplier internally.  Defaults to
+        ``w1_alpha``, which then serves both roles.  Ignored for
+        ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
         Local experts for expert parallelism.  Defaults to ``num_experts``.
     output : Optional[torch.Tensor]
@@ -122,8 +132,14 @@ def b12x_fused_moe(
     output_dtype : torch.dtype
         Output data type.  Only ``torch.bfloat16`` is currently supported.
     activation : str
-        Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
-        (non-gated Nemotron-Super).  Defaults to ``"silu"``.
+        Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"`` (gated
+        tanh-approx GeGLU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI)
+        or ``"relu2"`. Defaults to ``"silu"``.
+    swiglu_alpha, swiglu_beta, swiglu_limit : float
+        SwiGLU-OAI parameters used only when
+        ``activation="swigluoai_uninterleave"``: ``gate*sigmoid(alpha*gate)*
+        (up+beta)`` with optional clamp to ``swiglu_limit`` (``None`` disables).
+        Defaults to 1.702 / 1.0 / None as standard parameters for approximating GELU.
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -196,6 +212,7 @@ def b12x_fused_moe(
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
         fc2_input_scale=fc2_input_scale,
+        input_global_scale=input_global_scale,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
@@ -204,6 +221,9 @@ def b12x_fused_moe(
         num_local_experts=num_local_experts,
         scatter_output=output,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         source_format=source_format,
@@ -227,7 +247,8 @@ class B12xMoEWrapper:
         output_dtype: Output data type. Only torch.bfloat16 is currently
             supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
-        activation: Activation function — "silu" or "relu2". Default: "silu".
+        activation: Activation — "silu", "gelu_tanh", "swigluoai_uninterleave", or
+            "relu2". Default: "silu". swiglu_alpha/beta/limit apply to swigluoai.
         activation_precision: Backward-compatible alias for quant_mode.
             "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
         quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
@@ -255,6 +276,9 @@ class B12xMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: Optional[float] = None,
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
@@ -287,8 +311,13 @@ class B12xMoEWrapper:
             Device on which to allocate workspace buffers.  Defaults to
             ``"cuda"``.
         activation : str
-            Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
-            (non-gated).  Defaults to ``"silu"``.
+            Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"``
+            (gated GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated
+            SwiGLU-OAI) or ``"relu2"`` (non-gated). Defaults to ``"silu"``.
+        swiglu_alpha, swiglu_beta, swiglu_limit : float
+            SwiGLU-OAI parameters (only for ``"swigluoai_uninterleave"``):
+            ``gate*sigmoid(alpha*gate)*(up+beta)`` with optional clamp to
+            ``swiglu_limit`` (``None`` disables). Defaults 1.702 / 1.0 / None.
         activation_precision : str
             Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
             ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -335,6 +364,9 @@ class B12xMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
         self.quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
         self.activation_precision = _activation_precision_from_quant_mode(
             self.quant_mode
@@ -348,7 +380,11 @@ class B12xMoEWrapper:
         self._dynamic_workspace: object = None
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
+        self._padded_weights: Any = None
+        self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
+        self._folded_w1_alpha: Optional[torch.Tensor] = None
+        self._folded_w1_alpha_key: Optional[Tuple] = None
 
         if use_cuda_graph:
             self._allocate_buffers()
@@ -456,6 +492,7 @@ class B12xMoEWrapper:
         w1_alpha: torch.Tensor,
         w2_alpha: torch.Tensor,
         fc2_input_scale: Optional[torch.Tensor] = None,
+        input_global_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the b12x fused-MoE forward pass.
 
@@ -483,6 +520,10 @@ class B12xMoEWrapper:
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for FC2 input quantization.  Required for
             ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
+        input_global_scale : Optional[torch.Tensor]
+            Global scale for FC1 input quantization, scalar or
+            ``[num_experts]``.  Defaults to ``w1_alpha``; see
+            :func:`b12x_fused_moe`.  Ignored for ``"w4a16"``.
 
         Returns
         -------
@@ -515,6 +556,9 @@ class B12xMoEWrapper:
             launch_sm120_moe,
             select_sm120_moe_backend,
             _get_weight_views as _get_sm120_weight_views,
+            _pad_intermediate_to_tile,
+            _LEVEL_TILE_N,
+            is_gated_activation,
         )
 
         # Pick the right pre-allocated workspace for this call's token
@@ -537,6 +581,22 @@ class B12xMoEWrapper:
             else:
                 workspace = self._static_workspace
 
+        if self.quant_mode == "nvfp4" and input_global_scale is not None:
+            # Fold once and reuse; launch_sm120_moe skips its fold when
+            # weight views are given.
+            fold_key = (
+                w1_alpha.data_ptr(),
+                input_global_scale.data_ptr(),
+                w1_alpha._version,
+                input_global_scale._version,
+            )
+            if self._folded_w1_alpha is None or self._folded_w1_alpha_key != fold_key:
+                self._folded_w1_alpha = (
+                    w1_alpha.to(torch.float32) * input_global_scale.to(torch.float32)
+                ).contiguous()
+                self._folded_w1_alpha_key = fold_key
+            w1_alpha = self._folded_w1_alpha
+
         if self.quant_mode == "nvfp4":
             # Cache weight views; invalidate if weight pointers change.
             weight_key = (
@@ -548,6 +608,40 @@ class B12xMoEWrapper:
                 w2_weight_sf.data_ptr(),
                 w2_alpha.data_ptr(),
             )
+            n_eff = self.intermediate_size
+            # Pad non-128-aligned intermediate sizes once and cache.
+            if self.intermediate_size % _LEVEL_TILE_N != 0:
+                padded_weight_key = (
+                    *weight_key,
+                    fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+                )
+                if (
+                    self._padded_weights is None
+                    or self._padded_weight_key != padded_weight_key
+                ):
+                    is_gated = is_gated_activation(self.activation)
+                    self._padded_weights = _pad_intermediate_to_tile(
+                        w1_weight,
+                        w1_weight_sf,
+                        w2_weight,
+                        w2_weight_sf,
+                        fc2_input_scale,
+                        self.intermediate_size,
+                        _LEVEL_TILE_N,
+                        self.hidden_size,
+                        w1_weight.size(0),
+                        is_gated,
+                    )
+                    self._padded_weight_key = padded_weight_key
+                (
+                    w1_weight,
+                    w1_weight_sf,
+                    w2_weight,
+                    w2_weight_sf,
+                    fc2_input_scale,
+                    n_eff,
+                ) = self._padded_weights
+
             if self._weight_views is None or self._weight_key != weight_key:
                 self._weight_views = _get_sm120_weight_views(
                     w1_fp4=w1_weight,
@@ -556,7 +650,7 @@ class B12xMoEWrapper:
                     w2_blockscale=w2_weight_sf,
                     w1_alphas=w1_alpha,
                     w2_alphas=w2_alpha,
-                    n=self.intermediate_size,
+                    n=n_eff,
                     k=self.hidden_size,
                     activation_precision=self.activation_precision,
                 )
@@ -573,6 +667,7 @@ class B12xMoEWrapper:
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
             fc2_input_scale=fc2_input_scale,
+            input_global_scale=input_global_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,
@@ -581,6 +676,9 @@ class B12xMoEWrapper:
             num_local_experts=self.num_local_experts,
             scatter_output=moe_output,
             activation=self.activation,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             activation_precision=self.activation_precision,
             quant_mode=self.quant_mode,
             source_format=self.source_format,

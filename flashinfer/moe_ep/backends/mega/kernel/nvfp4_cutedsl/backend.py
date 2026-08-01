@@ -1,0 +1,345 @@
+"""CuTeDSL NVFP4 mega-MoE kernel backend.
+
+The fused kernel consumes NVFP4 expert weights in kernel-ready layout (packed
+weights + atom-swizzled scale factors). ``MoEWeightPack`` supplies canonical
+bf16 ``w13``/``w2`` by default; ``preprocess_weights()`` quantizes and swizzles
+them. Pass pre-quantized NVFP4 weights via ``w13``/``w2`` + ``w13_scale``/``w2_scale``
+to skip re-quantization.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from .....config import BootstrapConfig, FleetParams
+from .....core.kernel.base import MegaKernelBackend
+from .....core.kernel.registry import register_mega_kernel
+from .....core.runtime import nvfp4_cutedsl_runtime_requirements
+from .....core.validation.common import (
+    validate_mega_arch,
+    validate_mega_fleet_params,
+)
+from .....weights import MoEWeightPack
+from .config import Nvfp4CutedslMegaMoeConfig
+from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
+from .weights import (
+    TransformedMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
+
+if TYPE_CHECKING:
+    from .....tensors import MoEEpTensors
+
+
+def _resolve_gate_up_clamp(config: Nvfp4CutedslMegaMoeConfig) -> float | None:
+    if config.gate_up_clamp is not None:
+        return config.gate_up_clamp
+    return config.activation_clamp
+
+
+@register_mega_kernel("nvfp4_cutedsl")
+class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+    def __init__(self, config: Nvfp4CutedslMegaMoeConfig) -> None:
+        super().__init__(config)
+        self._kernel_config: Nvfp4CutedslMegaMoeConfig = config
+        self._thunk_state: tuple | None = None
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE multi-minute compile+timing "
+                "sweep at the first forward — never use it inside a serving "
+                "engine. Tune offline instead (python -m flashinfer.moe_ep.tune"
+                "); winners persist in the knob cache and knobs=None then "
+                "resolves them with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @classmethod
+    def kernel_name(cls) -> str:
+        return "nvfp4_cutedsl"
+
+    def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
+        return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+    def validate_init(
+        self,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        validate_mega_arch()
+        validate_mega_fleet_params(
+            fleet_params,
+            bootstrap.world_size,
+            intermediate_size=self._kernel_config.intermediate_size,
+            top_k=self._kernel_config.top_k,
+            # cutedsl tiles are tail-safe (ceil-div + predicated epilogue);
+            # the binding bound is TMA row alignment, not the dg SF word.
+            alignment=64,
+        )
+
+    def preprocess_weights(
+        self,
+        weights: MoEWeightPack,
+        fleet_params: FleetParams,
+    ) -> TransformedMegaWeights:
+        return preprocess_mega_weights(
+            weights,
+            intermediate_size=self._kernel_config.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
+            activation_clamp=self._kernel_config.activation_clamp,
+        )
+
+    def validate_transformed_weights(
+        self,
+        transformed_weights: TransformedMegaWeights,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        validate_transformed_mega_weights(
+            transformed_weights,
+            intermediate_size=self._kernel_config.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            world_size=self.ep_world_size,
+            num_experts=fleet_params.num_experts,
+        )
+
+    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
+        from .....kernel_src.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+
+        k = self._kernel_config
+        fp = fleet_params
+        return get_symm_buffer_for_mega_moe(
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            2 * k.intermediate_size,
+            self.ep_rank,
+            self.ep_world_size,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            activation_clamp=k.activation_clamp,
+            apply_topk_in_fc1=k.apply_topk_in_fc1,
+            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            combine_dtype=k.combine_dtype,
+            fc1_alpha=k.fc1_alpha,
+            fc2_alpha=k.fc2_alpha,
+            fc1_norm_const=k.fc1_norm_const,
+            knobs=k.knobs if isinstance(k.knobs, dict) else None,
+        )
+
+    def validate_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: FleetParams,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        validate_nvfp4_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            fleet_params,
+            top_k=self._kernel_config.top_k,
+            quantize_input=quantize_input,
+            scales=t.scales,
+        )
+
+    def stage_inputs(
+        self,
+        t: "MoEEpTensors",
+        workspace: Any,
+        *,
+        quantize_input: bool,
+    ) -> None:
+        num_tokens = t.hidden_states.shape[0]
+        if quantize_input:
+            stage_mega_moe_inputs(
+                t.hidden_states,
+                t.topk_weights,
+                t.topk_ids,
+                workspace.x,
+                workspace.x_sf,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                norm_const=self._kernel_config.input_norm_const,
+            )
+        else:
+            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+            from .....kernel_src.cutedsl_megamoe import (
+                Nvfp4BlockSize,
+                ceil_div,
+                round_up,
+            )
+
+            hidden = workspace.hidden
+            hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
+            hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
+
+            workspace.x[:num_tokens].copy_(t.hidden_states)
+            assert t.scales is not None
+            workspace.x_sf[:num_tokens].zero_()
+            workspace.x_sf[:num_tokens, :hidden_sf_cols].copy_(
+                t.scales[:num_tokens, :hidden_sf_cols]
+            )
+            if t.scales.shape[1] >= hidden_sf_cols_padded:
+                workspace.x_sf[
+                    :num_tokens, hidden_sf_cols:hidden_sf_cols_padded
+                ].zero_()
+            workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+            workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+            capacity = workspace.x.shape[0]
+            if num_tokens < capacity:
+                workspace.topk_idx[num_tokens:capacity].fill_(-1)
+            from .....kernel_src.cutedsl_megamoe import note_staged_tokens
+
+            note_staged_tokens(workspace.topk_idx, num_tokens)
+
+        if t.fc1_alpha is not None:
+            workspace.fc1_alpha.copy_(t.fc1_alpha)
+        if t.fc2_alpha is not None:
+            workspace.fc2_alpha.copy_(t.fc2_alpha)
+        if t.fc1_norm_const is not None:
+            workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+
+    def compute(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+        *,
+        output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from .....kernel_src.cutedsl_megamoe import staged_tokens
+
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
+
+        kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from .....kernel_src.cutedsl_megamoe import autotune_nvfp4_mega_moe
+
+            autotune_nvfp4_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=num_tokens,
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep holds).
+            self._autotune_pending = False
+        # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
+        # the clamp, and rebuilds the 12-field inputs bundle on every call
+        # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
+        # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
+        # Build once per (workspace, weights, compiled-session, STREAM) and
+        # reuse. The stream is part of the key because the thunk's launch
+        # kwargs bind it at build time — a graph capture runs on a capture
+        # stream and must get its own thunk or the kernel launch escapes the
+        # graph. A knobs/clamp change nulls the frontend's compiled session,
+        # changing the key and forcing a rebuild through the validated path.
+        fe = workspace._frontend
+        clamp = _resolve_gate_up_clamp(kcfg)
+        if clamp is not None:
+            fe.set_gate_up_clamp(clamp)
+        mega = fe._mega
+        stream = torch.cuda.current_stream().cuda_stream
+        key = (
+            id(workspace),
+            id(transformed_weights[0][0]),
+            id(mega.compiled) if mega is not None and mega.compiled else None,
+            stream,
+        )
+        state = self._thunk_state
+        if state is None or state[0] != key or key[2] is None:
+            from .....kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+                MegaMoENvfp4Inputs,
+            )
+
+            inputs = MegaMoENvfp4Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed_weights[0][0],
+                fc1_weight_sf=transformed_weights[0][1],
+                fc2_weight=transformed_weights[1][0],
+                fc2_weight_sf=transformed_weights[1][1],
+                fc1_alpha=workspace.fc1_alpha,
+                fc2_alpha=workspace.fc2_alpha,
+                fc1_norm_const=workspace.fc1_norm_const,
+                output_activation=workspace.output_activation,
+            )
+            # Full validation happens inside make_launch_thunk's
+            # _prepare_launch_inputs (run()'s slow-path validator).
+            thunk = fe.make_launch_thunk(inputs)
+            mega = fe._mega
+            key = (key[0], key[1], id(mega.compiled), stream)
+            state = (key, thunk, workspace.output_activation)
+            self._thunk_state = state
+
+        _, thunk, out_buf = state
+        thunk()
+        if output is not None:
+            output.copy_(out_buf[:num_tokens])
+            return output
+        # Zero-copy: the caller consumes the [:n] view under stream ordering
+        # (valid until the next launch on this session's buffers).
+        return out_buf[:num_tokens]
+
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        k = self._kernel_config
+        if k.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
+        import torch
+
+        from .....core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
+
+        fp = fleet_params
+        return (
+            "nvfp4_cutedsl",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self._ep_comm_group),
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            2 * k.intermediate_size,
+            _resolve_gate_up_clamp(k),
+            k.apply_topk_in_fc1,
+            k.in_kernel_fc2_reduce,
+            k.combine_dtype,
+            epilogue_pool_key(k.fc1_alpha),
+            epilogue_pool_key(k.fc2_alpha),
+            epilogue_pool_key(k.fc1_norm_const),
+            knobs_pool_key(k.knobs),
+        )

@@ -7,6 +7,16 @@ import flashinfer
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 
 
+def head_dim_512_supported() -> bool:
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+def skip_if_head_dim_unsupported(head_dim: int):
+    if head_dim > 256 and not head_dim_512_supported():
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+
 def build_causal_mask(qo_len, kv_len):
     i = torch.arange(qo_len).unsqueeze(1).to("cuda:0")
     j = torch.arange(kv_len).unsqueeze(0).to("cuda:0")
@@ -104,14 +114,7 @@ def test_sinqle_prefill_with_paged_kv_cache(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("kv_len", [128, 256])
-@pytest.mark.parametrize("qo_len", [64, 128])
-@pytest.mark.parametrize("num_kv_heads", [1])
-@pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
-def test_single_prefill_with_kv_cache_nvfp4(
+def _run_single_prefill_with_kv_cache_nvfp4(
     kv_len,
     qo_len,
     num_kv_heads,
@@ -119,6 +122,7 @@ def test_single_prefill_with_kv_cache_nvfp4(
     head_dim,
     causal,
     q_dtype,
+    pos_encoding_mode="NONE",
 ):
     """Test single_prefill_with_kv_cache with NVFP4 KV cache (contiguous layout).
 
@@ -147,16 +151,76 @@ def test_single_prefill_with_kv_cache_nvfp4(
         k_packed,
         v_packed,
         causal=causal,
-        pos_encoding_mode="NONE",
+        pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=0.0,
         k_scale=k_global_scale.item(),
         v_scale=v_global_scale.item(),
         kv_cache_sf=(k_sf, v_sf),
+        backend="fa2",
     )
 
     o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
-        q, k_dq, v_dq, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        q,
+        k_dq,
+        v_dq,
+        causal=causal,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=0.0,
     )
 
     # NVFP4 is 4-bit; use relaxed tolerance
     torch.testing.assert_close(o, o_ref, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_with_kv_cache_nvfp4(
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    q_dtype,
+):
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len,
+        qo_len,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        causal,
+        q_dtype,
+    )
+
+
+def test_single_prefill_with_kv_cache_nvfp4_large_head():
+    skip_if_head_dim_unsupported(512)
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len=256,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+    )
+
+
+def test_single_prefill_with_kv_cache_nvfp4_rope_large_head():
+    skip_if_head_dim_unsupported(512)
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len=128,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+        pos_encoding_mode="ROPE_LLAMA",
+    )

@@ -21,7 +21,7 @@ FlashInfer's unified AllReduce API (create_allreduce_fusion_workspace +
 allreduce_fusion). Designed to run with mpirun for multi-GPU benchmarking.
 
 Supports backends: trtllm, mnnvl, auto
-Supports patterns: allreduce, ar_residual_rmsnorm
+Supports patterns: allreduce, ar_residual_rmsnorm, ar_residual_rmsnorm_dynamic_fp8
 
 Launch examples:
     # Basic allreduce with auto backend
@@ -87,6 +87,9 @@ except ImportError:
 PATTERN_NAME_TO_CODE = {
     "allreduce": AllReduceFusionPattern.kAllReduce,
     "ar_residual_rmsnorm": AllReduceFusionPattern.kARResidualRMSNorm,
+    "ar_residual_rmsnorm_dynamic_fp8": (
+        AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
+    ),
 }
 
 PATTERN_CODE_TO_NAME = {v: k for k, v in PATTERN_NAME_TO_CODE.items()}
@@ -193,7 +196,10 @@ def _validate_allreduce(
             if rank == 0:
                 print(f"[VALIDATE] AllReduce mismatch: {e}")
 
-    elif pattern_code == AllReduceFusionPattern.kARResidualRMSNorm:
+    elif pattern_code in (
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+    ):
         residual = torch.randn(
             (num_tokens, hidden_size), dtype=input_dtype, device="cuda"
         )
@@ -201,8 +207,8 @@ def _validate_allreduce(
         eps = 1e-5
 
         # Broadcast residual and norm_weight so all ranks have the same data
-        residual_cpu = comm.bcast(residual.cpu().numpy(), root=0)
-        norm_weight_cpu = comm.bcast(norm_weight.cpu().numpy(), root=0)
+        residual_cpu = comm.bcast(residual.cpu().float().numpy(), root=0)
+        norm_weight_cpu = comm.bcast(norm_weight.cpu().float().numpy(), root=0)
         residual = torch.from_numpy(residual_cpu).to(device="cuda", dtype=input_dtype)
         norm_weight = torch.from_numpy(norm_weight_cpu).to(
             device="cuda", dtype=input_dtype
@@ -210,6 +216,13 @@ def _validate_allreduce(
 
         norm_out = torch.empty_like(x_local)
         residual_out = torch.empty_like(x_local)
+        is_dynamic_fp8 = (
+            pattern_code == AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
+        )
+        quant_out = scale_out = None
+        if is_dynamic_fp8:
+            quant_out = torch.empty_like(x_local, dtype=torch.float8_e4m3fn)
+            scale_out = torch.empty(num_tokens, 1, dtype=torch.float32, device="cuda")
 
         allreduce_fusion(
             input=x_local,
@@ -217,7 +230,9 @@ def _validate_allreduce(
             pattern=pattern_code,
             launch_with_pdl=False,
             residual_out=residual_out,
-            norm_out=norm_out,
+            norm_out=None if is_dynamic_fp8 else norm_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
             residual_in=residual,
             rms_gamma=norm_weight,
             rms_eps=eps,
@@ -230,10 +245,33 @@ def _validate_allreduce(
         ref_norm_out = rmsnorm(ref_residual_out, norm_weight, eps, enable_pdl=False)
 
         try:
-            torch.testing.assert_close(norm_out, ref_norm_out, atol=0.15, rtol=0.05)
             torch.testing.assert_close(
                 residual_out, ref_residual_out, atol=0.05, rtol=0.05
             )
+            if is_dynamic_fp8:
+                fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+                min_scale = 1.0 / (fp8_max * 512.0)
+                ref_scale = torch.clamp(
+                    ref_norm_out.float().abs().amax(dim=-1, keepdim=True) / fp8_max,
+                    min=min_scale,
+                )
+                ref_quant = (
+                    (ref_norm_out.float() / ref_scale)
+                    .clamp(
+                        min=float(torch.finfo(torch.float8_e4m3fn).min),
+                        max=float(torch.finfo(torch.float8_e4m3fn).max),
+                    )
+                    .to(torch.float8_e4m3fn)
+                )
+                torch.testing.assert_close(scale_out, ref_scale, atol=1e-3, rtol=1e-3)
+                torch.testing.assert_close(
+                    quant_out.float() * scale_out,
+                    ref_quant.float() * ref_scale,
+                    atol=0.5,
+                    rtol=0.5,
+                )
+            else:
+                torch.testing.assert_close(norm_out, ref_norm_out, atol=0.15, rtol=0.05)
             passed = True
         except AssertionError as e:
             passed = False
@@ -299,11 +337,21 @@ def _benchmark_single_config(
             )
             return output
 
-    elif pattern_code == AllReduceFusionPattern.kARResidualRMSNorm:
+    elif pattern_code in (
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+    ):
         residual = torch.randn_like(x)
         norm_weight = torch.randn((hidden_size,), dtype=input_dtype, device=device)
         norm_out = torch.empty_like(x)
         residual_out = torch.empty_like(x)
+        is_dynamic_fp8 = (
+            pattern_code == AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
+        )
+        quant_out = scale_out = None
+        if is_dynamic_fp8:
+            quant_out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+            scale_out = torch.empty(num_tokens, 1, dtype=torch.float32, device=device)
 
         def run_allreduce(inp):
             allreduce_fusion(
@@ -312,13 +360,15 @@ def _benchmark_single_config(
                 pattern=pattern_code,
                 launch_with_pdl=True,
                 residual_out=residual_out,
-                norm_out=norm_out,
+                norm_out=None if is_dynamic_fp8 else norm_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
                 residual_in=residual,
                 rms_gamma=norm_weight,
                 rms_eps=1e-5,
                 use_oneshot=use_oneshot,
             )
-            return norm_out
+            return quant_out if is_dynamic_fp8 else norm_out
 
     else:
         if rank == 0:
@@ -549,8 +599,12 @@ def test_allreduce_fusion(args):
                 for pattern_name in pattern_list:
                     pattern_code = PATTERN_NAME_TO_CODE[pattern_name]
 
-                    # MNNVL only supports patterns 0 and 1
-                    if workspace.backend == "mnnvl" and pattern_code > 1:
+                    # MNNVL supports allreduce, AR+RMSNorm, and dynamic FP8 AR+RMSNorm.
+                    if workspace.backend == "mnnvl" and pattern_code not in (
+                        AllReduceFusionPattern.kAllReduce,
+                        AllReduceFusionPattern.kARResidualRMSNorm,
+                        AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+                    ):
                         if rank == 0 and args.verbose >= 1:
                             print(
                                 f"[SKIP] MNNVL does not support pattern {pattern_name}"
@@ -558,6 +612,14 @@ def test_allreduce_fusion(args):
                         continue
 
                     for use_oneshot in oneshot_list:
+                        if use_oneshot is False and num_tokens <= world_size:
+                            if rank == 0 and args.verbose >= 1:
+                                print(
+                                    f"[SKIP] twoshot requires num_tokens > world_size; "
+                                    f"num_tokens={num_tokens}, world_size={world_size}"
+                                )
+                            continue
+
                         if rank == 0 and args.verbose >= 1:
                             print(
                                 f"[INFO] Benchmarking: backend={workspace.backend}, "

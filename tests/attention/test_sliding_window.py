@@ -26,13 +26,13 @@ from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
 def head_dim_512_supported() -> bool:
-    # head_dim > 256 is only supported on SM100+.
-    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 8
 
 
 def skip_if_head_dim_unsupported(head_dim: int):
     if head_dim > 256 and not head_dim_512_supported():
-        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
 @pytest.fixture(

@@ -400,20 +400,64 @@ def cute_dsl_fmha_ragged_prefill(
 
     if kernel_fn is None:
         gpu_arch = _get_gpu_arch(q.device)
-        kernel_fn = get_cute_dsl_fmha_kernel(
-            gpu_arch,
-            q.dtype,
-            o.dtype,
-            D,
-            is_causal,
-            is_persistent=False,  # varlen always uses non-persistent
-            varlen=True,
-            enable_tvm_ffi=enable_tvm_ffi,
-            with_lse=lse is not None,
-            enable_skip_softmax=use_skip_softmax,
-            enable_sink=attention_sinks is not None,
-            use_pdl=enable_pdl,
-        )
+        # Q and K feed the same GEMM operand dtype: neither the prebuilt
+        # artifacts nor the JIT compile (single qk_dtype) support q != k.
+        if q.dtype != k.dtype:
+            raise ValueError(
+                f"cute-dsl FMHA requires q.dtype == k.dtype, got {q.dtype} and {k.dtype}"
+            )
+        try:
+            if k.dtype != v.dtype:
+                raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
+            if window_left != -1 or window_right != -1:
+                # The exported artifact matrix has no window axis: every
+                # prebuilt variant is traced with window_size_left=None (and
+                # window_size_right present only for causal), so a windowed
+                # call into one fails the FFI signature check.  The causal
+                # artifact lookup would falsely succeed here — force JIT.
+                raise RuntimeError("windowed DSL FMHA variants are not exported")
+            kernel_fn = get_cute_dsl_fmha_kernel(
+                gpu_arch,
+                q.dtype,
+                o.dtype,
+                D,
+                is_causal,
+                is_persistent=False,  # varlen always uses non-persistent
+                varlen=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+                with_lse=lse is not None,
+                enable_skip_softmax=use_skip_softmax,
+                enable_sink=attention_sinks is not None,
+                use_pdl=enable_pdl,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            # Cubin variant not available / repo unreachable.
+            # JIT-compile the trtllm kernel instead.
+            logger.info(f"DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel.")
+            from flashinfer.cute_dsl.attention.fmha.compile import (
+                compile_cute_dsl_fmha_kernel,
+            )
+
+            kernel_fn = compile_cute_dsl_fmha_kernel(
+                q.dtype,
+                v.dtype,
+                o.dtype,
+                H_q,
+                H_k,
+                D,
+                D_v,
+                is_causal,
+                lse is not None,
+                attention_sinks is not None,
+                use_skip_softmax,
+                enable_pdl,
+                q.device,
+                has_window_left=window_left != -1,
+                has_window_right=is_causal or window_right != -1,
+            )
+            # JIT kernels are compiled with --enable-tvm-ffi; the CuTe-native branch
+            # would not accept them.
+            enable_tvm_ffi = True
 
     # Compute scale factors
     if sm_scale is None:

@@ -367,6 +367,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
                 custom_mask_buf is not None,  # use_custom_mask
                 q_data_type,
                 kv_data_type,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
             )
 
         jit_args = [

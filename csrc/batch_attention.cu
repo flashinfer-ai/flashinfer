@@ -167,6 +167,12 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
           params[i].v_stride_page = v_stride_page;
           params[i].v_stride_h = v_stride_h;
           params[i].v_stride_n = v_stride_n;
+          params[i].k_sf_stride_page = 0;
+          params[i].k_sf_stride_h = 0;
+          params[i].k_sf_stride_n = 0;
+          params[i].v_sf_stride_page = 0;
+          params[i].v_sf_stride_h = 0;
+          params[i].v_sf_stride_n = 0;
 
           params[i].sm_scale = sm_scale;
           params[i].v_scale = v_scale;

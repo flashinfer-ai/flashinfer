@@ -40,7 +40,7 @@ from flashinfer.fused_moe.core import (
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
 from . import utils as moe_utils
-from .test_trtllm_gen_fused_moe import (
+from .trtllm_gen_fused_moe_utils import (
     check_accuracy,
     routing_reference_topk,
 )
