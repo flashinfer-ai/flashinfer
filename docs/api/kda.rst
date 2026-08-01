@@ -1,14 +1,17 @@
-.. _apikda_decode:
+.. _apikda:
 
-flashinfer.kda_decode
-=====================
+flashinfer.kda
+==============
 
-Recurrent Key-Driven Attention (KDA) API. Single-token decode, speculative
+Recurrent Kimi Delta Attention (KDA) API. Single-token decode, speculative
 decode, GQA, state-pool indexing, and checkpoint modes use the CuTe-DSL
 backend under ``flashinfer.kda_kernels``. A strict ordinary multi-token
 prefill subset is dispatched to frozen FlashKDA-compatible SM100a kernels.
 
-.. currentmodule:: flashinfer.kda_decode
+The former ``flashinfer.kda_decode`` module remains as a compatibility import;
+new code should import this phase-neutral module.
+
+.. currentmodule:: flashinfer.kda
 
 .. autosummary::
     :toctree: ../generated

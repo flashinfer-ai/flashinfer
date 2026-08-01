@@ -19,13 +19,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.kda_decode import (
+from flashinfer.kda import (
     RecurrentKDAPrefillWorkspace,
     recurrent_kda,
 )
 from flashinfer.utils import get_compute_capability
 
-kda_api = importlib.import_module("flashinfer.kda_decode")
+kda_api = importlib.import_module("flashinfer.kda")
+
+
+def test_legacy_kda_decode_module_reexports_canonical_api():
+    legacy_api = importlib.import_module("flashinfer.kda_decode")
+
+    assert legacy_api.recurrent_kda is recurrent_kda
+    assert legacy_api.RecurrentKDAPrefillWorkspace is RecurrentKDAPrefillWorkspace
 
 
 def _strict_prefill_kwargs(inputs):

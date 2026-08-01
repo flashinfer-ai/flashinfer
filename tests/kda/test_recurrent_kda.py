@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from flashinfer.utils import is_sm100a_supported
 
 try:
-    from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE, recurrent_kda
+    from flashinfer.kda import _RECURRENT_KDA_AVAILABLE, recurrent_kda
 
     _has_recurrent_kda = _RECURRENT_KDA_AVAILABLE
 except ImportError:

@@ -42,7 +42,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from flashinfer.kda_decode import (
+from flashinfer.kda import (
     RecurrentKDAPrefillWorkspace,
     recurrent_kda,
 )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for recurrent Key-Driven Attention (KDA)."""
+"""TraceTemplate for recurrent Kimi Delta Attention (KDA)."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
@@ -21,7 +21,7 @@ recurrent_kda_trace = TraceTemplate(
     op_type="kda",
     name_prefix="recurrent_kda",
     description=(
-        "Recurrent Key-Driven Attention decode/spec-decode plus exact "
+        "Recurrent Kimi Delta Attention decode/spec-decode plus exact "
         "FlashKDA-compatible ordinary prefill on B200, with "
         "per-key-dimension gating and recurrent BF16 state."
     ),

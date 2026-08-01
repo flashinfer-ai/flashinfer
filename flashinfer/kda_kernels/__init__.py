@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-KDA (Key-Driven Attention) Kernels - CuTe DSL Implementations
+KDA (Kimi Delta Attention) Kernels - CuTe DSL Implementations
 ==============================================================
 
 Per-K-dimension gating variant of GDN. Gate g[B,T,HV,K] applied per-lane
