@@ -105,7 +105,7 @@ import flashinfer.norm
 import flashinfer.sampling
 import flashinfer.gemm
 import flashinfer.gdn_decode
-import flashinfer.kda
+import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
@@ -691,7 +691,7 @@ rk_source = torch.randn(
     rk_B + 2, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device
 )
 rk_source_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
-flashinfer.kda.recurrent_kda(
+flashinfer.kda_decode.recurrent_kda(
     rk_q,
     rk_k,
     rk_v,

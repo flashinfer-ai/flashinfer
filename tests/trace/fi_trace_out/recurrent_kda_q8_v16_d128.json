@@ -3,7 +3,7 @@
   "description": "Recurrent Kimi Delta Attention decode/spec-decode plus exact FlashKDA-compatible ordinary prefill on B200, with per-key-dimension gating and recurrent BF16 state.",
   "op_type": "kda",
   "tags": [
-    "fi_api:flashinfer.kda.recurrent_kda",
+    "fi_api:flashinfer.kda_decode.recurrent_kda",
     "stage:decode",
     "stage:prefill",
     "status:verified"

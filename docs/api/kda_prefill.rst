@@ -1,29 +1,24 @@
-.. _apikda:
+.. _apikda_prefill:
 
-flashinfer.kda
-==============
+flashinfer.kda_prefill
+======================
 
-Recurrent Kimi Delta Attention (KDA) API. Single-token decode, speculative
-decode, GQA, state-pool indexing, and checkpoint modes use the CuTe-DSL
-backend under ``flashinfer.kda_kernels``. A strict ordinary multi-token
-prefill subset is dispatched to frozen FlashKDA-compatible SM100a kernels.
+Optimized recurrent Kimi Delta Attention (KDA) prefill support. The stable
+:func:`flashinfer.kda_decode.recurrent_kda` API dispatches a strict ordinary
+multi-token prefill subset to frozen FlashKDA-compatible SM100a kernels.
 
-The former ``flashinfer.kda_decode`` module remains as a compatibility import;
-new code should import this phase-neutral module.
-
-.. currentmodule:: flashinfer.kda
+.. currentmodule:: flashinfer.kda_prefill
 
 .. autosummary::
     :toctree: ../generated
 
     RecurrentKDAPrefillWorkspace
-    recurrent_kda
 
 Optimized B200 prefill subset
 -----------------------------
 
-``recurrent_kda`` uses the frozen prefill backend only when every condition
-below holds:
+``flashinfer.kda_decode.recurrent_kda`` uses the frozen prefill backend only
+when every condition below holds:
 
 * the device has compute capability 10.0;
 * input is ordinary multi-token prefill: fixed ``T > 1``, or packed input

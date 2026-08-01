@@ -175,7 +175,7 @@ def test_attention_trace_check_tolerances_match_unit_tests():
 
 
 def test_recurrent_kda_fi_trace():
-    import flashinfer.kda
+    import flashinfer.kda_decode
 
     batch_size, num_q_heads, num_v_heads, head_dim = 4, 8, 16, 128
     q = torch.empty(batch_size, 1, num_q_heads, head_dim, dtype=torch.bfloat16)
@@ -191,7 +191,7 @@ def test_recurrent_kda_fi_trace():
     )
     source_indices = torch.arange(batch_size, dtype=torch.int32)
 
-    defn = flashinfer.kda.recurrent_kda.fi_trace(
+    defn = flashinfer.kda_decode.recurrent_kda.fi_trace(
         q=q,
         k=k,
         v=v,
@@ -203,7 +203,7 @@ def test_recurrent_kda_fi_trace():
         beta_is_logit=True,
     )
 
-    _check_defn(defn, "kda", "flashinfer.kda.recurrent_kda")
+    _check_defn(defn, "kda", "flashinfer.kda_decode.recurrent_kda")
     assert defn["inputs"]["initial_state_source"]["shape"] == [
         "source_pool_size",
         "num_v_heads",

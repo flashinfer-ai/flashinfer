@@ -19,20 +19,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.kda import (
-    RecurrentKDAPrefillWorkspace,
-    recurrent_kda,
-)
+import flashinfer
+from flashinfer.kda_decode import recurrent_kda
+from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
-kda_api = importlib.import_module("flashinfer.kda")
+kda_decode_api = importlib.import_module("flashinfer.kda_decode")
+kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 
 
-def test_legacy_kda_decode_module_reexports_canonical_api():
-    legacy_api = importlib.import_module("flashinfer.kda_decode")
-
-    assert legacy_api.recurrent_kda is recurrent_kda
-    assert legacy_api.RecurrentKDAPrefillWorkspace is RecurrentKDAPrefillWorkspace
+def test_public_api_keeps_decode_entry_and_prefill_workspace():
+    assert flashinfer.recurrent_kda is kda_decode_api.recurrent_kda
+    assert (
+        flashinfer.RecurrentKDAPrefillWorkspace
+        is kda_prefill_api.RecurrentKDAPrefillWorkspace
+    )
 
 
 def _strict_prefill_kwargs(inputs):
@@ -179,9 +180,9 @@ def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
         calls.append(kwargs)
         return sentinel
 
-    monkeypatch.setattr(kda_api, "_run_recurrent_kda", old_backend)
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", old_backend)
     monkeypatch.setattr(
-        kda_api,
+        kda_prefill_api,
         "_get_flash_kda_prefill_module",
         lambda variant: pytest.fail(f"unexpected frozen route {variant}"),
     )
@@ -202,10 +203,12 @@ def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
 
 def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
     sentinel = (object(), object())
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
-    monkeypatch.setattr(kda_api, "_run_recurrent_kda", lambda **kwargs: sentinel)
     monkeypatch.setattr(
-        kda_api,
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", lambda **kwargs: sentinel)
+    monkeypatch.setattr(
+        kda_prefill_api,
         "_get_flash_kda_prefill_module",
         lambda variant: pytest.fail(f"unexpected frozen route {variant}"),
     )
@@ -238,15 +241,17 @@ def test_frozen_route_and_ffi_abi(
     num_heads,
     expected_variant,
 ):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
-    monkeypatch.setattr(kda_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
     modules = {}
 
     def get_module(variant):
         modules.setdefault(variant, _RecorderModule())
         return modules[variant]
 
-    monkeypatch.setattr(kda_api, "_get_flash_kda_prefill_module", get_module)
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
     inputs = _make_inputs(
         seq_lens=[1, 2] if packed else [2],
         num_heads=num_heads,
@@ -295,10 +300,12 @@ def test_frozen_route_and_ffi_abi(
 
 
 def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule()
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     stream = torch.cuda.Stream(device=cuda_device)
@@ -313,10 +320,12 @@ def test_frozen_route_passes_nondefault_stream(cuda_device, monkeypatch):
 
 
 def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule()
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     with pytest.raises(ValueError, match="output must not overlap q"):
@@ -328,10 +337,12 @@ def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
 
 
 def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule(final_value=0.25)
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False, initial_state=True)
     original_state = inputs["initial_state"]
@@ -356,11 +367,13 @@ def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):
 def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
     cuda_device, monkeypatch
 ):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
-    monkeypatch.setattr(kda_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
     module = _RecorderModule(final_value=0.0)
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     cases = [
         _make_inputs(
@@ -388,8 +401,8 @@ def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
             output=torch.empty_like(inputs["q"]),
         )
 
-    assert len(kda_api._flash_kda_stream_workspaces) == 1
-    (workspace,) = kda_api._flash_kda_stream_workspaces.values()
+    assert len(kda_prefill_api._flash_kda_stream_workspaces) == 1
+    (workspace,) = kda_prefill_api._flash_kda_stream_workspaces.values()
     assert workspace._state_scratch is None
     assert workspace._beta_padding.numel() == 32 * 8
 
@@ -399,9 +412,11 @@ def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
     [(torch.int64, 0), (torch.int32, 1)],
 )
 def test_packed_seq_order_validation(cuda_device, monkeypatch, dtype, size_delta):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(
-        kda_api,
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
         "_get_flash_kda_prefill_module",
         lambda variant: _RecorderModule(),
     )
@@ -412,7 +427,9 @@ def test_packed_seq_order_validation(cuda_device, monkeypatch, dtype, size_delta
 
 
 def test_fixed_prefill_rejects_seq_order(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     with pytest.raises(ValueError, match="only supported for packed"):
         recurrent_kda(
@@ -422,7 +439,9 @@ def test_fixed_prefill_rejects_seq_order(cuda_device, monkeypatch):
 
 
 def test_graph_capture_requires_packed_int64_offsets(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     inputs = _make_inputs(seq_lens=[1, 2], num_heads=2, packed=True)
     inputs["cu_seqlens"] = inputs["cu_seqlens"].to(torch.int32)
@@ -435,7 +454,9 @@ def test_graph_capture_requires_packed_int64_offsets(cuda_device, monkeypatch):
 
 
 def test_graph_capture_requires_explicit_workspace(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     with pytest.raises(
@@ -448,10 +469,12 @@ def test_graph_capture_requires_explicit_workspace(cuda_device, monkeypatch):
 
 
 def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule()
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     output = torch.empty_like(inputs["q"])
@@ -482,10 +505,12 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
 def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
     cuda_device, monkeypatch
 ):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule()
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     output = torch.empty_like(inputs["q"])
@@ -529,10 +554,12 @@ def test_captured_workspace_rejects_eager_reuse_and_capture_mismatch(
 
 
 def test_workspace_rejects_a_different_stream(cuda_device, monkeypatch):
-    monkeypatch.setattr(kda_api, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
     module = _RecorderModule()
     monkeypatch.setattr(
-        kda_api, "_get_flash_kda_prefill_module", lambda variant: module
+        kda_prefill_api, "_get_flash_kda_prefill_module", lambda variant: module
     )
     inputs = _make_inputs(seq_lens=[2], num_heads=2, packed=False)
     output = torch.empty_like(inputs["q"])
