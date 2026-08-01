@@ -72,6 +72,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_head_dim,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1543,6 +1544,8 @@ def single_prefill_with_kv_cache(
         else v.shape[-1]
     )
 
+    _check_head_dim(q.shape[-1], out_head_dim)
+
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -2463,6 +2466,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -2743,6 +2747,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
 
@@ -4288,6 +4293,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        _check_head_dim(head_dim_qk, head_dim_vo)
         if fixed_split_size is None:
             fixed_split_size = -1
         if logits_soft_cap is None:
