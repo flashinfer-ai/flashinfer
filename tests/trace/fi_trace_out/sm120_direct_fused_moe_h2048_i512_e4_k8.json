@@ -1,5 +1,5 @@
 {
-  "name": "sm120_direct_fused_moe_h2048_i512_e4_eg16_k8",
+  "name": "sm120_direct_fused_moe_h2048_i512_e4_k8",
   "description": "SM120 BF16 low-token pre-routed SwiGLU MoE with optional global-to-local expert mapping and FP32 top-k accumulation.",
   "op_type": "moe",
   "tags": [
@@ -27,8 +27,7 @@
       "value": 4
     },
     "num_global_experts": {
-      "type": "const",
-      "value": 16
+      "type": "var"
     },
     "topk": {
       "type": "const",
@@ -39,7 +38,9 @@
     "1 <= num_tokens <= 8",
     "1 <= topk <= 8",
     "hidden_size % 8 == 0",
-    "intermediate_size % 8 == 0"
+    "intermediate_size % 8 == 0",
+    "hidden_size <= 8192",
+    "intermediate_size <= 1024"
   ],
   "inputs": {
     "hidden_states": {

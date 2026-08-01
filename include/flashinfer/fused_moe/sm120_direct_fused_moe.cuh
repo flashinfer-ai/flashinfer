@@ -43,6 +43,10 @@ struct Sm120DirectFusedMoeParams {
 
 namespace detail {
 
+constexpr int kWarpSize = 32;
+constexpr int kVectorElements = 8;
+constexpr int kWarpVectorStride = kWarpSize * kVectorElements;
+
 __device__ __forceinline__ float WarpReduceSum(float value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -137,8 +141,8 @@ __global__ void GateUpSwiGLUKernel(const __nv_bfloat16* __restrict__ hidden_stat
 
   float gate[kOutputs] = {};
   float up[kOutputs] = {};
-  const int hidden_vector_end = hidden_size & ~7;
-  for (int index = lane * 8; index < hidden_vector_end; index += 256) {
+  const int hidden_vector_end = hidden_size - hidden_size % kVectorElements;
+  for (int index = lane * kVectorElements; index < hidden_vector_end; index += kWarpVectorStride) {
     const Float8 activation = LoadBFloat16x8(shared_hidden + index);
 #pragma unroll
     for (int output_index = 0; output_index < kOutputs; ++output_index) {
@@ -167,6 +171,7 @@ __global__ void GateUpSwiGLUKernel(const __nv_bfloat16* __restrict__ hidden_stat
       }
     }
   }
+  // Defensive tail handling; the launcher currently requires hidden_size % 8 == 0.
   for (int index = hidden_vector_end + lane; index < hidden_size; index += 32) {
     const float activation = LoadBFloat16(shared_hidden + index);
 #pragma unroll
@@ -249,8 +254,9 @@ __global__ void DownFusedTopKKernel(
         shared_intermediate + static_cast<int64_t>(slot) * intermediate_size;
     const __nv_bfloat16* weight_base = gemm2_weights + static_cast<int64_t>(expert) * expert_stride;
     float result[kOutputs] = {};
-    const int intermediate_vector_end = intermediate_size & ~7;
-    for (int index = lane * 8; index < intermediate_vector_end; index += 256) {
+    const int intermediate_vector_end = intermediate_size - intermediate_size % kVectorElements;
+    for (int index = lane * kVectorElements; index < intermediate_vector_end;
+         index += kWarpVectorStride) {
       const Float8 activation = LoadBFloat16x8(input_row + index);
 #pragma unroll
       for (int output_index = 0; output_index < kOutputs; ++output_index) {
@@ -269,6 +275,7 @@ __global__ void DownFusedTopKKernel(
         }
       }
     }
+    // Defensive tail handling; the launcher currently requires intermediate_size % 8 == 0.
     for (int index = intermediate_vector_end + lane; index < intermediate_size; index += 32) {
       const float activation = LoadBFloat16(input_row + index);
 #pragma unroll

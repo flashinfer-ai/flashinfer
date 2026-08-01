@@ -86,9 +86,10 @@ def sm120_direct_fused_moe_workspace(
 def _recommended_launch(
     num_tokens: int, hidden_size: int, intermediate_size: int
 ) -> tuple[int, int]:
+    """Return the tuned launch policy or a conservative default."""
     policy = _TUNED_LAUNCHES.get((hidden_size, intermediate_size))
     if policy is not None:
-        return policy[num_tokens]
+        return policy.get(num_tokens, (1, 256))
     return 1, 256
 
 
@@ -100,6 +101,7 @@ def _check_tensor(
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
+    """Validate the common tensor requirements for the direct kernel."""
     if tensor.ndim != ndim:
         raise ValueError(f"{name} must be {ndim}D, got shape={tuple(tensor.shape)}")
     if tensor.dtype != dtype:
@@ -126,6 +128,7 @@ def _check_sm120_direct_fused_moe_supported(
     outputs_per_warp: Optional[int] = None,
     num_threads: Optional[int] = None,
 ) -> bool:
+    """Validate SM120 support, input shapes, dtypes, and launch overrides."""
     if hidden_states.ndim != 2:
         raise ValueError(
             "hidden_states must be 2D [num_tokens, hidden_size], "
@@ -249,6 +252,7 @@ def get_sm120_direct_fused_moe_module():
         outputs_per_warp: int,
         num_threads: int,
     ) -> None:
+        """Invoke the TVM-FFI entry point through a registered custom op."""
         module.sm120_direct_fused_moe(
             hidden_states,
             topk_ids,
@@ -292,7 +296,9 @@ def sm120_direct_fused_moe(
 
     Pass reusable ``output`` and ``workspace`` tensors to make execution
     allocation-free and CUDA Graph safe. If omitted, the output is allocated
-    and a process-local cached workspace is used.
+    and a process-local cached workspace is used. A later, larger request can
+    replace that cached buffer, so CUDA Graph callers should always provide an
+    explicit ``workspace`` whose address remains stable across replays.
 
     Parameters
     ----------
@@ -312,7 +318,9 @@ def sm120_direct_fused_moe(
     output : torch.Tensor, optional
         Reusable BF16 output buffer with shape ``[num_tokens, hidden_size]``.
     workspace : torch.Tensor, optional
-        Reusable BF16 buffer with shape ``[num_tokens * topk, I]``.
+        Reusable BF16 buffer with shape ``[num_tokens * topk, I]``. Pass this
+        explicitly when capturing a CUDA Graph to avoid cached-buffer
+        reallocation invalidating the captured address.
     outputs_per_warp, num_threads : int, optional
         Launch overrides. Defaults use measured SM120 policies for
         ``H=2048, I in {512, 768}`` and a conservative fallback otherwise.

@@ -33,6 +33,7 @@ PRESETS = {
 
 
 def _bench(fn, warmup: int, iterations: int) -> float:
+    """Measure one CUDA Graph replay path and return latency in microseconds."""
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -56,6 +57,7 @@ def _bench(fn, warmup: int, iterations: int) -> float:
 
 
 def main() -> None:
+    """Run the direct-kernel and CUTLASS comparison for all supported M."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", choices=PRESETS, default="qwen")
     parser.add_argument("--warmup", type=int, default=100)
@@ -68,6 +70,10 @@ def main() -> None:
         help="build CUTLASS from this checkout instead of loading an installed AOT cache",
     )
     args = parser.parse_args()
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations <= 0:
+        parser.error("--iterations must be positive")
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("bench_sm120_direct_fused_moe requires SM120")
@@ -121,6 +127,7 @@ def main() -> None:
     for num_tokens in range(1, 9):
 
         def run_direct():
+            """Run the direct SM120 kernel for the current token count."""
             return sm120_direct_fused_moe(
                 hidden_states[:num_tokens],
                 topk_ids[:num_tokens],
@@ -134,6 +141,7 @@ def main() -> None:
             )
 
         def run_cutlass():
+            """Run the CUTLASS baseline for the current token count."""
             return cutlass_fused_moe(
                 input=hidden_states[:num_tokens],
                 token_selected_experts=topk_ids[:num_tokens],

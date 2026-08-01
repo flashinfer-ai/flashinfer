@@ -88,11 +88,16 @@ void Sm120DirectFusedMoe(TensorView hidden_states, TensorView topk_ids, TensorVi
       << "expert_map must be empty or a global-to-local map";
 
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
-  cudaDeviceProp properties;
-  cudaError_t status = cudaGetDeviceProperties(&properties, hidden_states.device().device_id);
+  const int device_id = hidden_states.device().device_id;
+  int major = 0;
+  int minor = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "cudaGetDeviceProperties failed: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(properties.major == 12 && properties.minor == 0)
+      << "cudaDeviceGetAttribute(ComputeCapabilityMajor) failed: " << cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cudaDeviceGetAttribute(ComputeCapabilityMinor) failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(major == 12 && minor == 0)
       << "sm120_direct_fused_moe requires compute capability 12.0";
 
   const Sm120DirectFusedMoeParams params{

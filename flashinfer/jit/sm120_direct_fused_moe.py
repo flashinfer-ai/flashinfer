@@ -34,10 +34,5 @@ def gen_sm120_direct_fused_moe_module() -> JitSpec:
             / "fused_moe"
             / "sm120_direct_fused_moe_jit_binding.cu",
         ],
-        extra_cuda_cflags=[
-            *nvcc_flags,
-            "-DFLASHINFER_ENABLE_BF16",
-            "--use_fast_math",
-            "-lineinfo",
-        ],
+        extra_cuda_cflags=nvcc_flags,
     )

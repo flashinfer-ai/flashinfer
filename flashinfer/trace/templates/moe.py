@@ -4089,7 +4089,8 @@ sm120_direct_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Const(abbrev="i"),
         "num_local_experts": Const(abbrev="e"),
-        "num_global_experts": Const(abbrev="eg"),
+        # This dimension is sourced only from the optional expert_map input.
+        "num_global_experts": Var(),
         "topk": Const(abbrev="k"),
     },
     inputs={
@@ -4119,6 +4120,8 @@ sm120_direct_fused_moe_trace = TraceTemplate(
         "1 <= topk <= 8",
         "hidden_size % 8 == 0",
         "intermediate_size % 8 == 0",
+        "hidden_size <= 8192",
+        "intermediate_size <= 1024",
     ],
     tags=["status:verified", "backend:sm120", "moe", "dtype:bf16"],
     reference=_sm120_direct_fused_moe_reference,

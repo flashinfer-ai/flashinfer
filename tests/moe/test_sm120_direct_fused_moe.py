@@ -9,10 +9,11 @@ from flashinfer.fused_moe import (
     sm120_direct_fused_moe_workspace,
 )
 from flashinfer.trace.templates.moe import sm120_direct_fused_moe_trace
+from flashinfer.utils import is_sm120a_supported
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    not torch.cuda.is_available() or not is_sm120a_supported(torch.device("cuda")),
     reason="sm120_direct_fused_moe requires SM120",
 )
 
@@ -197,10 +198,24 @@ def test_sm120_direct_fused_moe_trace_schema():
         "description": "Decode batch size in [1, 8].",
     }
     assert definition["axes"]["hidden_size"]["value"] == 2048
+    assert definition["axes"]["num_global_experts"] == {"type": "var"}
     assert definition["outputs"]["output"]["shape"] == [
         "num_tokens",
         "hidden_size",
     ]
+
+
+def test_sm120_direct_fused_moe_trace_schema_without_expert_map():
+    args = _make_case(2, 512)
+    definition = sm120_direct_fused_moe.fi_trace(
+        hidden_states=args[0],
+        topk_ids=args[1],
+        topk_weights=args[2],
+        gemm1_weights=args[3],
+        gemm2_weights=args[4],
+    )
+    assert definition["axes"]["num_global_experts"] == {"type": "var"}
+    assert definition["name"] == "sm120_direct_fused_moe_h2048_i512_e4_k8"
 
 
 def test_sm120_direct_fused_moe_trace_reference():
