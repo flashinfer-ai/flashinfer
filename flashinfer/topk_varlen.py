@@ -186,6 +186,35 @@ if _CUTE_DSL_AVAILABLE:
 
 
 @functools.cache
+def _gvr_kernel_source_files() -> Tuple[str, ...]:
+    # All source files whose content the compiled GVR kernels depend on, so a
+    # change to any of them invalidates the persistent CuTe-DSL cache. The three
+    # _compile_gvr* helpers share the "gvr_topk" module directory, so they MUST
+    # pass an identical (union) key here — the key is module-level, and a
+    # per-function subset would let one helper's build serve another's stale
+    # artifact. GvrTopKLBKernel/GvrTopKLBPrepareKernel live in
+    # gvr_topk_decode_lb.py, which imports GvrTopKKernel from gvr_topk_decode.py;
+    # both decode modules pull warp_scan/block_prefix_sum from block_scan.py.
+    from .cute_dsl.top_k import gvr_topk_decode, gvr_topk_decode_lb, block_scan
+
+    return (
+        __file__,
+        gvr_topk_decode.__file__,
+        gvr_topk_decode_lb.__file__,
+        block_scan.__file__,
+    )
+
+
+@functools.cache
+def _radix_kernel_source_files() -> Tuple[str, ...]:
+    # radix_topk.py defines SinglePassMultiCTARadixTopKKernel and pulls
+    # block_prefix_sum_kernel from block_scan.py; both invalidate the cache.
+    from .cute_dsl.top_k import radix_topk, block_scan
+
+    return (__file__, radix_topk.__file__, block_scan.__file__)
+
+
+@functools.cache
 def _compile_gvr_lb_prepare(num_threads: int, long_threshold: int, compress_ratio: int):
     # batch_size (the seq_lens length) is DYNAMIC: it is passed as a runtime scalar
     # (cutlass.Int32(batch_size)) and only bounds the classifier's per-thread guard
@@ -193,24 +222,37 @@ def _compile_gvr_lb_prepare(num_threads: int, long_threshold: int, compress_rati
     # the grid is fixed (1,1,1). So seq_lens is compiled with a symbolic length and
     # one kernel serves every batch size. num_threads stays static (it sizes the
     # order_row buffer and the block-prefix-sum SMEM); counters is constant (2,).
+    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
     prep = GvrTopKLBPrepareKernel(
         long_threshold=long_threshold,
         compress_ratio=compress_ratio,
         num_threads=num_threads,
     )
     sym_batch = cute.sym_int()
-    return cute.compile(
-        prep,
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_batch,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (num_threads,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
-        cutlass.Int32(0),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+
+    def _compile_fn():
+        return cute.compile(
+            prep,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_batch,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (num_threads,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (2,), stride_order=(0,)
+            ),
+            cutlass.Int32(0),
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    return build_and_load_cute_dsl_kernel(
+        "gvr_topk",
+        f"lb_prepare_nt{num_threads}_lt{long_threshold}_cr{compress_ratio}",
+        _compile_fn,
+        extra_key_files=_gvr_kernel_source_files(),
     )
 
 
@@ -254,34 +296,58 @@ def _compile_gvr_lb(
         enable_phase3_unroll=enable_phase3_unroll,
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
     )
+    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
     sym_rows = sym_groups * next_n
-    return cute.compile(
-        kernel,
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_groups,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+
+    dtype_name = str(cute_dtype).split(".")[-1]
+    kernel_name = (
+        f"lb_{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
+        f"_bs{max_batch_size}_nt{num_threads}_cl{cluster_size}_rv{int(return_output_values)}"
+        f"_mbpm{min_blocks_per_mp}_256b{int(use_256bit_load)}_u4{int(enable_unroll_4)}"
+        f"_p3u{int(enable_phase3_unroll)}_wpr{int(enable_warp_parallel_reduce)}"
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (sym_groups, top_k),
+                stride_order=(1, 0),
+                assumed_align=16,
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_output_values
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (max_batch_size,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (2,), stride_order=(0,)
+            ),
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-        if return_output_values
-        else None,
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (max_batch_size,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(cutlass.Int32, (2,), stride_order=(0,)),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+
+    return build_and_load_cute_dsl_kernel(
+        "gvr_topk",
+        kernel_name,
+        _compile_fn,
+        extra_key_files=_gvr_kernel_source_files(),
     )
 
 
@@ -328,33 +394,55 @@ def _compile_gvr(
         use_constant_hint=False,
         seqlen_sorted=True,
     )
+    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
     sym_rows = sym_groups * next_n
-    return cute.compile(
-        kernel,
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_groups, top_k), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_groups,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+
+    dtype_name = str(cute_dtype).split(".")[-1]
+    kernel_name = (
+        f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
+        f"_nt{num_threads}_rv{int(return_output_values)}"
+        f"_mbpm{min_blocks_per_mp}_256b{int(use_256bit_load)}_u4{int(enable_unroll_4)}"
+        f"_p3u{int(enable_phase3_unroll)}_wpr{int(enable_warp_parallel_reduce)}"
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (sym_groups, top_k),
+                stride_order=(1, 0),
+                assumed_align=16,
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_output_values
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(  # order_row: request-level LJF order
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-        if return_output_values
-        else None,
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(  # order_row: request-level LJF order
-            cutlass.Int32, (sym_groups,), stride_order=(0,)
-        ),
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+
+    return build_and_load_cute_dsl_kernel(
+        "gvr_topk",
+        kernel_name,
+        _compile_fn,
+        extra_key_files=_gvr_kernel_source_files(),
     )
 
 
@@ -478,6 +566,8 @@ def _compile_radix(
     # num_rows (batch) and sym_groups are dynamic — one compiled kernel serves all
     # batch sizes at this (dtype, top_k, N, ctas_per_group, chunk_size) specialization.
     # compress_ratio is a const_expr in the kernel so it is a cache key here too.
+    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
     kernel = SinglePassMultiCTARadixTopKKernel(
         dtype=cute_dtype,
         chunk_size=chunk_size,
@@ -491,27 +581,42 @@ def _compile_radix(
     sym_n = N  # static vocab width
     sym_rows = sym_groups * next_n
     max_num_groups = max(1, num_sms // ctas_per_group)
-    return cute.compile(
-        kernel,
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (max_num_groups, _RADIX_STATE_SIZE), stride_order=(1, 0)
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_groups,), stride_order=(0,)
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
-        ),
-        cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+
+    dtype_name = str(cute_dtype).split(".")[-1]
+    kernel_name = (
+        f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
+        f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (max_num_groups, _RADIX_STATE_SIZE), stride_order=(1, 0)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_output_values
+            else None,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-        if return_output_values
-        else None,
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+
+    return build_and_load_cute_dsl_kernel(
+        "radix_topk",
+        kernel_name,
+        _compile_fn,
+        extra_key_files=_radix_kernel_source_files(),
     )
 
 
