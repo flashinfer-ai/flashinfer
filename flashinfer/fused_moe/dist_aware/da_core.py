@@ -16,6 +16,7 @@ from ...autotuner import (
     OptimizationProfile,
     StaticDim,
     TuningConfig,
+    ValueGenerationContext,
 )
 from ...tllm_enums import DtypeTrtllmGen
 from ..utils import make_random_topk_ids, map_to_hybrid_bucket
@@ -242,7 +243,7 @@ def switch_tile_sizes(
 
 
 def _subset_value_tensor_generator(
-    bucket_id: int, profiled_tensor: torch.Tensor, original_tensor: torch.Tensor
+    context: ValueGenerationContext,
 ) -> torch.Tensor:
     """Resize caller routing values along the token axis for a tuning profile.
 
@@ -252,7 +253,8 @@ def _subset_value_tensor_generator(
     """
 
     # The bucket marks profile provenance; it must not replace caller routing values.
-    del bucket_id
+    profiled_tensor = context.profiled
+    original_tensor = context.original
     if not isinstance(original_tensor, torch.Tensor):
         return profiled_tensor
     if profiled_tensor.shape == original_tensor.shape:
@@ -279,20 +281,13 @@ class DADistributionTensorGenerator:
             tuple[int, int, int, torch.device], torch.Tensor
         ] = {}
 
-    def __call__(
-        self,
-        bucket_id: int,
-        profiled_tensor: torch.Tensor,
-        original_tensor: torch.Tensor,
-        inputs: list[torch.Tensor],
-        sample_index: int = 0,
-    ) -> torch.Tensor:
+    def __call__(self, context: ValueGenerationContext) -> torch.Tensor:
+        bucket_id = context.bucket
+        profiled_tensor = context.profiled
+        original_tensor = context.original
+        sample_index = context.sample_index or 0
         if int(bucket_id) == DEFAULT_PROFILE_VALUE_BUCKET:
-            caller_values = _subset_value_tensor_generator(
-                bucket_id,
-                profiled_tensor,
-                original_tensor,
-            )
+            caller_values = _subset_value_tensor_generator(context)
             if caller_values is not profiled_tensor:
                 return caller_values
             call = self.execution.invocation
@@ -318,7 +313,6 @@ class DADistributionTensorGenerator:
                     dtype=profiled_tensor.dtype
                 )
             return profiled_tensor
-        del original_tensor, inputs
         call = self.execution.invocation
         dist = da_profile.active_auto_distributions(self.execution.config)[
             int(bucket_id)

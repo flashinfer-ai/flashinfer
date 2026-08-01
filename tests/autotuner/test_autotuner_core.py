@@ -38,8 +38,11 @@ from flashinfer.autotuner import (
     ConstraintSpec,
     DynamicTensorSpec,
     DynamicValueSpec,
+    OptimizationProfile,
+    StaticDim,
     TuningConfig,
     TunableRunner,
+    ValueGenerationContext,
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
@@ -130,9 +133,9 @@ def test_value_aware_tuning_reuses_arena_lanes_for_each_profile(monkeypatch):
     route_stager = object()
     sample_indices = []
 
-    def _sample_generator(value, tensor, _original, _inputs, sample_idx):
-        sample_indices.append(sample_idx)
-        return torch.full_like(tensor, value + 2)
+    def _sample_generator(context: ValueGenerationContext):
+        sample_indices.append(context.sample_index)
+        return torch.full_like(context.profiled, context.bucket + 2)
 
     config = TuningConfig(
         dynamic_tensor_specs=(
@@ -151,8 +154,8 @@ def test_value_aware_tuning_reuses_arena_lanes_for_each_profile(monkeypatch):
                         input_idx=0,
                         gen_value_buckets=(0, 1),
                         map_to_value_bucket=lambda _tensor: 0,
-                        tensor_value_generator=lambda value, tensor: torch.full_like(
-                            tensor, value
+                        tensor_value_generator=lambda context: torch.full_like(
+                            context.profiled, context.bucket
                         ),
                         sample_value_generator=_sample_generator,
                         sample_value_stager=route_stager,
@@ -853,10 +856,10 @@ def test_value_profile_autotune_replays_cuda_values_numerically(monkeypatch, tmp
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4096)
     runner = NumericalValueProfileRunner()
 
-    def sample_value_generator(bucket, profiled, _original, _inputs, sample_index):
+    def sample_value_generator(context: ValueGenerationContext):
         return torch.full_like(
-            profiled,
-            bucket + sample_index / 8,
+            context.profiled,
+            context.bucket + context.sample_index / 8,
             device="cpu",
         )
 
@@ -877,8 +880,8 @@ def test_value_profile_autotune_replays_cuda_values_numerically(monkeypatch, tmp
                         input_idx=0,
                         gen_value_buckets=(0, 1),
                         map_to_value_bucket=lambda tensor: int(tensor[0].item()),
-                        tensor_value_generator=lambda bucket, profiled: torch.full_like(
-                            profiled, bucket
+                        tensor_value_generator=lambda context: torch.full_like(
+                            context.profiled, context.bucket
                         ),
                         sample_value_generator=sample_value_generator,
                         sample_value_stager=HostValueStager(),
@@ -1049,8 +1052,8 @@ def test_value_specs_are_attached_to_dynamic_tensor_spec(monkeypatch):
                         input_idx=0,
                         gen_value_buckets=(10, 20),
                         map_to_value_bucket=lambda tensor: int(tensor[0].item()),
-                        tensor_value_generator=lambda bucket, profiled: torch.full_like(
-                            profiled, bucket
+                        tensor_value_generator=lambda context: torch.full_like(
+                            context.profiled, context.bucket
                         ),
                     ),
                 ),
@@ -1074,6 +1077,102 @@ def test_value_specs_are_attached_to_dynamic_tensor_spec(monkeypatch):
     assert torch.all(prepared[0] == profiles[0].value_buckets[0])
 
 
+def test_dynamic_value_spec_validates_callbacks_once(monkeypatch):
+    """Dispatch and profiling invoke fixed callbacks without introspection."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+
+    def map_with_context(tensor, inputs, kwargs):
+        assert tensor is inputs[0]
+        return kwargs["bucket"]
+
+    def tensor_generator(context: ValueGenerationContext):
+        assert context.original is context.inputs[0]
+        assert context.sample_index is None
+        return torch.full_like(context.profiled, context.bucket)
+
+    def sample_generator(context: ValueGenerationContext):
+        assert context.original is context.inputs[0]
+        return torch.full_like(context.profiled, context.bucket + context.sample_index)
+
+    context_spec = DynamicValueSpec(
+        input_idx=0,
+        gen_value_buckets=(3,),
+        map_to_value_bucket=map_with_context,
+        tensor_value_generator=tensor_generator,
+        sample_value_generator=sample_generator,
+    )
+    simple_spec = DynamicValueSpec(
+        input_idx=0,
+        gen_value_buckets=(5,),
+        map_to_value_bucket=lambda _tensor: 5,
+        tensor_value_generator=lambda context: torch.full_like(
+            context.profiled, context.bucket
+        ),
+    )
+
+    def fail_signature(_callable):
+        raise AssertionError("callback signatures must be precomputed")
+
+    monkeypatch.setattr(autotuner_module.inspect, "signature", fail_signature)
+    inputs = [torch.zeros((4,), dtype=torch.int32)]
+    assert AutoTuner._map_dynamic_value_bucket(context_spec, inputs, {"bucket": 3}) == 3
+    assert AutoTuner._map_dynamic_value_bucket(simple_spec, inputs, {}) == 5
+    assert torch.equal(
+        context_spec.generate_sample_value(3, inputs[0], inputs[0], inputs, 2),
+        torch.full_like(inputs[0], 5),
+    )
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4,),
+                map_to_tuning_buckets=lambda size: size,
+                value_specs=(context_spec,),
+            ),
+        )
+    )
+    profile = OptimizationProfile(
+        shapes=[[StaticDim(4)]],
+        tensor_initializers=[None],
+        value_buckets=(3,),
+    )
+    profiled = [torch.zeros_like(inputs[0])]
+    AutoTuner._apply_value_specs(profile, profiled, inputs, config)
+    assert torch.equal(profiled[0], torch.full_like(profiled[0], 3))
+
+
+@pytest.mark.parametrize(
+    ("field", "callback"),
+    [
+        ("map_to_value_bucket", lambda _tensor, _inputs: 0),
+        ("map_to_value_bucket", lambda _tensor, _inputs, _kwargs, _extra: 0),
+        ("tensor_value_generator", lambda: None),
+        (
+            "tensor_value_generator",
+            lambda _context, _extra: None,
+        ),
+        ("sample_value_generator", lambda: None),
+        (
+            "sample_value_generator",
+            lambda _context, _extra: None,
+        ),
+    ],
+)
+def test_dynamic_value_spec_rejects_unsupported_arities(field, callback):
+    """Callbacks fail at construction unless their arity is exact."""
+    kwargs = {
+        "input_idx": 0,
+        "gen_value_buckets": (0,),
+        "map_to_value_bucket": lambda _tensor: 0,
+        "tensor_value_generator": lambda context: context.profiled,
+    }
+    kwargs[field] = callback
+    with pytest.raises(TypeError, match="must accept exactly one of"):
+        DynamicValueSpec(**kwargs)
+
+
 def test_empty_profile_dependent_value_spec_does_not_create_partial_key(monkeypatch):
     """A profile unsupported by one value axis remains shape-only."""
     monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
@@ -1092,13 +1191,13 @@ def test_empty_profile_dependent_value_spec_does_not_create_partial_key(monkeypa
                             (16, 32) if profile.get_opt_shapes()[0][0] >= 8 else ()
                         ),
                         map_to_value_bucket=lambda _tensor: 16,
-                        tensor_value_generator=lambda _bucket, tensor: tensor,
+                        tensor_value_generator=lambda context: context.profiled,
                     ),
                     DynamicValueSpec(
                         input_idx=0,
                         gen_value_buckets=(0, 1),
                         map_to_value_bucket=lambda _tensor: 0,
-                        tensor_value_generator=lambda _bucket, tensor: tensor,
+                        tensor_value_generator=lambda context: context.profiled,
                     ),
                 ),
             ),
@@ -1144,13 +1243,10 @@ def test_default_value_profile_uses_original_values_and_publishes_shape_cache(
                         input_idx=0,
                         gen_value_buckets=(0, 1),
                         map_to_value_bucket=lambda _tensor: 0,
-                        tensor_value_generator=lambda bucket,
-                        profiled,
-                        original,
-                        _inputs: (
-                            original
-                            if bucket == -1
-                            else torch.full_like(profiled, bucket)
+                        tensor_value_generator=lambda context: (
+                            context.original
+                            if context.bucket == -1
+                            else torch.full_like(context.profiled, context.bucket)
                         ),
                     ),
                 ),
@@ -1219,6 +1315,13 @@ def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatc
                 raise ValueError("force exhaustive fallback")
             return (32, 3)
 
+        def get_measurement_only_tactics(self, default_tactic, _inputs, profile):
+            return (
+                [default_tactic]
+                if default_tactic[0] == profile.value_buckets[0]
+                else []
+            )
+
     runner = FactorizedRunner()
     config = TuningConfig(
         dynamic_tensor_specs=(
@@ -1232,10 +1335,10 @@ def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatc
                         input_idx=0,
                         gen_value_buckets=(32, 64),
                         map_to_value_bucket=lambda _tensor: 32,
-                        tensor_value_generator=lambda bucket, profiled, original: (
-                            original
-                            if bucket == -1
-                            else torch.full_like(profiled, bucket)
+                        tensor_value_generator=lambda context: (
+                            context.original
+                            if context.bucket == -1
+                            else torch.full_like(context.profiled, context.bucket)
                         ),
                     ),
                 ),
@@ -1302,6 +1405,74 @@ def test_factorized_value_profile_retains_fixed_default_tactic_timing(monkeypatc
     assert tactic_calls[(64, (32, 3))] == 6
 
 
+def test_factorized_measurement_only_tactics_are_runner_owned(monkeypatch):
+    """The core tuner never interprets opaque tactic or value-bucket layouts."""
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    tuner = reset_autotuner()
+
+    class OpaqueFactorizedRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=("baseline",))
+            self.hook_calls = []
+
+        def get_tactic_groups(self, _inputs, profile):
+            if profile.value_buckets == ("default",):
+                return None
+            return [["left"], ["right"]]
+
+        def compose_tactics(self, _group_winners, _inputs, _profile):
+            return "composed"
+
+        def get_valid_tactics(self, _inputs, profile):
+            if profile.value_buckets == ("default",):
+                return ["baseline"]
+            return ["left", "right"]
+
+        def get_measurement_only_tactics(self, default_tactic, _inputs, profile):
+            self.hook_calls.append((default_tactic, profile.value_buckets))
+            return [default_tactic]
+
+    runner = OpaqueFactorizedRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4,),
+                map_to_tuning_buckets=lambda size: size,
+                value_specs=(
+                    DynamicValueSpec(
+                        input_idx=0,
+                        gen_value_buckets=("skewed",),
+                        map_to_value_bucket=lambda _tensor: "skewed",
+                        tensor_value_generator=lambda context: context.profiled,
+                    ),
+                ),
+            ),
+        ),
+        default_value_buckets=("default",),
+    )
+    inputs = [torch.zeros((4,), dtype=torch.float32)]
+    profiled_tactics = []
+
+    def fake_profile(_self, _runner, _inputs, tactic, _config, **_kwargs):
+        profiled_tactics.append(tactic)
+        return {
+            "baseline": 1.0,
+            "left": 0.8,
+            "right": 0.7,
+            "composed": 0.6,
+        }[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        tuner.choose_one("opaque_factorized", [runner], config, inputs)
+
+    assert runner.hook_calls == [("baseline", ("skewed",))]
+    assert profiled_tactics.count("baseline") == 2 * tuner.repeat
+    assert set(profiled_tactics) == {"baseline", "left", "right", "composed"}
+
+
 def test_factorized_value_profile_never_profiles_blocklisted_composed_tactic(
     monkeypatch,
 ):
@@ -1334,10 +1505,10 @@ def test_factorized_value_profile_never_profiles_blocklisted_composed_tactic(
                         input_idx=0,
                         gen_value_buckets=(32,),
                         map_to_value_bucket=lambda _tensor: 32,
-                        tensor_value_generator=lambda bucket, profiled, original: (
-                            original
-                            if bucket == -1
-                            else torch.full_like(profiled, bucket)
+                        tensor_value_generator=lambda context: (
+                            context.original
+                            if context.bucket == -1
+                            else torch.full_like(context.profiled, context.bucket)
                         ),
                     ),
                 ),

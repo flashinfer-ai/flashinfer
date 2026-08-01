@@ -1726,6 +1726,27 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             combined_config = by_components[(tile, fc1_config, fc2_config)]
             return [tile, combined_config]
 
+        def get_measurement_only_tactics(
+            self,
+            default_tactic: Any,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[Any]:
+            """Measure the fixed NoDA tactic when it matches this DA tile."""
+            if (
+                not self.factorized_da_enabled
+                or not profile.value_buckets
+                or int(profile.value_buckets[0]) == da_core.DEFAULT_PROFILE_VALUE_BUCKET
+            ):
+                return []
+            try:
+                matches_profile_tile = int(default_tactic[0]) == int(
+                    profile.value_buckets[0]
+                )
+            except (IndexError, TypeError, ValueError):
+                return []
+            return [default_tactic] if matches_profile_tile else []
+
         def forward(
             self,
             inputs: List[torch.Tensor],

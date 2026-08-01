@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.autotuner import DynamicTensorSpec, DynamicValueSpec, TuningConfig
+from flashinfer.autotuner import (
+    DynamicTensorSpec,
+    DynamicValueSpec,
+    TuningConfig,
+)
 from flashinfer.fused_moe.dist_aware import da_core
 from flashinfer.fused_moe.dist_aware import da_state
 
@@ -23,7 +27,7 @@ def _value_aware_config():
         input_idx=0,
         gen_value_buckets=(0, 1),
         map_to_value_bucket=lambda _tensor: 0,
-        tensor_value_generator=lambda _bucket, tensor: tensor,
+        tensor_value_generator=lambda context: context.profiled,
     )
     return TuningConfig(
         dynamic_tensor_specs=(

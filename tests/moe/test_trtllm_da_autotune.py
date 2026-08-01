@@ -28,7 +28,7 @@ import pytest
 import torch
 
 import flashinfer.fused_moe as fused_moe_api
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import AutoTuner, ValueGenerationContext, autotune
 from flashinfer.autotuner import autotuner as autotuner_module
 from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
 from flashinfer.fused_moe import (
@@ -97,10 +97,12 @@ def test_future_default_profile_uses_valid_representative_routing(pack_topk_ids)
     profiled = torch.zeros(512, 8, dtype=torch.int32)
 
     generated = generator(
-        da_core.DEFAULT_PROFILE_VALUE_BUCKET,
-        profiled,
-        original,
-        [],
+        ValueGenerationContext(
+            bucket=da_core.DEFAULT_PROFILE_VALUE_BUCKET,
+            profiled=profiled,
+            original=original,
+            inputs=[],
+        )
     )
     expert_ids = generated >> 16 if pack_topk_ids else generated
 
@@ -135,10 +137,14 @@ def test_da_distribution_samples_are_stable_across_tactic_profiles():
         invocation.local_expert_offset,
     )
     torch.manual_seed(9284)
-    first = generator(0, profiled, profiled, [], sample_index=3)
+    first = generator(ValueGenerationContext(0, profiled, profiled, [], sample_index=3))
     torch.rand(4096)
-    repeated = generator(0, profiled, profiled, [], sample_index=3)
-    next_sample = generator(0, profiled, profiled, [], sample_index=4)
+    repeated = generator(
+        ValueGenerationContext(0, profiled, profiled, [], sample_index=3)
+    )
+    next_sample = generator(
+        ValueGenerationContext(0, profiled, profiled, [], sample_index=4)
+    )
 
     assert torch.equal(first, expected)
     assert torch.equal(first, repeated)

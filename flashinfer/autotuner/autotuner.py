@@ -528,6 +528,67 @@ class ValueSampleStager(ABC):
         """Stage one sample and return ``(copies, host_to_device_copies)``."""
 
 
+@dataclass(frozen=True, slots=True)
+class ValueGenerationContext:
+    """Named inputs for a value-aware tensor generator.
+
+    Tensor generation uses ``bucket``, ``profiled``, ``original``, and
+    ``inputs``. Sample generation additionally populates ``sample_index``.
+    Profiling loops therefore have one explicit callback contract instead of
+    positional arity conventions.
+    """
+
+    bucket: Any
+    profiled: Optional[torch.Tensor]
+    original: Optional[torch.Tensor]
+    inputs: List[Optional[torch.Tensor]]
+    sample_index: Optional[int] = None
+
+
+ValueBucketMapper: TypeAlias = Callable[
+    [torch.Tensor, List[torch.Tensor], Dict[str, Any]], Any
+]
+NormalizedValueGenerator: TypeAlias = Callable[[ValueGenerationContext], Any]
+
+
+def _validate_callback_arity(
+    callback: Callable,
+    *,
+    name: str,
+    allowed: Set[int],
+) -> int:
+    """Return one supported positional arity or fail during construction."""
+
+    try:
+        parameters = tuple(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must have an inspectable signature") from error
+    if any(
+        parameter.kind
+        not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        for parameter in parameters
+    ):
+        raise TypeError(f"{name} must use only positional parameters; got {callback!r}")
+    arity = len(parameters)
+    if arity not in allowed:
+        expected = ", ".join(str(value) for value in sorted(allowed))
+        raise TypeError(
+            f"{name} must accept exactly one of {{{expected}}} arguments; got {arity}"
+        )
+    return arity
+
+
+def _adapt_value_bucket_mapper(callback: Callable, arity: int) -> ValueBucketMapper:
+    """Normalize tensor-only or contextual mappers to one runtime signature."""
+
+    if arity == 1:
+        return lambda tensor, _inputs, _kwargs: callback(tensor)
+    return lambda tensor, inputs, kwargs: callback(tensor, inputs, kwargs)
+
+
 @dataclass(slots=True)
 class DynamicValueSpec:
     """Specification for value-bucket profiling within a DynamicTensorSpec.
@@ -539,29 +600,103 @@ class DynamicValueSpec:
         input_idx: Index of the input tensor whose values matter.
         gen_value_buckets: Bucket IDs to profile during tuning (tuple, a zero-argument
             callable, or a callable that accepts the generated OptimizationProfile).
-        map_to_value_bucket: Maps actual runtime inputs to a bucket ID at inference time.
-            Must be cheap (~microseconds). It may accept either:
+        map_to_value_bucket: Maps actual runtime inputs to a bucket ID at inference
+            time. Must be cheap (~microseconds). It may accept exactly either:
             - ``tensor``; or
             - ``tensor, inputs, kwargs`` for methods that need light call context.
-        tensor_value_generator: Generates representative tensor values for a given
-            bucket during profiling. It may accept either:
-            - ``bucket_id, profiled_tensor``; or
-            - ``bucket_id, profiled_tensor, original_tensor``; or
-            - ``bucket_id, profiled_tensor, original_tensor, inputs``.
-        sample_value_generator: Optional generator used for every outer value
-            realization. It follows the ``tensor_value_generator`` calling
-            convention, with an optional fifth ``sample_index`` argument, and
-            may return staging data with a different shape.
+            Construction wraps both forms into the fixed internal
+            ``(tensor, inputs, kwargs)`` signature, so dispatch allocates no context
+            and performs no introspection.
+        tensor_value_generator: One-argument callback receiving a
+            ``ValueGenerationContext``.
+        sample_value_generator: Optional generator for every outer value
+            realization. It receives the same ``ValueGenerationContext``, with
+            ``sample_index`` populated, and may return staging data with a
+            different shape.
         sample_value_stager: Optional object that stages a sample generator's
             result into the captured graph inputs.
+
+    All callback signatures are validated once during construction. Dispatch
+    and profiling loops perform no signature introspection.
     """
 
     input_idx: int
     gen_value_buckets: Union[Tuple[int, ...], Callable]
     map_to_value_bucket: Callable
-    tensor_value_generator: Callable
-    sample_value_generator: Optional[Callable] = None
+    tensor_value_generator: NormalizedValueGenerator
+    sample_value_generator: Optional[NormalizedValueGenerator] = None
     sample_value_stager: Optional[ValueSampleStager] = None
+    _map_value_bucket: ValueBucketMapper = field(init=False, repr=False, compare=False)
+    _generate_tensor_value: NormalizedValueGenerator = field(
+        init=False, repr=False, compare=False
+    )
+    _generate_sample_value: NormalizedValueGenerator = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        mapper_arity = _validate_callback_arity(
+            self.map_to_value_bucket,
+            name="map_to_value_bucket",
+            allowed={1, 3},
+        )
+        self._map_value_bucket = _adapt_value_bucket_mapper(
+            self.map_to_value_bucket, mapper_arity
+        )
+        _validate_callback_arity(
+            self.tensor_value_generator,
+            name="tensor_value_generator",
+            allowed={1},
+        )
+        self._generate_tensor_value = self.tensor_value_generator
+        if self.sample_value_generator is None:
+            self._generate_sample_value = self._generate_tensor_value
+        else:
+            _validate_callback_arity(
+                self.sample_value_generator,
+                name="sample_value_generator",
+                allowed={1},
+            )
+            self._generate_sample_value = self.sample_value_generator
+
+    def map_value_bucket(
+        self,
+        tensor: torch.Tensor,
+        inputs: List[torch.Tensor],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Map one runtime value using the normalized low-overhead signature."""
+
+        return self._map_value_bucket(tensor, inputs, kwargs)
+
+    def generate_tensor_value(
+        self,
+        bucket: Any,
+        profiled: Optional[torch.Tensor],
+        original: Optional[torch.Tensor],
+        inputs: List[Optional[torch.Tensor]],
+    ) -> Any:
+        """Generate one profile value from a named context."""
+
+        return self._generate_tensor_value(
+            ValueGenerationContext(bucket, profiled, original, inputs)
+        )
+
+    def generate_sample_value(
+        self,
+        bucket: Any,
+        profiled: Optional[torch.Tensor],
+        original: Optional[torch.Tensor],
+        inputs: List[Optional[torch.Tensor]],
+        sample_index: int,
+    ) -> Any:
+        """Generate one sampled profile value from a named context."""
+
+        return self._generate_sample_value(
+            ValueGenerationContext(
+                bucket, profiled, original, inputs, sample_index=sample_index
+            )
+        )
 
     def __hash__(self):
         return hash(
@@ -764,6 +899,20 @@ class TunableRunner(ABC):
     ) -> Any:
         """Compose independently selected group winners into an executable tactic."""
         raise NotImplementedError
+
+    def get_measurement_only_tactics(
+        self,
+        default_tactic: Any,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[Any]:
+        """Return extra tactics to measure without admitting them for selection.
+
+        The core tuner deliberately does not interpret tactic structure or value
+        bucket meaning. A runner may use this hook to compare an existing default
+        tactic with a value-aware candidate under the same profile.
+        """
+        return []
 
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
@@ -2744,39 +2893,15 @@ class AutoTuner:
                                     p.value_buckets,
                                     strict=True,
                                 ):
-                                    generator = (
-                                        spec.sample_value_generator
-                                        or spec.tensor_value_generator
-                                    )
-                                    num_params = len(
-                                        inspect.signature(generator).parameters
-                                    )
-                                    if num_params >= 5:
-                                        value_tensors[spec.input_idx] = generator(
+                                    value_tensors[spec.input_idx] = (
+                                        spec.generate_sample_value(
                                             bucket_id,
                                             tensors[spec.input_idx],
                                             inputs[spec.input_idx],
                                             inputs,
                                             sample_index,
                                         )
-                                    elif num_params >= 4:
-                                        value_tensors[spec.input_idx] = generator(
-                                            bucket_id,
-                                            tensors[spec.input_idx],
-                                            inputs[spec.input_idx],
-                                            inputs,
-                                        )
-                                    elif num_params >= 3:
-                                        value_tensors[spec.input_idx] = generator(
-                                            bucket_id,
-                                            tensors[spec.input_idx],
-                                            inputs[spec.input_idx],
-                                        )
-                                    else:
-                                        value_tensors[spec.input_idx] = generator(
-                                            bucket_id,
-                                            tensors[spec.input_idx],
-                                        )
+                                    )
                                     generated_value = value_tensors[spec.input_idx]
                                     if isinstance(generated_value, torch.Tensor):
                                         # A generator may cache sample zero,
@@ -2879,21 +3004,20 @@ class AutoTuner:
                                 )
                                 if default_entry is not None:
                                     default_tactic, _ = default_entry
-                                    try:
-                                        matches_profile_tile = int(
-                                            default_tactic[0]
-                                        ) == int(p.value_buckets[0])
-                                    except (IndexError, TypeError, ValueError):
-                                        matches_profile_tile = False
-                                    default_key = _tactic_key(default_tactic)
-                                    if (
-                                        matches_profile_tile
-                                        and default_key not in seen_tactics
-                                    ):
-                                        seen_tactics.add(default_key)
-                                        valid_tactics.append(default_tactic)
+                                    measurement_tactics = (
+                                        r.get_measurement_only_tactics(
+                                            default_tactic, tensors, p
+                                        )
+                                    )
+                                    for measurement_tactic in measurement_tactics:
+                                        measurement_key = _tactic_key(
+                                            measurement_tactic
+                                        )
+                                        if measurement_key not in seen_tactics:
+                                            seen_tactics.add(measurement_key)
+                                            valid_tactics.append(measurement_tactic)
                                         candidate_stages.setdefault(
-                                            default_key, []
+                                            measurement_key, []
                                         ).append("default_profile_baseline")
                             valid_tactics = self._blocklist.filter(
                                 custom_op, r, valid_tactics
@@ -3317,11 +3441,7 @@ class AutoTuner:
         inputs: List[torch.Tensor],
         kwargs: Dict[str, Any],
     ) -> int:
-        tensor = inputs[spec.input_idx]
-        num_params = len(inspect.signature(spec.map_to_value_bucket).parameters)
-        if num_params >= 3:
-            return spec.map_to_value_bucket(tensor, inputs, kwargs)
-        return spec.map_to_value_bucket(tensor)
+        return spec.map_value_bucket(inputs[spec.input_idx], inputs, kwargs)
 
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
@@ -3794,23 +3914,12 @@ class AutoTuner:
                     f"profile={profile.value_buckets!r}, num_specs={len(value_specs)}"
                 )
             for spec, bucket_id in zip(value_specs, profile.value_buckets, strict=True):
-                generator = spec.tensor_value_generator
-                num_params = len(inspect.signature(generator).parameters)
-                if num_params >= 4:
-                    generated = generator(
-                        bucket_id,
-                        tensors[spec.input_idx],
-                        inputs[spec.input_idx],
-                        inputs,
-                    )
-                elif num_params >= 3:
-                    generated = generator(
-                        bucket_id,
-                        tensors[spec.input_idx],
-                        inputs[spec.input_idx],
-                    )
-                else:
-                    generated = generator(bucket_id, tensors[spec.input_idx])
+                generated = spec.generate_tensor_value(
+                    bucket_id,
+                    tensors[spec.input_idx],
+                    inputs[spec.input_idx],
+                    inputs,
+                )
                 if preserve_storage:
                     destination = tensors[spec.input_idx]
                     if not isinstance(destination, torch.Tensor) or not isinstance(
