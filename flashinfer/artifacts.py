@@ -226,7 +226,15 @@ def get_checksums(subdirs):
             FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
         )
         checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
-        download_file(uri, checksum_path)
+        if not download_file(uri, checksum_path) and not checksum_path.is_file():
+            # Without this the next open() fails with a bare FileNotFoundError on
+            # the local cache path, which hides the real cause: the artifact pin
+            # is unreachable (typo'd/unpublished pin, or network/mirror failure).
+            raise RuntimeError(
+                f"Failed to fetch the checksum manifest for artifact pin '{subdir}' "
+                f"from {uri}. Check that the pin exists in "
+                f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
+            )
         with open(checksum_path, "r") as f:
             for line in f:
                 sha256, filename = line.strip().split()
