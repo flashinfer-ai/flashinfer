@@ -45,6 +45,7 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
+sm120_direct_fused_moe_h2048_i512_e4_eg16_k8.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
@@ -741,6 +742,54 @@ with contextlib.suppress(Exception):
         top_k=8,
         scoring_func="softmax",
         renormalize=True,
+    )
+
+# ── SM120 direct BF16 MoE (Qwen3.5 decode geometry) ──────────────────────────
+# The public path is intentionally limited to M<=8 and consumes precomputed
+# routes. Four of the sixteen experts are local to this example EP rank.
+with contextlib.suppress(Exception):
+    _sm120_M, _sm120_H, _sm120_I = 8, 2048, 512
+    _sm120_E_LOCAL, _sm120_E_GLOBAL, _sm120_TOPK = 4, 16, 8
+    _sm120_hidden = torch.randn(_sm120_M, _sm120_H, dtype=torch.bfloat16, device=device)
+    _sm120_topk_ids = (
+        torch.arange(_sm120_M * _sm120_TOPK, dtype=torch.int32, device=device).reshape(
+            _sm120_M, _sm120_TOPK
+        )
+        % _sm120_E_GLOBAL
+    )
+    _sm120_topk_weights = torch.full(
+        (_sm120_M, _sm120_TOPK),
+        1.0 / _sm120_TOPK,
+        dtype=torch.float32,
+        device=device,
+    )
+    _sm120_w1 = torch.zeros(
+        _sm120_E_LOCAL,
+        2 * _sm120_I,
+        _sm120_H,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _sm120_w2 = torch.zeros(
+        _sm120_E_LOCAL,
+        _sm120_H,
+        _sm120_I,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    _sm120_expert_map = torch.full(
+        (_sm120_E_GLOBAL,), -1, dtype=torch.int32, device=device
+    )
+    _sm120_expert_map[:_sm120_E_LOCAL] = torch.arange(
+        _sm120_E_LOCAL, dtype=torch.int32, device=device
+    )
+    flashinfer.fused_moe.sm120_direct_fused_moe(
+        _sm120_hidden,
+        _sm120_topk_ids,
+        _sm120_topk_weights,
+        _sm120_w1,
+        _sm120_w2,
+        expert_map=_sm120_expert_map,
     )
 
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────

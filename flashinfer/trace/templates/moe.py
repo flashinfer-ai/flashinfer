@@ -3973,3 +3973,154 @@ hash_topk_trace = TraceTemplate(
     reference=_hash_topk_reference,
     init=_hash_topk_init,
 )
+
+
+@torch.no_grad()
+def _sm120_direct_fused_moe_reference(
+    hidden_states,
+    topk_ids,
+    topk_weights,
+    gemm1_weights,
+    gemm2_weights,
+    expert_map=None,
+    output=None,
+    workspace=None,
+    outputs_per_warp=None,
+    num_threads=None,
+):
+    """FP32 reference for rank-local pre-routed BF16 SwiGLU MoE."""
+    del output, workspace, outputs_per_warp, num_threads
+    num_tokens, hidden_size = hidden_states.shape
+    intermediate_size = gemm2_weights.shape[2]
+    result = torch.zeros(
+        (num_tokens, hidden_size), dtype=torch.float32, device=hidden_states.device
+    )
+    hidden_fp32 = hidden_states.float()
+    gemm1_fp32 = gemm1_weights.float()
+    gemm2_fp32 = gemm2_weights.float()
+    for token in range(num_tokens):
+        for slot in range(topk_ids.shape[1]):
+            global_expert = int(topk_ids[token, slot])
+            if expert_map is None or expert_map.numel() == 0:
+                local_expert = global_expert
+            elif 0 <= global_expert < expert_map.numel():
+                local_expert = int(expert_map[global_expert])
+            else:
+                local_expert = -1
+            if local_expert < 0 or local_expert >= gemm1_weights.shape[0]:
+                continue
+            projection = torch.mv(gemm1_fp32[local_expert], hidden_fp32[token])
+            up = projection[:intermediate_size]
+            gate = projection[intermediate_size:]
+            activated = torch.nn.functional.silu(gate) * up
+            contribution = torch.mv(gemm2_fp32[local_expert], activated)
+            result[token] += contribution * topk_weights[token, slot]
+    return result.to(torch.bfloat16)
+
+
+def _sm120_direct_fused_moe_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 2048,
+    intermediate_size: int = 512,
+    num_local_experts: int = 4,
+    num_global_experts: int = 16,
+    topk: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build an EP-style input for the SM120 low-token direct MoE path."""
+    torch.manual_seed(seed)
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 0.1
+    ).contiguous()
+    gemm1_weights = (
+        torch.randn(
+            num_local_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.02
+    ).contiguous()
+    gemm2_weights = (
+        torch.randn(
+            num_local_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.02
+    ).contiguous()
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_global_experts, device=device)[:topk]
+            for _ in range(num_tokens)
+        ]
+    ).to(torch.int32)
+    topk_weights = torch.softmax(
+        torch.randn(num_tokens, topk, dtype=torch.float32, device=device), dim=-1
+    ).contiguous()
+    expert_map = torch.full((num_global_experts,), -1, dtype=torch.int32, device=device)
+    expert_map[:num_local_experts] = torch.arange(
+        num_local_experts, dtype=torch.int32, device=device
+    )
+    return {
+        "hidden_states": hidden_states,
+        "topk_ids": topk_ids.contiguous(),
+        "topk_weights": topk_weights,
+        "gemm1_weights": gemm1_weights,
+        "gemm2_weights": gemm2_weights,
+        "expert_map": expert_map,
+    }
+
+
+sm120_direct_fused_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="sm120_direct_fused_moe",
+    description=(
+        "SM120 BF16 low-token pre-routed SwiGLU MoE with optional global-to-local "
+        "expert mapping and FP32 top-k accumulation."
+    ),
+    axes={
+        "num_tokens": Var(description="Decode batch size in [1, 8]."),
+        "hidden_size": Const(abbrev="h"),
+        "intermediate_size": Const(abbrev="i"),
+        "num_local_experts": Const(abbrev="e"),
+        "num_global_experts": Const(abbrev="eg"),
+        "topk": Const(abbrev="k"),
+    },
+    inputs={
+        "hidden_states": Tensor(["num_tokens", "hidden_size"]),
+        "topk_ids": Tensor(["num_tokens", "topk"], dtype="int32"),
+        "topk_weights": Tensor(["num_tokens", "topk"], dtype="float32"),
+        "gemm1_weights": Tensor(
+            ["num_local_experts", "2 * intermediate_size", "hidden_size"]
+        ),
+        "gemm2_weights": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"]
+        ),
+        "expert_map": Tensor(
+            ["num_global_experts"],
+            dtype="int32",
+            optional=True,
+            description="Global-to-local expert map; -1 entries are skipped.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"], dtype="bfloat16", param="output"
+        )
+    },
+    constraints=[
+        "1 <= num_tokens <= 8",
+        "1 <= topk <= 8",
+        "hidden_size % 8 == 0",
+        "intermediate_size % 8 == 0",
+    ],
+    tags=["status:verified", "backend:sm120", "moe", "dtype:bf16"],
+    reference=_sm120_direct_fused_moe_reference,
+    init=_sm120_direct_fused_moe_init,
+)
