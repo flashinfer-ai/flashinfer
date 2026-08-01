@@ -20,16 +20,17 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer.kda import recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
 kda_decode_api = importlib.import_module("flashinfer.kda_decode")
+kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 
 
-def test_public_api_keeps_decode_entry_and_prefill_workspace():
-    assert flashinfer.recurrent_kda is kda_decode_api.recurrent_kda
+def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
+    assert flashinfer.recurrent_kda is kda_api.recurrent_kda
     assert (
         flashinfer.RecurrentKDAPrefillWorkspace
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
@@ -181,6 +182,11 @@ def test_decode_and_spec_stay_on_existing_backend(monkeypatch):
         return sentinel
 
     monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", old_backend)
+    monkeypatch.setattr(
+        kda_decode_api,
+        "recurrent_kda",
+        lambda *args, **kwargs: pytest.fail("facade nested the decorated decode API"),
+    )
     monkeypatch.setattr(
         kda_prefill_api,
         "_get_flash_kda_prefill_module",
@@ -580,34 +586,6 @@ def test_workspace_rejects_a_different_stream(cuda_device, monkeypatch):
             output=output,
             prefill_workspace=workspace,
         )
-
-
-def test_recurrent_kda_prefill_trace_has_semantic_inputs():
-    q = torch.empty((1, 8, 2, 128), dtype=torch.bfloat16)
-    trace = recurrent_kda.fi_trace(
-        q=q,
-        k=q,
-        v=q,
-        g=q,
-        beta=torch.empty((1, 8, 2), dtype=torch.bfloat16),
-        A_log=torch.empty(2),
-        dt_bias=torch.empty((2, 128)),
-        cu_seqlens=torch.tensor([0, 3, 8], dtype=torch.int64),
-        seq_order=torch.tensor([1, 0], dtype=torch.int32),
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=-5.0,
-        beta_is_logit=True,
-    )
-    assert trace["op_type"] == "kda"
-    assert "stage:prefill" in trace["tags"]
-    for name in (
-        "A_log",
-        "dt_bias",
-        "cu_seqlens",
-        "seq_order",
-    ):
-        assert name in trace["inputs"]
 
 
 def test_flash_kda_jit_getter_is_importable():

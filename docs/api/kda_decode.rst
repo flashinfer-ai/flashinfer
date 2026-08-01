@@ -3,10 +3,8 @@
 flashinfer.kda_decode
 =====================
 
-Recurrent Kimi Delta Attention (KDA) public API. Decode and speculative
-decode use the CuTe-DSL backend under ``flashinfer.kda_kernels``. Eligible
-ordinary multi-token prefill calls dispatch to the optimized backend described
-in :ref:`apikda_prefill`.
+Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
+``flashinfer.kda_kernels``; this module is the public entry point.
 
 .. currentmodule:: flashinfer.kda_decode
 

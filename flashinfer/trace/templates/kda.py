@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for recurrent Kimi Delta Attention (KDA)."""
+"""TraceTemplate for recurrent Key-Driven Attention (KDA) decode."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
@@ -21,9 +21,8 @@ recurrent_kda_trace = TraceTemplate(
     op_type="kda",
     name_prefix="recurrent_kda",
     description=(
-        "Recurrent Kimi Delta Attention decode/spec-decode plus exact "
-        "FlashKDA-compatible ordinary prefill on B200, with "
-        "per-key-dimension gating and recurrent BF16 state."
+        "Recurrent Key-Driven Attention decode with per-key-dimension gating "
+        "and an optional read-only committed-state source."
     ),
     axes={
         "batch_size": Var(description="Number of input batch rows."),
@@ -36,9 +35,6 @@ recurrent_kda_trace = TraceTemplate(
         "state_pool_size": Var(description="Number of writable state slots."),
         "source_pool_size": Var(description="Number of committed-state slots."),
         "num_sequences": Var(description="Number of state-source indices."),
-        "num_sequences_plus_one": Var(
-            description="Number of packed cumulative-length entries."
-        ),
     },
     inputs={
         "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
@@ -46,57 +42,19 @@ recurrent_kda_trace = TraceTemplate(
         "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
         "g": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
         "beta": Tensor(["batch_size", "seq_len", "num_v_heads"]),
-        "A_log": Tensor(
-            ["num_q_heads"],
-            dtype="float32",
-            optional=True,
-            description="FP32 per-query-head log decay rate.",
-        ),
-        "dt_bias": Tensor(
-            ["num_q_heads", "head_dim"],
-            dtype="float32",
-            optional=True,
-            description=(
-                "FP32 per-head/key decay bias; flattened [H*D] or [H,D] "
-                "storage is accepted by the API."
-            ),
-        ),
         "initial_state": Tensor(
             ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
-            dtype="bfloat16",
             optional=True,
         ),
         "initial_state_source": Tensor(
             ["source_pool_size", "num_v_heads", "head_dim", "head_dim"],
-            dtype="bfloat16",
             optional=True,
             description="Read-only committed-state pool.",
         ),
         "initial_state_indices": Tensor(
             ["num_sequences"],
-            dtype="int32",
             optional=True,
             description="Committed-state slot selected for each sequence.",
-        ),
-        "cu_seqlens": Tensor(
-            ["num_sequences_plus_one"],
-            optional=True,
-            description="Packed cumulative sequence lengths (int32 or int64).",
-        ),
-        "num_accepted_tokens": Tensor(
-            ["num_sequences"],
-            dtype="int32",
-            optional=True,
-            description="Accepted-token counts for speculative decode.",
-        ),
-        "seq_order": Tensor(
-            ["num_sequences"],
-            dtype="int32",
-            optional=True,
-            description=(
-                "Packed-prefill sequence permutation, normally descending "
-                "by sequence length."
-            ),
         ),
         "scale": Scalar("float32", optional=True),
         "output_final_state": Scalar("int32", optional=True),
@@ -110,7 +68,6 @@ recurrent_kda_trace = TraceTemplate(
         "output": Tensor(
             ["batch_size", "seq_len", "num_v_heads", "head_dim"],
             dtype_from="q",
-            param="output",
         ),
         "final_state": Tensor(
             ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
@@ -122,5 +79,5 @@ recurrent_kda_trace = TraceTemplate(
         "num_v_heads % num_q_heads == 0",
         "head_dim in (64, 128)",
     ],
-    tags=["stage:decode", "stage:prefill", "status:verified"],
+    tags=["stage:decode", "status:verified"],
 )

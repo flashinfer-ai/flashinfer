@@ -70,7 +70,7 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     """Caller-owned storage required for recurrent-KDA CUDA graph capture.
 
     Construct one workspace per captured
-    :func:`flashinfer.kda_decode.recurrent_kda` invocation on the graph's CUDA
+    :func:`flashinfer.kda.recurrent_kda` invocation on the graph's CUDA
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial

@@ -3,8 +3,8 @@
 flashinfer.kda_prefill
 ======================
 
-Optimized recurrent Kimi Delta Attention (KDA) prefill support. The stable
-:func:`flashinfer.kda_decode.recurrent_kda` API dispatches a strict ordinary
+Optimized recurrent Kimi Delta Attention (KDA) prefill support. The
+:func:`flashinfer.kda.recurrent_kda` facade dispatches a strict ordinary
 multi-token prefill subset to frozen FlashKDA-compatible SM100a kernels.
 
 .. currentmodule:: flashinfer.kda_prefill
@@ -17,8 +17,8 @@ multi-token prefill subset to frozen FlashKDA-compatible SM100a kernels.
 Optimized B200 prefill subset
 -----------------------------
 
-``flashinfer.kda_decode.recurrent_kda`` uses the frozen prefill backend only
-when every condition below holds:
+``flashinfer.kda.recurrent_kda`` uses the frozen prefill backend only when
+every condition below holds:
 
 * the device has compute capability 10.0;
 * input is ordinary multi-token prefill: fixed ``T > 1``, or packed input

@@ -42,7 +42,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer.kda import recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
