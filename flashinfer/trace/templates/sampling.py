@@ -1021,8 +1021,6 @@ def _top_k_page_table_transform_reference(
     row_starts=None,
     page_table_row_starts=None,
     page_size: int = 1,
-    out=None,
-    out_raw_indices=None,
     **_unused,
 ) -> torch.Tensor:
     """Reference for top_k_page_table_transform: per-row top-k selection on
@@ -1036,12 +1034,7 @@ def _top_k_page_table_transform_reference(
             "page_table_row_starts is required with page_size > 1 and row_starts"
         )
     num_rows = input.shape[0]
-    if out is None:
-        out = torch.full((num_rows, int(k)), -1, dtype=torch.int32, device=input.device)
-    else:
-        out.fill_(-1)
-    if out_raw_indices is not None:
-        out_raw_indices.fill_(-1)
+    out = torch.full((num_rows, int(k)), -1, dtype=torch.int32, device=input.device)
     for i in range(num_rows):
         L = int(lengths[i].item())
         if L <= 0:
@@ -1064,8 +1057,6 @@ def _top_k_page_table_transform_reference(
             b, page_table_row_start + idx.to(torch.long) // page_size
         ]
         out[i, :kk] = physical_pages * page_size + idx % page_size
-        if out_raw_indices is not None:
-            out_raw_indices[i, :kk] = idx
     return out
 
 
@@ -1096,7 +1087,24 @@ def _top_k_page_table_transform_init(
     }
 
 
-top_k_page_table_transform_trace = TraceTemplate(
+class _TopKPageTableTransformTraceTemplate(TraceTemplate):
+    """Keep API-default extraction local to the compact-page transform."""
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def extract_page_size(kwargs):
+            page_size = kwargs.get("page_size", 1)
+            return 1 if page_size is None else int(page_size)
+
+        extractors["page_size"] = extract_page_size
+        extractors["out_raw_indices"] = lambda kwargs: int(
+            kwargs.get("out_raw_indices") is not None
+        )
+        return extractors
+
+
+top_k_page_table_transform_trace = _TopKPageTableTransformTraceTemplate(
     op_type="sampling",
     name_prefix="top_k_page_table_transform",
     description=(
@@ -1111,7 +1119,11 @@ top_k_page_table_transform_trace = TraceTemplate(
         "batch_size": Var(),
         "max_pages_per_seq": Var(),
         "k": Const(abbrev="k"),
-        "page_size": Const(abbrev="ps", default=1),
+        "page_size": Const(abbrev="ps"),
+        "out_raw_indices": Const(
+            abbrev="raw",
+            description="Whether the optional raw-index destination is supplied (0 or 1).",
+        ),
     },
     inputs={
         "input": Tensor(["num_rows", "max_len"]),
@@ -1125,30 +1137,23 @@ top_k_page_table_transform_trace = TraceTemplate(
         "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_size": Scalar("int32", optional=True),
-        "out": Tensor(
-            ["num_rows", "k"],
-            dtype="int32",
-            optional=True,
-            description="Optional in-place transformed-index output buffer.",
-        ),
-        "out_raw_indices": Tensor(
-            ["num_rows", "k"],
-            dtype="int32",
-            optional=True,
-            description="Optional in-place raw-index output buffer.",
-        ),
     },
     outputs={
         "indices": Tensor(["num_rows", "k"], dtype="int32"),
-        "raw_indices": Tensor(
-            ["num_rows", "k"],
-            dtype="int32",
-            param="out_raw_indices",
-            optional=True,
-            description="Selected local indices before compact-page translation.",
-        ),
     },
     tags=["status:verified", "sparse"],
     reference=_top_k_page_table_transform_reference,
     init=_top_k_page_table_transform_init,
+)
+
+
+def top_k_page_table_transform_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Trace the returned indices when no raw side-output is requested."""
+    if kwargs.get("out_raw_indices") is not None:
+        return None
+    return top_k_page_table_transform_trace
+
+
+top_k_page_table_transform_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    top_k_page_table_transform_trace,
 )

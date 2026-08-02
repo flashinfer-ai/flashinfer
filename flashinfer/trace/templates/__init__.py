@@ -54,13 +54,9 @@ How to add a new template
 
    Key rules:
    - ``Var()``   → axis value is NOT baked into the generated name or JSON value.
-   - ``Const()`` → an extracted tensor or scalar value is written to JSON; if
-     neither source supplies a value, the ``value`` field is omitted.
-   - ``Const(default=N)`` supplies ``N`` when no tensor or scalar value is
-     available at trace time.
-   - Axis values are extracted **automatically** from the first available
-     ``Tensor`` input whose ``dim_names`` contains the axis, then from a
-     matching scalar kwarg.
+   - ``Const()`` → axis value IS extracted from a tensor and written to JSON.
+   - Axis values are extracted **automatically** from the first ``Tensor`` input
+     whose ``dim_names`` list contains that axis name.
    - For tuple parameters (e.g. ``paged_kv_cache=(k, v)``), set
      ``param="paged_kv_cache"`` and ``tuple_idx=0`` / ``tuple_idx=1``.
    - For output dtype, prefer ``dtype_from="<input_param>"`` to copy from an

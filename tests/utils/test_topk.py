@@ -942,8 +942,6 @@ def test_top_k_transform_with_row_starts(
         top_k_page_table_transform_trace,
     )
 
-    trace_out = torch.empty_like(output_page) if output_buffer is not None else None
-    trace_raw_indices = torch.empty_like(output_page) if with_raw_output else None
     trace_ref_page = top_k_page_table_transform_trace.reference(
         page_scores,
         src_page_table,
@@ -953,11 +951,7 @@ def test_top_k_transform_with_row_starts(
         row_starts=row_starts,
         page_table_row_starts=page_table_row_starts,
         page_size=page_size,
-        out=trace_out,
-        out_raw_indices=trace_raw_indices,
     )
-    if trace_out is not None:
-        assert trace_ref_page.data_ptr() == trace_out.data_ptr()
 
     ref_ragged = reference_ragged_transform(
         scores, offsets, lengths, k, row_starts=row_starts
@@ -970,14 +964,9 @@ def test_top_k_transform_with_row_starts(
 
     if output_raw_indices is not None:
         assert ref_raw_indices is not None
-        assert trace_raw_indices is not None
         assert page_table_row_starts is not None
         assert torch.equal(
             torch.sort(output_raw_indices, dim=-1).values,
-            torch.sort(ref_raw_indices, dim=-1).values,
-        )
-        assert torch.equal(
-            torch.sort(trace_raw_indices, dim=-1).values,
             torch.sort(ref_raw_indices, dim=-1).values,
         )
         for row in range(num_rows):

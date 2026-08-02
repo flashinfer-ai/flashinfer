@@ -392,20 +392,11 @@ class Const:
         * ``""`` — omit this axis from the file name entirely.
         * Any other string — use that as the prefix, e.g. ``"h"`` produces
           ``h32`` for ``num_qo_heads=32``.
-    default:
-        Value to use when the axis cannot be extracted from the supplied
-        tensors or scalar kwargs. Defaults to ``None`` (no fallback).
     """
 
-    def __init__(
-        self,
-        description: str = "",
-        abbrev: Optional[str] = None,
-        default: Optional[int] = None,
-    ) -> None:
+    def __init__(self, description: str = "", abbrev: Optional[str] = None) -> None:
         self.description = description
         self.abbrev = abbrev
-        self.default = default
 
 
 # ---------------------------------------------------------------------------
@@ -712,14 +703,12 @@ class TraceTemplate:
             # ── 1. Extract axis values ─────────────────────────────────────
             axis_values: Dict[str, int] = {}
             for axis_name, extractor in axis_extractors.items():
-                val = None
-                with contextlib.suppress(Exception):
+                try:
                     val = extractor(kwargs)
-                marker = template.axes[axis_name]
-                if val is None and isinstance(marker, Const):
-                    val = marker.default
-                if val is not None:
-                    axis_values[axis_name] = val
+                    if val is not None:
+                        axis_values[axis_name] = val
+                except Exception:
+                    pass
 
             # ── 3. Build "axes" section ────────────────────────────────────
             axes_json: Dict[str, Any] = {}
