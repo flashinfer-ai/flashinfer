@@ -446,6 +446,13 @@ class TestAutotuneReplayMemsetContract:
     ):
         from flashinfer.fused_moe.cute_dsl import fused_moe
 
+        # CPU-only contract test (see class header): stub out the functional
+        # API's arch guard, which otherwise calls torch.cuda.get_device_capability()
+        # on the CPU input tensors and raises "Expected a cuda device, but got: cpu".
+        monkeypatch.setattr(
+            fused_moe, "_require_cute_dsl_arch_for", lambda *a, **k: None
+        )
+
         calls = []
 
         class RecordingRunner:
