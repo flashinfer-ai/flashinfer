@@ -1124,7 +1124,7 @@ top_k_page_table_transform_trace = TraceTemplate(
         "row_to_batch": Tensor(["num_rows"], dtype="int32", optional=True),
         "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
-        "page_size": Scalar("int32", optional=True),
+        "page_size": Scalar("int32"),
         "out": Tensor(
             ["num_rows", "k"],
             dtype="int32",

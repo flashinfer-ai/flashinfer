@@ -749,8 +749,8 @@ def top_k_page_table_transform(
         the two starts use different units.
     page_size : int, optional
         Number of score positions represented by each page-table entry. Must
-        be a positive power of two. Setting this to 1 preserves the
-        one-entry-per-score behavior. Default is 1.
+        be a positive power of two no greater than ``2**30``. Setting this to
+        1 preserves the one-entry-per-score behavior. Default is 1.
     out : Optional[torch.Tensor], optional
         Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
         Supplying this buffer avoids an allocation and is CUDA-graph friendly.
@@ -758,7 +758,7 @@ def top_k_page_table_transform(
         Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
         Receives selected indices relative to each score window before
         compact-page translation. Padding positions are set to -1 and remain
-        positionally aligned with ``out``.
+        positionally aligned with ``out``. Must not overlap ``out``.
 
     Returns
     -------
@@ -793,8 +793,11 @@ def top_k_page_table_transform(
     num_rows = input.size(0)
     output_shape = (num_rows, k)
 
-    if page_size <= 0 or page_size & (page_size - 1):
-        raise ValueError(f"page_size must be a positive power of two, got {page_size}")
+    if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
+        raise ValueError(
+            "page_size must be a positive power of two no greater than 2**30, "
+            f"got {page_size}"
+        )
     if page_size > 1 and row_starts is not None and page_table_row_starts is None:
         raise ValueError(
             "page_table_row_starts is required with page_size > 1 and row_starts"
@@ -815,8 +818,15 @@ def top_k_page_table_transform(
         )
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
-        if out is not None and out_raw_indices.data_ptr() == out.data_ptr():
-            raise ValueError("out and out_raw_indices must not alias")
+        if out is not None:
+            out_start = out.data_ptr()
+            out_raw_indices_start = out_raw_indices.data_ptr()
+            output_nbytes = out.numel() * out.element_size()
+            if max(out_start, out_raw_indices_start) < min(
+                out_start + output_nbytes,
+                out_raw_indices_start + output_nbytes,
+            ):
+                raise ValueError("out and out_raw_indices must not overlap")
 
     if (
         can_use_clusters_topk(
@@ -845,8 +855,6 @@ def top_k_page_table_transform(
 
     if out is None:
         out = torch.empty(output_shape, dtype=torch.int32, device=device)
-    if out_raw_indices is not None and out_raw_indices.data_ptr() == out.data_ptr():
-        raise ValueError("out and out_raw_indices must not alias")
 
     get_topk_module().radix_topk_page_table_transform(
         input,

@@ -563,6 +563,35 @@ def _make_gdn_decode_func():
     return flashinfer.gdn_decode.gated_delta_rule_decode
 
 
+@pytest.mark.parametrize(
+    "kwargs,expected_k",
+    [
+        pytest.param({"k": 7}, 7, id="scalar_fallback"),
+        pytest.param(
+            {"k": 7, "out_raw_indices": torch.zeros(11, dtype=torch.int32)},
+            11,
+            id="next_available_tensor",
+        ),
+    ],
+)
+def test_axis_extractor_uses_available_tensor_then_scalar(kwargs, expected_k):
+    """Absent optional tensors must not hide later tensor or scalar axis sources."""
+    template = TraceTemplate(
+        op_type="sampling",
+        axes={"k": Const()},
+        inputs={
+            "k": Scalar("int32"),
+            "out": Tensor(["k"], dtype="int32", optional=True),
+            "out_raw_indices": Tensor(["k"], dtype="int32", optional=True),
+        },
+        outputs={"indices": Tensor(["k"], dtype="int32")},
+    )
+
+    definition = template.build_fi_trace_fn("flashinfer.test")(**kwargs)
+
+    assert definition["axes"]["k"]["value"] == expected_k
+
+
 def test_checker_rejects_wrong_param():
     """Signature checker must catch a param= that doesn't exist in the function."""
     # 'state' in gated_delta_rule_decode is a required positional arg.

@@ -597,6 +597,21 @@ def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
     ).reshape(num_rows, page_table_width)
     out = torch.empty((num_rows, k), device=device, dtype=torch.int32)
     out_raw_indices = torch.empty_like(out)
+    overlapping_storage = torch.empty(
+        num_rows * k + 1, device=device, dtype=torch.int32
+    )
+    overlapping_out = overlapping_storage[:-1].view(num_rows, k)
+    overlapping_raw_indices = overlapping_storage[1:].view(num_rows, k)
+    with pytest.raises(ValueError, match="must not overlap"):
+        flashinfer.top_k_page_table_transform(
+            scores,
+            src_page_table,
+            lengths,
+            k,
+            page_size=page_size,
+            out=overlapping_out,
+            out_raw_indices=overlapping_raw_indices,
+        )
 
     result = flashinfer.top_k_page_table_transform(
         scores,
