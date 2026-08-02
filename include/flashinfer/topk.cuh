@@ -1167,11 +1167,7 @@ inline uint32_t ReduceVecSizeForPointerAlignment(const DType* ptr, uint32_t vec_
 // contract can implement the same interface without changing the selection kernels or adding
 // another runtime flag to their signatures.
 template <typename IdType>
-struct DirectPageTableTransformPolicy {
-  static constexpr bool kRequiresPageTableMode = false;
-  static constexpr bool kHasRuntimeState = false;
-  static constexpr bool kMayWriteRawIndices = false;
-
+struct DirectPageTableKernelPolicy {
   __host__ __device__ __forceinline__ uint32_t get_input_stride(uint32_t max_len) const {
     return max_len;
   }
@@ -1199,14 +1195,15 @@ struct DirectPageTableTransformPolicy {
 };
 
 template <typename IdType>
-struct RuntimePageTableTransformPolicy {
-  static constexpr bool kRequiresPageTableMode = true;
-  static constexpr bool kHasRuntimeState = true;
-  static constexpr bool kMayWriteRawIndices = true;
-
+struct ConfigurablePageTableKernelPolicy {
   IdType* output_raw_indices;
   int64_t input_stride;
   uint32_t page_bits;
+
+  ConfigurablePageTableKernelPolicy() = delete;
+  ConfigurablePageTableKernelPolicy(IdType* output_raw_indices, int64_t input_stride,
+                                    uint32_t page_bits)
+      : output_raw_indices(output_raw_indices), input_stride(input_stride), page_bits(page_bits) {}
 
   __host__ __device__ __forceinline__ int64_t get_input_stride(uint32_t /*max_len*/) const {
     return input_stride;
@@ -1241,15 +1238,23 @@ struct RuntimePageTableTransformPolicy {
   }
 };
 
+// Keep the direct policy identifiable so its epilogues can retain their original source form.
+// Routing the same expressions through an inlined policy method changes NVCC-generated SASS.
 template <typename PageTablePolicy, typename IdType>
-inline constexpr bool IsDirectPageTableTransformPolicy =
-    std::is_same_v<PageTablePolicy, DirectPageTableTransformPolicy<IdType>>;
+inline constexpr bool IsDirectPageTableKernelPolicy =
+    std::is_same_v<PageTablePolicy, DirectPageTableKernelPolicy<IdType>>;
+
+// Empty policies are omitted from the kernel ABI and therefore must be default-constructible.
+template <typename PageTablePolicy>
+inline constexpr bool IsValidPageTablePolicy =
+    std::is_trivially_copyable_v<PageTablePolicy> &&
+    std::is_copy_constructible_v<PageTablePolicy> && std::is_standard_layout_v<PageTablePolicy> &&
+    (!std::is_empty_v<PageTablePolicy> || std::is_default_constructible_v<PageTablePolicy>);
 
 template <typename PageTablePolicy, typename... PageTableArgs>
-inline constexpr bool IsValidPageTablePolicyArgs =
-    std::is_trivially_copyable_v<PageTablePolicy> && std::is_standard_layout_v<PageTablePolicy> &&
-    (PageTablePolicy::kHasRuntimeState || std::is_empty_v<PageTablePolicy>) &&
-    sizeof...(PageTableArgs) == (PageTablePolicy::kHasRuntimeState ? 1 : 0) &&
+inline constexpr bool IsValidPageTableKernelArgs =
+    IsValidPageTablePolicy<PageTablePolicy> &&
+    sizeof...(PageTableArgs) == (std::is_empty_v<PageTablePolicy> ? 0 : 1) &&
     (std::is_same_v<std::decay_t<PageTableArgs>, PageTablePolicy> && ...);
 
 /*!
@@ -1272,7 +1277,7 @@ inline constexpr bool IsValidPageTablePolicyArgs =
  */
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, bool DETERMINISTIC,
           RadixTopKMode MODE, typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>,
           typename... PageTableArgs>
 __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     DType* input,            // [num_rows, stride]
@@ -1288,9 +1293,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     uint32_t top_k_val, uint32_t max_len, uint32_t num_rows, RadixRowState* row_states,
     RadixDeterministicCollectScratch* det_scratches, uint32_t chunk_size, uint32_t ctas_per_group,
     PageTableArgs... page_table_args) {
-  static_assert(!PageTablePolicy::kRequiresPageTableMode ||
-                MODE == RadixTopKMode::PageTableTransform);
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+  static_assert(MODE == RadixTopKMode::PageTableTransform ||
+                IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>);
+  static_assert(IsValidPageTableKernelArgs<PageTablePolicy, PageTableArgs...>);
   using Traits = RadixTopKTraits<DType>;
   using OrderedType = typename Traits::OrderedType;
   constexpr uint32_t RADIX = 256;
@@ -1352,7 +1357,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     // Mode-specific: output pointers and auxiliary data
     IdType* row_output = output_indices + row_idx * top_k_val;
     IdType* row_raw_output = nullptr;
-    if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+    if constexpr (!IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
       row_raw_output = page_table_policy.get_row_raw_output(row_idx, top_k_val);
     }
 
@@ -1390,15 +1395,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
       if (length <= top_k_val) {
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
-          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+          if constexpr (IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
             row_output[i] =
                 (i < length) ? src_page_entry[page_table_row_start + i] : static_cast<IdType>(-1);
           } else {
             const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
-            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-              if (row_raw_output != nullptr) {
-                row_raw_output[i] = raw_idx;
-              }
+            if (row_raw_output != nullptr) {
+              row_raw_output[i] = raw_idx;
             }
             row_output[i] = raw_idx >= 0 ? page_table_policy.transform_index(
                                                src_page_entry, page_table_row_start,
@@ -1495,13 +1498,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         // Transform through page table with coalesced access
         for (uint32_t i = tx; i < k; i += BLOCK_THREADS) {
           IdType idx = row_output[i];
-          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+          if constexpr (IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
             row_output[i] = src_page_entry[page_table_row_start + idx];
           } else {
-            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-              if (row_raw_output != nullptr) {
-                row_raw_output[i] = idx;
-              }
+            if (row_raw_output != nullptr) {
+              row_raw_output[i] = idx;
             }
             row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
                                                               static_cast<uint32_t>(idx));
@@ -1517,13 +1518,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         uint32_t my_end = min(my_start + elems_per_cta, k);
         for (uint32_t i = my_start + tx; i < my_end; i += BLOCK_THREADS) {
           IdType idx = row_output[i];
-          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+          if constexpr (IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
             row_output[i] = src_page_entry[page_table_row_start + idx];
           } else {
-            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-              if (row_raw_output != nullptr) {
-                row_raw_output[i] = idx;
-              }
+            if (row_raw_output != nullptr) {
+              row_raw_output[i] = idx;
             }
             row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
                                                               static_cast<uint32_t>(idx));
@@ -2096,21 +2095,18 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
  * \param row_states_buffer Buffer for inter-CTA synchronization
  * \param stream CUDA stream
  * \tparam PageTablePolicy Index-layout and optional-output policy type
- * \tparam PageTableArgs Policy arguments; empty when the policy has no runtime state
  */
 template <typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
-          typename... PageTableArgs>
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>>
 cudaError_t RadixTopKPageTableTransformMultiCTA(
     DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
     const IdType* row_to_batch, IdType* lengths, const IdType* row_starts,
     const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
     RadixRowState* row_states_buffer, bool deterministic, cudaStream_t stream = 0,
-    PageTableArgs... page_table_args) {
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+    const PageTablePolicy& page_table_policy = {}) {
+  static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
   constexpr uint32_t BLOCK_THREADS = 1024;
-  PageTablePolicy page_table_policy{page_table_args...};
   const auto row_stride = page_table_policy.get_input_stride(max_len);
   uint32_t vec_size =
       (row_starts != nullptr) ? 1 : std::gcd(16 / sizeof(DType), static_cast<uint32_t>(row_stride));
@@ -2159,56 +2155,36 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(
   DType* output_values = nullptr;  // Not used in PageTableTransform mode
   dim3 nblks(total_ctas);
   dim3 nthrs(BLOCK_THREADS);
-  auto launch_kernel = [&](auto kernel) -> cudaError_t {
+  auto launch_kernel = [&](auto kernel, auto... page_table_args) -> cudaError_t {
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    if constexpr (PageTablePolicy::kHasRuntimeState) {
-      void* args[] = {&input,
-                      &output_page_table,
-                      &output_values,
-                      &src_page_table,
-                      &lengths,
-                      &row_starts,
-                      &page_table_row_starts,
-                      &row_to_batch,
-                      &src_stride,
-                      &top_k_val,
-                      &max_len,
-                      &num_rows,
-                      &row_states_buffer,
-                      &det_scratch_buffer,
-                      &chunk_size,
-                      &ctas_per_group,
-                      &page_table_policy};
-      return cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
-    } else {
-      void* args[] = {&input,
-                      &output_page_table,
-                      &output_values,
-                      &src_page_table,
-                      &lengths,
-                      &row_starts,
-                      &page_table_row_starts,
-                      &row_to_batch,
-                      &src_stride,
-                      &top_k_val,
-                      &max_len,
-                      &num_rows,
-                      &row_states_buffer,
-                      &det_scratch_buffer,
-                      &chunk_size,
-                      &ctas_per_group};
-      return cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
-    }
+    void* args[] = {&input,
+                    &output_page_table,
+                    &output_values,
+                    &src_page_table,
+                    &lengths,
+                    &row_starts,
+                    &page_table_row_starts,
+                    &row_to_batch,
+                    &src_stride,
+                    &top_k_val,
+                    &max_len,
+                    &num_rows,
+                    &row_states_buffer,
+                    &det_scratch_buffer,
+                    &chunk_size,
+                    &ctas_per_group,
+                    &page_table_args...};
+    return cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
   };
 
 #define LAUNCH_PAGE_TABLE_KERNEL(THREADS, SINGLE_CTA_FLAG, DET_FLAG)                          \
   do {                                                                                        \
-    if constexpr (PageTablePolicy::kHasRuntimeState) {                                        \
+    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                        \
       auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,     \
                                             RadixTopKMode::PageTableTransform, DType, IdType, \
                                             PageTablePolicy, PageTablePolicy>;                \
-      FLASHINFER_CUDA_CALL(launch_kernel(kernel));                                            \
+      FLASHINFER_CUDA_CALL(launch_kernel(kernel, page_table_policy));                         \
     } else {                                                                                  \
       auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,     \
                                             RadixTopKMode::PageTableTransform, DType, IdType, \
@@ -2565,7 +2541,7 @@ enum class FilteredTopKMode { Plain, PageTable, Ragged };
  * - Ragged: output = indices, aux_input = offsets, aux_output/aux_stride/row_to_batch unused
  */
 template <typename DType, typename IdType, int VEC_SIZE, bool DETERMINISTIC, FilteredTopKMode MODE,
-          TopKTieBreak TIE_BREAK, typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
+          TopKTieBreak TIE_BREAK, typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>,
           typename... PageTableArgs>
 __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     FilteredTopKUnifiedKernel(const DType* __restrict__ input, IdType* __restrict__ output,
@@ -2577,8 +2553,9 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                               const IdType* __restrict__ row_starts,
                               const IdType* __restrict__ page_table_row_starts, uint32_t num_rows,
                               uint32_t top_k, uint32_t max_len, PageTableArgs... page_table_args) {
-  static_assert(!PageTablePolicy::kRequiresPageTableMode || MODE == FilteredTopKMode::PageTable);
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+  static_assert(MODE == FilteredTopKMode::PageTable ||
+                IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>);
+  static_assert(IsValidPageTableKernelArgs<PageTablePolicy, PageTableArgs...>);
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
@@ -2601,7 +2578,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   const DType* score = input + static_cast<size_t>(bid) * row_stride + row_start;
   IdType* dst = output + bid * top_k;
   IdType* dst_raw = nullptr;
-  if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+  if constexpr (!IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
     dst_raw = page_table_policy.get_row_raw_output(bid, top_k);
   }
 
@@ -2634,15 +2611,13 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         // Defer the page-table/ragged transform to the lightweight finalizer.
         dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
       } else if constexpr (MODE == FilteredTopKMode::PageTable) {
-        if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+        if constexpr (IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
           dst[i] =
               (i < length) ? src_page_entry[page_table_row_start + i] : static_cast<IdType>(-1);
         } else {
           const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
-          if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-            if (dst_raw != nullptr) {
-              dst_raw[i] = raw_idx;
-            }
+          if (dst_raw != nullptr) {
+            dst_raw[i] = raw_idx;
           }
           dst[i] = raw_idx >= 0
                        ? page_table_policy.transform_index(src_page_entry, page_table_row_start,
@@ -3140,13 +3115,11 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     } else if constexpr (DETERMINISTIC) {  // transform in SortTopKByIndexKernel
       dst[base] = static_cast<IdType>(idx);
     } else if constexpr (MODE == FilteredTopKMode::PageTable) {
-      if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+      if constexpr (IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
         dst[base] = src_page_entry[page_table_row_start + idx];
       } else {
-        if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-          if (dst_raw != nullptr) {
-            dst_raw[base] = static_cast<IdType>(idx);
-          }
+        if (dst_raw != nullptr) {
+          dst_raw[base] = static_cast<IdType>(idx);
         }
         dst[base] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
                                                       static_cast<uint32_t>(idx));
@@ -3195,7 +3168,7 @@ struct SortTopKByIndexBlockRadixSort<false, BLOCK_THREADS, ITEMS_PER_THREAD, DTy
 
 template <bool SORT_LOCAL_INDICES, FilteredTopKMode MODE, uint32_t BLOCK_THREADS,
           uint32_t ITEMS_PER_THREAD, typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>,
           typename... PageTableArgs>
 __global__ void __launch_bounds__(BLOCK_THREADS)
     FinalizeTopKIndicesKernel(IdType* output_indices, DType* output_values,
@@ -3203,8 +3176,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
                               const IdType* page_table_row_starts, const IdType* row_to_batch,
                               uint32_t top_k, uint32_t max_len,
                               PageTableArgs... page_table_args) {
-  static_assert(!PageTablePolicy::kRequiresPageTableMode || MODE == FilteredTopKMode::PageTable);
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+  static_assert(MODE == FilteredTopKMode::PageTable ||
+                IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>);
+  static_assert(IsValidPageTableKernelArgs<PageTablePolicy, PageTableArgs...>);
   constexpr bool WITH_VALUES = (MODE == FilteredTopKMode::Plain);
   using BlockRadixSortT = typename SortTopKByIndexBlockRadixSort<WITH_VALUES, BLOCK_THREADS,
                                                                  ITEMS_PER_THREAD, DType>::Type;
@@ -3215,7 +3189,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   const uint32_t tx = threadIdx.x;
   IdType* row_output = output_indices + static_cast<size_t>(row) * top_k;
   IdType* row_raw_output = nullptr;
-  if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+  if constexpr (!IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
     row_raw_output = page_table_policy.get_row_raw_output(row, top_k);
   }
 
@@ -3268,7 +3242,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
         row_output[pos] = static_cast<IdType>(idx);
         output_values[static_cast<size_t>(row) * top_k + pos] = values[i];
       } else if constexpr (MODE == FilteredTopKMode::PageTable) {
-        if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+        if constexpr (!IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>) {
           if (row_raw_output != nullptr) {
             row_raw_output[pos] = (idx != ~0u) ? static_cast<IdType>(idx) : static_cast<IdType>(-1);
           }
@@ -3285,16 +3259,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
 }
 
 template <bool SORT_LOCAL_INDICES, FilteredTopKMode MODE, typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
-          typename... PageTableArgs>
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>>
 cudaError_t LaunchFinalizeTopKIndices(IdType* output_indices, DType* output_values,
                                       const IdType* aux_input, int64_t aux_stride,
                                       const IdType* page_table_row_starts,
                                       const IdType* row_to_batch, uint32_t num_rows,
                                       uint32_t top_k_val, uint32_t max_len,
                                       cudaStream_t stream = 0,
-                                      PageTableArgs... page_table_args) {
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+                                      const PageTablePolicy& page_table_policy = {}) {
+  static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   // Block-local sort variants cover at most 256 * 8 = 2048 elements.
   if (top_k_val > 2048) {
     return cudaErrorInvalidValue;
@@ -3309,28 +3282,22 @@ cudaError_t LaunchFinalizeTopKIndices(IdType* output_indices, DType* output_valu
   }
 
   dim3 grid(num_rows);
-  PageTablePolicy page_table_policy{page_table_args...};
-  auto launch_finalize = [&](auto kernel, uint32_t threads) -> cudaError_t {
+  auto launch_finalize = [&](auto kernel, uint32_t threads,
+                             auto... page_table_args) -> cudaError_t {
     dim3 block(threads);
-    if constexpr (PageTablePolicy::kHasRuntimeState) {
-      void* args[] = {&output_indices,        &output_values, &aux_input, &aux_stride,
-                      &page_table_row_starts, &row_to_batch,  &top_k_val, &max_len,
-                      &page_table_policy};
-      return cudaLaunchKernel((void*)kernel, grid, block, args, 0, stream);
-    } else {
-      void* args[] = {&output_indices,        &output_values, &aux_input, &aux_stride,
-                      &page_table_row_starts, &row_to_batch,  &top_k_val, &max_len};
-      return cudaLaunchKernel((void*)kernel, grid, block, args, 0, stream);
-    }
+    void* args[] = {&output_indices,        &output_values, &aux_input, &aux_stride,
+                    &page_table_row_starts, &row_to_batch,  &top_k_val, &max_len,
+                    &page_table_args...};
+    return cudaLaunchKernel((void*)kernel, grid, block, args, 0, stream);
   };
 
 #define LAUNCH_FINALIZE_KERNEL(THREADS, ITEMS_PER_THREAD)                                    \
   do {                                                                                       \
-    if constexpr (PageTablePolicy::kHasRuntimeState) {                                       \
+    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                       \
       status = launch_finalize(                                                              \
           FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD,     \
                                     DType, IdType, PageTablePolicy, PageTablePolicy>,         \
-          THREADS);                                                                          \
+          THREADS, page_table_policy);                                                       \
     } else {                                                                                 \
       status = launch_finalize(                                                              \
           FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD,     \
@@ -3445,61 +3412,54 @@ cudaError_t StableSortTopKByValue(IdType* output_indices, DType* output_values, 
 }
 
 template <FilteredTopKMode MODE, typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
-          typename... PageTableArgs>
-cudaError_t LaunchFilteredTopKUnified(
-    DType* input, IdType* output, DType* aux_output, const IdType* aux_input, int64_t aux_stride,
-    const IdType* row_to_batch, const IdType* lengths, const IdType* row_starts,
-    const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
-    bool deterministic = false, TopKTieBreak tie_break = TopKTieBreak::None,
-    cudaStream_t stream = 0, bool dsa_graph_safe = false, PageTableArgs... page_table_args) {
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>>
+cudaError_t LaunchFilteredTopKUnified(DType* input, IdType* output, DType* aux_output,
+                                      const IdType* aux_input, int64_t aux_stride,
+                                      const IdType* row_to_batch, const IdType* lengths,
+                                      const IdType* row_starts, const IdType* page_table_row_starts,
+                                      uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+                                      bool deterministic = false,
+                                      TopKTieBreak tie_break = TopKTieBreak::None,
+                                      cudaStream_t stream = 0, bool dsa_graph_safe = false,
+                                      const PageTablePolicy& page_table_policy = {}) {
+  static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
   const bool deterministic_selection = deterministic || tie_break != TopKTieBreak::None;
 
   dim3 grid(num_rows);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  PageTablePolicy page_table_policy{page_table_args...};
   const auto row_stride = page_table_policy.get_input_stride(max_len);
   int vec_size = (row_starts != nullptr && MODE != FilteredTopKMode::Plain)
                      ? 1
                      : ComputeFilteredTopKVecSize<DType>(row_stride, dsa_graph_safe);
   vec_size = page_table_policy.refine_vec_size(input, vec_size);
 
-  auto launch_kernel = [&](auto kernel) -> cudaError_t {
+  auto launch_kernel = [&](auto kernel, auto... page_table_args) -> cudaError_t {
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    if constexpr (PageTablePolicy::kHasRuntimeState) {
-      void* args[] = {&input,
-                      &output,
-                      &aux_output,
-                      &aux_input,
-                      &aux_stride,
-                      &row_to_batch,
-                      &lengths,
-                      &row_starts,
-                      &page_table_row_starts,
-                      &num_rows,
-                      &top_k_val,
-                      &max_len,
-                      &page_table_policy};
-      return cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream);
-    } else {
-      void* args[] = {&input,     &output,     &aux_output,
-                      &aux_input, &aux_stride, &row_to_batch,
-                      &lengths,   &row_starts, &page_table_row_starts,
-                      &num_rows,  &top_k_val,  &max_len};
-      return cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream);
-    }
+    void* args[] = {&input,
+                    &output,
+                    &aux_output,
+                    &aux_input,
+                    &aux_stride,
+                    &row_to_batch,
+                    &lengths,
+                    &row_starts,
+                    &page_table_row_starts,
+                    &num_rows,
+                    &top_k_val,
+                    &max_len,
+                    &page_table_args...};
+    return cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream);
   };
 
 #define LAUNCH_FILTERED_KERNEL(VS, DET, TIE)                                                       \
   do {                                                                                             \
-    if constexpr (PageTablePolicy::kHasRuntimeState) {                                             \
+    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                             \
       auto kernel = FilteredTopKUnifiedKernel<DType, IdType, VS, DET, MODE, TIE, PageTablePolicy,  \
                                               PageTablePolicy>;                                    \
-      FLASHINFER_CUDA_CALL(launch_kernel(kernel));                                                 \
+      FLASHINFER_CUDA_CALL(launch_kernel(kernel, page_table_policy));                              \
     } else {                                                                                       \
       auto kernel = FilteredTopKUnifiedKernel<DType, IdType, VS, DET, MODE, TIE, PageTablePolicy>; \
       FLASHINFER_CUDA_CALL(launch_kernel(kernel));                                                 \
@@ -3534,29 +3494,20 @@ cudaError_t LaunchFilteredTopKUnified(
 
 // Launch functions with VEC_SIZE and BLOCK_THREADS dispatch - using unified kernel
 template <typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
-          typename... PageTableArgs>
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>>
 cudaError_t FilteredTopKPageTableTransform(
     DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
     const IdType* row_to_batch, IdType* lengths, const IdType* row_starts,
     const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
     bool deterministic = false, TopKTieBreak tie_break = TopKTieBreak::None,
-    cudaStream_t stream = 0, bool dsa_graph_safe = false, PageTableArgs... page_table_args) {
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
+    cudaStream_t stream = 0, bool dsa_graph_safe = false,
+    const PageTablePolicy& page_table_policy = {}) {
+  static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   DType* aux_output = nullptr;  // Not used for PageTable mode
-  PageTablePolicy page_table_policy{page_table_args...};
-  if constexpr (PageTablePolicy::kHasRuntimeState) {
-    return LaunchFilteredTopKUnified<FilteredTopKMode::PageTable, DType, IdType, PageTablePolicy,
-                                     PageTablePolicy>(
-        input, output_page_table, aux_output, src_page_table, src_stride, row_to_batch, lengths,
-        row_starts, page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break,
-        stream, dsa_graph_safe, page_table_policy);
-  } else {
-    return LaunchFilteredTopKUnified<FilteredTopKMode::PageTable, DType, IdType, PageTablePolicy>(
-        input, output_page_table, aux_output, src_page_table, src_stride, row_to_batch, lengths,
-        row_starts, page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break,
-        stream, dsa_graph_safe);
-  }
+  return LaunchFilteredTopKUnified<FilteredTopKMode::PageTable, DType, IdType, PageTablePolicy>(
+      input, output_page_table, aux_output, src_page_table, src_stride, row_to_batch, lengths,
+      row_starts, page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break,
+      stream, dsa_graph_safe, page_table_policy);
 }
 
 template <typename DType, typename IdType>
@@ -3689,17 +3640,15 @@ inline bool ShouldUseFilteredTopK(uint32_t num_rows, uint32_t top_k_val, uint32_
 
 // Dispatch functions with heuristics
 template <typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableTransformPolicy<IdType>,
-          typename... PageTableArgs>
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>>
 cudaError_t TopKPageTableTransformDispatch(
     DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
     IdType* lengths, const IdType* row_starts, const IdType* row_to_batch, uint32_t num_rows,
     uint32_t top_k_val, uint32_t max_len, RadixRowState* row_states_buffer, bool deterministic,
     TopKTieBreak tie_break = TopKTieBreak::None, cudaStream_t stream = 0,
     bool dsa_graph_safe = false, const IdType* page_table_row_starts = nullptr,
-    PageTableArgs... page_table_args) {
-  static_assert(IsValidPageTablePolicyArgs<PageTablePolicy, PageTableArgs...>);
-  const PageTablePolicy page_table_policy{page_table_args...};
+    const PageTablePolicy& page_table_policy = {}) {
+  static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   FLASHINFER_CUDA_CALL(page_table_policy.validate(row_starts, page_table_row_starts));
   if (page_table_row_starts == nullptr) {
     page_table_row_starts = row_starts;
@@ -3710,58 +3659,29 @@ cudaError_t TopKPageTableTransformDispatch(
   }
   if (ShouldUseFilteredTopK<DType>(num_rows, top_k_val, max_len, deterministic, tie_break,
                                    dsa_graph_safe)) {
-    if constexpr (PageTablePolicy::kHasRuntimeState) {
-      FLASHINFER_CUDA_CALL(
-          (FilteredTopKPageTableTransform<DType, IdType, PageTablePolicy, PageTablePolicy>(
-              input, output_page_table, src_page_table, src_stride, row_to_batch, lengths,
-              row_starts, page_table_row_starts, num_rows, top_k_val, max_len, deterministic,
-              tie_break, stream, dsa_graph_safe, page_table_policy)));
-    } else {
-      FLASHINFER_CUDA_CALL((FilteredTopKPageTableTransform<DType, IdType, PageTablePolicy>(
-          input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
-          page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break, stream,
-          dsa_graph_safe)));
-    }
+    FLASHINFER_CUDA_CALL((FilteredTopKPageTableTransform<DType, IdType, PageTablePolicy>(
+        input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
+        page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break, stream,
+        dsa_graph_safe, page_table_policy)));
     if (deterministic) {
-      if constexpr (PageTablePolicy::kHasRuntimeState) {
-        FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-            true, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy, PageTablePolicy>(
-            output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
-            page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream,
-            page_table_policy)));
-      } else {
-        FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-            true, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
-            output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
-            page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream)));
-      }
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
+          true, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
+          output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
+          page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream,
+          page_table_policy)));
     } else if (tie_break != TopKTieBreak::None) {
-      if constexpr (PageTablePolicy::kHasRuntimeState) {
-        FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-            false, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy,
-            PageTablePolicy>(output_page_table, static_cast<uint8_t*>(nullptr), src_page_table,
-                             src_stride, page_table_row_starts, row_to_batch, num_rows, top_k_val,
-                             max_len, stream, page_table_policy)));
-      } else {
-        FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-            false, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
-            output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
-            page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream)));
-      }
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
+          false, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
+          output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
+          page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream,
+          page_table_policy)));
     }
     return cudaSuccess;
   }
-  if constexpr (PageTablePolicy::kHasRuntimeState) {
-    return RadixTopKPageTableTransformMultiCTA<DType, IdType, PageTablePolicy, PageTablePolicy>(
-        input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
-        page_table_row_starts, num_rows, top_k_val, max_len, row_states_buffer, deterministic,
-        stream, page_table_policy);
-  } else {
-    return RadixTopKPageTableTransformMultiCTA<DType, IdType, PageTablePolicy>(
-        input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
-        page_table_row_starts, num_rows, top_k_val, max_len, row_states_buffer, deterministic,
-        stream);
-  }
+  return RadixTopKPageTableTransformMultiCTA<DType, IdType, PageTablePolicy>(
+      input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, row_starts,
+      page_table_row_starts, num_rows, top_k_val, max_len, row_states_buffer, deterministic, stream,
+      page_table_policy);
 }
 
 template <typename DType, typename IdType>

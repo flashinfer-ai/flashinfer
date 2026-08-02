@@ -557,7 +557,7 @@ def test_top_k_page_table_transform(num_rows, max_len, k, dtype):
 
 @pytest.mark.parametrize("algo", ["multi_cta", "filtered"])
 @pytest.mark.parametrize("page_size", [64])
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "num_rows,max_len,k",
     [
@@ -580,11 +580,8 @@ def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
         (num_rows, max_len + score_padding), device=device, dtype=dtype
     )
     scores = score_storage[:, 1 : max_len + 1]
-    scores.copy_(
-        torch.arange(max_len, device=device, dtype=dtype)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-    )
+    scores.zero_()
+    scores[:, :k] = 1
     assert scores.stride() == (max_len + score_padding, 1)
     assert scores.data_ptr() % 16 != 0
 
@@ -657,7 +654,7 @@ def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
 
 
 @pytest.mark.parametrize("page_size", [64])
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "num_rows,max_len,k",
     [
@@ -679,11 +676,6 @@ def test_top_k_page_table_transform_compact_pages_cuda_graph_replay(
         (num_rows, max_len + score_padding), device=device, dtype=dtype
     )
     scores = score_storage[:, :max_len]
-    scores.copy_(
-        torch.arange(max_len, device=device, dtype=dtype)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-    )
     page_table_width = (max_len + page_size - 1) // page_size
     src_page_table = torch.arange(
         num_rows * page_table_width, device=device, dtype=torch.int32
@@ -698,6 +690,17 @@ def test_top_k_page_table_transform_compact_pages_cuda_graph_replay(
             torch.where(row_ids % 4 == 2, 0, k + 73),
         ),
     ).to(torch.int32)
+
+    def set_selected_scores(use_prefix: bool) -> None:
+        scores.zero_()
+        for row, length in enumerate(lengths.tolist()):
+            num_selected = min(length, k)
+            if num_selected == 0:
+                continue
+            start = 0 if use_prefix else length - num_selected
+            scores[row, start : start + num_selected] = 1
+
+    set_selected_scores(use_prefix=False)
     out = torch.empty((num_rows, k), device=device, dtype=torch.int32)
     out_raw_indices = torch.empty_like(out)
 
@@ -718,11 +721,6 @@ def test_top_k_page_table_transform_compact_pages_cuda_graph_replay(
         )
     assert result.data_ptr() == out.data_ptr()
 
-    scores.copy_(
-        torch.arange(max_len, 0, -1, device=device, dtype=dtype)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-    )
     src_page_table.add_(100)
     updated_lengths = torch.where(
         row_ids % 4 == 0,
@@ -734,6 +732,7 @@ def test_top_k_page_table_transform_compact_pages_cuda_graph_replay(
         ),
     ).to(torch.int32)
     lengths.copy_(updated_lengths)
+    set_selected_scores(use_prefix=True)
     graph.replay()
     torch.cuda.synchronize()
 

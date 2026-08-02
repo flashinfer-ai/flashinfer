@@ -691,8 +691,9 @@ def top_k_page_table_transform(
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
     This function performs top-k selection on input scores and translates the
-    selected indices through a compact page table in a single fused kernel.
-    For each selected local index ``idx`` in row ``i``::
+    selected indices through a page table in a single fused kernel. Each
+    page-table entry represents ``page_size`` consecutive score positions. For
+    each selected local index ``idx`` in row ``i``::
 
         physical_page = src_page_table[
             batch_idx, page_table_row_start[i] + idx // page_size
@@ -708,8 +709,8 @@ def top_k_page_table_transform(
         Input scores tensor of shape ``(num_rows, max_len)``.
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     src_page_table : torch.Tensor
-        Compact source page table of shape ``(batch_size, max_pages_per_seq)``
-        with dtype ``int32``.
+        Source page table of shape ``(batch_size, max_page_table_length)`` with
+        dtype ``int32``.
     lengths : torch.Tensor
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int
@@ -757,7 +758,7 @@ def top_k_page_table_transform(
     out_raw_indices : Optional[torch.Tensor], optional
         Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
         Receives selected indices relative to each score window before
-        compact-page translation. Padding positions are set to -1 and remain
+        page-table translation. Padding positions are set to -1 and remain
         positionally aligned with ``out``. Must not overlap ``out``.
 
     Returns
@@ -791,27 +792,25 @@ def top_k_page_table_transform(
     """
     device = input.device
     num_rows = input.size(0)
-    output_shape = (num_rows, k)
 
-    if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
-        raise ValueError(
-            "page_size must be a positive power of two no greater than 2**30, "
-            f"got {page_size}"
-        )
-    if page_size > 1 and row_starts is not None and page_table_row_starts is None:
-        raise ValueError(
-            "page_table_row_starts is required with page_size > 1 and row_starts"
-        )
-    if input.ndim != 2 or input.stride(1) != 1:
-        raise ValueError("input must be 2D and contiguous in its last dimension")
+    if page_size != 1:
+        if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
+            raise ValueError(
+                "page_size must be a positive power of two no greater than 2**30, "
+                f"got {page_size}"
+            )
+        if row_starts is not None and page_table_row_starts is None:
+            raise ValueError(
+                "page_table_row_starts is required with page_size > 1 and row_starts"
+            )
     if out is not None:
-        check_shape_dtype_device(out, output_shape, torch.int32, device, "out")
+        check_shape_dtype_device(out, (num_rows, k), torch.int32, device, "out")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
     if out_raw_indices is not None:
         check_shape_dtype_device(
             out_raw_indices,
-            output_shape,
+            (num_rows, k),
             torch.int32,
             device,
             "out_raw_indices",
@@ -854,7 +853,7 @@ def top_k_page_table_transform(
     )
 
     if out is None:
-        out = torch.empty(output_shape, dtype=torch.int32, device=device)
+        out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
 
     get_topk_module().radix_topk_page_table_transform(
         input,

@@ -96,9 +96,12 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   CHECK_INPUT_AND_TYPE(output_page_table, dl_int32);
   CHECK_INPUT_AND_TYPE(src_page_table, dl_int32);
   CHECK_INPUT_AND_TYPE(lengths, dl_int32);
+  CHECK_DEVICE(output_page_table, input);
+  CHECK_DEVICE(src_page_table, input);
+  CHECK_DEVICE(lengths, input);
   CHECK_DIM(2, input);              // input: (num_rows, max_len)
   CHECK_DIM(2, output_page_table);  // output_page_table: (num_rows, top_k)
-  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_len)
+  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_page_table_length)
   CHECK_DIM(1, lengths);            // lengths: (num_rows,)
   TVM_FFI_ICHECK_EQ(output_page_table.size(0), input.size(0))
       << "output_page_table must have shape (num_rows, top_k)";
@@ -114,20 +117,24 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
       << "page_table_row_starts is required with page_size > 1 and row_starts";
   if (maybe_row_starts.has_value()) {
     CHECK_INPUT_AND_TYPE(maybe_row_starts.value(), dl_int32);
+    CHECK_DEVICE(maybe_row_starts.value(), input);
     CHECK_DIM(1, maybe_row_starts.value());
   }
   if (maybe_page_table_row_starts.has_value()) {
     CHECK_INPUT_AND_TYPE(maybe_page_table_row_starts.value(), dl_int32);
+    CHECK_DEVICE(maybe_page_table_row_starts.value(), input);
     CHECK_DIM(1, maybe_page_table_row_starts.value());
   }
   if (maybe_row_to_batch.has_value()) {
     CHECK_INPUT_AND_TYPE(maybe_row_to_batch.value(), dl_int32);
+    CHECK_DEVICE(maybe_row_to_batch.value(), input);
     CHECK_DIM(1, maybe_row_to_batch.value());
     TVM_FFI_ICHECK_EQ(maybe_row_to_batch.value().size(0), input.size(0))
         << "row_to_batch must have shape (num_rows,)";
   }
   if (maybe_output_raw_indices.has_value()) {
     CHECK_INPUT_AND_TYPE(maybe_output_raw_indices.value(), dl_int32);
+    CHECK_DEVICE(maybe_output_raw_indices.value(), input);
     CHECK_DIM(2, maybe_output_raw_indices.value());
     CHECK_SHAPE(maybe_output_raw_indices.value(), output_page_table);
     const auto output_begin = reinterpret_cast<std::uintptr_t>(output_page_table.data_ptr());
@@ -138,6 +145,9 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
     TVM_FFI_ICHECK(output_begin + output_nbytes <= output_raw_begin ||
                    output_raw_begin + output_nbytes <= output_begin)
         << "output_page_table and output_raw_indices must not overlap";
+  }
+  if (maybe_row_states_buffer.has_value()) {
+    CHECK_DEVICE(maybe_row_states_buffer.value(), input);
   }
 
   unsigned int num_rows = input.size(0);
@@ -184,41 +194,31 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   if (maybe_output_raw_indices.has_value()) {
     output_raw_indices_ptr = static_cast<int32_t*>(maybe_output_raw_indices.value().data_ptr());
   }
-  const bool use_runtime_page_table_policy =
+  const bool use_configurable_page_table_policy =
       page_bits != 0 || output_raw_indices_ptr != nullptr ||
       input_stride != static_cast<int64_t>(max_len) ||
-      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % sampling::TOPK_MAX_VECTOR_BYTES != 0;
+      (row_starts_ptr == nullptr && !dsa_graph_safe &&
+       reinterpret_cast<std::uintptr_t>(input.data_ptr()) % sampling::TOPK_MAX_VECTOR_BYTES != 0);
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   auto dispatch_with_page_table_policy = [&](auto page_table_policy) {
     using PageTablePolicy = decltype(page_table_policy);
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-      if constexpr (PageTablePolicy::kHasRuntimeState) {
-        status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy,
-                                                          PageTablePolicy>(
-            static_cast<c_type*>(input.data_ptr()),
-            static_cast<int32_t*>(output_page_table.data_ptr()),
-            static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
-            static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
-            static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
-            stream, dsa_graph_safe, page_table_row_starts_ptr, page_table_policy);
-      } else {
-        status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy>(
-            static_cast<c_type*>(input.data_ptr()),
-            static_cast<int32_t*>(output_page_table.data_ptr()),
-            static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
-            static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
-            static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
-            stream, dsa_graph_safe, page_table_row_starts_ptr);
-      }
+      status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy>(
+          static_cast<c_type*>(input.data_ptr()),
+          static_cast<int32_t*>(output_page_table.data_ptr()),
+          static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
+          static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
+          static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
+          stream, dsa_graph_safe, page_table_row_starts_ptr, page_table_policy);
       return true;
     });
   };
-  if (use_runtime_page_table_policy) {
-    dispatch_with_page_table_policy(sampling::RuntimePageTableTransformPolicy<int32_t>{
+  if (use_configurable_page_table_policy) {
+    dispatch_with_page_table_policy(sampling::ConfigurablePageTableKernelPolicy<int32_t>{
         output_raw_indices_ptr, input_stride, page_bits});
   } else {
-    dispatch_with_page_table_policy(sampling::DirectPageTableTransformPolicy<int32_t>{});
+    dispatch_with_page_table_policy(sampling::DirectPageTableKernelPolicy<int32_t>{});
   }
 
   TVM_FFI_ICHECK(status == cudaSuccess)
