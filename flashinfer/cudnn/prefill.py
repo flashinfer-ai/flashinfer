@@ -806,7 +806,9 @@ def cudnn_batch_prefill_with_kv_cache(
     out : Optional[torch.Tensor]
         Pre-allocated output tensor, shape
         ``(total_qo_tokens, num_heads_qo, head_dim_vo)``.  Allocated internally
-        when ``None``.
+        when ``None``.  When supplied it must match that shape, be contiguous, be
+        on the same device as ``q``, and have dtype ``o_data_type`` (or ``q.dtype``
+        when ``o_data_type`` is ``None``); otherwise ``ValueError`` is raised.
     lse : Optional[torch.Tensor]
         Pre-allocated LSE tensor, shape
         ``(batch_size, max_token_per_sequence, num_heads_qo)``.  Allocated
