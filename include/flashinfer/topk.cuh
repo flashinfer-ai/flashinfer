@@ -1241,6 +1241,10 @@ struct RuntimePageTableTransformPolicy {
   }
 };
 
+template <typename PageTablePolicy, typename IdType>
+inline constexpr bool IsDirectPageTableTransformPolicy =
+    std::is_same_v<PageTablePolicy, DirectPageTableTransformPolicy<IdType>>;
+
 template <typename PageTablePolicy, typename... PageTableArgs>
 inline constexpr bool IsValidPageTablePolicyArgs =
     std::is_trivially_copyable_v<PageTablePolicy> && std::is_standard_layout_v<PageTablePolicy> &&
@@ -1386,16 +1390,21 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
       if (length <= top_k_val) {
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
-          const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
-          if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-            if (row_raw_output != nullptr) {
-              row_raw_output[i] = raw_idx;
+          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+            row_output[i] =
+                (i < length) ? src_page_entry[page_table_row_start + i] : static_cast<IdType>(-1);
+          } else {
+            const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
+            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+              if (row_raw_output != nullptr) {
+                row_raw_output[i] = raw_idx;
+              }
             }
+            row_output[i] = raw_idx >= 0 ? page_table_policy.transform_index(
+                                               src_page_entry, page_table_row_start,
+                                               static_cast<uint32_t>(raw_idx))
+                                         : static_cast<IdType>(-1);
           }
-          row_output[i] =
-              raw_idx >= 0 ? page_table_policy.transform_index(src_page_entry, page_table_row_start,
-                                                               static_cast<uint32_t>(raw_idx))
-                           : static_cast<IdType>(-1);
         }
         // Clear histogram for next iteration
         if constexpr (!SINGLE_CTA) {
@@ -1486,13 +1495,17 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         // Transform through page table with coalesced access
         for (uint32_t i = tx; i < k; i += BLOCK_THREADS) {
           IdType idx = row_output[i];
-          if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-            if (row_raw_output != nullptr) {
-              row_raw_output[i] = idx;
+          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+            row_output[i] = src_page_entry[page_table_row_start + idx];
+          } else {
+            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+              if (row_raw_output != nullptr) {
+                row_raw_output[i] = idx;
+              }
             }
+            row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
+                                                              static_cast<uint32_t>(idx));
           }
-          row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
-                                                            static_cast<uint32_t>(idx));
         }
       } else {
         // Barrier to ensure all CTAs finished writing indices
@@ -1504,13 +1517,17 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         uint32_t my_end = min(my_start + elems_per_cta, k);
         for (uint32_t i = my_start + tx; i < my_end; i += BLOCK_THREADS) {
           IdType idx = row_output[i];
-          if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-            if (row_raw_output != nullptr) {
-              row_raw_output[i] = idx;
+          if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+            row_output[i] = src_page_entry[page_table_row_start + idx];
+          } else {
+            if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+              if (row_raw_output != nullptr) {
+                row_raw_output[i] = idx;
+              }
             }
+            row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
+                                                              static_cast<uint32_t>(idx));
           }
-          row_output[i] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
-                                                            static_cast<uint32_t>(idx));
         }
       }
     } else {  // RaggedTransform
@@ -2617,16 +2634,21 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         // Defer the page-table/ragged transform to the lightweight finalizer.
         dst[i] = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
       } else if constexpr (MODE == FilteredTopKMode::PageTable) {
-        const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
-        if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-          if (dst_raw != nullptr) {
-            dst_raw[i] = raw_idx;
+        if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+          dst[i] =
+              (i < length) ? src_page_entry[page_table_row_start + i] : static_cast<IdType>(-1);
+        } else {
+          const IdType raw_idx = (i < length) ? static_cast<IdType>(i) : static_cast<IdType>(-1);
+          if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+            if (dst_raw != nullptr) {
+              dst_raw[i] = raw_idx;
+            }
           }
+          dst[i] = raw_idx >= 0
+                       ? page_table_policy.transform_index(src_page_entry, page_table_row_start,
+                                                           static_cast<uint32_t>(raw_idx))
+                       : static_cast<IdType>(-1);
         }
-        dst[i] = raw_idx >= 0
-                     ? page_table_policy.transform_index(src_page_entry, page_table_row_start,
-                                                         static_cast<uint32_t>(raw_idx))
-                     : static_cast<IdType>(-1);
       } else {  // Ragged
         dst[i] = (i < length) ? static_cast<IdType>(i) + offset_val : static_cast<IdType>(-1);
       }
@@ -3118,13 +3140,17 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     } else if constexpr (DETERMINISTIC) {  // transform in SortTopKByIndexKernel
       dst[base] = static_cast<IdType>(idx);
     } else if constexpr (MODE == FilteredTopKMode::PageTable) {
-      if constexpr (PageTablePolicy::kMayWriteRawIndices) {
-        if (dst_raw != nullptr) {
-          dst_raw[base] = static_cast<IdType>(idx);
+      if constexpr (IsDirectPageTableTransformPolicy<PageTablePolicy, IdType>) {
+        dst[base] = src_page_entry[page_table_row_start + idx];
+      } else {
+        if constexpr (PageTablePolicy::kMayWriteRawIndices) {
+          if (dst_raw != nullptr) {
+            dst_raw[base] = static_cast<IdType>(idx);
+          }
         }
+        dst[base] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
+                                                      static_cast<uint32_t>(idx));
       }
-      dst[base] = page_table_policy.transform_index(src_page_entry, page_table_row_start,
-                                                    static_cast<uint32_t>(idx));
     } else {  // Ragged
       dst[base] = static_cast<IdType>(idx) + offset_val;
     }
