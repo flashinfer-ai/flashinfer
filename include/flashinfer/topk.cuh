@@ -2092,19 +2092,6 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(
   return cudaSuccess;
 }
 
-// Backward-compatible overload for one-entry-per-score page tables and contiguous inputs.
-template <typename DType, typename IdType>
-cudaError_t RadixTopKPageTableTransformMultiCTA(
-    DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
-    const IdType* row_to_batch, IdType* lengths, const IdType* row_starts,
-    const IdType* page_table_row_starts, uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
-    RadixRowState* row_states_buffer, bool deterministic, cudaStream_t stream = 0) {
-  return RadixTopKPageTableTransformMultiCTA<DType, IdType>(
-      input, output_page_table, nullptr, src_page_table, src_stride, row_to_batch, lengths,
-      row_starts, page_table_row_starts, num_rows, top_k_val, max_len, max_len, 0,
-      row_states_buffer, deterministic, stream);
-}
-
 /*!
  * \brief Launch multi-CTA Radix Top-K with Ragged Index Transform kernel.
  *
@@ -3542,20 +3529,6 @@ cudaError_t TopKPageTableTransformDispatch(
       input, output_page_table, output_raw_indices, src_page_table, src_stride, row_to_batch,
       lengths, row_starts, page_table_row_starts, num_rows, top_k_val, max_len, input_stride,
       page_bits, row_states_buffer, deterministic, stream);
-}
-
-// Backward-compatible overload for one-entry-per-score page tables and contiguous inputs.
-template <typename DType, typename IdType>
-cudaError_t TopKPageTableTransformDispatch(
-    DType* input, IdType* output_page_table, const IdType* src_page_table, int64_t src_stride,
-    IdType* lengths, const IdType* row_starts, const IdType* row_to_batch, uint32_t num_rows,
-    uint32_t top_k_val, uint32_t max_len, RadixRowState* row_states_buffer, bool deterministic,
-    TopKTieBreak tie_break = TopKTieBreak::None, cudaStream_t stream = 0,
-    bool dsa_graph_safe = false, const IdType* page_table_row_starts = nullptr) {
-  return TopKPageTableTransformDispatch<DType, IdType>(
-      input, output_page_table, nullptr, src_page_table, src_stride, lengths, row_starts,
-      row_to_batch, num_rows, top_k_val, max_len, max_len, 0, row_states_buffer, deterministic,
-      tie_break, stream, dsa_graph_safe, page_table_row_starts);
 }
 
 template <typename DType, typename IdType>

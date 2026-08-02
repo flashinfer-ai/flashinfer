@@ -54,7 +54,8 @@ How to add a new template
 
    Key rules:
    - ``Var()``   → axis value is NOT baked into the generated name or JSON value.
-   - ``Const()`` → axis value IS extracted and written to JSON.
+   - ``Const()`` → an extracted tensor or scalar value is written to JSON; if
+     neither source supplies a value, the ``value`` field is omitted.
    - ``Const(default=N)`` supplies ``N`` when no tensor or scalar value is
      available at trace time.
    - Axis values are extracted **automatically** from the first available
