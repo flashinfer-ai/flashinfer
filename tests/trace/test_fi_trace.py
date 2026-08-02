@@ -289,6 +289,18 @@ def test_top_k_sampling_fi_trace():
     assert defn["outputs"]["samples"]["dtype"] == "int64"
 
 
+def test_top_k_page_table_transform_fi_trace_default_page_size(tmp_path):
+    inputs = flashinfer.top_k_page_table_transform.fi_init(num_rows=2, device="cpu")
+    inputs.pop("page_size")
+
+    defn = flashinfer.top_k_page_table_transform.fi_trace(save_dir=tmp_path, **inputs)
+
+    _check_defn(defn, "sampling", "top_k_page_table_transform")
+    assert defn["axes"]["page_size"]["value"] == 1
+    assert defn["name"] == "top_k_page_table_transform_k8_ps1"
+    assert (tmp_path / f"{defn['name']}.json").is_file()
+
+
 def test_top_p_sampling_fi_trace():
     import flashinfer.sampling
 

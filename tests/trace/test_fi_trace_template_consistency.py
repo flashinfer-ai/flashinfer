@@ -592,6 +592,28 @@ def test_axis_extractor_uses_available_tensor_then_scalar(kwargs, expected_k):
     assert definition["axes"]["k"]["value"] == expected_k
 
 
+@pytest.mark.parametrize(
+    "kwargs,expected_page_size",
+    [
+        pytest.param({}, 1, id="default"),
+        pytest.param({"page_size": 64}, 64, id="override"),
+    ],
+)
+def test_const_axis_uses_declared_default(kwargs, expected_page_size):
+    template = TraceTemplate(
+        op_type="sampling",
+        name_prefix="page_transform",
+        axes={"page_size": Const(abbrev="ps", default=1)},
+        inputs={"page_size": Scalar("int32", optional=True)},
+        outputs={"indices": Tensor([], dtype="int32")},
+    )
+
+    definition = template.build_fi_trace_fn("flashinfer.test")(**kwargs)
+
+    assert definition["axes"]["page_size"]["value"] == expected_page_size
+    assert definition["name"] == f"page_transform_ps{expected_page_size}"
+
+
 def test_checker_rejects_wrong_param():
     """Signature checker must catch a param= that doesn't exist in the function."""
     # 'state' in gated_delta_rule_decode is a required positional arg.

@@ -21,7 +21,7 @@ import torch
 
 import flashinfer
 import flashinfer.utils as flashinfer_utils
-from flashinfer.topk import can_implement_filtered_topk
+from flashinfer.topk import can_implement_filtered_topk, get_topk_module
 from flashinfer.utils import get_compute_capability
 
 
@@ -421,7 +421,6 @@ def reference_page_table_transform(
 ) -> torch.Tensor:
     """Reference implementation for page table transform using torch.topk."""
     num_rows = scores.size(0)
-    scores.size(1)
     device = scores.device
 
     output = torch.full((num_rows, k), -1, dtype=torch.int32, device=device)
@@ -612,6 +611,23 @@ def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
             out=overlapping_out,
             out_raw_indices=overlapping_raw_indices,
         )
+    with pytest.raises(RuntimeError, match="must not overlap"):
+        get_topk_module().radix_topk_page_table_transform(
+            scores,
+            overlapping_out,
+            src_page_table,
+            None,
+            lengths,
+            None,
+            k,
+            False,
+            0,
+            page_size,
+            False,
+            row_starts=None,
+            page_table_row_starts=None,
+            output_raw_indices=overlapping_raw_indices,
+        )
 
     result = flashinfer.top_k_page_table_transform(
         scores,
@@ -797,6 +813,7 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
     [
         pytest.param(1, False, False, id="page_size_1_shared_starts"),
         pytest.param(1, True, False, id="page_size_1_separate_starts"),
+        pytest.param(1, True, True, id="page_size_1_raw_output"),
         pytest.param(64, True, False, id="compact_pages"),
         pytest.param(64, True, True, id="compact_pages_raw_output"),
     ],

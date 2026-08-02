@@ -1111,7 +1111,7 @@ top_k_page_table_transform_trace = TraceTemplate(
         "batch_size": Var(),
         "max_pages_per_seq": Var(),
         "k": Const(abbrev="k"),
-        "page_size": Const(abbrev="ps"),
+        "page_size": Const(abbrev="ps", default=1),
     },
     inputs={
         "input": Tensor(["num_rows", "max_len"]),
@@ -1124,7 +1124,7 @@ top_k_page_table_transform_trace = TraceTemplate(
         "row_to_batch": Tensor(["num_rows"], dtype="int32", optional=True),
         "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
-        "page_size": Scalar("int32"),
+        "page_size": Scalar("int32", optional=True),
         "out": Tensor(
             ["num_rows", "k"],
             dtype="int32",

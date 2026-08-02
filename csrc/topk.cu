@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
 
@@ -129,6 +130,14 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
     CHECK_INPUT_AND_TYPE(maybe_output_raw_indices.value(), dl_int32);
     CHECK_DIM(2, maybe_output_raw_indices.value());
     CHECK_SHAPE(maybe_output_raw_indices.value(), output_page_table);
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(output_page_table.data_ptr());
+    const auto output_raw_begin =
+        reinterpret_cast<std::uintptr_t>(maybe_output_raw_indices.value().data_ptr());
+    const auto output_nbytes =
+        static_cast<std::uintptr_t>(output_page_table.numel()) * sizeof(int32_t);
+    TVM_FFI_ICHECK(output_begin + output_nbytes <= output_raw_begin ||
+                   output_raw_begin + output_nbytes <= output_begin)
+        << "output_page_table and output_raw_indices must not overlap";
   }
 
   unsigned int num_rows = input.size(0);
