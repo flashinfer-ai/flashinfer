@@ -743,13 +743,13 @@ def top_k_page_table_transform(
     page_table_row_starts : Optional[torch.Tensor], optional
         Per-row page-table start indices of shape ``(num_rows,)`` with dtype
         ``int32``, measured in page-table entries. If None, defaults to
-        ``row_starts`` to preserve the legacy behavior where score and
-        page-table windows share the same start. When ``page_size > 1`` and
+        ``row_starts``, so score and page-table windows share the same start.
+        When ``page_size > 1`` and
         ``row_starts`` is provided, this argument must also be provided because
         the two starts use different units.
     page_size : int, optional
         Number of score positions represented by each page-table entry. Must
-        be a positive power of two. Setting this to 1 preserves the legacy
+        be a positive power of two. Setting this to 1 preserves the
         one-entry-per-score behavior. Default is 1.
     out : Optional[torch.Tensor], optional
         Optional contiguous ``int32`` output buffer of shape ``(num_rows, k)``.
