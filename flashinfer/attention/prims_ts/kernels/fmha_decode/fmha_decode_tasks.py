@@ -63,9 +63,6 @@ from .fmha_decode_constants import (
     KV_KIND_V,
     KV_TILE_256_SHARED_FIFO_STAGES,
 )
-from .fmha_decode_resources.helpers_block_sparse import (
-    _block_sparse_row_retained_route_count,
-)
 from .fmha_decode_resources.helpers_common import (
     ResourceVars,
     _q_group_token_base,
@@ -638,45 +635,49 @@ def _decode_work_tile_schedule_with_invariant_bridge(
 
 
 @cute.jit
-def _load_sparse_row_bounds_warp(
-    sparse_indptr: cute.Pointer,
+def _load_prepared_sparse_row_warp(
+    row_route_offsets: cute.Pointer,
+    row_route_counts: cute.Pointer,
     row_address: cutlass.Int32,
     lane_idx: cutlass.Int32,
 ) -> tuple[cutlass.Int32, cutlass.Int32]:
-    """Load one sparse row header once per warp and broadcast it.
+    """Load one prepared row header once per warp and broadcast it.
 
     DecodeGenTask.get_domain is a regular Task override, so staged control flow
     lives in this JIT helper rather than in the Python method itself.
     """
 
-    loaded_row_begin = cutlass.Int32(0)
-    loaded_row_end = cutlass.Int32(0)
+    loaded_row_route_begin = cutlass.Int32(0)
+    loaded_route_count = cutlass.Int32(0)
     if lane_idx == cutlass.Int32(0):
-        loaded_row_begin = cutlass.Int32(sparse_indptr[row_address])
-        loaded_row_end = cutlass.Int32(sparse_indptr[row_address + cutlass.Int32(1)])
-    row_begin = cute.arch.make_warp_uniform(
+        loaded_row_route_begin = cutlass.Int32(row_route_offsets[row_address])
+        loaded_route_count = cutlass.Int32(row_route_counts[row_address])
+    row_route_begin = cute.arch.make_warp_uniform(
         cutlass.Int32(
             prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
-                val=loaded_row_begin,
+                val=loaded_row_route_begin,
                 offset=0,
                 mask_and_clamp=0x1F,
                 kind=prims.Shfl.IDX,
             )
         )
     )
-    row_end = cute.arch.make_warp_uniform(
+    route_count = cute.arch.make_warp_uniform(
         cutlass.Int32(
             prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
-                val=loaded_row_end,
+                val=loaded_route_count,
                 offset=0,
                 mask_and_clamp=0x1F,
                 kind=prims.Shfl.IDX,
             )
         )
     )
-    return row_begin, row_end
+    # Prepare encodes an invalid range or capacity overflow as a negative
+    # header. Fail closed without touching that row's metadata slice.
+    route_count = cute.math.max(route_count, cutlass.Int32(0))
+    return row_route_begin, route_count
 
 
 class DecodeGenTask(Task):
@@ -687,8 +688,8 @@ class DecodeGenTask(Task):
         self.cfg = kwargs.pop("cfg", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.paged_kv_indptr = kwargs.pop("paged_kv_indptr", None)
-        self.block_sparse_indptr = kwargs.pop("block_sparse_indptr", None)
-        self.block_sparse_indices = kwargs.pop("block_sparse_indices", None)
+        self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
+        self.sparse_row_route_counts = kwargs.pop("sparse_row_route_counts", None)
         self.num_heads_kv = kwargs.pop("num_heads_kv", None)
         self.max_seq_len_kv = kwargs.pop("max_seq_len_kv", cutlass.Int32(0))
         self.seq_len_q = kwargs.pop("seq_len_q", None)
@@ -933,16 +934,17 @@ class DecodeGenTask(Task):
         if self.cfg is None:
             return self.domain
 
-        # Sparse rows have a runtime-dependent number of KV128 routes even
-        # when sequence lengths are static. Resolve them before the fixed-dense
-        # early return below. Persistent workers pass the logical WorkQueue
-        # tile here, so the same (q_group, head, batch) mapping serves both
-        # static and CLC schedules without a scheduler-specific graph fork.
+        # Sparse rows have a runtime-dependent number of prepared KV128 routes
+        # even when sequence lengths are static. Load their compact header
+        # before the fixed-dense early return below. Persistent workers pass
+        # the logical WorkQueue tile here, so static and CLC schedules share
+        # the same (q_group, head, batch) mapping.
         if self.cfg.use_block_sparse:
-            # Validation-only TaskManagers intentionally omit the GMEM pointer
-            # and retain their configured static domain for graph simulation.
-            sparse_indptr = self.block_sparse_indptr
-            if sparse_indptr is None or self.block_sparse_indices is None:
+            # Validation-only TaskManagers intentionally omit prepared GMEM
+            # pointers and retain their configured static graph domain.
+            row_route_offsets = self.sparse_row_route_offsets
+            row_route_counts = self.sparse_row_route_counts
+            if row_route_offsets is None or row_route_counts is None:
                 return self.domain
             if self.num_heads_kv is None:
                 raise ValueError(
@@ -982,36 +984,27 @@ class DecodeGenTask(Task):
             num_q_blocks = (
                 self.cfg.max_seq_len_q + self.cfg.q_block_size - 1
             ) // self.cfg.q_block_size
-            row_address = (b_idx * self.num_heads_kv + h_idx) * (
-                num_q_blocks + 1
-            ) + q_block
+            row_address = (b_idx * self.num_heads_kv + h_idx) * num_q_blocks + q_block
 
-            row_begin, row_end = _load_sparse_row_bounds_warp(
-                sparse_indptr,
+            row_route_begin, route_count = _load_prepared_sparse_row_warp(
+                row_route_offsets,
+                row_route_counts,
                 cutlass.Int32(row_address),
                 self._lane_idx,
-            )
-            row_nnz = row_end - row_begin
-            retained_route_count = _block_sparse_row_retained_route_count(
-                self.block_sparse_indices,
-                cutlass.Int32(row_begin),
-                cutlass.Int32(row_end),
-                self.cfg.kv_block_size,
-                cutlass.Int32(self.max_seq_len_kv),
             )
 
             # Sparse resources reuse the paged-KV cache fields as compact row
             # metadata. Clear dense/paged-only coordinates on every logical
             # tile because persistent tasks reuse the same task object.
             self._seq_len_kv = self.max_seq_len_kv
-            self._kv_request_begin = row_begin
-            self._kv_page_idx_ub = row_nnz
+            self._kv_request_begin = row_route_begin
+            self._kv_page_idx_ub = route_count
             self._kv_raw_tile_base = cutlass.Int32(0)
-            self._kv_valid_tile_end = retained_route_count
+            self._kv_valid_tile_end = route_count
             self._kv_window_start = cutlass.Int32(0)
 
             loop_domain = _block_sparse_route_loop_domain(
-                retained_route_count,
+                route_count,
                 num_insts_kv=self.cfg.num_insts_kv,
             )
             if isinstance(loop_domain, int):
@@ -1651,36 +1644,50 @@ def create_load_task_split_kv(
         def resolve_and_store_kv_route(
             sparse_kv_metadata: MemoryResource | None,
             section: FmhaStage,
-        ) -> tuple[Any, Any, Any] | None:
-            """Resolve one route and retain it for the matching K/V pair."""
+        ) -> tuple[Any, Any, Any, Any] | None:
+            """Load one prepared route and retain it for the matching K/V pair."""
 
             if sparse_kv_metadata is None:
                 return None
-            resolved_origin0, resolved_origin1, resolved_route_flags = (
-                sparse_kv_metadata.resolve_route(section=section)
-            )
+            (
+                resolved_origin0,
+                resolved_origin1,
+                resolved_atom_validity,
+                route_record_word_offset,
+            ) = sparse_kv_metadata.resolve_route(section=section)
             sparse_kv_metadata.store_route(
                 resolved_origin0=resolved_origin0,
                 resolved_origin1=resolved_origin1,
-                resolved_route_flags=resolved_route_flags,
+                resolved_atom_validity=resolved_atom_validity,
             )
-            return resolved_origin0, resolved_origin1, resolved_route_flags
+            return (
+                resolved_origin0,
+                resolved_origin1,
+                resolved_atom_validity,
+                route_record_word_offset,
+            )
 
         def store_softmax_route(
             sparse_softmax_metadata: MemoryResource | None,
-            route: tuple[Any, Any, Any] | None,
+            route: tuple[Any, Any, Any, Any] | None,
         ) -> None:
             """Stage one resolved route for its Softmax consumer."""
 
             if sparse_softmax_metadata is None:
                 return
             assert route is not None
-            resolved_origin0, resolved_origin1, resolved_route_flags = route
+            (
+                resolved_origin0,
+                resolved_origin1,
+                resolved_atom_validity,
+                route_record_word_offset,
+            ) = route
             sparse_softmax_metadata.acquire()
             sparse_softmax_metadata.store_route(
                 resolved_origin0=resolved_origin0,
                 resolved_origin1=resolved_origin1,
-                resolved_route_flags=resolved_route_flags,
+                resolved_atom_validity=resolved_atom_validity,
+                route_record_word_offset=route_record_word_offset,
             )
             sparse_softmax_metadata.commit()
 

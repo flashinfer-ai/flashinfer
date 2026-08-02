@@ -56,9 +56,11 @@ from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
 from ..._block_sparse.common import (
+    _PREPARED_KV_ROUTE_SIZE,
     _block_sparse_kv_atom_size,
-    _block_sparse_kv_routes_are_block_aligned,
+    _prepared_kv_routes_are_block_aligned,
 )
+from ..._block_sparse.prepared import _PreparedBlockSparseLayout
 from ..tensor_map import (
     create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled_from_view,
@@ -251,9 +253,9 @@ def _build_decode_gen_schedule(
     use_static_native_seqlens_kv: bool = False,
     paged_kv_indptr: cute.Pointer | None = None,
     paged_kv_indices: cute.Pointer | None = None,
-    block_sparse_indptr: cute.Pointer | None = None,
-    block_sparse_indices: cute.Pointer | None = None,
-    kv_valid_bits: cute.Pointer | None = None,
+    sparse_row_route_offsets: cute.Pointer | None = None,
+    sparse_row_route_counts: cute.Pointer | None = None,
+    sparse_route_metadata: cute.Pointer | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -298,19 +300,20 @@ def _build_decode_gen_schedule(
         )
     if cfg.use_block_sparse:
         if tma_desc_q is not None:
-            if block_sparse_indptr is None:
+            if sparse_row_route_offsets is None:
                 raise ValueError(
-                    "block_sparse_indptr is required for block-sparse kernel "
+                    "sparse_row_route_offsets is required for block-sparse kernel "
                     "construction"
                 )
-            if block_sparse_indices is None:
+            if sparse_row_route_counts is None:
                 raise ValueError(
-                    "block_sparse_indices is required for block-sparse kernel "
+                    "sparse_row_route_counts is required for block-sparse kernel "
                     "construction"
                 )
-            if cfg.use_kv_valid_bits and kv_valid_bits is None:
+            if sparse_route_metadata is None:
                 raise ValueError(
-                    "kv_valid_bits is required when use_kv_valid_bits=True"
+                    "sparse_route_metadata is required for block-sparse kernel "
+                    "construction"
                 )
             segment_tensormaps = {
                 "tma_desc_k_64": tma_desc_k_64,
@@ -426,9 +429,10 @@ def _build_decode_gen_schedule(
     # are standalone and P remains in SMEM.  Keep instruction-local FIFOs when
     # stats or TMEM-P alias S: their overwrite-credit cadence is tied to each
     # instruction. Dense Swaps uses the shared FIFO, including staged H256;
-    # raw BSR uses instruction-local rings in either MMA orientation. Its load
-    # warp issues V(route R) before replacing the in-place metadata with route
-    # R+1, so that slot's lifetime is independent of the K/V data-ring depth.
+    # prepared sparse routes use instruction-local rings in either MMA
+    # orientation. The load warp issues V(route R) before replacing the
+    # in-place metadata with route R+1, so that slot's lifetime is independent
+    # of the K/V data-ring depth.
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
@@ -754,36 +758,43 @@ def _build_decode_gen_schedule(
     sparse_softmax_metadata0 = None
     sparse_softmax_metadata1 = None
     if cfg.use_block_sparse:
+        prepared_route_layout = _PreparedBlockSparseLayout.create(
+            kv_route_size=_PREPARED_KV_ROUTE_SIZE,
+            kv_block_size=cfg.kv_block_size,
+            has_token_bits=cfg.use_kv_valid_bits,
+            route_metadata_capacity=0,
+            num_rows=1,
+        )
         sparse_kv_metadata0 = SmemBlockSparseKvMetadataResource(
             pipeline_config=None,
             cfg=cfg,
             inst_id=0,
-            block_sparse_indices=block_sparse_indices,
+            route_metadata=sparse_route_metadata,
+            route_layout=prepared_route_layout,
             name="smemBlockSparseKvMetadata0",
         )
         sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
             pipeline_config=None,
             cfg=cfg,
             inst_id=1,
-            block_sparse_indices=block_sparse_indices,
+            route_metadata=sparse_route_metadata,
+            route_layout=prepared_route_layout,
             name="smemBlockSparseKvMetadata1",
         )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata0_cfg,
             cfg=cfg,
             inst_id=0,
-            kv_valid_bits=kv_valid_bits,
-            h_k_idx=h_k_idx,
-            b_idx=b_idx,
+            route_metadata=sparse_route_metadata,
+            route_layout=prepared_route_layout,
             name="smemBlockSparseSoftmaxMetadata0",
         )
         sparse_softmax_metadata1 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata1_cfg,
             cfg=cfg,
             inst_id=1,
-            kv_valid_bits=kv_valid_bits,
-            h_k_idx=h_k_idx,
-            b_idx=b_idx,
+            route_metadata=sparse_route_metadata,
+            route_layout=prepared_route_layout,
             name="smemBlockSparseSoftmaxMetadata1",
         )
     smem_kv = None
@@ -1083,8 +1094,8 @@ def _build_decode_gen_schedule(
         "seqlens_kv": kv_seqlens,
         "max_seq_len_kv": max_seq_len_kv,
         "seq_len_q": seq_len_q,
-        "block_sparse_indptr": block_sparse_indptr,
-        "block_sparse_indices": block_sparse_indices,
+        "sparse_row_route_offsets": sparse_row_route_offsets,
+        "sparse_row_route_counts": sparse_row_route_counts,
         "num_heads_kv": num_heads_kv,
     }
     if use_one_inst_qkv:
@@ -1797,9 +1808,9 @@ def _run_decode_gen_active(
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     g_paged_kv_indptr: cute.Pointer | None = None,
     g_paged_kv_indices: cute.Pointer | None = None,
-    g_block_sparse_indptr: cute.Pointer | None = None,
-    g_block_sparse_indices: cute.Pointer | None = None,
-    g_kv_valid_bits: cute.Pointer | None = None,
+    g_sparse_row_route_offsets: cute.Pointer | None = None,
+    g_sparse_row_route_counts: cute.Pointer | None = None,
+    g_sparse_route_metadata: cute.Pointer | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -1849,7 +1860,7 @@ def _run_decode_gen_active(
         if cutlass.const_expr(
             cfg.use_block_sparse
             and _block_sparse_kv_atom_size(cfg.kv_block_size) == 64
-            and not _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+            and not _prepared_kv_routes_are_block_aligned(cfg.kv_block_size)
         ):
             # Non-aligned coarse routes need a second descriptor for
             # single-half loads. Block-aligned coarse and fine routes alias
@@ -1911,9 +1922,9 @@ def _run_decode_gen_active(
         use_static_native_seqlens_kv=use_static_native_seqlens_kv,
         paged_kv_indptr=g_paged_kv_indptr,
         paged_kv_indices=g_paged_kv_indices,
-        block_sparse_indptr=g_block_sparse_indptr,
-        block_sparse_indices=g_block_sparse_indices,
-        kv_valid_bits=g_kv_valid_bits,
+        sparse_row_route_offsets=g_sparse_row_route_offsets,
+        sparse_row_route_counts=g_sparse_row_route_counts,
+        sparse_route_metadata=g_sparse_route_metadata,
     )
 
     smem_allocator.allocate()
@@ -2074,9 +2085,9 @@ def _run_decode_gen_runtime_prefix(
     use_static_native_seqlens_kv: cutlass.Constexpr[bool],
     g_paged_kv_indptr: cute.Pointer | None,
     g_paged_kv_indices: cute.Pointer | None,
-    g_block_sparse_indptr: cute.Pointer | None,
-    g_block_sparse_indices: cute.Pointer | None,
-    g_kv_valid_bits: cute.Pointer | None,
+    g_sparse_row_route_offsets: cute.Pointer | None,
+    g_sparse_row_route_counts: cute.Pointer | None,
+    g_sparse_route_metadata: cute.Pointer | None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2137,9 +2148,9 @@ def _run_decode_gen_runtime_prefix(
                 use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
-                g_block_sparse_indptr,
-                g_block_sparse_indices,
-                g_kv_valid_bits,
+                g_sparse_row_route_offsets,
+                g_sparse_row_route_counts,
+                g_sparse_route_metadata,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2179,9 +2190,9 @@ def _run_decode_gen_runtime_prefix(
                 use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
-                g_block_sparse_indptr,
-                g_block_sparse_indices,
-                g_kv_valid_bits,
+                g_sparse_row_route_offsets,
+                g_sparse_row_route_counts,
+                g_sparse_route_metadata,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2215,9 +2226,9 @@ def decode_gen_kernel(
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     g_paged_kv_indptr: cute.Pointer | None = None,
     g_paged_kv_indices: cute.Pointer | None = None,
-    g_block_sparse_indptr: cute.Pointer | None = None,
-    g_block_sparse_indices: cute.Pointer | None = None,
-    g_kv_valid_bits: cute.Pointer | None = None,
+    g_sparse_row_route_offsets: cute.Pointer | None = None,
+    g_sparse_row_route_counts: cute.Pointer | None = None,
+    g_sparse_route_metadata: cute.Pointer | None = None,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
@@ -2276,9 +2287,9 @@ def decode_gen_kernel(
                 use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
-                g_block_sparse_indptr,
-                g_block_sparse_indices,
-                g_kv_valid_bits,
+                g_sparse_row_route_offsets,
+                g_sparse_row_route_counts,
+                g_sparse_route_metadata,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -2315,9 +2326,9 @@ def decode_gen_kernel(
                 use_static_native_seqlens_kv,
                 g_paged_kv_indptr,
                 g_paged_kv_indices,
-                g_block_sparse_indptr,
-                g_block_sparse_indices,
-                g_kv_valid_bits,
+                g_sparse_row_route_offsets,
+                g_sparse_row_route_counts,
+                g_sparse_route_metadata,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -2552,7 +2563,7 @@ def fmha_decode_launch(
     cluster_shape = [1, 1, 1]
     if cutlass.const_expr(cfg.use_cluster_smem_reduction):
         cluster_shape = [cfg.splits_kv, 1, 1]
-    null_block_sparse_ptr = cute.make_ptr(
+    null_sparse_route_ptr = cute.make_ptr(
         Int32,
         0,
         mem_space=cutlass.AddressSpace.gmem,
@@ -2585,9 +2596,9 @@ def fmha_decode_launch(
         use_static_native_seqlens_kv,
         paged_kv_indptr_iter,
         paged_kv_indices_iter,
-        null_block_sparse_ptr,
-        null_block_sparse_ptr,
-        null_block_sparse_ptr,
+        null_sparse_route_ptr,
+        null_sparse_route_ptr,
+        null_sparse_route_ptr,
         static_full_split_prefix,
     ).launch(
         grid=grid,
@@ -2606,20 +2617,21 @@ def fmha_block_sparse_launch(
     k_iter: cute.Pointer,
     v_iter: cute.Pointer,
     o_iter: cute.Pointer,
-    block_sparse_indptr_iter: cute.Pointer,
-    block_sparse_indices_iter: cute.Pointer,
-    kv_valid_bits_iter: cute.Pointer,
+    row_route_offsets_iter: cute.Pointer,
+    row_route_counts_iter: cute.Pointer,
+    route_metadata_iter: cute.Pointer,
     scale_s: Float32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int],
 ) -> None:
-    """Launch the initial contiguous-BSHD block-sparse profile.
+    """Launch contiguous-BSHD attention over prepared KV128 route metadata.
 
-    The decode schedule consumes fixed KV128 routes. Sparse BSR rows are
-    resolved inside the K/V producer into fixed execution atoms. Fine blocks
-    use their single-atom TensorMap directly; coarse KV64 blocks may use the
-    KV128 TensorMap when both route halves are adjacent.
+    A preceding prepare kernel has already resolved each BSR row into compact
+    physical atom origins, validity flags, and optional logical token words.
+    The attention schedule consumes only that metadata. Fine blocks use their
+    single-atom TensorMap directly; coarse KV64 blocks may use the KV128
+    TensorMap when both route halves are adjacent.
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires cfg.use_block_sparse=True")
@@ -2662,28 +2674,28 @@ def fmha_block_sparse_launch(
         swizzle=tma_swizzle,
     )
 
-    # The physical BSHD stride order is D, H, S, B.  Passing original-mode
-    # box dimensions with stride_order=(0, 2, 1, 3) creates descriptor
-    # coordinates (D, H, physical-token, B), matching SmemKvTileResource.
+    # Keep sparse K/V TensorMap coordinates in the tensor's logical
+    # (D, S, H, B) mode order, matching the dense decode descriptor ABI.
+    # The BSHD storage strides and TMA box geometry remain unchanged.
     kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
     primary_kv_box_size = 2 * kv_atom_size if kv_atom_size == 64 else kv_atom_size
     k_desc_primary = create_tensor_map_tiled_from_view(
         k_tma,
         box_dims=(tma_box0, primary_kv_box_size, 1, 1),
-        stride_order=(0, 2, 1, 3),
+        stride_order=(0, 1, 2, 3),
         swizzle=tma_swizzle,
     )
     v_desc_primary = create_tensor_map_tiled_from_view(
         v_tma,
         box_dims=(tma_box0, primary_kv_box_size, 1, 1),
-        stride_order=(0, 2, 1, 3),
+        stride_order=(0, 1, 2, 3),
         swizzle=tma_swizzle,
     )
     k_desc_atom = k_desc_primary
     v_desc_atom = v_desc_primary
     if cutlass.const_expr(
         kv_atom_size == 64
-        and not _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+        and not _prepared_kv_routes_are_block_aligned(cfg.kv_block_size)
     ):
         # B64/odd-coarse routes may join unrelated BSR entries and therefore
         # need KV64 fallback maps. B128/B256/... issue only the primary KV128
@@ -2691,13 +2703,13 @@ def fmha_block_sparse_launch(
         k_desc_atom = create_tensor_map_tiled_from_view(
             k_tma,
             box_dims=(tma_box0, kv_atom_size, 1, 1),
-            stride_order=(0, 2, 1, 3),
+            stride_order=(0, 1, 2, 3),
             swizzle=tma_swizzle,
         )
         v_desc_atom = create_tensor_map_tiled_from_view(
             v_tma,
             box_dims=(tma_box0, kv_atom_size, 1, 1),
-            stride_order=(0, 2, 1, 3),
+            stride_order=(0, 1, 2, 3),
             swizzle=tma_swizzle,
         )
 
@@ -2751,9 +2763,9 @@ def fmha_block_sparse_launch(
         False,  # use_static_native_seqlens_kv
         null_i32_ptr,  # g_paged_kv_indptr
         null_i32_ptr,  # g_paged_kv_indices
-        block_sparse_indptr_iter,  # g_block_sparse_indptr
-        block_sparse_indices_iter,  # g_block_sparse_indices
-        kv_valid_bits_iter,  # g_kv_valid_bits
+        row_route_offsets_iter,
+        row_route_counts_iter,
+        route_metadata_iter,
         False,  # static_full_split_prefix
     ).launch(
         grid=grid,

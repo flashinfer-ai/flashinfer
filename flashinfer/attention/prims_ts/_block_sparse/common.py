@@ -15,7 +15,7 @@
 """Dependency-neutral semantic contract for PrimTS block-sparse attention."""
 
 _FINE_BLOCK_SIZES = (8, 16, 32)
-_KV_ROUTE_SIZE = 128
+_PREPARED_KV_ROUTE_SIZE = 128
 _MAX_KV_ATOM_SIZE = 64
 _SIGNED_INT32_MAX = (1 << 31) - 1
 
@@ -66,10 +66,11 @@ def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
     )
 
 
-def _block_sparse_kv_routes_are_block_aligned(kv_block_size: int) -> bool:
+def _prepared_kv_routes_are_block_aligned(kv_block_size: int) -> bool:
     """Return whether every KV128 route stays within one semantic BSR block."""
 
     return (
-        _validate_sparse_block_size(kv_block_size, "kv_block_size") % _KV_ROUTE_SIZE
+        _validate_sparse_block_size(kv_block_size, "kv_block_size")
+        % _PREPARED_KV_ROUTE_SIZE
         == 0
     )

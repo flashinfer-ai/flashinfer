@@ -42,7 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...._block_sparse.common import (
     _block_sparse_kv_atom_size,
-    _block_sparse_kv_routes_are_block_aligned,
+    _prepared_kv_routes_are_block_aligned,
 )
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
@@ -699,13 +699,17 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 fragment_chunk_elems = chunk_hd * 64
                 if prims.elect_sync():
                     origin0 = Int32(self.sparse_kv_metadata.route_origin(Int32(0)))
-                    route_flags = Int32(self.sparse_kv_metadata.route_flags())
-                    valid0 = cutlass.Boolean((route_flags & Int32(1)) != Int32(0))
+                    atom_valid_mask = Int32(
+                        self.sparse_kv_metadata.route_atom_valid_mask()
+                    )
+                    valid0 = cutlass.Boolean(
+                        (atom_valid_mask & Int32(1)) != Int32(0)
+                    )
                     if not valid0:
                         origin0 = Int32(self.max_seq_len_kv)
                     stage_base = self._stage_base(stage_info)
                     if cutlass.const_expr(
-                        _block_sparse_kv_routes_are_block_aligned(cfg.kv_block_size)
+                        _prepared_kv_routes_are_block_aligned(cfg.kv_block_size)
                     ):
                         for chunk_idx in cutlass.range_constexpr(num_chunks):
                             local_head_dim_offset = chunk_idx * chunk_hd
@@ -718,15 +722,17 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 tma_desc,
                                 (
                                     Int32(global_head_dim_offset),
-                                    logical_h_k_idx,
                                     origin0,
+                                    logical_h_k_idx,
                                     logical_b_idx,
                                 ),
                                 stage_info.barrier,
                             )
                     else:
                         origin1 = Int32(self.sparse_kv_metadata.route_origin(Int32(1)))
-                        valid1 = cutlass.Boolean((route_flags & Int32(2)) != Int32(0))
+                        valid1 = cutlass.Boolean(
+                            (atom_valid_mask & Int32(2)) != Int32(0)
+                        )
                         adjacent = (valid0 & valid1) & cutlass.Boolean(
                             origin1 == origin0 + Int32(64)
                         )
@@ -744,8 +750,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                     tma_desc,
                                     (
                                         Int32(global_head_dim_offset),
-                                        logical_h_k_idx,
                                         origin0,
+                                        logical_h_k_idx,
                                         logical_b_idx,
                                     ),
                                     stage_info.barrier,
@@ -756,8 +762,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                     tma_desc_atom,
                                     (
                                         Int32(global_head_dim_offset),
-                                        logical_h_k_idx,
                                         origin0,
+                                        logical_h_k_idx,
                                         logical_b_idx,
                                     ),
                                     stage_info.barrier,
@@ -769,8 +775,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                     tma_desc_atom,
                                     (
                                         Int32(global_head_dim_offset),
-                                        logical_h_k_idx,
                                         origin1,
+                                        logical_h_k_idx,
                                         logical_b_idx,
                                     ),
                                     stage_info.barrier,
@@ -803,8 +809,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 tma_desc_atom,
                                 (
                                     Int32(global_head_dim_offset),
-                                    logical_h_k_idx,
                                     origin,
+                                    logical_h_k_idx,
                                     logical_b_idx,
                                 ),
                                 stage_info.barrier,

@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32
+from cutlass import Boolean, Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -41,6 +41,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...._block_sparse.common import _MAX_KV_ATOM_SIZE
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from ..fmha_decode_constants import KV_TILE_256_RESCALE_THRESHOLD_LOG2
 from ...tcgen05_compat import tcgen05_mma_ws
@@ -78,8 +79,7 @@ from .helpers_common import (
     _q_group_token_base,
     _softmax_tile_idx,
 )
-from .helpers_block_sparse import sparse_keeps_can_skip_structural_mask
-from .smem_block_sparse_metadata import _TOKEN_MASK_ROUTE_IS_FULL_FLAG
+from .smem_block_sparse_metadata import _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG
 from .helpers_kv_tile_idx import (
     _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
@@ -97,6 +97,50 @@ from .helpers_softmax import (
     _u32_to_float_for_atomic_max,
     _wspro_reduce_max4,
 )
+
+# A block-sparse route often changes the exact row maximum without changing it
+# enough to justify rescaling the live O tile. Keeping the prior anchor within
+# this bound makes the correction scale exactly one and bounds FP16/BF16 P by
+# 2**8. As in the FlashInfer/TRT-LLM policy, this assumes normal model tensor
+# ranges rather than adversarial values near the BF16 finite limit.
+_BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 = 8.0
+
+
+@cute.jit
+def _can_skip_sparse_keeps_structural_mask(
+    q_row_is_valid: Boolean,
+    origin0: Int32,
+    origin1: Int32,
+    valid0: Int32,
+    valid1: Int32,
+    seq_len_kv: Int32,
+    causal_end: Int32,
+    *,
+    apply_causal_mask: cutlass.Constexpr[bool],
+) -> Boolean:
+    """Return whether one Keeps row needs no Q/tail/causal predicate.
+
+    Token-bit masking is independent. Comparing against the last complete
+    KV64 origin avoids overflowing an origin near the Int32 upper bound.
+    """
+
+    fragment_size = Int32(_MAX_KV_ATOM_SIZE)
+    last_complete_origin = seq_len_kv - fragment_size
+    can_skip = Boolean(
+        q_row_is_valid
+        and valid0 != Int32(0)
+        and valid1 != Int32(0)
+        and origin0 <= last_complete_origin
+        and origin1 <= last_complete_origin
+    )
+    if cutlass.const_expr(apply_causal_mask):
+        last_causal_origin = causal_end - fragment_size
+        can_skip = Boolean(
+            can_skip
+            and origin0 <= last_causal_origin
+            and origin1 <= last_causal_origin
+        )
+    return can_skip
 
 
 def _qk_mma_operand_contract_for_config(
@@ -124,9 +168,19 @@ class TmemSResource(DecodeGenResourceBase):
         "s_arr",
     )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
-        ("old_max_arr", cutlass.Array, None, "Previous running softmax maximum."),
+        (
+            "old_max_arr",
+            cutlass.Array,
+            None,
+            "Previous softmax anchor (normally the running row maximum).",
+        ),
         ("sum_arr", cutlass.Array, None, "Running softmax denominator."),
-        ("new_max_arr", cutlass.Array, None, "Current running softmax maximum."),
+        (
+            "new_max_arr",
+            cutlass.Array,
+            None,
+            "Current softmax anchor (normally the running row maximum).",
+        ),
         ("s_arr", cutlass.Array, None, "Loaded S scores for the current tile."),
     )
     inst_id: Constexpr[int] = 0
@@ -778,12 +832,24 @@ class TmemSResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
     ) -> None:
-        """Publish a masked Keeps row and its updated running maximum."""
+        """Publish a masked Keeps row and its updated softmax anchor."""
 
-        new_max = cute.math.max(old_max, tile_max, ftz=True)
+        new_anchor = cute.math.max(old_max, tile_max, ftz=True)
+        if cutlass.const_expr(
+            self.cfg.use_block_sparse
+            and _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 > 0.0
+        ):
+            # Online softmax only requires a common finite reference for P,
+            # sum, and O; it does not require the exact row maximum. Defer a
+            # small anchor increase so correction can skip a TMEM O rescale.
+            rescale_log2 = (old_max - new_anchor) * self.scale_softmax_log2
+            if (old_max != _neg_max_f32()) and (
+                rescale_log2 >= Float32(-_BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2)
+            ):
+                new_anchor = old_max
         old_max_arr[0] = old_max
         sum_arr[0] = running_sum
-        new_max_arr[0] = new_max
+        new_max_arr[0] = new_anchor
         for reg_idx in cutlass.range_constexpr(self.cfg.num_s_regs_per_thread):
             s_arr[reg_idx] = s_vals[reg_idx]
 
@@ -1036,7 +1102,7 @@ class TmemSResource(DecodeGenResourceBase):
         return tile_max
 
     @cute.jit
-    def _load_raw_sparse_mask_metadata(
+    def _decode_sparse_mask_metadata(
         self,
         routed_origin0: Int32,
         routed_origin1: Int32,
@@ -1046,7 +1112,7 @@ class TmemSResource(DecodeGenResourceBase):
         routed_token_word2: Uint32,
         routed_token_word3: Uint32,
     ) -> tuple[Int32, Int32, Int32, Int32, cutlass.Array, cutlass.Boolean]:
-        """Materialize one explicitly routed register-resident mask payload."""
+        """Decode one prepared, register-routed mask payload."""
 
         origin0 = Int32(routed_origin0)
         origin1 = Int32(routed_origin1)
@@ -1056,7 +1122,8 @@ class TmemSResource(DecodeGenResourceBase):
         route_token_mask_is_full = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
             route_token_mask_is_full = cutlass.Boolean(
-                (route_flags & Int32(_TOKEN_MASK_ROUTE_IS_FULL_FLAG)) != Int32(0)
+                (route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG))
+                != Int32(0)
             )
 
         num_local_words = 4 if self.cfg.tile_size_q == 128 else 2
@@ -1124,7 +1191,7 @@ class TmemSResource(DecodeGenResourceBase):
             valid1,
             local_token_words,
             route_token_mask_is_full,
-        ) = self._load_raw_sparse_mask_metadata(
+        ) = self._decode_sparse_mask_metadata(
             routed_origin0=routed_origin0,
             routed_origin1=routed_origin1,
             routed_route_flags=routed_route_flags,
@@ -1191,7 +1258,7 @@ class TmemSResource(DecodeGenResourceBase):
             self.seq_len_q,
         )
         causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
-        can_skip_structural_mask = sparse_keeps_can_skip_structural_mask(
+        can_skip_structural_mask = _can_skip_sparse_keeps_structural_mask(
             q_row_is_valid,
             origin0,
             origin1,

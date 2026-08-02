@@ -34,10 +34,10 @@ SMEM resources
                             TMA copies.  Multiple consecutive tiles whose page
                             IDs share a 32-page window reuse the same stage.
 
-- SmemBlockSparseKvMetadataResource : Pipeline-free raw-BSR route metadata
+- SmemBlockSparseKvMetadataResource : Pipeline-free prepared route metadata
                             retained from one K load through the matching V.
 
-- SmemBlockSparseSoftmaxMetadataResource : Staged raw-BSR route/token metadata
+- SmemBlockSparseSoftmaxMetadataResource : Staged prepared route/token metadata
                             copied to Softmax task-local registers before the
                             corresponding pipeline stage is released.
 
