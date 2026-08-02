@@ -184,17 +184,42 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   if (maybe_output_raw_indices.has_value()) {
     output_raw_indices_ptr = static_cast<int32_t*>(maybe_output_raw_indices.value().data_ptr());
   }
+  const bool use_runtime_page_table_policy =
+      page_bits != 0 || output_raw_indices_ptr != nullptr ||
+      input_stride != static_cast<int64_t>(max_len) ||
+      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % sampling::TOPK_MAX_VECTOR_BYTES != 0;
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    status = sampling::TopKPageTableTransformDispatch<c_type, int32_t>(
-        static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
-        output_raw_indices_ptr, static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
-        static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
-        static_cast<uint32_t>(top_k), max_len, input_stride, page_bits, row_states_ptr,
-        deterministic, tie_break_mode, stream, dsa_graph_safe, page_table_row_starts_ptr);
-    return true;
-  });
+  auto dispatch_with_page_table_policy = [&](auto page_table_policy) {
+    using PageTablePolicy = decltype(page_table_policy);
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+      if constexpr (PageTablePolicy::kHasRuntimeState) {
+        status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy,
+                                                          PageTablePolicy>(
+            static_cast<c_type*>(input.data_ptr()),
+            static_cast<int32_t*>(output_page_table.data_ptr()),
+            static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
+            static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
+            static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
+            stream, dsa_graph_safe, page_table_row_starts_ptr, page_table_policy);
+      } else {
+        status = sampling::TopKPageTableTransformDispatch<c_type, int32_t, PageTablePolicy>(
+            static_cast<c_type*>(input.data_ptr()),
+            static_cast<int32_t*>(output_page_table.data_ptr()),
+            static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
+            static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
+            static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
+            stream, dsa_graph_safe, page_table_row_starts_ptr);
+      }
+      return true;
+    });
+  };
+  if (use_runtime_page_table_policy) {
+    dispatch_with_page_table_policy(sampling::RuntimePageTableTransformPolicy<int32_t>{
+        output_raw_indices_ptr, input_stride, page_bits});
+  } else {
+    dispatch_with_page_table_policy(sampling::DirectPageTableTransformPolicy<int32_t>{});
+  }
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKPageTableTransform failed with error code " << cudaGetErrorString(status);

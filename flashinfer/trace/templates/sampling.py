@@ -1098,9 +1098,6 @@ class _TopKPageTableTransformTraceTemplate(TraceTemplate):
             return 1 if page_size is None else int(page_size)
 
         extractors["page_size"] = extract_page_size
-        extractors["out_raw_indices"] = lambda kwargs: int(
-            kwargs.get("out_raw_indices") is not None
-        )
         return extractors
 
 
@@ -1120,10 +1117,6 @@ top_k_page_table_transform_trace = _TopKPageTableTransformTraceTemplate(
         "max_pages_per_seq": Var(),
         "k": Const(abbrev="k"),
         "page_size": Const(abbrev="ps"),
-        "out_raw_indices": Const(
-            abbrev="raw",
-            description="Whether the optional raw-index destination is supplied (0 or 1).",
-        ),
     },
     inputs={
         "input": Tensor(["num_rows", "max_len"]),

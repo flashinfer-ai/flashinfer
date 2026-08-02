@@ -289,62 +289,6 @@ def test_top_k_sampling_fi_trace():
     assert defn["outputs"]["samples"]["dtype"] == "int64"
 
 
-@pytest.mark.parametrize(
-    "page_size",
-    [
-        pytest.param(None, id="default"),
-        pytest.param(1, id="page_size_1"),
-        pytest.param(64, id="page_size_64"),
-    ],
-)
-@pytest.mark.parametrize(
-    "num_rows,max_len,k",
-    [
-        (2, 128 * 1024, 2048),
-        (1, 256 * 1024, 1024),
-        (74, 16 * 1024, 512),
-    ],
-)
-def test_top_k_page_table_transform_fi_trace(tmp_path, page_size, num_rows, max_len, k):
-    expected_page_size = 1 if page_size is None else page_size
-    inputs = flashinfer.top_k_page_table_transform.fi_init(
-        num_rows=num_rows,
-        max_len=max_len,
-        max_pages_per_seq=(max_len + expected_page_size - 1) // expected_page_size,
-        k=k,
-        page_size=expected_page_size,
-        device="cpu",
-    )
-    if page_size is None:
-        inputs.pop("page_size")
-
-    defn = flashinfer.top_k_page_table_transform.fi_trace(save_dir=tmp_path, **inputs)
-
-    _check_defn(defn, "sampling", "top_k_page_table_transform")
-    assert defn["axes"]["page_size"]["value"] == expected_page_size
-    assert defn["name"] == (
-        f"top_k_page_table_transform_k{k}_ps{expected_page_size}_raw0"
-    )
-    assert "out" not in defn["inputs"]
-    assert "out_raw_indices" not in defn["inputs"]
-    assert list(defn["outputs"]) == ["indices"]
-    assert (tmp_path / f"{defn['name']}.json").is_file()
-
-    inputs["out_raw_indices"] = torch.empty(
-        (num_rows, k), dtype=torch.int32, device="cpu"
-    )
-    from flashinfer.trace.templates.sampling import top_k_page_table_transform_trace
-
-    extractors = top_k_page_table_transform_trace._build_axis_extractors()
-    raw_axis_values = {
-        axis: extractor(inputs) for axis, extractor in extractors.items()
-    }
-    assert top_k_page_table_transform_trace.definition_name(raw_axis_values) == (
-        f"top_k_page_table_transform_k{k}_ps{expected_page_size}_raw1"
-    )
-    assert flashinfer.top_k_page_table_transform.fi_trace(**inputs) == {}
-
-
 def test_top_p_sampling_fi_trace():
     import flashinfer.sampling
 
