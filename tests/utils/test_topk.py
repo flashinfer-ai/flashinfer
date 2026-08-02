@@ -416,7 +416,6 @@ def reference_page_table_transform(
     row_to_batch: torch.Tensor = None,
     row_starts: torch.Tensor = None,
     page_table_row_starts: torch.Tensor = None,
-    *,
     page_size: int = 1,
     out: torch.Tensor = None,
     out_raw_indices: torch.Tensor = None,

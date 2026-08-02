@@ -262,10 +262,10 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        page_size: int = 1,
         dsa_graph_safe: bool = False,
         row_starts: Optional[torch.Tensor] = None,
         page_table_row_starts: Optional[torch.Tensor] = None,
-        page_size: int = 1,
         output_raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
         assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
@@ -281,10 +281,10 @@ def get_topk_module():
             top_k,
             deterministic,
             tie_break,
+            page_size,
             dsa_graph_safe,
             row_starts,
             page_table_row_starts,
-            page_size,
             output_raw_indices,
         )
 
@@ -299,10 +299,10 @@ def get_topk_module():
         top_k: int,
         deterministic: bool,
         tie_break: int,
+        page_size: int = 1,
         dsa_graph_safe: bool = False,
         row_starts: Optional[torch.Tensor] = None,
         page_table_row_starts: Optional[torch.Tensor] = None,
-        page_size: int = 1,
         output_raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
         pass
@@ -684,7 +684,6 @@ def top_k_page_table_transform(
     dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
     page_table_row_starts: Optional[torch.Tensor] = None,
-    *,
     page_size: int = 1,
     out: Optional[torch.Tensor] = None,
     out_raw_indices: Optional[torch.Tensor] = None,
@@ -859,10 +858,10 @@ def top_k_page_table_transform(
         k,
         deterministic,
         tie_break,
+        page_size,
         dsa_graph_safe,
         row_starts=row_starts,
         page_table_row_starts=page_table_row_starts,
-        page_size=page_size,
         output_raw_indices=out_raw_indices,
     )
 

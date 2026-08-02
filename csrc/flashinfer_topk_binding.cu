@@ -26,10 +26,9 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
                                      TensorView src_page_table,
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
-                                     bool deterministic, int64_t tie_break, bool dsa_graph_safe,
-                                     Optional<TensorView> maybe_row_starts,
+                                     bool deterministic, int64_t tie_break, int64_t page_size,
+                                     bool dsa_graph_safe, Optional<TensorView> maybe_row_starts,
                                      Optional<TensorView> maybe_page_table_row_starts,
-                                     int64_t page_size,
                                      Optional<TensorView> maybe_output_raw_indices);
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
