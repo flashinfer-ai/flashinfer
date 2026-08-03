@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from ......fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
 
 
 def build_activation_pack(
@@ -198,14 +198,14 @@ def _quantize_and_pack(
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
     """
-    from ......fused_moe.api import MoEActivationPack, QuantVariant
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
 
     device = flat.device
     per_token_scale = None
     if per_token_activation and quant_variant is not QuantVariant.NVFP4:
         raise ValueError("per-token activation scaling requires QuantVariant.NVFP4")
     if quant_variant is QuantVariant.NVFP4:
-        from ......quantization.fp4_quantization import (
+        from flashinfer.quantization.fp4_quantization import (
             fp4_quantize,
             nvfp4_quantize,
         )
@@ -222,11 +222,11 @@ def _quantize_and_pack(
         # tests/moe/test_b12x_fused_moe.py).  The default swizzled layout makes
         # the kernel index the scale tensor out of bounds → illegal memory access.
         if per_token_activation:
-            from ......quantization.nvfp4_quantization_utils import (
+            from flashinfer.quantization.nvfp4_quantization_utils import (
                 current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
             )
-            from ......tllm_enums import SfLayout
+            from flashinfer.tllm_enums import SfLayout
 
             global_scale = make_nvfp4_global_scale(
                 flat,

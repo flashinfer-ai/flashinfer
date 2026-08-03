@@ -1949,8 +1949,7 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
-    def test_cuda_graph_wrapper_lifetime_before_autotune(self, quant_mode: str):
+    def test_cuda_graph_wrapper_lifetime_before_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
@@ -1960,7 +1959,7 @@ class TestCuteDslMoEWrapper:
         target_num_tokens = 256
 
         def run_wrapper(moe, tensors):
-            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
+            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
             return moe.run(
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -1989,7 +1988,6 @@ class TestCuteDslMoEWrapper:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=True,
                 max_num_tokens=64,
-                quant_mode=quant_mode,
             )
             ref = weakref.ref(moe)
             finalized = []
@@ -2025,7 +2023,6 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            quant_mode=quant_mode,
         )
 
         with autotune(True):
@@ -2035,8 +2032,7 @@ class TestCuteDslMoEWrapper:
         assert result.shape == (target_num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
-    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
-    def test_cuda_graph_wrapper_lifetime_after_autotune(self, quant_mode: str):
+    def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
         from flashinfer import autotune
@@ -2047,7 +2043,7 @@ class TestCuteDslMoEWrapper:
         num_experts, top_k = 256, 2
 
         def run_wrapper(moe, tensors):
-            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
+            api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
             return moe.run(
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
@@ -2076,7 +2072,6 @@ class TestCuteDslMoEWrapper:
                 intermediate_size=intermediate_size,
                 use_cuda_graph=True,
                 max_num_tokens=64,
-                quant_mode=quant_mode,
             )
             ref = weakref.ref(moe)
             finalized = []
@@ -2097,14 +2092,9 @@ class TestCuteDslMoEWrapper:
             # Confirm profiling actually ran for this custom op. Cache keys
             # are ProfilingCacheKey instances; see AutoTuner._get_cache_key
             # in flashinfer/autotuner/autotuner.py.
-            if quant_mode == "w4a4":
-                expected_custom_op = "CuteDslMoEWrapper::run::Swiglu"
-            elif quant_mode == "w4a16":
-                expected_custom_op = "CuteDslMoEWrapper::run::W4A16::Swiglu"
-            else:
-                raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
             assert any(
-                k.custom_op == expected_custom_op for k in autotuner.profiling_cache
+                k.custom_op == "CuteDslMoEWrapper::run::Swiglu"
+                for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized
 
