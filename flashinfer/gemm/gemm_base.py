@@ -9291,6 +9291,8 @@ def _cudnn_bmm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "auto"] = "cudnn",
 ):
+    if A_scale.ndim != 1 or B_scale.ndim != 1:
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -9333,10 +9335,10 @@ def _check_bmm_mxfp8_problem_size(
             f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
-    if A_scale.ndim != 1 or B_scale.ndim != 1:
+    if A_scale.ndim not in (1, 3) or B_scale.ndim not in (1, 3):
         raise ValueError(
-            "bmm_mxfp8 requires 1D swizzled scale tensors "
-            "(produced by mxfp8_quantize(..., is_sf_swizzled_layout=True)); "
+            "bmm_mxfp8 requires 1D flattened or 3D per-batch swizzled scale "
+            "tensors; "
             f"got A_scale.ndim={A_scale.ndim}, B_scale.ndim={B_scale.ndim}."
         )
     _validate_mxfp8_output_dtype(dtype)
