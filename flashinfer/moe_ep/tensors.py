@@ -27,5 +27,13 @@ class MoEEpTensors:
     topk_ids: "torch.Tensor"
     topk_weights: "torch.Tensor"
     scales: Optional["torch.Tensor"] = None
+    fc1_alpha: Optional["torch.Tensor"] = None
+    fc2_alpha: Optional["torch.Tensor"] = None
+    fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
+
+    @property
+    def num_tokens(self) -> int:
+        """Batch size for this forward (``hidden_states.shape[0]``)."""
+        return self.hidden_states.shape[0]

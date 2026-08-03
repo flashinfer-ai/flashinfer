@@ -17,6 +17,8 @@ limitations under the License.
 # Unified MoE API
 from .api import (  # noqa: F401
     ActivationConfig,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     BackendOptions,
     CuteDslConfig,
     CutlassConfig,
@@ -35,14 +37,21 @@ from .api import (  # noqa: F401
     TrtllmMxInt4Config,
 )
 from .layer import MoELayer  # noqa: F401
-from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
+from .runners import (  # noqa: F401
+    B12xNvfp4Runner,
+    B12xW4A16Runner,
+    CuteDslNvfp4Runner,
+    TrtllmFp4RoutedRunner,
+    TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
+)
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
+    RoutingInputMode,
     convert_to_block_layout,
     cutlass_fused_moe,
-    interleave_moe_scales_for_sm90_mixed_gemm,
-    interleave_moe_weights_for_sm90_mixed_gemm,
+    cutlass_fused_moe_workspace_size,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -54,10 +63,17 @@ from .core import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
     trtllm_mxint4_block_scale_routed_moe,
+)
+
+from .prepare import (
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
+    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
 )
 
 from ..tllm_enums import (
@@ -71,12 +87,20 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+from .hash_topk import (  # noqa: F401
+    hash_topk as hash_topk,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
     fill_w_ptr as fill_w_ptr,
     has_bgmv_moe as has_bgmv_moe,
+)
+from .moe_lora_delta import (  # noqa: F401
+    bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
+    bgmv_moe_gemm2_lora_delta as bgmv_moe_gemm2_lora_delta,
 )
 from .monomoe import (  # noqa: F401
     mono_moe as mono_moe,
@@ -102,6 +126,10 @@ except ImportError:
 __all__ = [
     # Unified API
     "ActivationConfig",
+    "B12xNvfp4Config",
+    "B12xNvfp4Runner",
+    "B12xW4A16Config",
+    "B12xW4A16Runner",
     "BackendOptions",
     "CuteDslConfig",
     "CutlassConfig",
@@ -109,10 +137,13 @@ __all__ = [
     "ExpertConfig",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
+    "RoutingInputMode",
     "MoEConfig",
     "MoELayer",
     "MoEWeightPack",
     "TrtllmFp4RoutedRunner",
+    "TrtllmFp8BlockRunner",
+    "TrtllmFp8PerTensorRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
@@ -128,8 +159,10 @@ __all__ = [
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
+    "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_moe_weights_for_sm90_mixed_gemm",
+    "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",
     "gen_cutlass_fused_moe_sm100_module",
@@ -143,12 +176,16 @@ __all__ = [
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
+    "trtllm_fp8_per_tensor_scale_routed_moe",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "hash_topk",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
+    "bgmv_moe_gemm1_lora_delta",
+    "bgmv_moe_gemm2_lora_delta",
     "fill_w_ptr",
     "has_bgmv_moe",
     "mono_moe",

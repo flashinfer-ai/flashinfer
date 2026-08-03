@@ -103,7 +103,17 @@ from .moe_activation import gated_activation_f32, is_gated_activation
 _SF_VEC_SIZE = 16
 _TASK_SLICE_CHUNK = 1
 _PRODUCER_PAIRS_PER_WARP = 2
-_FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
+
+_WORK_ITEM_FIELDS = 5
+_WORK_EXPERT = 0
+_WORK_M_TILE = 1
+_WORK_SLICE_BEGIN = 2
+_WORK_SLICE_COUNT = 3
+_WORK_VALID_ROWS = 4
+
+_CTRL_HAS_WORK = 0
+_CTRL_DONE = 1
+_CTRL_WORK_BEGIN = 2
 
 
 class DynamicLaunchParams:
@@ -247,25 +257,6 @@ def _threadfence(*, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Int64(addr).ir_value(loc=loc, ip=ip),
-                Int32(compare).ir_value(loc=loc, ip=ip),
-                Int32(value).ir_value(loc=loc, ip=ip),
-            ],
-            "atom.global.cas.b32 $0, [$1], $2, $3;",
-            "=r,l,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
 class MoEDynamicKernel:
     """Queue-driven first-pass dynamic MoE kernel."""
 
@@ -288,20 +279,45 @@ class MoEDynamicKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
+        # Scale factors come in 128-row atoms, so for sub-128 MMA tiles the
+        # TMA atoms and smem are built at max(128, tile) and the kernel
+        # offsets into the shared block by `*_tiles_per_block`.
+        self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
+        self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
+        self.sfa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
+        self.sfa_tiles_per_block = self.sfa_tile_shape_mk[0] // mma_tiler_mn[0]
+        self.sfb_tile_shape_nk = (max(128, mma_tiler_mn[1]), tile_k)
+        self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)
         self.cluster_shape_mn = (1, 1)
         self.epi_tile = (mma_tiler_mn[0], mma_tiler_mn[1])
         self.occupancy = 1
-        self.num_mma_warps = 4
+        # Smaller tiles need a matching MMA atom shape so the SF smem layout
+        # and V-map stay consistent.
+        if mma_tiler_mn[0] == 128:
+            self.atom_shape = (2, 2, 1)
+            self.num_mma_warps = 4
+        elif mma_tiler_mn[0] == 64:
+            self.atom_shape = (4, 2, 1)
+            self.num_mma_warps = 8
+        elif mma_tiler_mn[0] == 32:
+            self.atom_shape = (2, 2, 1)
+            self.num_mma_warps = 4
+        elif mma_tiler_mn[0] == 16:
+            self.atom_shape = (1, 2, 1)
+            self.num_mma_warps = 2
+        else:
+            raise ValueError(f"unsupported dynamic MMA tile_m {mma_tiler_mn[0]}")
         self.tma_load_warp_id = self.num_mma_warps
         self.num_threads_per_warp = 32
         self.threads_per_cta = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -345,7 +361,7 @@ class MoEDynamicKernel:
             self.acc_dtype,
             self.sf_dtype,
         )
-        atom_layout = cute.make_layout((2, 2, 1))
+        atom_layout = cute.make_layout(self.atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -358,19 +374,27 @@ class MoEDynamicKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
+        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * self.atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
+        # A/SFA smem hold the whole 128-row block for sub-128 MMA tiles (the
+        # SF smem helper also rejects tile M % 64 != 0), so build all smem
+        # layouts at the block shape; sub-128 tasks slice into it.
+        smem_tile_shape_mnk = (
+            self.sa_tile_shape_mk[0],
+            self.tile_shape_mnk[1],
+            self.tile_shape_mnk[2],
+        )
         sfa_smem = sm120_make_smem_layout_sfa(
             self.tiled_mma,
-            self.tile_shape_mnk,
+            smem_tile_shape_mnk,
             self.sf_vec_size,
             1,
         )
         sfb_smem = sm120_make_smem_layout_sfb(
             self.tiled_mma,
-            self.tile_shape_mnk,
+            smem_tile_shape_mnk,
             self.sf_vec_size,
             1,
         )
@@ -387,11 +411,40 @@ class MoEDynamicKernel:
             self.smem_capacity,
             self.occupancy,
         )
-        # The gated path stages a second weight pipeline (sB_up / sSFB_up) that
-        # _compute_stages doesn't model. Extra smem usage requires capping at 2
-        # to stay within the SM12x smem budget.
-        if self.is_gated:
-            self.ab_stage = max(1, min(self.ab_stage, 2))
+        # dense._compute_stages models a single B/SFB buffer, but the gated
+        # path double-buffers both. Recompute the stage cap from the real
+        # per-stage footprint so shapes with room keep their extra stages.
+        nb = 2 if self.is_gated else 1
+        n_pipe = 3 if self.is_gated else 2
+        # sA smem holds the whole 128-row block, so size the stage from it.
+        a_bytes = (
+            self.sa_tile_shape_mk[0]
+            * self.sa_tile_shape_mk[1]
+            * self.a_dtype.width
+            // 8
+        )
+        b_bytes = (
+            cute.size(cute.slice_(self.tile_shape_mnk, (0, None, None)))
+            * self.b_dtype.width
+            // 8
+        )
+        sfa_bytes = (
+            cute.size(cute.filter_zeros(sfa_smem).shape) * self.sf_dtype.width // 8
+        )
+        sfb_bytes = (
+            cute.size(cute.filter_zeros(sfb_smem).shape) * self.sf_dtype.width // 8
+        )
+        per_stage = a_bytes + nb * b_bytes + sfa_bytes + nb * sfb_bytes + n_pipe * 2 * 8
+        fixed = (
+            self.tile_shape_mnk[0] * self.tile_shape_mnk[1] * 2  # sC (bf16 epi)
+            + 2 * (self.num_mma_warps + 1) * 32 * 4  # route caches
+            + self.tile_shape_mnk[0] * 8  # scatter caches
+            + 8 * 8
+            + 1024
+            + 8 * 1024  # ctrl/mbar/align slack
+        )
+        max_fit = max(1, (self.smem_capacity - fixed) // per_stage)
+        self.ab_stage = min(self.ab_stage, max_fit)
         # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
         # _compute_stages returns the max that fits in smem, but it may not
         # divide k_tile_cnt. Round down to the nearest divisor.
@@ -406,7 +459,7 @@ class MoEDynamicKernel:
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
         ) = self._dense_cls._make_smem_layouts(
-            self.tile_shape_mnk,
+            smem_tile_shape_mnk,
             self.epi_tile,
             self.a_dtype,
             self.a_layout,
@@ -443,53 +496,9 @@ class MoEDynamicKernel:
         cute.arch.sync_threads()
 
     @cute.jit
-    def _publish_ready_tasks(
-        self,
-        task_tail: cute.Tensor,
-        task_ready: cute.Tensor,
-        task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
-        task_valid_rows: cute.Tensor,
-        gate_tile_cnt: Int32,
-        slice_chunk: Int32,
-        expert_idx: Int32,
-        m_tile_idx: Int32,
-        valid_rows: Int32,
-    ):
-        num_groups = (gate_tile_cnt + slice_chunk - Int32(1)) // slice_chunk
-        start = atomic_add_global_i32(get_ptr_as_int64(task_tail, Int32(0)), num_groups)
-
-        g = Int32(0)
-        while g < num_groups:
-            slot = start + g
-            slice_begin = g * slice_chunk
-            slice_count = gate_tile_cnt - slice_begin
-            if slice_count > slice_chunk:
-                slice_count = slice_chunk
-            task_expert[slot] = expert_idx
-            task_m_tile[slot] = m_tile_idx
-            task_slice_begin[slot] = slice_begin
-            task_slice_count[slot] = slice_count
-            task_valid_rows[slot] = valid_rows
-            g += Int32(1)
-
-        _threadfence()
-
-        g = Int32(0)
-        while g < num_groups:
-            slot = start + g
-            _st_global_release_i32(get_ptr_as_int64(task_ready, slot), Int32(1))
-            g += Int32(1)
-
-    @cute.jit
     def _publish_deferred_tasks(
         self,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
         gate_tile_cnt: Int32,
         slice_chunk: Int32,
@@ -503,16 +512,61 @@ class MoEDynamicKernel:
         g = Int32(0)
         while g < num_groups:
             slot = start + g
-            slice_begin = g * slice_chunk
-            slice_count = gate_tile_cnt - slice_begin
-            if slice_count > slice_chunk:
-                slice_count = slice_chunk
             task_expert[slot] = expert_idx
-            task_m_tile[slot] = m_tile_idx
-            task_slice_begin[slot] = slice_begin
-            task_slice_count[slot] = slice_count
             task_valid_rows[slot] = valid_rows
             g += Int32(1)
+
+    @cute.jit
+    def _decode_materialized_work_item(
+        self,
+        work_item: cute.Tensor,
+        task_expert: cute.Tensor,
+        task_valid_rows: cute.Tensor,
+        slot: Int32,
+        num_groups: Int32,
+        slice_chunk: Int32,
+        gate_tile_cnt: Int32,
+    ):
+        """Decode a deferred task from its slot index.
+
+        Slots are ordered by m-tile, then group, so only expert and
+        valid-row metadata need global storage.
+        """
+
+        m_tile = slot // num_groups
+        group = slot - m_tile * num_groups
+        slice_begin = group * slice_chunk
+        slice_count = gate_tile_cnt - slice_begin
+        if slice_count > slice_chunk:
+            slice_count = slice_chunk
+        work_item[_WORK_EXPERT] = task_expert[slot].to(Int32)
+        work_item[_WORK_M_TILE] = m_tile
+        work_item[_WORK_SLICE_BEGIN] = slice_begin
+        work_item[_WORK_SLICE_COUNT] = slice_count
+        work_item[_WORK_VALID_ROWS] = task_valid_rows[slot].to(Int32)
+
+    @cute.jit
+    def _store_shared_work_item(
+        self,
+        ctrl_base_addr: Int32,
+        work_item: cute.Tensor,
+    ):
+        for field in cutlass.range_constexpr(_WORK_ITEM_FIELDS):
+            _st_shared_i32(
+                ctrl_base_addr + Int32((_CTRL_WORK_BEGIN + field) * 4),
+                work_item[field],
+            )
+
+    @cute.jit
+    def _load_shared_work_item(
+        self,
+        work_item: cute.Tensor,
+        ctrl_base_addr: Int32,
+    ):
+        for field in cutlass.range_constexpr(_WORK_ITEM_FIELDS):
+            work_item[field] = _ld_shared_i32(
+                ctrl_base_addr + Int32((_CTRL_WORK_BEGIN + field) * 4)
+            )
 
     @cute.jit
     def __call__(
@@ -527,17 +581,10 @@ class MoEDynamicKernel:
         barrier_count: cute.Tensor,  # [1] int32 (host-zeroed)
         barrier_epoch: cute.Tensor,  # [1] int32 (host-zeroed)
         pair_head: cute.Tensor,  # [1] int32
-        producers_done_count: cute.Tensor,  # [1] int32
-        all_work_published: cute.Tensor,  # [1] int32
         task_head: cute.Tensor,  # [1] int32
         task_tail: cute.Tensor,  # [1] int32
-        task_ready: cute.Tensor,  # [max_tasks] int32
         task_expert: cute.Tensor,  # [max_tasks] int32
-        task_m_tile: cute.Tensor,  # [max_tasks] int32
-        task_slice_begin: cute.Tensor,  # [max_tasks] int32
-        task_slice_count: cute.Tensor,  # [max_tasks] int32
         task_valid_rows: cute.Tensor,  # [max_tasks] int32
-        tile_write_count: cute.Tensor,  # [E * max_m_tiles] int32
         b_w13: cute.Tensor,  # [2*I_tp, K, E] (gated) or [I_tp, K, E] (relu2)
         sfb_w13_ptr: cute.Pointer,  # scale factors for w13
         b_down: cute.Tensor,  # [K, I_tp, E]
@@ -582,13 +629,13 @@ class MoEDynamicKernel:
         tma_a, gA = self._dense_cls._make_tma_atoms_and_tensors(
             packed_a,
             self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            self.sa_tile_shape_mk,
             1,
         )
         tma_sfa, gSFA = self._dense_cls._make_tma_atoms_and_tensors(
             sfa_tensor,
             self.sfa_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            self.sfa_tile_shape_mk,
             1,
             internal_type=cutlass.Int16,
         )
@@ -603,7 +650,7 @@ class MoEDynamicKernel:
         tma_sfb_w13, gSFB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_w13_tensor,
             self.sfb_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            self.sfb_tile_shape_nk,
             1,
             internal_type=cutlass.Int16,
         )
@@ -621,7 +668,7 @@ class MoEDynamicKernel:
         tma_sfb_down, gSFB_down = self._dense_cls._make_tma_atoms_and_tensors(
             sfb_down_tensor,
             self.sfb_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            self.sfb_tile_shape_nk,
             1,
             internal_type=cutlass.Int16,
         )
@@ -640,17 +687,10 @@ class MoEDynamicKernel:
             barrier_count,
             barrier_epoch,
             pair_head,
-            producers_done_count,
-            all_work_published,
             task_head,
             task_tail,
-            task_ready,
             task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
             task_valid_rows,
-            tile_write_count,
             tma_a,
             gA,
             tma_sfa,
@@ -685,6 +725,9 @@ class MoEDynamicKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -699,17 +742,10 @@ class MoEDynamicKernel:
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
         pair_head: cute.Tensor,
-        producers_done_count: cute.Tensor,
-        all_work_published: cute.Tensor,
         task_head: cute.Tensor,
         task_tail: cute.Tensor,
-        task_ready: cute.Tensor,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
-        tile_write_count: cute.Tensor,
         tma_a: cute.CopyAtom,
         mA: cute.Tensor,
         tma_sfa: cute.CopyAtom,
@@ -749,7 +785,7 @@ class MoEDynamicKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)
@@ -958,11 +994,13 @@ class MoEDynamicKernel:
         num_k_tiles = (cols + Int32(63)) // Int32(64)
         route_gate_tile_cnt = launch_params.gate_tile_cnt
         task_slice_chunk = Int32(_TASK_SLICE_CHUNK)
-        full_tile_publish_enabled = Int32(0)
+        materialized_num_groups = (
+            route_gate_tile_cnt + task_slice_chunk - Int32(1)
+        ) // task_slice_chunk
 
-        # Phase 0: cooperative init — zero routing state, queue state, and output.
-        task_capacity = Int32(task_ready.shape[0])
-        tile_write_slots = Int32(tile_write_count.shape[0])
+        # Phase 0: cooperative init. Zero routing state, queue state, and
+        # output. Task metadata slots are overwritten before the second grid
+        # barrier and need no clear.
         i = flat_tid
         while i < num_experts:
             row_counts[i] = Int32(0)
@@ -971,7 +1009,7 @@ class MoEDynamicKernel:
         if flat_tid < num_experts + Int32(1):
             expert_tile_base[flat_tid] = Int32(0)
 
-        scatter_total_u32 = num_tokens * cols_u32
+        scatter_total_u32 = Int32(scatter_output.shape[0]) * cols_u32
         scatter_vecs = scatter_total_u32 // Int32(4)
         zero_u32 = Uint32(0)
         zv = flat_tid
@@ -990,26 +1028,8 @@ class MoEDynamicKernel:
             scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
             j += flat_stride
 
-        k = flat_tid
-        while k < task_capacity:
-            task_ready[k] = Int32(0)
-            task_expert[k] = Int32(0)
-            task_m_tile[k] = Int32(0)
-            task_slice_begin[k] = Int32(0)
-            task_slice_count[k] = Int32(0)
-            task_valid_rows[k] = Int32(0)
-            k += flat_stride
-
-        if full_tile_publish_enabled > Int32(0):
-            tw = flat_tid
-            while tw < tile_write_slots:
-                tile_write_count[tw] = Int32(0)
-                tw += flat_stride
-
         if flat_tid == Int32(0):
             pair_head[Int32(0)] = Int32(0)
-            producers_done_count[Int32(0)] = Int32(0)
-            all_work_published[Int32(0)] = Int32(0)
             task_head[Int32(0)] = Int32(0)
             task_tail[Int32(0)] = Int32(0)
 
@@ -1141,18 +1161,17 @@ class MoEDynamicKernel:
                                 phys_row = _ld_shared_i32(
                                     route_phys_rows_addr + slot * Int32(4)
                                 )
-                                phys_tile = phys_row // Int32(self.tile_shape_mnk[0])
-                                tile_row = phys_row - phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                )
                                 route_output_base[cache_slot] = (
                                     phys_row * output_bytes_per_row
                                 )
+                                # Scale storage is tiled in 128-row SF atoms,
+                                # independently of the MMA tile.
+                                sf_atom = phys_row >> Int32(7)
+                                sf_row = phys_row & Int32(127)
                                 route_scale_base[cache_slot] = (
-                                    phys_tile * num_k_tiles * Int32(32 * 4 * 4)
-                                    + (tile_row % Int32(32)) * Int32(4 * 4)
-                                    + ((tile_row % Int32(32 * 4)) // Int32(32))
-                                    * Int32(4)
+                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                                    + (sf_row % Int32(32)) * Int32(4 * 4)
+                                    + (sf_row // Int32(32)) * Int32(4)
                                 )
 
                             sf_idx = lane_id
@@ -1228,12 +1247,6 @@ class MoEDynamicKernel:
                                     phys_row = _ld_shared_i32(
                                         route_phys_rows_addr + slot * Int32(4)
                                     )
-                                    phys_tile = phys_row // Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
-                                    tile_row = phys_row - phys_tile * Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
                                     output_offset = (
                                         phys_row * output_bytes_per_row
                                         + sf_idx * Int32(8)
@@ -1244,14 +1257,16 @@ class MoEDynamicKernel:
                                         ),
                                         packed64,
                                     )
+                                    # Scale storage is tiled in 128-row SF
+                                    # atoms, not MMA tiles.
                                     k_tile_idx = sf_idx // Int32(4)
-                                    outer_m_idx = tile_row % Int32(32)
-                                    inner_m_idx = (tile_row % Int32(32 * 4)) // Int32(
-                                        32
-                                    )
+                                    sf_atom = phys_row >> Int32(7)
+                                    sf_row = phys_row & Int32(127)
+                                    outer_m_idx = sf_row % Int32(32)
+                                    inner_m_idx = sf_row // Int32(32)
                                     inner_k_idx = sf_idx % Int32(4)
                                     scale_offset = (
-                                        phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                        sf_atom * num_k_tiles * Int32(32 * 4 * 4)
                                         + k_tile_idx * Int32(32 * 4 * 4)
                                         + outer_m_idx * Int32(4 * 4)
                                         + inner_m_idx * Int32(4)
@@ -1261,44 +1276,6 @@ class MoEDynamicKernel:
                                     topk_slot += Int32(1)
                                 sf_idx += Int32(32)
 
-                        if full_tile_publish_enabled > Int32(0):
-                            cute.arch.sync_warp()
-                            _threadfence()
-                            cute.arch.sync_warp()
-
-                            if lane_id == Int32(0):
-                                topk_slot = Int32(0)
-                                while topk_slot < num_topk:
-                                    slot = route_slot_base + topk_slot
-                                    phys_row = _ld_shared_i32(
-                                        route_phys_rows_addr + slot * Int32(4)
-                                    )
-                                    expert_id = _ld_shared_i32(
-                                        route_expert_ids_addr + slot * Int32(4)
-                                    )
-                                    phys_tile = phys_row // Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self._publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
-                                        )
-                                    topk_slot += Int32(1)
                 else:
                     warp_item = Int32(0)
                     while warp_item < Int32(_PRODUCER_PAIRS_PER_WARP):
@@ -1378,48 +1355,25 @@ class MoEDynamicKernel:
                                     packed64,
                                 )
 
+                                # Scale storage is tiled in 128-row SF atoms,
+                                # not MMA tiles.
                                 k_tile_idx = sf_idx // Int32(4)
-                                outer_m_idx = row % Int32(32)
-                                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
                                 inner_k_idx = sf_idx % Int32(4)
+                                phys_row = phys_tile * Int32(
+                                    self.tile_shape_mnk[0]
+                                ) + row % Int32(self.tile_shape_mnk[0])
+                                sf_atom = phys_row >> Int32(7)
+                                sf_row = phys_row & Int32(127)
                                 scale_offset = (
-                                    phys_tile * num_k_tiles * Int32(32 * 4 * 4)
+                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
                                     + k_tile_idx * Int32(32 * 4 * 4)
-                                    + outer_m_idx * Int32(4 * 4)
-                                    + inner_m_idx * Int32(4)
+                                    + (sf_row % Int32(32)) * Int32(4 * 4)
+                                    + (sf_row // Int32(32)) * Int32(4)
                                     + inner_k_idx
                                 )
                                 scale_storage[scale_offset] = scale_byte
                                 sf_idx += Int32(32)
 
-                            if full_tile_publish_enabled > Int32(0):
-                                cute.arch.sync_warp()
-                                # When the whole launch has fewer than one M-tile of routed
-                                # rows, only the final partial-tile flush can publish work.
-                                # Skip the per-row fence/counter path in that common micro case.
-                                _threadfence()
-                                cute.arch.sync_warp()
-
-                                if lane_id == Int32(0):
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self._publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
-                                        )
                         warp_item += Int32(1)
 
         cute.arch.sync_threads()
@@ -1429,99 +1383,51 @@ class MoEDynamicKernel:
         _threadfence()
         cute.arch.sync_threads()
 
-        if full_tile_publish_enabled == Int32(0):
-            # Micro batches cannot fill a full M tile, so overlap is impossible.
-            # Rendezvous once, publish the final partial tiles, then consume.
-            self._resident_grid_barrier(
-                barrier_count,
-                barrier_epoch,
-                Int32(gdim_z),
-                is_cta_leader,
-            )
-
-            if is_cta_leader > Int32(0):
-                expert_flush = Int32(bidz)
-                while expert_flush < num_experts:
-                    rows_remaining = row_counts[expert_flush]
-                    m_tile_offset = Int32(0)
-                    while rows_remaining > Int32(0):
-                        valid_rows = rows_remaining
-                        if valid_rows > Int32(self.tile_shape_mnk[0]):
-                            valid_rows = Int32(self.tile_shape_mnk[0])
-                        self._publish_deferred_tasks(
-                            task_expert,
-                            task_m_tile,
-                            task_slice_begin,
-                            task_slice_count,
-                            task_valid_rows,
-                            route_gate_tile_cnt,
-                            task_slice_chunk,
-                            expert_flush,
-                            expert_tile_base[expert_flush] + m_tile_offset,
-                            valid_rows,
-                        )
-                        rows_remaining -= Int32(self.tile_shape_mnk[0])
-                        m_tile_offset += Int32(1)
-                    expert_flush += Int32(gdim_z)
-
-            if flat_tid == Int32(0):
-                num_groups = (
-                    route_gate_tile_cnt + task_slice_chunk - Int32(1)
-                ) // task_slice_chunk
-                st_global_i32(
-                    get_ptr_as_int64(task_tail, Int32(0)),
-                    expert_tile_base[num_experts] * num_groups,
-                )
-
-            self._resident_grid_barrier(
-                barrier_count,
-                barrier_epoch,
-                Int32(gdim_z),
-                is_cta_leader,
-            )
-            if flat_tid == Int32(0):
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
-                )
-        elif is_cta_leader > Int32(0):
-            prev_done = atomic_add_global_i32(
-                get_ptr_as_int64(producers_done_count, Int32(0)),
-                Int32(1),
-            )
-            if prev_done == Int32(gdim_z) - Int32(1):
-                expert_flush = Int32(0)
-                while expert_flush < num_experts:
-                    rows = row_counts[expert_flush]
-                    rem = rows % Int32(self.tile_shape_mnk[0])
-                    if rem != Int32(0):
-                        partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(
-                            self.tile_shape_mnk[0]
-                        )
-                        self._publish_ready_tasks(
-                            task_tail,
-                            task_ready,
-                            task_expert,
-                            task_m_tile,
-                            task_slice_begin,
-                            task_slice_count,
-                            task_valid_rows,
-                            route_gate_tile_cnt,
-                            task_slice_chunk,
-                            expert_flush,
-                            partial_m_tile,
-                            rem,
-                        )
-                    expert_flush += Int32(1)
-                _threadfence()
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
-                )
-
-        gA = cute.local_tile(
-            mA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None)
+        # Rendezvous once, publish every physical tile, then consume the
+        # finished queue.
+        self._resident_grid_barrier(
+            barrier_count,
+            barrier_epoch,
+            Int32(gdim_z),
+            is_cta_leader,
         )
+
+        if is_cta_leader > Int32(0):
+            expert_flush = Int32(bidz)
+            while expert_flush < num_experts:
+                rows_remaining = row_counts[expert_flush]
+                m_tile_offset = Int32(0)
+                while rows_remaining > Int32(0):
+                    valid_rows = rows_remaining
+                    if valid_rows > Int32(self.tile_shape_mnk[0]):
+                        valid_rows = Int32(self.tile_shape_mnk[0])
+                    self._publish_deferred_tasks(
+                        task_expert,
+                        task_valid_rows,
+                        route_gate_tile_cnt,
+                        task_slice_chunk,
+                        expert_flush,
+                        expert_tile_base[expert_flush] + m_tile_offset,
+                        valid_rows,
+                    )
+                    rows_remaining -= Int32(self.tile_shape_mnk[0])
+                    m_tile_offset += Int32(1)
+                expert_flush += Int32(gdim_z)
+
+        if flat_tid == Int32(0):
+            st_global_i32(
+                get_ptr_as_int64(task_tail, Int32(0)),
+                expert_tile_base[num_experts] * materialized_num_groups,
+            )
+
+        self._resident_grid_barrier(
+            barrier_count,
+            barrier_epoch,
+            Int32(gdim_z),
+            is_cta_leader,
+        )
+
+        gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
         # Tiled view over w13.
         # Gated: [2*I_tp, K, E] packed as [up, gate] across N.
         #   Up tiles: N-indices 0..gate_tile_cnt-1
@@ -1532,13 +1438,11 @@ class MoEDynamicKernel:
             cute.slice_(self.tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
-        gSFA = cute.local_tile(
-            mSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None)
-        )
+        # A/SF tiles use the 128-row block shape; for sub-128 MMA tiles one
+        # block backs `sa_tiles_per_block` MMA tiles (offset applied below).
+        gSFA = cute.local_tile(mSFA, self.sfa_tile_shape_mk, (None, None, None))
         gSFB_w13_tiled = cute.local_tile(
-            mSFB_w13,
-            cute.slice_(self.tile_shape_mnk, (0, None, None)),
-            (None, None, None),
+            mSFB_w13, self.sfb_tile_shape_nk, (None, None, None)
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
@@ -1627,11 +1531,29 @@ class MoEDynamicKernel:
         tBgSFB_down = cute.filter_zeros(tBgSFB_down)
 
         # MMA fragment partitions
-        tCsA = thr_mma.partition_A(sA)
+        # sA/sSFA hold the whole 128-row block; slice to the tile_m sub-tile
+        # the V-map expects (the per-task offset is applied at consumption).
+        if cutlass.const_expr(self.sa_tiles_per_block > 1):
+            sA_part = cute.local_tile(
+                sA,
+                cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                (Int32(0), 0, None),
+            )
+        else:
+            sA_part = sA
+        tCsA = thr_mma.partition_A(sA_part)
         tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+        if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+            sSFA_part = cute.local_tile(
+                sSFA,
+                cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                (Int32(0), 0, None),
+            )
+        else:
+            sSFA_part = sSFA
         tCrSFA = self._dense_cls._partition_fragment_SFA(
             self,  # type: ignore[arg-type]
-            sSFA[None, None, 0],
+            sSFA_part[None, None, 0],
             thr_mma,
             tidx,
         )
@@ -1726,7 +1648,7 @@ class MoEDynamicKernel:
 
         thr_ld_A = smem_copy_A.get_slice(tidx)
         thr_ld_B = smem_copy_B.get_slice(tidx)
-        csA = thr_ld_A.partition_S(sA)
+        csA = thr_ld_A.partition_S(sA_part)
         crA = thr_ld_A.retile(tCrA)
         csB = thr_ld_B.partition_S(sB)
         csB_up = thr_ld_B.partition_S(sB_up)
@@ -1734,7 +1656,7 @@ class MoEDynamicKernel:
 
         thr_ld_SFA = smem_copy_SFA.get_slice(tidx)
         thr_ld_SFB = smem_copy_SFB.get_slice(tidx)
-        csSFA = thr_ld_SFA.partition_S(sSFA)
+        csSFA = thr_ld_SFA.partition_S(sSFA_part)
         crSFA = thr_ld_SFA.retile(tCrSFA)
         csSFB = thr_ld_SFB.partition_S(sSFB)
         csSFB_up = thr_ld_SFB.partition_S(sSFB_up)
@@ -1752,77 +1674,40 @@ class MoEDynamicKernel:
         # Consumer steady state: pop one ready task per CTA, then let
         # the MMA warps and DMA warp cooperate on that task.
         # ===================================================================
+        work_item = cute.make_rmem_tensor((_WORK_ITEM_FIELDS,), Int32)
         consumer_live = Int32(1)
         while consumer_live > Int32(0):
             if is_cta_leader > Int32(0):
-                _st_shared_i32(ctrl_base_addr + Int32(0), Int32(0))  # has_task
-                _st_shared_i32(ctrl_base_addr + Int32(4), Int32(0))  # done
-                _st_shared_i32(ctrl_base_addr + Int32(28), Int32(0))  # claimed slot
-                if full_tile_publish_enabled == Int32(0):
-                    tail = _ld_global_acquire_i32(get_ptr_as_int64(task_tail, Int32(0)))
-                    slot = atomic_add_global_i32(
-                        get_ptr_as_int64(task_head, Int32(0)),
-                        Int32(1),
+                _st_shared_i32(ctrl_base_addr + Int32(_CTRL_HAS_WORK * 4), Int32(0))
+                _st_shared_i32(ctrl_base_addr + Int32(_CTRL_DONE * 4), Int32(0))
+                slot = atomic_add_global_i32(
+                    get_ptr_as_int64(task_head, Int32(0)), Int32(1)
+                )
+                # task_tail is final after the pre-consume grid barrier, so an
+                # out-of-range slot is a definitive done signal.
+                tail = _ld_global_acquire_i32(get_ptr_as_int64(task_tail, Int32(0)))
+                if slot < tail:
+                    self._decode_materialized_work_item(
+                        work_item,
+                        task_expert,
+                        task_valid_rows,
+                        slot,
+                        materialized_num_groups,
+                        task_slice_chunk,
+                        route_gate_tile_cnt,
                     )
-                    if slot < tail:
-                        _st_shared_i32(ctrl_base_addr + Int32(0), Int32(1))
-                        _st_shared_i32(ctrl_base_addr + Int32(28), slot)
-                        _st_shared_i32(ctrl_base_addr + Int32(8), task_expert[slot])
-                        _st_shared_i32(ctrl_base_addr + Int32(12), task_m_tile[slot])
-                        _st_shared_i32(
-                            ctrl_base_addr + Int32(16), task_slice_begin[slot]
-                        )
-                        _st_shared_i32(
-                            ctrl_base_addr + Int32(20), task_slice_count[slot]
-                        )
-                        _st_shared_i32(
-                            ctrl_base_addr + Int32(24), task_valid_rows[slot]
-                        )
-                    else:
-                        _st_shared_i32(ctrl_base_addr + Int32(4), Int32(1))
+                    self._store_shared_work_item(ctrl_base_addr, work_item)
+                    _st_shared_i32(ctrl_base_addr + Int32(_CTRL_HAS_WORK * 4), Int32(1))
                 else:
-                    head = _ld_global_acquire_i32(get_ptr_as_int64(task_head, Int32(0)))
-                    tail = _ld_global_acquire_i32(get_ptr_as_int64(task_tail, Int32(0)))
-                    if head < tail:
-                        prev_head = _atomic_cas_global_i32(
-                            get_ptr_as_int64(task_head, Int32(0)),
-                            head,
-                            head + Int32(1),
-                        )
-                        if prev_head == head:
-                            _spin_wait_global_eq_i32(
-                                get_ptr_as_int64(task_ready, head), Int32(0)
-                            )
-                            _st_shared_i32(ctrl_base_addr + Int32(0), Int32(1))
-                            _st_shared_i32(ctrl_base_addr + Int32(28), head)
-                            _st_shared_i32(ctrl_base_addr + Int32(8), task_expert[head])
-                            _st_shared_i32(
-                                ctrl_base_addr + Int32(12), task_m_tile[head]
-                            )
-                            _st_shared_i32(
-                                ctrl_base_addr + Int32(16), task_slice_begin[head]
-                            )
-                            _st_shared_i32(
-                                ctrl_base_addr + Int32(20), task_slice_count[head]
-                            )
-                            _st_shared_i32(
-                                ctrl_base_addr + Int32(24), task_valid_rows[head]
-                            )
-                    else:
-                        if _ld_global_acquire_i32(
-                            get_ptr_as_int64(all_work_published, Int32(0))
-                        ) > Int32(0):
-                            _st_shared_i32(ctrl_base_addr + Int32(4), Int32(1))
+                    _st_shared_i32(ctrl_base_addr + Int32(_CTRL_DONE * 4), Int32(1))
             cute.arch.sync_threads()
 
-            has_task = _ld_shared_i32(ctrl_base_addr + Int32(0))
-            is_done = _ld_shared_i32(ctrl_base_addr + Int32(4))
-            if has_task > Int32(0) and full_tile_publish_enabled > Int32(0):
-                claimed_slot = _ld_shared_i32(ctrl_base_addr + Int32(28))
-                _ld_global_acquire_i32(get_ptr_as_int64(task_ready, claimed_slot))
+            has_task = _ld_shared_i32(ctrl_base_addr + Int32(_CTRL_HAS_WORK * 4))
+            is_done = _ld_shared_i32(ctrl_base_addr + Int32(_CTRL_DONE * 4))
             if has_task > Int32(0):
-                task_m_tile_idx_cache = _ld_shared_i32(ctrl_base_addr + Int32(12))
-                task_valid_rows_cache = _ld_shared_i32(ctrl_base_addr + Int32(24))
+                self._load_shared_work_item(work_item, ctrl_base_addr)
+                task_m_tile_idx_cache = work_item[_WORK_M_TILE]
+                task_valid_rows_cache = work_item[_WORK_VALID_ROWS]
                 tile_m_base_cache = task_m_tile_idx_cache * Int32(
                     self.tile_shape_mnk[0]
                 )
@@ -1842,14 +1727,43 @@ class MoEDynamicKernel:
                 if is_done > Int32(0):
                     consumer_live = Int32(0)
             elif warp_idx < self.num_mma_warps:
-                task_expert_idx = _ld_shared_i32(ctrl_base_addr + Int32(8))
-                task_m_tile_idx = _ld_shared_i32(ctrl_base_addr + Int32(12))
-                task_slice_begin_idx = _ld_shared_i32(ctrl_base_addr + Int32(16))
-                task_slice_count_val = _ld_shared_i32(ctrl_base_addr + Int32(20))
-                task_valid_rows_val = _ld_shared_i32(ctrl_base_addr + Int32(24))
+                task_expert_idx = work_item[_WORK_EXPERT]
+                task_m_tile_idx = work_item[_WORK_M_TILE]
+                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
+                task_slice_count_val = work_item[_WORK_SLICE_COUNT]
+                task_valid_rows_val = work_item[_WORK_VALID_ROWS]
 
                 alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
                 valid_rows = task_valid_rows_val
+
+                # FC1's activation rows sit at offset (task_m_tile_idx %
+                # sfa_tiles_per_block) within the shared 128-row block; FC2
+                # re-slices at offset 0 since its intermediate is written there.
+                if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                    _fc1_off = task_m_tile_idx % Int32(self.sfa_tiles_per_block)
+                    _sA_il = cute.local_tile(
+                        sA,
+                        cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (_fc1_off, 0, None),
+                    )
+                    tCrA = tiled_mma.make_fragment_A(
+                        thr_mma.partition_A(_sA_il)[None, None, None, 0]
+                    )
+                    csA = thr_ld_A.partition_S(_sA_il)
+                    crA = thr_ld_A.retile(tCrA)
+                    _sSFA_il = cute.local_tile(
+                        sSFA,
+                        cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (_fc1_off, 0, None),
+                    )
+                    tCrSFA = self._dense_cls._partition_fragment_SFA(
+                        self,  # type: ignore[arg-type]
+                        _sSFA_il[None, None, 0],
+                        thr_mma,
+                        tidx,
+                    )
+                    csSFA = thr_ld_SFA.partition_S(_sSFA_il)
+                    crSFA = thr_ld_SFA.retile(tCrSFA)
 
                 _is_m_major = self.c_layout.is_m_major_c()
                 copy_atom_r2s = cute.make_copy_atom(
@@ -2315,6 +2229,34 @@ class MoEDynamicKernel:
                     warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
                     warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
 
+                    # FC2's intermediate was quant-written to the head of the
+                    # shared 128-row block, so phase B re-slices at offset 0
+                    # rather than FC1's per-task offset.
+                    if cutlass.const_expr(self.sfa_tiles_per_block > 1):
+                        _sA_p2 = cute.local_tile(
+                            sA,
+                            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (Int32(0), 0, None),
+                        )
+                        tCrA = tiled_mma.make_fragment_A(
+                            thr_mma.partition_A(_sA_p2)[None, None, None, 0]
+                        )
+                        csA = thr_ld_A.partition_S(_sA_p2)
+                        crA = thr_ld_A.retile(tCrA)
+                        _sSFA_p2 = cute.local_tile(
+                            sSFA,
+                            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                            (Int32(0), 0, None),
+                        )
+                        tCrSFA = self._dense_cls._partition_fragment_SFA(
+                            self,  # type: ignore[arg-type]
+                            _sSFA_p2[None, None, 0],
+                            thr_mma,
+                            tidx,
+                        )
+                        csSFA = thr_ld_SFA.partition_S(_sSFA_p2)
+                        crSFA = thr_ld_SFA.retile(tCrSFA)
+
                     csA_phase2 = csA[None, None, None, 0]
                     csSFA_phase2 = csSFA[None, None, None, 0]
 
@@ -2549,13 +2491,17 @@ class MoEDynamicKernel:
                     slice_idx += Int32(1)
 
             elif warp_idx == self.tma_load_warp_id:
-                task_expert_idx = _ld_shared_i32(ctrl_base_addr + Int32(8))
-                task_m_tile_idx = _ld_shared_i32(ctrl_base_addr + Int32(12))
-                task_slice_begin_idx = _ld_shared_i32(ctrl_base_addr + Int32(16))
-                task_slice_count_val = _ld_shared_i32(ctrl_base_addr + Int32(20))
+                task_expert_idx = work_item[_WORK_EXPERT]
+                task_m_tile_idx = work_item[_WORK_M_TILE]
+                task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
+                task_slice_count_val = work_item[_WORK_SLICE_COUNT]
 
-                tAgA_mk = tAgA[(None, task_m_tile_idx, None, Int32(0))]
-                tAgSFA_mk = tAgSFA[(None, task_m_tile_idx, None, Int32(0))]
+                # gA/gSFA are tiled in 128-row blocks; the fragment partition
+                # selects the within-block sub-tile.
+                sa_block_idx = task_m_tile_idx // Int32(self.sa_tiles_per_block)
+                tAgA_mk = tAgA[(None, sa_block_idx, None, Int32(0))]
+                sfa_block_idx = task_m_tile_idx // Int32(self.sfa_tiles_per_block)
+                tAgSFA_mk = tAgSFA[(None, sfa_block_idx, None, Int32(0))]
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
                     intermediate_slice = task_slice_begin_idx + slice_idx

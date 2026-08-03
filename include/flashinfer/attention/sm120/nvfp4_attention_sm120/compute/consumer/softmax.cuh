@@ -51,7 +51,10 @@ struct SoftmaxFused {
   static constexpr float fp4_scale = 1.f / 6.f;
   static constexpr float fp4_scale_log2 = -2.584962500721156f;
   static constexpr float AbsMaxPEps = 1.0e-8f;
-  static constexpr int RowReductionThr = 8;
+  // One accumulator row is spread across 4 threads (m16n8 acc: 2 columns
+  // per thread per 8-column atom); reducing across 8 threads would fold
+  // the neighboring row's sum into row_sum and halve the output.
+  static constexpr int RowReductionThr = 4;
 
   CUTLASS_DEVICE SoftmaxFused() {};
 

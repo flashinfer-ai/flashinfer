@@ -179,6 +179,9 @@ def main() -> int:
             dtype_bytes=2,
             algorithm=algo,
             layout=layout,
+            # Comm-only benchmark (no expert FFN): weights are a layer-level
+            # concern now — FleetParams carries only EP sizing, and create_fleet
+            # never touches expert weights, so none are needed here.
         ),
         backend="nccl_ep",
     )

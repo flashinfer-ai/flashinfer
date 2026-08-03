@@ -40,12 +40,38 @@ from flashinfer.fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.jit import setup_cubin_loader
-from flashinfer.utils import _get_cache_buf
+from flashinfer.utils import _get_cache_buf, get_compute_capability
+
+# Tensor index constants for trtllm_low_latency_gemm inputs: [A, B, global_scale, out]
+_LLGEMM_A_IDX = 0
+_LLGEMM_OUT_IDX = 3
+
+# Module-level as the tuning config is independent of the inputs in this case.
+# Avoids re-instantiating on each call.
+_LLGEMM_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (_LLGEMM_A_IDX,),
+            (-2,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(_LLGEMM_OUT_IDX, -2, lambda shapes: shapes[_LLGEMM_A_IDX][-2]),
+    ),
+)
+
+
+def get_trtllm_low_latency_gemm_module():
+    device = torch.device("cuda", torch.cuda.current_device())
+    enable_rubin = get_compute_capability(device) == (10, 7)
+    return _get_trtllm_low_latency_gemm_module_impl(enable_rubin)
 
 
 @functools.cache
-def get_trtllm_low_latency_gemm_module():
-    mod = gen_trtllm_low_latency_gemm_module()
+def _get_trtllm_low_latency_gemm_module_impl(enable_rubin: bool):
+    mod = gen_trtllm_low_latency_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
     setup_cubin_loader(str(mod.get_library_path()))
 
@@ -67,8 +93,8 @@ def get_trtllm_low_latency_gemm_module():
             (
                 a,
                 b,
-                global_scale,
-                out,
+                _,
+                _,
             ) = inputs
             type_e4m3 = 1
             type_bf16 = 2
@@ -164,30 +190,13 @@ def trtllm_low_latency_gemm(
     """
 
     tuner = AutoTuner.get()
-    a_tensor_index = 0
-    out_tensor_index = 3
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                (a_tensor_index,),
-                (-2,),
-                get_hybrid_num_tokens_buckets,
-                map_to_hybrid_bucket_uncapped,
-            ),
-        ),
-        constraint_specs=(
-            ConstraintSpec(
-                out_tensor_index, -2, lambda shapes: shapes[a_tensor_index][-2]
-            ),
-        ),
-    )
     inputs = [A, B, global_scale, out]
     runners: List[TunableRunner] = []
     runners.append(get_trtllm_low_latency_gemm_module().gemm_runner())
     runner, tactic = tuner.choose_one(
         "trtllm_low_latency_gemm",
         runners,
-        tuning_config,
+        _LLGEMM_TUNING_CONFIG,
         inputs,
     )
 
