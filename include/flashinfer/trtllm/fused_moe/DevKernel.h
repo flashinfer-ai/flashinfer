@@ -366,9 +366,9 @@ struct Data {
   int32_t numTokens;
   int32_t numExperts;
   int32_t topK;
-  // Hidden dimension output of MoE block. It is not padded.
+  // Final output row width of the MoE block.
   int32_t hiddenDim;
-  // Hidden dimension output of FC2. It might be padded.
+  // Hidden dimension output stride of FC2.
   int32_t hiddenDimPadded;
   int32_t const* totalNumPaddedTokens;
 };
