@@ -499,8 +499,9 @@ def cp_delta_rule_fixup_dsl_sm100(
         output_state.dtype if store_final_state else torch.float32
     )
     if _kernel_kind is None:
+        num_parallel_states = num_seqs * num_heads
         if num_heads <= 8:
-            _kernel_kind = "simt_row4"
+            _kernel_kind = "simt_row4" if num_parallel_states <= 8 else "simt_row8"
         elif num_heads <= 16:
             _kernel_kind = "simt_row8"
         else:
@@ -853,6 +854,7 @@ def cp_delta_rule_dsl_sm100(
             chunk_len_granularity=cp_chunk_len_granularity,
             device_capability=device_capability,
             total_seqlen=total_seqlen,
+            num_seqs=num_seqs,
             device_name=device_name,
         )
     if q.ndim != 3:
