@@ -16,6 +16,7 @@
 
 import math
 import inspect
+from typing import Any, cast
 
 import torch
 
@@ -281,6 +282,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    num_fused_shared_experts=0,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -293,6 +295,13 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         on the kept groups, take global top_k experts
         combine with weights derived from s (without bias), normalised and
         scaled by routed_scaling_factor
+
+    With ``num_fused_shared_experts = S > 0`` the routing kernel appends S
+    slots per token carrying ids ``[E, E + S)`` at weight exactly ``1.0``
+    (``routed_scaling_factor`` applies to the routed weights only), and the
+    weight tensors carry ``E + S`` rows.  Serving both the S=0 and S>0 trace
+    templates from one function keeps the routing math single-sourced; S=0
+    callers simply omit the argument.
     """
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
@@ -333,6 +342,23 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     # Gather per-row weights into [T, TOP_K] for the shared GEMM helper
     w_topk = weights.gather(1, topk_idx)
 
+    # Mirror the routing kernel's shared-expert append: ids [E, E + S) at
+    # weight 1.0, after the routed top-k slots. _fp8_moe_run_experts iterates
+    # the E + S weight rows and skips any id >= the expert count it is given,
+    # so the count passed below must be the fused total.
+    S = int(num_fused_shared_experts or 0)
+    if S > 0:
+        shared_ids = torch.arange(
+            E_global, E_global + S, device=topk_idx.device, dtype=topk_idx.dtype
+        ).expand(T, S)
+        topk_idx = torch.cat((topk_idx, shared_ids), dim=1)
+        # Build the [T, S] weight block explicitly rather than slicing w_topk:
+        # a `w_topk[:, :S]` slice silently yields min(TOP_K, S) columns, which
+        # is wrong whenever S > TOP_K (reachable — only TOP_K + S <= 32 is
+        # enforced, so e.g. TOP_K=1, S=2 is valid).
+        shared_w = torch.ones((T, S), device=w_topk.device, dtype=w_topk.dtype)
+        w_topk = torch.cat((w_topk, shared_w), dim=1)
+
     return _fp8_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -343,7 +369,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         w_topk,
         topk_idx,
         local_expert_offset,
-        E_global,
+        E_global + S,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -932,126 +958,285 @@ def _moe_fp8_block_scale_ds_init(
     }
 
 
-trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
-    op_type="moe",
-    name_prefix="moe_fp8_block_scale_ds_routing",
-    description="FP8 block scale MoE with DeepSeek-V3 routing. Includes grouped sigmoid routing and two grouped-GEMM.",
-    axes={
-        "seq_len": Var(description="Sequence length (number of tokens)"),
-        "num_experts": Const(description="Total number of experts.", abbrev=""),
-        "top_k": Const(
-            description="Number of experts to route to per token.", abbrev="topk"
-        ),
-        "n_group": Const(
-            description="Number of expert groups for group routing.", abbrev="ng"
-        ),
-        "topk_group": Const(
-            description="Number of groups to select for top-k routing.", abbrev="kg"
-        ),
-        "num_local_experts": Const(description="Number of local experts.", abbrev="e"),
-        "hidden_size": Const(description="Hidden dimension size.", abbrev="h"),
-        "intermediate_size": Const(
-            description="MoE intermediate layer size.", abbrev="i"
-        ),
-        "gemm1_out_size": Const(
-            description="Output size of the first GEMM (W13). Should be 2 * intermediate_size.",
-            abbrev="",
-        ),
-        "num_hidden_blocks": Const(
-            description="Number of quantized blocks along the hidden_size dimension (block_size=128).",
-            abbrev="",
-        ),
-        "num_intermediate_blocks": Const(
-            description="Number of quantized blocks along the intermediate_size dimension (block_size=128).",
-            abbrev="",
-        ),
-        "num_gemm1_out_blocks": Const(
-            description="Number of quantized blocks along the gemm1_out_size dimension (block_size=128).",
-            abbrev="",
-        ),
-    },
-    inputs={
-        "routing_logits": Tensor(
-            ["seq_len", "num_experts"],
-            description="Routing logits for expert selection.",
-        ),
-        "routing_bias": Tensor(
-            ["num_experts"],
-            description="Bias tensor for routing. Pass all zeros for no bias.",
-        ),
-        "hidden_states": Tensor(
-            ["seq_len", "hidden_size"],
-            description="Input hidden states tensor (FP8 quantized).",
-        ),
-        "hidden_states_scale": Tensor(
-            ["num_hidden_blocks", "seq_len"],
-            description="Block-wise scaling factors for hidden states.",
-        ),
-        "gemm1_weights": Tensor(
-            ["num_local_experts", "gemm1_out_size", "hidden_size"],
-            description="First GEMM weights for all local experts (gate and up projections).",
-        ),
-        "gemm1_weights_scale": Tensor(
-            ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
-            description="Block-wise scaling factors for first GEMM weights.",
-        ),
-        "gemm1_alpha": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
-            optional=True,
-        ),
-        "gemm1_beta": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
-            optional=True,
-        ),
-        "gemm1_clamp_limit": Tensor(
-            ["num_local_experts"],
-            dtype="float32",
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
-            optional=True,
-        ),
-        "gemm2_weights": Tensor(
-            ["num_local_experts", "hidden_size", "intermediate_size"],
-            description="Second GEMM weights for all local experts (down projection).",
-        ),
-        "gemm2_weights_scale": Tensor(
-            ["num_local_experts", "num_hidden_blocks", "num_intermediate_blocks"],
-            description="Block-wise scaling factors for second GEMM weights.",
-        ),
-        "top_k": Scalar(
+def _moe_fp8_block_scale_ds_shared_experts_init(
+    *,
+    seq_len: int,
+    num_fused_shared_experts: int = 1,
+    num_experts: int = 256,
+    num_weight_rows: int = 0,
+    num_local_experts: int = 0,
+    **kwargs,
+):
+    """Build inputs for ``trtllm_fp8_block_scale_moe`` with fused shared experts.
+
+    Same pipeline as :func:`_moe_fp8_block_scale_ds_init`, with two differences
+    that are easy to get backwards:
+
+    * the weight tensors carry ``routed + S`` rows (routed first, shared
+      appended), while
+    * ``local_num_experts`` stays *routed-only* — the kernel widens it itself.
+
+    The routed count is *derived*, not defaulted.  The shared-expert template
+    has no ``num_local_experts`` axis (every expert-major tensor is
+    ``routed + S`` rows, so the routed-only count is carried by no tensor), and
+    replay passes ``num_weight_rows`` instead.  Defaulting the routed count
+    here would rebuild an ``e33/s1`` definition with 257 rows.  Resolution
+    order: ``num_weight_rows - S``, then an explicit ``num_local_experts``,
+    then ``num_experts`` — the last being exact because fused shared experts
+    require the full routed set on this rank.
+
+    ``seq_len`` is spelled out rather than absorbed by ``**kwargs``: it is the
+    template's only ``Var`` axis, and the trace machinery discovers Var axes by
+    inspecting this signature.
+    """
+    S = int(num_fused_shared_experts)
+    if num_weight_rows:
+        routed = int(num_weight_rows) - S
+    elif num_local_experts:
+        routed = int(num_local_experts)
+    else:
+        routed = int(num_experts)
+    if routed <= 0:
+        raise ValueError(
+            f"derived routed expert count must be > 0, got {routed} "
+            f"(num_weight_rows={num_weight_rows}, num_fused_shared_experts={S})."
+        )
+    out = _moe_fp8_block_scale_ds_init(
+        seq_len=seq_len,
+        num_experts=num_experts,
+        # Ask the routed builder for routed + S experts so the shared rows are
+        # materialized, then report the routed-only count below.
+        num_local_experts=routed + S,
+        **kwargs,
+    )
+    out["local_num_experts"] = routed
+    out["num_fused_shared_experts"] = S
+    return out
+
+
+# Inline the routed builder into the rendered init: the shared-expert builder
+# delegates to it, and the emitted source must run standalone. Set the
+# attribute directly rather than via _bind_init_dependency, which also copies
+# the dependency's __signature__ -- that would hide num_weight_rows and make
+# replay rebuild the routed expert count from a default instead of deriving it.
+cast(Any, _moe_fp8_block_scale_ds_shared_experts_init)._trace_init_dependencies = (
+    _moe_fp8_block_scale_ds_init,
+)
+
+
+def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
+    """Build the DeepSeek-V3 block-FP8 trace, with or without shared experts.
+
+    The two variants differ only in the expert-major row count and the extra
+    ``num_fused_shared_experts`` axis/input, so they are generated from one
+    body rather than copied: a divergence between them would silently produce
+    a benchmark definition that does not match what the kernel ran.
+
+    They must stay *separate templates* rather than one template with an S
+    axis defaulted to 0. Routing an S>0 call through the routed template
+    mislabels it: the expert-major axis is read from the weight rows, so the
+    definition records ``local_num_experts = E + S`` for a call that passed
+    ``E``, and drops ``S`` entirely — leaving a benchmark that cannot be
+    replayed as the kernel ran it. That is the load-bearing reason, and it bites
+    on every S>0 dump, because ``fi_trace`` *does* route through the dispatch
+    function below.
+
+    A second, currently-unreachable hazard: ``definition_name`` builds the
+    filename from the const axes alone and the dumper overwrites
+    unconditionally, so two configs whose physical row counts coincide (e.g.
+    ``E=32, S=0`` and ``E=31, S=1``) would land on one key. That matters for
+    Trace Apply, which resolves solutions by definition name at runtime — but
+    Trace Apply cannot reach any dispatched template today: ``apply.py`` builds
+    its wrapper from ``templates[0]``, which for this API is the *default*
+    routing template regardless of ``routing_method_type``. So the collision
+    only becomes reachable once that is fixed; it is listed here so the reason
+    for the separate name survives that fix.
+
+    ``num_fused_shared_experts`` therefore carries a non-empty abbrev, and the
+    routed template keeps its existing name untouched.
+    """
+    # Expert-major tensors (weights, scales, and the per-expert OA vectors)
+    # carry E_local + S physical rows; local_num_experts stays routed-only.
+    rows = "num_weight_rows" if shared_experts else "num_local_experts"
+    extra_axes = {}
+    extra_inputs = {}
+    if shared_experts:
+        extra_axes["num_fused_shared_experts"] = Const(
+            description="Number of fused shared experts (S), applied to every token.",
+            abbrev="s",
+        )
+        # Replaces num_local_experts as the expert-major dim rather than
+        # sitting alongside it: with S > 0 every expert-major tensor (weights,
+        # scales, and the per-expert OA vectors) has E_local + S rows, so no
+        # tensor carries the routed-only count and an axis for it would be
+        # unreachable. The routed count stays recoverable as rows - S.
+        # It inherits the "e" abbrev so the definition name still reports an
+        # expert-row count; the s<N> component disambiguates it from routed.
+        extra_axes["num_weight_rows"] = Const(
+            description=(
+                "Physical expert-major rows: local_num_experts + "
+                "num_fused_shared_experts."
+            ),
+            abbrev="e",
+        )
+        extra_inputs["num_fused_shared_experts"] = Scalar(
             "int32",
-            description="Number of experts to route to per token (DeepSeek-V3 uses 8).",
+            description=(
+                "Number of shared experts fused into the launch. Their weight "
+                "rows are appended after the routed experts and the routing "
+                "kernel emits ids [E, E + S) at weight 1.0."
+            ),
+        )
+    return TraceTemplate(
+        op_type="moe",
+        name_prefix=(
+            "moe_fp8_block_scale_ds_shared_experts"
+            if shared_experts
+            else "moe_fp8_block_scale_ds_routing"
         ),
-        "n_group": Scalar(
-            "int32",
-            description="Number of expert groups (DeepSeek-V3 uses 8).",
+        description=(
+            "FP8 block scale MoE with DeepSeek-V3 routing. Includes grouped "
+            "sigmoid routing and two grouped-GEMM."
+            + (" Fused shared experts run for every token." if shared_experts else "")
         ),
-        "topk_group": Scalar(
-            "int32",
-            description="Number of groups to keep after group-level top-k (DeepSeek-V3 uses 4).",
+        axes={
+            **extra_axes,
+            "seq_len": Var(description="Sequence length (number of tokens)"),
+            "num_experts": Const(description="Total number of experts.", abbrev=""),
+            "top_k": Const(
+                description="Number of experts to route to per token.", abbrev="topk"
+            ),
+            "n_group": Const(
+                description="Number of expert groups for group routing.", abbrev="ng"
+            ),
+            "topk_group": Const(
+                description="Number of groups to select for top-k routing.", abbrev="kg"
+            ),
+            **(
+                {}
+                if shared_experts
+                else {
+                    "num_local_experts": Const(
+                        description="Number of local experts.", abbrev="e"
+                    )
+                }
+            ),
+            "hidden_size": Const(description="Hidden dimension size.", abbrev="h"),
+            "intermediate_size": Const(
+                description="MoE intermediate layer size.", abbrev="i"
+            ),
+            "gemm1_out_size": Const(
+                description="Output size of the first GEMM (W13). Should be 2 * intermediate_size.",
+                abbrev="",
+            ),
+            "num_hidden_blocks": Const(
+                description="Number of quantized blocks along the hidden_size dimension (block_size=128).",
+                abbrev="",
+            ),
+            "num_intermediate_blocks": Const(
+                description="Number of quantized blocks along the intermediate_size dimension (block_size=128).",
+                abbrev="",
+            ),
+            "num_gemm1_out_blocks": Const(
+                description="Number of quantized blocks along the gemm1_out_size dimension (block_size=128).",
+                abbrev="",
+            ),
+        },
+        inputs={
+            **extra_inputs,
+            "routing_logits": Tensor(
+                ["seq_len", "num_experts"],
+                description="Routing logits for expert selection.",
+            ),
+            "routing_bias": Tensor(
+                ["num_experts"],
+                description="Bias tensor for routing. Pass all zeros for no bias.",
+            ),
+            "hidden_states": Tensor(
+                ["seq_len", "hidden_size"],
+                description="Input hidden states tensor (FP8 quantized).",
+            ),
+            "hidden_states_scale": Tensor(
+                ["num_hidden_blocks", "seq_len"],
+                description="Block-wise scaling factors for hidden states.",
+            ),
+            "gemm1_weights": Tensor(
+                [rows, "gemm1_out_size", "hidden_size"],
+                description="First GEMM weights for all local experts (gate and up projections).",
+            ),
+            "gemm1_weights_scale": Tensor(
+                [rows, "num_gemm1_out_blocks", "num_hidden_blocks"],
+                description="Block-wise scaling factors for first GEMM weights.",
+            ),
+            "gemm1_alpha": Tensor(
+                [rows],
+                dtype="float32",
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
+                optional=True,
+            ),
+            "gemm1_beta": Tensor(
+                [rows],
+                dtype="float32",
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
+                optional=True,
+            ),
+            "gemm1_clamp_limit": Tensor(
+                [rows],
+                dtype="float32",
+                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
+                optional=True,
+            ),
+            "gemm2_weights": Tensor(
+                [rows, "hidden_size", "intermediate_size"],
+                description="Second GEMM weights for all local experts (down projection).",
+            ),
+            "gemm2_weights_scale": Tensor(
+                [rows, "num_hidden_blocks", "num_intermediate_blocks"],
+                description="Block-wise scaling factors for second GEMM weights.",
+            ),
+            "top_k": Scalar(
+                "int32",
+                description="Number of experts to route to per token (DeepSeek-V3 uses 8).",
+            ),
+            "n_group": Scalar(
+                "int32",
+                description="Number of expert groups (DeepSeek-V3 uses 8).",
+            ),
+            "topk_group": Scalar(
+                "int32",
+                description="Number of groups to keep after group-level top-k (DeepSeek-V3 uses 4).",
+            ),
+            "local_expert_offset": Scalar(
+                "int32",
+                description="Offset of local experts in global expert space.",
+            ),
+            "routed_scaling_factor": Scalar(
+                "float32",
+                description="Scaling factor for routing weights.",
+            ),
+        },
+        outputs={
+            "output": Tensor(
+                ["seq_len", "hidden_size"],
+                dtype="bfloat16",
+                description="Final MoE output tensor.",
+            ),
+        },
+        tags=["status:verified", "quantization:float8_e4m3fn"],
+        reference=_trtllm_fp8_block_scale_moe_ds_routing_reference,
+        init=(
+            _moe_fp8_block_scale_ds_shared_experts_init
+            if shared_experts
+            else _moe_fp8_block_scale_ds_init
         ),
-        "local_expert_offset": Scalar(
-            "int32",
-            description="Offset of local experts in global expert space.",
-        ),
-        "routed_scaling_factor": Scalar(
-            "float32",
-            description="Scaling factor for routing weights.",
-        ),
-    },
-    outputs={
-        "output": Tensor(
-            ["seq_len", "hidden_size"],
-            dtype="bfloat16",
-            description="Final MoE output tensor.",
-        ),
-    },
-    tags=["status:verified", "quantization:float8_e4m3fn"],
-    reference=_trtllm_fp8_block_scale_moe_ds_routing_reference,
-    init=_moe_fp8_block_scale_ds_init,
+    )
+
+
+trtllm_fp8_block_scale_moe_ds_routing_trace = _make_fp8_block_ds_trace(
+    shared_experts=False
+)
+trtllm_fp8_block_scale_moe_ds_shared_experts_trace = _make_fp8_block_ds_trace(
+    shared_experts=True
 )
 
 # Backward-compatible alias (the original name used in fused_moe/core.py import).
@@ -1124,16 +1309,29 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
 
     Returns ``None`` for ``RoutingMethodType.Unspecified`` (6), which
     suppresses trace generation.
+
+    Fused shared experts select a separate DeepSeekV3 template: the two differ
+    in expert-major row count, so they must not share a definition name (the
+    dumper overwrites by name).  Only DeepSeekV3 supports them, so no other
+    routing type branches on ``num_fused_shared_experts``.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
+    if (
+        routing_method_type == 2
+        and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+    ):
+        return trtllm_fp8_block_scale_moe_ds_shared_experts_trace
     return _MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
 
 
 # Expose all possible templates so _attach_fi_trace can auto-register them
-# in _TRACE_REGISTRY for consistency testing.
-trtllm_fp8_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _MOE_TRACE_BY_ROUTING_TYPE.values()
-)
+# in _TRACE_REGISTRY for consistency testing.  The shared-expert template is
+# not in the routing-type map (it is selected by the S branch above), so it is
+# appended explicitly.
+trtllm_fp8_block_scale_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    *_MOE_TRACE_BY_ROUTING_TYPE.values(),
+    trtllm_fp8_block_scale_moe_ds_shared_experts_trace,
+]
 
 
 # ---------------------------------------------------------------------------

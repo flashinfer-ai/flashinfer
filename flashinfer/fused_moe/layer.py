@@ -132,11 +132,27 @@ class MoELayer:
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
+            # Fused shared experts are supported by only a subset of backends,
+            # and a non-supporting runner is filtered out above like any other
+            # unsupported configuration. Call that out explicitly: otherwise the
+            # generic message sends the reader looking at arch/quant support.
+            hint = ""
+            if config.experts.num_fused_shared_experts > 0:
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if getattr(r, "supports_fused_shared_experts", False)
+                )
+                hint = (
+                    f" Note num_fused_shared_experts="
+                    f"{config.experts.num_fused_shared_experts}, which only "
+                    f"[{supporting}] support."
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
-                f"runners: [{mvp}]."
+                f"runners: [{mvp}].{hint}"
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
