@@ -64,6 +64,8 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _raise_cuda_graph_capture_misuse,
+    is_current_stream_capturing,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1910,7 +1912,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
+
+        Raises
+        ------
+        RuntimeError
+            If called while the current CUDA stream is being captured into a
+            CUDA graph but this wrapper was constructed with
+            ``use_cuda_graph=False``. In that mode :meth:`plan` re-allocates
+            its auxiliary buffers on every call, so a captured graph would
+            replay against stale memory and silently produce wrong output.
+            Construct the wrapper with ``use_cuda_graph=True`` and the
+            required fixed-size buffers, and call :meth:`plan` outside the
+            captured region. Setting ``FLASHINFER_ALLOW_UNSAFE_GRAPH_CAPTURE=1``
+            bypasses this check at your own risk.
         """
+        if not self._use_cuda_graph and is_current_stream_capturing():
+            _raise_cuda_graph_capture_misuse(type(self).__name__)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)

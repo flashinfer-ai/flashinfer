@@ -18,6 +18,7 @@ import os
 import logging
 import functools
 import math
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
@@ -174,6 +175,51 @@ def _check_kv_layout(kv_layout: str) -> None:
 
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+
+# Resolved once at import: whether this torch exposes the capture query
+# (checking per call would put a hasattr probe on wrapper hot paths).
+_torch_is_current_stream_capturing = getattr(
+    torch.cuda, "is_current_stream_capturing", None
+)
+
+
+def is_current_stream_capturing() -> bool:
+    """Return True iff the current CUDA stream is in graph-capture mode.
+
+    Returns ``False`` on torch builds without graph-capture support.
+    """
+    if _torch_is_current_stream_capturing is None:
+        return False
+    try:
+        return _torch_is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _raise_cuda_graph_capture_misuse(wrapper_name: str) -> None:
+    """Fail a default-mode wrapper whose ``run()`` is being graph-captured.
+
+    In default mode, ``plan()`` re-allocates its auxiliary buffers on every
+    call, so a graph captured around ``run()`` would replay against stale
+    memory and silently produce wrong output (issue #3904). Callers
+    pre-check ``use_cuda_graph`` and :func:`is_current_stream_capturing`,
+    so this function (env lookup, message construction) only runs on the
+    error path.
+    """
+    if os.environ.get("FLASHINFER_ALLOW_UNSAFE_GRAPH_CAPTURE", "0") not in ("0", ""):
+        return
+    raise RuntimeError(
+        f"{wrapper_name}.run() is being captured into a CUDA graph, but this "
+        "wrapper was constructed with use_cuda_graph=False. In this mode, "
+        "plan() re-allocates its auxiliary buffers on every call, so the "
+        "captured graph would replay against stale memory and silently "
+        "produce wrong output (or crash with an illegal memory access as "
+        "sequences grow). Construct the wrapper with use_cuda_graph=True, "
+        "provide the required fixed-size buffers, and call plan() outside "
+        "the captured region. To bypass this check at your own risk, set "
+        "FLASHINFER_ALLOW_UNSAFE_GRAPH_CAPTURE=1."
+    )
 
 
 def get_indptr(x: torch.Tensor) -> torch.Tensor:

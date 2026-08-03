@@ -30,6 +30,8 @@ import contextlib
 import importlib
 import torch
 
+from .utils import is_current_stream_capturing
+
 
 # Helper function to substitute %i with process ID in file paths
 def _substitute_process_id(path: str) -> str:
@@ -645,16 +647,6 @@ def _extract_tensors_and_metadata(
     return _extract_tensors_and_metadata_common(args, kwargs, graph_capture=False)
 
 
-def _is_current_stream_capturing() -> bool:
-    """Return True iff the current CUDA stream is in graph-capture mode."""
-    if not hasattr(torch.cuda, "is_current_stream_capturing"):
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except Exception:
-        return False
-
-
 def _extract_tensors_and_metadata_graph_refs(
     args: tuple, kwargs: dict
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -765,7 +757,7 @@ def _dump_function_inputs(
     # references instead; the replay hook materializes them to CPU after replay.
     # In eager mode keep the legacy ``.cpu()`` path so original CUDA strides are
     # recorded faithfully, matching pre-PR behavior.
-    is_capturing = _is_current_stream_capturing()
+    is_capturing = is_current_stream_capturing()
     if is_capturing:
         input_tensors, input_metadata = _extract_tensors_and_metadata_graph_refs(
             args, kwargs
@@ -950,7 +942,7 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             _logger.error(f"Dump directory not found: {dump_dir}")
             return
 
-        is_capturing = _is_current_stream_capturing()
+        is_capturing = is_current_stream_capturing()
 
         # Extract tensors and metadata from outputs.
         # During capture, hold tensor references instead of adding D2H copies
@@ -1918,10 +1910,7 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
             try:
                 # Skip statistics if we're in CUDA graph capture mode
                 # (operations like .min()/.max()/.mean() cause synchronization issues)
-                is_capturing = False
-                if value.is_cuda and hasattr(torch.cuda, "is_current_stream_capturing"):
-                    with contextlib.suppress(Exception):
-                        is_capturing = torch.cuda.is_current_stream_capturing()
+                is_capturing = value.is_cuda and is_current_stream_capturing()
 
                 if is_capturing:
                     # Delegate stats to a captured CUDA kernel that prints via
