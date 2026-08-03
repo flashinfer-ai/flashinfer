@@ -1641,12 +1641,12 @@ def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
 
 def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     """Smoke test routed FP8 block-scale call path with explicit non-gated activation_type."""
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    device = torch.device("cuda:0")
+    compute_capability = get_compute_capability(device)
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
 
     torch.manual_seed(0)
-    device = torch.device("cuda:0")
 
     num_tokens = 32
     hidden_size = 512
@@ -1980,7 +1980,7 @@ def test_fp4_block_scale_moe_fused_shared_experts_reject_routed_only_tensors():
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+        pytest.skip("These tests require TRTLLM FP4 MoE on SM100, SM103, or SM107.")
 
     device = torch.device("cuda")
     num_tokens = 2
