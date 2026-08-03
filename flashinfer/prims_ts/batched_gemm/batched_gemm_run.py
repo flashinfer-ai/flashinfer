@@ -1570,6 +1570,7 @@ def reference_check(
     gemm1_beta_value=None,
     gemm1_clamp_limit_value=2.0,
     return_output=False,
+    repeat_launches=1,
     output_guard_elements=0,
     early_exit_max_token_ctas=0,
     **cfg_overrides,
@@ -1584,8 +1585,11 @@ def reference_check(
 
     When problem_n / problem_k are None, they default to tile_n / tile_k
     (single-tile test). Set them to realistic values (e.g. 4096) for
-    multi-tile benchmarks.
+    multi-tile benchmarks. ``repeat_launches`` reuses the compiled kernel and
+    requires bitwise-stable output and output scale buffers across launches.
     """
+    if repeat_launches < 1:
+        raise ValueError(f"repeat_launches must be positive, got {repeat_launches}")
     launch_early_exit_max_token_ctas = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -2298,8 +2302,20 @@ def reference_check(
     print("Compiling kernel...")
     compiled_fn = _compile_for_launch(ref_io, stream)
     print("Launching kernel...")
-    compiled_fn(*_launch_arg_tuple(ref_io, stream))
-    torch.cuda.synchronize()
+    repeat_outputs = []
+    repeat_scales = []
+    for _ in range(repeat_launches):
+        compiled_fn(*_launch_arg_tuple(ref_io, stream))
+        torch.cuda.synchronize()
+        if repeat_launches > 1:
+            output_tensor = (
+                c_storage
+                if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
+                else c_torch
+            )
+            repeat_outputs.append(output_tensor.detach().clone())
+            if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
+                repeat_scales.append(sf_c_torch.detach().clone())
     # Unload the per-check CUDA library at a deterministic point after the
     # launch is synchronized. Letting Python GC do this later can overlap
     # library unload with the next clustered persistent compile/launch.
@@ -2386,6 +2402,19 @@ def reference_check(
         if return_output:
             return result, c_logical.detach().clone()
         return result
+
+    outputs_deterministic = all(
+        torch.equal(repeat_outputs[0], output) for output in repeat_outputs[1:]
+    )
+    scales_deterministic = all(
+        torch.equal(repeat_scales[0], scale) for scale in repeat_scales[1:]
+    )
+    if not outputs_deterministic or not scales_deterministic:
+        print(
+            "FAIL: repeated launches are nondeterministic "
+            f"(output={outputs_deterministic}, scale={scales_deterministic})"
+        )
+        return _return(False)
 
     if has_nan or has_inf:
         print(f"FAIL: output has NaN={has_nan}, Inf={has_inf}")

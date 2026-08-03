@@ -2427,6 +2427,16 @@ class GmemCResource(MemoryResource):
                     prims.cp_async_bulk_wait_group(1, read=True)
                 else:
                     prims.cp_async_bulk_wait_group(0, read=True)
+                # Only the warp-group leader owns the TMA store group, so the
+                # other epilogue threads return from wait_group immediately.
+                # Rendezvous before reusing the shared-memory scratch tile;
+                # otherwise they can overwrite data still being consumed by
+                # the previous subtile's TMA store.
+                store_barrier_id = Int32(7) + warpgroup_idx
+                prims.barrier_cta_sync(
+                    barrier_id=store_barrier_id,
+                    thread_count=128,
+                )
             if cutlass.const_expr(self.cfg.has_epilogue_quant):
                 # MX output paths collect scale bytes in a local Python list so
                 # scale computation is batched, then stores SF-C through the
