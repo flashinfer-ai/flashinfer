@@ -2320,11 +2320,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, mS_init.element_type)
 
         if cutlass.const_expr(mS_indices is not None):
-            state_row = mS_indices[batch_idx]
+            state_idx = mS_indices[batch_idx]
         else:
-            state_row = batch_idx
+            state_idx = batch_idx
         gS_init = cute.flat_divide(
-            mS_init[None, None, head_idx, state_row],
+            mS_init[None, None, head_idx, state_idx],
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
         )[None, None, 0, 0]
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
@@ -2444,11 +2444,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                         )
             if cutlass.const_expr(self.store_final_state):
                 if cutlass.const_expr(mS_indices is not None):
-                    state_row = mS_indices[batch_idx]
+                    state_idx = mS_indices[batch_idx]
                 else:
-                    state_row = batch_idx
+                    state_idx = batch_idx
                 gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, state_row],
+                    mS_out[None, None, head_idx, state_idx],
                     (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
                 )[None, None, 0, 0]
                 tRG_tCgState = thr_state_t2r.partition_D(gS_out)

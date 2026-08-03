@@ -1951,9 +1951,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             (self.D, self.D, num_heads, num_seqs),
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
-        state_row = seq_idx
+        state_idx = seq_idx
         if cutlass.const_expr(self.use_state_indices):
-            state_row = cutlass.Int32(g_state_indices_t[seq_idx])
+            state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
             if cutlass.const_expr(self.use_state_indices):
                 initial_layout = cute.make_layout(
@@ -1964,7 +1964,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             else:
                 gInitialStateTensor = cute.make_tensor(g_initial_state_t.iterator, state_layout)
             gInitialState = cute.local_tile(
-                gInitialStateTensor[None, None, head_idx, state_row],
+                gInitialStateTensor[None, None, head_idx, state_idx],
                 (self.rows_per_cta, self.D), (row_cta_idx, 0),
             )
             gInitialStateWorkspaceTensor = cute.make_tensor(g_initial_state_workspace_t.iterator, state_layout)
@@ -1985,7 +1985,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             else:
                 gOutputStateTensor = cute.make_tensor(g_output_state_t.iterator, state_layout)
             gOutputState = cute.local_tile(
-                gOutputStateTensor[None, None, head_idx, state_row],
+                gOutputStateTensor[None, None, head_idx, state_idx],
                 (self.rows_per_cta, self.D), (row_cta_idx, 0),
             )
         else:
