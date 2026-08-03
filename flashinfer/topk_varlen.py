@@ -71,11 +71,12 @@ _ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
 # CuTe DSL radix backend: all Blackwell-plus tiers.
 _BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
 
-# GVR validated tiers: B200-class only (SM100/103).
-# GVR LB uses cluster_size=4 CTA clusters (programmatic multicast); SM120/121
-# only support a 1×1×1 cluster shape (no multicast) so the clustered path
-# would be incorrect there.  The non-LB path (cluster_size=1) is also
-# restricted to the same tiers for consistency — let radix serve SM110+.
+# GVR is B200-class only (SM100/103). The non-LB (cluster_size=1) GVR CuTe-DSL
+# kernel fails to build on sm_120a: libNVVM rejects the generated device IR
+# (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't use GVR
+# even without load balancing. The LB path additionally needs cluster_size=4
+# programmatic multicast, which SM120/121's 1×1×1 cluster shape lacks. radix
+# serves SM110+.
 _GVR_CCS = [100, 103]
 
 # ---------------------------------------------------------------------------
