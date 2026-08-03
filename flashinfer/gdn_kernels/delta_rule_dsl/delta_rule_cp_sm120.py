@@ -1754,12 +1754,16 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        use_state_indices: bool = False,
+        store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
         self.initial_state_dtype = initial_state_dtype
         self.state_dtype = state_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.use_state_indices = use_state_indices
+        self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = 64
         self.row_ctas = 2
@@ -1779,6 +1783,8 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             "initial_state_dtype",
             "state_dtype",
             "cu_seqlens_dtype",
+            "use_state_indices",
+            "store_initial_state",
             "D",
             "rows_per_cta",
             "row_ctas",
@@ -1852,11 +1858,13 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         n_consumer_state,
         gFixedState: cute.Tensor,
         gInitialState: cute.Tensor,
+        gInitialStateWorkspace: cute.Tensor,
         gOutputState: cute.Tensor,
         num_chunks: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
         chunk_start: cutlass.Int32,
         seq_idx: cutlass.Int32,
+        state_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
         row_cta_idx: cutlass.Int32,
         math_tidx: cutlass.Int32,
@@ -1896,13 +1904,19 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         )
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_warp = cute.local_tile(
-                gInitialState[None, None, head_idx, seq_idx],
+                gInitialState[None, None, head_idx, state_idx],
+                (16, self.D),
+                (global_row_base // 16, 0),
+            )
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace_warp = cute.local_tile(
+                gInitialStateWorkspace[None, None, head_idx, seq_idx],
                 (16, self.D),
                 (global_row_base // 16, 0),
             )
         if cutlass.const_expr(self.store_final_state):
             gOutputState_warp = cute.local_tile(
-                gOutputState[None, None, head_idx, seq_idx],
+                gOutputState[None, None, head_idx, state_idx],
                 (16, self.D),
                 (global_row_base // 16, 0),
             )
@@ -1910,6 +1924,8 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         tSMgFixedState = thr_store_C.partition_D(gFixedState_warp)
         if cutlass.const_expr(self.needs_initial_state):
             tSMgInitialState = thr_copy_C.partition_S(gInitialState_warp)
+        if cutlass.const_expr(self.store_initial_state):
+            tSMgInitialStateWorkspace = thr_store_C.partition_D(gInitialStateWorkspace_warp)
         if cutlass.const_expr(self.store_final_state):
             tSMgOutputState = thr_store_C.partition_D(gOutputState_warp)
 
@@ -1939,6 +1955,8 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
 
             # init tSMrState from initial_state
             tSMrState_cv.store(tSMgInitialState.load().to(cutlass.Float32))
+            if cutlass.const_expr(self.store_initial_state):
+                cute.copy(tiled_store_C, tSMrState_store, tSMgInitialStateWorkspace)
 
         for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
             TF32.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)
@@ -1996,8 +2014,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
         g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2032,8 +2052,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             g_transfer_t,
             g_local_state_t,
             g_initial_state_t,
+            g_initial_state_workspace_t,
             g_fixed_state_t,
             g_output_state_t,
+            g_state_indices_t,
             g_cu_seqlens,
             chunk_len,
             total_cp_chunks,
@@ -2053,8 +2075,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
         g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2111,16 +2135,47 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             (self.D, self.D, num_heads, num_seqs),
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
+        state_idx = seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
-            gInitialState = cute.make_tensor(
-                g_initial_state_t.iterator, fixed_state_layout
-            )
+            if cutlass.const_expr(self.use_state_indices):
+                initial_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    stride=(
+                        g_initial_state_t.stride[2],
+                        g_initial_state_t.stride[3],
+                        g_initial_state_t.stride[1],
+                        g_initial_state_t.stride[0],
+                    ),
+                )
+                gInitialState = cute.make_tensor(g_initial_state_t.iterator, initial_state_layout)
+            else:
+                gInitialState = cute.make_tensor(g_initial_state_t.iterator, fixed_state_layout)
         else:
             gInitialState = gFixedState
         if cutlass.const_expr(self.store_final_state):
-            gOutputState = cute.make_tensor(g_output_state_t.iterator, fixed_state_layout)
+            if cutlass.const_expr(self.use_state_indices):
+                output_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    stride=(
+                        g_output_state_t.stride[2],
+                        g_output_state_t.stride[3],
+                        g_output_state_t.stride[1],
+                        g_output_state_t.stride[0],
+                    ),
+                )
+                gOutputState = cute.make_tensor(g_output_state_t.iterator, output_state_layout)
+            else:
+                gOutputState = cute.make_tensor(g_output_state_t.iterator, fixed_state_layout)
         else:
             gOutputState = gFixedState
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace = cute.make_tensor(
+                g_initial_state_workspace_t.iterator, fixed_state_layout
+            )
+        else:
+            gInitialStateWorkspace = gFixedState
 
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128
@@ -2283,11 +2338,13 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
                     n_consumer_state,
                     gFixedState,
                     gInitialState,
+                    gInitialStateWorkspace,
                     gOutputState,
                     num_chunks,
                     total_cp_chunks,
                     chunk_start,
                     seq_idx,
+                    state_idx,
                     head_idx,
                     row_cta_idx,
                     math_tidx,
@@ -2303,12 +2360,16 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        use_state_indices: bool = False,
+        store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
         self.initial_state_dtype = initial_state_dtype
         self.state_dtype = state_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.use_state_indices = use_state_indices
+        self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = rows_per_cta
         self.row_ctas = self.D // self.rows_per_cta
@@ -2322,6 +2383,8 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             "initial_state_dtype",
             "state_dtype",
             "cu_seqlens_dtype",
+            "use_state_indices",
+            "store_initial_state",
             "D",
             "rows_per_cta",
             "row_ctas",
@@ -2338,12 +2401,16 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         gFixedState: cute.Tensor,
         gLocalState: cute.Tensor,
         gInitialState: cute.Tensor,
+        gInitialStateWorkspace: cute.Tensor,
         col: cutlass.Int32,
     ) -> cutlass.Int32:
         start = cutlass.Int32(0)
         if cutlass.const_expr(self.needs_initial_state):
             for i in cutlass.range_constexpr(self.rows_per_cta):
-                sState[i, col] = gInitialState[i, col].to(cutlass.Float32)
+                value = gInitialState[i, col].to(cutlass.Float32)
+                sState[i, col] = value
+                if cutlass.const_expr(self.store_initial_state):
+                    gInitialStateWorkspace[i, col] = value
         else:
             start = cutlass.Int32(1)
             for i in cutlass.range_constexpr(self.rows_per_cta):
@@ -2471,8 +2538,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
         g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2493,8 +2562,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             g_transfer_t,
             g_local_state_t,
             g_initial_state_t,
+            g_initial_state_workspace_t,
             g_fixed_state_t,
             g_output_state_t,
+            g_state_indices_t,
             g_cu_seqlens,
             chunk_len,
             total_cp_chunks,
@@ -2514,8 +2585,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
         g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2558,19 +2631,55 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             (self.D, self.D, num_heads, num_seqs),
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
+        state_idx = seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
-            gInitialState = cute.make_tensor(
-                g_initial_state_t.iterator, fixed_state_layout
-            )
+            if cutlass.const_expr(self.use_state_indices):
+                initial_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    stride=(
+                        g_initial_state_t.stride[2],
+                        g_initial_state_t.stride[3],
+                        g_initial_state_t.stride[1],
+                        g_initial_state_t.stride[0],
+                    ),
+                )
+                gInitialState = cute.make_tensor(g_initial_state_t.iterator, initial_state_layout)
+            else:
+                gInitialState = cute.make_tensor(g_initial_state_t.iterator, fixed_state_layout)
         else:
             gInitialState = gFixedState
         if cutlass.const_expr(self.store_final_state):
-            gOutputState = cute.make_tensor(g_output_state_t.iterator, fixed_state_layout)
+            if cutlass.const_expr(self.use_state_indices):
+                output_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    stride=(
+                        g_output_state_t.stride[2],
+                        g_output_state_t.stride[3],
+                        g_output_state_t.stride[1],
+                        g_output_state_t.stride[0],
+                    ),
+                )
+                gOutputState = cute.make_tensor(g_output_state_t.iterator, output_state_layout)
+            else:
+                gOutputState = cute.make_tensor(g_output_state_t.iterator, fixed_state_layout)
             gOutputState_cta = cute.local_tile(
-                gOutputState[None, None, head_idx, seq_idx],
+                gOutputState[None, None, head_idx, state_idx],
                 (self.rows_per_cta, self.D),
                 (row_cta_idx, 0),
             )
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace = cute.make_tensor(
+                g_initial_state_workspace_t.iterator, fixed_state_layout
+            )
+            gInitialStateWorkspace_cta = cute.local_tile(
+                gInitialStateWorkspace[None, None, head_idx, seq_idx],
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
+            )
+        else:
+            gInitialStateWorkspace_cta = gFixedState
 
         sState = storage.smem_state.get_tensor(state_layout)
         gTransfer_head = gTransfer[None, None, head_idx, None]
@@ -2589,7 +2698,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         gFixedState_seq = cute.domain_offset((0, 0, chunk_start), gFixedState_cta)
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_cta = cute.local_tile(
-                gInitialState[None, None, head_idx, seq_idx],
+                gInitialState[None, None, head_idx, state_idx],
                 (self.rows_per_cta, self.D),
                 (row_cta_idx, 0),
             )
@@ -2604,6 +2713,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
                 gFixedState_seq,
                 gLocalState_seq,
                 gInitialState_cta,
+                gInitialStateWorkspace_cta,
                 col,
             )
             cute.arch.sync_threads()
@@ -2760,7 +2870,9 @@ def cp_delta_rule_fixup_dsl_sm120(
             leading_dim=1
         ),
         initial_state_cute,
+        None,
         from_dlpack(fixed_state.reshape(-1), assumed_align=128).mark_layout_dynamic(),
+        None,
         None,
         from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
         cutlass.Int32(cp_chunk_len),

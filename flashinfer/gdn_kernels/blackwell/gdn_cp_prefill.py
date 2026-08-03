@@ -26,9 +26,12 @@ from ..delta_rule_dsl.varlen_helper import (
     max_num_chunks_host,
     workspace_num_chunks_host,
 )
-from .gated_delta_net_cp import CPDeltaRuleMNPrecomputeUtcmma1Sm100
+from .gated_delta_net_cp import (
+    CPDeltaRuleFixupUtcmmaSm100,
+    CPDeltaRuleMNPrecomputeUtcmma1Sm100,
+)
 from .gated_delta_net_cp_prefill import CPDeltaRulePrefillTcgen05Sm100
-from .gdn_prefill import _cutlass_state_dtype
+from .gdn_prefill import _cutlass_state_dtype, _mark_state_layout
 
 
 @functools.cache
@@ -360,34 +363,52 @@ def _get_fixup_kernel(
     store_final_state,
     initial_state_dtype,
     output_state_dtype,
+    use_state_indices,
     kernel_kind,
     cu_seqlens_dtype,
 ):
     if kernel_kind == "simt_row4":
         return CPDeltaRuleFixupSm100(
-            needs_initial_state,
-            4,
-            store_final_state,
-            initial_state_dtype,
-            output_state_dtype,
-            cu_seqlens_dtype,
+            needs_initial_state=needs_initial_state,
+            rows_per_cta=4,
+            store_final_state=store_final_state,
+            initial_state_dtype=initial_state_dtype,
+            state_dtype=output_state_dtype,
+            cu_seqlens_dtype=cu_seqlens_dtype,
+            use_state_indices=use_state_indices,
+            store_initial_state=needs_initial_state,
         )
     if kernel_kind == "simt_row8":
         return CPDeltaRuleFixupSm100(
-            needs_initial_state,
-            8,
-            store_final_state,
-            initial_state_dtype,
-            output_state_dtype,
-            cu_seqlens_dtype,
+            needs_initial_state=needs_initial_state,
+            rows_per_cta=8,
+            store_final_state=store_final_state,
+            initial_state_dtype=initial_state_dtype,
+            state_dtype=output_state_dtype,
+            cu_seqlens_dtype=cu_seqlens_dtype,
+            use_state_indices=use_state_indices,
+            store_initial_state=needs_initial_state,
         )
     if kernel_kind == "hmma":
         return CPDeltaRuleFixupHmmaSm100(
-            needs_initial_state,
-            store_final_state,
-            initial_state_dtype,
-            output_state_dtype,
-            cu_seqlens_dtype,
+            needs_initial_state=needs_initial_state,
+            store_final_state=store_final_state,
+            initial_state_dtype=initial_state_dtype,
+            state_dtype=output_state_dtype,
+            cu_seqlens_dtype=cu_seqlens_dtype,
+            use_state_indices=use_state_indices,
+            store_initial_state=needs_initial_state,
+        )
+    if kernel_kind in ("utcmma", "utcmma64", "utcmma128"):
+        return CPDeltaRuleFixupUtcmmaSm100(
+            rows_per_cta=128 if kernel_kind == "utcmma128" else 64,
+            needs_initial_state=needs_initial_state,
+            store_final_state=store_final_state,
+            initial_state_dtype=initial_state_dtype,
+            state_dtype=output_state_dtype,
+            cu_seqlens_dtype=cu_seqlens_dtype,
+            use_state_indices=use_state_indices,
+            store_initial_state=needs_initial_state,
         )
     raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
 
@@ -400,6 +421,8 @@ def cp_delta_rule_fixup_dsl_sm100(
     cp_chunk_len: int = 4096,
     initial_state: torch.Tensor | None = None,
     output_state: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    initial_state_workspace: torch.Tensor | None = None,
     *,
     _skip_check: bool = False,
     _kernel_kind: str | None = None,
@@ -430,31 +453,37 @@ def cp_delta_rule_fixup_dsl_sm100(
                 "CPDeltaRuleFixupSm100 only supports float32 inputs, "
                 f"got {local_transfer.dtype} and {local_state.dtype}"
             )
+        use_state_indices = state_indices is not None
         for name, tensor in (("initial_state", initial_state), ("output_state", output_state)):
             if tensor is not None:
-                if tensor.shape != (
-                    cu_seqlens.shape[0] - 1,
-                    local_transfer.shape[1],
-                    128,
-                    128,
+                expected_tail = (local_transfer.shape[1], 128, 128)
+                if tuple(tensor.shape[1:]) != expected_tail or (
+                    not use_state_indices and tensor.shape[0] != cu_seqlens.shape[0] - 1
                 ):
                     raise RuntimeError(
                         f"{name} must have shape "
-                        f"{(cu_seqlens.shape[0] - 1, local_transfer.shape[1], 128, 128)}, "
-                        f"got {tuple(tensor.shape)}"
+                        f"{('[N_pool]' if use_state_indices else f'[{cu_seqlens.shape[0] - 1}]')}"
+                        f" + {expected_tail}, got {tuple(tensor.shape)}"
                     )
                 if tensor.dtype not in (torch.float32, torch.bfloat16, torch.float16):
                     raise RuntimeError(
                         f"{name} must have dtype float32, bfloat16, or float16, got {tensor.dtype}"
                     )
+        if use_state_indices:
+            if state_indices.dtype != torch.int32 or state_indices.shape != (cu_seqlens.shape[0] - 1,):
+                raise RuntimeError(
+                    f"state_indices must have shape {(cu_seqlens.shape[0] - 1,)} and dtype int32"
+                )
         for name, tensor in (
             ("local_transfer", local_transfer),
             ("local_state", local_state),
-            ("initial_state", initial_state),
-            ("output_state", output_state),
+            ("state_indices", state_indices),
         ):
             if tensor is not None and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
+        for name, tensor in (("initial_state", initial_state), ("output_state", output_state)):
+            if tensor is not None and tensor.stride()[1:] != (128 * 128, 128, 1):
+                raise RuntimeError(f"{name} must be contiguous in its inner [H, V, K] modes")
 
     total_cp_chunks, num_heads, _, d = local_transfer.shape
     if not _skip_check:
@@ -476,11 +505,18 @@ def cp_delta_rule_fixup_dsl_sm100(
     fixed_state = _get_cp_workspace(
         "gdn_cp_sm100_fixed_state", local_state.shape, local_state.dtype, device
     )
+    if initial_state is not None and initial_state_workspace is None:
+        initial_state_workspace = _get_cp_workspace(
+            "gdn_cp_sm100_initial_state",
+            (num_seqs, num_heads, d, d),
+            torch.float32,
+            device,
+        )
     if total_cp_chunks == 0:
         return fixed_state
 
     local_transfer_tma = local_transfer.as_strided(
-        (d, d, num_heads, total_cp_chunks), (d, 1, d * d, num_heads * d * d)
+        (d, d, num_heads, total_cp_chunks), (1, d, d * d, num_heads * d * d)
     )
     local_state_tma = local_state.as_strided(
         (d, d, num_heads, total_cp_chunks), (d, 1, d * d, num_heads * d * d)
@@ -492,6 +528,7 @@ def cp_delta_rule_fixup_dsl_sm100(
     )
     needs_initial_state = initial_state is not None
     store_final_state = output_state is not None
+    use_state_indices = state_indices is not None
     initial_state_dtype = _cutlass_state_dtype(
         initial_state.dtype if needs_initial_state else torch.float32
     )
@@ -500,17 +537,23 @@ def cp_delta_rule_fixup_dsl_sm100(
     )
     if _kernel_kind is None:
         num_parallel_states = num_seqs * num_heads
-        if num_heads <= 8:
-            _kernel_kind = "simt_row4" if num_parallel_states <= 8 else "simt_row8"
-        elif num_heads <= 16:
-            _kernel_kind = "simt_row8"
+        num_sms = get_device_sm_count(device)
+        # SIMT4 sustains two CTAs/SM. UTC64 and UTC128 launch D/rows_per_cta
+        # CTAs per state, so UTC64 switches out when its two-CTA grid exceeds one wave.
+        simt_row4_one_wave_states = num_sms * 2 // (d // 4)
+        utcmma64_one_wave_states = num_sms // (d // 64)
+        if num_parallel_states <= simt_row4_one_wave_states:
+            _kernel_kind = "simt_row4"
+        elif num_parallel_states <= utcmma64_one_wave_states:
+            _kernel_kind = "utcmma64"
         else:
-            _kernel_kind = "hmma"
+            _kernel_kind = "utcmma128"
     kernel = _get_fixup_kernel(
         needs_initial_state,
         store_final_state,
         initial_state_dtype,
         output_state_dtype,
+        use_state_indices,
         _kernel_kind,
         _cu_seqlens_dtype(cu_seqlens.dtype),
     )
@@ -520,29 +563,35 @@ def cp_delta_rule_fixup_dsl_sm100(
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-        initial_state_cute = (
-            from_dlpack(
-                initial_state.reshape(-1), assumed_align=16
-            ).mark_layout_dynamic()
+        initial_state_cute = None
+        if needs_initial_state:
+            initial_state_cute = from_dlpack(initial_state, assumed_align=16)
+            _mark_state_layout(initial_state_cute, use_state_indices, d)
+        initial_state_workspace_cute = (
+            from_dlpack(initial_state_workspace.reshape(-1), assumed_align=16).mark_layout_dynamic()
             if needs_initial_state
             else None
         )
+        output_state_cute = None
+        if store_final_state:
+            output_state_cute = from_dlpack(output_state, assumed_align=16)
+            _mark_state_layout(output_state_cute, use_state_indices, d)
         kernel_args = (
             from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
-                leading_dim=1
+                leading_dim=0
             ),
             from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
                 leading_dim=1
             ),
             initial_state_cute,
+            initial_state_workspace_cute,
             from_dlpack(
                 fixed_state.reshape(-1), assumed_align=128
             ).mark_layout_dynamic(),
+            output_state_cute,
             (
-                from_dlpack(
-                    output_state.reshape(-1), assumed_align=16
-                ).mark_layout_dynamic()
-                if store_final_state
+                from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+                if use_state_indices
                 else None
             ),
             from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
@@ -556,9 +605,11 @@ def cp_delta_rule_fixup_dsl_sm100(
     compiled(
         local_transfer_tma,
         local_state_tma,
-        initial_state.reshape(-1) if needs_initial_state else None,
+        initial_state if needs_initial_state else None,
+        initial_state_workspace.reshape(-1) if needs_initial_state else None,
         fixed_state.reshape(-1),
-        output_state.reshape(-1) if store_final_state else None,
+        output_state if store_final_state else None,
+        state_indices if use_state_indices else None,
         cu_seqlens,
         cp_chunk_len,
         total_cp_chunks,
@@ -696,10 +747,11 @@ def cp_delta_rule_prefill_dsl_sm100(
             raise RuntimeError(
                 f"fixed_state must have shape {expected_workspace_shape}, got {tuple(fixed_state.shape)}"
             )
-        if initial_state is not None and initial_state.shape != expected_state_shape:
-            raise RuntimeError(
-                f"initial_state must have shape {expected_state_shape}, got {tuple(initial_state.shape)}"
-            )
+        if initial_state is not None:
+            if initial_state.shape != expected_state_shape:
+                raise RuntimeError(
+                    f"initial_state must have shape {expected_state_shape}, got {tuple(initial_state.shape)}"
+                )
         if not _FullyFusedDeltaRuleSm120.can_implement(
             num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
         ):
@@ -713,12 +765,13 @@ def cp_delta_rule_prefill_dsl_sm100(
             ("v", v),
             ("t", t),
             ("fixed_state", fixed_state),
-            ("initial_state", initial_state),
             ("alpha", alpha),
             ("o", o),
         ):
             if tensor is not None and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
+        if initial_state is not None and initial_state.stride()[1:] != (d * d, d, 1):
+            raise RuntimeError("initial_state must be contiguous in its inner [H, V, K] modes")
     if total_cp_chunks == 0:
         return
 
@@ -766,6 +819,10 @@ def cp_delta_rule_prefill_dsl_sm100(
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
+        initial_state_cute = None
+        if needs_initial_state:
+            initial_state_cute = from_dlpack(initial_state, assumed_align=16)
+            _mark_state_layout(initial_state_cute, False, d)
         kernel_args = (
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(k, assumed_align=16).mark_layout_dynamic(),
@@ -775,11 +832,7 @@ def cp_delta_rule_prefill_dsl_sm100(
             from_dlpack(o, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
             from_dlpack(fixed_state, assumed_align=16).mark_layout_dynamic(),
-            (
-                from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic()
-                if needs_initial_state
-                else None
-            ),
+            initial_state_cute,
             None,
             cutlass.Int32(cp_chunk_len),
             cutlass.Int32(total_cp_chunks),
@@ -823,6 +876,7 @@ def cp_delta_rule_dsl_sm100(
     scale: float,
     *,
     initial_state: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     cp_chunk_len: int | None = None,
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
@@ -901,13 +955,30 @@ def cp_delta_rule_dsl_sm100(
             f"got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
     expected_state_shape = (num_seqs, num_sab_heads, d, d)
-    if state is not None and state.shape != expected_state_shape:
+    use_state_indices = state_indices is not None
+    if state is not None and (
+        (not use_state_indices and state.shape != expected_state_shape)
+        or (use_state_indices and tuple(state.shape[1:]) != expected_state_shape[1:])
+    ):
         raise RuntimeError(
-            f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
+            f"state must have shape "
+            f"{('[N_pool]' if use_state_indices else f'[{num_seqs}]')} + {expected_state_shape[1:]}, "
+            f"got {tuple(state.shape)}"
         )
-    if initial_state is not None and initial_state.shape != expected_state_shape:
+    if initial_state is not None and (
+        (not use_state_indices and initial_state.shape != expected_state_shape)
+        or (use_state_indices and tuple(initial_state.shape[1:]) != expected_state_shape[1:])
+    ):
         raise RuntimeError(
-            f"initial_state must have shape {expected_state_shape}, got {tuple(initial_state.shape)}"
+            f"initial_state must have shape "
+            f"{('[N_pool]' if use_state_indices else f'[{num_seqs}]')} + {expected_state_shape[1:]}, "
+            f"got {tuple(initial_state.shape)}"
+        )
+    if use_state_indices and (
+        state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+    ):
+        raise RuntimeError(
+            f"state_indices must have shape {(num_seqs,)} and dtype int32"
         )
     if d != 128:
         raise RuntimeError(f"CPDeltaRuleSm100 only supports D=128, got {d}")
@@ -935,11 +1006,13 @@ def cp_delta_rule_dsl_sm100(
         ("alpha", alpha),
         ("beta", beta),
         ("o", o),
-        ("state", state),
-        ("initial_state", initial_state),
+        ("state_indices", state_indices),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
+    for name, tensor in (("state", state), ("initial_state", initial_state)):
+        if tensor is not None and tensor.stride()[1:] != (d * d, d, 1):
+            raise RuntimeError(f"{name} must be contiguous in its inner [H, V, K] modes")
 
     with torch.cuda.nvtx.range("cp_delta_rule_sm100"):
         t = cp_delta_rule_t_precompute_dsl_sm100(
@@ -965,6 +1038,14 @@ def cp_delta_rule_dsl_sm100(
             _device=device,
             _stream=stream,
         )
+        initial_state_workspace = None
+        if initial_state is not None:
+            initial_state_workspace = _get_cp_workspace(
+                "gdn_cp_sm100_initial_state",
+                (num_seqs, num_sab_heads, d, d),
+                torch.float32,
+                device,
+            )
         fixed_state = cp_delta_rule_fixup_dsl_sm100(
             local_transfer,
             local_state,
@@ -973,6 +1054,8 @@ def cp_delta_rule_dsl_sm100(
             cp_chunk_len=cp_chunk_len,
             initial_state=initial_state,
             output_state=state,
+            state_indices=state_indices,
+            initial_state_workspace=initial_state_workspace,
             _skip_check=True,
             _device=device,
             _stream=stream,
@@ -990,7 +1073,7 @@ def cp_delta_rule_dsl_sm100(
             total_seqlen,
             cp_chunk_len=cp_chunk_len,
             max_seqlen=max_seqlen,
-            initial_state=initial_state,
+            initial_state=initial_state_workspace,
             _skip_check=True,
             _device=device,
             _stream=stream,

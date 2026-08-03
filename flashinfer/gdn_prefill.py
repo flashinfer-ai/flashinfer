@@ -59,6 +59,7 @@ def _cp_delta_rule_rejection_reason(
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
 ) -> Optional[str]:
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
@@ -94,12 +95,20 @@ def _cp_delta_rule_rejection_reason(
         ("k", k),
         ("v", v),
         ("output", output),
-        ("initial_state", initial_state),
     ):
         if tensor is None:
             continue
         if not tensor.is_contiguous():
             return f"CP delta rule requires {name} to be contiguous"
+    if initial_state is not None:
+        if state_indices is None and not initial_state.is_contiguous():
+            return "CP delta rule requires initial_state to be contiguous"
+        if state_indices is not None and initial_state.stride()[1:] != (
+            initial_state.shape[2] * initial_state.shape[3],
+            initial_state.shape[3],
+            1,
+        ):
+            return "CP delta rule requires initial_state to be contiguous in [H, V, K]"
     return None
 
 
@@ -356,7 +365,7 @@ def chunk_gated_delta_rule(
         # CuTe-DSL kernel. Reject it on every other dispatch path (SM90, SM120,
         # or CP) rather than silently ignoring it and reading/writing the state
         # in packed, sequence-ordered layout.
-        if _arch_major != 10 or will_use_cp:
+        if _arch_major != 10:
             raise NotImplementedError(
                 "state_indices is only supported on the SM100/SM103 GDN prefill "
                 f"kernel (non-CP); got compute-capability major {_arch_major}, "
@@ -384,6 +393,7 @@ def chunk_gated_delta_rule(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            state_indices=state_indices,
         )
         if cp_rejection_reason is not None:
             if use_cp is True:
@@ -432,6 +442,7 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
+                state_indices=state_indices,
                 max_seqlen=total_seq_len,
             )
             if output_final_state:
