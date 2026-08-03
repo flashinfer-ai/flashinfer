@@ -417,6 +417,11 @@ class _FunctionalMLARequest:
     cum_seq_lens_q: Optional[torch.Tensor]
     max_q_len: Optional[int]
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor]
+    sparse_mla_top_k_lens: Optional[torch.Tensor]
+    enable_dcp: bool
+    cp_world: int
+    cp_rank: int
+    causal_seqlens_kv_global: Optional[torch.Tensor]
 
 
 class _FunctionalMLARunner(TunableRunner):

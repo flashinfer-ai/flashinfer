@@ -51,6 +51,7 @@ __all__ = (
     "MLAHeadDimensions",
     "deepseek_mla_dimensions",
     "smaller_mla_dimensions",
+    "nope_mla_dimensions",
     "supported_mla_head_dimensions",
     "MLALayerDimensions",
     "supported_mla_layer_dimensions",
@@ -98,7 +99,18 @@ smaller_mla_dimensions = MLAHeadDimensions(
     kv_lora_rank=256,
 )
 
-supported_mla_head_dimensions = [deepseek_mla_dimensions, smaller_mla_dimensions]
+nope_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=256,
+    qk_rope_head_dim=0,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+supported_mla_head_dimensions = [
+    deepseek_mla_dimensions,
+    smaller_mla_dimensions,
+    nope_mla_dimensions,
+]
 
 
 @dataclass(frozen=True)
@@ -1124,6 +1136,7 @@ _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 # Re-export internal Batch MLA implementations through the package façade.
 from ._batch_mla._functional import (
+    _compute_mla_decode_buckets as _compute_mla_decode_buckets,
     _run_functional_mla,
     get_batch_mla_module as get_batch_mla_module,
     get_mla_module as get_mla_module,
@@ -1238,6 +1251,11 @@ def _batch_mla_paged_attention_impl(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if isinstance(bmm1_scale, torch.Tensor) and bmm1_scale.dtype != torch.float32:
         raise TypeError("bmm1_scale tensor must have dtype torch.float32")
@@ -1245,6 +1263,95 @@ def _batch_mla_paged_attention_impl(
         raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+    is_nope_mla = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if is_nope_mla and sparse_mla_top_k <= 0:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+        )
+    if is_nope_mla and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
+
+    if not isinstance(enable_dcp, bool):
+        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
+    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
+        raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
+    if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
+        raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+    if not enable_dcp:
+        nondefault_dcp_args = []
+        if cp_world != 1:
+            nondefault_dcp_args.append(f"cp_world={cp_world}")
+        if cp_rank != 0:
+            nondefault_dcp_args.append(f"cp_rank={cp_rank}")
+        if causal_seqlens_kv_global is not None:
+            nondefault_dcp_args.append("causal_seqlens_kv_global")
+        if nondefault_dcp_args:
+            raise ValueError(
+                "DCP arguments require enable_dcp=True; got "
+                + ", ".join(nondefault_dcp_args)
+            )
+    else:
+        if query.ndim != 4:
+            raise ValueError(
+                "DCP requires a dense query with shape "
+                "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
+            )
+        if not 0 <= cp_rank < cp_world:
+            raise ValueError(
+                "cp_rank must satisfy 0 <= cp_rank < cp_world, got "
+                f"cp_rank={cp_rank}, cp_world={cp_world}"
+            )
+        if backend not in ("auto", "cute-dsl", "cute-dsl-monolithic"):
+            raise ValueError(
+                "enable_dcp=True is only supported by backend='cute-dsl', got "
+                f"backend={backend!r}"
+            )
+        if not return_lse:
+            raise ValueError(
+                "enable_dcp=True requires return_lse=True so rank-local "
+                "attention states can be merged"
+            )
+        if sinks is not None:
+            raise ValueError("DCP cannot be combined with sinks")
+        if cum_seq_lens_q is not None or max_q_len is not None:
+            raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
+        if not isinstance(causal_seqlens_kv_global, torch.Tensor):
+            raise TypeError(
+                "causal_seqlens_kv_global must be a torch.Tensor, got "
+                f"{type(causal_seqlens_kv_global).__name__}"
+            )
+        check_shape_dtype_device(
+            causal_seqlens_kv_global,
+            (query.shape[0],),
+            torch.int32,
+            query.device,
+            "causal_seqlens_kv_global",
+        )
+        if not causal_seqlens_kv_global.is_contiguous():
+            raise ValueError("causal_seqlens_kv_global must be contiguous")
+        backend = "cute-dsl"
     if backend not in (
         "auto",
         "xqa",
@@ -1325,6 +1432,11 @@ def _batch_mla_paged_attention_impl(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
         multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
     return _run_functional_mla(request, backend)
 
@@ -1357,6 +1469,11 @@ def batch_mla_paged_attention(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -1485,6 +1602,20 @@ def batch_mla_paged_attention(
         alive for every launch or CUDA graph replay that uses it and be
         zero-initialized once. Autotune profiling uses runner-owned storage;
         this buffer is used only for the selected TRTLLM-GEN final request.
+    sparse_mla_top_k_lens : Optional[torch.Tensor] = None
+        Flattened active sparse top-k lengths, one INT32 value per query token.
+        Required by native ``kv_lora_rank=512, qk_rope_head_dim=0``
+        TRTLLM-GEN MLA.
+    enable_dcp : bool = False
+        Enable cyclic decode context parallelism in monolithic CuTe DSL MLA.
+        Requires ``return_lse=True`` so callers can merge rank-local states.
+    cp_world : int = 1
+        Context-parallel world size.
+    cp_rank : int = 0
+        Context-parallel rank for this launch.
+    causal_seqlens_kv_global : Optional[torch.Tensor] = None
+        Contiguous CUDA int32 tensor ``[batch_size]`` containing each request's
+        global exclusive causal KV bound. Required when DCP is enabled.
 
     Note
     ----
@@ -1534,6 +1665,11 @@ def batch_mla_paged_attention(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
         multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
 
 
@@ -1565,6 +1701,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
+    enable_dcp: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     warnings.warn(
         "trtllm_batch_decode_with_kv_cache_mla is deprecated; "
@@ -1599,6 +1740,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cum_seq_lens_q=cum_seq_lens_q,
         max_q_len=max_q_len,
         multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        enable_dcp=enable_dcp,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
     )
 
 
