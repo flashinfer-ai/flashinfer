@@ -6,7 +6,7 @@ from typing import Tuple
 
 import torch
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 TransformedMegaWeights = Tuple[
     Tuple[torch.Tensor, torch.Tensor],
@@ -71,7 +71,7 @@ def preprocess_mega_weights(
     """User fp4+scale (or bf16) weights → layout expected by ``fp8_fp4_mega_moe``."""
     import deep_gemm
 
-    if weights.w13_scale is None or weights.w2_scale is None:
+    if not isinstance(weights, PrequantizedMoEWeights):
         l1 = _transform_weight_sf(*_quantize_grouped_fp4(weights.w13))
         l2 = _transform_weight_sf(*_quantize_grouped_fp4(weights.w2))
     else:

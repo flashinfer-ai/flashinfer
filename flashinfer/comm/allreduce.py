@@ -60,6 +60,7 @@ from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
+from flashinfer.utils import is_confidential_compute
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
@@ -131,7 +132,9 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """
         super().__init__(tp_size, tp_rank)
 
-        # Call the actual workspace creation function
+        # NVIDIA Confidential Computing requires multicast-free IPC workspaces so needs to disable symmetric device memory
+        use_symm_dev_mem = not is_confidential_compute()
+
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -141,19 +144,32 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
-            use_symm_dev_mem=True,
+            use_symm_dev_mem=use_symm_dev_mem,
         )
 
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
-        workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
-            self._internal_workspace,
-        )
-        self.ipc_handles = workspace_tuple[0]
-        self.workspace_tensor = workspace_tuple[1]
-        self.mem_handles = workspace_tuple[2]
-        self.metadata = workspace_tuple[3]
+        if use_symm_dev_mem:
+            # use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles, metadata)
+            symm_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = symm_workspace_tuple[0]
+            self.workspace_tensor = symm_workspace_tuple[1]
+            self.mem_handles = symm_workspace_tuple[2]
+            self.metadata = symm_workspace_tuple[3]
+        else:
+            # use_symm_dev_mem=False: (ipc_handles, workspace_tensor, metadata)
+            ipc_workspace_tuple = cast(
+                Tuple[List[List[int]], torch.Tensor, dict],
+                self._internal_workspace,
+            )
+            self.ipc_handles = ipc_workspace_tuple[0]
+            self.workspace_tensor = ipc_workspace_tuple[1]
+            self.metadata = ipc_workspace_tuple[2]
+            # No symmetric-memory handles for the multicast-free IPC path.
+            self.mem_handles = []
 
     @property
     def backend(self) -> str:
@@ -486,6 +502,12 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
+        if is_confidential_compute():
+            raise ValueError(
+                "NVIDIA Confidential Computing is not supported by the mnnvl AllReduce fusion backend "
+                "since mnnvl backend requires NVLink multicast, which is unavailable under Confidential Computing. "
+                "Use backend='trtllm' instead."
+            )
         mapping = Mapping(
             world_size=world_size,
             rank=rank,

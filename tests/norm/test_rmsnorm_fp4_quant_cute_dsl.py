@@ -18,6 +18,14 @@ Unit tests for Fused RMSNorm + FP4 Quantization using CuTe-DSL backend.
 import pytest
 import torch
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(*torch.cuda.get_device_capability(0)),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
 from tests.test_helpers.utils_fp4 import cast_from_fp4
 

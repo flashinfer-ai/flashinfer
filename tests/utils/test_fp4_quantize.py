@@ -388,7 +388,15 @@ def _is_cute_dsl_available():
     try:
         from flashinfer.cute_dsl import is_cute_dsl_available
 
-        return is_cute_dsl_available()
+        if not is_cute_dsl_available():
+            return False
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+            return is_cute_dsl_arch_supported(*_torch.cuda.get_device_capability(0))
+        return True
     except ImportError:
         return False
 
@@ -1045,7 +1053,7 @@ def test_nvfp4_quantize_backend_parity(
     sf_layout: SfLayout,
     device: str,
 ) -> None:
-    """Test that CUDA and CuTe-DSL backends produce matching results for NVFP4."""
+    """Test backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
@@ -1067,6 +1075,13 @@ def test_nvfp4_quantize_backend_parity(
     quant_cute, scale_cute = nvfp4_quantize(
         x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
     )
+    quant_cute_host, scale_cute_host = nvfp4_quantize(
+        x, global_scale.item(), sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    # Prefer a host-side float while retaining the single-element tensor form.
+    torch.testing.assert_close(quant_cute_host, quant_cute, rtol=0, atol=0)
+    torch.testing.assert_close(scale_cute_host, scale_cute, rtol=0, atol=0)
 
     # Shape should match
     assert quant_cuda.shape == quant_cute.shape, (
@@ -1140,6 +1155,32 @@ def test_nvfp4_quantize_backend_parity(
             atol=0,
             msg=error_msg,
         )
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_cute_dsl_device_scale_cuda_graph(device: str) -> None:
+    """Device-side global scales must not introduce a host sync during capture."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    x = torch.randn((128, 64), dtype=torch.bfloat16, device=device)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Warm the JIT cache before capture.
+    quant_ref, scale_ref = nvfp4_quantize(x, global_scale, backend="cute-dsl")
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        quant_graph, scale_graph = nvfp4_quantize(x, global_scale, backend="cute-dsl")
+    graph.replay()
+
+    torch.testing.assert_close(quant_graph, quant_ref, rtol=0, atol=0)
+    torch.testing.assert_close(scale_graph, scale_ref, rtol=0, atol=0)
 
 
 NVFP4_FP8_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024)]
@@ -1224,7 +1265,7 @@ def test_nvfp4_quantize_fp8_backend_parity(
     sf_layout: SfLayout,
     device: str,
 ) -> None:
-    """Test CUDA and CuTe-DSL backends produce matching results for FP8 input."""
+    """Test FP8 backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
@@ -1246,6 +1287,12 @@ def test_nvfp4_quantize_fp8_backend_parity(
     quant_cute, scale_cute = nvfp4_quantize(
         x_fp8, global_scale, sfLayout=sf_layout, backend="cute-dsl"
     )
+    quant_cute_host, scale_cute_host = nvfp4_quantize(
+        x_fp8, global_scale.item(), sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    torch.testing.assert_close(quant_cute_host, quant_cute, rtol=0, atol=0)
+    torch.testing.assert_close(scale_cute_host, scale_cute, rtol=0, atol=0)
 
     assert quant_cuda.shape == quant_cute.shape, (
         f"Quantized output shape mismatch for FP8 input, {sf_layout.name}"
@@ -1294,7 +1341,7 @@ def test_nvfp4_quantize_tma_backend_parity(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test that TMA-based CuTe-DSL kernel matches the CUDA backend for large problems."""
+    """Test TMA backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
@@ -1319,6 +1366,12 @@ def test_nvfp4_quantize_tma_backend_parity(
     quant_cute, scale_cute = nvfp4_quantize(
         x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
     )
+    quant_cute_host, scale_cute_host = nvfp4_quantize(
+        x, global_scale.item(), sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    torch.testing.assert_close(quant_cute_host, quant_cute, rtol=0, atol=0)
+    torch.testing.assert_close(scale_cute_host, scale_cute, rtol=0, atol=0)
 
     assert quant_cuda.shape == quant_cute.shape, (
         f"TMA quantized output shape mismatch for {sf_layout.name}"

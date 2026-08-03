@@ -72,6 +72,7 @@ NVFP4_NAME_BASELINE = {
     "disable_fp4_quant_fast_math": False,
     "silu_and_mul": False,
     "nvfp4_4over6_config": None,
+    "global_scale_is_tensor": True,
 }
 NVFP4_NAME_PERTURBED = {
     "variant": "linear",
@@ -82,6 +83,7 @@ NVFP4_NAME_PERTURBED = {
     "disable_fp4_quant_fast_math": True,
     "silu_and_mul": True,
     "nvfp4_4over6_config": NVFP44Over6Config(),
+    "global_scale_is_tensor": False,
 }
 
 

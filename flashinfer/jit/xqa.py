@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
+
 from . import env as jit_env
 import torch
 from .utils import filename_safe_dtype_map
@@ -31,6 +33,23 @@ xqa_nvcc_flags = [
 ]
 
 
+def swap_ab_eligible(q_seq_len: int, head_group_ratio: int) -> bool:
+    """True when the shape fits the SM90 kernel's SPEC_Q_SEQ_LEN (SWAP_AB)
+    specialization."""
+    return q_seq_len * head_group_ratio <= 32
+
+
+@functools.cache
+def _has_sm90_target() -> bool:
+    return any(major == 9 for major, _ in CompilationContext().TARGET_CUDA_ARCHS)
+
+
+def ragged_q_changes_build(q_seq_len: int, head_group_ratio: int) -> bool:
+    """True when ragged Q changes the build: it suppresses SPEC_Q_SEQ_LEN
+    (SWAP_AB), which only the SM90 kernel uses."""
+    return swap_ab_eligible(q_seq_len, head_group_ratio) and _has_sm90_target()
+
+
 def gen_xqa_module(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -40,6 +59,7 @@ def gen_xqa_module(
     use_sliding_window: bool,
     output_dtype: torch.dtype,
     q_seq_len: int = 1,
+    use_ragged_q: bool = False,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -85,17 +105,28 @@ def gen_xqa_module(
 
     if q_seq_len > 1:
         use_spec_dec = True
-        if q_seq_len * head_group_ratio <= 32:
+        # The SPEC_Q_SEQ_LEN (SWAP_AB) specialization requires a uniform q
+        # length across the batch, so it must be skipped for ragged Q.
+        ragged_changes_flags = use_ragged_q and ragged_q_changes_build(
+            q_seq_len, head_group_ratio
+        )
+        if swap_ab_eligible(q_seq_len, head_group_ratio) and not ragged_changes_flags:
             flag_spec_dec = ["-DSPEC_DEC=1", f"-DSPEC_Q_SEQ_LEN={q_seq_len}"]
         else:
             flag_spec_dec = ["-DSPEC_DEC=1"]
+        # The xqa() mask API indexes draft tokens by row position (linear
+        # chains only); non-tree mode enables per-row sliding-window masking.
+        flag_spec_dec.append("-DIS_SPEC_DEC_TREE=0")
     else:
+        if use_ragged_q:
+            raise ValueError("use_ragged_q requires q_seq_len > 1 (speculative decode)")
         flag_spec_dec = ["-DSPEC_DEC=0"]
         use_spec_dec = False
+        ragged_changes_flags = False
 
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 12]
+        supported_major_versions=[9, 10, 12], map_sm107_to_100f=True
     )
     sm_nvcc_flags = nvcc_flags
 
@@ -107,18 +138,18 @@ def gen_xqa_module(
         jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
     ]
 
-    target_archs = compilation_context.TARGET_CUDA_ARCHS
-
-    has_sm90 = any(major == 9 for major, minor in target_archs)
-    if has_sm90:
+    if _has_sm90_target():
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
         flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
     else:
         flag_sm90_mha = ["-DUSE_SM90_MHA=0"]
 
+    # Suffix the URI only when ragged Q actually changes the compile flags
+    # (i.e. it suppressed the SPEC_Q_SEQ_LEN specialization above).
+    ragged_suffix = "_ragged_q" if ragged_changes_flags else ""
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}{ragged_suffix}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
