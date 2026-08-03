@@ -78,12 +78,18 @@ def normalize_requirement(requirement: str) -> tuple[str, str]:
 
 
 def read_provider_manifest(wheel: Wheel, provider: str) -> tuple[dict[str, Any], str]:
-    package_prefix = f"flashinfer_jit_cache/providers/{provider}"
-    manifest_path = f"{package_prefix}/manifest.json"
+    package_suffix = f"flashinfer_jit_cache/providers/{provider}/manifest.json"
+    manifest_paths = [
+        path
+        for path in wheel.contents
+        if path == package_suffix or path.endswith(f".data/purelib/{package_suffix}")
+    ]
     require(
-        manifest_path in wheel.contents,
-        f"{wheel.path.name}: missing {manifest_path}",
+        len(manifest_paths) == 1,
+        f"{wheel.path.name}: expected one {package_suffix}, found {manifest_paths}",
     )
+    manifest_path = manifest_paths[0]
+    package_prefix = manifest_path.removesuffix("/manifest.json")
     with zipfile.ZipFile(wheel.path) as archive:
         manifest = json.loads(archive.read(manifest_path))
     return manifest, package_prefix
