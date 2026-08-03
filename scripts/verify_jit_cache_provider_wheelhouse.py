@@ -222,6 +222,12 @@ def inspect_cuda_architectures(
                     capture_output=True,
                     text=True,
                 )
+                if (
+                    process.returncode != 0
+                    and "does not contain device code" in process.stderr
+                ):
+                    result[module] = []
+                    continue
                 require(
                     process.returncode == 0,
                     f"cuobjdump failed for {module}: {process.stderr.strip()}",
