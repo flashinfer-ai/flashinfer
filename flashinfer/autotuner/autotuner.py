@@ -591,6 +591,16 @@ class TunableRunner(ABC):
         autotuner would synthesize for the same profile (i.e., depend only
         on dtype, is-None flags, or scalar-argument values -- not on
         per-tensor content).
+
+        Every element must also have a **stable ``str()`` across processes**.
+        Hashability alone is not sufficient: ``ProfilingCacheKey.file_key``
+        renders this tuple with ``str()`` to key the on-disk cache, so an
+        element whose repr embeds an object address (or otherwise varies per
+        run) produces a key that never matches on reload. Prefer ints, floats,
+        bools, strs, enum ``.name``/``.value``, and tuples of those; avoid bare
+        objects, and note that ``file_key`` intentionally excludes
+        ``runner_hash``, so anything the persisted cache must distinguish has
+        to appear here rather than only in ``__hash__``.
         """
         return ()
 
