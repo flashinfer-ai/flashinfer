@@ -65,10 +65,10 @@ def recurrent_kda(
     This is the public API layer for the CuTe DSL implementation in
     ``flashinfer.kda_kernels.recurrent_kda``. It supports single-token decode,
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
-    gate modes as the backend implementation. On NVIDIA B200, the exact
-    FlashKDA-compatible subset of ordinary multi-token prefill is dispatched to
-    frozen SM100a kernels. All existing decode and speculative-decode calls
-    retain the CuTe DSL backend.
+    gate modes as the backend implementation. On SM100a (B200/GB200) and
+    SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
+    prefill is dispatched to the corresponding frozen SM100-family kernel. All
+    existing decode and speculative-decode calls retain the CuTe DSL backend.
 
     Args:
         q (torch.Tensor):
@@ -157,11 +157,11 @@ def recurrent_kda(
             timed launches. Fixed-layout prefill and decode calls must leave it
             as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
-            Caller-owned workspace for the frozen B200 prefill backend. It is
-            optional for eager execution and required for CUDA graph capture.
-            Warm it eagerly with the exact tensors on the capture stream before
-            capture. Use one workspace per captured ``recurrent_kda``
-            invocation.
+            Caller-owned workspace for the frozen SM100-family prefill backend.
+            It is optional for eager execution and required for CUDA graph
+            capture. Warm it eagerly with the exact tensors on the capture
+            stream before capture. Use one workspace per captured
+            ``recurrent_kda`` invocation.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -220,12 +220,12 @@ def recurrent_kda(
     if prefill_workspace is not None:
         raise ValueError(
             "prefill_workspace is only supported by eligible ordinary "
-            "prefill on the frozen B200 FlashKDA backend"
+            "prefill on the frozen SM100-family FlashKDA backend"
         )
     if seq_order is not None:
         raise ValueError(
             "seq_order is only supported by eligible packed ordinary prefill "
-            "on the frozen B200 FlashKDA backend"
+            "on the frozen SM100-family FlashKDA backend"
         )
     if _kda_decode._run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
