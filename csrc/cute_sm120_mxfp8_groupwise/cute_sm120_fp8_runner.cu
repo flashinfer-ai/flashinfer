@@ -82,10 +82,45 @@ static int select_fp8_fused_moe_tile_m(int total_rows, int shape_n, int num_expe
   if (m128_waves < m64_waves) {
     return 128;
   }
-  if (m128_waves > m64_waves && m64_tiles <= int64_t(num_sms) * 8) {
+  if (m128_waves > m64_waves) {
     return 64;
   }
   return 128;
+}
+
+static int select_plain_m64_or_m128(int m_per_expert, int shape_n, int num_experts, int num_sms) {
+  constexpr int kPlainTileOverhead = 48;
+  auto cost = [&](int tile_m) {
+    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
+    int64_t num_n = (int64_t(shape_n) + 127) / 128;
+    int64_t num_tiles = int64_t(num_experts) * num_m * num_n;
+    int64_t num_waves = (num_tiles + num_sms - 1) / num_sms;
+    return num_waves * int64_t(tile_m + kPlainTileOverhead);
+  };
+  return (cost(64) < cost(128)) ? 64 : 128;
+}
+
+static int select_fp8_plain_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
+                                       int num_sms) {
+  int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
+  auto tile_count = [&](int tile_m, int tile_n) {
+    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
+    int64_t num_n = (int64_t(shape_n) + tile_n - 1) / tile_n;
+    return int64_t(num_experts) * num_m * num_n;
+  };
+  int64_t swapab_tiles = tile_count(8, 128);
+  int64_t m32_tiles = tile_count(32, 128);
+  if (shape_n % 128 == 0 &&
+      (m_per_expert <= 8 || (m32_tiles < num_sms / 2 && swapab_tiles <= num_sms))) {
+    return 8;
+  }
+  if (m_per_expert <= 32) {
+    return 32;
+  }
+  if (shape_k <= 2048) {
+    return (m_per_expert < 192) ? 64 : 128;
+  }
+  return select_plain_m64_or_m128(m_per_expert, shape_n, num_experts, num_sms);
 }
 
 static int select_fp8_flat_tile_m(int shape_m, int shape_n, int num_groups, int num_sms) {
@@ -372,26 +407,16 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
   auto ptr_D = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
   int num_sms = sm120_blockscaling::get_num_sms();
-  int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
-
-  auto tile_count = [&](int tile_m, int tile_n) {
-    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
-    int64_t num_n = (int64_t(shape_n) + tile_n - 1) / tile_n;
-    return int64_t(num_experts) * num_m * num_n;
-  };
-  int64_t swapab_tiles = tile_count(8, 128);
-  int64_t m32_tiles = tile_count(32, 128);
-
-  if (shape_n % 128 == 0 &&
-      (m_per_expert <= 8 || (m32_tiles < num_sms / 2 && swapab_tiles <= num_sms))) {
+  int tile_m = select_fp8_plain_moe_tile_m(total_rows, shape_n, shape_k, num_experts, num_sms);
+  if (tile_m == 8) {
     sm120_blockscaling::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                       total_rows, shape_n, shape_k, num_experts,
                                                       token_offset, num_sms, stream);
-  } else if (m_per_expert <= 32) {
+  } else if (tile_m == 32) {
     sm120_blockscaling::launch_moe_gemm<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
                                                 shape_n, shape_k, num_experts, token_offset,
                                                 num_sms, stream);
-  } else if (m_per_expert < 96 || (m_per_expert < 192 && shape_k <= 2048)) {
+  } else if (tile_m == 64) {
     sm120_blockscaling::launch_moe_gemm<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
                                                 shape_n, shape_k, num_experts, token_offset,
                                                 num_sms, stream);
