@@ -100,6 +100,52 @@ def test_mm_bf16(
     assert cos_sim > 0.99
 
 
+@pytest.mark.parametrize("epilogue_subtile", [False, True])
+@pytest.mark.parametrize("beta", [0.0, 0.5])
+def test_gemm_alpha_beta_cutile_epilogue(beta, epilogue_subtile):
+    """beta=0 must ignore a NaN-poisoned C; beta!=0 must still accumulate C."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutile", cc_num):
+        pytest.skip("cuTile backend not supported on current compute capability.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+    if epilogue_subtile and cc_num != 100:
+        pytest.skip("Epilogue subtiling is only validated on SM100.")
+
+    from flashinfer.gemm.kernels.cutile.mm_bf16_cutile import (
+        _gemm_alpha_beta_cutile,
+    )
+
+    torch.manual_seed(42)
+    a = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    if beta == 0.0:
+        c = torch.full((128, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
+    else:
+        # Make the C contribution dominate so accidentally dropping the C load
+        # cannot still pass a loose similarity check.
+        c = torch.full((128, 128), 2.0, device="cuda", dtype=torch.bfloat16)
+    c_before = c.clone()
+    reference = torch.addmm(c_before, a, b.T, beta=beta, alpha=0.5)
+
+    result = _gemm_alpha_beta_cutile(
+        a,
+        b,
+        c,
+        trans_a=False,
+        trans_b=True,
+        alpha=0.5,
+        beta=beta,
+        use_autotune=False,
+        kernel_configs={"EPILOGUE_SUBTILE": int(epilogue_subtile)},
+    )
+
+    assert result.data_ptr() == c.data_ptr()
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result, reference, rtol=0.02, atol=0.02)
+
+
 def test_mm_bf16_cutile_rejects_bias_and_pdl():
     """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
 
