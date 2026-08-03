@@ -158,6 +158,35 @@ def test_bmm_mxfp8_cudnn_scale_length_check_has_aligned_size_blind_spot():
     )
 
 
+def test_bmm_mxfp8_common_check_accepts_rank_preserving_scales():
+    a = torch.empty((2, 17, 128), dtype=torch.float8_e4m3fn)
+    b = torch.empty((2, 128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((2, 128, 4), dtype=torch.uint8)
+
+    assert gemm_base._check_bmm_mxfp8_problem_size(  # pyright: ignore[reportPrivateUsage]
+        a,
+        b,
+        scale,
+        scale,
+        torch.bfloat16,
+        backend="cutlass",
+    )
+
+
+@pytest.mark.parametrize(("m", "legacy_len"), [(17, 512), (100, 1024)])
+def test_bmm_mxfp8_cutlass_rejects_legacy_flattened_scales(m, legacy_len):
+    legacy_scale = torch.empty((legacy_len,), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="legacy combined-batch swizzled layout"):
+        gemm_base._prepare_bmm_mxfp8_cutlass_scale(  # pyright: ignore[reportPrivateUsage]
+            legacy_scale,
+            batch_size=2,
+            rows=m,
+            cols=128,
+            name="A_scale",
+        )
+
+
 @pytest.mark.parametrize("m", [130, 200, 257, 384, 1000])
 def test_bmm_mxfp8_cudnn_dynamic_m(m: int):
     if get_compute_capability(torch.device("cuda"))[0] != 10:
