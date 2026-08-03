@@ -206,6 +206,7 @@ def _gemm1_oa_flags_from_kwargs(kwargs: dict) -> dict[str, bool]:
 def _gemm_config_flags_from_static_extras(runner) -> dict[str, bool]:
     static_extras = dict(getattr(runner, "_cache_key_static_extras", ()))
     return {
+        "enable_pdl": bool(static_extras.get("enable_pdl", False)),
         "fc1_has_bias": bool(static_extras.get("gemm1_bias", False)),
         "fc2_has_bias": bool(static_extras.get("gemm2_bias", False)),
         "has_gemm1_alpha": bool(static_extras.get("gemm1_alpha", False)),
@@ -1088,6 +1089,8 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     valid_tactics_dict: dict = {}
 
+    _MXFP4_MXFP8_CONFIG_VERSION = 1
+
     def __init__(
         self,
         moe_op,
@@ -1115,6 +1118,15 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            *super().get_cache_key_extras(inputs),
+            (
+                "prims_ts_mxfp4_mxfp8_config_version",
+                self._MXFP4_MXFP8_CONFIG_VERSION,
+            ),
+        )
 
     def _make_tuning_config(
         self,

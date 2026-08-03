@@ -19,17 +19,25 @@ import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
     SUPPORTED_MXFP4_BF16_TILE_N,
+    _DType,
     _expanded_prims_ts_json_configs,
     _expanded_trtllm_gen_json_configs,
+    _json_config_by_global_index,
+    _make_json_moe_config_pair,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+    valid_prims_ts_mxfp8_mxfp8_moe_tactics,
 )
-from flashinfer.prims_ts.moe.runner import _filter_valid_moe_tactics
+from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.moe import support
+from flashinfer.prims_ts.moe.runner import (
+    PrimsTsMxfp4Mxfp8MoERunner,
+    _filter_valid_moe_tactics,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -74,6 +82,44 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
             continue
         return pair
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
+
+_MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT = "MxFp4xMxFp8_FC1_LowLatencyFastDrain"
+
+
+def _mxfp4_mxfp8_json_pair(
+    tactic,
+    *,
+    enable_pdl=False,
+    activation_type=int(ActivationType.Swiglu),
+    dtype_a=int(_DType.MXE2M1),
+):
+    return _make_json_moe_config_pair(
+        tile_n=tactic[0],
+        moe_config_index=tactic[1],
+        activation_type=activation_type,
+        dtype_a=dtype_a,
+        dtype_b=int(_DType.MXE4M3),
+        fc1_dtype_c=int(_DType.MXE4M3),
+        fc2_dtype_c=int(_DType.BF16),
+        dtype_label=("MXFP4xMXFP8" if dtype_a == int(_DType.MXE2M1) else "MXFP8xMXFP8"),
+        enable_pdl=enable_pdl,
+    )
+
+
+def _fc1_comments(tactics, **pair_kwargs):
+    return {
+        _json_config_by_global_index(
+            _mxfp4_mxfp8_json_pair(tactic, **pair_kwargs).fc1.prims_ts_gemm_config_index
+        ).comment
+        for tactic in tactics
+    }
+
+
+def _flat_moe_inputs(num_tokens, hidden_size=3072):
+    inputs = [None] * 8
+    inputs[4] = torch.empty((num_tokens, hidden_size), device="meta")
+    return inputs
+
 
 def test_config_mapper_loads_local_prims_ts_json():
     assert _expanded_trtllm_gen_json_configs()
@@ -285,6 +331,150 @@ def test_config_mapper_exposes_gpt_oss_mid_batch_fc2(num_tokens, tile_n, num_sta
         return
 
     pytest.fail(f"GPT-OSS mid-batch MXFP4xMXFP8 FC2 tile-N{tile_n} config is missing")
+
+
+@pytest.mark.parametrize("num_tokens", [256, 1024])
+def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
+    kwargs = dict(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=num_tokens,
+        top_k=4,
+        num_local_experts=128,
+        enable_pdl=True,
+    )
+    tactics = valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs)
+    pairs = [
+        _mxfp4_mxfp8_json_pair(tactic, enable_pdl=True)
+        for tactic in tactics
+        if tactic[0] == 32
+    ]
+    fast_drain_pairs = [
+        pair
+        for pair in pairs
+        if _json_config_by_global_index(
+            pair.fc1.prims_ts_gemm_config_index
+        ).comment
+        == _MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT
+    ]
+
+    assert fast_drain_pairs
+    assert len({pair.fc2.prims_ts_gemm_config_index for pair in fast_drain_pairs}) > 1
+    fc1 = fast_drain_pairs[0].fc1.cfg.kwargs
+    assert fc1["tile_n"] == 32
+    assert fc1["tile_k"] == 256
+    assert fc1["cluster_m"] == 2
+    assert fc1["mma_m"] == 256
+    assert fc1["tile_scheduler"] == 1
+    assert fc1["route_act"] == 1
+    assert fc1["route_sfs_act"] == 2
+    assert fc1["use_clc_fast_drain"] == 1
+    assert fc1["use_work_throttle"] == 0
+    assert fc1["use_pdl"] == 1
+    assert all(
+        fc1[field] == 5
+        for field in (
+            "num_stages_a",
+            "num_stages_b",
+            "num_stages_smem_sfa",
+            "num_stages_smem_sfb",
+            "num_stages_tmem_sfa",
+            "num_stages_tmem_sfb",
+        )
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 256])
+def test_gpt_oss_legacy_tactic_maps_to_expected_configs(num_tokens):
+    tactics = valid_prims_ts_mxfp4_mxfp8_moe_tactics(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=num_tokens,
+        top_k=4,
+        num_local_experts=128,
+        enable_pdl=True,
+    )
+
+    assert [32, 155] in tactics
+    pair = _mxfp4_mxfp8_json_pair([32, 155], enable_pdl=True)
+    fc1_json = _json_config_by_global_index(pair.fc1.prims_ts_gemm_config_index)
+    fc2_json = _json_config_by_global_index(pair.fc2.prims_ts_gemm_config_index)
+    assert fc1_json.comment == "MxFp4xMxFp8_FC1_LowLatency"
+    assert fc2_json.comment == "MxFp4xMxFp8_FC2_GptOssMidBatch"
+    assert pair.fc1.cfg.kwargs["use_clc_fast_drain"] == 0
+
+
+def test_mxfp4_mxfp8_fast_drain_fc1_is_not_visible_to_mxfp8_moe():
+    tactics = valid_prims_ts_mxfp8_mxfp8_moe_tactics(
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=1024,
+        top_k=4,
+        num_local_experts=128,
+        enable_pdl=True,
+    )
+
+    assert _MXFP4_MXFP8_FAST_DRAIN_FC1_COMMENT not in _fc1_comments(
+        tactics,
+        activation_type=int(ActivationType.Swiglu),
+        dtype_a=int(_DType.MXE4M3),
+        enable_pdl=True,
+    )
+
+
+def test_mxfp4_mxfp8_runner_passes_generic_flags_to_tactic_mapper(monkeypatch):
+    captured = {}
+
+    def _capture_valid_tactics(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        runner_module,
+        "valid_prims_ts_mxfp4_mxfp8_moe_tactics",
+        _capture_valid_tactics,
+    )
+    monkeypatch.setattr(PrimsTsMxfp4Mxfp8MoERunner, "valid_tactics_dict", {})
+    runner = PrimsTsMxfp4Mxfp8MoERunner(
+        None,
+        top_k=4,
+        num_local_experts=128,
+        hidden_size=3072,
+        intermediate_size=3072,
+    )
+    runner.set_cache_key_static_extras(enable_pdl=True)
+    inputs = _flat_moe_inputs(1024)
+
+    assert runner.get_valid_tactics(inputs, None) == [-1]
+    assert captured["enable_pdl"] is True
+    assert "hidden_size" not in captured
+    assert "intermediate_size" not in captured
+
+
+def test_mxfp4_mxfp8_has_config_set_cache_discriminator():
+    discriminator = ("prims_ts_mxfp4_mxfp8_config_version", 1)
+    runner = PrimsTsMxfp4Mxfp8MoERunner(
+        None,
+        top_k=4,
+        num_local_experts=128,
+        hidden_size=3072,
+        intermediate_size=3072,
+    )
+    runner.set_cache_key_static_extras(enable_pdl=True)
+
+    target_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
+    assert discriminator in target_key
+
+    bs256_key = runner.get_cache_key_extras(_flat_moe_inputs(256))
+    assert discriminator in bs256_key
+
+    runner.set_cache_key_static_extras(enable_pdl=False)
+    non_pdl_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
+    assert discriminator in non_pdl_key
+
+    runner.set_cache_key_static_extras(
+        enable_pdl=True,
+        gemm1_bias=torch.empty((), device="meta"),
+    )
+    biased_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
+    assert discriminator in biased_key
 
 
 def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
