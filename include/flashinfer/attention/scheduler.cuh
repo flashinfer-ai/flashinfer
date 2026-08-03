@@ -1349,10 +1349,21 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         cluster_kv_head_idx(num_clusters, std::vector<IdType>()),
         cluster_partial_indptr(num_clusters, std::vector<IdType>());
 
+    // LPT scheduling: collect work items in qo order (for correct partial_o offset assignment
+    // and merge_indptr construction), then sort descending by cost before cluster assignment.
+    struct WorkItem {
+      IdType q_indptr, kv_indptr;
+      int partial_indptr;
+      int q_len, kv_len, q_start, kv_start, kv_end;
+      float cost;
+    };
+    std::vector<WorkItem> work_items;
+    work_items.reserve(max_total_num_works);
+
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
-      // NOTE (Yilong): this ordering correspoinds to the layout of reduction kernel
+      // NOTE (Yilong): this ordering corresponds to the layout of reduction kernel
       for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
         int remaining_len = causal
                                 ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
@@ -1365,23 +1376,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         bool zero_kv_len = (remaining_len == 0);
         while (remaining_len > 0 || zero_kv_len) {
           int actual_len = std::min(remaining_len, kv_len_limit);
-          for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-            auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
-            cluster_cost_heap.insert(
-                {cluster_idx, accum_cost + cost_function(cluster_tile_q, actual_len)});
-            cluster_q_len[cluster_idx].push_back(qo_len);
-            cluster_kv_len[cluster_idx].push_back(kv_len);
-            cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
-            cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
-
-            // use kv_chunk to rematerize num_kv_tiles and kv_tile_idx
-            cluster_partial_indptr[cluster_idx].push_back(partial_o_nnz);
-
-            cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
-            cluster_kv_start[cluster_idx].push_back(kv_start);
-            cluster_kv_end[cluster_idx].push_back(kv_start + actual_len);
-            cluster_kv_head_idx[cluster_idx].push_back(kv_head_idx);
-          }
+          // use kv_chunk to rematerialize num_kv_tiles and kv_tile_idx
+          work_items.push_back({qo_indptr_h[i], kv_indptr_h[i], partial_o_nnz, qo_len, kv_len,
+                                qo_tile_idx * cluster_tile_q, kv_start, kv_start + actual_len,
+                                cost_function(cluster_tile_q, actual_len)});
           remaining_len -= actual_len;
           zero_kv_len = (remaining_len == 0);
           kv_start += actual_len;
@@ -1401,6 +1399,27 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
           }
           partial_o_nnz += row_tile_size * num_kv_tiles;
         }
+      }
+    }
+
+    // LPT: sort work items by descending cost so the heaviest tiles are scheduled first,
+    // giving the min-heap a better chance to balance load across clusters.
+    std::sort(work_items.begin(), work_items.end(),
+              [](const WorkItem& a, const WorkItem& b) { return a.cost > b.cost; });
+
+    for (const auto& item : work_items) {
+      for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+        auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
+        cluster_cost_heap.insert({cluster_idx, accum_cost + item.cost});
+        cluster_q_indptr[cluster_idx].push_back(item.q_indptr);
+        cluster_kv_indptr[cluster_idx].push_back(item.kv_indptr);
+        cluster_partial_indptr[cluster_idx].push_back(item.partial_indptr);
+        cluster_q_len[cluster_idx].push_back(item.q_len);
+        cluster_kv_len[cluster_idx].push_back(item.kv_len);
+        cluster_q_start[cluster_idx].push_back(item.q_start);
+        cluster_kv_start[cluster_idx].push_back(item.kv_start);
+        cluster_kv_end[cluster_idx].push_back(item.kv_end);
+        cluster_kv_head_idx[cluster_idx].push_back(kv_head_idx);
       }
     }
 
