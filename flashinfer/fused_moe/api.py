@@ -230,10 +230,8 @@ class ExecutionConfig:
 # claiming them here makes the batched-GEMM runner abort at dispatch (#4107).
 _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 
-# The pinned Rubin artifact contains SM107 FP8 cubins, but unified FP8 remains
-# gated to the validated SM100 family until SM107 runtime correctness is covered.
-# The outer JIT module compiles for major 12 as well, but those cubins fail at
-# runtime on SM120/121.
+# The FP8 kernels are validated on the SM100 family only — the outer JIT module
+# compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
 

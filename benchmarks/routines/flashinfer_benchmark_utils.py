@@ -566,12 +566,11 @@ routine_cc_to_supported_backends = {
         "12.0": ["b12x"],
         "12.1": ["b12x"],
     },
-    # MoELayer NVFP4: CuteDSL + TRTLLM compete on SM100/SM103; SM107 uses
-    # the TRTLLM routed runner only.
+    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
+    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
-        "10.7": ["unified"],
     },
     # NORM
     "rmsnorm": {
