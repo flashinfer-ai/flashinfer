@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,24 @@ TIMING_HEADER = [
     "unit_id",
     "shard_index",
     "attempt_id",
+]
+
+SOURCE_SUMMARY_HEADER = [
+    "shard_index",
+    "source_file",
+    "status",
+    "planned_nodes",
+    "finalized_nodes",
+    "passed",
+    "failed",
+    "skipped",
+    "unknown",
+    "pending_nodes",
+    "process_seconds",
+    "max_host_rss_mib",
+    "max_gpu_memory_mib",
+    "memory_samples",
+    "partial_resources",
 ]
 
 
@@ -71,6 +90,36 @@ class RunSummary(TypedDict):
     capacity: CapacityMetrics
     attempts: list[AttemptSummary]
     infrastructure_errors: list[str]
+
+
+@dataclass
+class _SourceSummary:
+    shard_index: int
+    source_file: str
+    planned_nodes: int = 0
+    finalized_nodes: int = 0
+    pending_nodes: int = 0
+    outcomes: Counter[str] = field(default_factory=Counter)
+    process_seconds: float = 0.0
+    has_process_timing: bool = False
+    max_host_rss_mib: float = 0.0
+    max_gpu_memory_mib: float = 0.0
+    memory_samples: int = 0
+    partial_resources: bool = False
+
+    @property
+    def status(self) -> str:
+        if self.pending_nodes:
+            if self.outcomes["failed"]:
+                return "failed-partial"
+            if self.outcomes["unknown"]:
+                return "unknown-partial"
+            return "no-result"
+        if self.outcomes["failed"]:
+            return "failed"
+        if self.outcomes["unknown"]:
+            return "unknown"
+        return "passed"
 
 
 def batch_directory(junit_dir: Path, unit: Unit) -> Path:
@@ -126,6 +175,17 @@ def _memory_samples(path: Path) -> list[dict[str, float]]:
     return samples
 
 
+def _process_seconds(path: Path) -> float | None:
+    try:
+        value = json.loads(_sidecar(path, ".meta.json").read_text(encoding="utf-8"))
+        launched_at = float(value["launched_at"])
+        exited_at = float(value["exited_at"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    duration = exited_at - launched_at
+    return duration if math.isfinite(duration) and duration >= 0 else None
+
+
 def _max_memory(samples: list[dict[str, float]]) -> tuple[float, float]:
     if not samples:
         return 0.0, 0.0
@@ -153,19 +213,35 @@ class _SummaryScan:
     shard_memory: dict[int, list[tuple[float, float]]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    sources: dict[tuple[int, str], _SourceSummary] = field(default_factory=dict)
 
     @classmethod
     def for_plan(cls, plan: Plan) -> _SummaryScan:
-        return cls(
+        scan = cls(
             shard_outcomes={
                 index: Counter() for index in range(plan.options.shard_count)
             }
         )
+        for unit in plan.units:
+            for batch in unit.batches:
+                key = (unit.shard_index, batch.source_file)
+                source = scan.sources.setdefault(
+                    key,
+                    _SourceSummary(
+                        shard_index=unit.shard_index,
+                        source_file=batch.source_file,
+                    ),
+                )
+                source.planned_nodes += len(batch.nodeids)
+        return scan
 
 
 def _record_pending(scan: _SummaryScan, unit: Unit, batch: Batch) -> None:
     scan.pending.extend(batch.nodeids)
     scan.shard_pending[unit.shard_index] += len(batch.nodeids)
+    source = scan.sources[(unit.shard_index, batch.source_file)]
+    source.pending_nodes += len(batch.nodeids)
+    source.partial_resources = True
 
 
 def _case_memory(
@@ -184,6 +260,13 @@ def _case_memory(
     )
 
 
+def _recorded_outcome(phase: dict[str, Any], fallback: str) -> str:
+    outcome = phase.get("outcome")
+    return (
+        outcome if outcome in {"passed", "failed", "skipped", "unknown"} else fallback
+    )
+
+
 def _record_final_batch(
     scan: _SummaryScan,
     *,
@@ -199,14 +282,30 @@ def _record_final_batch(
     phases = _phase_results(path)
     samples = _memory_samples(path)
     memory = _max_memory(samples)
+    source = scan.sources[(unit.shard_index, batch.source_file)]
+    source.finalized_nodes += len(validation.cases)
+    duration = _process_seconds(path)
+    if duration is None:
+        source.partial_resources = True
+    else:
+        source.process_seconds += duration
+        source.has_process_timing = True
+    if samples:
+        source.max_host_rss_mib = max(source.max_host_rss_mib, memory[0])
+        source.max_gpu_memory_mib = max(source.max_gpu_memory_mib, memory[1])
+        source.memory_samples += len(samples)
+    else:
+        source.partial_resources = True
     scan.batch_memory[batch.id] = memory
     scan.unit_memory[unit.id].append(memory)
     scan.shard_memory[unit.shard_index].append(memory)
     for case in validation.cases:
         phase = phases.get(case.nodeid, {})
+        outcome = _recorded_outcome(phase, case.outcome)
         scan.node_memory[case.nodeid] = _case_memory(samples, phase)
-        scan.outcomes[case.outcome] += 1
-        scan.shard_outcomes[unit.shard_index][case.outcome] += 1
+        source.outcomes[outcome] += 1
+        scan.outcomes[outcome] += 1
+        scan.shard_outcomes[unit.shard_index][outcome] += 1
         scan.shard_finalized[unit.shard_index] += 1
         scan.synthetic_count += int(case.synthetic)
         scan.rows.append(
@@ -214,7 +313,7 @@ def _record_final_batch(
                 "nodeid": case.nodeid,
                 "source_file": case.source_file,
                 "base_function": case.base_function,
-                "outcome": case.outcome,
+                "outcome": outcome,
                 "setup_seconds": phase.get("setup", 0.0),
                 "call_seconds": phase.get("call", case.seconds),
                 "teardown_seconds": phase.get("teardown", 0.0),
@@ -288,6 +387,187 @@ def _write_memory_csv(junit_dir: Path, scan: _SummaryScan) -> None:
     atomic_write_text(junit_dir / "memory_summary.csv", memory_stream.getvalue())
 
 
+def _source_csv_rows(scan: _SummaryScan) -> list[dict[str, Any]]:
+    rows = []
+    for source in sorted(
+        scan.sources.values(),
+        key=lambda item: (item.shard_index, item.source_file.encode("utf-8")),
+    ):
+        rows.append(
+            {
+                "shard_index": source.shard_index,
+                "source_file": source.source_file,
+                "status": source.status,
+                "planned_nodes": source.planned_nodes,
+                "finalized_nodes": source.finalized_nodes,
+                "passed": source.outcomes["passed"],
+                "failed": source.outcomes["failed"],
+                "skipped": source.outcomes["skipped"],
+                "unknown": source.outcomes["unknown"],
+                "pending_nodes": source.pending_nodes,
+                "process_seconds": f"{source.process_seconds:.6f}",
+                "max_host_rss_mib": f"{source.max_host_rss_mib:.3f}",
+                "max_gpu_memory_mib": f"{source.max_gpu_memory_mib:.3f}",
+                "memory_samples": source.memory_samples,
+                "partial_resources": str(source.partial_resources).lower(),
+            }
+        )
+    return rows
+
+
+def _write_source_csv(junit_dir: Path, scan: _SummaryScan) -> None:
+    source_stream = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        source_stream, fieldnames=SOURCE_SUMMARY_HEADER, lineterminator="\n"
+    )
+    writer.writeheader()
+    writer.writerows(_source_csv_rows(scan))
+    atomic_write_text(junit_dir / "source_summary.csv", source_stream.getvalue())
+
+
+def _merged_sources(
+    scan: _SummaryScan,
+    shard_index: int | None,
+) -> list[_SourceSummary]:
+    selected = [
+        source
+        for source in scan.sources.values()
+        if shard_index is None or source.shard_index == shard_index
+    ]
+    if shard_index is not None:
+        return sorted(selected, key=lambda item: item.source_file.encode("utf-8"))
+    merged: dict[str, _SourceSummary] = {}
+    for source in selected:
+        target = merged.setdefault(
+            source.source_file,
+            _SourceSummary(shard_index=-1, source_file=source.source_file),
+        )
+        target.planned_nodes += source.planned_nodes
+        target.finalized_nodes += source.finalized_nodes
+        target.pending_nodes += source.pending_nodes
+        target.outcomes.update(source.outcomes)
+        target.process_seconds += source.process_seconds
+        target.has_process_timing = (
+            target.has_process_timing or source.has_process_timing
+        )
+        target.max_host_rss_mib = max(target.max_host_rss_mib, source.max_host_rss_mib)
+        target.max_gpu_memory_mib = max(
+            target.max_gpu_memory_mib, source.max_gpu_memory_mib
+        )
+        target.memory_samples += source.memory_samples
+        target.partial_resources = target.partial_resources or source.partial_resources
+    return sorted(merged.values(), key=lambda item: item.source_file.encode("utf-8"))
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _format_mib(mib: float) -> str:
+    if mib >= 1024 * 1024:
+        return f"{mib / (1024 * 1024):.1f} TiB"
+    if mib >= 1024:
+        return f"{mib / 1024:.1f} GiB"
+    return f"{int(round(mib))} MiB"
+
+
+def _format_resource_row(rank: int, source: _SourceSummary) -> str:
+    suffix = " (partial)" if source.partial_resources else ""
+    return (
+        f"  {rank:2d}. {source.source_file} - "
+        f"duration {_format_duration(source.process_seconds)}, "
+        f"peak RSS {_format_mib(source.max_host_rss_mib)}, "
+        f"peak GPU {_format_mib(source.max_gpu_memory_mib)}, "
+        f"samples {source.memory_samples}{suffix}"
+    )
+
+
+def format_test_run_summary(
+    junit_dir: Path,
+    plan: Plan,
+    *,
+    shard_index: int | None = None,
+) -> str:
+    """Render node outcomes and source-level resources from finalized batch data."""
+
+    sources = _merged_sources(_scan_batches(junit_dir, plan), shard_index)
+    outcomes: Counter[str] = Counter()
+    for source in sources:
+        outcomes.update(source.outcomes)
+    pending_nodes = sum(source.pending_nodes for source in sources)
+    separator = "=" * 42
+    title = (
+        "TEST SUMMARY" if shard_index is None else f"TEST SUMMARY - SHARD {shard_index}"
+    )
+    lines = [
+        separator,
+        title,
+        separator,
+        f"Total test files: {len(sources)}",
+        f"Total test nodes: {sum(source.planned_nodes for source in sources)}",
+        f"Passed: {outcomes['passed']}",
+        f"Failed: {outcomes['failed']}",
+        f"Skipped: {outcomes['skipped']}",
+        f"Unknown: {outcomes['unknown']}",
+        f"No result: {pending_nodes}",
+    ]
+    failed = [source for source in sources if source.outcomes["failed"]]
+    if failed:
+        lines.extend(["", "Failed test files:"])
+        lines.extend(
+            f"  - {source.source_file} - "
+            f"{source.outcomes['failed']}/{source.planned_nodes} failed"
+            for source in failed
+        )
+    pending = [source for source in sources if source.pending_nodes]
+    if pending:
+        lines.extend(["", "Test files with no result:"])
+        lines.extend(
+            f"  - {source.source_file} - "
+            f"{source.pending_nodes}/{source.planned_nodes} pending"
+            for source in pending
+        )
+
+    lines.extend(["", separator, "TEST RUN RESOURCE SUMMARY", separator])
+    duration_sources = [source for source in sources if source.has_process_timing]
+    memory_sources = [source for source in sources if source.memory_samples]
+    if not duration_sources and not memory_sources:
+        lines.append("No resource reports found for test-run resource summary.")
+        return "\n".join(lines)
+    rankings = (
+        ("Top 10 longest-running test files:", duration_sources, "process_seconds"),
+        ("Top 10 highest host RSS test files:", memory_sources, "max_host_rss_mib"),
+        (
+            "Top 10 highest GPU memory test files:",
+            memory_sources,
+            "max_gpu_memory_mib",
+        ),
+    )
+    for title, candidates, attribute in rankings:
+        if not candidates:
+            continue
+        lines.extend([title])
+        ranked = sorted(
+            candidates,
+            key=lambda source: (
+                -float(getattr(source, attribute)),
+                source.source_file.encode("utf-8"),
+            ),
+        )[:10]
+        lines.extend(
+            _format_resource_row(rank, source)
+            for rank, source in enumerate(ranked, start=1)
+        )
+    return "\n".join(lines)
+
+
 def _attempt_history(junit_dir: Path) -> tuple[list[AttemptSummary], list[Path]]:
     attempts: list[AttemptSummary] = []
     attempt_paths = list_attempts(junit_dir)
@@ -353,6 +633,7 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     scan = _scan_batches(junit_dir, plan)
     _write_timing_csv(junit_dir, scan.rows)
     _write_memory_csv(junit_dir, scan)
+    _write_source_csv(junit_dir, scan)
     attempts, attempt_paths = _attempt_history(junit_dir)
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {

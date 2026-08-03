@@ -54,6 +54,7 @@ from .summary import (
     batch_is_final,
     batch_xml_path,
     exit_code_for_summary,
+    format_test_run_summary,
     publish_summary,
     publish_summary_under_lock,
 )
@@ -127,6 +128,7 @@ def _reject_runner_path_collisions(junit_dir: Path, *, include_attempts: bool) -
     runner_paths = [
         junit_dir / "test_timings.csv",
         junit_dir / "memory_summary.csv",
+        junit_dir / "source_summary.csv",
         junit_dir / "run-summary.json",
         claims_dir(junit_dir),
         units_dir(junit_dir),
@@ -184,6 +186,26 @@ def _report_shard_status(
         f"{deadline_clock.status_fields()}",
         flush=True,
     )
+
+
+def _report_shard_terminal(
+    junit_dir: Path,
+    plan: Plan,
+    summary: RunSummary,
+    shard_index: int,
+    *,
+    state: str,
+    deadline_clock: DeadlineClock,
+    reason: str | None = None,
+) -> None:
+    _report_shard_status(
+        summary,
+        shard_index,
+        state=state,
+        deadline_clock=deadline_clock,
+        reason=reason,
+    )
+    write_console(format_test_run_summary(junit_dir, plan, shard_index=shard_index))
 
 
 def _estimate_paths(repo_root: Path) -> tuple[Path, Path]:
@@ -1130,7 +1152,9 @@ def _existing_shard_result(
         attempt_path=attempt_path,
     )
     shard_summary = summary["shards"][str(execution.shard_index)]
-    _report_shard_status(
+    _report_shard_terminal(
+        junit_dir,
+        plan,
         summary,
         execution.shard_index,
         state="completed" if shard_summary["complete"] else "incomplete",
@@ -1155,7 +1179,9 @@ def _report_shard_result(
     if shard_executor.infrastructure_errors:
         for error in shard_executor.infrastructure_errors:
             print(f"ERROR: {error}", file=sys.stderr)
-        _report_shard_status(
+        _report_shard_terminal(
+            junit_dir,
+            plan,
             summary,
             execution.shard_index,
             state="failed",
@@ -1171,7 +1197,9 @@ def _report_shard_result(
         reason = ",".join(sorted(shard_executor.interruption_reasons))
     else:
         state, reason = "incomplete", None
-    _report_shard_status(
+    _report_shard_terminal(
+        junit_dir,
+        plan,
         summary,
         execution.shard_index,
         state=state,
@@ -1207,7 +1235,9 @@ def execute_shard(
                 plan=plan,
                 attempt_path=attempts[-1],
             )
-        _report_shard_status(
+        _report_shard_terminal(
+            junit_dir,
+            plan,
             initial_summary,
             execution.shard_index,
             state="completed",

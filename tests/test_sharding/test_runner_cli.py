@@ -697,6 +697,12 @@ def test_fails():
     assert executed.returncode == 1, executed.stdout + executed.stderr
     assert "RUNNER STATUS: shard=0 state=completed" in executed.stdout
     assert "finalized=2/2 passed=1 failed=1 skipped=0 pending=0" in executed.stdout
+    assert executed.stdout.count("TEST SUMMARY - SHARD 0") == 1
+    assert "Total test files: 1" in executed.stdout
+    assert "Total test nodes: 2" in executed.stdout
+    assert "Passed: 1" in executed.stdout
+    assert "Failed: 1" in executed.stdout
+    assert f"  - {suite / 'test_sample.py'} - 1/2 failed" in executed.stdout
     summary = json.loads(
         (tmp_path / "junit" / "run-summary.json").read_text(encoding="utf-8")
     )
@@ -732,6 +738,35 @@ def test_fails():
     )
     assert repeated.returncode == 1
     assert len(list((tmp_path / "junit" / "attempts").glob("attempt-*"))) == 1
+
+
+def test_post_collection_setup_failure_prints_the_test_summary(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+
+    result = _run(tmp_path, "run", suite, "--workers", "999")
+
+    assert result.returncode == 3
+    assert result.stdout.count("TEST SUMMARY - SHARD 0") == 1
+    assert "Total test files: 1" in result.stdout
+    assert "Total test nodes: 1" in result.stdout
+    assert "No result: 1" in result.stdout
+
+
+def test_invalid_shard_index_prints_an_unscoped_test_summary(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+
+    result = _run(tmp_path, "run", suite, "--shard-index", "999")
+
+    assert result.returncode == 3
+    assert "TEST SUMMARY\n" in result.stdout
+    assert "TEST SUMMARY - SHARD 999" not in result.stdout
+    assert "Total test files: 1" in result.stdout
+    assert "Total test nodes: 1" in result.stdout
+    assert "No result: 1" in result.stdout
 
 
 def test_unit_progress_omits_skipped_results_and_reports_all_outcomes(
@@ -1065,6 +1100,11 @@ def test_timeout_policy_resume_starts_a_new_attempt_without_fake_results(
     assert "node=test_slow.py::test_slow" in first.stdout
     assert "RUNNER STATUS: shard=0 state=interrupted" in first.stdout
     assert "reason=unit-timeout" in first.stdout
+    assert first.stdout.count("TEST SUMMARY - SHARD 0") == 1
+    assert "Total test files: 1" in first.stdout
+    assert "Total test nodes: 1" in first.stdout
+    assert "No result: 1" in first.stdout
+    assert f"  - {suite / 'test_slow.py'} - 1/1 pending" in first.stdout
     assert not list((tmp_path / "junit").glob("unit-*.xml"))
     attempts = list((tmp_path / "junit" / "attempts").glob("attempt-*"))
     assert len(attempts) == 2

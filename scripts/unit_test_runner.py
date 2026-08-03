@@ -40,7 +40,11 @@ from scripts.test_sharding.state import (
     RunnerStateError,
     load_manifest,
 )
-from scripts.test_sharding.summary import exit_code_for_summary, publish_summary
+from scripts.test_sharding.summary import (
+    exit_code_for_summary,
+    format_test_run_summary,
+    publish_summary,
+)
 
 
 EXIT_HELP = (
@@ -410,13 +414,25 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
         memory_interval=_env_positive_float("MEMORY_MONITOR_INTERVAL", 2),
         pytest_command_prefix=pytest_command_prefix,
     )
-    return execute_shard(
-        repo_root=REPO_ROOT,
-        junit_dir=junit_dir,
-        plan=plan,
-        execution=execution,
-        operation_started_at=operation_started_at,
-    )
+    try:
+        return execute_shard(
+            repo_root=REPO_ROOT,
+            junit_dir=junit_dir,
+            plan=plan,
+            execution=execution,
+            operation_started_at=operation_started_at,
+        )
+    except (RunnerStateError, ValueError, OSError):
+        report_shard = (
+            args.shard_index
+            if 0 <= args.shard_index < plan.options.shard_count
+            else None
+        )
+        print(
+            format_test_run_summary(junit_dir, plan, shard_index=report_shard),
+            flush=True,
+        )
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
