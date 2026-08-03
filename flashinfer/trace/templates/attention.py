@@ -3024,6 +3024,63 @@ def _trtllm_batch_decode_mla_sparse_reference(
     return output
 
 
+@torch.no_grad()
+def _trtllm_batch_decode_mla_ragged_sparse_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    sparse_mla_top_k,
+    cum_seq_lens_q,
+    **kwargs,
+):
+    """Reference for flattened ragged sparse top-k page MLA decode."""
+    del (
+        workspace_buffer,
+        qk_nope_head_dim,
+        seq_lens,
+        max_seq_len,
+        sparse_mla_top_k,
+        cum_seq_lens_q,
+    )
+    num_tokens, num_heads, head_dim_qk = query.shape
+    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
+    bmm1_scale = kwargs.get("bmm1_scale", 1.0)
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = float(bmm1_scale.item())
+    bmm2_scale = kwargs.get("bmm2_scale", 1.0)
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = float(bmm2_scale.item())
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    output = torch.zeros(
+        (num_tokens, num_heads, kv_lora_rank),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    for token_idx in range(num_tokens):
+        pages = block_tables[token_idx].to(torch.long)
+        valid = (pages >= 0) & (pages < kv_cache.shape[0])
+        pages = pages[valid]
+        if pages.numel() == 0:
+            continue
+        flat = kv_cache[pages].reshape(-1, head_dim_qk).to(torch.float32)
+        kn = flat[:, :kv_lora_rank]
+        kp = flat[:, kv_lora_rank:]
+        q = query[token_idx].to(torch.float32)
+        qn = q[:, :kv_lora_rank]
+        qp = q[:, kv_lora_rank:]
+        logits = (qn @ kn.T + qp @ kp.T) * bmm1_scale
+        attn = torch.softmax(logits, dim=-1)
+        output[token_idx] = (attn @ kn * bmm2_scale).to(query.dtype)
+    return output
+
+
 def _trtllm_batch_decode_mla_init(
     *,
     batch_size: int,
@@ -3491,24 +3548,127 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
 )
 
 
+trtllm_batch_decode_mla_ragged_sparse_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="trtllm_batch_decode_mla_ragged_sparse",
+    description=(
+        "SM100+ TRT-LLM MLA paged decode with flattened variable query "
+        "lengths and one sparse top-k page-index row per query token."
+    ),
+    axes={
+        key: marker
+        for key, marker in trtllm_batch_decode_mla_ragged_trace.axes.items()
+        if key != "max_pages_per_seq"
+    }
+    | {
+        "sparse_mla_top_k": Const(
+            abbrev="topk",
+            description="Number of top-k pages selected per query token.",
+        )
+    },
+    inputs={
+        key: descriptor
+        for key, descriptor in trtllm_batch_decode_mla_ragged_trace.inputs.items()
+        if key != "block_tables"
+    }
+    | {
+        "block_tables": Tensor(
+            ["num_tokens", "sparse_mla_top_k"],
+            dtype="int32",
+            description="Sparse top-k page IDs for each flattened query token.",
+        ),
+        "sparse_mla_top_k": Scalar(
+            "int32",
+            description="Number of top-k pages selected per query token.",
+        ),
+    },
+    outputs=dict(trtllm_batch_decode_mla_ragged_trace.outputs),
+    tags=[
+        "status:verified",
+        "stage:decode",
+        "backend:trtllm",
+        "mla",
+        "sparse",
+        "ragged",
+    ],
+    reference=_trtllm_batch_decode_mla_ragged_sparse_reference,
+)
+
+
+def _functional_mla_backend_trace(
+    backend: str, *, ragged: bool = False
+) -> TraceTemplate:
+    """Retag the shared functional MLA schema for an explicit backend."""
+    base = (
+        trtllm_batch_decode_mla_ragged_trace
+        if ragged
+        else trtllm_batch_decode_mla_dense_trace
+    )
+    return TraceTemplate(
+        op_type=base.op_type,
+        name_prefix=f"{backend}_batch_decode_mla" + ("_ragged" if ragged else ""),
+        description=f"Functional MLA paged decode dispatched explicitly to {backend}.",
+        axes=dict(base.axes),
+        inputs=dict(base.inputs),
+        outputs=dict(base.outputs),
+        reference=base.reference,
+        check=base.check,
+        init=base.init,
+        constraints=list(base.constraints),
+        tags=[tag for tag in base.tags if not tag.startswith("backend:")]
+        + [f"backend:{backend}"],
+    )
+
+
+fa2_batch_decode_mla_trace = _functional_mla_backend_trace("fa2")
+fa2_batch_decode_mla_ragged_trace = _functional_mla_backend_trace("fa2", ragged=True)
+fa3_batch_decode_mla_trace = _functional_mla_backend_trace("fa3")
+fa3_batch_decode_mla_ragged_trace = _functional_mla_backend_trace("fa3", ragged=True)
+cutlass_batch_decode_mla_trace = _functional_mla_backend_trace("cutlass")
+
+
 def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
     if kwargs.get("enable_dcp", False):
         raise NotImplementedError(
             "fi_trace does not yet represent cyclic DCP KV ownership or "
             "cross-rank LSE merging for MLA decode"
         )
+    backend = kwargs.get("backend", "auto")
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
+    has_ragged_query = kwargs.get("cum_seq_lens_q") is not None
+    if backend == "fa2":
+        return (
+            fa2_batch_decode_mla_ragged_trace
+            if has_ragged_query
+            else fa2_batch_decode_mla_trace
+        )
+    if backend == "fa3":
+        return (
+            fa3_batch_decode_mla_ragged_trace
+            if has_ragged_query
+            else fa3_batch_decode_mla_trace
+        )
+    if backend == "cutlass":
+        return cutlass_batch_decode_mla_trace
+    if sparse_mla_top_k > 0 and has_ragged_query:
+        return trtllm_batch_decode_mla_ragged_sparse_trace
+    if has_ragged_query:
+        return trtllm_batch_decode_mla_ragged_trace
     if sparse_mla_top_k > 0:
         return trtllm_batch_decode_mla_sparse_trace
-    if kwargs.get("cum_seq_lens_q") is None:
-        return trtllm_batch_decode_mla_dense_trace
-    return trtllm_batch_decode_mla_ragged_trace
+    return trtllm_batch_decode_mla_dense_trace
 
 
 trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-defined]
     trtllm_batch_decode_mla_dense_trace,
     trtllm_batch_decode_mla_ragged_trace,
     trtllm_batch_decode_mla_sparse_trace,
+    trtllm_batch_decode_mla_ragged_sparse_trace,
+    fa2_batch_decode_mla_trace,
+    fa2_batch_decode_mla_ragged_trace,
+    fa3_batch_decode_mla_trace,
+    fa3_batch_decode_mla_ragged_trace,
+    cutlass_batch_decode_mla_trace,
 ]
 
 

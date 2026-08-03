@@ -5,12 +5,18 @@ Backend selection remains in the wrapper/controller, while backend-specific
 module loading belongs to the backend compartments.
 """
 
-from contextlib import contextmanager
-from functools import wraps
-from dataclasses import dataclass, field, fields
-from typing import Iterator, Optional, Protocol, Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Protocol, Tuple
 
 import torch
+
+from ._contracts import MLAPlanMetadata
+
+
+_MLALSEMode = Literal["none", "base2", "basee"]
+_MLAKVLayout = Literal["combined", "adjacent-split", "independent-split"]
+_MLAOutputScale = Literal["none", "per-tensor"]
+_MLAScaleMode = Literal["default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"]
 
 
 class _MLAGeneratedFaWorkspace(Protocol):
@@ -45,19 +51,17 @@ class _DensePlanMetadata:
     max_q_len: int
 
 
-@dataclass(frozen=True, slots=True)
-class _MLASelectionDescriptor:
-    """Scalar metadata facts used to choose an MLA planning backend.
-
-    This descriptor deliberately excludes metadata tensors.  Candidate
-    selection can therefore validate which forms are available without
-    allocating or converting the representation consumed by the backend.
-    """
-
-    has_csr: bool
-    has_dense: bool
-    page_size: int
-    device: torch.device
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        candidate
+        for candidate in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        )
+        if candidate is not None
+    }
 
 
 def _validate_metadata_tensor(
@@ -89,10 +93,10 @@ def _validate_metadata_tensor(
 def _indptr_values(name: str, indptr: torch.Tensor) -> torch.Tensor:
     if indptr.numel() == 0:
         raise ValueError(f"{name} metadata must contain at least one element.")
-    values = indptr.to(device="cpu", dtype=torch.int64)
+    values = indptr.to(dtype=torch.int64)
     if int(values[0].item()) != 0:
         raise ValueError(f"{name} metadata must start at zero.")
-    if torch.any(values[1:] < values[:-1]).item():
+    if bool(torch.any(values[1:] < values[:-1]).item()):
         raise ValueError(f"{name} metadata must be nondecreasing.")
     return values
 
@@ -136,11 +140,11 @@ def _validate_dense_metadata(
             f"{validated_seq_lens.numel()}."
         )
 
-    seq_lens_host = validated_seq_lens.to(device="cpu", dtype=torch.int64)
-    if torch.any(seq_lens_host < 0).item():
+    seq_lens_values = validated_seq_lens.to(dtype=torch.int64)
+    if bool(torch.any(seq_lens_values < 0).item()):
         raise ValueError("seq_lens metadata must be nonnegative.")
     live_pages = torch.div(
-        seq_lens_host + page_size - 1, page_size, rounding_mode="floor"
+        seq_lens_values + page_size - 1, page_size, rounding_mode="floor"
     )
     if (
         live_pages.numel()
@@ -223,11 +227,11 @@ def _validate_csr_metadata(
             f"kv_indices metadata has {validated_kv_indices.numel()} entries but "
             f"kv_indptr[-1] is {kv_end}."
         )
-    kv_lens_host = validated_kv_len_arr.to(device="cpu", dtype=torch.int64)
-    if torch.any(kv_lens_host < 0).item():
+    kv_lens_values = validated_kv_len_arr.to(dtype=torch.int64)
+    if bool(torch.any(kv_lens_values < 0).item()):
         raise ValueError("kv_len_arr metadata must be nonnegative.")
     expected_pages = torch.div(
-        kv_lens_host + page_size - 1, page_size, rounding_mode="floor"
+        kv_lens_values + page_size - 1, page_size, rounding_mode="floor"
     )
     actual_pages = kv_values[1:] - kv_values[:-1]
     if not torch.equal(expected_pages, actual_pages):
@@ -325,19 +329,22 @@ class _MLAPlanMetadataResolver:
     def __init__(
         self,
         *,
-        qo_indptr: object = None,
-        kv_indptr: object = None,
-        kv_indices: object = None,
-        kv_len_arr: object = None,
-        cum_seq_lens_q: object = None,
-        block_tables: object = None,
-        seq_lens: object = None,
-        max_q_len: object = None,
+        metadata: MLAPlanMetadata,
         page_size: int,
         device: torch.device,
     ) -> None:
-        self._raw_csr = (qo_indptr, kv_indptr, kv_indices, kv_len_arr)
-        self._raw_dense = (cum_seq_lens_q, block_tables, seq_lens, max_q_len)
+        self._raw_csr = (
+            metadata.qo_indptr,
+            metadata.kv_indptr,
+            metadata.kv_indices,
+            metadata.kv_len_arr,
+        )
+        self._raw_dense = (
+            metadata.cum_seq_lens_q,
+            metadata.block_tables,
+            metadata.seq_lens,
+            metadata.max_q_len,
+        )
         self.page_size = page_size
         self.device = device
 
@@ -408,16 +415,6 @@ class _MLAPlanMetadataResolver:
         if not self._has_csr and not self._has_dense:
             raise ValueError("A complete CSR or dense metadata form is required.")
         self._forms_checked = True
-
-    def selection_descriptor(self) -> _MLASelectionDescriptor:
-        """Return validated form-presence facts without resolving metadata."""
-        self._check_forms()
-        return _MLASelectionDescriptor(
-            has_csr=self._has_csr,
-            has_dense=self._has_dense,
-            page_size=self.page_size,
-            device=self.device,
-        )
 
     @staticmethod
     def _check_table_width_alignment(table_width_alignment: int) -> None:
@@ -575,12 +572,13 @@ class _MLAPlanMetadataResolver:
 
 @dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class _MLAPlanArguments:
-    """Normalized public arguments and lazy metadata for one plan request."""
+    """Normalized planning inputs and lazy metadata for one plan request.
 
-    qo_indptr: Optional[torch.Tensor] = None
-    kv_indptr: Optional[torch.Tensor] = None
-    kv_indices: Optional[torch.Tensor] = None
-    kv_len_arr: Optional[torch.Tensor] = None
+    Run-behavior fields are used for backend compatibility checks during
+    automatic planning and retained by the wrapper after a successful plan.
+    """
+
+    metadata: MLAPlanMetadata
     num_heads: int
     head_dim_ckv: int
     head_dim_kpe: int
@@ -589,11 +587,13 @@ class _MLAPlanArguments:
     sm_scale: float
     q_data_type: torch.dtype
     kv_data_type: torch.dtype
+    lse_mode: _MLALSEMode = "none"
+    kv_layout: _MLAKVLayout = "independent-split"
+    output_dtype: torch.dtype = torch.float16
+    output_scale: _MLAOutputScale = "none"
+    scale_mode: _MLAScaleMode = "default"
+    skip_softmax: bool = False
     use_profiler: bool = False
-    cum_seq_lens_q: Optional[torch.Tensor] = None
-    block_tables: Optional[torch.Tensor] = None
-    seq_lens: Optional[torch.Tensor] = None
-    max_q_len: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     enable_pdl: Optional[bool] = None
     is_var_seq: Optional[bool] = None
@@ -608,86 +608,43 @@ class _MLAPlanArguments:
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )
-    _audited_public_arguments: Optional[frozenset[str]] = field(
-        init=False, repr=False, compare=False, default=None
-    )
-    _accessed_public_arguments: Optional[set[str]] = field(
-        init=False, repr=False, compare=False, default=None
-    )
-
-    def __getattribute__(self, name: str):
-        value = object.__getattribute__(self, name)
-        audited_arguments = object.__getattribute__(self, "_audited_public_arguments")
-        if audited_arguments is not None and name in audited_arguments:
-            accessed_arguments = object.__getattribute__(
-                self, "_accessed_public_arguments"
-            )
-            assert accessed_arguments is not None
-            accessed_arguments.add(name)
-        return value
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, MLAPlanMetadata):
+            raise TypeError("metadata must be an MLAPlanMetadata instance.")
+        if self.lse_mode not in ("none", "base2", "basee"):
+            raise ValueError(f"unsupported LSE mode {self.lse_mode!r}")
+        if self.kv_layout not in ("combined", "adjacent-split", "independent-split"):
+            raise ValueError(f"unsupported KV layout {self.kv_layout!r}")
+        if not isinstance(self.output_dtype, torch.dtype):
+            raise ValueError(
+                f"output_dtype must be a torch.dtype, got {self.output_dtype!r}"
+            )
+        if self.output_scale not in ("none", "per-tensor"):
+            raise ValueError(f"unsupported output scale {self.output_scale!r}")
+        if self.scale_mode not in (
+            "default",
+            "kv-per-tensor",
+            "bmm-scalar",
+            "bmm-tensor",
+        ):
+            raise ValueError(f"unsupported scale mode {self.scale_mode!r}")
+        if type(self.skip_softmax) is not bool:
+            raise ValueError(f"skip_softmax must be a bool, got {self.skip_softmax!r}")
+        if self.output_scale == "per-tensor" and not _is_fp8_dtype(self.output_dtype):
+            raise ValueError(
+                "per-tensor output scale requires a supported FP8 output dtype"
+            )
         object.__setattr__(
             self,
             "_metadata_resolver",
             _MLAPlanMetadataResolver(
-                qo_indptr=self.qo_indptr,
-                kv_indptr=self.kv_indptr,
-                kv_indices=self.kv_indices,
-                kv_len_arr=self.kv_len_arr,
-                cum_seq_lens_q=self.cum_seq_lens_q,
-                block_tables=self.block_tables,
-                seq_lens=self.seq_lens,
-                max_q_len=self.max_q_len,
+                metadata=self.metadata,
                 page_size=self.page_size,
                 device=self._float_workspace_buffer.device,
             ),
         )
-        self._metadata_resolver.selection_descriptor()
-
-    @contextmanager
-    def audit_public_argument_access(self, backend_name: str) -> Iterator[None]:
-        """Assert that a successful backend adapter consumes every public input."""
-        if self._audited_public_arguments is not None:
-            raise RuntimeError("nested MLA plan-argument access audits are unsupported")
-
-        audited_arguments = frozenset(
-            item.name for item in fields(self) if not item.name.startswith("_")
-        )
-        accessed_arguments: set[str] = set()
-        object.__setattr__(self, "_audited_public_arguments", audited_arguments)
-        object.__setattr__(self, "_accessed_public_arguments", accessed_arguments)
-        try:
-            yield
-        except BaseException:
-            raise
-        else:
-            unconsumed_arguments = audited_arguments - accessed_arguments
-            if unconsumed_arguments:
-                raise AssertionError(
-                    f"{backend_name} plan_from_wrapper did not consume public "
-                    "arguments: "
-                    f"{', '.join(sorted(unconsumed_arguments))}"
-                )
-        finally:
-            object.__setattr__(self, "_audited_public_arguments", None)
-            object.__setattr__(self, "_accessed_public_arguments", None)
-
-    def _record_metadata_argument_access(self) -> None:
-        accessed_arguments = self._accessed_public_arguments
-        if accessed_arguments is not None:
-            accessed_arguments.update(
-                (
-                    "qo_indptr",
-                    "kv_indptr",
-                    "kv_indices",
-                    "kv_len_arr",
-                    "cum_seq_lens_q",
-                    "block_tables",
-                    "seq_lens",
-                    "max_q_len",
-                )
-            )
+        self._metadata_resolver._check_forms()
 
     @property
     def has_canonical_dense_metadata(self) -> bool:
@@ -695,47 +652,22 @@ class _MLAPlanArguments:
         return any(
             value is not None
             for value in (
-                self.cum_seq_lens_q,
-                self.block_tables,
-                self.seq_lens,
-                self.max_q_len,
+                self.metadata.cum_seq_lens_q,
+                self.metadata.block_tables,
+                self.metadata.seq_lens,
+                self.metadata.max_q_len,
             )
         )
 
-    def selection_descriptor(self) -> _MLASelectionDescriptor:
-        """Return selection facts without materializing a metadata form."""
-        return self._metadata_resolver.selection_descriptor()
-
     @property
     def csr(self) -> _CSRPlanMetadata:
-        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_csr()
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
-        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_dense(
             table_width_alignment=table_width_alignment
         )
 
     @property
     def native_dense(self) -> _DensePlanMetadata:
-        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_native_dense()
-
-
-def _audit_plan_from_wrapper_arguments(plan_from_wrapper):
-    """Audit successful concrete backend adapters without affecting test doubles."""
-
-    @wraps(plan_from_wrapper)
-    def audited_plan_from_wrapper(cls, args: _MLAPlanArguments):
-        # TODO @mingyangw: Consider gating this audit behind an environment variable
-        # or debug mode if plan-time overhead becomes a concern.
-        with args.audit_public_argument_access(cls.__name__):
-            return plan_from_wrapper(cls, args)
-
-    return audited_plan_from_wrapper
-
-
-@dataclass(frozen=True)
-class _MLAWrapperPlanResult:
-    backend_impl: object

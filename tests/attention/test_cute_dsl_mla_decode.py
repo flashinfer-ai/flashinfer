@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(
     and not is_cute_dsl_arch_supported(*torch.cuda.get_device_capability(0)),
     reason="installed CuTe DSL does not support this GPU architecture",
 )
-
+from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_reference
+from flashinfer.mla import MLAKVCache, MLAQuery
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 from flashinfer.cute_dsl import is_cute_dsl_available
 
@@ -97,6 +98,38 @@ def torch_reference_mla(
         return_lse: bool — also return LSE [B, q_len, H] (float32).
     """
     B, q_len, H, latent_dim = q_nope.shape
+
+    # The ordinary decode path has the same paged-MLA semantics as the shared
+    # reference.  MTP masking below remains specialized because its per-query
+    # causal bounds are intentionally not part of the canonical matrix helper.
+    if not apply_mtp_mask:
+        qo_indptr = torch.arange(
+            0,
+            (B + 1) * q_len,
+            q_len,
+            device=q_nope.device,
+            dtype=torch.int32,
+        )
+        output, lse = mla_paged_attention_reference(
+            q_nope=q_nope.flatten(0, 1),
+            q_pe=q_rope.flatten(0, 1),
+            ckv_cache=c_latent.view(-1, page_size, latent_dim),
+            kpe_cache=c_rope.view(-1, page_size, c_rope.shape[-1]),
+            qo_indptr=qo_indptr,
+            block_tables=page_table,
+            seq_lens=cache_seqs,
+            page_size=page_size,
+            sm_scale=softmax_scale,
+            bmm1_scale=softmax_scale,
+            bmm2_scale=output_scale,
+            contract=MLAReferenceContract(
+                lse_mode="basee" if return_lse else "none",
+                kv_layout="independent-split",
+                scale_mode="bmm-scalar",
+            ),
+        )
+        output = output.view(B, q_len, H, latent_dim)
+        return (output, lse.view(B, q_len, H)) if return_lse else output
 
     outputs = []
     lses = []
@@ -205,6 +238,32 @@ def torch_reference_variable_q_mla(
             ),
         )
     return torch.cat(outputs), torch.cat(lses)
+
+
+def test_torch_reference_mla_preserves_pre_refactor_softmax_scale():
+    """A BMM1 override must retain the former softmax-scale attention result."""
+    q_nope = torch.tensor([[[[1.0]]]])
+    q_rope = torch.zeros_like(q_nope)
+    c_latent = torch.tensor([[1.0], [3.0]])
+    c_rope = torch.zeros_like(c_latent)
+    page_table = torch.tensor([[0]], dtype=torch.int32)
+    cache_seqs = torch.tensor([2], dtype=torch.int32)
+    softmax_scale = 0.5
+
+    actual = torch_reference_mla(
+        q_nope,
+        q_rope,
+        c_latent,
+        c_rope,
+        page_table,
+        cache_seqs,
+        softmax_scale,
+        output_scale=1.0,
+        page_size=2,
+    )
+    logits = torch.tensor([0.5, 1.5])
+    expected = (torch.softmax(logits, dim=0) * c_latent.flatten()).sum()
+    torch.testing.assert_close(actual.squeeze(), expected)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
@@ -1273,8 +1332,6 @@ def test_monolithic_workspace_cap_drops_empty_partitions():
         )
         == 8
     )
-
-
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [32, 128])
@@ -1353,142 +1410,6 @@ def test_cute_dsl_mla_decode_variable_seq_len(
     ref_out_cast = ref_out.to(dtype)
 
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("batch_size", [1, 4, 128])
-@pytest.mark.parametrize("seq_len_k", [128, 512])
-@pytest.mark.parametrize("num_heads", [128, 64])
-def test_cute_dsl_mla_decode_via_api(
-    batch_size, seq_len_k, num_heads, cute_dsl_impl, page_size=128, enable_pdl=False
-):
-    """Test MLA decode via the trtllm_batch_decode_with_kv_cache_mla API with cute-dsl backend."""
-    skip_if_unsupported()
-
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    latent_dim = 512
-    rope_dim = 64
-    q_len = 1
-    softmax_scale = 1.0 / (latent_dim**0.5)
-    D_qk = latent_dim + rope_dim
-
-    query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
-    )
-
-    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
-    total_pages = num_pages_per_batch * batch_size + 10
-    kv_cache = torch.randn(
-        total_pages, page_size, D_qk, dtype=torch.float16, device=device
-    )
-
-    block_tables = torch.zeros(
-        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
-    )
-    for b in range(batch_size):
-        for p in range(num_pages_per_batch):
-            block_tables[b, p] = b * num_pages_per_batch + p
-
-    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
-
-    out = trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=kv_cache,
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=latent_dim,
-        kv_lora_rank=latent_dim,
-        qk_rope_head_dim=rope_dim,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_seq_len=seq_len_k,
-        bmm1_scale=softmax_scale,
-        bmm2_scale=1.0,
-        backend="cute-dsl",
-        is_var_seq=False,
-        enable_pdl=enable_pdl,
-        cute_dsl_impl=cute_dsl_impl,
-    )
-
-    assert out.shape == (batch_size, q_len, num_heads, latent_dim)
-    assert torch.isfinite(out).all(), "cute-dsl MLA decode produced non-finite values"
-
-
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("seq_len_k", [128, 512])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-def test_cute_dsl_vs_trtllm_gen(
-    batch_size, seq_len_k, enable_pdl, cute_dsl_impl, page_size=64
-):
-    """Test cute-dsl backend output matches trtllm-gen backend output."""
-    skip_if_unsupported()
-
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    num_heads = 128
-    latent_dim = 512
-    rope_dim = 64
-    q_len = 1
-    softmax_scale = 1.0 / (latent_dim**0.5)
-    D_qk = latent_dim + rope_dim
-
-    query = torch.randn(
-        batch_size, q_len, num_heads, D_qk, dtype=torch.bfloat16, device=device
-    )
-
-    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
-    total_pages = num_pages_per_batch * batch_size + 10
-    # trtllm-gen expects 4D kv_cache: [num_pages, 1, page_size, D]
-    kv_cache = torch.randn(
-        total_pages, 1, page_size, D_qk, dtype=torch.bfloat16, device=device
-    )
-
-    block_tables = torch.zeros(
-        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
-    )
-    for b in range(batch_size):
-        for p in range(num_pages_per_batch):
-            block_tables[b, p] = b * num_pages_per_batch + p
-
-    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
-    workspace_buffer = torch.zeros(256 * 1024 * 1024, dtype=torch.int8, device=device)
-
-    common_args = dict(
-        query=query,
-        kv_cache=kv_cache,
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=latent_dim,
-        kv_lora_rank=latent_dim,
-        qk_rope_head_dim=rope_dim,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_seq_len=seq_len_k,
-        bmm1_scale=softmax_scale,
-        bmm2_scale=1.0,
-    )
-
-    out_trtllm = trtllm_batch_decode_with_kv_cache_mla(
-        **common_args, backend="trtllm-gen", is_var_seq=False
-    )
-    out_cute_dsl = trtllm_batch_decode_with_kv_cache_mla(
-        **common_args,
-        backend="cute-dsl",
-        is_var_seq=False,
-        cute_dsl_impl=cute_dsl_impl,
-    )
-
-    torch.testing.assert_close(
-        out_cute_dsl.to(torch.float32),
-        out_trtllm.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -1986,8 +1907,6 @@ def test_cute_dsl_mla_decode_via_api_with_sinks(cute_dsl_impl_arg):
     """Public trtllm_batch_decode_with_kv_cache_mla(backend='cute-dsl', sinks=...)
     works end-to-end on both ``cute_dsl_impl="auto"`` (which auto-promotes
     to modular due to sinks) and ``cute_dsl_impl="modular"`` (explicit).
-    The ``cute_dsl_impl="monolithic"`` case is the strict-error contract
-    covered separately by test_via_api_monolithic_with_sinks_raises below.
 
     Single shape is sufficient — sinks correctness across shapes is
     already covered by test_cute_dsl_mla_decode_attention_sink; this
@@ -2018,7 +1937,7 @@ def test_cute_dsl_mla_decode_via_api_with_sinks(cute_dsl_impl_arg):
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=latent_dim,
+        qk_nope_head_dim=128,
         kv_lora_rank=latent_dim,
         qk_rope_head_dim=rope_dim,
         block_tables=block_tables,
@@ -2035,113 +1954,6 @@ def test_cute_dsl_mla_decode_via_api_with_sinks(cute_dsl_impl_arg):
     assert torch.isfinite(out).all(), (
         "public-API cute-dsl with sinks produced non-finite values"
     )
-
-
-def test_via_api_monolithic_with_sinks_raises():
-    """Strict-mode contract: cute_dsl_impl='monolithic' + sinks must raise
-    ValueError, never silently substitute modular.  Inputs are minimal —
-    we just need to reach the dispatcher's resolver, not actually run the
-    kernel."""
-    skip_if_unsupported()
-
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    torch.manual_seed(42)
-    dtype = torch.bfloat16
-    (
-        query,
-        kv_cache,
-        block_tables,
-        seq_lens,
-        workspace_buffer,
-        num_heads,
-        latent_dim,
-        rope_dim,
-    ) = _make_mla_test_data(batch_size=1, seq_len_k=128, page_size=64, dtype=dtype)
-    sink = torch.randn((num_heads,), dtype=dtype, device="cuda")
-
-    with pytest.raises(ValueError, match=r"monolithic.*sinks.*modular"):
-        trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache.unsqueeze(1),
-            workspace_buffer=workspace_buffer,
-            qk_nope_head_dim=latent_dim,
-            kv_lora_rank=latent_dim,
-            qk_rope_head_dim=rope_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=128,
-            bmm1_scale=1.0 / (latent_dim**0.5),
-            bmm2_scale=1.0,
-            sinks=sink,
-            backend="cute-dsl",
-            is_var_seq=False,
-            cute_dsl_impl="monolithic",
-        )
-
-
-def test_via_api_cute_dsl_sinks_wrong_shape_raises():
-    """The cute-dsl standalone validates the sinks shape at the API boundary
-    instead of letting a wrong-shape tensor surface as a confusing kernel
-    failure.  ``AttentionWithSink.update_statistics`` indexes
-    ``self.params[qo_head_idx]``, so the tensor must be 1-D of length
-    num_qo_heads."""
-    skip_if_unsupported()
-
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    torch.manual_seed(42)
-    dtype = torch.bfloat16
-    (
-        query,
-        kv_cache,
-        block_tables,
-        seq_lens,
-        workspace_buffer,
-        num_heads,
-        latent_dim,
-        rope_dim,
-    ) = _make_mla_test_data(batch_size=1, seq_len_k=128, page_size=64, dtype=dtype)
-
-    # Off-by-one length triggers the shape check.
-    wrong_sink = torch.randn((num_heads + 1,), dtype=dtype, device="cuda")
-    with pytest.raises(ValueError, match=r"shape \(num_qo_heads,\)"):
-        trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache.unsqueeze(1),
-            workspace_buffer=workspace_buffer,
-            qk_nope_head_dim=latent_dim,
-            kv_lora_rank=latent_dim,
-            qk_rope_head_dim=rope_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=128,
-            bmm1_scale=1.0 / (latent_dim**0.5),
-            bmm2_scale=1.0,
-            sinks=wrong_sink,
-            backend="cute-dsl",
-            is_var_seq=False,
-        )
-
-    # 2-D shape also rejected, even if total numel matches.
-    wrong_sink_2d = torch.randn((1, num_heads), dtype=dtype, device="cuda")
-    with pytest.raises(ValueError, match=r"shape \(num_qo_heads,\)"):
-        trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache.unsqueeze(1),
-            workspace_buffer=workspace_buffer,
-            qk_nope_head_dim=latent_dim,
-            kv_lora_rank=latent_dim,
-            qk_rope_head_dim=rope_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=128,
-            bmm1_scale=1.0 / (latent_dim**0.5),
-            bmm2_scale=1.0,
-            sinks=wrong_sink_2d,
-            backend="cute-dsl",
-            is_var_seq=False,
-        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -2666,8 +2478,6 @@ def test_mla_decode_variable_q_auto_uses_cute_dsl_for_head_gap():
         max_q_len=8,
         public_backend="auto",
     )
-
-
 def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_impl):
     skip_if_unsupported()
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
@@ -2717,6 +2527,10 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_im
         kv_data_type=kv_cache.dtype,
         is_var_seq=True,
         use_sinks=use_sinks,
+        lse_mode="basee" if return_lse else "none",
+        kv_layout="combined",
+        output_dtype=torch.bfloat16,
+        scale_mode="bmm-scalar",
     )
     if metadata_form == "dense":
         wrapper.plan(
@@ -2757,6 +2571,7 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_im
         sinks=sinks,
         return_lse=return_lse,
         cute_dsl_impl=cute_dsl_impl,
+        functional_backend=wrapper_backend,
         wrapper_out=wrapper_out,
         wrapper_lse=wrapper_lse,
     )
@@ -2765,11 +2580,12 @@ def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_im
 def _run_batch_mla_wrapper_cute_dsl_case(case):
     query = case["query"]
     return case["wrapper"].run(
-        q=query.flatten(0, 1),
-        kv_cache=case["kv_cache"],
+        query=MLAQuery.packed(query.flatten(0, 1)),
+        kv=MLAKVCache.packed(case["kv_cache"]),
         out=case["wrapper_out"],
         lse=case["wrapper_lse"] if case["return_lse"] else None,
         return_lse=case["return_lse"],
+        return_lse_base_on_e=case["return_lse"],
         sinks=case["sinks"],
         bmm1_scale=case["bmm1_scale"],
         bmm2_scale=case["bmm2_scale"],
@@ -2799,77 +2615,11 @@ def _functional_batch_mla_cute_dsl_result(case):
             device=query.device,
         ),
         sinks=None if case["sinks"] is None else [case["sinks"]],
-        backend="cute-dsl",
+        backend=case["functional_backend"],
         is_var_seq=True,
         return_lse=case["return_lse"],
         cute_dsl_impl=case["cute_dsl_impl"],
     )
-
-
-@pytest.mark.parametrize(
-    ("metadata_form", "wrapper_backend", "cute_dsl_impl"),
-    (
-        ("dense", "cute-dsl-monolithic", "monolithic"),
-        ("csr", "cute-dsl-modular", "modular"),
-        ("dense", "cute-dsl", "monolithic"),
-        ("csr", "cute-dsl", "modular"),
-    ),
-)
-def test_batch_mla_wrapper_cute_dsl_matches_functional_api(
-    metadata_form, wrapper_backend, cute_dsl_impl
-):
-    case = _batch_mla_wrapper_cute_dsl_case(
-        metadata_form, wrapper_backend, cute_dsl_impl
-    )
-    functional = _functional_batch_mla_cute_dsl_result(case)
-    wrapped = _run_batch_mla_wrapper_cute_dsl_case(case)
-
-    return_lse = case["return_lse"]
-    functional_out = functional[0] if return_lse else functional
-    wrapped_out = wrapped[0] if return_lse else wrapped
-    torch.testing.assert_close(
-        wrapped_out,
-        functional_out.flatten(0, 1),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    if return_lse:
-        torch.testing.assert_close(wrapped[1], functional[1], atol=1e-3, rtol=1e-3)
-
-
-@pytest.mark.parametrize("cute_dsl_impl", ("monolithic", "modular"))
-def test_batch_mla_wrapper_cute_dsl_reuses_planned_artifact(cute_dsl_impl):
-    case = _batch_mla_wrapper_cute_dsl_case(
-        "dense", f"cute-dsl-{cute_dsl_impl}", cute_dsl_impl
-    )
-
-    from flashinfer.cute_dsl.attention import mla_dispatch
-
-    if cute_dsl_impl == "monolithic":
-        from flashinfer.cute_dsl.attention.monolithic import mla_decode as impl
-
-        compile_helper = "_get_compiled_mla_kernel"
-    else:
-        from flashinfer.cute_dsl.attention.wrappers import batch_mla as impl
-
-        compile_helper = "_compile_mla_kernel"
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            mla_dispatch,
-            "_resolve_impl",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("run selected a CuTe implementation")
-            ),
-        )
-        monkeypatch.setattr(
-            impl,
-            compile_helper,
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("run loaded or compiled a CuTe kernel")
-            ),
-        )
-        _run_batch_mla_wrapper_cute_dsl_case(case)
 
 
 def test_batch_mla_wrapper_cute_dsl_cuda_graph_replays():

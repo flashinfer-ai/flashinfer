@@ -424,14 +424,13 @@ def test_batch_mla_varlen_page_attention(
         )
         * qo_len
     )
+    page_counts = pages_nums.repeat(batch_size).to(device)
     kv_indptr = torch.cat(
-        [
-            torch.arange(0, batch_size + 1).unsqueeze(-1).int() * pages_nums_sum
-            + pages_nums_indptr[i]
-            for i in range(num_different_kv_len)
-        ],
-        dim=-1,
-    ).flatten()
+        (
+            torch.zeros(1, device=device, dtype=torch.int32),
+            page_counts.cumsum(0, dtype=torch.int32),
+        )
+    )
     kv_indices = torch.arange(
         0, batch_size * pages_nums_sum, device=device, dtype=torch.int32
     )
@@ -449,6 +448,7 @@ def test_batch_mla_varlen_page_attention(
         sm_scale,
         q_nope.dtype,
         ckv.dtype,
+        lse_mode="base2",
     )
     o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
@@ -654,6 +654,7 @@ def test_batch_mla_page_attention(
             sm_scale,
             q_nope.dtype,
             ckv.dtype,
+            lse_mode="base2",
         )
 
         # warmup
@@ -682,6 +683,7 @@ def test_batch_mla_page_attention(
         sm_scale,
         q_nope.dtype,
         ckv.dtype,
+        lse_mode="base2",
     )
     if use_cuda_graph:
         o.fill_(0)

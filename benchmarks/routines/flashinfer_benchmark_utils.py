@@ -4,6 +4,33 @@ import torch
 from flashinfer.testing.utils import set_seed
 from flashinfer.utils import get_compute_capability
 
+
+def sample_actual_seq_lens(
+    max_seqlen,
+    batch_size,
+    device,
+    random_actual_seq_len,
+    *,
+    generator=None,
+):
+    """Build actual sequence lengths for attention benchmark inputs."""
+    if random_actual_seq_len:
+        return torch.randint(
+            1,
+            max_seqlen + 1,
+            (batch_size, 1, 1, 1),
+            device=device,
+            dtype=torch.int32,
+            generator=generator,
+        )
+    return torch.full(
+        (batch_size, 1, 1, 1),
+        max_seqlen,
+        device=device,
+        dtype=torch.int32,
+    )
+
+
 # Output columns for the test results.
 output_column_dict = {
     "perf": [
@@ -14,6 +41,47 @@ output_column_dict = {
         "tb_per_sec",
         "backend",
         "resolved_backend",
+    ],
+    # MLA rows record the normalized wrapper lifecycle. Other routines leave
+    # these fields empty through flashinfer_benchmark's normal column backfill.
+    "mla": [
+        "mla_qk_nope_head_dim",
+        "mla_metadata_form",
+        "mla_enable_pdl",
+        "requested_backend",
+        "mla_status",
+        "mla_correctness_status",
+        "mla_reason",
+        "mla_rejections",
+        "mla_lse_mode",
+        "mla_kv_layout",
+        "mla_output_scale",
+        "mla_scale_mode",
+        "mla_skip_softmax",
+        "mla_measurement_seed",
+        "plan_latency_ms",
+        "first_run_median_ms",
+        "first_run_p90_ms",
+        "first_run_mad_ms",
+        "first_run_repetitions",
+        "warm_median_ms",
+        "warm_p90_ms",
+        "warm_mad_ms",
+        "warm_repetitions",
+        "cold_l2_median_ms",
+        "cold_l2_p90_ms",
+        "cold_l2_mad_ms",
+        "cold_l2_repetitions",
+        "cuda_graph_median_ms",
+        "cuda_graph_p90_ms",
+        "cuda_graph_mad_ms",
+        "graph_replay_repetitions",
+        "workspace_bytes",
+        "peak_memory_delta_bytes",
+        "mla_is_var_seq",
+        "mla_cute_dsl_impl",
+        "mla_uses_shared_paged_kv_idx",
+        "mla_autotune",
     ],
     "attention": [
         "s_qo",
@@ -185,6 +253,7 @@ output_column_dict = {
 
 full_output_columns = (
     output_column_dict["perf"]
+    + output_column_dict["mla"]
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
@@ -203,11 +272,14 @@ full_output_columns = (
 )
 
 benchmark_apis = {
+    "mla": [
+        "BatchMLAPagedAttentionWrapper",
+        "batch_mla_paged_attention",
+    ],
     "attention": [
         "BatchDecodeWithPagedKVCacheWrapper",
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",
-        "BatchMLAPagedAttentionWrapper",
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
@@ -464,20 +536,41 @@ routine_cc_to_supported_backends = {
         "12.1": ["fa2", "cudnn", "cudnn-native"],
     },
     "BatchMLAPagedAttentionWrapper": {
-        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
-        # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
-        # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
-        #       and is the only backend that benefits from --autotune
+        "7.5": [],
+        "8.0": ["fa2", "auto"],
+        "8.6": ["fa2", "auto"],
+        "8.9": ["fa2", "auto"],
+        "9.0": ["fa2", "fa3", "auto"],
+        "10.0": [
+            "fa2",
+            "cutlass",
+            "trtllm-gen",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
+            "auto",
+        ],
+        "10.3": [
+            "fa2",
+            "cutlass",
+            "trtllm-gen",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
+            "auto",
+        ],
+        "12.0": ["fa2", "xqa", "auto"],
+        "12.1": ["fa2", "xqa", "auto"],
+    },
+    "batch_mla_paged_attention": {
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "10.0": ["fa2", "cutlass", "trtllm-gen", "cute-dsl", "auto"],
+        "10.3": ["fa2", "cutlass", "trtllm-gen", "cute-dsl", "auto"],
+        "10.7": ["fa2", "cutlass", "trtllm-gen"],
+        "12.0": ["fa2", "xqa", "auto"],
+        "12.1": ["fa2", "xqa", "auto"],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {

@@ -9,21 +9,32 @@ You may obtain a copy of the License at
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.utils import get_compute_capability
 
+from ._capabilities import (
+    BACKEND_OPERATIONAL_PLAN_FIELDS,
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import (
-    _audit_plan_from_wrapper_arguments,
     _MLAGeneratedFaWorkspace,
     _MLAPlanArguments,
-    _MLAWrapperPlanResult,
+)
+from .._contracts import (
+    _FunctionalBackendUnsupportedError,
+    _FunctionalMLARequest,
+    MLAKVCache,
+    MLAQuery,
+    _split_mla_value_objects,
 )
 from ._fa_common import (
     _BatchMLAGeneratedFaMechanics,
+    _GeneratedFaMlaRunner,
     get_batch_mla_module,
 )
 
@@ -33,6 +44,15 @@ def _get_batch_mla_fa3_module(*args):
 
 
 class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
+    _plan_capabilities = MLAPlanCapabilities(
+        backend_name="fa3",
+        lse_modes=frozenset({"none", "base2", "basee"}),
+        kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
+        output_scales=frozenset({"none"}),
+        scale_modes=frozenset({"default", "kv-per-tensor"}),
+    )
+    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
+
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -55,23 +75,25 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
         )
 
     @classmethod
-    @_audit_plan_from_wrapper_arguments
-    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
-        args._generated_fa_workspace.raise_if_invalid()
-        enable_pdl = args.enable_pdl
-        is_var_seq = args.is_var_seq
-        use_sinks = args.use_sinks
-        qk_nope_head_dim = args.qk_nope_head_dim
-        if enable_pdl:
-            raise ValueError("enable_pdl is not supported by the fa3 wrapper backend.")
-        if is_var_seq is not None:
-            raise ValueError("is_var_seq is not supported by the fa3 wrapper backend.")
-        if use_sinks:
-            raise ValueError("use_sinks is not supported by the fa3 wrapper backend.")
-        if qk_nope_head_dim is not None:
-            raise ValueError(
-                "qk_nope_head_dim is only supported with trtllm-gen backend."
+    def plan_from_wrapper(
+        cls, args: _MLAPlanArguments
+    ) -> "_BatchMLAPagedAttentionFa3Backend":
+        validate_plan_capabilities(args, cls._plan_capabilities)
+        output_dtype = args.output_dtype
+        if output_dtype != args.q_data_type:
+            raise _BackendPlanUnsupportedError(
+                "fa3 backend does not support this output contract; it only "
+                "supports q_data_type output without o_scale."
             )
+        if (
+            args.scale_mode == "kv-per-tensor"
+            and args.kv_data_type != torch.float8_e4m3fn
+        ):
+            raise _BackendPlanUnsupportedError(
+                "fa3 backend requires FP8 kv_data_type for the kv-per-tensor "
+                "scale contract."
+            )
+        args._generated_fa_workspace.raise_if_invalid()
         csr = args.csr
         backend = cls(
             args._float_workspace_buffer,
@@ -97,7 +119,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             kv_data_type=args.kv_data_type,
             use_profiler=args.use_profiler,
         )
-        return _MLAWrapperPlanResult(backend_impl=backend)
+        return backend
 
     def plan(
         self,
@@ -126,13 +148,12 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
                 f"MLA kv_data_type {kv_data_type} is not supported. "
                 f"Supported dtypes: {list(supported_kv_dtypes)}."
             )
+        major, minor = get_compute_capability(self.device)
+        if (major, minor) != (9, 0):
+            raise _BackendPlanUnsupportedError(
+                f"FA3 MLA requires an SM90 (Hopper) device, got SM{major}{minor}."
+            )
         if kv_data_type == torch.float8_e4m3fn:
-            major, minor = get_compute_capability(self.device)
-            if major != 9:
-                raise _BackendPlanUnsupportedError(
-                    "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
-                    f"got SM{major}{minor}."
-                )
             if q_data_type != torch.bfloat16:
                 raise _BackendPlanUnsupportedError(
                     "FP8 kv_data_type for MLA currently only supports "
@@ -229,11 +250,8 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
     def run_from_wrapper(
         self,
         *,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
-        kv_cache: Optional[torch.Tensor],
+        query: MLAQuery,
+        kv: MLAKVCache,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -250,6 +268,9 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
         bmm2_scale: Optional[Union[float, torch.Tensor]],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         self._generated_fa_workspace.raise_if_invalid()
+        q_nope, q_pe, ckv_cache, kpe_cache = _split_mla_value_objects(
+            query, kv, getattr(self, "_input_contract", None)
+        )
         if sinks is not None:
             raise ValueError("sinks are not supported by the fa3 wrapper backend.")
         if skip_softmax_threshold_scale_factor is not None:
@@ -282,3 +303,27 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             ckv_scale=ckv_scale,
             kpe_scale=kpe_scale,
         )
+
+
+class Fa3MlaRunner(_GeneratedFaMlaRunner):
+    """Direct functional generated-FA3 MLA runner."""
+
+    backend_name = "fa3"
+
+    def _load_functional_module(self, module_args: Sequence[Any]) -> Any:
+        return get_batch_mla_module("fa3", *module_args)
+
+    def _validate_backend_capability(self, request: _FunctionalMLARequest) -> None:
+        if request.kv_cache.dtype == torch.float8_e4m3fn:
+            raise ValueError("functional fa3 MLA does not support FP8 kv_cache.")
+        supported_kv_dtypes = (torch.float16, torch.bfloat16)
+        if request.kv_cache.dtype not in supported_kv_dtypes:
+            raise _FunctionalBackendUnsupportedError(
+                f"MLA kv_data_type {request.kv_cache.dtype} is not supported. "
+                f"Supported dtypes: {list(supported_kv_dtypes)}."
+            )
+        major, minor = get_compute_capability(request.query.device)
+        if (major, minor) != (9, 0):
+            raise _FunctionalBackendUnsupportedError(
+                f"FA3 MLA requires an SM90 (Hopper) device, got SM{major}{minor}."
+            )

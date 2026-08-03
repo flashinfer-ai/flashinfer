@@ -213,6 +213,7 @@ PageAttention for MLA
 .. autosummary::
     :toctree: ../generated
 
+    batch_mla_paged_attention
     trtllm_batch_decode_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
@@ -229,6 +230,9 @@ PageAttention for MLA
     with ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
     remain arbitrary absolute rows. Precompute that conversion before a CUDA
     Graph or a latency-sensitive loop.
+
+``xqa_batch_decode_with_kv_cache_mla`` is deprecated. Use
+``batch_mla_paged_attention(..., backend="xqa")`` instead.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

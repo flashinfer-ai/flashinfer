@@ -933,7 +933,7 @@ def _xqa_mla_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.xqa_mla``.
+    """Build inputs for ``flashinfer.xqa.xqa_mla``.
 
     Mirrors ``tests/attention/test_xqa.py``: MLA uses 128 query heads,
     FP8 Q/K/V latent width 576, and a bfloat16 output buffer width 512.
