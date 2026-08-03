@@ -44,9 +44,7 @@ def _q_offset_tensor(
     through), which skips differencing it back apart."""
     if q_offset is None:
         seqlens_k = (
-            cu_seqlens_k
-            if k_is_lengths
-            else (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+            cu_seqlens_k if k_is_lengths else (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
         )
         return (seqlens_k - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])).to(torch.int32)
     return _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, device)

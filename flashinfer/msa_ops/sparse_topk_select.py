@@ -167,7 +167,7 @@ def msa_topk_select(
             f"{force_end_blocks}) must be <= topk ({topk})"
         )
 
-    if per_token_nvp:
+    if isinstance(num_valid_pages, torch.Tensor):
         if num_valid_pages.dtype != torch.int32 or num_valid_pages.ndim != 1:
             raise ValueError("num_valid_pages tensor must be 1D int32")
         if num_valid_pages.numel() != total_qo_len:

@@ -151,9 +151,8 @@ def test_per_token_is_cuda_graph_safe():
     g = torch.cuda.CUDAGraph()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        with torch.cuda.graph(g):
-            run()
+    with torch.cuda.stream(s), torch.cuda.graph(g):
+        run()
     torch.cuda.current_stream().wait_stream(s)
 
     eager = msa_topk_select(
