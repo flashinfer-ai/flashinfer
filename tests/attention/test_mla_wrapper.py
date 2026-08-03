@@ -1,0 +1,349 @@
+"""Canonical numerical coverage for the public stateful MLA wrapper."""
+
+from dataclasses import replace
+import warnings
+
+import pytest
+import torch
+
+from flashinfer.mla import (
+    BatchMLAPagedAttentionWrapper,
+    MLAKVCache,
+    MLAPlanMetadata,
+    MLAQuery,
+)
+from tests.test_helpers.mla import (
+    MLATestCase,
+    assert_mla_close,
+    make_mla_inputs,
+    reference_result,
+    require_architecture,
+    unpack_mla_result,
+    wrapper_plan_kwargs,
+    wrapper_run_kwargs,
+)
+
+
+_WRAPPER_BACKENDS = {
+    "fa2",
+    "fa3",
+    "cutlass",
+    "trtllm-gen",
+    "cute-dsl-monolithic",
+    "cute-dsl-modular",
+    "xqa",
+}
+
+_WRAPPER_CASES = (
+    MLATestCase("sm80-fa2-decode", (8, 0), "fa2"),
+    MLATestCase(
+        "sm90-fa2-fp16-csr-split-basee",
+        (9, 0),
+        "fa2",
+        page_size=64,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        output_dtype=torch.float16,
+        kv_layout="independent-split",
+        lse_mode="basee",
+        metadata_form="csr",
+    ),
+    MLATestCase(
+        "sm90-fa2-prefill-adjacent-base2",
+        (9, 0),
+        "fa2",
+        q_len=2,
+        page_size=128,
+        kv_layout="adjacent-split",
+        lse_mode="base2",
+    ),
+    MLATestCase("sm90-fa3-decode", (9, 0), "fa3", lse_mode="base2"),
+    MLATestCase(
+        "sm90-fa3-fp16-csr-adjacent-basee",
+        (9, 0),
+        "fa3",
+        page_size=64,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        output_dtype=torch.float16,
+        kv_layout="adjacent-split",
+        lse_mode="basee",
+        metadata_form="csr",
+    ),
+    MLATestCase(
+        "sm90-fa3-fp8-kv-scale",
+        (9, 0),
+        "fa3",
+        page_size=128,
+        kv_dtype=torch.float8_e4m3fn,
+        kv_layout="independent-split",
+        scale_mode="kv-per-tensor",
+    ),
+    MLATestCase(
+        "sm100-cutlass-decode",
+        (10, 0),
+        "cutlass",
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm100-cutlass-adjacent-page64",
+        (10, 0),
+        "cutlass",
+        page_size=64,
+        kv_layout="adjacent-split",
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm100-cutlass-fp8-output-scale",
+        (10, 0),
+        "cutlass",
+        page_size=128,
+        output_dtype=torch.float8_e4m3fn,
+        kv_layout="independent-split",
+        output_scale="per-tensor",
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm100-trtllm-decode",
+        (10, 0),
+        "trtllm-gen",
+        qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm100-trtllm-base2-scalar-pdl",
+        (10, 0),
+        "trtllm-gen",
+        page_size=64,
+        kv_layout="adjacent-split",
+        lse_mode="base2",
+        scale_mode="bmm-scalar",
+        enable_pdl=True,
+        qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm100-trtllm-tensor-skip-softmax",
+        (10, 0),
+        "trtllm-gen",
+        page_size=64,
+        scale_mode="bmm-tensor",
+        skip_softmax=True,
+        enable_pdl=False,
+        is_var_seq=True,
+        qk_nope_head_dim=128,
+    ),
+    MLATestCase("sm100-cute-monolithic", (10, 0), "cute-dsl-monolithic"),
+    MLATestCase(
+        "sm100-cute-monolithic-fp16-basee",
+        (10, 0),
+        "cute-dsl-monolithic",
+        page_size=128,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        kv_layout="adjacent-split",
+        lse_mode="basee",
+        scale_mode="bmm-scalar",
+        is_var_seq=True,
+    ),
+    MLATestCase(
+        "sm100-cute-modular",
+        (10, 0),
+        "cute-dsl-modular",
+    ),
+    MLATestCase(
+        "sm100-cute-modular-fp16-scalar",
+        (10, 0),
+        "cute-dsl-modular",
+        page_size=64,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        kv_layout="adjacent-split",
+        scale_mode="bmm-scalar",
+        is_var_seq=True,
+    ),
+    MLATestCase(
+        "sm120-xqa-decode",
+        (12, 0),
+        "xqa",
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm120-xqa-adjacent-scalar-pdl",
+        (12, 0),
+        "xqa",
+        page_size=64,
+        kv_layout="adjacent-split",
+        scale_mode="bmm-scalar",
+        enable_pdl=True,
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+    MLATestCase(
+        "sm120-xqa-page128-pdl-off",
+        (12, 0),
+        "xqa",
+        page_size=128,
+        enable_pdl=False,
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+)
+
+_AUTO_CASES = (
+    MLATestCase("sm90-auto", (9, 0), "auto"),
+    MLATestCase("sm100-auto", (10, 0), "auto", qk_nope_head_dim=128),
+    MLATestCase("sm103-auto", (10, 3), "auto", qk_nope_head_dim=128),
+    MLATestCase("sm120-auto", (12, 0), "auto", softmax_scale_qk_nope_head_dim=128),
+    MLATestCase("sm121-auto", (12, 1), "auto", softmax_scale_qk_nope_head_dim=128),
+)
+
+
+def _workspace() -> torch.Tensor:
+    return torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+
+def _metadata(case, inputs):
+    if case.metadata_form == "csr":
+        return MLAPlanMetadata.csr(
+            inputs.qo_indptr,
+            inputs.kv_indptr,
+            inputs.kv_indices,
+            inputs.kv_len_arr,
+        )
+    return MLAPlanMetadata.dense(
+        inputs.cum_seq_lens_q,
+        inputs.block_tables,
+        inputs.seq_lens,
+        case.q_len,
+    )
+
+
+def _query_and_kv(inputs):
+    query = MLAQuery.split(inputs.q_nope, inputs.q_pe)
+    if inputs.kv_cache is not None:
+        return query, MLAKVCache.packed(inputs.kv_cache)
+    return query, MLAKVCache.split(inputs.ckv_cache, inputs.kpe_cache)
+
+
+def _run_public_wrapper(case, inputs):
+    wrapper = BatchMLAPagedAttentionWrapper(_workspace(), backend=case.backend)
+    plan_kwargs = wrapper_plan_kwargs(case, inputs)
+    for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
+        plan_kwargs.pop(name)
+    wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
+    query, kv = _query_and_kv(inputs)
+    run_kwargs = wrapper_run_kwargs(case, inputs)
+    for name in ("kv_cache", "ckv_cache", "kpe_cache"):
+        run_kwargs.pop(name)
+    result = wrapper.run(query=query, kv=kv, **run_kwargs)
+    return wrapper, unpack_mla_result(result, case.lse_mode != "none")
+
+
+def test_wrapper_case_table_covers_every_explicit_backend():
+    assert {case.backend for case in _WRAPPER_CASES} == _WRAPPER_BACKENDS
+
+
+def test_wrapper_case_table_covers_public_configuration_dimensions():
+    assert {case.q_dtype for case in _WRAPPER_CASES} == {
+        torch.float16,
+        torch.bfloat16,
+    }
+    assert {case.page_size for case in _WRAPPER_CASES} == {32, 64, 128}
+    assert {case.q_len for case in _WRAPPER_CASES} == {1, 2}
+    assert {case.kv_layout for case in _WRAPPER_CASES} == {
+        "combined",
+        "adjacent-split",
+        "independent-split",
+    }
+    assert {case.lse_mode for case in _WRAPPER_CASES} == {
+        "none",
+        "base2",
+        "basee",
+    }
+    assert {case.scale_mode for case in _WRAPPER_CASES} == {
+        "default",
+        "bmm-scalar",
+        "bmm-tensor",
+        "kv-per-tensor",
+    }
+    assert {case.output_scale for case in _WRAPPER_CASES} == {
+        "none",
+        "per-tensor",
+    }
+    assert {case.skip_softmax for case in _WRAPPER_CASES} == {False, True}
+    assert {case.metadata_form for case in _WRAPPER_CASES} == {"dense", "csr"}
+    assert {case.enable_pdl for case in _WRAPPER_CASES} == {None, False, True}
+
+
+@pytest.mark.parametrize("case", _WRAPPER_CASES, ids=lambda case: case.case_id)
+def test_explicit_wrapper_matches_reference(case):
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, expected_lse = reference_result(case, inputs)
+
+    wrapper, (actual_output, actual_lse) = _run_public_wrapper(case, inputs)
+
+    assert wrapper.resolved_backend == case.backend
+    assert_mla_close(
+        actual_output,
+        expected_output,
+        fp8=case.output_dtype == torch.float8_e4m3fn,
+    )
+    if expected_lse is not None:
+        assert_mla_close(actual_lse, expected_lse)
+
+
+@pytest.mark.parametrize("case", _AUTO_CASES, ids=lambda case: case.case_id)
+def test_wrapper_auto_matches_selected_backend_and_reference(case):
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, expected_lse = reference_result(case, inputs)
+
+    automatic, automatic_result = _run_public_wrapper(case, inputs)
+    assert automatic.resolved_backend in _WRAPPER_BACKENDS
+    explicit, explicit_result = _run_public_wrapper(
+        replace(case, backend=automatic.resolved_backend), inputs
+    )
+
+    assert explicit.resolved_backend == automatic.resolved_backend
+    assert_mla_close(automatic_result[0], expected_output)
+    assert_mla_close(automatic_result[0], explicit_result[0])
+    if expected_lse is not None:
+        assert_mla_close(automatic_result[1], expected_lse)
+        assert_mla_close(automatic_result[1], explicit_result[1])
+
+
+def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
+    case = MLATestCase("sm90-fa3-legacy", (9, 0), "fa3", kv_layout="independent-split")
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, _ = reference_result(case, inputs)
+    wrapper = BatchMLAPagedAttentionWrapper(_workspace(), backend="fa3")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        wrapper.plan(
+            inputs.qo_indptr,
+            inputs.kv_indptr,
+            inputs.kv_indices,
+            inputs.kv_len_arr,
+            128,
+            512,
+            64,
+            case.page_size,
+            False,
+            case.sm_scale,
+            case.q_dtype,
+            case.kv_dtype,
+            kv_layout=case.kv_layout,
+        )
+        first = wrapper.run(
+            inputs.q_nope, inputs.q_pe, inputs.ckv_cache, inputs.kpe_cache
+        )
+        warning_count = len(caught)
+        second = wrapper.run(
+            inputs.q_nope, inputs.q_pe, inputs.ckv_cache, inputs.kpe_cache
+        )
+
+    assert warning_count == len(caught)
+    assert sum("Positional MLA arguments" in str(item.message) for item in caught) == 1
+    assert sum("Legacy MLA metadata" in str(item.message) for item in caught) == 1
+    assert_mla_close(first, expected_output)
+    assert_mla_close(second, expected_output)

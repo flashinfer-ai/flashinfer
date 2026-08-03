@@ -152,6 +152,7 @@ def test_xqa_mla_batch_decode(
         sm_scale,
         query.dtype,
         kv_cache.dtype,
+        kv_layout="adjacent-split",
     )
     q_nope = query[..., :kv_lora_rank].view(
         batch_size * q_len_per_request, num_q_heads, kv_lora_rank

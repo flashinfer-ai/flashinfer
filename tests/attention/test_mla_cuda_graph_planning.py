@@ -8,6 +8,7 @@ import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.mla import _core as mla_core
+from flashinfer.mla import MLAKVCache, MLAPlanMetadata, MLAQuery
 from flashinfer.mla._batch_mla import _wrapper as batch_mla_core
 from flashinfer.mla._batch_mla import _planning
 from flashinfer.mla._batch_mla._backends import _fa_common
@@ -68,6 +69,8 @@ def _dense_plan_args(backend_name):
         sm_scale=1.0,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        kv_layout="combined",
         qk_nope_head_dim=128 if backend_name == "trtllm-gen" else None,
     )
 
@@ -86,12 +89,21 @@ def _csr_plan_args():
         sm_scale=1.0,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
     )
 
 
 def _make_generated_fa_plan_request(workspace):
+    plan_args = _csr_plan_args()
+    metadata = MLAPlanMetadata.csr(
+        plan_args.pop("qo_indptr"),
+        plan_args.pop("kv_indptr"),
+        plan_args.pop("kv_indices"),
+        plan_args.pop("kv_len_arr"),
+    )
     return _planning._MLAPlanArguments(
-        **_csr_plan_args(),
+        metadata=metadata,
+        **plan_args,
         _float_workspace_buffer=torch.empty(1),
         _generated_fa_workspace=workspace,
         _use_cuda_graph=False,
@@ -104,10 +116,8 @@ def _make_generated_fa_plan_request(workspace):
 
 def _generated_fa_run_args():
     return dict(
-        q_nope=None,
-        q_pe=None,
-        ckv_cache=None,
-        kpe_cache=None,
+        query=MLAQuery.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+        kv=MLAKVCache.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
         out=None,
         lse=None,
         return_lse=False,
@@ -181,11 +191,11 @@ def test_non_fa_plan_ignores_invalid_generated_fa_workspace(monkeypatch):
     backend = object()
 
     def successful_cutlass_plan(cls, args):
-        assert cls is batch_mla_core._WRAPPER_BACKEND_TYPES["cutlass"]
-        return _planning._MLAWrapperPlanResult(backend_impl=backend)
+        assert cls is batch_mla_core._BATCH_MLA_BACKENDS["cutlass"]
+        return backend
 
     monkeypatch.setattr(
-        batch_mla_core._WRAPPER_BACKEND_TYPES["cutlass"],
+        batch_mla_core._BATCH_MLA_BACKENDS["cutlass"],
         "plan_from_wrapper",
         classmethod(successful_cutlass_plan),
     )
@@ -216,13 +226,21 @@ def test_non_fa_run_ignores_invalid_generated_fa_workspace():
         "qo_indptr", RuntimeError("copy failed")
     )
 
-    assert wrapper.run(None, None, None, None) is result
+    assert (
+        wrapper.run(
+            torch.empty((1, 1, 1)),
+            torch.empty((1, 1, 1)),
+            torch.empty((1, 1, 1)),
+            torch.empty((1, 1, 1)),
+        )
+        is result
+    )
     assert len(calls) == 1
 
 
 def _patch_plan_from_wrapper_owner(monkeypatch, backend_name, owner):
-    backend_type = batch_mla_core._WRAPPER_BACKEND_TYPES[backend_name]
-    plan_from_wrapper = backend_type.__dict__["plan_from_wrapper"].__func__
+    backend_type = batch_mla_core._BATCH_MLA_BACKENDS[backend_name]
+    plan_from_wrapper = backend_type.plan_from_wrapper.__func__
 
     def dispatch(cls, args):
         assert cls is backend_type
@@ -235,12 +253,14 @@ def _patch_plan_from_wrapper_owner(monkeypatch, backend_name, owner):
     )
 
 
-@pytest.mark.parametrize("backend_name", ("cutlass", "trtllm-gen", "cute-dsl", "xqa"))
+@pytest.mark.parametrize(
+    "backend_name", ("cutlass", "trtllm-gen", "cute-dsl-monolithic", "xqa")
+)
 def test_cuda_graph_dense_backend_supports_first_plan_but_rejects_replan(
     monkeypatch, backend_name
 ):
     backend = _RecordingBackend()
-    backend_type = batch_mla_core._WRAPPER_BACKEND_TYPES[backend_name]
+    backend_type = batch_mla_core._BATCH_MLA_BACKENDS[backend_name]
 
     class _Backend(backend_type):
         def __new__(cls, *args):
@@ -579,6 +599,8 @@ def test_generated_fa_replans_share_wrapper_workspace_and_replace_backend(
 
 
 def test_auto_cuda_graph_replan_stays_on_selected_fa_backend(monkeypatch):
+    from flashinfer.mla._batch_mla import _auto_policy
+
     instances = []
     cutlass_plan_calls = 0
 
@@ -597,10 +619,12 @@ def test_auto_cuda_graph_replan_stays_on_selected_fa_backend(monkeypatch):
         cutlass_plan_calls += 1
         raise AssertionError("CUDA-graph FA replan must not fall back to CUTLASS")
 
-    monkeypatch.setattr(batch_mla_core, "determine_mla_backend", lambda device: "fa2")
+    monkeypatch.setattr(
+        _auto_policy, "rank_auto_backend_candidates", lambda args: ("fa2", "cutlass")
+    )
     _patch_plan_from_wrapper_owner(monkeypatch, "fa2", _FaBackend)
     monkeypatch.setattr(
-        batch_mla_core._WRAPPER_BACKEND_TYPES["cutlass"],
+        batch_mla_core._BATCH_MLA_BACKENDS["cutlass"],
         "plan_from_wrapper",
         classmethod(reject_cutlass_fallback),
     )

@@ -36,7 +36,7 @@ from .mla import (
     trtllm_batch_decode_with_kv_cache_mla as trtllm_batch_decode_with_kv_cache_mla,
     xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
 )
-from .xqa import xqa, xqa_mla as xqa_mla
+from .xqa import xqa
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
     gen_batch_decode_mla_module,

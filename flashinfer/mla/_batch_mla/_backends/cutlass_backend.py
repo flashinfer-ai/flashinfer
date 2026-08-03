@@ -11,22 +11,31 @@ You may obtain a copy of the License at
 import functools
 import logging
 import math
-from typing import Optional, Tuple, Union
+from dataclasses import replace
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
+from flashinfer.autotuner import TunableRunner
 from flashinfer.jit.mla import gen_mla_module
+from ._capabilities import (
+    BACKEND_OPERATIONAL_PLAN_FIELDS,
+    MLAPlanCapabilities,
+    validate_plan_capabilities,
+)
 from .._planning import (
-    _audit_plan_from_wrapper_arguments,
     _MLAPlanArguments,
-    _MLAWrapperPlanResult,
+    _validate_dense_metadata,
+)
+from .._contracts import (
+    MLAKVCache,
+    MLAQuery,
+    _FunctionalMLARequest,
+    _concat_adjacent_views_or_cat,
+    _split_mla_value_objects,
 )
 from flashinfer.utils import check_shape_dtype_device, get_compute_capability
-
-from ._layout import (
-    _concat_adjacent_views_or_cat,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -140,33 +149,37 @@ class _BatchMLAPagedAttentionCutlassBackend:
     unless callers provide cheap-verified aliases of the same tensor views.
     """
 
+    _plan_capabilities = MLAPlanCapabilities(
+        backend_name="cutlass",
+        lse_modes=frozenset({"none"}),
+        kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
+        output_scales=frozenset({"none", "per-tensor"}),
+        scale_modes=frozenset({"default"}),
+    )
+    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
+
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self._backend = "cutlass"
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
     @classmethod
-    @_audit_plan_from_wrapper_arguments
-    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _MLAWrapperPlanResult:
-        enable_pdl = args.enable_pdl
-        is_var_seq = args.is_var_seq
-        use_sinks = args.use_sinks
-        qk_nope_head_dim = args.qk_nope_head_dim
-        if enable_pdl:
-            raise ValueError(
-                "enable_pdl is not supported by the cutlass wrapper backend."
+    def plan_from_wrapper(
+        cls, args: _MLAPlanArguments
+    ) -> "_BatchMLAPagedAttentionCutlassBackend":
+        validate_plan_capabilities(args, cls._plan_capabilities)
+        output_dtype = args.output_dtype
+        output_scale = args.output_scale
+        if output_scale == "none" and output_dtype != args.q_data_type:
+            raise _BackendPlanUnsupportedError(
+                "cutlass backend requires q_data_type output without o_scale."
             )
-        if is_var_seq is not None:
-            raise ValueError(
-                "is_var_seq is not supported by the cutlass wrapper backend."
-            )
-        if use_sinks:
-            raise ValueError(
-                "use_sinks is not supported by the cutlass wrapper backend."
-            )
-        if qk_nope_head_dim is not None:
-            raise ValueError(
-                "qk_nope_head_dim is only supported with trtllm-gen backend."
+        if output_scale == "per-tensor" and output_dtype not in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            raise _BackendPlanUnsupportedError(
+                "cutlass backend requires FP8 output for the per-tensor output contract."
             )
         if (
             not isinstance(args.page_size, int)
@@ -177,7 +190,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 f"page_size must be a positive int, got {args.page_size!r}."
             )
         if args.page_size > 128 or 128 % args.page_size != 0:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutlass dense metadata requires page_size to divide 128, "
                 f"got {args.page_size}."
             )
@@ -198,7 +211,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
             kv_len=dense.seq_lens,
             page_table=dense.block_tables,
         )
-        return _MLAWrapperPlanResult(backend_impl=backend)
+        return backend
 
     def plan(
         self,
@@ -278,6 +291,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
             )
         self._batch_size = batch_size
         self._page_size = page_size
+        self._head_dim_ckv = head_dim_ckv
         self._kv_len = kv_len
         self._page_table = page_table
         self._cached_module = get_mla_module()
@@ -372,11 +386,8 @@ class _BatchMLAPagedAttentionCutlassBackend:
     def run_from_wrapper(
         self,
         *,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
-        kv_cache: Optional[torch.Tensor],
+        query: MLAQuery,
+        kv: MLAKVCache,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -404,14 +415,14 @@ class _BatchMLAPagedAttentionCutlassBackend:
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
         )
+        packed_query = query.require_packed()
+        kv_cache = kv.packed_or_adjacent()
+        if kv_cache is None:
+            ckv_cache, kpe_cache = kv.split_views(None)
+            kv_cache = _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
         return self.run(
-            q_nope=q_nope,
-            q_pe=q_pe,
-            kv_cache=(
-                _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
-                if kv_cache is None
-                else kv_cache
-            ),
+            query=packed_query,
+            kv_cache=kv_cache,
             out=out,
             kv_len=kv_len,
             page_table=page_table,
@@ -423,11 +434,8 @@ class _BatchMLAPagedAttentionCutlassBackend:
         cls,
         float_workspace_buffer: torch.Tensor,
         *,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        ckv_cache: torch.Tensor,
-        kpe_cache: torch.Tensor,
-        kv_cache: Optional[torch.Tensor],
+        query: MLAQuery,
+        kv: MLAKVCache,
         out: Optional[torch.Tensor],
         lse: Optional[torch.Tensor],
         return_lse: bool,
@@ -456,6 +464,9 @@ class _BatchMLAPagedAttentionCutlassBackend:
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
         )
+        q_nope, q_pe, ckv_cache, kpe_cache = _split_mla_value_objects(query, kv, None)
+        packed_query = query.require_packed()
+        kv_cache = kv.packed_or_adjacent()
         backend = cls(float_workspace_buffer)
         backend.plan(
             num_heads=q_nope.shape[1],
@@ -472,8 +483,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
             page_table=None,
         )
         return backend.run(
-            q_nope=q_nope,
-            q_pe=q_pe,
+            query=packed_query,
             kv_cache=(
                 _concat_adjacent_views_or_cat(ckv_cache, kpe_cache)
                 if kv_cache is None
@@ -488,8 +498,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
     def run(
         self,
         *,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
+        query: torch.Tensor,
         kv_cache: torch.Tensor,
         out: Optional[torch.Tensor],
         kv_len: Optional[torch.Tensor],
@@ -503,6 +512,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
             )
 
         kv_len, page_table = self._resolve_metadata(kv_len, page_table)
+        out_shape = query.shape[:-1] + (self._head_dim_ckv,)
 
         output_scale = 1.0
         if o_scale is not None:
@@ -522,24 +532,234 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 raise ValueError(
                     f"out must be an FP8 tensor when o_scale is provided, got {out.dtype}"
                 )
-            check_shape_dtype_device(out, q_nope.shape, None, q_nope.device, "out")
+            check_shape_dtype_device(
+                out,
+                out_shape,
+                None,
+                query.device,
+                "out",
+            )
         elif out is None:
-            out = torch.empty_like(q_nope)
+            out = torch.empty(
+                out_shape,
+                dtype=query.dtype,
+                device=query.device,
+            )
         else:
             check_shape_dtype_device(
-                out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                out,
+                out_shape,
+                query.dtype,
+                query.device,
+                "out",
             )
-        q_nope_pe = _concat_adjacent_views_or_cat(q_nope, q_pe)
-        _check_cutlass_shape(q_nope_pe, kv_cache, kv_len, page_table)
+        _check_cutlass_shape(query, kv_cache, kv_len, page_table)
         lse = torch.empty(0, dtype=torch.float32, device=self.device)
         self._cached_module.cutlass_mla_paged_attention(
             self._float_workspace_buffer,
             out,
             lse,
-            q_nope_pe,
+            query,
             kv_cache,
             kv_len,
             page_table,
             output_scale,
+        )
+        return out
+
+
+class CutlassMlaRunner(TunableRunner):
+    """Direct functional runner for the fixed-shape CUTLASS MLA kernel."""
+
+    name = "cutlass"
+
+    def __init__(self, request: _FunctionalMLARequest) -> None:
+        self.request = request
+        self._validate_functional_options(request)
+        initial_out = request.out
+        if initial_out is None:
+            initial_out = torch.empty(
+                request.query.shape[:-1] + (request.kv_lora_rank,),
+                dtype=request.query.dtype,
+                device=request.query.device,
+            )
+        self._normalize_request(replace(request, out=initial_out))
+        self._inputs = [
+            request.query,
+            request.block_tables,
+            request.seq_lens,
+            initial_out,
+        ]
+
+    @staticmethod
+    def _validate_functional_options(request: _FunctionalMLARequest) -> None:
+        if request.sparse_mla_top_k:
+            raise ValueError("cutlass MLA does not support sparse_mla_top_k.")
+        if not request.uses_shared_paged_kv_idx:
+            raise ValueError("cutlass MLA requires dense shared page-table metadata.")
+        if request.cum_seq_lens_q is not None:
+            raise ValueError("cutlass MLA does not support ragged queries.")
+        if request.return_lse or request.lse is not None:
+            raise ValueError("cutlass MLA does not support LSE output.")
+        if isinstance(request.bmm1_scale, torch.Tensor) or isinstance(
+            request.bmm2_scale, torch.Tensor
+        ):
+            raise ValueError("cutlass MLA does not support tensor scales.")
+        try:
+            bmm1_scale = float(request.bmm1_scale)
+            bmm2_scale = float(request.bmm2_scale)
+        except (TypeError, ValueError) as error:
+            raise ValueError("cutlass MLA scales must be scalar floats.") from error
+        if not math.isfinite(bmm1_scale) or not math.isfinite(bmm2_scale):
+            raise ValueError("cutlass MLA scales must be finite.")
+        if bmm2_scale != 1.0:
+            raise ValueError("cutlass MLA requires bmm2_scale == 1.0.")
+        if request.sinks is not None:
+            raise ValueError("cutlass MLA does not support sinks.")
+        if request.skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("cutlass MLA does not support skip-softmax.")
+        if request.enable_pdl is not None:
+            raise ValueError("cutlass MLA does not support enable_pdl.")
+        if request.is_var_seq is not True:
+            raise ValueError("cutlass MLA requires is_var_seq=True.")
+        if request.multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported by trtllm-gen."
+            )
+
+    @staticmethod
+    def _normalize_request(
+        request: _FunctionalMLARequest,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        query = request.query
+        kv_cache = request.kv_cache
+        if not isinstance(query, torch.Tensor) or query.ndim != 4:
+            raise ValueError(
+                "cutlass MLA requires a rank-4 dense query with q_len == 1."
+            )
+        if query.shape[1] != 1:
+            raise ValueError("cutlass MLA requires q_len == 1.")
+        if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 3:
+            raise ValueError("cutlass MLA requires a rank-3 packed kv_cache.")
+        if query.device != kv_cache.device:
+            raise ValueError("query and kv_cache must be on the same device.")
+        if query.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ) or kv_cache.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            raise ValueError("functional cutlass MLA does not support FP8 query or KV.")
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("cutlass MLA requires float16 or bfloat16 query and KV.")
+        if query.dtype != kv_cache.dtype:
+            raise ValueError("query and kv_cache must have matching dtype.")
+        if (
+            not isinstance(request.kv_lora_rank, int)
+            or isinstance(request.kv_lora_rank, bool)
+            or not isinstance(request.qk_rope_head_dim, int)
+            or isinstance(request.qk_rope_head_dim, bool)
+            or request.kv_lora_rank <= 0
+            or request.qk_rope_head_dim <= 0
+        ):
+            raise ValueError("kv_lora_rank and qk_rope_head_dim must be positive ints.")
+        packed_head_dim = request.kv_lora_rank + request.qk_rope_head_dim
+        if query.shape[-1] != packed_head_dim or kv_cache.shape[-1] != packed_head_dim:
+            raise ValueError(
+                "query and kv_cache must use the packed MLA head dimension."
+            )
+        if request.seq_lens is None:
+            raise ValueError("seq_lens is required for cutlass MLA.")
+        page_size = kv_cache.shape[1]
+        if page_size <= 0:
+            raise ValueError("kv_cache page_size must be positive.")
+        if page_size > 128 or 128 % page_size != 0:
+            raise ValueError("cutlass MLA requires page_size to divide 128.")
+        if not isinstance(request.workspace_buffer, torch.Tensor):
+            raise ValueError("workspace_buffer must be a torch.Tensor.")
+        if request.workspace_buffer.device != query.device:
+            raise ValueError("workspace_buffer must be on the query device.")
+        cumulative_q = torch.arange(
+            query.shape[0] + 1, dtype=torch.int32, device=query.device
+        )
+        dense = _validate_dense_metadata(
+            cum_seq_lens_q=cumulative_q,
+            block_tables=request.block_tables,
+            seq_lens=request.seq_lens,
+            max_q_len=1,
+            page_size=page_size,
+            device=query.device,
+            table_width_alignment=128 // page_size,
+        )
+        _validate_cutlass_metadata(
+            dense.seq_lens,
+            dense.block_tables,
+            batch_size=query.shape[0],
+            page_size=page_size,
+            device=query.device,
+        )
+        expected_out_shape = query.shape[:-1] + (request.kv_lora_rank,)
+        out = request.out
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.shape != expected_out_shape
+            or out.dtype != query.dtype
+            or out.device != query.device
+        ):
+            raise ValueError(
+                "out must match the functional CUTLASS output shape, dtype, and device."
+            )
+        _check_cutlass_shape(query[:, 0], kv_cache, dense.seq_lens, dense.block_tables)
+        return (
+            query[:, 0],
+            kv_cache,
+            dense.seq_lens,
+            dense.block_tables,
+            float(request.bmm1_scale),
+        )
+
+    @property
+    def inputs(self) -> list[torch.Tensor]:
+        return self._inputs
+
+    def get_valid_tactics(self, inputs, profile) -> list[int]:
+        del inputs, profile
+        return [-1]
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del do_preparation, kwargs
+        if tactic != -1:
+            raise ValueError(f"cutlass MLA only supports tactic -1, got {tactic!r}.")
+        if len(inputs) != 4:
+            raise ValueError("cutlass MLA runner expects four dynamic inputs.")
+        query, block_tables, seq_lens, out = inputs
+        request = replace(
+            self.request,
+            query=query,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            out=out,
+        )
+        self._validate_functional_options(request)
+        packed_query, kv_cache, kv_len, page_table, sm_scale = self._normalize_request(
+            request
+        )
+        lse = torch.empty(0, dtype=torch.float32, device=query.device)
+        get_mla_module().cutlass_mla_paged_attention(
+            request.workspace_buffer,
+            out[:, 0],
+            lse,
+            packed_query,
+            kv_cache,
+            kv_len,
+            page_table,
+            sm_scale,
         )
         return out
