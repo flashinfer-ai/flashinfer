@@ -1956,7 +1956,14 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             # init tSMrState from initial_state
             tSMrState_cv.store(tSMgInitialState.load().to(cutlass.Float32))
             if cutlass.const_expr(self.store_initial_state):
-                cute.copy(tiled_store_C, tSMrState_store, tSMgInitialStateWorkspace)
+                tSMrInitialState = cute.make_tensor(
+                    tSMrState_store.iterator.align(8), tSMrState_store.layout
+                )
+                tSMgInitialStateWorkspace = cute.make_tensor(
+                    tSMgInitialStateWorkspace.iterator.align(8),
+                    tSMgInitialStateWorkspace.layout,
+                )
+                cute.autovec_copy(tSMrInitialState, tSMgInitialStateWorkspace)
 
         for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
             TF32.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)

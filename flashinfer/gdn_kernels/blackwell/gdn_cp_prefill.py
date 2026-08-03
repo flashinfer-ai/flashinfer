@@ -628,6 +628,7 @@ def _get_prefill_kernel(
     is_gqa,
     head_ratio,
     needs_initial_state,
+    store_final_state,
     cu_seqlens_dtype,
 ):
     return CPDeltaRulePrefillTcgen05Sm100(
@@ -643,7 +644,7 @@ def _get_prefill_kernel(
         is_GQA=is_gqa,
         head_ratio=head_ratio,
         use_initial_state=needs_initial_state,
-        store_final_state=False,
+        store_final_state=store_final_state,
         enable_checkpoints=False,
         is_persistent=False,
         cu_seqlens_dtype=cu_seqlens_dtype,
@@ -652,6 +653,7 @@ def _get_prefill_kernel(
 
 def cp_delta_rule_prefill_dsl_sm100(
     o: torch.Tensor,
+    state: torch.Tensor | None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -747,6 +749,15 @@ def cp_delta_rule_prefill_dsl_sm100(
             raise RuntimeError(
                 f"fixed_state must have shape {expected_workspace_shape}, got {tuple(fixed_state.shape)}"
             )
+        if state is not None:
+            if state.shape != expected_state_shape:
+                raise RuntimeError(
+                    f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
+                )
+            if state.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+                raise RuntimeError(
+                    f"state must have dtype float32, bfloat16, or float16, got {state.dtype}"
+                )
         if initial_state is not None:
             if initial_state.shape != expected_state_shape:
                 raise RuntimeError(
@@ -770,8 +781,18 @@ def cp_delta_rule_prefill_dsl_sm100(
         ):
             if tensor is not None and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
+        if state is not None and state.stride()[1:] != (d * d, d, 1):
+            raise RuntimeError("state must be contiguous in its inner [H, V, K] modes")
         if initial_state is not None and initial_state.stride()[1:] != (d * d, d, 1):
             raise RuntimeError("initial_state must be contiguous in its inner [H, V, K] modes")
+        if (
+            state is not None
+            and initial_state is not None
+            and state.dtype != initial_state.dtype
+        ):
+            raise RuntimeError(
+                f"state and initial_state dtypes must match, got {state.dtype} and {initial_state.dtype}"
+            )
     if total_cp_chunks == 0:
         return
 
@@ -789,18 +810,19 @@ def cp_delta_rule_prefill_dsl_sm100(
         else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
     )
     needs_initial_state = initial_state is not None
+    store_final_state = state is not None
     num_sm = get_device_sm_count(device)
     is_gqa = num_q_heads >= num_v_heads
     head_ratio = num_q_heads // num_v_heads if is_gqa else num_v_heads // num_q_heads
+    state_dtype = state.dtype if store_final_state else initial_state.dtype if needs_initial_state else torch.float32
     kernel = _get_prefill_kernel(
         kernel_dtype,
-        _cutlass_state_dtype(
-            initial_state.dtype if needs_initial_state else torch.float32
-        ),
+        _cutlass_state_dtype(state_dtype),
         num_sm,
         is_gqa,
         head_ratio,
         needs_initial_state,
+        store_final_state,
         _cu_seqlens_dtype(cu_seqlens.dtype),
     )
     compile_options = _blackwell_compile_options(device)
@@ -823,6 +845,10 @@ def cp_delta_rule_prefill_dsl_sm100(
         if needs_initial_state:
             initial_state_cute = from_dlpack(initial_state, assumed_align=16)
             _mark_state_layout(initial_state_cute, False, d)
+        state_cute = None
+        if store_final_state:
+            state_cute = from_dlpack(state, assumed_align=16)
+            _mark_state_layout(state_cute, False, d)
         kernel_args = (
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(k, assumed_align=16).mark_layout_dynamic(),
@@ -833,7 +859,7 @@ def cp_delta_rule_prefill_dsl_sm100(
             from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
             from_dlpack(fixed_state, assumed_align=16).mark_layout_dynamic(),
             initial_state_cute,
-            None,
+            state_cute,
             cutlass.Int32(cp_chunk_len),
             cutlass.Int32(total_cp_chunks),
             cutlass.Int32(max_cp_chunks_per_seq),
@@ -853,7 +879,7 @@ def cp_delta_rule_prefill_dsl_sm100(
         cu_seqlens,
         fixed_state,
         initial_state if needs_initial_state else None,
-        None,
+        state if store_final_state else None,
         cp_chunk_len,
         total_cp_chunks,
         max_cp_chunks_per_seq,
@@ -1062,6 +1088,7 @@ def cp_delta_rule_dsl_sm100(
         )
         cp_delta_rule_prefill_dsl_sm100(
             o,
+            None,
             q,
             k,
             v,
