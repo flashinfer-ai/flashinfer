@@ -347,15 +347,16 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
     "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
 )
 def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
-    """Paged FA3 must advance past a zero-visible request without hanging."""
+    """Paged FA3 must advance past zero-visible data and preserve page bases."""
     device = torch.device("cuda:0")
     block_size = 32
     page_size = 16
     num_heads, num_kv_heads, head_dim = 32, 8, 128
-    qo_len = kv_len = 64
+    qo_len = 64
+    kv_lens = [64, 97]
     batch_size = 2
-    pages_per_request = kv_len // page_size
-    num_pages = batch_size * pages_per_request
+    pages_per_request = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    num_pages = sum(pages_per_request)
     sm_scale = 1.0 / math.sqrt(head_dim)
     tol = tolerance_for(dtype)
 
@@ -374,7 +375,9 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
     k = paged_kv[:, 0].reshape(-1, num_kv_heads, head_dim)
     v = paged_kv[:, 1].reshape(-1, num_kv_heads, head_dim)
 
-    # Request 0 sees no KV (kv_offset=256); request 1 is a normal request.
+    # Request 0 sees no KV (kv_offset=256); request 1 is normal and has a
+    # different number of pages. This catches accidental compaction of the
+    # page indptr, which would shift request 1's physical page-table base.
     q_offset_values = [0, 0]
     kv_offset_values = [256, 0]
     q_offsets = torch.tensor(q_offset_values, dtype=torch.int32, device=device)
@@ -383,17 +386,21 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
         [0, qo_len, 2 * qo_len], dtype=torch.int32, device=device
     )
     paged_kv_indptr = torch.tensor(
-        [0, pages_per_request, num_pages], dtype=torch.int32, device=device
+        [0, pages_per_request[0], num_pages], dtype=torch.int32, device=device
     )
     paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
-    paged_kv_last_page_len = torch.full(
-        (batch_size,), page_size, dtype=torch.int32, device=device
+    paged_kv_last_page_len = torch.tensor(
+        [page_size, kv_lens[1] - (pages_per_request[1] - 1) * page_size],
+        dtype=torch.int32,
+        device=device,
     )
 
     refs = []
+    kv_starts = [0, pages_per_request[0] * page_size]
     for i in range(batch_size):
         start_q, end_q = i * qo_len, (i + 1) * qo_len
-        start_kv, end_kv = i * kv_len, (i + 1) * kv_len
+        start_kv = kv_starts[i]
+        end_kv = start_kv + kv_lens[i]
         refs.append(
             block_extend_reference(
                 q[start_q:end_q],
