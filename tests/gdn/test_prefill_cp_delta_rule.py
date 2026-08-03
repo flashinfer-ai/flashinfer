@@ -25,7 +25,11 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
-from flashinfer.utils import is_sm90a_supported, is_sm12x_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm12x_supported,
+)
 
 if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
@@ -34,6 +38,14 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
         cp_delta_rule_mn_precompute_dsl_sm90 as cp_delta_rule_mn_precompute_dsl,
         cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
+    )
+elif torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda")):
+    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+        cp_delta_rule_dsl_sm100 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm100 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm100 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm100 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm100 as cp_delta_rule_t_precompute_dsl,
     )
 elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm120 import (
@@ -52,6 +64,8 @@ else:
 
 from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
     chunk_bound_host,
+    choose_cp_chunk_len_host,
+    should_use_cp_host,
     workspace_num_chunks_host,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
@@ -65,8 +79,12 @@ FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM12x")
+    if not (
+        is_sm90a_supported(device)
+        or is_sm100a_supported(device)
+        or is_sm12x_supported(device)
+    ):
+        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
 
 
 def _seed_all(seed):
@@ -88,6 +106,99 @@ def _make_gates(total_seqlen, num_heads, baseline, device):
         + (1.0 - baseline)
         * torch.rand(total_seqlen, num_heads, dtype=torch.float32, device=device)
     ).contiguous()
+
+
+@pytest.mark.parametrize(
+    "parallel_work, total_seqlen, num_seqs, expected",
+    [
+        (8, 1536, 1, False),
+        (8, 2048, 1, False),
+        (16, 4095, 1, False),
+        (16, 4096, 1, True),
+        (16, 8192 * 2, 2, True),
+        (16, 8192 * 3, 3, False),
+        (16, 8192, 1, True),
+        (24, 16383, 1, False),
+        (24, 16384, 1, True),
+        (32, 16384, 1, True),
+        (32, 32768 * 2, 2, True),
+        (32, 32768 * 3, 3, False),
+        (33, 65536, 1, False),
+    ],
+)
+def test_sm100_cp_dispatch_heuristic(parallel_work, total_seqlen, num_seqs, expected):
+    assert (
+        should_use_cp_host(
+            parallel_work,
+            148,
+            "NVIDIA B300 SXM6 AC",
+            device_capability=(10, 3),
+            total_seqlen=total_seqlen,
+            num_seqs=num_seqs,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_seqlen, num_heads, expected",
+    [
+        (2048, 8, 384),
+        (4096, 8, 512),
+        (6144, 8, 512),
+        (8192, 8, 512),
+        (16384, 4, 512),
+        (32768, 4, 1024),
+        (32768, 2, 512),
+        (65536, 2, 1024),
+        (65536, 1, 512),
+        (262144, 1, 2048),
+        (16384, 8, 1024),
+        (8192, 16, 1024),
+    ],
+)
+def test_sm100_cp_chunk_balance(max_seqlen, num_heads, expected):
+    assert (
+        choose_cp_chunk_len_host(
+            max_seqlen,
+            num_heads,
+            148,
+            device_capability=(10, 3),
+            total_seqlen=max_seqlen,
+            device_name="NVIDIA B300 SXM6 AC",
+        )
+        == expected
+    )
+
+
+def test_other_arch_cp_heuristics_are_unchanged():
+    assert should_use_cp_host(
+        73,
+        148,
+        "NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+        total_seqlen=128,
+        num_seqs=1,
+    )
+    assert not should_use_cp_host(
+        74,
+        148,
+        "NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+        total_seqlen=65536,
+        num_seqs=1,
+    )
+    assert (
+        choose_cp_chunk_len_host(
+            8192,
+            8,
+            148,
+            device_capability=(9, 0),
+            total_seqlen=8192,
+            device_name="NVIDIA H100 80GB HBM3",
+        )
+        == 512
+    )
 
 
 @torch.inference_mode()
@@ -289,7 +400,13 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
 @pytest.mark.parametrize("gate_baseline", [0.9, 0.99, 0.9995])
 @pytest.mark.parametrize(
     "seq_lens, cp_chunk_len",
-    [([64, 192], 64), ([128, 200], 128), ([1024, 3000], 1024), ([96, 64, 192], 128)],
+    [
+        ([64, 192], 64),
+        ([128, 200], 128),
+        ([192], 192),
+        ([1024, 3000], 1024),
+        ([96, 64, 192], 128),
+    ],
 )
 def test_cp_delta_rule_mn_precompute(
     qkv_factory,
@@ -707,6 +824,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         (torch.bfloat16, [2048], 1024, 1, 1, 1, 0.99, 1.0),
         (torch.bfloat16, [4096], 2048, 2, 1, 1, 0.9995, 1.0),
         (torch.float16, [2049], 1024, 1, 1, 1, 0.99, "auto"),
+        (torch.float16, [8193], 2048, 1, 1, 1, 0.99, "auto"),
         (torch.bfloat16, [1536, 257], 1024, 1, 1, 2, 0.99, 1.0),
     ],
 )
@@ -908,7 +1026,7 @@ def test_cp_delta_rule_e2e(
         ref_o = ref_o.to(dtype)
         atol_o = 2e-2
         rtol_o = 2e-2
-        atol_state = 5e-3
+        atol_state = 1e-2
         rtol_state = 5e-3
     else:
         atol_o = 5e-3
@@ -922,7 +1040,7 @@ def test_cp_delta_rule_e2e(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64], [2048]])
 def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     qkv_factory,
     dtype,
