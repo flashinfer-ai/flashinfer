@@ -71,6 +71,12 @@ class AttentionConfig:
     mask_spec: MaskSpec
     num_repeat_kv_heads: int = 1
 
+    # Paged KV cache: tokens per page, or None for contiguous (ragged) KV.
+    # Compile-time on purpose — the per-page TMA loop in the loader fully
+    # unrolls (pages_per_kv_tile copies per KV tile) and the TMA box shape
+    # depends on it.
+    page_size: int | None = None
+
     # Reserved for decode — unused by prefill. Decode kernels pack heads into
     # MMA M/N dimensions; prefill maps heads via the grid (HeadMapping.GRID).
     head_mapping: HeadMapping = HeadMapping.GRID
@@ -109,6 +115,16 @@ class AttentionConfig:
             raise ValueError(
                 f"num_repeat_kv_heads={self.num_repeat_kv_heads} must be >= 1"
             )
+        if self.page_size is not None:
+            kv_tile = self.mma_tiler[1]
+            # >= 8 keeps the page box aligned to the 8-row smem swizzle atom;
+            # dividing the KV tile keeps the per-page copy loop a constexpr
+            # unroll with no partial-page boxes inside a tile.
+            if self.page_size < 8 or kv_tile % self.page_size != 0:
+                raise ValueError(
+                    f"page_size={self.page_size} must be >= 8 and divide the "
+                    f"KV tile size ({kv_tile})"
+                )
 
     @property
     def cta_tiler(self) -> Tuple[int, int, int]:
@@ -137,6 +153,18 @@ class AttentionConfig:
     def cluster_shape_mn(self) -> Tuple[int, int]:
         """Cluster shape (always (1,1) for prefill)."""
         return (1, 1)
+
+    @property
+    def paged(self) -> bool:
+        """Whether KV comes from a paged cache (page-table indirection)."""
+        return self.page_size is not None
+
+    @property
+    def pages_per_kv_tile(self) -> int:
+        """TMA copies per 128-token KV tile in paged mode (1 for ragged)."""
+        if self.page_size is None:
+            return 1
+        return self.mma_tiler[1] // self.page_size
 
     @property
     def tile_bounds(self) -> TileBounds:

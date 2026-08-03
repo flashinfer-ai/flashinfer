@@ -53,6 +53,7 @@ def _get_compiled_prefill_kernel(
     params_shape,
     with_lse=False,
     v_in_dtype=None,
+    page_size=None,
 ):
     """Compile and cache the prefill kernel.
 
@@ -79,6 +80,7 @@ def _get_compiled_prefill_kernel(
         is_persistent=is_persistent,
         mask_spec=mask_spec,
         num_repeat_kv_heads=h_r,
+        page_size=page_size,
     )
     _dtype_width_map = {
         cutlass.Float16: 16,
@@ -98,18 +100,52 @@ def _get_compiled_prefill_kernel(
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
-    k_fake = cute.runtime.make_fake_compact_tensor(
-        in_dtype,
-        (sym_s_k, num_kv_heads, head_dim),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
-    v_fake = cute.runtime.make_fake_compact_tensor(
-        v_in_dtype if v_in_dtype is not None else in_dtype,
-        (sym_s_k, num_kv_heads, head_dim),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
+    page_table_fake = None
+    page_indptr_fake = None
+    if page_size is not None:
+        # Paged K/V caches: (num_pages, page_size, h_k, d) page-pool views,
+        # plus the flat page-id table and its per-item indptr.  Outer
+        # strides are fully symbolic (batch_decode.py precedent) so the
+        # same kernel handles NHD-compact caches, combined-cache slices
+        # (leading-dim stride 2x from kv_cache[:, 0/1]), and
+        # HND-transposed views; only head_dim is pinned contiguous (TMA).
+        sym_num_pages = cute.sym_int()
+        sym_num_page_ids = cute.sym_int()
+        k_fake = cute.runtime.make_fake_tensor(
+            in_dtype,
+            (sym_num_pages, page_size, num_kv_heads, head_dim),
+            stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+            assumed_align=16,
+        )
+        v_fake = cute.runtime.make_fake_tensor(
+            v_in_dtype if v_in_dtype is not None else in_dtype,
+            (sym_num_pages, page_size, num_kv_heads, head_dim),
+            stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+            assumed_align=16,
+        )
+        page_table_fake = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (sym_num_page_ids,),
+            assumed_align=4,
+        )
+        page_indptr_fake = cute.runtime.make_fake_compact_tensor(
+            Int32,
+            (sym_batch_p1,),
+            assumed_align=4,
+        )
+    else:
+        k_fake = cute.runtime.make_fake_compact_tensor(
+            in_dtype,
+            (sym_s_k, num_kv_heads, head_dim),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
+        v_fake = cute.runtime.make_fake_compact_tensor(
+            v_in_dtype if v_in_dtype is not None else in_dtype,
+            (sym_s_k, num_kv_heads, head_dim),
+            stride_order=(2, 1, 0),
+            assumed_align=16,
+        )
     o_fake = cute.runtime.make_fake_compact_tensor(
         out_dtype,
         (sym_s_q, num_qo_heads, head_dim),
@@ -167,6 +203,8 @@ def _get_compiled_prefill_kernel(
         0,
         params_fake,
         lse_fake,
+        page_table_fake,
+        page_indptr_fake,
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -223,10 +261,10 @@ class BatchPrefillCuteDSLWrapper:
     def plan(
         self,
         qo_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
+        kv_indptr=None,
+        num_qo_heads=None,
+        num_kv_heads=None,
+        head_dim_qk=None,
         head_dim_vo=None,
         causal=True,
         sm_scale=None,
@@ -235,6 +273,11 @@ class BatchPrefillCuteDSLWrapper:
         window_left: int = -1,
         variant: AttentionVariant | None = None,
         window_right: int = -1,
+        page_size: Optional[int] = None,
+        paged_kv_indptr: Optional[torch.Tensor] = None,
+        paged_kv_indices: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len: Optional[torch.Tensor] = None,
+        kv_layout: str = "NHD",
     ) -> None:
         """Compile the FMHA prefill kernel for the given configuration.
 
@@ -242,8 +285,11 @@ class BatchPrefillCuteDSLWrapper:
         ----------
         qo_indptr : torch.Tensor
             Cumulative query sequence lengths, shape [batch_size + 1].
-        kv_indptr : torch.Tensor
-            Cumulative KV sequence lengths, shape [batch_size + 1].
+        kv_indptr : Optional[torch.Tensor]
+            Cumulative KV sequence lengths, shape [batch_size + 1] (ragged
+            KV).  Must be None when planning for a paged KV cache — pass
+            ``page_size`` + the paged triple instead, and the logical
+            per-item KV lengths are derived from them.
         num_qo_heads : int
             Number of query/output heads.
         num_kv_heads : int
@@ -271,10 +317,81 @@ class BatchPrefillCuteDSLWrapper:
             unbounded. Mutually exclusive with ``causal=True``.
         variant : Optional[AttentionVariant]
             Attention variant (ALiBi, RPE, Sigmoid, etc.). None uses standard softmax.
+        page_size : Optional[int]
+            Tokens per KV-cache page.  None (default) plans for ragged
+            (contiguous varlen) KV; an int plans for a paged KV cache and
+            requires the ``paged_kv_*`` triple below.  Must divide the
+            128-token KV tile (16/32/64/128; 8 accepted).
+        paged_kv_indptr : Optional[torch.Tensor]
+            Page-count cumsums per batch item, shape [batch_size + 1], int32.
+        paged_kv_indices : Optional[torch.Tensor]
+            Flat physical page ids, shape [paged_kv_indptr[-1]], int32.
+            Pages referenced here must be finite everywhere (including past
+            ``last_page_len`` — the kernel over-reads full pages and relies
+            on masking, like every TMA-based paged kernel).  Reclaimed
+            out-of-window slots may point at a null block: with
+            ``window_left`` set, the kernel never reads pages wholly below
+            the attention window.
+        paged_kv_last_page_len : Optional[torch.Tensor]
+            Valid entries in each item's last page, shape [batch_size].
+        kv_layout : str
+            ``"NHD"`` (default) or ``"HND"`` page layout.  Paged-only; the
+            ragged path remains NHD.
         """
         if not torch.cuda.is_available():
             raise RuntimeError("GPU is required to run this example!")
         _require_dsl_arch(qo_indptr.device)
+
+        if num_qo_heads is None or num_kv_heads is None or head_dim_qk is None:
+            raise ValueError("num_qo_heads, num_kv_heads and head_dim_qk are required")
+
+        self._page_size = page_size
+        self._paged_kv_layout = kv_layout
+        self._paged_kv_indptr = None
+        self._paged_kv_indices = None
+        self._paged_kv_last_page_len = None
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+        if page_size is not None:
+            if page_size < 8 or 128 % page_size != 0:
+                raise ValueError(
+                    f"page_size={page_size} must be >= 8 and divide the "
+                    "128-token KV tile (8/16/32/64/128)"
+                )
+            if (
+                paged_kv_indptr is None
+                or paged_kv_indices is None
+                or paged_kv_last_page_len is None
+            ):
+                raise ValueError(
+                    "paged plan requires paged_kv_indptr, paged_kv_indices "
+                    "and paged_kv_last_page_len"
+                )
+            if kv_indptr is not None:
+                raise ValueError(
+                    "pass either kv_indptr (ragged) or the paged_kv_* triple, not both"
+                )
+            from flashinfer.page import get_seq_lens
+
+            device = qo_indptr.device
+            seq_lens = get_seq_lens(
+                paged_kv_indptr.cpu(), paged_kv_last_page_len.cpu(), page_size
+            )
+            # Logical token cumsums: the kernel's consumer roles derive
+            # per-item seqlen_k from these exactly as on the ragged path.
+            kv_indptr = torch.zeros(seq_lens.numel() + 1, dtype=torch.int64)
+            kv_indptr[1:] = torch.cumsum(seq_lens, 0)
+            kv_indptr = kv_indptr.to(device)
+            self._paged_kv_indptr = paged_kv_indptr.to(torch.int32).to(device)
+            self._paged_kv_indices = paged_kv_indices.to(torch.int32).to(device)
+            self._paged_kv_last_page_len = paged_kv_last_page_len.to(torch.int32).to(
+                device
+            )
+        else:
+            if kv_indptr is None:
+                raise ValueError("kv_indptr is required for a ragged plan")
+            if kv_layout != "NHD":
+                raise NotImplementedError("HND layout is only supported with paged KV")
 
         self._batch_size = qo_indptr.shape[0] - 1
         self._num_qo_heads = num_qo_heads
@@ -400,7 +517,14 @@ class BatchPrefillCuteDSLWrapper:
             params_shape,
         )
         self._cache_variant = cache_variant
-        self._compiled_fmha = _get_compiled_prefill_kernel(*self._compile_key)
+        # page_size joins the compile key only when set, so ragged callers
+        # (kwarg-less) and the wrapper share one functools.cache entry.
+        self._page_kwargs = (
+            {"page_size": self._page_size} if self._page_size is not None else {}
+        )
+        self._compiled_fmha = _get_compiled_prefill_kernel(
+            *self._compile_key, **self._page_kwargs
+        )
         # Lazily compiled kernel variants, keyed by (with_lse, v_in_dtype):
         # return_lse and a mixed V dtype are both run()-time properties.
         self._kernel_cache = {(False, None): self._compiled_fmha}
@@ -512,9 +636,127 @@ class BatchPrefillCuteDSLWrapper:
         """
         if self._compiled_fmha is None:
             raise RuntimeError("Plan the prefill attention computation first!")
+        if self._page_size is not None:
+            raise RuntimeError(
+                "this wrapper was planned for a paged KV cache; use run_paged()"
+            )
 
         self._validate_run_inputs(q, k, v, out)
+        return self._invoke_kernel(q, k, v, out, return_lse, lse, None, None)
 
+    @flashinfer_api
+    def run_paged(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache,
+        out: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        lse: Optional[torch.Tensor] = None,
+    ):
+        r"""Run paged-KV prefill attention (requires a paged ``plan()``).
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Query tensor, shape ``[total_q_len, num_qo_heads, head_dim]``.
+        paged_kv_cache : torch.Tensor or (torch.Tensor, torch.Tensor)
+            Either the combined cache ``[num_pages, 2, page_size,
+            num_kv_heads, head_dim]`` (NHD) / ``[num_pages, 2, num_kv_heads,
+            page_size, head_dim]`` (HND), or a ``(k_cache, v_cache)`` tuple
+            of ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD) /
+            ``[num_pages, num_kv_heads, page_size, head_dim]`` (HND).
+            Referenced pages must be finite everywhere (see ``plan``).
+        out, return_lse, lse
+            As in :meth:`run`.
+        """
+        if self._compiled_fmha is None:
+            raise RuntimeError("Plan the prefill attention computation first!")
+        if self._page_size is None:
+            raise RuntimeError(
+                "this wrapper was planned for ragged KV; use run() or re-plan "
+                "with page_size + the paged_kv_* triple"
+            )
+
+        if isinstance(paged_kv_cache, (tuple, list)):
+            k_cache, v_cache = paged_kv_cache
+        else:
+            if paged_kv_cache.dim() != 5 or paged_kv_cache.shape[1] != 2:
+                raise ValueError(
+                    "combined paged_kv_cache must be 5D [num_pages, 2, ...]; "
+                    f"got shape {tuple(paged_kv_cache.shape)}"
+                )
+            k_cache, v_cache = paged_kv_cache[:, 0], paged_kv_cache[:, 1]
+        if self._paged_kv_layout == "HND":
+            # [num_pages, h, page_size, d] -> logical NHD view; the kernel
+            # consumes the underlying strides (symbolic-stride compile).
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
+
+        for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+            if t.dtype != self._q_data_type:
+                raise NotImplementedError(
+                    f"{name}.dtype={t.dtype} != planned {self._q_data_type}; "
+                    "mixed K/V dtypes are not supported on the paged route yet"
+                )
+            if t.shape[-3:] != (
+                self._page_size,
+                self._num_kv_heads,
+                self._head_dim,
+            ):
+                raise ValueError(
+                    f"{name} logical shape {tuple(t.shape)} mismatches plan "
+                    f"(page_size={self._page_size}, "
+                    f"num_kv_heads={self._num_kv_heads}, "
+                    f"head_dim={self._head_dim})"
+                )
+            if t.stride(-1) != 1:
+                raise ValueError(f"{name} head_dim must be contiguous")
+        if q.dtype != self._q_data_type or q.device != self._device:
+            raise ValueError(
+                f"q dtype/device ({q.dtype}, {q.device}) mismatches plan "
+                f"({self._q_data_type}, {self._device})"
+            )
+
+        if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("", "0"):
+            self._validate_paged_cache(k_cache, v_cache)
+
+        return self._invoke_kernel(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            return_lse,
+            lse,
+            self._paged_kv_indices,
+            self._paged_kv_indptr,
+        )
+
+    def _validate_paged_cache(self, k_cache, v_cache) -> None:
+        """Debug-mode (FLASHINFER_VALIDATE_INPUTS) scan: every referenced
+        page must be finite everywhere.  A NaN in a live page's tail
+        corrupts output through the PV MMA (0 x NaN = NaN) — see the paged
+        test suite's null-block contract."""
+        pages = self._paged_kv_indices.long()
+        for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
+            ref = t[pages].float()
+            if not torch.isfinite(ref).all().item():
+                raise ValueError(
+                    f"FLASHINFER_VALIDATE_INPUTS: {name} has non-finite values "
+                    "in table-referenced pages; live pages must be finite "
+                    "everywhere (including past last_page_len)"
+                )
+
+    def _invoke_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: Optional[torch.Tensor],
+        return_lse: bool,
+        lse: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        page_indptr: Optional[torch.Tensor],
+    ):
         if return_lse:
             if self._cache_variant is not None and (
                 self._cache_variant.has_logits_transform
@@ -543,7 +785,10 @@ class BatchPrefillCuteDSLWrapper:
         kernel_fn = self._kernel_cache.get(kernel_key)
         if kernel_fn is None:
             kernel_fn = _get_compiled_prefill_kernel(
-                *self._compile_key, with_lse=return_lse, v_in_dtype=v_in_dtype
+                *self._compile_key,
+                with_lse=return_lse,
+                v_in_dtype=v_in_dtype,
+                **self._page_kwargs,
             )
             self._kernel_cache[kernel_key] = kernel_fn
 
@@ -563,6 +808,8 @@ class BatchPrefillCuteDSLWrapper:
             self._window_right,
             self._params_torch if self._has_params else None,
             lse,
+            page_table,
+            page_indptr,
         )
 
         if out is not None:

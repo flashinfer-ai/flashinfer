@@ -1677,10 +1677,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         _check_kv_layout(kv_layout)
 
+        self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
-            raise NotImplementedError(
-                "cute-dsl backend is not yet supported for paged KV cache. "
-                "Use BatchPrefillWithRaggedKVCacheWrapper instead."
+            from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+            self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
+                float_workspace_buffer, use_cuda_graph=use_cuda_graph
             )
 
         if jit_args is not None and backend != "cute-dsl":
@@ -2375,7 +2377,69 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cached_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
 
-        if self._jit_module is not None:
+        if self._backend == "cute-dsl":
+            if custom_mask is not None or packed_custom_mask is not None:
+                raise NotImplementedError(
+                    "cute-dsl backend does not support custom_mask"
+                )
+            if head_dim_vo is not None and head_dim_vo != head_dim_qk:
+                raise NotImplementedError(
+                    "cute-dsl backend requires head_dim_vo == head_dim_qk"
+                )
+            if pos_encoding_mode not in ("NONE", "ALIBI"):
+                raise NotImplementedError(
+                    f"cute-dsl backend does not support pos_encoding_mode={pos_encoding_mode!r}. "
+                    "For RoPE, apply rotary embeddings to Q/K before calling the kernel."
+                )
+            if kv_data_type is not None and q_data_type != kv_data_type:
+                raise ValueError(
+                    "cute-dsl paged prefill requires q_data_type == "
+                    f"kv_data_type, got {q_data_type} and {kv_data_type}"
+                )
+
+            cute_variant: Optional[Any] = None
+            if pos_encoding_mode == "ALIBI":
+                from .cute_dsl.attention import ALiBiAttention
+
+                slopes = ALiBiAttention.get_slopes(num_qo_heads)
+                cute_variant = ALiBiAttention(
+                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                )
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                from .cute_dsl.attention import SoftCappingAttention
+
+                if cute_variant is not None:
+                    raise NotImplementedError(
+                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                    )
+                cute_variant = SoftCappingAttention(cap=logits_soft_cap)
+
+            _sm_scale = (
+                sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
+            )
+            # All paged plans use the modular kernel — the vendored FMHA
+            # artifacts (the ragged wrapper's dense/causal route) have no
+            # paged variant.
+            self._cute_dsl_wrapper.plan(
+                qo_indptr,
+                None,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo=head_dim_qk,
+                causal=causal,
+                sm_scale=_sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
+                window_left=window_left,
+                variant=cute_variant,
+                page_size=page_size,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                kv_layout=self._kv_layout,
+            )
+        elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
@@ -2682,6 +2746,44 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"For paged prefill, q must have shape [total_tokens, num_heads, head_dim] "
                     f"where total_tokens = qo_indptr[-1]."
                 )
+
+        if self._backend == "cute-dsl":
+            if q_scale is not None or k_scale is not None or v_scale is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support q/k/v scale factors"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support NVFP4 KV cache "
+                    "scale factors (kv_cache_sf)"
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support attention sinks"
+                )
+            if skip_softmax_threshold_scale_factor is not None:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support skip-softmax"
+                )
+            if window_left is not None and window_left != self._window_left:
+                raise NotImplementedError(
+                    "cute-dsl paged backend does not support per-call "
+                    "window_left overrides; re-plan instead"
+                )
+            # enable_pdl is accepted as a hint (no-op for the modular kernel,
+            # matching the ragged cute-dsl route).
+            if out is None and q.dtype.itemsize == 1:
+                # fp8 inputs produce bf16 output, matching the ragged
+                # cute-dsl route's convention (the kernel's native scratch
+                # is fp16; the copy-out converts).
+                out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+            return self._cute_dsl_wrapper.run_paged(
+                q,
+                (k_cache, v_cache),
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+            )
 
         if (
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
