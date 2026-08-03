@@ -129,6 +129,14 @@ small enough to publish independently. A later common-module split is useful
 only if inventory data shows that it materially reduces total size without
 reintroducing a large fat-binary core.
 
+The first SM121 experiment found 652 SM121a-only modules, one host-only module,
+and four SM90a-only FA3 attention-sink modules in a 657-module provider. The
+foreign modules were 6.1 MB compressed out of a 250.2 MB compressed shared-object
+payload. They came from unconditional FA3 registration, not from a reusable
+binary base, and are now omitted unless the AOT target includes SM90. This is an
+example of an AOT inventory bug that a provider-wide architecture label alone
+would conceal.
+
 Relevant CUDA compatibility references:
 
 - [CUDA C Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#binary-compatibility)
@@ -185,8 +193,21 @@ version metadata, the shim's exact provider pin, provider entry-point discovery,
 manifest/module parity, and `cuobjdump --list-elf` output for every shared
 library. It writes `wheelhouse.json` with sizes, hashes, the module inventory,
 and observed per-module CUDA targets, plus a conventional `SHA256SUMS` file.
-The resulting wheels should then be installed on an SM121 system for the
-JIT-disabled runtime gate described below.
+Strict CUDA target validation is the default; set
+`CUDA_ARCHITECTURE_POLICY=report` only when inventorying a known mixed-target
+prototype. After installing the resulting wheels on the target system, run the
+JIT-disabled GPU gate with:
+
+```bash
+FLASHINFER_DISABLE_JIT=1 \
+python scripts/smoke_test_jit_cache_provider.py --provider sm121a
+```
+
+The initial DGX Spark build produced a 250,767,917-byte provider wheel containing
+657 modules (487,366,496 bytes uncompressed), a 16,105,950-byte
+`flashinfer-python` wheel, and a 4,349-byte shim. The build generated 3,404 Ninja
+steps with seven concurrent jobs. The installed provider resolved and launched
+`silu_and_mul` on an SM121 GB10 with JIT disabled.
 
 ## Validation Gates
 

@@ -241,7 +241,9 @@ def inspect_cuda_architectures(
                 result[module] = targets
 
     mismatches = {
-        module: targets for module, targets in result.items() if targets != [provider]
+        module: targets
+        for module, targets in result.items()
+        if targets and targets != [provider]
     }
     if strict and mismatches:
         examples = ", ".join(

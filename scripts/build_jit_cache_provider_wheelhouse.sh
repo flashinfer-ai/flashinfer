@@ -31,7 +31,7 @@ normalize_provider_tag() {
 : "${AOT_MAX_JOBS_CAP:=4}"
 : "${AOT_MAX_JOBS_MEMORY_GB:=16}"
 : "${FLASHINFER_NVCC_THREADS:=1}"
-: "${CUDA_ARCHITECTURE_POLICY:=report}"
+: "${CUDA_ARCHITECTURE_POLICY:=strict}"
 : "${CLEAN_OUTPUT:=0}"
 
 PROVIDER_TAG=$(normalize_provider_tag "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}")
