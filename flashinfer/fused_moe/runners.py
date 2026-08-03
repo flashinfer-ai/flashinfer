@@ -262,6 +262,68 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__}.build() must be called before execution."
             )
 
+    # ---- Autotune cache keying -------------------------------------------
+    #
+    # The autotuner keys a profiling result on
+    # (custom_op, runner_class_name, runner_hash, nearest_profile, extras).
+    # ``custom_op`` is ``f"moe_{backend_key}"`` — constant per backend — and
+    # ``nearest_profile`` sees only the *profiled tensor list*, which for the
+    # trtllm-gen adapters carries activations and routing but NOT the weights:
+    # those travel in ``_static_kwargs``. So intermediate_size, the expert
+    # counts, the activation, and the layout flags are all invisible to the
+    # profile, and two configs differing only in those would share one entry.
+    #
+    # ``file_key`` additionally drops ``runner_hash`` on purpose (it is runtime
+    # identity and would differ across processes), so the on-disk cache is
+    # keyed by ``extras`` alone. Both therefore derive from one tuple below.
+    #
+    # Contents mirror the instance key that ``core.MoERunner.get_valid_tactics``
+    # feeds to ``trtllm_get_valid_moe_configs`` — that is what actually decides
+    # which tactics are legal. hidden_size and num_tokens are omitted because
+    # they *are* recoverable from the profiled shapes.
+
+    def _cache_key_extras(self) -> tuple:
+        """Tactic-relevant configuration, as a hashable, str()-stable tuple."""
+        routing = self.config.routing
+        experts = self.config.experts
+        local_num_experts = (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else routing.num_experts
+        )
+        return (
+            self.backend_key,
+            # Name, not the enum object: this tuple is serialized via str()
+            # into the on-disk cache key, so every element needs a stable
+            # cross-process repr.
+            self.config.quant.variant.name,
+            int(routing.top_k),
+            int(routing.num_experts),
+            int(local_num_experts),
+            int(experts.local_expert_offset),
+            int(experts.intermediate_size),
+            int(self.config.activation.type),
+            bool(self.config.execution.do_finalize),
+        ) + tuple(self._backend_cache_key_parts())
+
+    def _backend_cache_key_parts(self) -> tuple:
+        """Backend-specific tactic-relevant values; override as needed.
+
+        Only for values not already implied by the shared tuple (e.g. a layout
+        flag that is not derivable from the quant variant). Must be hashable
+        and have a stable ``str()`` across processes.
+        """
+        return ()
+
+    def __hash__(self) -> int:
+        return hash(self._cache_key_extras())
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        # Synthesis-invariant: derived from configuration scalars only, never
+        # from tensor contents, so the autotuner's synthesized profiling
+        # tensors produce the same key as the caller's real inputs.
+        return self._cache_key_extras()
+
 
 # ---------------------------------------------------------------------------
 # CUTLASS runners — dense BF16 and mixed-input W4A16
@@ -944,11 +1006,6 @@ class CuteDslNvfp4Runner(MoERunner):
                 "W4A4 per-token, or W4A16"
             )
 
-    def __hash__(self):
-        self._require_built()
-        return hash(("cute_dsl_nvfp4", hash(self._inner)))
-
-
 # ---------------------------------------------------------------------------
 # TRTLLM runners — shared module lifecycle, shape-specific inner runners
 # ---------------------------------------------------------------------------
@@ -1400,9 +1457,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_fp4_routed", self._variant))
-
 
 # ---------------------------------------------------------------------------
 # TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
@@ -1717,9 +1771,6 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_fp8_block", self._variant))
-
 
 # ---------------------------------------------------------------------------
 # TRTLLM per-tensor FP8 runner — E4M3 activations/weights
@@ -1985,9 +2036,6 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_fp8_per_tensor",))
-
 
 # ---------------------------------------------------------------------------
 # TRTLLM BF16 runner — canonical trtllm-gen MoERunner, bf16 dtypes
@@ -2210,9 +2258,6 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             use_cold_l2_cache=True,
         )
         return moe_inputs.to_list()
-
-    def __hash__(self):
-        return hash(("trtllm_bf16_routed",))
 
 
 # ---------------------------------------------------------------------------
@@ -2699,9 +2744,6 @@ class _B12xRunner(MoERunner):
             token_selected_experts=inputs[1],
             token_final_scales=inputs[2],
         )
-
-    def __hash__(self):
-        return hash((self.backend_key, self.config))
 
 
 class B12xNvfp4Runner(_B12xRunner):
