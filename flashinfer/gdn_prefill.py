@@ -395,7 +395,7 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
-            if output_state is None:
+            if output_final_state and output_state is None:
                 output_state = torch.empty(
                     (num_seqs, num_sab_heads, head_size, head_size),
                     dtype=torch.float32,

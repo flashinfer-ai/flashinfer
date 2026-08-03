@@ -982,3 +982,76 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 
     torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
+def test_sm100_cp_delta_rule_external_state_dtype(
+    qkv_factory,
+    state_dtype,
+    seq_lens,
+    seed=int(os.environ.get("SEED", "0")),
+):
+    device = torch.device("cuda")
+    if not is_sm100a_supported(device):
+        pytest.skip("typed CP state requires SM100/SM103")
+    _seed_all(seed)
+    dtype = torch.bfloat16
+    head_size = 128
+    num_heads = 1
+    num_seqs = len(seq_lens)
+    total_seqlen = sum(seq_lens)
+    cu_seqlens = _make_cu_seqlens(seq_lens, device)
+
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
+        )
+        initial_state = (
+            torch.randn(num_seqs, num_heads, head_size, head_size) * 0.01
+        ).to(state_dtype)
+    q = q.contiguous()
+    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
+    v = v.contiguous()
+    alpha = _make_gates(total_seqlen, num_heads, 0.99, device)
+    beta = _make_gates(total_seqlen, num_heads, 0.99, device)
+    our_o = torch.empty_like(q)
+    ref_o = torch.empty_like(q)
+    our_state = torch.empty_like(initial_state)
+    ref_state = torch.empty_like(initial_state)
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,
+        initial_state,
+        True,
+        cu_seqlens,
+        False,
+        output=our_o,
+        output_state=our_state,
+        use_cp=True,
+    )
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,
+        initial_state,
+        True,
+        cu_seqlens,
+        False,
+        output=ref_o,
+        output_state=ref_state,
+        use_cp=False,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)

@@ -516,23 +516,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                     ),
                 ),
             )
-        state_out = cute.make_tensor(
-            state_out.iterator,
-            cute.make_layout(
-                (
-                    state_out.shape[2],
-                    state_out.shape[3],
-                    (h_r, h_qv),
-                    state_out.shape[0],
+        if cutlass.const_expr(self.store_final_state):
+            state_out = cute.make_tensor(
+                state_out.iterator,
+                cute.make_layout(
+                    (
+                        state_out.shape[2],
+                        state_out.shape[3],
+                        (h_r, h_qv),
+                        state_out.shape[0],
+                    ),
+                    stride=(
+                        state_out.stride[2],
+                        state_out.stride[3],
+                        (state_out.stride[1], h_r * state_out.stride[1]),
+                        state_out.stride[0],
+                    ),
                 ),
-                stride=(
-                    state_out.stride[2],
-                    state_out.stride[3],
-                    (state_out.stride[1], h_r * state_out.stride[1]),
-                    state_out.stride[0],
-                ),
-            ),
-        )
+            )
+        else:
+            state_out = fixed_state
 
         # ------------------------------------------------------------------
         # Build tiled MMAs  (one per logical GEMM group, differing in operand major modes)
@@ -2314,7 +2317,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tRT_tCcState = thr_state_r2t.partition_S(cState)
         tRT_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
-        tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.state_dtype)
+        tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, mS_init.element_type)
 
         if cutlass.const_expr(mS_indices is not None):
             state_row = mS_indices[batch_idx]
@@ -2333,7 +2336,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 tGR_tCrState[None, 0, sub],
                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
-            if cutlass.const_expr(self.acc_dtype != self.state_dtype):
+            if cutlass.const_expr(self.acc_dtype != mS_init.element_type):
                 tRT_tCrState[None, 0, sub].store(
                     tGR_tCrState[None, 0, sub].load().to(self.acc_dtype)
                 )
