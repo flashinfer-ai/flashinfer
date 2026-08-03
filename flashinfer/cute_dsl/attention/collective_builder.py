@@ -61,6 +61,16 @@ def build_fmha_launch_params(
     """
     config = mainloop.config
 
+    # Paged KV shares the K/V smem ring layouts with ragged; only the TMA
+    # atoms (per-page box) and their smem partition views differ.  Mixed
+    # K/V dtypes would need the stage-stride padding below replicated on
+    # the *_for_tma views — not wired up yet.
+    if config.page_size is not None and k_dtype.width != v_dtype.width:
+        raise ValueError(
+            "paged KV cache with mixed K/V dtypes is not supported yet; "
+            "use a uniform dtype or the ragged (contiguous) KV path"
+        )
+
     cta_group = tcgen05.CtaGroup.ONE
     p_major_mode = cute.nvgpu.OperandMajorMode.K
     p_source = tcgen05.OperandSource.TMEM
@@ -160,23 +170,69 @@ def build_fmha_launch_params(
         cluster_layout_vmnk.shape,
     )
     k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
-    tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_load_op,
-        k,
-        k_smem_layout,
-        config.qk_mma_tiler,
-        qk_tiled_mma,
-        cluster_layout_vmnk.shape,
-    )
     v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-    tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_load_op,
-        v,
-        v_smem_layout,
-        config.pv_mma_tiler,
-        pv_tiled_mma,
-        cluster_layout_vmnk.shape,
-    )
+    k_smem_layout_for_tma = None
+    v_smem_layout_for_tma = None
+    if config.page_size is not None:
+        # Paged: the TMA box shrinks to one page ((page_size, d) for K,
+        # (d, page_size) for V) and the loader issues pages_per_kv_tile
+        # copies per tile, indexing the page mode with a runtime page id.
+        # The *_for_tma layouts view the same physical smem ring divided
+        # into per-page sub-boxes — the MLA decode pairing
+        # (kc_smem_layout_for_tma / make_paged_tiled_tma_atom).
+        k_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.K,
+            (config.qk_mma_tiler[1], config.qk_mma_tiler[2]),
+            k_dtype,
+            mainloop.kv_stages,
+        )
+        k_smem_layout_for_tma = cute.tiled_divide(
+            k_smem_layout_for_tma, (config.page_size, config.qk_mma_tiler[2])
+        )
+        tma_atom_k, tma_tensor_k = make_paged_tiled_tma_atom(
+            tma_load_op,
+            k,
+            cute.select(k_smem_layout_for_tma, mode=[0]),
+            (config.qk_mma_tiler[1], config.qk_mma_tiler[2]),
+            qk_tiled_mma,
+            config.page_size,
+            is_k_load=True,
+        )
+        v_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.MN,
+            (config.pv_mma_tiler[1], config.pv_mma_tiler[2]),
+            v_dtype,
+            mainloop.kv_stages,
+        )
+        v_smem_layout_for_tma = cute.tiled_divide(
+            v_smem_layout_for_tma, (config.pv_mma_tiler[1], config.page_size)
+        )
+        tma_atom_v, tma_tensor_v = make_paged_tiled_tma_atom(
+            tma_load_op,
+            v,
+            cute.select(v_smem_layout_for_tma, mode=[0]),
+            (config.pv_mma_tiler[1], config.pv_mma_tiler[2]),
+            pv_tiled_mma,
+            config.page_size,
+            is_k_load=False,
+        )
+    else:
+        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            k,
+            k_smem_layout,
+            config.qk_mma_tiler,
+            qk_tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            v,
+            v_smem_layout,
+            config.pv_mma_tiler,
+            pv_tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
     o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
     tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
         tma_store_op,
@@ -251,6 +307,8 @@ def build_fmha_launch_params(
         p_tmem_layout_staged=p_tmem_layout_staged,
         v_smem_layout_staged=v_smem_layout_staged,
         o_smem_layout_staged=o_smem_layout_staged,
+        k_smem_layout_for_tma=k_smem_layout_for_tma,
+        v_smem_layout_for_tma=v_smem_layout_for_tma,
         SharedStorage=SharedStorage,
         tma_copy_q_bytes=tma_copy_q_bytes,
         tma_copy_kv_bytes=tma_copy_kv_bytes,

@@ -39,6 +39,10 @@ class LoaderRole:
         self.qk_mma_tiler = config.qk_mma_tiler
         self.pv_mma_tiler = config.pv_mma_tiler
         self.mask_spec = config.mask_spec
+        # Paged KV: tokens per page (None = ragged) and the per-tile
+        # TMA copy count, both compile-time.
+        self.page_size = config.page_size
+        self.pages_per_kv_tile = config.pages_per_kv_tile
         # Populated by set_v_tx_bytes() once dtypes are known at __call__
         # time.  None means K and V have the same width (plain acquires).
         self.v_tx_bytes = None
@@ -77,6 +81,70 @@ class LoaderRole:
             )
         load_kv_producer.advance()
         return state.index, load_kv_mbar_base_ptr + state.index
+
+    @cute.jit
+    def _load_paged_tile(
+        self,
+        tma_atom,
+        tGg,
+        tGs,
+        stage_index,
+        barrier,
+        kv_tile,
+        table_base,
+        page_idx_lb,
+        num_pages_kv,
+        kv_page_table,
+        first_tile: cutlass.Constexpr,
+        is_k: cutlass.Constexpr,
+    ):
+        """Issue one K or V tile's per-page TMA copies.
+
+        ``unroll=1`` is required: left to heuristics, LLVM/ptxas
+        fully unroll this constant-trip loop (static UTMALDGs 12 -> 68)
+        and the enlarged loader text regresses ps16 to ~1.2x ragged via
+        instruction-fetch stalls (four warp-group code regions share
+        fetch).  K and V run separate loops and re-read the ids —
+        fusing the loops or staging ids across them measured worse.
+
+        A page id of -1 puts the TMA coordinate out of bounds: the copy
+        writes zeros to smem and still credits the barrier with the full
+        box bytes.  Two kinds of pages are mapped to -1: pages past the
+        end of the sequence, and — on windowed kernels — pages below
+        ``page_idx_lb``, whose table slots serving frameworks repoint at
+        a shared scratch block that may hold NaN (trtllm-gen's pageIdxLb
+        contract).  Loading zeros there, rather than relying on the
+        softmax mask, is required for correctness: masked-out positions
+        still pass through the PV MMA with P=0, and 0 * NaN = NaN.
+        Only an item's first tile can contain the window lower bound,
+        so only ``first_tile`` applies the window clamp.  The table
+        index is min-clamped separately so the table read itself never
+        goes past the item's slice.
+        """
+        logical0 = kv_tile * self.pages_per_kv_tile
+        for p in cutlass.range(self.pages_per_kv_tile, unroll=1):
+            logical_page = logical0 + p
+            safe_page = cutlass.min(logical_page, num_pages_kv - 1)
+            page_idx = kv_page_table[table_base + safe_page]
+            if cutlass.const_expr(first_tile and self.mask_spec.has_window_left):
+                in_range = (logical_page >= page_idx_lb) & (logical_page < num_pages_kv)
+            else:
+                in_range = logical_page < num_pages_kv
+            page_idx = cutlass.select_(in_range, page_idx, Int32(-1))
+            if cutlass.const_expr(is_k):
+                cute.copy(
+                    tma_atom,
+                    tGg[None, page_idx],
+                    tGs[None, p, 0, stage_index],
+                    tma_bar_ptr=barrier,
+                )
+            else:
+                cute.copy(
+                    tma_atom,
+                    tGg[None, page_idx],
+                    tGs[None, 0, p, stage_index],
+                    tma_bar_ptr=barrier,
+                )
 
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
@@ -200,10 +268,18 @@ class LoaderRole:
         load_kv_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
         load_kv_mbar_base_ptr,
+        sK_tma: cute.Tensor | None,
+        sV_tma: cute.Tensor | None,
+        kv_page_table: cute.Tensor | None,
+        kv_page_indptr: cute.Tensor | None,
     ):
         """Loader warp orchestration loop (prefill-specific).
 
-        Q0/Q1 double-buffered loads with KV tile streaming.
+        Q0/Q1 double-buffered loads with KV tile streaming.  With paged KV
+        (``config.page_size`` set), K/V TMA boxes shrink to one page, each
+        tile issues ``pages_per_kv_tile`` copies indexed by runtime page
+        ids from ``kv_page_table``, and ``sK_tma``/``sV_tma`` are the
+        per-page-divided views of the same K/V smem ring.
         """
         tile_sched = create_fmha_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -246,15 +322,16 @@ class LoaderRole:
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    logical_offset_mK = (cuseqlen_k, 0, (0, 0))
-                    logical_offset_mV = (0, cuseqlen_k, (0, 0))
-                    mK_kdl_ = cute.domain_offset(logical_offset_mK, mK_kdl)
-                    mV_dkl_ = cute.domain_offset(logical_offset_mV, mV_dkl)
-                    curr_block_coord_kv = (
-                        curr_block_coord[0],
-                        curr_block_coord[1],
-                        (curr_block_coord[2][0], Int32(0)),
-                    )
+                    if cutlass.const_expr(self.page_size is None):
+                        logical_offset_mK = (cuseqlen_k, 0, (0, 0))
+                        logical_offset_mV = (0, cuseqlen_k, (0, 0))
+                        mK_kdl_ = cute.domain_offset(logical_offset_mK, mK_kdl)
+                        mV_dkl_ = cute.domain_offset(logical_offset_mV, mV_dkl)
+                        curr_block_coord_kv = (
+                            curr_block_coord[0],
+                            curr_block_coord[1],
+                            (curr_block_coord[2][0], Int32(0)),
+                        )
 
                 # Local tile partition global tensors
                 gQ_qdl = cute.flat_divide(
@@ -270,31 +347,77 @@ class LoaderRole:
                 )
                 tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]
 
-                gK_kdl = cute.flat_divide(
-                    mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
-                )
-                tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
-                tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_k,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sK, 0, 3),
-                    cute.group_modes(tSgK_kdl, 0, 3),
-                )
-                tKgK = tKgK_kdl[None, None, 0, curr_block_coord_kv[2]]
+                table_base = Int32(0)
+                num_pages_kv = Int32(0)
+                page_idx_lb = Int32(0)
+                if cutlass.const_expr(self.page_size is not None):
+                    # Paged: per-page TMA boxes over the page pool.  No
+                    # thr_mma partition_B — the box is one page, not the
+                    # MMA tile — and no domain shift: the trailing page
+                    # mode is indexed with a runtime page id per copy
+                    # (the MLA decode loader pattern).
+                    gK_kdl = cute.tiled_divide(
+                        mK_kdl_, (self.page_size, self.qk_mma_tiler[2])
+                    )
+                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_k,
+                        0,
+                        cute.make_layout(1),
+                        sK_tma,
+                        gK_kdl[None, 0, 0, None],
+                    )
+                    tKgK = tKgK_kdl[None, (curr_block_coord[2][0], None)]
 
-                gV_dkl = cute.flat_divide(
-                    mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
-                )
-                tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
-                tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_v,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sV, 0, 3),
-                    cute.group_modes(tSgV_dkl, 0, 3),
-                )
-                tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
+                    gV_dkl = cute.tiled_divide(
+                        mV_dkl_, (self.pv_mma_tiler[1], self.page_size)
+                    )
+                    tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_v,
+                        0,
+                        cute.make_layout(1),
+                        sV_tma,
+                        gV_dkl[None, 0, 0, None],
+                    )
+                    tVgV = tVgV_dkl[None, (curr_block_coord[2][0], None)]
+
+                    table_base = kv_page_indptr[batch_coord]
+                    num_pages_kv = cute.ceil_div(seqlen_k, self.page_size)
+                    # Window clamp lower bound: pages wholly below every Q
+                    # row's band start are never attended, and their table
+                    # slots may point at a reclaimed null block (see
+                    # _paged_page_idx).  Row 0 of the Q tile has the
+                    # smallest band start: lo = q0 + (seqlen_k - seqlen_q)
+                    # - window_left.
+                    if cutlass.const_expr(self.mask_spec.has_window_left):
+                        q0 = curr_block_coord[0] * self.cta_tiler[0]
+                        lo_min = q0 + (seqlen_k - seqlen_q) - window_left
+                        page_idx_lb = cutlass.max(lo_min, Int32(0)) // self.page_size
+                else:
+                    gK_kdl = cute.flat_divide(
+                        mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                    )
+                    tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
+                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_k,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sK, 0, 3),
+                        cute.group_modes(tSgK_kdl, 0, 3),
+                    )
+                    tKgK = tKgK_kdl[None, None, 0, curr_block_coord_kv[2]]
+
+                    gV_dkl = cute.flat_divide(
+                        mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
+                    )
+                    tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
+                    tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_v,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sV, 0, 3),
+                        cute.group_modes(tSgV_dkl, 0, 3),
+                    )
+                    tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
 
                 # Q0
                 q0_coord = 2 * curr_block_coord_q[0]
@@ -317,12 +440,28 @@ class LoaderRole:
                 )
                 kv_coord = kv_block_start
                 k_handle_producer = load_kv_producer.acquire_and_advance()
-                cute.copy(
-                    tma_atom_k,
-                    tKgK[None, kv_coord],
-                    tKsK[None, k_handle_producer.index],
-                    tma_bar_ptr=k_handle_producer.barrier,
-                )
+                if cutlass.const_expr(self.page_size is not None):
+                    self._load_paged_tile(
+                        tma_atom_k,
+                        tKgK,
+                        tKsK,
+                        k_handle_producer.index,
+                        k_handle_producer.barrier,
+                        kv_coord,
+                        table_base,
+                        page_idx_lb,
+                        num_pages_kv,
+                        kv_page_table,
+                        True,
+                        True,
+                    )
+                else:
+                    cute.copy(
+                        tma_atom_k,
+                        tKgK[None, kv_coord],
+                        tKsK[None, k_handle_producer.index],
+                        tma_bar_ptr=k_handle_producer.barrier,
+                    )
                 # Q1
                 q1_coord = q0_coord + 1
                 q1_handle_producer = load_q_producer.acquire_and_advance()
@@ -336,34 +475,82 @@ class LoaderRole:
                 v_index, v_bar_ptr = self._acquire_v(
                     load_kv_producer, load_kv_mbar_base_ptr
                 )
-                cute.copy(
-                    tma_atom_v,
-                    tVgV[None, kv_coord],
-                    tVsV[None, v_index],
-                    tma_bar_ptr=v_bar_ptr,
-                )
-                kv_coord += 1
-
-                seqlen_kv_loop_steps = kv_block_end - kv_block_start - 1
-                for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                    # Ki
-                    k_handle_producer = load_kv_producer.acquire_and_advance()
-                    cute.copy(
-                        tma_atom_k,
-                        tKgK[None, kv_coord],
-                        tKsK[None, k_handle_producer.index],
-                        tma_bar_ptr=k_handle_producer.barrier,
+                if cutlass.const_expr(self.page_size is not None):
+                    self._load_paged_tile(
+                        tma_atom_v,
+                        tVgV,
+                        tVsV,
+                        v_index,
+                        v_bar_ptr,
+                        kv_coord,
+                        table_base,
+                        page_idx_lb,
+                        num_pages_kv,
+                        kv_page_table,
+                        True,
+                        False,
                     )
-                    # Vi
-                    v_index, v_bar_ptr = self._acquire_v(
-                        load_kv_producer, load_kv_mbar_base_ptr
-                    )
+                else:
                     cute.copy(
                         tma_atom_v,
                         tVgV[None, kv_coord],
                         tVsV[None, v_index],
                         tma_bar_ptr=v_bar_ptr,
                     )
+                kv_coord += 1
+
+                seqlen_kv_loop_steps = kv_block_end - kv_block_start - 1
+                for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                    # Ki
+                    k_handle_producer = load_kv_producer.acquire_and_advance()
+                    if cutlass.const_expr(self.page_size is not None):
+                        self._load_paged_tile(
+                            tma_atom_k,
+                            tKgK,
+                            tKsK,
+                            k_handle_producer.index,
+                            k_handle_producer.barrier,
+                            kv_coord,
+                            table_base,
+                            page_idx_lb,
+                            num_pages_kv,
+                            kv_page_table,
+                            False,
+                            True,
+                        )
+                    else:
+                        cute.copy(
+                            tma_atom_k,
+                            tKgK[None, kv_coord],
+                            tKsK[None, k_handle_producer.index],
+                            tma_bar_ptr=k_handle_producer.barrier,
+                        )
+                    # Vi
+                    v_index, v_bar_ptr = self._acquire_v(
+                        load_kv_producer, load_kv_mbar_base_ptr
+                    )
+                    if cutlass.const_expr(self.page_size is not None):
+                        self._load_paged_tile(
+                            tma_atom_v,
+                            tVgV,
+                            tVsV,
+                            v_index,
+                            v_bar_ptr,
+                            kv_coord,
+                            table_base,
+                            page_idx_lb,
+                            num_pages_kv,
+                            kv_page_table,
+                            False,
+                            False,
+                        )
+                    else:
+                        cute.copy(
+                            tma_atom_v,
+                            tVgV[None, kv_coord],
+                            tVsV[None, v_index],
+                            tma_bar_ptr=v_bar_ptr,
+                        )
                     kv_coord += 1
 
             tile_sched.advance_to_next_work()
