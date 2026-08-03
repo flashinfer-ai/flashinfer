@@ -836,7 +836,15 @@ def _run_radix_cutlass(
 
     if return_output_values:
         # Gather values at selected indices — O(num_rows*top_k) vs O(num_rows*N).
-        out_values.copy_(torch.gather(logits, 1, out_indices.long()))
+        # radix_topk_ragged_transform writes the -1 sentinel into surplus slots
+        # when a row's length <= top_k (topk.cuh Ragged branch), so clamp the
+        # index before gathering — a raw -1 trips a device-side bounds assert —
+        # then zero those sentinel slots so they don't carry column-0 values.
+        # No-op for rows with seq_len >= top_k (no sentinels).
+        sentinel = out_indices < 0
+        gather_idx = out_indices.long().clamp_(min=0)
+        out_values.copy_(torch.gather(logits, 1, gather_idx))
+        out_values.masked_fill_(sentinel, 0)
 
     return out_indices, (out_values if return_output_values else None)
 

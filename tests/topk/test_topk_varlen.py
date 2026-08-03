@@ -1300,14 +1300,37 @@ def test_seq_len_less_than_top_k(backend):
     dtype, top_k, N = torch.bfloat16, 512, 4096
     seq_len_list = [top_k - 1, top_k // 2, 17, 1]  # all strictly < top_k
     logits, seq_lens = _make_varlen_inputs(seq_len_list, N, dtype, seed=71)
-    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, backend=backend)
+    # return_values=True exercises the value-gather path. With seq_len < top_k the
+    # kernel writes the -1 sentinel into surplus slots, so radix_cutlass's gather
+    # must clamp the index (a raw -1 trips a device-side bounds assert) and zero
+    # those slots — this combination guards that regression.
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend=backend, return_values=True
+    )
     torch.cuda.synchronize()
+    lf = logits.float()
     for row, sl in enumerate(seq_len_list):
-        in_range = sorted(i for i in indices[row].cpu().tolist() if 0 <= i < sl)
+        idx = indices[row]
+        in_range = sorted(i for i in idx.cpu().tolist() if 0 <= i < sl)
         assert in_range == list(range(sl)), (
             f"{backend} row={row} seq_len={sl}: expected all valid indices "
             f"[0,{sl}); got {len(in_range)} unique in-range"
         )
+        # Values at valid slots must equal logits[row, idx].
+        valid = (idx >= 0) & (idx < sl)
+        if valid.any():
+            got = values[row][valid].float()
+            exp = lf[row][idx[valid].long()]
+            assert torch.allclose(got, exp, rtol=1e-3, atol=1e-3), (
+                f"{backend} row={row}: gathered values mismatch logits[row, idx]"
+            )
+        # radix_cutlass zeros the -1 sentinel slots; assert it did.
+        if backend == "radix_cutlass":
+            sentinel = idx < 0
+            if sentinel.any():
+                assert (values[row][sentinel] == 0).all(), (
+                    f"{backend} row={row}: sentinel (-1) value slots not zeroed"
+                )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
