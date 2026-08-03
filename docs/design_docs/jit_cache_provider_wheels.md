@@ -160,6 +160,34 @@ The provider backend forces `FLASHINFER_CUDA_ARCH_LIST` to exactly one declared
 target, compiles the AOT inventory, and generates the manifest from the copied
 libraries. Shim requirements exactly pin every provider to the shim version.
 
+### One-off SM121 wheelhouse
+
+On an AArch64 Docker host, the experiment can be built with:
+
+```bash
+scripts/build_jit_cache_provider_wheelhouse.sh
+```
+
+The wrapper defaults to the CUDA 13.0 PyTorch manylinux AArch64 builder, target
+`12.1a`, local version `cu130`, one NVCC thread, and at most four concurrent
+jobs. It builds these aligned-version artifacts under `dist/`:
+
+- `flashinfer-python`
+- `flashinfer-jit-cache-sm121a`
+- `flashinfer-jit-cache`, with an exact dependency on the SM121 provider only
+
+Set `OUTPUT_DIR`, `FLASHINFER_DEV_RELEASE_SUFFIX`, or
+`FLASHINFER_JIT_CACHE_PROVIDER_ARCH` to override the one-off defaults. Existing
+output is retained unless `CLEAN_OUTPUT=1` is explicit.
+
+The build does not require a GPU. Its final validation checks distribution and
+version metadata, the shim's exact provider pin, provider entry-point discovery,
+manifest/module parity, and `cuobjdump --list-elf` output for every shared
+library. It writes `wheelhouse.json` with sizes, hashes, the module inventory,
+and observed per-module CUDA targets, plus a conventional `SHA256SUMS` file.
+The resulting wheels should then be installed on an SM121 system for the
+JIT-disabled runtime gate described below.
+
 ## Validation Gates
 
 Before changing release workflows or making shim mode the default:
