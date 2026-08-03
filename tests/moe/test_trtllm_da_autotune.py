@@ -643,9 +643,14 @@ def _da_test_context(
     ],
 )
 def test_fp8_block_lora_delta_remains_excluded_from_da_knn_capture(
+    monkeypatch,
     quantization_type,
 ):
     """FP8 block-scale LoRA is supported, but not by DA's KNN graph capture."""
+    # Architecture rejection has its own focused test. Pin this policy test to
+    # DA's supported architecture so it isolates only the LoRA exclusion on
+    # H100, SM12x, and other CI hosts.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
     context_args = (
         "flashinfer::trtllm_fp8_block_scale_moe",
         (
