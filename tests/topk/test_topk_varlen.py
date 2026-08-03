@@ -362,7 +362,13 @@ def test_large_batch():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_repeated_calls():
-    """Two identical calls must return the same top-K index set per row."""
+    """Repeated identical calls each return a valid top-K (no state corruption).
+
+    Results need not be bit-identical: the radix_cutlass fallback runs with
+    deterministic=False, so BF16 values that tie at the K-th boundary let two
+    correct calls select different (equally valid) tied indices. Assert each
+    call is a correct top-K rather than requiring identical index sets.
+    """
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=3)
     pre_idx_arg = pre_idx if _IS_BLACKWELL else None
@@ -372,10 +378,8 @@ def test_repeated_calls():
     idx2, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=pre_idx_arg)
     torch.cuda.synchronize()
 
-    for row in range(batch_size):
-        assert set(idx1[row].cpu().tolist()) == set(idx2[row].cpu().tolist()), (
-            f"row={row}: repeated calls returned different top-k sets"
-        )
+    _check_correct(idx1, logits, seq_lens, top_k, require_all_checked=True)
+    _check_correct(idx2, logits, seq_lens, top_k, require_all_checked=True)
 
 
 # ---------------------------------------------------------------------------
