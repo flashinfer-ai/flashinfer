@@ -2,142 +2,104 @@
 
 set -eo pipefail
 
-export PARALLEL_TESTS=true  # Enable parallel test execution for unit tests (auto-discovery mode)
-
-# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNER="${SCRIPT_DIR}/unit_test_runner.py"
 
-# Source common test functions
-# shellcheck disable=SC1091  # File exists, checked separately
+# Help must not prepare the environment, install dependencies, or collect tests.
+for arg in "$@"; do
+    if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+        exec python "${RUNNER}" run --help
+    fi
+done
+
+if [ -n "${PYTEST_FILE_TIMEOUT_SECONDS+x}" ]; then
+    echo "ERROR: PYTEST_FILE_TIMEOUT_SECONDS is obsolete; use UNIT_TEST_TIMEOUT_SECONDS or --unit-timeout-seconds." >&2
+    exit 3
+fi
+if [ -n "${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS+x}" ]; then
+    echo "ERROR: PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS is obsolete; use UNIT_TEST_TIMEOUT_GRACE_SECONDS or --timeout-grace-seconds." >&2
+    exit 3
+fi
+
+# The old shared helper randomized this value while being sourced. The sharding
+# manifest freezes sampling, so establish the documented deterministic default.
+: "${SAMPLE_OFFSET:=0}"
+export SAMPLE_OFFSET
+export PARALLEL_TESTS=true
+
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/test_utils.sh"
 
-# nvshmem4py-cu12 pins cuda-python<=12.9; letting pip resolve its deps on a
-# cu13 container downgrades cuda-python/cuda-bindings and makes the next
-# requirements resolution evict CUDA torch (aarch64 backtracks to the CPU-only
-# wheel -> "Torch not compiled with CUDA enabled"). Install only if missing,
-# and --no-deps: the image already ships the right-flavor cuda-python and
-# nvidia-nvshmem libraries.
-# TODO: Remove once CI container ships with nvshmem4py pre-installed.
-python -c "import nvshmem.core" 2>/dev/null || pip install --no-deps nvshmem4py-cu12
-
-# Find and filter test files based on pytest.ini exclusions
-find_test_files() {
-    SEARCH_DIR="${TEST_PATH:-tests/}"
-
-    if [ -n "$TEST_PATH" ]; then
-        if [ ! -d "${SEARCH_DIR}" ]; then
-            echo "ERROR: TEST_PATH '${SEARCH_DIR}' does not exist or is not a directory."
-            echo "Available test directories:"
-            find tests/ -maxdepth 1 -type d | sort | tail -n +2 | sed 's/^/  /'
-            exit 1
-        fi
-        echo "🎯 TEST_PATH set: scoping test discovery to ${SEARCH_DIR}"
-        echo ""
-    fi
-
-    echo "Reading pytest.ini for excluded directories..."
-    EXCLUDED_DIRS=""
-    if [ -f "./pytest.ini" ]; then
-        # Extract norecursedirs from pytest.ini and convert to array
-        NORECURSEDIRS=$(grep "^norecursedirs" ./pytest.ini | sed 's/norecursedirs\s*=\s*//' | sed 's/#.*//')
-        if [ -n "$NORECURSEDIRS" ]; then
-            EXCLUDED_DIRS=$(echo "$NORECURSEDIRS" | tr ',' ' ' | tr -s ' ')
-            echo "⚠️  WARNING: Excluding directories from pytest.ini: $EXCLUDED_DIRS"
-            echo ""
-        fi
-    fi
-
-    echo "Finding all test_*.py files in ${SEARCH_DIR} directory..."
-
-    # Find all test_*.py files
-    ALL_TEST_FILES=$(find "${SEARCH_DIR}" -name "test_*.py" -type f | sort)
-
-    # Filter out excluded files based on directory exclusions
-    TEST_FILES=""
-    for test_file in $ALL_TEST_FILES; do
-        exclude_file=false
-        test_dir=$(dirname "$test_file")
-
-        for excluded_dir in $EXCLUDED_DIRS; do
-            excluded_dir=$(echo "$excluded_dir" | xargs)  # trim whitespace
-            if [ -n "$excluded_dir" ]; then
-                # Check if this file's directory should be excluded
-                if [[ "$test_dir" == *"/$excluded_dir" ]] || [[ "$test_dir" == "tests/$excluded_dir" ]] || [[ "$test_dir" == *"/$excluded_dir/"* ]]; then
-                    exclude_file=true
-                    break
-                fi
-            fi
-        done
-
-        if [ "$exclude_file" = false ]; then
-            TEST_FILES="$TEST_FILES $test_file"
-        fi
-    done
-
-    # Clean up whitespace
-    TEST_FILES=$(echo "$TEST_FILES" | xargs)
-
-    if [ -z "$TEST_FILES" ]; then
-        echo "No test files found in ${SEARCH_DIR} directory (after exclusions)"
-        exit 1
-    fi
-
-    echo "Found test files:"
-    for test_file in $TEST_FILES; do
-        echo "  $test_file"
-    done
-    echo ""
-}
-
-# Main execution
 main() {
-    # Parse command line arguments
-    parse_args "$@"
+    local runner_settings_output
+    local -a runner_settings
+    runner_settings_output=$(python "${RUNNER}" __shell-settings "$@")
+    mapfile -t runner_settings <<< "${runner_settings_output}"
+    local operation="${runner_settings[0]}"
+    TEST_PATH="${runner_settings[1]}"
 
-    # Print test mode banner
-    print_test_mode_banner
+    export JUNIT_DIR SAMPLE_RATE SAMPLE_OFFSET TEST_PATH
 
-    # Install and verify (includes precompiled kernels)
-    install_and_verify
-
-    # apply dependency overrides after installation since pip may overwrite
-    source "${SCRIPT_DIR}/setup_test_env.sh"
-
-    # tests/moe_ep needs the EP runtime stack (nvidia-nccl >= 2.30.7 + nccl4py,
-    # nvshmem4py, DeepGEMM) and a --no-build-isolation FlashInfer install so the
-    # build hook's NCCL floor upgrade isn't lost in a throwaway PEP 517 env.
-    # Without it the split-path tests fail validate_arch_for_backend on
-    # Blackwell (NCCL 2.28.9 from the torch pin) and the deep_gemm multirank
-    # file exits 5 (module-level importorskip collects nothing).
-    # The ~25-min trtllm fused-MoE JIT prewarm stays off (FI_EP_PREWARM
-    # defaults to 0); the torchrun-only tests that would need it auto-skip
-    # here (no WORLD_SIZE).
-    #
-    # build_flashinfer_ep_pytorch.sh pins cuda-bindings==13.2.0 (a cu13 package)
-    # and is designed for the nvcr.io/nvidia/pytorch:26.05 base image. On cu12
-    # CI images that ship CUDA 12.x torch, that pin conflicts with the image's
-    # cuda-python~=12.x and breaks nccl.ep's CUDA-major consistency check.
-    # cu12 CI images already have nccl4py pre-installed as a base dependency of
-    # flashinfer-python, so EP is available (or unavailable due to the cu12/cu13
-    # libnccl_ep mismatch — in either case the tests handle it via auto-skip).
-    _cuda_major=$(python -c \
-        'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
-        2>/dev/null || echo 0)
-    if [ "$DRY_RUN" != "true" ] && [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${_cuda_major}" -ge 13 ]; then
-        FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
-    fi
-
-    # Find test files (unique to unit tests - auto-discovery)
-    find_test_files
-
-    # Execute tests or dry run
-    if [ "$DRY_RUN" == "true" ]; then
-        execute_dry_run "$TEST_FILES"
+    if [ "$operation" = "plan" ]; then
+        echo "🔍 DRY RUN MODE - collecting and writing a deterministic plan only"
     else
-        execute_tests "$TEST_FILES"
+        echo "📋 DETERMINISTIC SHARD MODE - finalized batches resume automatically"
+
+        # nvshmem4py-cu12 pins cuda-python<=12.9. The CI image already carries
+        # compatible cuda-python and NVIDIA NVSHMEM libraries, so avoid allowing
+        # pip to replace the CUDA flavor while filling this one missing module.
+        python -c "import nvshmem.core" 2>/dev/null || pip install --no-deps nvshmem4py-cu12
+
+        install_and_verify
+
+        # Apply dependency overrides after installation since pip may overwrite
+        # the versions established by the CI image.
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup_test_env.sh"
+
+        # tests/moe_ep needs its additional runtime stack only on CUDA 13 images.
+        local cuda_major
+        cuda_major=$(python -c \
+            'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
+            2>/dev/null || echo 0)
+        if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
+            FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
+        fi
     fi
 
-    exit "$EXIT_CODE"
+    # test_utils.sh defines the obsolete variables for its legacy callers. They
+    # are deliberately not forwarded to the replacement runner.
+    unset PYTEST_FILE_TIMEOUT_SECONDS PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS
+
+    local runner_exit_code
+    local runner_status
+    if python "${RUNNER}" "${operation}" "$@"; then
+        runner_exit_code=0
+    else
+        runner_exit_code=$?
+    fi
+
+    case "${runner_exit_code}" in
+        0)
+            runner_status="complete-without-failures"
+            ;;
+        1)
+            runner_status="complete-with-failures"
+            ;;
+        2)
+            runner_status="incomplete-and-resumable"
+            ;;
+        3)
+            runner_status="configuration-collection-or-infrastructure-error"
+            ;;
+        *)
+            echo "UNIT TEST RUNNER ABNORMAL EXIT: exit_code=${runner_exit_code} wrapper_exit_code=unchanged" >&2
+            return "${runner_exit_code}"
+            ;;
+    esac
+
+    echo "UNIT TEST RUNNER RESULT: exit_code=${runner_exit_code} status=${runner_status} wrapper_exit_code=0"
+    return 0
 }
 
 main "$@"
