@@ -142,6 +142,7 @@ run_in_container() {
     echo "Memory budget per job: ${MEM_PER_JOB} GB"
 
     rm -rf \
+        "${REPO_ROOT}/flashinfer/data" \
         "${REPO_ROOT}/flashinfer-jit-cache-provider/build" \
         "${REPO_ROOT}/flashinfer-jit-cache-provider/dist" \
         "${REPO_ROOT}/flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/jit_cache" \
@@ -149,6 +150,7 @@ run_in_container() {
         "${REPO_ROOT}/flashinfer-jit-cache/dist" \
         "${REPO_ROOT}/flashinfer-jit-cache/flashinfer_jit_cache/jit_cache"
     rm -f \
+        "${REPO_ROOT}/flashinfer/_build_meta.py" \
         "${REPO_ROOT}/flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/manifest.json" \
         "${REPO_ROOT}/flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/_build_meta.py" \
         "${REPO_ROOT}/flashinfer-jit-cache/flashinfer_jit_cache/_build_meta.py" \
