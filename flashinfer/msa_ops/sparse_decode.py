@@ -341,8 +341,13 @@ def msa_sparse_decode_attention(
             raise ValueError(
                 f"paged k/v must be (num_pages, num_kv_heads, 128, {kv_last})"
             )
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
-        cu_k[1:] = seqused_k.to(dev).cumsum(0)
+        # Paged addressing comes entirely from page_table, so the kernel never
+        # needs a KV base offset -- only each request's length. Hand it
+        # seqused_k directly instead of building a prefix sum (a zeros + cumsum
+        # + slice-copy on every decode call) just for the kernel to difference
+        # it back apart. The kernel reads this as lengths when `paged`.
+        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        cu_k = cu_k.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:

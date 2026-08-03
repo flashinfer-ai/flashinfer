@@ -35,16 +35,21 @@ _SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
 class TopKSelectCountRankSm12x:
     """O(N^2) count-rank top-K selection for small candidate counts."""
 
-    def __init__(self, topk: int):
+    def __init__(self, topk: int, per_token_nvp: bool = False):
         if topk != 16:
             raise ValueError(f"topk must be 16, got {topk}")
         self._topk = topk
+        # Per-token valid-page counts: each query token carries its own causal
+        # KV extent, so the forced local window and the ranked middle range are
+        # token-relative instead of batch-uniform.
+        self._per_token_nvp = per_token_nvp
 
     @cute.jit
     def __call__(
         self,
         mMaxScore: cute.Tensor,  # (H, P, S) f32  (P = max_k_tiles)
         mOut: cute.Tensor,  # (S, H, topk) int32
+        mNumValidPages: cute.Tensor,  # (S,) int32; dummy when not per-token
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
         force_end: cutlass.Int32,
@@ -53,7 +58,9 @@ class TopKSelectCountRankSm12x:
         stream: cuda.CUstream,
     ):
         mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
-        self.kernel(mBits, mOut, num_valid_pages, force_begin, force_end).launch(
+        self.kernel(
+            mBits, mOut, mNumValidPages, num_valid_pages, force_begin, force_end
+        ).launch(
             grid=(total_qo_len, num_qo_heads, 1),
             block=(_NTHREADS, 1, 1),
             stream=stream,
@@ -72,6 +79,7 @@ class TopKSelectCountRankSm12x:
         self,
         mScore: cute.Tensor,  # (H, P, S) f32 recast to u32 bits
         mOut: cute.Tensor,  # (S, H, topk) int32
+        mNumValidPages: cute.Tensor,  # (S,) int32
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
         force_end: cutlass.Int32,
@@ -91,10 +99,21 @@ class TopKSelectCountRankSm12x:
         sel = st.sel.get_tensor(cute.make_layout(16))
         cnt = st.cnt.get_tensor(cute.make_layout(1))
 
-        nvp = num_valid_pages
-        mid_lo = force_begin
-        mid_hi = num_valid_pages - force_end
-        n_forced = force_begin + force_end
+        if cutlass.const_expr(self._per_token_nvp):
+            nvp = mNumValidPages[q]
+        else:
+            nvp = num_valid_pages
+
+        # Per-token nvp can be smaller than the forced region (a token whose
+        # causal extent is shorter than the local window), which the host-side
+        # scalar check cannot rule out. Shrink the forced region to fit rather
+        # than emitting negative block indices.
+        fb = cutlass.min(force_begin, nvp)
+        fe = cutlass.min(force_end, nvp - fb)
+
+        mid_lo = fb
+        mid_hi = nvp - fe
+        n_forced = fb + fe
         target = cutlass.Int32(self._topk) - n_forced
 
         # Stage the middle scores' radix keys in SMEM: the rank loop rereads each
@@ -109,13 +128,13 @@ class TopKSelectCountRankSm12x:
         if tid == 0:
             w = cutlass.Int32(0)
             i = cutlass.Int32(0)
-            while i < force_begin:
+            while i < fb:
                 sel[w] = i
                 w += 1
                 i += 1
             j = cutlass.Int32(0)
-            while j < force_end:
-                sel[w] = (nvp - force_end) + j
+            while j < fe:
+                sel[w] = mid_hi + j
                 w += 1
                 j += 1
             k = w

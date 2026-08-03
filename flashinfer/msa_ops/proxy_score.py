@@ -32,9 +32,14 @@ from ._common import _BLK_KV
 _SF_VEC_SIZE = 16
 
 
-def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
+def _resolve_proxy_dims(
+    cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=False
+):
     """Resolve grid dims ``(max_seqlen_q, max_k_tiles)`` as Python ints; deriving
-    them reads ``cu_seqlens`` on host, so under CUDA-graph capture we raise."""
+    them reads ``cu_seqlens`` on host, so under CUDA-graph capture we raise.
+
+    ``k_is_lengths`` says ``cu_k`` holds per-request lengths rather than a
+    prefix sum (the paged path)."""
     if max_k_tiles is None and output is not None:
         max_k_tiles = int(output.shape[1])
     if max_seqlen_q is not None and max_k_tiles is not None:
@@ -50,7 +55,7 @@ def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
         max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
     if max_k_tiles is None:
         cu_k_cpu = cu_k.cpu()
-        seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
+        seqlens_k = cu_k_cpu if k_is_lengths else (cu_k_cpu[1:] - cu_k_cpu[:-1])
         max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
     return max_seqlen_q, max_k_tiles
 
@@ -382,8 +387,12 @@ def msa_proxy_score(
                 f"paged k must be (num_pages, num_kv_heads, {_BLK_KV}, {head_dim})"
             )
         batch_size = seqused_k.numel()
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
-        cu_k[1:] = seqused_k.to(dev).cumsum(0)
+        # Paged addressing comes entirely from page_table, so the kernel needs
+        # only each request's length. Pass seqused_k through instead of building
+        # a prefix sum (zeros + cumsum + slice-copy on every call) for the
+        # kernel to difference back apart; `paged` tells it which form this is.
+        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        cu_k = cu_k.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
@@ -396,7 +405,7 @@ def msa_proxy_score(
 
     cu_q_dev = cu_seqlens_q.to(dev)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
-        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output
+        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
@@ -427,7 +436,7 @@ def msa_proxy_score(
     if use_stream and qoff_default:
         qoff_dev = _proxy_dummies(dev.index)[1]
     else:
-        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
+        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev, k_is_lengths=paged)
 
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
@@ -461,8 +470,11 @@ def msa_proxy_score(
         kdt = _cutlass_dtype(k.dtype)
         i32 = _cutlass_dtype(torch.int32)
         f32 = _cutlass_dtype(torch.float32)
-        s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0, s_pb, s_pm, s_mt = (
-            cute.sym_int() for _ in range(9)
+        # s_bk is mCuK's own symbol: on the paged path it holds per-request
+        # lengths (batch entries), not a prefix sum (batch + 1), so it must not
+        # share mCuQ's dim or the compiled signature rejects the call.
+        s_tq, s_hq, s_tk, s_hkv, s_b1, s_bk, s_b0, s_pb, s_pm, s_mt = (
+            cute.sym_int() for _ in range(10)
         )
         k_shape = (s_tk, s_hkv, _BLK_KV, head_dim) if paged else (s_tk, s_hkv, head_dim)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -503,8 +515,8 @@ def msa_proxy_score(
             _fake(kdt, k_shape),
             _fake(i32, (s_pb, s_pm), align=4),
             _fake(f32, (s_hq, s_mt, s_tq), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b1,), align=4),  # mCuQ
+            _fake(i32, (s_bk,), align=4),  # mCuK (lengths when paged)
             _fake(i32, (s_b0,), align=4),
             cutlass.Int32(1),
             cutlass.Int32(1),
@@ -715,8 +727,12 @@ def msa_proxy_score_fp4(
                 f"paged k_fp4 must be (num_pages, num_kv_heads, {_BLK_KV}, {hd2})"
             )
         batch_size = seqused_k.numel()
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=dev)
-        cu_k[1:] = seqused_k.to(dev).cumsum(0)
+        # Paged addressing comes entirely from page_table, so the kernel needs
+        # only each request's length. Pass seqused_k through instead of building
+        # a prefix sum (zeros + cumsum + slice-copy on every call) for the
+        # kernel to difference back apart; `paged` tells it which form this is.
+        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        cu_k = cu_k.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
@@ -728,9 +744,9 @@ def msa_proxy_score_fp4(
         batch_size = cu_k.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
-    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
+    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev, k_is_lengths=paged)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
-        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output
+        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
@@ -774,13 +790,16 @@ def msa_proxy_score_fp4(
             s_tk,
             s_hkv,
             s_b1,
+            # mCuK's own symbol: per-request lengths (batch) when paged, a
+            # prefix sum (batch + 1) when flat, so it cannot share mCuQ's dim.
+            s_bk,
             s_b0,
             s_pb,
             s_pm,
             s_mt,
             s_qsf,
             s_ksf,
-        ) = (cute.sym_int() for _ in range(11))
+        ) = (cute.sym_int() for _ in range(12))
         if paged:
             k_shape: tuple = (s_tk, s_hkv, _BLK_KV, hd2)
         else:
@@ -809,8 +828,8 @@ def msa_proxy_score_fp4(
             _fake(u8, (s_ksf,), align=4),
             _fake(i32, (s_pb, s_pm), align=4),
             _fake(f32, (s_hq, s_mt, s_tq), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b1,), align=4),  # mCuQ
+            _fake(i32, (s_bk,), align=4),  # mCuK (lengths when paged)
             _fake(i32, (s_b0,), align=4),
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),

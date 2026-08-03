@@ -1645,10 +1645,13 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     score = torch.randn(H, P, S, device=dev, dtype=torch.float32)
     score[0, 5, :] = float("nan")
     score[1, 40, ::3] = float("nan")
+    # Scalar num_valid_pages path: the per-token tensor is a signature filler
+    # the kernel does not read.
+    nvp_unused = torch.zeros(1, dtype=torch.int32, device=dev)
     outs = []
     for small in (True, False, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-        _get_compiled_topk(topk, small)(score, out, P, 0, 0, S, H)
+        _get_compiled_topk(topk, small)(score, out, nvp_unused, P, 0, 0, S, H)
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"

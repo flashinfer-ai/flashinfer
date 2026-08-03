@@ -31,17 +31,24 @@ def _q_offset_tensor(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     device,
+    k_is_lengths: bool = False,
 ) -> torch.Tensor:
     """Build the per-batch causal offset tensor the kernels consume.
 
     A query's global position is ``q_offset[b] + local_index`` (MSA q_offset
     semantics). When ``q_offset`` is None, queries are right-aligned to the end
-    of the KV sequence: ``q_offset[b] = seqlen_k[b] - seqlen_q[b]``."""
+    of the KV sequence: ``q_offset[b] = seqlen_k[b] - seqlen_q[b]``.
+
+    ``k_is_lengths`` says ``cu_seqlens_k`` already holds per-request lengths
+    rather than a prefix sum (the paged paths pass ``seqused_k`` straight
+    through), which skips differencing it back apart."""
     if q_offset is None:
-        return (
-            (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
-            - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-        ).to(torch.int32)
+        seqlens_k = (
+            cu_seqlens_k
+            if k_is_lengths
+            else (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+        )
+        return (seqlens_k - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])).to(torch.int32)
     return _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, device)
 
 
