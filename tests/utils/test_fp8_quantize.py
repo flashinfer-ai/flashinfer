@@ -844,6 +844,44 @@ def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backe
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_nan_inf_saturation(dtype, is_sf_swizzled_layout, backend):
+    """The E4M3 conversion must saturate +/-inf (and large finite values) to
+    +/-448 while preserving NaN, matching torch's saturating float8_e4m3fn cast.
+
+    Asserted directly on the quantized data (per 32-element SF block) rather than
+    against the reference: a NaN-containing block drives the block amax to NaN, so
+    the reference/kernel scale-factor bytes for such a block need not agree; only
+    the data-conversion contract is checked here.
+    """
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    # Four 32-wide SF blocks per row: large-finite, +inf, -inf, NaN.
+    a = torch.empty((2, 128), dtype=dtype, device="cuda")
+    a[:, 0:32] = 60000.0  # large finite (representable in fp16/bf16), must not -> NaN
+    a[:, 32:64] = float("inf")
+    a[:, 64:96] = -float("inf")
+    a[:, 96:128] = float("nan")
+
+    a_fp8, _ = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+    vals = (
+        a_fp8.view(torch.float8_e4m3fn) if a_fp8.dtype == torch.uint8 else a_fp8
+    ).float()
+
+    assert not torch.isnan(vals[:, 0:32]).any(), (
+        "large finite input must not map to NaN"
+    )
+    assert torch.all(vals[:, 32:64] == 448.0), "+inf must saturate to +448"
+    assert torch.all(vals[:, 64:96] == -448.0), "-inf must saturate to -448"
+    assert torch.all(torch.isnan(vals[:, 96:128])), "NaN input must be preserved as NaN"
+
+
 # =============================================================================
 # CuTe-DSL Compilation Cache Tests
 # =============================================================================
