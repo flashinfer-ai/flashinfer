@@ -935,7 +935,17 @@ class MixedCommHandler:
 
     @flashinfer_api
     def checkpoint_restore(self, comm_backend: CommBackend):
-        """Restore physical VMM backing at retained graph-visible addresses."""
+        """Restore physical VMM backing at retained graph-visible addresses.
+
+        Parameters
+        ----------
+        comm_backend : CommBackend
+            Intra-node communication backend whose ``Get_rank()`` and
+            ``Get_size()`` match this handler's ``local_rank`` and
+            ``local_size``. Its ``bcast`` and ``barrier`` operations
+            coordinate the Unix-socket handle exchange and synchronize VMM
+            mapping restoration.
+        """
         if self.para_info.use_inter:
             raise NotImplementedError(
                 "MixedComm checkpointing does not yet support multi-node handlers"

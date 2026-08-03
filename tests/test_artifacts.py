@@ -4,6 +4,7 @@ from flashinfer.artifacts import (
     get_subdir_file_list,
 )
 
+import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
@@ -239,6 +240,12 @@ def _mock_file_index_responses():
     responses.add(
         responses.GET, gemm_rubin_source, body=success_gemm_response, status=200
     )
+    deepgemm_rubin_source = safe_urljoin(
+        test_cubin_repository, artifact_paths.DEEPGEMM_RUBIN
+    )
+    responses.add(
+        responses.GET, deepgemm_rubin_source, body=success_deepgemm_response, status=200
+    )
 
 
 @responses.activate
@@ -291,6 +298,50 @@ def test_get_available_cubin_files_non_200_response():
         source, retries=1, delay=0, timeout=5
     )
     assert available_cubin_files == ()
+
+
+def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
+    """An artifact pin whose checksums.txt cannot be fetched must fail loudly.
+
+    Guards the diagnosis path exercised by #4280: a pin added to `cubin_dirs`
+    without a published (or, in tests, mocked) manifest used to surface as a bare
+    FileNotFoundError on a local cache path, which reads like a corrupt cache
+    rather than an unreachable pin. `download_file` is stubbed rather than mocked
+    over HTTP so the test does not pay its 4 retries of exponential backoff.
+    """
+    from flashinfer import artifacts
+
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    # The pin must be named -- that is the whole point of the error.
+    assert artifact_paths.DEEPGEMM_RUBIN in str(excinfo.value)
+
+
+def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
+    """A failed refresh must not invalidate an already-cached manifest.
+
+    Offline / FLASHINFER_NO_DOWNLOAD setups rely on the on-disk copy.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
+    cached.parent.mkdir(parents=True)
+    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+
+    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    assert checksums == {
+        safe_urljoin(
+            artifact_paths.DEEPGEMM_RUBIN,
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+        ): "abc123"
+    }
 
 
 @responses.activate
@@ -349,6 +400,13 @@ e8f9a0b1c2d3 kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
 f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 """
 
+    checksums_deepgemm_rubin = """3333333333333333333333333333333333333333333333333333333333333333 kernel_map.json
+1111aaaabbbbcccc kernel.fp8_m_grouped_gemm.007404769193.cubin
+2222aaaabbbbcccc kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
+3333aaaabbbbcccc kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
+4444aaaabbbbcccc kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
+"""
+
     # Add mock responses for checksums.txt files
     fmha_checksums_url = safe_urljoin(
         test_cubin_repository,
@@ -389,6 +447,17 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
     )
     responses.add(
         responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
+    )
+
+    deepgemm_rubin_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+    )
+    responses.add(
+        responses.GET,
+        deepgemm_rubin_checksums_url,
+        body=checksums_deepgemm_rubin,
+        status=200,
     )
 
     # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
@@ -479,6 +548,11 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
             "Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin",
             artifact_paths.TRTLLM_GEN_GEMM,
             artifact_paths.TRTLLM_GEN_GEMM_RUBIN,
+        ),
+        (
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+            artifact_paths.DEEPGEMM,
+            artifact_paths.DEEPGEMM_RUBIN,
         ),
     ):
         plain_path = safe_urljoin(plain_dir, shared_name)

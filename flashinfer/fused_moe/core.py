@@ -3306,8 +3306,8 @@ def trtllm_bf16_moe(
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
-        Optional ``[num_experts]`` tensor of routing bias.  Must be
-        ``bfloat16`` if provided.
+        Optional ``[num_experts]`` tensor of routing bias.  ``float32`` or
+        ``bfloat16``.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states.  Must be
         ``bfloat16``.

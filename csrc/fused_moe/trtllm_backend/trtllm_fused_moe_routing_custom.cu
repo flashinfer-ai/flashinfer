@@ -1479,6 +1479,9 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
                  data.mPtrTopKIds != nullptr)
       << "Routing kernel requires at least one input parameter";
+  TVM_FFI_ICHECK_LE(data.mTopK, data.mNumExperts)
+      << "Routing kernel expects topK (" << data.mTopK << ") to be <= numExperts ("
+      << data.mNumExperts << ").";
 
   // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
   // delegate to the shared post-topK pipeline which handles all path selection

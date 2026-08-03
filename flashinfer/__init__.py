@@ -124,7 +124,10 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
-from .kda_decode import recurrent_kda as recurrent_kda
+from .kda_prefill import (
+    RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
+)
+from .kda import recurrent_kda as recurrent_kda
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
