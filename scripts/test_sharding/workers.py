@@ -497,6 +497,7 @@ def _promote_batch_artifacts(
             "pytest_exit_code": outcome.returncode,
             "launched_at": outcome.launched_at,
             "exited_at": outcome.exited_at,
+            "monitor_memory": request.monitor_memory,
             "synthetic": False,
         },
     )

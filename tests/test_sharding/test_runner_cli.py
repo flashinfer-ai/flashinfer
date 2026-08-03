@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import queue
@@ -769,6 +770,42 @@ def test_invalid_shard_index_prints_an_unscoped_test_summary(tmp_path: Path) -> 
     assert "No result: 1" in result.stdout
 
 
+def test_disabled_memory_monitoring_is_persisted_and_reported(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        env_override={"MONITOR_TEST_MEMORY": "0"},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Memory monitoring: disabled" in result.stdout
+    assert "samples 0 (partial)" not in result.stdout
+    [metadata_path] = list((tmp_path / "junit").glob("units/*/batches/*.meta.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["monitor_memory"] is False
+    settings = json.loads(
+        (
+            tmp_path
+            / "junit"
+            / "attempts"
+            / "attempt-0001"
+            / "shards"
+            / "shard-0000.settings.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert settings["monitor_memory"] is False
+    with (tmp_path / "junit" / "source_summary.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        [source] = list(csv.DictReader(stream))
+    assert source["partial_resources"] == "false"
+
+
 def test_unit_progress_omits_skipped_results_and_reports_all_outcomes(
     tmp_path: Path,
 ) -> None:
@@ -1053,6 +1090,7 @@ def test_terminal_timeout_policies_synthesize_junit(
         "0",
         "--timeout-policy",
         policy,
+        env_override={"MONITOR_TEST_MEMORY": "false"},
     )
 
     assert result.returncode == expected_code, result.stdout + result.stderr
@@ -1068,6 +1106,7 @@ def test_terminal_timeout_policies_synthesize_junit(
         else "passed=0 failed=0 skipped=1 unknown=0"
     )
     assert expected_counts in result.stdout
+    assert "Memory monitoring: disabled" in result.stdout
     assert "completed_nodes=1/1" in result.stdout
     assert len(summary["attempts"][0]["unit_timeout_events"]) == 1
     assert summary["attempts"][0]["unit_timeout_events"][0]["timeout_policy"] == policy

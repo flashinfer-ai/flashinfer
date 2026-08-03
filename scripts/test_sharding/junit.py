@@ -11,12 +11,17 @@ from .io import atomic_write_xml
 from .models import base_function_for_nodeid, source_file_for_nodeid
 
 
+_MAX_FAILURE_REASON_CHARS = 500
+_TRUNCATION_SUFFIX = "... [truncated; see JUnit XML]"
+
+
 @dataclass(frozen=True)
 class TestCaseResult:
     nodeid: str
     source_file: str
     base_function: str
     outcome: str
+    failure_reason: str | None
     seconds: float
     synthetic: bool
 
@@ -61,6 +66,43 @@ def testcase_outcome(testcase: ET.Element) -> str:
     return "passed"
 
 
+def _normalized_reason(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
+def _bounded_reason(value: str) -> str:
+    if len(value) <= _MAX_FAILURE_REASON_CHARS:
+        return value
+    prefix_length = _MAX_FAILURE_REASON_CHARS - len(_TRUNCATION_SUFFIX)
+    return value[:prefix_length].rstrip() + _TRUNCATION_SUFFIX
+
+
+def testcase_failure_reason(testcase: ET.Element) -> str | None:
+    result = testcase.find("./failure")
+    if result is None:
+        result = testcase.find("./error")
+    if result is None:
+        return None
+
+    message = _normalized_reason(result.attrib.get("message"))
+    if message:
+        return _bounded_reason(message)
+
+    raw_lines = [
+        line.strip()
+        for value in result.itertext()
+        for line in value.splitlines()
+        if line.strip()
+    ]
+    if not raw_lines:
+        return None
+    pytest_errors = [
+        _normalized_reason(line[1:]) for line in raw_lines if line.startswith("E ")
+    ]
+    reason = pytest_errors[-1] if pytest_errors else _normalized_reason(raw_lines[-1])
+    return _bounded_reason(reason) if reason else None
+
+
 def validate_batch_xml(path: Path, expected_nodeids: Sequence[str]) -> BatchValidation:
     diagnostics: list[str] = []
     try:
@@ -91,6 +133,7 @@ def validate_batch_xml(path: Path, expected_nodeids: Sequence[str]) -> BatchVali
                     source_file=source_file_for_nodeid(nodeid),
                     base_function=base_function_for_nodeid(nodeid),
                     outcome=testcase_outcome(testcase),
+                    failure_reason=testcase_failure_reason(testcase),
                     seconds=seconds,
                     synthetic=properties.get("synthetic") == "true",
                 )

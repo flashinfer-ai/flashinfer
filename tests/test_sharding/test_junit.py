@@ -66,6 +66,54 @@ def test_finalized_batch_outcomes_preserve_unknown_plugin_results(
     assert outcomes == Counter({"unknown": 1})
 
 
+def test_batch_validation_extracts_concise_failure_reasons(tmp_path: Path) -> None:
+    report = tmp_path / "batch.xml"
+    nodes = [
+        "tests/test_sample.py::test_failure",
+        "tests/test_sample.py::test_error",
+    ]
+    report.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" tests="2" failures="1" errors="1">
+  <testcase classname="sample" name="failure"><properties><property name="pytest_nodeid" value="tests/test_sample.py::test_failure"/></properties><failure message="  AssertionError:   values differ  ">ignored traceback</failure></testcase>
+  <testcase classname="sample" name="error"><properties><property name="pytest_nodeid" value="tests/test_sample.py::test_error"/></properties><error>first traceback line
+E   RuntimeError: device unavailable
+tests/test_sample.py:12: RuntimeError
+</error></testcase>
+</testsuite></testsuites>
+""",
+        encoding="utf-8",
+    )
+
+    validation = validate_batch_xml(report, nodes)
+
+    assert validation.valid is True
+    assert [case.failure_reason for case in validation.cases] == [
+        "AssertionError: values differ",
+        "RuntimeError: device unavailable",
+    ]
+
+
+def test_batch_validation_bounds_long_failure_reasons(tmp_path: Path) -> None:
+    report = tmp_path / "batch.xml"
+    nodeid = "tests/test_sample.py::test_failure"
+    report.write_text(
+        "<testsuites><testsuite>"
+        '<testcase><properties><property name="pytest_nodeid" '
+        f'value="{nodeid}"/></properties><failure message="'
+        f"{'x' * 1000}"
+        '"/></testcase></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    validation = validate_batch_xml(report, [nodeid])
+
+    reason = validation.cases[0].failure_reason
+    assert reason is not None
+    assert len(reason) == 500
+    assert reason.endswith("... [truncated; see JUnit XML]")
+
+
 def test_synthetic_timeout_report_is_self_describing(tmp_path: Path) -> None:
     output = tmp_path / "synthetic.xml"
     nodes = ["tests/test_sample.py::test_a", "tests/test_sample.py::test_b"]

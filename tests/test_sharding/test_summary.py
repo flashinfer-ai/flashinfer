@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import pytest
 
@@ -31,6 +32,8 @@ def _write_final_batch(
     launched_at: float,
     exited_at: float,
     memory: list[tuple[float, float, float]],
+    monitor_memory: bool | None = True,
+    failure_reasons: dict[str, str] | None = None,
 ) -> None:
     path = batch_xml_path(junit_dir, unit, batch)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,7 +41,7 @@ def _write_final_batch(
     for nodeid in batch.nodeids:
         outcome = outcomes[nodeid]
         result = (
-            '<failure message="failed"/>'
+            f"<failure message={quoteattr((failure_reasons or {}).get(nodeid, 'failed'))}/>"
             if outcome == "failed"
             else '<skipped message="skipped"/>'
             if outcome == "skipped"
@@ -54,14 +57,15 @@ def _write_final_batch(
         f'{len(batch.nodeids)}">{"".join(testcases)}</testsuite></testsuites>',
         encoding="utf-8",
     )
+    metadata = {
+        "attempt_id": "attempt-1",
+        "launched_at": launched_at,
+        "exited_at": exited_at,
+    }
+    if monitor_memory is not None:
+        metadata["monitor_memory"] = monitor_memory
     path.with_name(f"{batch.id}.meta.json").write_text(
-        json.dumps(
-            {
-                "attempt_id": "attempt-1",
-                "launched_at": launched_at,
-                "exited_at": exited_at,
-            }
-        ),
+        json.dumps(metadata),
         encoding="utf-8",
     )
     path.with_name(f"{batch.id}.results.json").write_text(
@@ -181,6 +185,12 @@ def test_console_summary_counts_nodes_and_aggregates_failed_files(
         launched_at=20,
         exited_at=143,
         memory=[(21, 2048, 4096)],
+        failure_reasons={
+            alpha_second_batch.nodeids[0]: (
+                "AssertionError: quantized output element mismatch: "
+                "64/256 elements differ"
+            )
+        },
     )
     _write_final_batch(
         tmp_path,
@@ -206,6 +216,13 @@ def test_console_summary_counts_nodes_and_aggregates_failed_files(
     assert "Skipped: 1" in report
     assert "Unknown: 1" in report
     assert "No result: 2" in report
+    assert (
+        "Failed test nodes:\n"
+        "  1. tests/test_alpha.py::test_case[1] - "
+        "AssertionError: quantized output element mismatch: "
+        "64/256 elements differ" in report
+    )
+    assert report.index("Failed test nodes:") < report.index("Total test files:")
     assert "  - tests/test_alpha.py - 1/3 failed" in report
     assert "  - tests/test_alpha.py - 1/3 pending" in report
     assert "  - tests/test_beta.py - 1/1 pending" in report
@@ -314,3 +331,235 @@ def test_global_summary_merges_a_source_split_across_shards(tmp_path: Path) -> N
         ("0", "tests/test_split.py"),
         ("1", "tests/test_split.py"),
     ]
+
+
+def test_failed_nodes_are_all_numbered_in_nodeid_order_and_scoped_to_shard(
+    tmp_path: Path,
+) -> None:
+    nodes = tuple(
+        CollectedNode.from_nodeid(f"tests/test_failed.py::test_case[{index}]", index)
+        for index in (1, 0)
+    )
+    units = []
+    for shard_index, node in enumerate(nodes):
+        batch = Batch(
+            id=f"batch-failed-{shard_index}",
+            source_file=node.source_file,
+            nodeids=(node.nodeid,),
+            estimated_ms=1000,
+            overhead_ms=0,
+            oversized=False,
+        )
+        unit = Unit(
+            id=f"unit-failed-{shard_index}",
+            batches=(batch,),
+            estimated_ms=1000,
+            oversized=False,
+            shard_index=shard_index,
+        )
+        units.append(unit)
+        _write_final_batch(
+            tmp_path,
+            unit,
+            batch,
+            {node.nodeid: "failed"},
+            launched_at=10,
+            exited_at=20,
+            memory=[],
+            failure_reasons={node.nodeid: f"reason {node.order}"},
+        )
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic", shard_count=2),
+        nodes=nodes,
+        units=tuple(units),
+    )
+
+    global_report = summary_module.format_test_run_summary(tmp_path, plan)
+    shard_report = summary_module.format_test_run_summary(tmp_path, plan, shard_index=0)
+
+    first = "  1. tests/test_failed.py::test_case[0] - reason 0"
+    second = "  2. tests/test_failed.py::test_case[1] - reason 1"
+    assert first in global_report
+    assert second in global_report
+    assert global_report.index(first) < global_report.index(second)
+    assert "  1. tests/test_failed.py::test_case[1] - reason 1" in shard_report
+    assert "test_case[0] - reason 0" not in shard_report
+
+
+def test_disabled_memory_monitoring_is_reported_and_not_partial(
+    tmp_path: Path,
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_nomem.py::test_case", 0)
+    batch = Batch(
+        id="batch-nomem",
+        source_file=node.source_file,
+        nodeids=(node.nodeid,),
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    unit = Unit(
+        id="unit-nomem",
+        batches=(batch,),
+        estimated_ms=1000,
+        oversized=False,
+        shard_index=0,
+    )
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic"),
+        nodes=(node,),
+        units=(unit,),
+    )
+    _write_final_batch(
+        tmp_path,
+        unit,
+        batch,
+        {node.nodeid: "passed"},
+        launched_at=10,
+        exited_at=25,
+        memory=[],
+        monitor_memory=False,
+    )
+
+    report = summary_module.format_test_run_summary(tmp_path, plan, shard_index=0)
+
+    assert "Memory monitoring: disabled" in report
+    assert (
+        "tests/test_nomem.py - duration 15s, peak RSS 0 MiB, "
+        "peak GPU 0 MiB, samples 0" in report
+    )
+    assert "samples 0 (partial)" not in report
+
+    summary_module.publish_summary(tmp_path, plan)
+    with (tmp_path / "source_summary.csv").open(newline="", encoding="utf-8") as stream:
+        [row] = list(csv.DictReader(stream))
+    assert row["partial_resources"] == "false"
+
+
+def test_legacy_batch_without_monitoring_metadata_is_conservatively_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_legacy.py::test_case", 0)
+    batch = Batch(
+        id="batch-legacy",
+        source_file=node.source_file,
+        nodeids=(node.nodeid,),
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    unit = Unit(
+        id="unit-legacy",
+        batches=(batch,),
+        estimated_ms=1000,
+        oversized=False,
+        shard_index=0,
+    )
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic"),
+        nodes=(node,),
+        units=(unit,),
+    )
+    _write_final_batch(
+        tmp_path,
+        unit,
+        batch,
+        {node.nodeid: "passed"},
+        launched_at=10,
+        exited_at=25,
+        memory=[],
+        monitor_memory=None,
+    )
+
+    monkeypatch.setenv("MONITOR_TEST_MEMORY", "0")
+    disabled_environment = summary_module.format_test_run_summary(
+        tmp_path, plan, shard_index=0
+    )
+    monkeypatch.setenv("MONITOR_TEST_MEMORY", "true")
+    enabled_environment = summary_module.format_test_run_summary(
+        tmp_path, plan, shard_index=0
+    )
+
+    assert disabled_environment == enabled_environment
+    assert "Memory monitoring: disabled" not in disabled_environment
+    assert "samples 0 (partial)" in disabled_environment
+
+
+@pytest.mark.parametrize("attempt_values", [(False, True), (True, False)])
+def test_resumed_attempts_report_mixed_memory_monitoring_deterministically(
+    tmp_path: Path,
+    attempt_values: tuple[bool, bool],
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_pending.py::test_case", 0)
+    batch = Batch(
+        id="batch-pending",
+        source_file=node.source_file,
+        nodeids=(node.nodeid,),
+        estimated_ms=1000,
+        overhead_ms=0,
+        oversized=False,
+    )
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic"),
+        nodes=(node,),
+        units=(
+            Unit(
+                id="unit-pending",
+                batches=(batch,),
+                estimated_ms=1000,
+                oversized=False,
+                shard_index=0,
+            ),
+        ),
+    )
+    for number, monitor_memory in enumerate(attempt_values, start=1):
+        attempt = tmp_path / "attempts" / f"attempt-{number:04d}"
+        shard_settings = attempt / "shards" / "shard-0000.settings.json"
+        shard_settings.parent.mkdir(parents=True)
+        (attempt / "attempt.json").write_text("{}", encoding="utf-8")
+        shard_settings.write_text(
+            json.dumps({"monitor_memory": monitor_memory}), encoding="utf-8"
+        )
+
+    report = summary_module.format_test_run_summary(tmp_path, plan, shard_index=0)
+
+    assert "Memory monitoring: partially disabled (shards: 0)" in report
+
+
+def test_malformed_memory_monitoring_settings_are_reported_as_unknown(
+    tmp_path: Path,
+) -> None:
+    plan = Plan(
+        options=PlanningOptions(profile="synthetic"),
+        nodes=(),
+        units=(),
+    )
+    attempt = tmp_path / "attempts" / "attempt-0001"
+    settings = attempt / "shards" / "shard-0000.settings.json"
+    settings.parent.mkdir(parents=True)
+    (attempt / "attempt.json").write_text("{}", encoding="utf-8")
+    settings.write_text("[]", encoding="utf-8")
+
+    report = summary_module.format_test_run_summary(tmp_path, plan, shard_index=0)
+
+    assert "Memory monitoring: mixed or unknown (shards: 0)" in report
+
+
+def test_no_monitoring_evidence_is_environment_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _summary_plan()
+
+    monkeypatch.setenv("MONITOR_TEST_MEMORY", "0")
+    disabled_environment = summary_module.format_test_run_summary(
+        tmp_path, plan, shard_index=0
+    )
+    monkeypatch.setenv("MONITOR_TEST_MEMORY", "true")
+    enabled_environment = summary_module.format_test_run_summary(
+        tmp_path, plan, shard_index=0
+    )
+
+    assert disabled_environment == enabled_environment
+    assert "Memory monitoring: mixed or unknown (shards: 0)" in disabled_environment

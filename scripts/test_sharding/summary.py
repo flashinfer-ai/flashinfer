@@ -122,6 +122,13 @@ class _SourceSummary:
         return "passed"
 
 
+@dataclass(frozen=True)
+class _FailedNode:
+    nodeid: str
+    reason: str
+    shard_index: int
+
+
 def batch_directory(junit_dir: Path, unit: Unit) -> Path:
     return units_dir(junit_dir) / unit.id / "batches"
 
@@ -139,12 +146,20 @@ def _sidecar(path: Path, suffix: str) -> Path:
     return path.with_name(path.stem + suffix)
 
 
-def _attempt_for_batch(path: Path) -> str:
+def _json_object(path: Path) -> dict[str, Any] | None:
     try:
-        value = json.loads(_sidecar(path, ".meta.json").read_text(encoding="utf-8"))
-        return str(value.get("attempt_id", ""))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
-        return ""
+        return None
+
+
+def _batch_metadata(path: Path) -> dict[str, Any]:
+    return _json_object(_sidecar(path, ".meta.json")) or {}
+
+
+def _attempt_for_batch(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("attempt_id", ""))
 
 
 def _phase_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -175,15 +190,19 @@ def _memory_samples(path: Path) -> list[dict[str, float]]:
     return samples
 
 
-def _process_seconds(path: Path) -> float | None:
+def _process_seconds(metadata: dict[str, Any]) -> float | None:
     try:
-        value = json.loads(_sidecar(path, ".meta.json").read_text(encoding="utf-8"))
-        launched_at = float(value["launched_at"])
-        exited_at = float(value["exited_at"])
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        launched_at = float(metadata["launched_at"])
+        exited_at = float(metadata["exited_at"])
+    except (KeyError, TypeError, ValueError):
         return None
     duration = exited_at - launched_at
     return duration if math.isfinite(duration) and duration >= 0 else None
+
+
+def _batch_memory_monitoring(metadata: dict[str, Any]) -> bool:
+    configured = metadata.get("monitor_memory")
+    return configured if isinstance(configured, bool) else True
 
 
 def _max_memory(samples: list[dict[str, float]]) -> tuple[float, float]:
@@ -214,6 +233,7 @@ class _SummaryScan:
         default_factory=lambda: defaultdict(list)
     )
     sources: dict[tuple[int, str], _SourceSummary] = field(default_factory=dict)
+    failed_nodes: list[_FailedNode] = field(default_factory=list)
 
     @classmethod
     def for_plan(cls, plan: Plan) -> _SummaryScan:
@@ -278,13 +298,14 @@ def _record_final_batch(
     if not validation.valid:
         _record_pending(scan, unit, batch)
         return
-    attempt_id = _attempt_for_batch(path)
+    metadata = _batch_metadata(path)
+    attempt_id = _attempt_for_batch(metadata)
     phases = _phase_results(path)
     samples = _memory_samples(path)
     memory = _max_memory(samples)
     source = scan.sources[(unit.shard_index, batch.source_file)]
     source.finalized_nodes += len(validation.cases)
-    duration = _process_seconds(path)
+    duration = _process_seconds(metadata)
     if duration is None:
         source.partial_resources = True
     else:
@@ -294,7 +315,7 @@ def _record_final_batch(
         source.max_host_rss_mib = max(source.max_host_rss_mib, memory[0])
         source.max_gpu_memory_mib = max(source.max_gpu_memory_mib, memory[1])
         source.memory_samples += len(samples)
-    else:
+    elif _batch_memory_monitoring(metadata):
         source.partial_resources = True
     scan.batch_memory[batch.id] = memory
     scan.unit_memory[unit.id].append(memory)
@@ -308,6 +329,16 @@ def _record_final_batch(
         scan.shard_outcomes[unit.shard_index][outcome] += 1
         scan.shard_finalized[unit.shard_index] += 1
         scan.synthetic_count += int(case.synthetic)
+        if outcome == "failed":
+            scan.failed_nodes.append(
+                _FailedNode(
+                    nodeid=case.nodeid,
+                    reason=(
+                        case.failure_reason or "failure reason unavailable in JUnit XML"
+                    ),
+                    shard_index=unit.shard_index,
+                )
+            )
         scan.rows.append(
             {
                 "nodeid": case.nodeid,
@@ -339,6 +370,9 @@ def _scan_batches(junit_dir: Path, plan: Plan) -> _SummaryScan:
                 continue
             _record_final_batch(scan, unit=unit, batch=batch, path=path)
     scan.rows.sort(key=lambda row: row["nodeid"].encode("utf-8"))
+    scan.failed_nodes.sort(
+        key=lambda failed: (failed.nodeid.encode("utf-8"), failed.shard_index)
+    )
     for outcome in ("passed", "failed", "skipped"):
         scan.outcomes.setdefault(outcome, 0)
         for shard in scan.shard_outcomes.values():
@@ -459,6 +493,99 @@ def _merged_sources(
     return sorted(merged.values(), key=lambda item: item.source_file.encode("utf-8"))
 
 
+def _memory_monitoring_by_shard(
+    junit_dir: Path,
+    plan: Plan,
+) -> dict[int, str]:
+    observed: dict[int, set[bool]] = defaultdict(set)
+    unknown: set[int] = set()
+    for attempt_path in list_attempts(junit_dir):
+        for shard_index in range(plan.options.shard_count):
+            settings_path = (
+                attempt_path / "shards" / f"shard-{shard_index:04d}.settings.json"
+            )
+            if not settings_path.exists():
+                continue
+            settings = _json_object(settings_path)
+            if settings is None:
+                unknown.add(shard_index)
+                continue
+            monitor_memory = settings.get("monitor_memory")
+            if isinstance(monitor_memory, bool):
+                observed[shard_index].add(monitor_memory)
+            elif "monitor_memory" not in settings:
+                observed[shard_index].add(True)
+            else:
+                unknown.add(shard_index)
+
+    for unit in plan.units:
+        for batch in unit.batches:
+            path = batch_xml_path(junit_dir, unit, batch)
+            if not path.exists():
+                continue
+            metadata_path = _sidecar(path, ".meta.json")
+            metadata = _json_object(metadata_path)
+            if metadata is None:
+                unknown.add(unit.shard_index)
+                continue
+            if metadata.get("synthetic") is True:
+                continue
+            configured = metadata.get("monitor_memory")
+            if isinstance(configured, bool):
+                observed[unit.shard_index].add(configured)
+            elif "monitor_memory" not in metadata:
+                observed[unit.shard_index].add(True)
+            else:
+                unknown.add(unit.shard_index)
+
+    states: dict[int, str] = {}
+    for shard_index in range(plan.options.shard_count):
+        values = observed[shard_index]
+        if shard_index in unknown:
+            states[shard_index] = "unknown"
+        elif values == {False}:
+            states[shard_index] = "disabled"
+        elif values == {True}:
+            states[shard_index] = "enabled"
+        elif values:
+            states[shard_index] = "mixed"
+        else:
+            states[shard_index] = "unknown"
+    return states
+
+
+def _memory_monitoring_message(
+    junit_dir: Path,
+    plan: Plan,
+    shard_index: int | None,
+) -> str | None:
+    states = _memory_monitoring_by_shard(junit_dir, plan)
+    selected = (
+        [shard_index]
+        if shard_index is not None
+        else list(range(plan.options.shard_count))
+    )
+    disabled = [index for index in selected if states[index] == "disabled"]
+    mixed = [index for index in selected if states[index] == "mixed"]
+    unknown = [index for index in selected if states[index] == "unknown"]
+    if unknown:
+        return (
+            "Memory monitoring: mixed or unknown (shards: "
+            + ", ".join(str(index) for index in sorted({*disabled, *mixed, *unknown}))
+            + ")"
+        )
+    if disabled and len(disabled) == len(selected):
+        return "Memory monitoring: disabled"
+    affected = sorted({*disabled, *mixed})
+    if affected:
+        return (
+            "Memory monitoring: partially disabled (shards: "
+            + ", ".join(str(index) for index in affected)
+            + ")"
+        )
+    return None
+
+
 def _format_duration(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     hours, remainder = divmod(total, 3600)
@@ -497,7 +624,13 @@ def format_test_run_summary(
 ) -> str:
     """Render node outcomes and source-level resources from finalized batch data."""
 
-    sources = _merged_sources(_scan_batches(junit_dir, plan), shard_index)
+    scan = _scan_batches(junit_dir, plan)
+    sources = _merged_sources(scan, shard_index)
+    failed_nodes = [
+        failed
+        for failed in scan.failed_nodes
+        if shard_index is None or failed.shard_index == shard_index
+    ]
     outcomes: Counter[str] = Counter()
     for source in sources:
         outcomes.update(source.outcomes)
@@ -510,14 +643,25 @@ def format_test_run_summary(
         separator,
         title,
         separator,
-        f"Total test files: {len(sources)}",
-        f"Total test nodes: {sum(source.planned_nodes for source in sources)}",
-        f"Passed: {outcomes['passed']}",
-        f"Failed: {outcomes['failed']}",
-        f"Skipped: {outcomes['skipped']}",
-        f"Unknown: {outcomes['unknown']}",
-        f"No result: {pending_nodes}",
     ]
+    if failed_nodes:
+        lines.append("Failed test nodes:")
+        lines.extend(
+            f"  {index}. {failed.nodeid} - {failed.reason}"
+            for index, failed in enumerate(failed_nodes, start=1)
+        )
+        lines.append("")
+    lines.extend(
+        [
+            f"Total test files: {len(sources)}",
+            f"Total test nodes: {sum(source.planned_nodes for source in sources)}",
+            f"Passed: {outcomes['passed']}",
+            f"Failed: {outcomes['failed']}",
+            f"Skipped: {outcomes['skipped']}",
+            f"Unknown: {outcomes['unknown']}",
+            f"No result: {pending_nodes}",
+        ]
+    )
     failed = [source for source in sources if source.outcomes["failed"]]
     if failed:
         lines.extend(["", "Failed test files:"])
@@ -536,6 +680,9 @@ def format_test_run_summary(
         )
 
     lines.extend(["", separator, "TEST RUN RESOURCE SUMMARY", separator])
+    monitoring_message = _memory_monitoring_message(junit_dir, plan, shard_index)
+    if monitoring_message is not None:
+        lines.append(monitoring_message)
     duration_sources = [source for source in sources if source.has_process_timing]
     memory_sources = [source for source in sources if source.memory_samples]
     if not duration_sources and not memory_sources:

@@ -1271,6 +1271,7 @@ def execute_shard(
         {
             "shard_index": execution.shard_index,
             "workers": execution.workers,
+            "monitor_memory": execution.monitor_memory,
             "recorded_at": time.time(),
         },
     )
