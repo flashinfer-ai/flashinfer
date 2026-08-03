@@ -25,7 +25,7 @@ try:
     __git_commit__: str = getattr(_build_meta, "__git_commit__", None) or getattr(
         _build_meta, "__git_version__", "unknown"
     )
-except ModuleNotFoundError:
+except ImportError:
     __version__ = "0.0.0+unknown"
     __git_commit__ = "unknown"
 
