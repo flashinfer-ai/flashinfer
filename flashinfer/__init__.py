@@ -59,6 +59,10 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .conv import (
+    conv3d_nvfp4 as conv3d_nvfp4,
+    prepare_nvfp4_conv3d_weight as prepare_nvfp4_conv3d_weight,
+)
 from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,

@@ -34,6 +34,14 @@ from .jit.spdlog import gen_spdlog_module
 logger = logging.getLogger(__name__)
 
 
+def _ensure_user_env() -> None:
+    """Ensure getpass can resolve a user in containers with unmapped UIDs."""
+    if not any(
+        os.environ.get(name) for name in ("LOGNAME", "USER", "LNAME", "USERNAME")
+    ):
+        os.environ["USER"] = str(os.getuid())
+
+
 class PosEncodingMode(Enum):
     NONE = 0
     ROPE_LLAMA = 1

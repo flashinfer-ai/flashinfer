@@ -49,6 +49,7 @@ from .jit.attention import (
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
+from .jit.conv3d import gen_conv3d_nvfp4_activation_module
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
@@ -523,6 +524,8 @@ def gen_all_modules(
     )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    if has_sm120:
+        jit_specs.append(gen_conv3d_nvfp4_activation_module())
 
     if add_act:
         for act_name in act_func_def_str:

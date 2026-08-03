@@ -29,6 +29,8 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
+from ..utils import _ensure_user_env
+
 
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
@@ -249,16 +251,6 @@ def current_cuda_stream():  # noqa: F811
     _ensure_user_env()
     current_cuda_stream = torch._dynamo.disable(_current_cuda_stream_impl)
     return current_cuda_stream()
-
-
-def _ensure_user_env():
-    """Ensure a USER env var exists so that torch._dynamo initialization
-    (which calls getpass.getuser()) doesn't crash in containers running
-    as UIDs without /etc/passwd entries."""
-    import os
-
-    if not any(os.environ.get(v) for v in ("LOGNAME", "USER", "LNAME", "USERNAME")):
-        os.environ["USER"] = str(os.getuid())
 
 
 # Cache for HardwareInfo - it's expensive to create on every call
