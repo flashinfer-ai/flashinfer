@@ -1544,7 +1544,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             raise ValueError(f"rows_per_cta must be 64 or 128, got {rows_per_cta}")
         self.rows_per_cta          = rows_per_cta
         self.row_ctas              = self.D // rows_per_cta
-        self.m_stage               = 1
+        # A second M stage hides the exposed UTC64 TMA load; UTC128 is unchanged by it.
+        self.m_stage               = 2 if rows_per_cta == 64 else 1
         self.n_stage               = 1
         self.threads_per_cta       = 256
         self.compute_warp_group_id = 0
@@ -1870,7 +1871,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             grid=(num_seqs * num_heads * self.row_ctas, 1, 1), block=(self.threads_per_cta, 1, 1),
             max_number_threads=(self.threads_per_cta, 1, 1),
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
-            stream=stream, min_blocks_per_mp=2 if self.rows_per_cta == 64 else 1,
+            stream=stream, min_blocks_per_mp=1,
         )
 
     @cute.kernel
