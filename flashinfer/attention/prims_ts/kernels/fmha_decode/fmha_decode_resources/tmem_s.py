@@ -42,6 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ...._block_sparse.common import _MAX_KV_ATOM_SIZE
+from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
 from ..fmha_decode_constants import KV_TILE_256_RESCALE_THRESHOLD_LOG2
 from ...tcgen05_compat import tcgen05_mma_ws
@@ -79,7 +80,10 @@ from .helpers_common import (
     _q_group_token_base,
     _softmax_tile_idx,
 )
-from .smem_block_sparse_metadata import _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG
+from .smem_block_sparse_metadata import (
+    _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG,
+    _swaps_uses_packed_route_full_summary,
+)
 from .helpers_kv_tile_idx import (
     _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
@@ -1613,6 +1617,7 @@ class TmemSResource(DecodeGenResourceBase):
         sparse_origin2: Int32,
         sparse_origin3: Int32,
         sparse_token_word: Uint32,
+        sparse_route_flags: Uint32,
         use_sparse: Constexpr[bool],
     ) -> tuple[object, object, object, object]:
         """Load SWAP S from TMEM and materialize the running softmax state.
@@ -1749,7 +1754,8 @@ class TmemSResource(DecodeGenResourceBase):
                 )
         else:
             # Sparse routes always have a committed S tile. Invalid atoms were
-            # zero-filled by TMA and are suppressed below from their -1 origin.
+            # zero-filled by TMA and are suppressed below by either the staged
+            # origin predicate or the prepared token word.
             use_runtime_kv_domain = False
             effective_tile_idx = Int32(0)
             effective_total_kv_tiles = Int32(1)
@@ -1798,19 +1804,49 @@ class TmemSResource(DecodeGenResourceBase):
                 not cfg.uses_uniform_causal_mask
                 and not cfg.uses_per_row_causal_mask
                 and not cfg.use_kv_valid_bits
-                and min(cfg.kv_block_size, 32) == 32
-            ):
-                # One origin covers this warp's K32, so complete no-mask routes
-                # can bypass all four lane-local K8 predicates.
-                route_is_full = cute.arch.make_warp_uniform(
-                    cutlass.Boolean(
-                        sparse_origin0 >= Int32(0)
-                        and sparse_origin0 <= seq_len_kv - Int32(32)
-                    )
+                and (
+                    _swaps_uses_packed_route_full_summary(cfg)
+                    or min(cfg.kv_block_size, 32) == 32
                 )
+            ):
+                if cutlass.const_expr(
+                    _swaps_uses_packed_route_full_summary(cfg)
+                ):
+                    # Prepare already proved structural fullness for the
+                    # complete KV128 route and staging replicated the summary
+                    # for this Softmax warp's logical K32 slice.
+                    route_is_full = cute.arch.make_warp_uniform(
+                        cutlass.Boolean(
+                            (
+                                sparse_route_flags
+                                & Uint32(_PREPARED_ROUTE_IS_FULL_FLAG)
+                            )
+                            != Uint32(0)
+                        )
+                    )
+                else:
+                    # One origin covers this warp's K32 slice, so a complete
+                    # route can bypass all four lane-local K8 predicates. B16
+                    # stays on the straight-line predicate path: its two-origin
+                    # guard is not cheaper after code generation.
+                    route_is_full = cute.arch.make_warp_uniform(
+                        cutlass.Boolean(
+                            sparse_origin0 >= Int32(0)
+                            and sparse_origin0 <= seq_len_kv - Int32(32)
+                        )
+                    )
                 should_apply_sparse_mask = cutlass.Boolean(not route_is_full)
             if should_apply_sparse_mask:
                 lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
+                token_word_covers_kv_tail = (
+                    cfg.use_kv_valid_bits
+                    and not cfg.uses_uniform_causal_mask
+                    and not cfg.uses_per_row_causal_mask
+                    and (
+                        min(cfg.kv_block_size, 32) >= 16
+                        or cfg.use_prepared_route_validity
+                    )
+                )
                 for token_group_idx in cutlass.range_constexpr(4):
                     atom_origin, physical_k = self._sparse_swaps_physical_k(
                         lane_k_offset,
@@ -1820,10 +1856,17 @@ class TmemSResource(DecodeGenResourceBase):
                         sparse_origin3,
                         token_group_idx=token_group_idx,
                     )
-                    score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
-                    score_is_valid = cutlass.Boolean(
-                        score_is_valid and physical_k < seq_len_kv
-                    )
+                    # Prepared words zero absent routes and the KV tail. The
+                    # host policy decides whether they also replace the local
+                    # origin predicate; this choice is independent of which
+                    # warp issued the K/V load.
+                    score_is_valid = cutlass.Boolean(True)
+                    if cutlass.const_expr(not cfg.use_prepared_route_validity):
+                        score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
+                    if cutlass.const_expr(not token_word_covers_kv_tail):
+                        score_is_valid = cutlass.Boolean(
+                            score_is_valid and physical_k < seq_len_kv
+                        )
                     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
                         score_is_valid = cutlass.Boolean(
                             score_is_valid and physical_k < element_mask_end_idx
@@ -2164,6 +2207,7 @@ class TmemSResource(DecodeGenResourceBase):
             sparse_origin2=Int32(-1),
             sparse_origin3=Int32(-1),
             sparse_token_word=Uint32(0xFFFFFFFF),
+            sparse_route_flags=Uint32(0),
             use_sparse=False,
         )
 
@@ -2305,9 +2349,10 @@ class TmemSBlockSparseResource(TmemSResource):
                 routed_token_word2=sparse_token_word2,
                 routed_token_word3=sparse_token_word3,
             )
-        # SWAP reuses the Keeps seven-slot task ABI: origin2 occupies the flags
-        # slot, origin3 is bit-preserved in word0, and word1 is its logical K32
-        # token mask. The remaining two words stay typed sink values.
+        # SWAP reuses the Keeps seven-slot task ABI: all four origins remain
+        # physical KV atom bases, but origin2 occupies the flags slot and
+        # origin3 is bit-preserved in word0. Word1 carries the logical K32 token
+        # mask and word2 optionally carries the prepared route-full summary.
         return self._compute_softmax_loop_swaps(
             stage_info,
             old_max_arr=old_max_arr,
@@ -2319,5 +2364,6 @@ class TmemSBlockSparseResource(TmemSResource):
             sparse_origin2=Int32(sparse_route_flags),
             sparse_origin3=sparse_token_word0.bitcast(Int32),
             sparse_token_word=Uint32(sparse_token_word1),
+            sparse_route_flags=Uint32(sparse_token_word2),
             use_sparse=True,
         )

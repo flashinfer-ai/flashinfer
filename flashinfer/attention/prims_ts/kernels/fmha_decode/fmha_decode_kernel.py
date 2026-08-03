@@ -97,6 +97,7 @@ from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
     SmemKvReuseCreditResource,
+    create_block_sparse_load_tasks_per_inst,
     create_correction_task,
     create_correction_task_one_inst_qkv,
     create_load_task,
@@ -120,6 +121,55 @@ from .reduction import (  # noqa: F401
 )
 
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
+
+
+def _resolve_block_sparse_per_inst_load_topology(
+    cfg: FmhaDecodeConfig,
+    *,
+    use_clc_dynamic: bool,
+) -> tuple[tuple[int, int], tuple[int, int] | None] | None:
+    """Reuse idle WG3 padding warps for two independent sparse load streams.
+
+    The return value contains the two load warp indices and an optional
+    residual padding task ``(warp_idx, num_warps)``. ``None`` identifies a
+    noncanonical override that the caller must reject explicitly.
+    """
+
+    if cfg.load_num_warps != 1:
+        return None
+    if use_clc_dynamic:
+        # Load1 consumes the only otherwise-idle warp in WG3. A profile with
+        # an additional CLC tail-padding warp therefore cannot use this
+        # topology without assigning two tasks to the same warp.
+        if (
+            cfg.scheduler_num_warps != 1
+            or cfg.clc_padding_num_warps != 1
+            or cfg.clc_tail_padding_num_warps != 0
+        ):
+            return None
+        role_warps = (
+            cfg.mma_warp_idx,
+            cfg.scheduler_warp_idx,
+            cfg.clc_load_warp_idx,
+            cfg.clc_padding_warp_idx,
+        )
+        if len(set(role_warps)) != len(role_warps):
+            return None
+        if len({warp_idx // 4 for warp_idx in role_warps}) != 1:
+            return None
+        return (cfg.clc_load_warp_idx, cfg.clc_padding_warp_idx), None
+
+    padding_warps = tuple(
+        range(cfg.padding_warp_idx, cfg.padding_warp_idx + cfg.padding_num_warps)
+    )
+    if len(padding_warps) != 2:
+        return None
+    role_warps = (cfg.mma_warp_idx, cfg.load_warp_idx, *padding_warps)
+    if len(set(role_warps)) != len(role_warps):
+        return None
+    if len({warp_idx // 4 for warp_idx in role_warps}) != 1:
+        return None
+    return (cfg.load_warp_idx, padding_warps[0]), (padding_warps[1], 1)
 
 
 def _stages_page_ids_per_tile(uses_paired_page_offset_resources: bool) -> bool:
@@ -441,6 +491,16 @@ def _build_decode_gen_schedule(
         and cfg.tile_size_kv != 256
         and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
     )
+    # B8/B16 issue enough fine-grained TMA copies to benefit from reusing a
+    # padding warp as a second issuer. The host policy applies one KV-side
+    # crossover across all two-instance Swaps Q tiles.
+    supports_per_inst_block_sparse_load_tasks = (
+        cfg.use_block_sparse
+        and cfg.use_parallel_sparse_kv_loads
+        and not cfg.use_keeps_mma_ab
+        and cfg.kv_block_size in (8, 16)
+        and cfg.num_insts_kv == 2
+    )
     split_head_dim_page_offsets_kv = (
         use_paged_kv and use_split_head_dim_kv and not use_one_inst_qkv
     )
@@ -646,6 +706,21 @@ def _build_decode_gen_schedule(
     # in every task, which regresses multi-wave decode workloads. CLC computes
     # each schedule token once on the scheduler warp and broadcasts it to the workers.
     use_clc_dynamic = cfg.use_persistent_scheduler
+    per_inst_block_sparse_load_topology = None
+    if supports_per_inst_block_sparse_load_tasks:
+        per_inst_block_sparse_load_topology = (
+            _resolve_block_sparse_per_inst_load_topology(
+                cfg,
+                use_clc_dynamic=use_clc_dynamic,
+            )
+        )
+        if per_inst_block_sparse_load_topology is None:
+            raise ValueError(
+                "parallel sparse K/V loads require the canonical idle-warp topology"
+            )
+    use_per_inst_block_sparse_load_tasks = (
+        per_inst_block_sparse_load_topology is not None
+    )
     if use_clc_dynamic:
         num_consumer_threads = 16 * WARP_SIZE
         wq_pipeline_config = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
@@ -771,6 +846,7 @@ def _build_decode_gen_schedule(
             inst_id=0,
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
+            tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata0",
         )
         sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
@@ -779,6 +855,7 @@ def _build_decode_gen_schedule(
             inst_id=1,
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
+            tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata1",
         )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
@@ -1115,8 +1192,10 @@ def _build_decode_gen_schedule(
             ),
         )
     elif use_split_head_dim_kv:
-        load_tasks = (
-            create_load_task_split_kv(
+        if use_per_inst_block_sparse_load_tasks:
+            assert per_inst_block_sparse_load_topology is not None
+            load_warp_indices, _ = per_inst_block_sparse_load_topology
+            load_tasks = create_block_sparse_load_tasks_per_inst(
                 smem_q,
                 smem_k0,
                 smem_k1,
@@ -1126,17 +1205,37 @@ def _build_decode_gen_schedule(
                 schedule_token_throttle,
                 cfg,
                 domain=load_domain,
-                smem_page_offsets=smem_page_offsets,
-                smem_page_offsets_v=smem_page_offsets_v,
                 sparse_kv_metadata0=sparse_kv_metadata0,
                 sparse_kv_metadata1=sparse_kv_metadata1,
                 sparse_softmax_metadata0=sparse_softmax_metadata0,
                 sparse_softmax_metadata1=sparse_softmax_metadata1,
                 domain_bias=0,
-                warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                warp_indices=load_warp_indices,
                 **task_runtime_kwargs,
-            ),
-        )
+            )
+        else:
+            load_tasks = (
+                create_load_task_split_kv(
+                    smem_q,
+                    smem_k0,
+                    smem_k1,
+                    smem_v0,
+                    smem_v1,
+                    work_queue,
+                    schedule_token_throttle,
+                    cfg,
+                    domain=load_domain,
+                    smem_page_offsets=smem_page_offsets,
+                    smem_page_offsets_v=smem_page_offsets_v,
+                    sparse_kv_metadata0=sparse_kv_metadata0,
+                    sparse_kv_metadata1=sparse_kv_metadata1,
+                    sparse_softmax_metadata0=sparse_softmax_metadata0,
+                    sparse_softmax_metadata1=sparse_softmax_metadata1,
+                    domain_bias=0,
+                    warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                    **task_runtime_kwargs,
+                ),
+            )
     else:
         load_tasks = (
             create_load_task(
@@ -1291,12 +1390,19 @@ def _build_decode_gen_schedule(
             domain_bias=0,
             **task_runtime_kwargs,
         )
-    padding_warp_ranges = (
-        (cfg.wg0_padding_warp_idx, cfg.wg0_padding_num_warps),
-        (cfg.wg1_padding_warp_idx, cfg.wg1_padding_num_warps),
-        (cfg.wg2_padding_warp_idx, cfg.wg2_padding_num_warps),
-        (cfg.wg3_padding_warp_idx, cfg.wg3_padding_num_warps),
-    )
+    if use_per_inst_block_sparse_load_tasks:
+        assert per_inst_block_sparse_load_topology is not None
+        _, residual_padding = per_inst_block_sparse_load_topology
+        padding_warp_ranges = (
+            (residual_padding,) if residual_padding is not None else ()
+        )
+    else:
+        padding_warp_ranges = (
+            (cfg.wg0_padding_warp_idx, cfg.wg0_padding_num_warps),
+            (cfg.wg1_padding_warp_idx, cfg.wg1_padding_num_warps),
+            (cfg.wg2_padding_warp_idx, cfg.wg2_padding_num_warps),
+            (cfg.wg3_padding_warp_idx, cfg.wg3_padding_num_warps),
+        )
     padding_tasks = [
         create_padding_task(
             cfg,

@@ -1555,11 +1555,11 @@ def create_page_offsets_task_one_inst_qkv(
 
 
 def create_load_task_split_kv(
-    smem_q: MemoryResource,
-    smem_k0: MemoryResource,
-    smem_k1: MemoryResource,
-    smem_v0: MemoryResource,
-    smem_v1: MemoryResource,
+    smem_q: MemoryResource | None,
+    smem_k0: MemoryResource | None,
+    smem_k1: MemoryResource | None,
+    smem_v0: MemoryResource | None,
+    smem_v1: MemoryResource | None,
     work_queue: WorkQueue | None,
     schedule_token_throttle: MemoryResource | None,
     cfg: FmhaDecodeConfig,
@@ -1573,6 +1573,7 @@ def create_load_task_split_kv(
     sparse_softmax_metadata1: MemoryResource | None = None,
     warp_idx: int | None = None,
     num_warps: int | None = None,
+    task_name: str = "LoadTask",
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -1584,13 +1585,19 @@ def create_load_task_split_kv(
         raise ValueError("schedule-token throttle requires a work queue")
     if smem_page_offsets_v is not None and smem_page_offsets is None:
         raise ValueError("V page offsets require K page offsets")
+    if (smem_k0 is None) != (smem_v0 is None) or (smem_k1 is None) != (
+        smem_v1 is None
+    ):
+        raise ValueError("each split K resource requires its matching V resource")
+    if smem_k0 is None and smem_k1 is None:
+        raise ValueError("at least one split K/V instance is required")
 
     def load_schedule_body(
-        smem_q: MemoryResource,
-        smem_k0: MemoryResource,
-        smem_k1: MemoryResource,
-        smem_v0: MemoryResource,
-        smem_v1: MemoryResource,
+        smem_q: MemoryResource | None,
+        smem_k0: MemoryResource | None,
+        smem_k1: MemoryResource | None,
+        smem_v0: MemoryResource | None,
+        smem_v1: MemoryResource | None,
         sparse_kv_metadata0: MemoryResource | None,
         sparse_kv_metadata1: MemoryResource | None,
         sparse_softmax_metadata0: MemoryResource | None,
@@ -1600,19 +1607,40 @@ def create_load_task_split_kv(
         schedule_token_throttle: MemoryResource | None = None,
     ) -> None:
         """Build the split-resource K/V load cadence for all schedule phases."""
-        smem_q.init_load_state()
-        smem_k0.init_load_state()
-        smem_k1.init_load_state()
-        smem_v0.init_load_state()
-        smem_v1.init_load_state()
-        if sparse_kv_metadata0 is not None:
-            sparse_kv_metadata0.init_load_state()
-        if sparse_kv_metadata1 is not None:
-            sparse_kv_metadata1.init_load_state()
-        if sparse_softmax_metadata0 is not None:
-            sparse_softmax_metadata0.init_load_state()
-        if sparse_softmax_metadata1 is not None:
-            sparse_softmax_metadata1.init_load_state()
+        if smem_q is not None:
+            smem_q.init_load_state()
+        active_instances = (
+            (
+                smem_k0,
+                smem_v0,
+                sparse_kv_metadata0,
+                sparse_softmax_metadata0,
+                "load_k0",
+                "load_v0",
+            ),
+            (
+                smem_k1,
+                smem_v1,
+                sparse_kv_metadata1,
+                sparse_softmax_metadata1,
+                "load_k1",
+                "load_v1",
+            ),
+        )
+        # Preserve the original full-resource lowering order while allowing a
+        # per-instance task to omit the other stream's resources.
+        for smem_k, _, _, _, _, _ in active_instances:
+            if smem_k is not None:
+                smem_k.init_load_state()
+        for _, smem_v, _, _, _, _ in active_instances:
+            if smem_v is not None:
+                smem_v.init_load_state()
+        for _, _, sparse_kv_metadata, _, _, _ in active_instances:
+            if sparse_kv_metadata is not None:
+                sparse_kv_metadata.init_load_state()
+        for _, _, _, sparse_softmax_metadata, _, _ in active_instances:
+            if sparse_softmax_metadata is not None:
+                sparse_softmax_metadata.init_load_state()
         if smem_page_offsets is not None:
             smem_page_offsets.init_read_state()
         if smem_page_offsets_v is not None:
@@ -1691,39 +1719,71 @@ def create_load_task_split_kv(
             )
             sparse_softmax_metadata.commit()
 
-        smem_q.acquire()
-        smem_q.tma_load()
-        smem_q.commit()
-        route0 = resolve_and_store_kv_route(sparse_kv_metadata0, FmhaStage.Head)
-        load_tile(smem_k0, "load_k0", smem_page_offsets_k, FmhaStage.Head)
-        route1 = resolve_and_store_kv_route(sparse_kv_metadata1, FmhaStage.Head)
-        load_tile(smem_k1, "load_k1", smem_page_offsets_k, FmhaStage.Head)
-        # Preserve both K issues ahead of Softmax backpressure: metadata stages
-        # are acquired only after the pair of TensorMaps has been launched.
-        store_softmax_route(sparse_softmax_metadata0, route0)
-        store_softmax_route(sparse_softmax_metadata1, route1)
+        if smem_q is not None:
+            smem_q.acquire()
+            smem_q.tma_load()
+            smem_q.commit()
+
+        head_routes = []
+        for smem_k, _, sparse_kv_metadata, sparse_softmax_metadata, load_k, _ in (
+            active_instances
+        ):
+            if smem_k is None:
+                continue
+            route = resolve_and_store_kv_route(
+                sparse_kv_metadata, FmhaStage.Head
+            )
+            load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
+            head_routes.append((sparse_softmax_metadata, route))
+        # In the combined task, preserve both K issues ahead of Softmax
+        # backpressure. A per-instance task naturally stages its sole route.
+        for sparse_softmax_metadata, route in head_routes:
+            store_softmax_route(sparse_softmax_metadata, route)
 
         with domain_loop(0, domain, 1, unroll=1):
             # V consumes the retained route before the next K overwrites it.
-            load_tile(smem_v0, "load_v0", smem_page_offsets_v_local, FmhaStage.Loop)
-            route0 = resolve_and_store_kv_route(sparse_kv_metadata0, FmhaStage.Loop)
-            load_tile(smem_k0, "load_k0", smem_page_offsets_k, FmhaStage.Loop)
-            load_tile(smem_v1, "load_v1", smem_page_offsets_v_local, FmhaStage.Loop)
-            route1 = resolve_and_store_kv_route(sparse_kv_metadata1, FmhaStage.Loop)
-            load_tile(smem_k1, "load_k1", smem_page_offsets_k, FmhaStage.Loop)
-            store_softmax_route(sparse_softmax_metadata0, route0)
-            store_softmax_route(sparse_softmax_metadata1, route1)
+            loop_routes = []
+            for (
+                smem_k,
+                smem_v,
+                sparse_kv_metadata,
+                sparse_softmax_metadata,
+                load_k,
+                load_v,
+            ) in active_instances:
+                if smem_k is None:
+                    continue
+                assert smem_v is not None
+                load_tile(
+                    smem_v,
+                    load_v,
+                    smem_page_offsets_v_local,
+                    FmhaStage.Loop,
+                )
+                route = resolve_and_store_kv_route(
+                    sparse_kv_metadata, FmhaStage.Loop
+                )
+                load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
+                loop_routes.append((sparse_softmax_metadata, route))
+            for sparse_softmax_metadata, route in loop_routes:
+                store_softmax_route(sparse_softmax_metadata, route)
 
-        load_tile(smem_v0, "load_v0", smem_page_offsets_v_local, FmhaStage.Tail)
-        load_tile(smem_v1, "load_v1", smem_page_offsets_v_local, FmhaStage.Tail)
+        for _, smem_v, _, _, _, load_v in active_instances:
+            if smem_v is not None:
+                load_tile(
+                    smem_v,
+                    load_v,
+                    smem_page_offsets_v_local,
+                    FmhaStage.Tail,
+                )
 
     @_schedule_with_optional_resources
     def load_schedule(
-        smem_q: MemoryResource,
-        smem_k0: MemoryResource,
-        smem_k1: MemoryResource,
-        smem_v0: MemoryResource,
-        smem_v1: MemoryResource,
+        smem_q: MemoryResource | None,
+        smem_k0: MemoryResource | None,
+        smem_k1: MemoryResource | None,
+        smem_v0: MemoryResource | None,
+        smem_v1: MemoryResource | None,
         sparse_kv_metadata0: MemoryResource | None,
         sparse_kv_metadata1: MemoryResource | None,
         sparse_softmax_metadata0: MemoryResource | None,
@@ -1754,15 +1814,17 @@ def create_load_task_split_kv(
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
 
-    has_sparse_kv_metadata = sparse_kv_metadata0 is not None
-    has_sparse_softmax_metadata = sparse_softmax_metadata0 is not None
-    if (sparse_kv_metadata1 is not None) != has_sparse_kv_metadata:
-        raise ValueError("block-sparse K/V metadata resources must be paired")
-    if (sparse_softmax_metadata1 is not None) != has_sparse_softmax_metadata:
-        raise ValueError("block-sparse Softmax metadata resources must be paired")
-    if has_sparse_softmax_metadata and not has_sparse_kv_metadata:
-        raise ValueError("block-sparse Softmax metadata requires K/V metadata")
-    if has_sparse_kv_metadata:
+    for smem_k, sparse_kv_metadata, sparse_softmax_metadata in (
+        (smem_k0, sparse_kv_metadata0, sparse_softmax_metadata0),
+        (smem_k1, sparse_kv_metadata1, sparse_softmax_metadata1),
+    ):
+        if smem_k is None and (
+            sparse_kv_metadata is not None or sparse_softmax_metadata is not None
+        ):
+            raise ValueError("inactive K/V instances cannot own sparse metadata")
+        if sparse_softmax_metadata is not None and sparse_kv_metadata is None:
+            raise ValueError("Softmax sparse metadata requires retained KV metadata")
+    if sparse_kv_metadata0 is not None or sparse_kv_metadata1 is not None:
         if smem_page_offsets is not None or smem_page_offsets_v is not None:
             raise ValueError(
                 "block-sparse and paged-KV load resources cannot be combined"
@@ -1786,16 +1848,20 @@ def create_load_task_split_kv(
     src = []
     # Route resolution is ConsumerWork and K/V retention is ProducerWork on
     # the same pipeline-free resource, so register both sides of that route.
-    if sparse_kv_metadata0 is not None:
-        assert sparse_kv_metadata1 is not None
-        src.extend((sparse_kv_metadata0, sparse_kv_metadata1))
+    for sparse_kv_metadata in (sparse_kv_metadata0, sparse_kv_metadata1):
+        if sparse_kv_metadata is not None:
+            src.append(sparse_kv_metadata)
     if smem_page_offsets is not None:
         src.append(smem_page_offsets)
     if smem_page_offsets_v is not None:
         src.append(smem_page_offsets_v)
     if work_queue is not None:
         src.append(work_queue)
-    dst = [smem_q, smem_k0, smem_k1, smem_v0, smem_v1]
+    dst = [
+        resource
+        for resource in (smem_q, smem_k0, smem_k1, smem_v0, smem_v1)
+        if resource is not None
+    ]
     for sparse_resource in (
         sparse_kv_metadata0,
         sparse_kv_metadata1,
@@ -1806,24 +1872,89 @@ def create_load_task_split_kv(
             dst.append(sparse_resource)
     if schedule_token_throttle is not None:
         dst.append(schedule_token_throttle)
+    q_bound_resources = tuple(
+        (resource, resource is smem_q)
+        for resource in (smem_q, smem_k0, smem_k1, smem_v0, smem_v1)
+        if resource is not None
+    )
     return task_class(
         src_resources=src,
         dst_resources=dst,
-        q_bound_resources=(
-            (smem_q, True),
-            (smem_k0, False),
-            (smem_k1, False),
-            (smem_v0, False),
-            (smem_v1, False),
-        ),
+        q_bound_resources=q_bound_resources,
         cfg=cfg,
         warp_idx=cfg.load_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.load_num_warps if num_warps is None else num_warps,
         schedule=schedule_result,
         num_registers=cfg.mma_load_task_num_registers,
-        name="LoadTask",
+        name=task_name,
         **kw,
     )
+
+
+def create_block_sparse_load_tasks_per_inst(
+    smem_q: MemoryResource,
+    smem_k0: MemoryResource,
+    smem_k1: MemoryResource,
+    smem_v0: MemoryResource,
+    smem_v1: MemoryResource,
+    work_queue: WorkQueue | None,
+    schedule_token_throttle: MemoryResource | None,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    sparse_kv_metadata0: MemoryResource,
+    sparse_kv_metadata1: MemoryResource,
+    sparse_softmax_metadata0: MemoryResource,
+    sparse_softmax_metadata1: MemoryResource,
+    warp_indices: tuple[int, int],
+    task_class: type[DecodeGenTask] = DecodeGenTask,
+    **kw: TaskKwarg,
+) -> tuple[Task, Task]:
+    """Assign each sparse K/V instruction stream to an independent load warp.
+
+    Load0 alone owns Q and the persistent schedule-token throttle. Both tasks
+    consume the same logical work tile, while their K/V and sparse-metadata
+    pipelines remain disjoint.
+    """
+
+    if not cfg.use_block_sparse:
+        raise ValueError("per-instance load tasks require block-sparse metadata")
+
+    load0 = create_load_task_split_kv(
+        smem_q,
+        smem_k0,
+        None,
+        smem_v0,
+        None,
+        work_queue,
+        schedule_token_throttle,
+        cfg,
+        domain=domain,
+        sparse_kv_metadata0=sparse_kv_metadata0,
+        sparse_softmax_metadata0=sparse_softmax_metadata0,
+        warp_idx=warp_indices[0],
+        task_name="LoadTask0",
+        task_class=task_class,
+        **kw,
+    )
+    load1 = create_load_task_split_kv(
+        None,
+        None,
+        smem_k1,
+        None,
+        smem_v1,
+        work_queue,
+        None,
+        cfg,
+        domain=domain,
+        sparse_kv_metadata1=sparse_kv_metadata1,
+        sparse_softmax_metadata1=sparse_softmax_metadata1,
+        warp_idx=warp_indices[1],
+        task_name="LoadTask1",
+        task_class=task_class,
+        **kw,
+    )
+    return load0, load1
 
 
 def create_load_task_one_inst_qkv(

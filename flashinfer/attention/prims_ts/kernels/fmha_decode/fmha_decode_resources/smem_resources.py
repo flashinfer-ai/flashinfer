@@ -782,26 +782,42 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                     stage_info.barrier,
                                 )
             else:
-                # Fine routes stay fully general: issue one TMA per live BSR
-                # atom and use an OOB origin for empty tail slots. Avoiding
-                # route-shape branches is faster for irregular top-k rows and
-                # keeps the load policy independent of adjacency morphology.
+                # Fine routes stay fully general: issue one TMA per route
+                # atom. Retained metadata has already mapped empty slots to
+                # an OOB origin, avoiding a repeated predicate here. Keeping
+                # the load policy independent of adjacency is faster for
+                # irregular top-k rows.
                 atom_chunk_elems = chunk_hd * kv_atom_size
                 atoms_per_route = cfg.tile_size_kv // kv_atom_size
                 if prims.elect_sync():
                     stage_base = self._stage_base(stage_info)
-                    for chunk_idx in cutlass.range_constexpr(num_chunks):
-                        local_head_dim_offset = chunk_idx * chunk_hd
-                        global_head_dim_offset = (
-                            head_dim_stage_offset + local_head_dim_offset
-                        )
-                        local_tile_offset = chunk_idx * tile_chunk_elems
-                        for atom_idx in cutlass.range_constexpr(atoms_per_route):
-                            origin = Int32(
-                                self.sparse_kv_metadata.route_origin(Int32(atom_idx))
+                    # Reuse each retained origin across all head-dimension
+                    # chunks. The copies still target disjoint SMEM regions
+                    # and share one completion barrier, so only issue order
+                    # changes.
+                    origin = Int32(
+                        self.sparse_kv_metadata.route_origin(Int32(0))
+                    )
+                    next_origin = Int32(
+                        self.sparse_kv_metadata.route_origin(Int32(1))
+                    )
+                    for atom_idx in cutlass.range_constexpr(atoms_per_route):
+                        # Keep two origins ahead of TMA issue so the scalar
+                        # LDS -> uniform-register handoff can overlap a full
+                        # atom's asynchronous copies.
+                        future_origin = next_origin
+                        if cutlass.const_expr(atom_idx + 2 < atoms_per_route):
+                            future_origin = Int32(
+                                self.sparse_kv_metadata.route_origin(
+                                    Int32(atom_idx + 2)
+                                )
                             )
-                            if origin < Int32(0):
-                                origin = Int32(self.max_seq_len_kv)
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 stage_base.subview(
                                     local_tile_offset + atom_idx * atom_chunk_elems
@@ -815,6 +831,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 ),
                                 stage_info.barrier,
                             )
+                        origin = next_origin
+                        next_origin = future_origin
 
         elif cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: the page-offset resource has already staged the

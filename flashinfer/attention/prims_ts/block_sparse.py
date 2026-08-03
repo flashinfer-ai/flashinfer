@@ -78,10 +78,21 @@ _BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE = 128
 # of this launch-policy threshold.
 _CAUSAL_CLC_WAVE_THRESHOLD = 5
 _CAUSAL_CLC_MIN_MAX_ROW_ROUTES = 4
-# Q8's short tasks do not amortize CLC work discovery in the current
-# prepared-route profile. Keep this as block-sparse caller policy; dense and
-# future Q8 profiles remain free to select persistent scheduling.
-_BLOCK_SPARSE_CLC_MIN_TILE_SIZE_Q = 16
+# Q8/B8 no-mask and Q8/B16 with either token policy remain CLC-qualified
+# through the measured R128 range. Masked Q8/B8 is different: its CLC profile
+# is 7.3% faster at R12, while static is 3.4% faster at R16. Beyond R128 and
+# for other unmeasured Q8 cross-geometries, prefer the qualified static path
+# rather than extrapolating a low-margin scheduler result.
+_Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES = 8
+_Q8_B8_MASKED_CLC_MAX_ROW_ROUTES = 12
+_Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES = 128
+# A SWAPAB loop schedules two KV128 route records at a time, padding an odd
+# capacity. Representative B200 Q8/B8 and Q16/B16 sweeps place the crossover
+# at three pairs for masked B8 and four pairs for B16; unmasked B8 benefits
+# immediately. Reuse those measurements as KV-side defaults for every Swaps Q
+# tile so cross-geometries do not create additional codegen policy variants.
+_B8_MASKED_CLC_MIN_PARALLEL_ROUTE_PAIRS = 3
+_B16_CLC_MIN_PARALLEL_ROUTE_PAIRS = 4
 
 
 _BlockSparseCompileKey = tuple[
@@ -97,6 +108,8 @@ _BlockSparseCompileKey = tuple[
     Literal["dense", "causal"],
     bool,
     bool,
+    bool,
+    bool,
 ]
 
 
@@ -106,6 +119,123 @@ class _BlockSparseLaunchSpec:
 
     policy: tuple[tuple[str, object], ...]
     compile_key: _BlockSparseCompileKey
+
+
+@dataclass(frozen=True)
+class _BlockSparseExecutionPolicy:
+    """Compile-time choices that jointly define one sparse execution path."""
+
+    use_persistent_scheduler: bool
+    use_parallel_sparse_kv_loads: bool
+    use_prepared_route_validity: bool
+
+
+def _should_consider_clc(
+    *,
+    q_tile_size: int,
+    kv_block_size: int,
+    mask_type: Literal["dense", "causal"],
+    max_row_route_capacity: int,
+    use_kv_valid_bits: bool,
+) -> bool:
+    """Return whether the common selector may choose CLC for this task."""
+
+    if q_tile_size != 8:
+        return True
+    if mask_type == "causal":
+        return max_row_route_capacity <= _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
+    if kv_block_size == 8:
+        if use_kv_valid_bits:
+            return (
+                max_row_route_capacity <= _Q8_B8_MASKED_CLC_MAX_ROW_ROUTES
+            )
+        return (
+            max_row_route_capacity <= _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES
+        )
+    if kv_block_size == 16:
+        return (
+            max_row_route_capacity <= _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES
+        )
+    return max_row_route_capacity <= _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
+
+
+def _select_parallel_sparse_kv_loads(
+    *,
+    kv_block_size: int,
+    use_kv_valid_bits: bool,
+    max_row_route_capacity: int,
+    use_persistent_scheduler: bool,
+) -> bool:
+    """Choose two K/V issuer warps from KV-side TMA issue pressure."""
+
+    if kv_block_size not in (8, 16):
+        return False
+    if not use_persistent_scheduler:
+        return True
+
+    # Base the crossover on paired route capacity so R(2n - 1) and R(2n),
+    # whose final pair differs only by one padded route, share one path.
+    if kv_block_size == 8 and use_kv_valid_bits:
+        min_route_pairs = _B8_MASKED_CLC_MIN_PARALLEL_ROUTE_PAIRS
+    elif kv_block_size == 16:
+        min_route_pairs = _B16_CLC_MIN_PARALLEL_ROUTE_PAIRS
+    else:
+        return True
+    route_capacity_pairs = (max_row_route_capacity + 1) // 2
+    return route_capacity_pairs >= min_route_pairs
+
+
+def _select_prepared_route_validity(
+    *,
+    q_tile_size: int,
+    kv_block_size: int,
+    mask_type: Literal["dense", "causal"],
+    use_kv_valid_bits: bool,
+    use_persistent_scheduler: bool,
+    use_parallel_sparse_kv_loads: bool,
+) -> bool:
+    """Choose when token words alone validate a sparse atom and its KV tail."""
+
+    # B16 and larger profiles benefit directly. B8 selects this representation
+    # only with the parallel-load profile; it regresses the combined path.
+    return (
+        use_kv_valid_bits
+        and q_tile_size < 64
+        and mask_type == "dense"
+        and use_persistent_scheduler
+        and (kv_block_size >= 16 or use_parallel_sparse_kv_loads)
+    )
+
+
+def _resolve_block_sparse_execution_policy(
+    *,
+    q_tile_size: int,
+    kv_block_size: int,
+    mask_type: Literal["dense", "causal"],
+    use_kv_valid_bits: bool,
+    max_row_route_capacity: int,
+    use_persistent_scheduler: bool,
+) -> _BlockSparseExecutionPolicy:
+    """Resolve dependent codegen choices for one scheduler candidate."""
+
+    use_parallel_sparse_kv_loads = _select_parallel_sparse_kv_loads(
+        kv_block_size=kv_block_size,
+        use_kv_valid_bits=use_kv_valid_bits,
+        max_row_route_capacity=max_row_route_capacity,
+        use_persistent_scheduler=use_persistent_scheduler,
+    )
+    return _BlockSparseExecutionPolicy(
+        use_persistent_scheduler=use_persistent_scheduler,
+        use_parallel_sparse_kv_loads=use_parallel_sparse_kv_loads,
+        use_prepared_route_validity=_select_prepared_route_validity(
+            q_tile_size=q_tile_size,
+            kv_block_size=kv_block_size,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            use_persistent_scheduler=use_persistent_scheduler,
+            use_parallel_sparse_kv_loads=use_parallel_sparse_kv_loads,
+        ),
+    )
 
 
 def _validate_matching_dtypes(
@@ -294,6 +424,8 @@ def _make_block_sparse_config(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
+    use_parallel_sparse_kv_loads: bool,
+    use_prepared_route_validity: bool,
 ) -> "FmhaDecodeConfig":
     import cutlass
 
@@ -316,6 +448,8 @@ def _make_block_sparse_config(
         "kv_block_size": kv_block_size,
         "use_kv_valid_bits": use_kv_valid_bits,
         "num_kv_valid_words": (ceil_div(seq_len_kv, 32) if use_kv_valid_bits else 0),
+        "use_parallel_sparse_kv_loads": use_parallel_sparse_kv_loads,
+        "use_prepared_route_validity": use_prepared_route_validity,
     }
     if use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
@@ -367,7 +501,13 @@ def _resolve_block_sparse_launch_spec(
         max_row_route_capacity * _PREPARED_KV_ROUTE_SIZE
     )
     mode = "static"
-    if q_tile_size >= _BLOCK_SPARSE_CLC_MIN_TILE_SIZE_Q:
+    if _should_consider_clc(
+        q_tile_size=q_tile_size,
+        kv_block_size=kv_block_size,
+        mask_type=mask_type,
+        max_row_route_capacity=max_row_route_capacity,
+        use_kv_valid_bits=use_kv_valid_bits,
+    ):
         with torch.cuda.device(device_index):
             mode = _select_auto_launch_mode(
                 batch_size=batch_size,
@@ -383,7 +523,19 @@ def _resolve_block_sparse_launch_spec(
                 ),
             )
 
-    def validate_profile(use_persistent_scheduler: bool) -> None:
+    def resolve_execution_policy(
+        use_persistent_scheduler: bool,
+    ) -> _BlockSparseExecutionPolicy:
+        return _resolve_block_sparse_execution_policy(
+            q_tile_size=q_tile_size,
+            kv_block_size=kv_block_size,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            max_row_route_capacity=max_row_route_capacity,
+            use_persistent_scheduler=use_persistent_scheduler,
+        )
+
+    def validate_profile(execution_policy: _BlockSparseExecutionPolicy) -> None:
         _make_block_sparse_config(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -395,17 +547,23 @@ def _resolve_block_sparse_launch_spec(
             dtype_key=dtype_key,
             mask_type=mask_type,
             use_kv_valid_bits=use_kv_valid_bits,
-            use_persistent_scheduler=use_persistent_scheduler,
+            use_persistent_scheduler=execution_policy.use_persistent_scheduler,
+            use_parallel_sparse_kv_loads=(
+                execution_policy.use_parallel_sparse_kv_loads
+            ),
+            use_prepared_route_validity=(
+                execution_policy.use_prepared_route_validity
+            ),
         )
 
-    use_persistent_scheduler = mode == "persistent"
+    execution_policy = resolve_execution_policy(mode == "persistent")
     try:
-        validate_profile(use_persistent_scheduler)
+        validate_profile(execution_policy)
     except ValueError:
-        if not use_persistent_scheduler:
+        if not execution_policy.use_persistent_scheduler:
             raise
-        use_persistent_scheduler = False
-        validate_profile(use_persistent_scheduler)
+        execution_policy = resolve_execution_policy(False)
+        validate_profile(execution_policy)
 
     compile_key: _BlockSparseCompileKey = (
         device_index,
@@ -419,11 +577,16 @@ def _resolve_block_sparse_launch_spec(
         dtype_key,
         mask_type,
         use_kv_valid_bits,
-        use_persistent_scheduler,
+        execution_policy.use_persistent_scheduler,
+        execution_policy.use_parallel_sparse_kv_loads,
+        execution_policy.use_prepared_route_validity,
     )
     policy: tuple[tuple[str, object], ...] = (
         ("tile_size_q", q_tile_size),
-        ("use_persistent_scheduler", use_persistent_scheduler),
+        (
+            "use_persistent_scheduler",
+            execution_policy.use_persistent_scheduler,
+        ),
         ("max_row_route_capacity", max_row_route_capacity),
         # Deprecated diagnostic alias retained for existing benchmark parsers.
         ("max_execution_tiles", max_row_route_capacity),
@@ -432,6 +595,14 @@ def _resolve_block_sparse_launch_spec(
         ("visible_kv_tokens", scheduler_kv_capacity_tokens),
         ("execution_path", "prepared_bsr_decode"),
         ("use_kv_valid_bits", use_kv_valid_bits),
+        (
+            "use_parallel_sparse_kv_loads",
+            execution_policy.use_parallel_sparse_kv_loads,
+        ),
+        (
+            "use_prepared_route_validity",
+            execution_policy.use_prepared_route_validity,
+        ),
     )
     return _BlockSparseLaunchSpec(
         policy,
@@ -453,6 +624,8 @@ def _get_compiled_block_sparse(
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
     use_persistent_scheduler: bool,
+    use_parallel_sparse_kv_loads: bool,
+    use_prepared_route_validity: bool,
 ) -> Callable[..., object]:
     """Compile and cache one prepare-plus-attention TVM-FFI adapter."""
 
@@ -485,6 +658,8 @@ def _get_compiled_block_sparse(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
+        use_parallel_sparse_kv_loads=use_parallel_sparse_kv_loads,
+        use_prepared_route_validity=use_prepared_route_validity,
     )
     prepare_routes = _PrepareBlockSparseRoutes(
         batch_size=batch_size,

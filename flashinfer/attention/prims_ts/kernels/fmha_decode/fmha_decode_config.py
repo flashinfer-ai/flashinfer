@@ -517,6 +517,14 @@ class FmhaDecodeConfig:
     # time; it is intentionally not a separate plan/config specialization.
     use_kv_valid_bits: bool = False
     num_kv_valid_words: int = 0
+    # Let independent warps issue the two fine-route K/V instruction streams.
+    # The wrapper resolves this from immutable route capacity; the kernel does
+    # not inspect live BSR morphology to select its task topology.
+    use_parallel_sparse_kv_loads: bool = False
+    # Let prepared token words replace the per-atom origin/tail predicate.
+    # Correctness is independent of the load topology; the wrapper co-selects
+    # both codegen choices only for profiles where their combination is faster.
+    use_prepared_route_validity: bool = False
     # Number of K/V instances that the loop processes per step. Two instances
     # (K0/V0 and K1/V1) let two parallel SoftmaxTask groups consume alternating
     # tiles, improving SM utilization when tile_size_q is tiny.
@@ -1203,6 +1211,13 @@ class FmhaDecodeConfig:
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
         """Validate the qualified host profile for block-sparse."""
         if not self.use_block_sparse:
+            if (
+                self.use_parallel_sparse_kv_loads
+                or self.use_prepared_route_validity
+            ):
+                raise ValueError(
+                    "sparse execution policy requires block-sparse attention"
+                )
             return
 
         if not (self.q_dtype == self.kv_dtype == self.out_dtype):
@@ -1235,6 +1250,25 @@ class FmhaDecodeConfig:
             raise ValueError("coarse block-sparse Q tiles require KeepsMmaAb")
         if uses_fine_kv_blocks and not uses_fine_q_tile:
             raise ValueError("fine KV blocks require a SwapsMmaAb Q tile")
+        if self.use_parallel_sparse_kv_loads and (
+            self.use_keeps_mma_ab
+            or kv_block_size not in (8, 16)
+            or self.num_insts_kv != 2
+        ):
+            raise ValueError(
+                "parallel sparse K/V loads require two-instance SwapsMmaAb "
+                "with KV block size 8 or 16"
+            )
+        if self.use_prepared_route_validity and (
+            not uses_fine_q_tile
+            or not self.use_kv_valid_bits
+            or self.uses_uniform_causal_mask
+            or self.uses_per_row_causal_mask
+        ):
+            raise ValueError(
+                "prepared route validity requires noncausal SwapsMmaAb "
+                "token-validity words"
+            )
         if self.use_variable_seqlens_q:
             raise ValueError("block-sparse does not support variable-Q sequences")
         if self.use_sliding_window_causal:

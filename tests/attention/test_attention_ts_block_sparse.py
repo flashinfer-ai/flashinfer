@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import inspect
 import math
@@ -63,11 +64,69 @@ class _Case:
     scheduler: str
     pattern: str = "sparse"
     include_empty_row: bool = False
+    expected_parallel_loads: bool | None = None
 
 
 _CASES = (
     _Case(
-        "q8_kv16_fp16_holey_empty_static",
+        "q8_kv8_fp16_no_token_full_and_partial_clc",
+        1,
+        1,
+        16,
+        145,
+        8,
+        8,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        pattern="full_and_partial",
+    ),
+    _Case(
+        "q8_kv8_fp16_noncausal_holey_static",
+        1,
+        1,
+        17,
+        151,
+        8,
+        8,
+        torch.float16,
+        "dense",
+        "holey",
+        "static",
+        pattern="mixed",
+    ),
+    _Case(
+        "q8_kv8_bf16_noncausal_holey_clc",
+        1,
+        1,
+        17,
+        151,
+        8,
+        8,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q8_kv8_bf16_noncausal_holey_parallel_clc",
+        1,
+        1,
+        17,
+        2313,
+        8,
+        8,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "persistent",
+        pattern="wide_mixed",
+        expected_parallel_loads=True,
+    ),
+    _Case(
+        "q8_kv16_fp16_holey_empty_clc",
         1,
         1,
         23,
@@ -77,9 +136,23 @@ _CASES = (
         torch.float16,
         "dense",
         "holey",
-        "static",
+        "persistent",
         pattern="mixed",
         include_empty_row=True,
+    ),
+    _Case(
+        "q8_kv16_fp16_no_token_short_clc",
+        1,
+        1,
+        23,
+        207,
+        8,
+        16,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        pattern="mixed",
     ),
     _Case(
         "q16_kv32_bf16_causal_holey_clc",
@@ -91,6 +164,91 @@ _CASES = (
         32,
         torch.bfloat16,
         "causal",
+        "holey",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q16_kv16_bf16_noncausal_holey_clc",
+        1,
+        1,
+        47,
+        289,
+        16,
+        16,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q16_kv16_fp16_noncausal_holey_static",
+        1,
+        1,
+        49,
+        287,
+        16,
+        16,
+        torch.float16,
+        "dense",
+        "holey",
+        "static",
+        pattern="mixed",
+    ),
+    _Case(
+        "q16_kv16_fp16_no_token_tail_clc",
+        1,
+        1,
+        47,
+        289,
+        16,
+        16,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q32_kv32_fp16_noncausal_holey_clc",
+        1,
+        1,
+        65,
+        233,
+        32,
+        32,
+        torch.float16,
+        "dense",
+        "holey",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q32_kv16_bf16_noncausal_holey_parallel_clc",
+        1,
+        1,
+        65,
+        2304,
+        32,
+        16,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "persistent",
+        pattern="wide_mixed",
+        expected_parallel_loads=True,
+    ),
+    _Case(
+        "q32_kv64_fp16_noncausal_holey_tail_clc",
+        1,
+        1,
+        65,
+        321,
+        32,
+        64,
+        torch.float16,
+        "dense",
         "holey",
         "persistent",
         pattern="mixed",
@@ -108,6 +266,7 @@ _CASES = (
         "holey",
         "static",
         pattern="unaligned_tail",
+        expected_parallel_loads=True,
     ),
     _Case(
         "q32_kv128_bf16_causal_tail_static",
@@ -208,6 +367,13 @@ def _make_patterns(case: _Case) -> _Patterns:
                 ):
                     rows.append(())
                     continue
+                if case.pattern == "full_and_partial":
+                    rows.append(
+                        tuple(range(16))
+                        if row_idx == 0
+                        else (0, num_kv_blocks - 1)
+                    )
+                    continue
                 if case.pattern == "mixed":
                     candidates = (0, 1, 3, 5, 6, 7, num_kv_blocks - 1)
                     rows.append(
@@ -221,6 +387,13 @@ def _make_patterns(case: _Case) -> _Patterns:
                             )
                         )
                     )
+                    continue
+                if case.pattern == "wide_mixed":
+                    # 144 B8 blocks form nine KV128 routes, exercising the
+                    # two parallel load streams with an odd final route.
+                    candidates = list(range(0, num_kv_blocks, 2))[:143]
+                    candidates.append(num_kv_blocks - 1)
+                    rows.append(tuple(sorted(candidates)))
                     continue
                 if case.pattern == "unaligned_tail":
                     rows.append((*range(1, 9), *range(22, 30)))
@@ -816,6 +989,407 @@ def test_plan_rejects_unsupported_profile(
         block_sparse_module.BlockSparseTSWrapper().plan(**arguments)
 
 
+@pytest.mark.parametrize(
+    (
+        "q_tile_size",
+        "kv_block_size",
+        "mask_type",
+        "max_row_route_capacity",
+        "use_kv_valid_bits",
+        "expected",
+    ),
+    (
+        pytest.param(8, 8, "dense", 8, False, True, id="q8-b8-route8"),
+        pytest.param(8, 8, "dense", 32, False, True, id="q8-b8-route32"),
+        pytest.param(8, 8, "dense", 128, False, True, id="q8-b8-route128"),
+        pytest.param(8, 8, "dense", 129, False, False, id="q8-b8-route129"),
+        pytest.param(8, 8, "causal", 9, False, False, id="q8-b8-causal-route9"),
+        pytest.param(8, 16, "dense", 16, False, True, id="q8-b16-route16"),
+        pytest.param(8, 16, "dense", 16, True, True, id="q8-b16-mask-route16"),
+        pytest.param(8, 16, "dense", 128, True, True, id="q8-b16-mask-route128"),
+        pytest.param(8, 16, "dense", 129, True, False, id="q8-b16-mask-route129"),
+        pytest.param(8, 8, "dense", 12, True, True, id="q8-mask-route12"),
+        pytest.param(8, 8, "dense", 13, True, False, id="q8-mask-route13"),
+        pytest.param(16, 16, "dense", 17, False, True, id="q16-route17"),
+        pytest.param(32, 32, "dense", 64, True, True, id="q32-mask-route64"),
+    ),
+)
+def test_block_sparse_clc_candidate_capacity_gate(
+    q_tile_size: int,
+    kv_block_size: int,
+    mask_type: str,
+    max_row_route_capacity: int,
+    use_kv_valid_bits: bool,
+    expected: bool,
+) -> None:
+    assert (
+        block_sparse_module._should_consider_clc(
+            q_tile_size=q_tile_size,
+            kv_block_size=kv_block_size,
+            mask_type=mask_type,
+            max_row_route_capacity=max_row_route_capacity,
+            use_kv_valid_bits=use_kv_valid_bits,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "kv_block_size",
+        "use_kv_valid_bits",
+        "max_row_route_capacity",
+        "expected",
+    ),
+    (
+        pytest.param(8, True, 4, False, id="b8-mask-short"),
+        pytest.param(8, True, 5, True, id="b8-mask-three-pairs"),
+        pytest.param(8, True, 6, True, id="b8-mask-three-full-pairs"),
+        pytest.param(8, False, 4, True, id="b8-unmasked-short"),
+        pytest.param(16, False, 6, False, id="b16-unmasked-three-pairs"),
+        pytest.param(16, True, 6, False, id="b16-masked-three-pairs"),
+        pytest.param(16, False, 7, True, id="b16-unmasked-four-pairs"),
+        pytest.param(16, True, 7, True, id="b16-masked-four-pairs"),
+        pytest.param(32, True, 16, False, id="b32-combined"),
+        pytest.param(64, True, 8, False, id="b64-combined"),
+    ),
+)
+def test_block_sparse_parallel_kv_load_policy(
+    kv_block_size: int,
+    use_kv_valid_bits: bool,
+    max_row_route_capacity: int,
+    expected: bool,
+) -> None:
+    assert (
+        block_sparse_module._select_parallel_sparse_kv_loads(
+            kv_block_size=kv_block_size,
+            use_kv_valid_bits=use_kv_valid_bits,
+            max_row_route_capacity=max_row_route_capacity,
+            use_persistent_scheduler=True,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "common_arguments",
+    (
+        pytest.param(
+            dict(
+                kv_block_size=8,
+                use_kv_valid_bits=True,
+                max_row_route_capacity=4,
+            ),
+            id="b8-masked",
+        ),
+        pytest.param(
+            dict(
+                kv_block_size=16,
+                use_kv_valid_bits=False,
+                max_row_route_capacity=6,
+            ),
+            id="b16-unmasked",
+        ),
+    ),
+)
+def test_parallel_kv_load_policy_is_scheduler_aware(
+    common_arguments: dict[str, object],
+) -> None:
+    """A short fine-KV row uses combined only in persistent mode."""
+
+    assert block_sparse_module._select_parallel_sparse_kv_loads(
+        **common_arguments,
+        use_persistent_scheduler=False,
+    )
+    assert not block_sparse_module._select_parallel_sparse_kv_loads(
+        **common_arguments,
+        use_persistent_scheduler=True,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "q_tile_size",
+        "kv_block_size",
+        "mask_type",
+        "use_kv_valid_bits",
+        "use_persistent_scheduler",
+        "use_parallel_sparse_kv_loads",
+        "expected",
+    ),
+    (
+        pytest.param(8, 8, "dense", True, True, True, True, id="b8-clc-dual"),
+        pytest.param(8, 8, "dense", True, True, False, False, id="b8-clc-combined"),
+        pytest.param(16, 16, "dense", True, True, False, True, id="b16-clc"),
+        pytest.param(16, 16, "dense", True, False, True, False, id="static"),
+        pytest.param(16, 16, "causal", True, True, True, False, id="causal"),
+        pytest.param(
+            16, 16, "dense", False, True, True, False, id="no-token-bits"
+        ),
+        pytest.param(64, 64, "dense", True, True, False, False, id="keeps"),
+    ),
+)
+def test_prepared_route_validity_policy_is_explicit(
+    q_tile_size: int,
+    kv_block_size: int,
+    mask_type: str,
+    use_kv_valid_bits: bool,
+    use_persistent_scheduler: bool,
+    use_parallel_sparse_kv_loads: bool,
+    expected: bool,
+) -> None:
+    """Validity codegen must not infer its policy from the load task graph."""
+
+    assert (
+        block_sparse_module._select_prepared_route_validity(
+            q_tile_size=q_tile_size,
+            kv_block_size=kv_block_size,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            use_persistent_scheduler=use_persistent_scheduler,
+            use_parallel_sparse_kv_loads=use_parallel_sparse_kv_loads,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("use_parallel_sparse_kv_loads", "use_prepared_route_validity"),
+)
+def test_sparse_execution_policy_rejects_dense_decode_config(field: str) -> None:
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        FmhaDecodeConfig,
+    )
+
+    cfg = FmhaDecodeConfig(**{field: True})
+    with pytest.raises(ValueError, match="requires block-sparse"):
+        cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            dict(
+                q_block_size=32,
+                kv_block_size=32,
+                tile_size_q=32,
+                use_parallel_sparse_kv_loads=True,
+            ),
+            "KV block size 8 or 16",
+            id="b32-parallel-loads",
+        ),
+        pytest.param(
+            dict(
+                q_block_size=64,
+                kv_block_size=64,
+                tile_size_q=64,
+                use_keeps_mma_ab=True,
+                use_kv_valid_bits=True,
+                num_kv_valid_words=1,
+                use_prepared_route_validity=True,
+            ),
+            "SwapsMmaAb",
+            id="keeps-prepared-validity",
+        ),
+    ),
+)
+def test_sparse_execution_policy_rejects_unqualified_profiles(
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        FmhaDecodeConfig,
+    )
+
+    cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        **overrides,
+    )
+    with pytest.raises(ValueError, match=match):
+        cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
+
+def test_parallel_sparse_kv_load_capability_is_independent_of_q_tile_size() -> None:
+    """A Swaps Q32 profile may reuse the same fine-KV issuer topology."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        FmhaDecodeConfig,
+    )
+
+    cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=32,
+        kv_block_size=16,
+        tile_size_q=32,
+        use_parallel_sparse_kv_loads=True,
+    )
+    cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
+
+def test_clc_capacity_gates_control_launch_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route bounds must gate the selector used by the final policy."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    selector_calls: list[dict[str, object]] = []
+
+    def select_persistent(**kwargs: object) -> str:
+        selector_calls.append(kwargs)
+        return "persistent"
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        select_persistent,
+    )
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_make_block_sparse_config",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+
+    common_arguments = dict(
+        device_index=0,
+        batch_size=1,
+        seq_len_q=128,
+        seq_len_kv=4096,
+        num_heads=32,
+        head_dim=_HEAD_DIM,
+        q_block_size=8,
+        kv_block_size=8,
+        dtype_key="bf16",
+        mask_type="dense",
+    )
+    block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        cases = (
+            (False, 8, True, True),
+            (False, 32, True, True),
+            (True, 4, True, False),
+            (True, 8, True, True),
+            (True, 12, True, True),
+            (True, 13, False, True),
+        )
+        for (
+            use_kv_valid_bits,
+            capacity,
+            expected_persistent,
+            expected_parallel,
+        ) in cases:
+            selector_calls.clear()
+            spec = block_sparse_module._resolve_block_sparse_launch_spec(
+                **common_arguments,
+                use_kv_valid_bits=use_kv_valid_bits,
+                max_row_route_capacity=capacity,
+            )
+            assert (
+                dict(spec.policy)["use_persistent_scheduler"]
+                is expected_persistent
+            )
+            assert (
+                dict(spec.policy)["use_parallel_sparse_kv_loads"]
+                is expected_parallel
+            )
+            assert len(selector_calls) == int(expected_persistent)
+
+        selector_calls.clear()
+        q8_b16 = block_sparse_module._resolve_block_sparse_launch_spec(
+            **{**common_arguments, "kv_block_size": 16},
+            use_kv_valid_bits=True,
+            max_row_route_capacity=16,
+        )
+        q8_b16_policy = dict(q8_b16.policy)
+        assert q8_b16_policy["use_persistent_scheduler"] is True
+        assert q8_b16_policy["use_parallel_sparse_kv_loads"] is True
+        assert q8_b16_policy["use_prepared_route_validity"] is True
+        assert len(selector_calls) == 1
+
+        for capacity, expected_parallel in ((6, False), (7, True)):
+            selector_calls.clear()
+            q16_b16 = block_sparse_module._resolve_block_sparse_launch_spec(
+                **{
+                    **common_arguments,
+                    "q_block_size": 16,
+                    "kv_block_size": 16,
+                },
+                use_kv_valid_bits=True,
+                max_row_route_capacity=capacity,
+            )
+            q16_b16_policy = dict(q16_b16.policy)
+            assert q16_b16_policy["use_persistent_scheduler"] is True
+            assert (
+                q16_b16_policy["use_parallel_sparse_kv_loads"]
+                is expected_parallel
+            )
+            assert q16_b16_policy["use_prepared_route_validity"] is True
+            assert len(selector_calls) == 1
+    finally:
+        block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+
+
+def test_static_fallback_reselects_dependent_sparse_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected CLC profile must not retain its issuer/validity codegen."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    config_calls: list[dict[str, object]] = []
+
+    def validate_config(**kwargs: object) -> None:
+        config_calls.append(kwargs)
+        if kwargs["use_persistent_scheduler"]:
+            raise ValueError("reject persistent profile")
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        lambda **_kwargs: "persistent",
+    )
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_make_block_sparse_config",
+        validate_config,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+
+    block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        spec = block_sparse_module._resolve_block_sparse_launch_spec(
+            device_index=0,
+            batch_size=1,
+            seq_len_q=128,
+            seq_len_kv=4096,
+            num_heads=32,
+            head_dim=_HEAD_DIM,
+            q_block_size=8,
+            kv_block_size=8,
+            dtype_key="bf16",
+            mask_type="dense",
+            use_kv_valid_bits=True,
+            max_row_route_capacity=4,
+        )
+    finally:
+        block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+
+    assert [call["use_persistent_scheduler"] for call in config_calls] == [True, False]
+    assert config_calls[0]["use_parallel_sparse_kv_loads"] is False
+    assert config_calls[0]["use_prepared_route_validity"] is False
+    assert config_calls[1]["use_parallel_sparse_kv_loads"] is True
+    assert config_calls[1]["use_prepared_route_validity"] is False
+    policy = dict(spec.policy)
+    assert policy["use_persistent_scheduler"] is False
+    assert policy["use_parallel_sparse_kv_loads"] is True
+    assert policy["use_prepared_route_validity"] is False
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
@@ -950,12 +1524,10 @@ def test_public_block_sparse_correctness(
 ) -> None:
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
-    # Exercise the block-sparse Q8 static guard when auto selection asks for CLC.
-    selected_scheduler = "persistent" if case.q_block_size == 8 else case.scheduler
     monkeypatch.setattr(
         fmha_decode_config,
         "_select_auto_launch_mode",
-        lambda **_kwargs: selected_scheduler,
+        lambda **_kwargs: case.scheduler,
     )
     block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
     torch.manual_seed(20260716)
@@ -1005,6 +1577,11 @@ def test_public_block_sparse_correctness(
         policy = dict(wrapper._policy)
         assert policy["use_persistent_scheduler"] == (case.scheduler == "persistent")
         assert policy["use_kv_valid_bits"] == (valid_bits is not None)
+        if case.expected_parallel_loads is not None:
+            assert (
+                policy["use_parallel_sparse_kv_loads"]
+                is case.expected_parallel_loads
+            )
         actual = wrapper.run(q, k, v, sm_scale=sm_scale)
         if case.q_block_size == case.kv_block_size == 64:
             one_shot_actual = block_sparse_module.block_sparse_attention(
