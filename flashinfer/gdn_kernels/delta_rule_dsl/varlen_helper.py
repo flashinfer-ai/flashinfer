@@ -12,14 +12,7 @@ CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
 CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
-# (minimum average sequence length, threshold numerator, threshold denominator,
-# maximum number of sequences).
-# CP wins when non-CP parallel work is below the corresponding fraction of SMs.
-CP_SM100_PARALLELISM_TIERS = (
-    (4096, 1, 8, 1),
-    (8192, 1, 8, 2),
-    (16384, 2, 9, 2),
-)
+CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR = 4
 CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
 CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
@@ -99,8 +92,6 @@ def should_use_cp_host(
     num_sms: int,
     device_name: str,
     device_capability: tuple[int, int] | None = None,
-    total_seqlen: int | None = None,
-    num_seqs: int | None = None,
 ) -> bool:
     """Return whether a public wrapper should dispatch to the CP path.
 
@@ -108,22 +99,8 @@ def should_use_cp_host(
     output/state heads. CP is selected only when that parallelism is strictly
     below the card-specific threshold.
     """
-    if (
-        device_capability is not None
-        and device_capability[0] == 10
-        and total_seqlen is not None
-        and num_seqs is not None
-    ):
-        avg_seqlen = _ceil_div(total_seqlen, num_seqs)
-        for min_avg_seqlen, threshold_num, threshold_den, max_num_seqs in reversed(
-            CP_SM100_PARALLELISM_TIERS
-        ):
-            if avg_seqlen >= min_avg_seqlen:
-                return (
-                    num_seqs <= max_num_seqs
-                    and num_parallel_work * threshold_den < num_sms * threshold_num
-                )
-        return False
+    if device_capability is not None and device_capability[0] == 10:
+        return num_parallel_work * CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR < num_sms
 
     threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
     return num_parallel_work * threshold_den < num_sms * threshold_num

@@ -349,8 +349,6 @@ def chunk_gated_delta_rule(
         _sm_count,
         _device_name,
         device_capability=_device_capability,
-        total_seqlen=total_seq_len,
-        num_seqs=num_seqs,
     )
     will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
     if state_indices is not None:
