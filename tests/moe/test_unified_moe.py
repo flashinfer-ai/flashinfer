@@ -685,16 +685,10 @@ class TestMoERunnerSupport:
         runner.check_support()
 
     @pytest.mark.parametrize(
-        ("variant", "supported"),
-        [
-            (QuantVariant.NVFP4, True),
-            (QuantVariant.MXFP4, True),
-            (QuantVariant.W4A16, True),
-        ],
+        "variant",
+        [QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16],
     )
-    def test_fp4_sm107_variant_support_after_reland(
-        self, monkeypatch, variant, supported
-    ):
+    def test_fp4_sm107_variant_support_after_reland(self, monkeypatch, variant):
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
@@ -702,11 +696,7 @@ class TestMoERunnerSupport:
         runner.config = cfg
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
-        if supported:
-            runner.check_support()
-        else:
-            with pytest.raises(NotImplementedError, match=rf"{variant.name}.*SM107"):
-                runner.check_support()
+        runner.check_support()
 
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
