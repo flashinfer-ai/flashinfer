@@ -94,6 +94,7 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
@@ -130,6 +131,7 @@ from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
+from .norm import layernorm_quant as layernorm_quant
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
@@ -181,6 +183,9 @@ from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
+from .prefill import (
+    trtllm_sage_attention_quantize as trtllm_sage_attention_quantize,
+)
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope

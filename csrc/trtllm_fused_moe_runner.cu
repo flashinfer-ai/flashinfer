@@ -78,11 +78,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeBias = dtypeBias;
     routingData.mRouteScale = routedScalingFactor;
     // Floor the renorm denominator. ScaledSumNormalizePostprocess computes
-    // sigmoid * routeScale / (sum + mSumEpsilon). If a token's top-K selected experts all have
-    // strongly negative pre-bias logits, their sigmoids underflow to exactly 0.0 (bf16) so sum ==
-    // 0, and mSumEpsilon's 0.0f default makes this 0/0 = NaN across the token's whole output row.
-    // 1e-20f matches DeepSeek-V3's reference gate (modeling_deepseek.py: sum + 1e-20) and the
-    // MiniMax2 branch.
+    // sigmoid(raw) * routeScale / (sum + mSumEpsilon). If every selected
+    // expert contributes a zero sigmoid after underflow, the 0.0f default
+    // makes this 0/0 = NaN across the token's output row. 1e-20f matches the
+    // adjacent MiniMax2 path and prevents that zero-denominator case.
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
@@ -194,6 +193,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
     routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
     routingData.mUseRoutingSoftmax = false;
 
     int32_t const numDevices = (localNumExperts > 0) ? numExperts / localNumExperts : 1;
@@ -357,6 +357,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
       return ActType::SwiGlu;
     case ActivationType::Geglu:
       return ActType::GeGlu;
+    case ActivationType::Situ:
+      return ActType::SiTuGlu;
     default:
       FLASHINFER_CHECK(false, "Unsupported gated activation type ",
                        serializeActivationType(actType), " of enum ",
@@ -425,6 +427,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -449,6 +454,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
+        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                              : btg::Dtype::Fp32)
+                                              : btg::Dtype::Void,
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -560,6 +568,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
+      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
+                                                                            : btg::Dtype::Fp32)
+                                            : btg::Dtype::Void,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }
@@ -771,6 +782,21 @@ std::vector<int64_t> Runner::getValidConfigIndices(int32_t topK, int32_t hiddenS
   }
 
   return validIndices;
+}
+
+bool Runner::isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                int32_t intermediateSize, int32_t numLocalExperts,
+                                int32_t numTokens) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
+    return false;
+  }
+
+  auto const& config = mPassingConfigs[configIndex];
+  return mPermuteGemm1.isValidConfigIndex(static_cast<int32_t>(config.gemm1Config), topK,
+                                          hiddenSize, intermediateSize, numLocalExperts,
+                                          numTokens) &&
+         mGemm2.isValidConfigIndex(static_cast<int32_t>(config.gemm2Config), topK, hiddenSize,
+                                   intermediateSize, numLocalExperts, numTokens);
 }
 
 int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,

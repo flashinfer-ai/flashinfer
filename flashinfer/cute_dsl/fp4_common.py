@@ -915,7 +915,12 @@ def cvt_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32
 
 @dsl_user_op
 def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 AND compute reciprocal."""
+    """Convert FP8 E4M3 to float32 AND compute reciprocal (0 stays 0).
+
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -923,21 +928,17 @@ def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             """
             {
                 .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
+                .reg .f32 fp8_float, result;
 
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 fp8_float, h_lo;
                 rcp.approx.ftz.f32 result, fp8_float;
+                setp.eq.f32 p_zero, fp8_float, 0f00000000;
                 selp.f32 $0, 0f00000000, result, p_zero;
             }
             """,
@@ -1860,33 +1861,26 @@ def scatter_add_v4_bf16x2(
 
 @dsl_user_op
 def fp8_e4m3_to_f32(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32."""
+    """Convert FP8 E4M3 to float32.
+
+    Uses the hardware conversion instruction, which is exact for every
+    finite e4m3 value, including subnormals, and matches how the tensor
+    core decodes the same byte.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
             [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
             """
             {
-                .reg .pred p_zero, p_neg;
-                .reg .u32 sign_u, exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, fp8_neg;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
 
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 sign_u, $1, 0x80;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                neg.f32 fp8_neg, fp8_float;
-                setp.ne.u32 p_neg, sign_u, 0;
-                selp.f32 fp8_float, fp8_neg, fp8_float, p_neg;
-                selp.f32 $0, 0f00000000, fp8_float, p_zero;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 $0, h_lo;
             }
             """,
             "=f,r",
@@ -2426,7 +2420,10 @@ def quantize_block_fp4(
     quantized_scale = fp8_e4m3_to_f32(scale_u32)
     packed64 = Uint64(0)
     if quantized_scale != Float32(0.0) and global_scale_val != Float32(0.0):
-        packed64 = quantize_and_pack_16(values, quantized_scale * global_scale_val)
+        # 1/(qs*gs): precise counterpart of the fast path's rcp(qs)*rcp(gs).
+        packed64 = quantize_and_pack_16(
+            values, Float32(1.0) / (quantized_scale * global_scale_val)
+        )
     return packed64, scale_byte
 
 

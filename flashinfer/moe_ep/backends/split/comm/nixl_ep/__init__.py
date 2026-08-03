@@ -112,8 +112,8 @@ def _preload_libnixl() -> None:
             raise MoEEpNotBuiltError(
                 "Could not locate the NIXL runtime libraries. Install with "
                 "one of:\n"
-                "    uv pip install --no-deps 'nixl-cu13>=1.0.1'\n"
-                "    pip install --no-deps 'nixl-cu13>=1.0.1'\n"
+                "    uv pip install --no-deps 'nixl-cu13>=1.3.1'\n"
+                "    pip install --no-deps 'nixl-cu13>=1.3.1'\n"
                 "or set LD_LIBRARY_PATH to a directory containing libnixl.so."
             ) from e
 
@@ -124,7 +124,7 @@ def _preload_libnixl() -> None:
         raise MoEEpNotBuiltError(
             f"libnixl.so is missing from the NIXL wheel lib dir at "
             f"{nixl_lib_dir}. Reinstall: "
-            "uv pip install --no-deps 'nixl-cu13>=1.0.1'"
+            "uv pip install --no-deps 'nixl-cu13>=1.3.1'"
         )
     for libname in _NIXL_BASE_LIBS:
         libpath = nixl_lib_dir / libname
@@ -137,7 +137,7 @@ def _preload_libnixl() -> None:
                 f"Failed to load NIXL base lib {libpath}: {e}. The wheel "
                 "may be corrupted or built against a different glibc/CUDA. "
                 "Reinstall with: "
-                "uv pip install --force-reinstall --no-deps 'nixl-cu13>=1.0.1'"
+                "uv pip install --force-reinstall --no-deps 'nixl-cu13>=1.3.1'"
             ) from e
 
 

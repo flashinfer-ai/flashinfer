@@ -14,10 +14,15 @@ from flashinfer.fused_moe.utils import (
     make_hybrid_bucket_mapper,
 )
 from flashinfer.mla._core import (
+    CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
-from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+from flashinfer.tllm_enums import (
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    RoutingInputMode,
+)
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -245,9 +250,68 @@ def test_search_cache_hit_and_miss():
     assert miss == (False, 0, -1, None)
 
     key = AutoTuner._get_cache_key("dummy", runner, shapes, config)
-    tuner.profiling_cache[key] = (0, 1, None)
+    tuner.profiling_cache[key] = (1, None)
     hit = tuner.search_cache("dummy", [runner], shapes, config)
     assert hit == (True, 0, 1, None)
+
+
+def test_search_cache_hit_resolves_runner_id_against_current_list():
+    """A cache hit must dispatch to the runner matching its key, not to a
+    position recorded at tuning time (issue #3999 regression test)."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    winner = DummyRunner()
+    other = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+    tuple_tactic = (7, ((1, 2),))  # non-int tactic, like cuDNN engine/knobs
+
+    # Entry recorded when `winner` was tuned alone (position 0 at tuning time).
+    key = AutoTuner._get_cache_key("dummy", winner, shapes, config)
+    tuner.profiling_cache[key] = (tuple_tactic, None)
+
+    # A later call sees a longer runner list where `winner` sits at position 1.
+    hit = tuner.search_cache("dummy", [other, winner], shapes, config)
+    assert hit == (True, 1, tuple_tactic, None)
+
+    inputs = [torch.zeros(8, 16)]
+    chosen_runner, tactic = tuner.choose_one("dummy", [other, winner], config, inputs)
+    assert chosen_runner is winner
+    assert tactic == tuple_tactic
+
+
+def test_search_cache_in_memory_beats_file_config_across_runners():
+    """An in-memory tuning result must win over a file config that matches an
+    earlier-listed runner: sources are searched in priority order across all
+    runners, not per-runner."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner()
+    b = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+
+    # File config matches runner `a` (position 0); fresher in-memory result
+    # matches runner `b` (position 1).
+    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
+    tuner._file_configs[key_a.file_key] = ("DummyRunner", 3)
+    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
+    tuner.profiling_cache[key_b] = (5, None)
+
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 1, 5, None)
+
+    # Without the in-memory entry, the file config is used and resolves to
+    # `a`'s position in the current list.
+    tuner.profiling_cache.clear()
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 0, 3, None)
 
 
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
@@ -320,7 +384,7 @@ def test_choose_one_inference_uses_cache_or_fallback():
 
     # Seed cache -> cache hit.
     key = AutoTuner._get_cache_key("dummy", runner, (inputs[0].shape,), config)
-    tuner.profiling_cache[key] = (0, 2, None)
+    tuner.profiling_cache[key] = (2, None)
     chosen_runner, tactic = tuner.choose_one("dummy", [runner], config, inputs)
     assert chosen_runner is runner
     assert tactic == 2
@@ -1219,11 +1283,18 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     )
 
 
-def test_make_tuning_config_reuses_topk_ids_initializer():
+@pytest.mark.parametrize(
+    ("routing_input_mode", "packed"),
+    [
+        (RoutingInputMode.PackedPrecomputed, True),
+        (RoutingInputMode.UnpackedPrecomputed, False),
+    ],
+)
+def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
     """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls for the same num_experts.
+    same object across calls and matches the launcher's routing representation.
     """
-    fn = core_mod.get_trtllm_moe_sm100_module
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
         mock_module = MagicMock()
@@ -1259,8 +1330,12 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             per_token_scale=None,
         )
 
-        config_a = runner._make_tuning_config(moe_inputs)
-        config_b = runner._make_tuning_config(moe_inputs)
+        config_a = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
+        config_b = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
 
         spec_a = config_a.dynamic_tensor_specs[0]
         spec_b = config_b.dynamic_tensor_specs[0]
@@ -1274,6 +1349,21 @@ def test_make_tuning_config_reuses_topk_ids_initializer():
             "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
             "lru_cache key — a per-call closure reintroduces the memory leak."
         )
+        assert init_a is _moe_topk_ids_init(128, packed=packed)
+
+        initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        if packed:
+            # Packed routing stores the expert ID in the high 16 bits and a
+            # deterministic BF16 routing weight of 1.0 in the low 16 bits.
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            assert torch.all((initialized >> 16) < 128)
+            assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
+        else:
+            # Unpacked routing contains plain expert IDs, not packed bitfields.
+            assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()
 
@@ -1387,3 +1477,34 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
     finally:
         AutoTuner._find_nearest_profile.cache_clear()
         _mla_decode_tuning_config.cache_clear()
+
+
+def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(CuteDslMlaDecodeRunner)
+    runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
+    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner.qk_nope_head_dim = 512
+    runner.kv_lora_rank = 512
+    runner.qk_rope_head_dim = 64
+    runner.page_size = 32
+    runner.max_seq_len = max_seq_len
+    runner.is_var_seq = True
+    runner.uses_shared_paged_kv_idx = True
+    runner.enable_pdl = False
+    runner.sinks = None
+    runner.cute_dsl_impl = "auto"
+    runner._resolved_cute_dsl_impl = "monolithic"
+
+    query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
+    return runner.get_cache_key_extras([query, None, None, out])
+
+
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
+    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
+    assert key_257 != key_385
+
+    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    assert key_257 != key_small_workspace

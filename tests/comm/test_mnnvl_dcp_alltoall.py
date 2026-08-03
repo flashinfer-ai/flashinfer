@@ -75,7 +75,7 @@ pytestmark = [
     ),
     pytest.mark.skipif(
         not mnnvl_available(),
-        reason="MNNVL not supported on this platform or container lacks SYS_PTRACE",
+        reason="MNNVL not supported on this platform",
     ),
     pytest.mark.skipif(
         not _mpi4py_available(),
@@ -114,7 +114,7 @@ def _setup_rank():
 
 # Guard module-level allocation: pytestmark skipif conditions are not
 # enforced during module import (collection phase). If we allocate
-# unconditionally, CI environments without SYS_PTRACE will fail at
+# unconditionally, CI environments without MNNVL will fail at
 # collection time instead of gracefully skipping.
 if _dcp_alltoall_supported() and mnnvl_available() and _mpi4py_available():
     _rank, _cp_size, _comm = _setup_rank()
