@@ -178,6 +178,12 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+    # Fused shared experts are opt-in per backend. A runner that does not set
+    # this either pins num_fused_shared_experts=0 on its launch path or never
+    # forwards the argument at all, so honoring S>0 would silently drop the
+    # shared experts from the result rather than fail. Default False keeps that
+    # failure mode unreachable for backends that have not been wired.
+    supports_fused_shared_experts: ClassVar[bool] = False
 
     config: MoEConfig
 
@@ -187,6 +193,25 @@ class MoERunner(TunableRunner):
         if variant not in self.supported_quant_variants:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
+            )
+        self._assert_shared_experts_supported()
+
+    def _assert_shared_experts_supported(self) -> None:
+        """Reject S>0 on a backend that does not implement it.
+
+        Called from ``check_support()`` *and* from every ``pack_inputs()``.
+        ``check_support()`` alone is not enough: only ``MoELayer.__init__``
+        calls it (and swallows the result to filter candidates), so anything
+        holding a runner directly — tests, benchmarks, a caller reusing one
+        backend — would otherwise reach the launch path. A non-supporting
+        runner pins ``num_fused_shared_experts=0`` or never forwards it, so the
+        shared experts would be dropped from the result with no error.
+        """
+        s = self.config.experts.num_fused_shared_experts
+        if s > 0 and not self.supports_fused_shared_experts:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support fused shared experts "
+                f"(num_fused_shared_experts={s})."
             )
 
     # ---- Autotune cache keying -------------------------------------------
@@ -229,6 +254,10 @@ class MoERunner(TunableRunner):
             int(local_num_experts),
             int(experts.local_expert_offset),
             int(experts.intermediate_size),
+            # Fused shared experts widen the counts the tactic enumeration
+            # keys on (top_k + S, num_local_experts + S) without changing any
+            # profiled shape, so S=0 and S>0 would otherwise share a tactic.
+            int(experts.num_fused_shared_experts),
             int(self.config.activation.type),
             bool(self.config.execution.do_finalize),
         ) + tuple(self._backend_cache_key_parts())
@@ -325,6 +354,7 @@ class CuteDslNvfp4Runner(MoERunner):
         present for the autotuner profiling path to assign it a per-bucket
         initializer.
         """
+        self._assert_shared_experts_supported()
         # MoELayer already filters by supported_routing_modes; this guards the
         # direct-runner path (tests/benchmarks) against silently forwarding a
         # logits pack's None topk tensors into the kernel launch.
@@ -650,6 +680,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
         (passed via the static kwargs) and dropping ids outside
         ``[offset, offset + local_num_experts)``.
         """
+        self._assert_shared_experts_supported()
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -820,6 +851,7 @@ class TrtllmFp8BlockRunner(MoERunner):
         QuantVariant.DeepSeekFp8,
         QuantVariant.MxFp8,
     )
+    supports_fused_shared_experts = True
 
     def check_support(self) -> None:
         super().check_support()
@@ -874,6 +906,12 @@ class TrtllmFp8BlockRunner(MoERunner):
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
+        # Fused shared experts append S weight rows after the routed experts,
+        # so every expert-major tensor carries local + S rows. Keep the routed
+        # count separate: the kernel takes routed-only num_local_experts and
+        # widens it itself.
+        self._num_fused_shared_experts = experts.num_fused_shared_experts
+        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
 
         enable_pdl = execution.enable_pdl
         if enable_pdl is None:
@@ -902,6 +940,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             weight_layout=int(WeightLayout.MajorK),
             use_per_token_scaling=False,
             num_experts=self.config.routing.num_experts,
+            num_fused_shared_experts=self._num_fused_shared_experts,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -949,12 +988,12 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
                 )
             expected_w1_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size // 128,
                 hidden_size // 128,
             )
             expected_w2_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size // 128,
                 self._intermediate_size // 128,
             )
@@ -967,12 +1006,12 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
                 )
             expected_w1_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size,
                 hidden_size // 32,
             )
             expected_w2_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size,
                 self._intermediate_size // 32,
             )
@@ -980,12 +1019,12 @@ class TrtllmFp8BlockRunner(MoERunner):
 
         expected_weights = {
             "gemm1_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size,
                 hidden_size,
             ),
             "gemm2_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size,
                 self._intermediate_size,
             ),
@@ -1012,6 +1051,7 @@ class TrtllmFp8BlockRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._assert_shared_experts_supported()
         from ..tllm_enums import WeightLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
@@ -1037,6 +1077,24 @@ class TrtllmFp8BlockRunner(MoERunner):
             topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
             expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            # Matches the flat API, where num_fused_shared_experts is
+            # deliberately absent from the *_routed_moe entry points. Widening
+            # a caller's [num_tokens, top_k] row-major ids/weights to top_k + S
+            # here would cost a full re-strided copy -- O(tokens x top_k) of
+            # pure data movement -- or dual-stride awareness through the whole
+            # post-topk pipeline. A pre-routed caller that wants shared experts
+            # can express them directly instead: append the slots to
+            # topk_ids/topk_weights and declare num_experts + S experts with
+            # top_k + S, which needs no support from this runner.
+            if self._num_fused_shared_experts > 0:
+                raise NotImplementedError(
+                    "TrtllmFp8BlockRunner requires FromLogits routing when "
+                    "num_fused_shared_experts > 0. A pre-routed caller can fuse "
+                    "the shared experts itself by appending the slots to "
+                    "topk_ids/topk_weights and declaring num_experts + "
+                    f"{self._num_fused_shared_experts} experts with top_k + "
+                    f"{self._num_fused_shared_experts}."
+                )
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"
             )
@@ -1073,7 +1131,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             gemm2_weights=view["gemm2_weights"],
             gemm2_weights_scale=view["gemm2_weights_scale"],
             num_experts=routing.num_experts,
-            num_fused_shared_experts=0,
+            num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,
@@ -1277,6 +1335,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._assert_shared_experts_supported()
         from ..tllm_enums import RoutingMethodType
         from .core import MoeRunnerInputs
 
@@ -1489,6 +1548,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
         (the EP bridge does not quantize on the bf16 path);
         ``act.hidden_states_scale`` is unused.
         """
+        self._assert_shared_experts_supported()
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -1980,6 +2040,7 @@ class _B12xRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._assert_shared_experts_supported()
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
         first_weight = v[self.required_weight_keys[0]]

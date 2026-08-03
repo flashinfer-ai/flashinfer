@@ -36,6 +36,20 @@ from torch import Tensor
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 # ---------------------------------------------------------------------------
+# Kernel ceilings
+# ---------------------------------------------------------------------------
+# Mirrored from the trtllm-gen DeepSeek routing kernel
+# (``csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu``:
+# ``MaxSupportedTopExperts`` / ``NumNemotronExperts``).  Duplicated here so a
+# fused shared-expert geometry error is raised at config-construction time with
+# the offending numbers, instead of surfacing from a FLASHINFER_CHECK deep in
+# the launch path.  Both apply to the *fused* totals (``top_k + S`` and
+# ``num_experts + S``), because the routing kernel widens those counts before
+# running the permutation pipeline.
+MAX_SUPPORTED_TOP_EXPERTS = 32
+MAX_SUPPORTED_TOTAL_EXPERTS = 512
+
+# ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 # Routing and activation reuse the shared kernel-level enums directly
@@ -175,11 +189,35 @@ class ExpertConfig:
         Start index for expert-parallel sharding.
     local_num_experts : int or None
         Number of experts on this rank.  ``None`` → ``num_experts`` at runtime.
+    num_fused_shared_experts : int
+        Number of shared experts (``S``) fused into the MoE launch.  Shared
+        experts run for *every* token in addition to the routed top-k.  ``0``
+        (default) disables the feature.
+
+        This is layer geometry, not per-call state: ``S`` is fixed for the
+        life of the layer and must never be derived from an activation pack.
+
+        When ``> 0`` the weight and scale tensors carry ``E + S`` rows —
+        routed experts first, shared experts appended — while
+        ``RoutingConfig.num_experts`` (``E``) and ``local_num_experts`` stay
+        *routed-only*, because ``E`` is also the routing-logits width.  The
+        routing kernel emits the shared ids ``[E, E + S)`` at weight ``1.0``,
+        so the effective per-token expert count is ``top_k + S``.
+
+        Cross-field constraints are checked by :class:`MoEConfig`.
     """
 
     intermediate_size: int
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
+    num_fused_shared_experts: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_fused_shared_experts < 0:
+            raise ValueError(
+                "num_fused_shared_experts must be >= 0, got "
+                f"{self.num_fused_shared_experts}."
+            )
 
     def __repr__(self) -> str:
         parts = [f"intermediate_size={self.intermediate_size!r}"]
@@ -187,6 +225,8 @@ class ExpertConfig:
             parts.append(f"local_expert_offset={self.local_expert_offset!r}")
         if self.local_num_experts is not None:
             parts.append(f"local_num_experts={self.local_num_experts!r}")
+        if self.num_fused_shared_experts != 0:
+            parts.append(f"num_fused_shared_experts={self.num_fused_shared_experts!r}")
         return f"ExpertConfig({', '.join(parts)})"
 
 
@@ -328,6 +368,18 @@ class TrtllmFp8BlockConfig:
         prepared by separate paths. The shuffled MXFP8 view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
+
+        .. warning::
+           ``num_local_experts`` here is the **physical row count** of
+           ``w1_bf16`` / ``w2_bf16``, which with fused shared experts is
+           ``E_local + S`` — not
+           :attr:`ExpertConfig.local_num_experts`, which stays routed-only
+           (``E_local``).  The two deliberately disagree: the kernel takes the
+           routed count and widens it itself, while these tensors must already
+           carry the appended shared rows.  Passing ``E_local`` here with
+           ``S > 0`` produces a view the runner rejects as too small; passing
+           ``E_local + S`` to :class:`ExpertConfig` instead silently
+           double-counts the shared experts.
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
@@ -722,6 +774,68 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+
+    def __post_init__(self) -> None:
+        # Cross-field constraints only; single-field checks live on the
+        # sub-config.  These belong here rather than in a runner's
+        # ``check_support()`` because ``MoELayer.__init__`` *swallows* that
+        # method's exceptions to drop unsupported backends — a geometry error
+        # raised there would surface as "no backend available", not as the
+        # real cause.
+        self._validate_fused_shared_experts()
+
+    def _validate_fused_shared_experts(self) -> None:
+        s = self.experts.num_fused_shared_experts
+        if s == 0:
+            return
+
+        # Only the DeepSeekV3 routing kernel emits the appended shared slots;
+        # the Llama4/renormalize/custom kernels reject a non-zero count.
+        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+            raise ValueError(
+                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                f"method={self.routing.method!r}."
+            )
+
+        # The routing kernel widens top_k and the expert dimension by S before
+        # running the permutation pipeline, so both kernel ceilings apply to
+        # the *fused* totals rather than the routed-only values.
+        total_top_k = self.routing.top_k + s
+        if total_top_k > MAX_SUPPORTED_TOP_EXPERTS:
+            raise ValueError(
+                f"top_k + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOP_EXPERTS}, got {self.routing.top_k} + {s} = "
+                f"{total_top_k}."
+            )
+        total_experts = self.routing.num_experts + s
+        if total_experts > MAX_SUPPORTED_TOTAL_EXPERTS:
+            raise ValueError(
+                f"num_experts + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOTAL_EXPERTS}, got {self.routing.num_experts} "
+                f"+ {s} = {total_experts}."
+            )
+
+        # EP is rejected outright: the routing kernel maps a shared expert's
+        # global id (num_experts + k) to a weight row as
+        # (global_id - local_expert_offset), which only lands on the intended
+        # local slot when this rank holds the full routed expert set.
+        local_num_experts = (
+            self.experts.local_num_experts
+            if self.experts.local_num_experts is not None
+            else self.routing.num_experts
+        )
+        if self.experts.local_expert_offset != 0 or (
+            local_num_experts != self.routing.num_experts
+        ):
+            raise ValueError(
+                "num_fused_shared_experts > 0 does not support expert "
+                "parallelism: require local_expert_offset == 0 and "
+                "local_num_experts == num_experts. Got "
+                f"num_fused_shared_experts={s}, "
+                f"local_expert_offset={self.experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts}, "
+                f"num_experts={self.routing.num_experts}."
+            )
 
     # --- Dict-unpacking protocol: enables ``**config`` at call sites ---
 

@@ -20,6 +20,8 @@ These tests pin that contract for every dimension that reaches
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -263,4 +265,37 @@ def test_profiling_cache_key_file_key_separates_configs():
     assert key_a.file_key != key_b.file_key, (
         "identical profiles with different intermediate_size produced the same "
         "file_key; the persisted tactic would be reused across both."
+    )
+
+
+def test_fused_shared_experts_change_both_cache_keys():
+    """S must separate cache entries.
+
+    S widens the counts the tactic enumeration keys on (top_k + S,
+    num_local_experts + S) but changes no profiled shape, so without it in the
+    extras an S=0 layer and an S>0 layer in the same process would share one
+    tuned tactic -- and the persisted cache would reuse it across runs.
+    """
+    _skip_unless_sm100()
+    device = torch.device("cuda")
+    base = TrtllmFp8BlockRunner(
+        _config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8), device=device
+    )
+    keys = {0: (hash(base), str(base.get_cache_key_extras([])))}
+    for num_shared in (1, 2):
+        cfg = _config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8)
+        cfg = dataclasses.replace(
+            cfg,
+            experts=dataclasses.replace(
+                cfg.experts, num_fused_shared_experts=num_shared
+            ),
+        )
+        runner = TrtllmFp8BlockRunner(cfg, device=device)
+        keys[num_shared] = (hash(runner), str(runner.get_cache_key_extras([])))
+
+    assert len({h for h, _ in keys.values()}) == 3, (
+        f"S values share a runner_hash: {keys}"
+    )
+    assert len({e for _, e in keys.values()}) == 3, (
+        f"S values share cache-key extras: {keys}"
     )

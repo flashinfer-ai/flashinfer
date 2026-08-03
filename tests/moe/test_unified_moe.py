@@ -2245,3 +2245,161 @@ class TestPrepareTrtllmBf16Weights:
         for view in (nc, cpu):
             for key in ("gemm1_weights", "gemm2_weights"):
                 assert torch.equal(view[key], base[key])
+
+
+# ---------------------------------------------------------------------------
+# Fused shared experts — configuration boundaries and backend gating
+# ---------------------------------------------------------------------------
+
+
+class TestFusedSharedExpertsConfig:
+    """Geometry rejections live on the config, not in ``check_support()``.
+
+    ``MoELayer.__init__`` swallows ``check_support()`` exceptions to filter
+    unusable backends, so a geometry error raised there would surface as
+    "no backend available" rather than naming the offending value.
+    """
+
+    def _cfg(self, *, num_shared, **overrides):
+        routing = dict(
+            num_experts=64,
+            top_k=8,
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=8,
+            topk_group=4,
+            routed_scaling_factor=2.5,
+        )
+        experts = dict(intermediate_size=512, num_fused_shared_experts=num_shared)
+        routing.update(overrides.pop("routing", {}))
+        experts.update(overrides.pop("experts", {}))
+        return MoEConfig(
+            routing=RoutingConfig(**routing),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            experts=ExpertConfig(**experts),
+        )
+
+    def test_zero_is_the_default_and_stays_out_of_repr(self):
+        cfg = ExpertConfig(intermediate_size=512)
+        assert cfg.num_fused_shared_experts == 0
+        assert "num_fused_shared_experts" not in repr(cfg)
+
+    def test_repr_round_trips_with_shared_experts(self):
+        cfg = ExpertConfig(intermediate_size=512, num_fused_shared_experts=2)
+        assert eval(repr(cfg)) == cfg
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="must be >= 0"):
+            ExpertConfig(intermediate_size=512, num_fused_shared_experts=-1)
+
+    @pytest.mark.parametrize(
+        "method",
+        [m for m in RoutingMethodType if m is not RoutingMethodType.DeepSeekV3],
+    )
+    def test_non_deepseek_routing_rejected(self, method):
+        # Only the DeepSeek routing kernel emits the appended shared slots.
+        with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
+            self._cfg(num_shared=1, routing=dict(method=method))
+
+    def test_top_k_plus_shared_bounded(self):
+        # MaxSupportedTopExperts == 32 applies to the *fused* total.
+        self._cfg(num_shared=24)  # 8 + 24 == 32, allowed
+        with pytest.raises(ValueError, match=r"top_k \+ num_fused_shared_experts"):
+            self._cfg(num_shared=25)
+
+    def test_num_experts_plus_shared_bounded(self):
+        # NumNemotronExperts == 512, likewise on the fused total.
+        with pytest.raises(
+            ValueError, match=r"num_experts \+ num_fused_shared_experts"
+        ):
+            self._cfg(num_shared=1, routing=dict(num_experts=512))
+
+    @pytest.mark.parametrize(
+        "experts_override",
+        [
+            dict(local_expert_offset=8),
+            dict(local_num_experts=32),
+            dict(local_expert_offset=8, local_num_experts=32),
+        ],
+    )
+    def test_expert_parallelism_rejected(self, experts_override):
+        # The routing kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), which only lands on the intended
+        # slot when this rank holds the whole routed set.
+        with pytest.raises(ValueError, match="does not support expert"):
+            self._cfg(num_shared=1, experts=experts_override)
+
+    def test_full_local_set_accepted(self):
+        cfg = self._cfg(num_shared=1, experts=dict(local_num_experts=64))
+        assert cfg.experts.num_fused_shared_experts == 1
+
+
+class TestFusedSharedExpertsBackendGating:
+    """Only backends that opt in may see S>0.
+
+    A runner that pins ``num_fused_shared_experts=0`` on its launch path, or
+    never forwards it, would drop the shared experts from the result instead of
+    failing. ``check_support()`` alone is not enough because callers holding a
+    runner directly never invoke it, so ``pack_inputs()`` re-checks.
+    """
+
+    def _shared_cfg(self, variant):
+        return MoEConfig(
+            routing=RoutingConfig(
+                num_experts=64,
+                top_k=2,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+                routed_scaling_factor=2.5,
+            ),
+            quant=QuantConfig(variant=variant),
+            experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=2),
+        )
+
+    def test_registry_is_split_into_supporting_and_not(self):
+        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+        supporting = {
+            r.__name__
+            for r in _BACKEND_RUNNERS.values()
+            if r.supports_fused_shared_experts
+        }
+        assert supporting == {"TrtllmFp8BlockRunner"}, (
+            "backends claiming fused shared-expert support changed; confirm the "
+            f"new backend forwards num_fused_shared_experts: {supporting}"
+        )
+
+    def test_every_non_supporting_runner_rejects_at_check_support(self):
+        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+        checked = 0
+        for runner_cls in set(_BACKEND_RUNNERS.values()):
+            if runner_cls.supports_fused_shared_experts:
+                continue
+            variant = runner_cls.supported_quant_variants[0]
+            runner = runner_cls.__new__(runner_cls)
+            runner.config = self._shared_cfg(variant)
+            with pytest.raises(
+                NotImplementedError, match="does not support fused shared experts"
+            ):
+                runner.check_support()
+            checked += 1
+        assert checked, "no non-supporting runners exercised"
+
+    def test_every_non_supporting_runner_rejects_at_pack_inputs(self):
+        """The guard must also hold for callers that never call check_support."""
+        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+        checked = 0
+        for runner_cls in set(_BACKEND_RUNNERS.values()):
+            if runner_cls.supports_fused_shared_experts:
+                continue
+            variant = runner_cls.supported_quant_variants[0]
+            runner = runner_cls.__new__(runner_cls)
+            runner.config = self._shared_cfg(variant)
+            with pytest.raises(
+                NotImplementedError, match="does not support fused shared experts"
+            ):
+                runner.pack_inputs(None, None)
+            checked += 1
+        assert checked, "no non-supporting runners exercised"
