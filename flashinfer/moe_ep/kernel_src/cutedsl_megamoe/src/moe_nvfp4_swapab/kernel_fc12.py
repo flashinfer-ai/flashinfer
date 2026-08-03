@@ -8,6 +8,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from packaging.version import Version
+
+cute_dsl_version = Version(cutlass.__version__)
 
 try:
     from cutlass.cute import iket  # type: ignore
@@ -2210,11 +2213,28 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    # CuTe-DSL 4.5.2 mainloop WAR (cutedsl_megamoe MR!27; see
+                    # TUNING.md "Follow-up 2026-07-22"): 4.5.2's codegen
+                    # mishandles the data-dependent peek guard inside the
+                    # K-loop (`if k_tile + 1 < cnt: try_wait()`), costing
+                    # 34-54% kernel time vs 4.6.1. Peeling the last k-tile out
+                    # of the loop makes the in-loop try_wait unconditional
+                    # (the peeled tail consumes the final peek), which
+                    # restores full 4.6.1 parity. const_expr-gated on exactly
+                    # 4.5.2 so newer runtimes keep the original loop shape;
+                    # delete both peel branches when 4.5.2 support is dropped.
+                    cutedsl_452_ver_war = cute_dsl_version == Version("4.5.2")
+                    k_tile_loop_cnt = k_tile_cnt
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        k_tile_loop_cnt = k_tile_loop_cnt - 1
+
+                    for k_tile in cutlass.range(0, k_tile_loop_cnt, 1, unroll=1):
                         handle = ab_consumer.wait_and_advance(peek_ab_full_status)
-                        peek_ab_full_status = cutlass.Boolean(1)
-                        if k_tile + 1 < k_tile_cnt:
+                        if cutlass.const_expr(cutedsl_452_ver_war):
                             peek_ab_full_status = ab_consumer.try_wait()
+                        else:
+                            if k_tile + 1 < k_tile_loop_cnt:
+                                peek_ab_full_status = ab_consumer.try_wait()
 
                         s2t_stage_coord = (None, None, None, None, handle.index)
                         cute.copy(
@@ -2237,6 +2257,36 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                             sfa_tensor=tCtSFA,
                             sfb_tensor=tCtSFB_mma,
                             k_tile_idx=k_tile,
+                            valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
+                            mma_tiler_mnk=self.mma_tiler_mnk,
+                        )
+                        handle.release()
+
+                    if cutlass.const_expr(cutedsl_452_ver_war):
+                        # 4.5.2 WAR peeled last k-tile (rationale above): same
+                        # body as the loop, consuming the final try_wait peek.
+                        handle = ab_consumer.wait_and_advance(peek_ab_full_status)
+
+                        s2t_stage_coord = (None, None, None, None, handle.index)
+                        cute.copy(
+                            tiled_copy_s2t_sfa,
+                            tCsSFA_compact_s2t[s2t_stage_coord],
+                            tCtSFA_compact_s2t,
+                        )
+                        cute.copy(
+                            tiled_copy_s2t_sfb,
+                            tCsSFB_compact_s2t[s2t_stage_coord],
+                            tCtSFB_compact_s2t,
+                        )
+
+                        tile_crd = (None, None, None, handle.index)
+                        dynamic_mainloop.issue_dynamic_block_scaled_mma_tile(
+                            acc_tensor=tCtAcc,
+                            a_frag_tile=tCrA[tile_crd],
+                            b_frag_tile=tCrB[tile_crd],
+                            sfa_tensor=tCtSFA,
+                            sfb_tensor=tCtSFB_mma,
+                            k_tile_idx=k_tile_cnt - 1,
                             valid_tokens_in_tile=work_tile_info.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler_mnk,
                         )

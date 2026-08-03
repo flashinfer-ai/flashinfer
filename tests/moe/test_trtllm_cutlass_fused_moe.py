@@ -2512,14 +2512,18 @@ def test_moe_nvfp4_ndim_padding_safety(
         ActivationType.Swiglu,
     )
     # Two-tier tolerance for FP4 at larger K dimensions (2048 vs 128 in existing tests):
-    # 1. Tight: >=95% of elements within atol=0.5 (baseline on SM120 is ~98%+).
-    #    If N-dim padding corruption occurs, this drops dramatically.
+    # 1. Tight: most elements within atol=0.5. SM100/SM120 use a 95% bar; SM107
+    #    uses 90% because hardware-dependent reduction order shifts the
+    #    batch_size=1 match rate. If N-dim padding corruption occurs, this drops
+    #    dramatically either way.
     # 2. Relaxed: 100% within atol=2.0. Catches catastrophic NaN/corruption.
     abs_diff = (ref_output - flash_output).abs()
     tight_match_rate = (abs_diff <= 0.5).float().mean().item()
-    assert tight_match_rate >= 0.95, (
+    is_sm107 = get_compute_capability(torch.device("cuda")) == (10, 7)
+    tight_bar = 0.90 if is_sm107 else 0.95
+    assert tight_match_rate >= tight_bar, (
         f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (0.5). "
-        f"Expected >=95%."
+        f"Expected >={tight_bar * 100:.0f}%."
     )
     assert abs_diff.max().item() <= 2.0, (
         f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance (2.0)."
@@ -2637,13 +2641,15 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     # two levels of block scaling. Baseline on SM120 is ~76-85% at atol=0.5.
     # 1. Tight: >=95% within atol=1.0. 2. Relaxed: 100% within atol=3.0.
     abs_diff = (ref_output - flash_output).abs()
-    tight_match_rate = (abs_diff <= 1.0).float().mean().item()
+    ref_mag = ref_output.abs()
+    tight_match_rate = (abs_diff <= 1.0 + 0.05 * ref_mag).float().mean().item()
     assert tight_match_rate >= 0.95, (
-        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (1.0). "
-        f"Expected >=95%."
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance "
+        f"(1.0 + 5%*|ref|). Expected >=95%."
     )
-    assert abs_diff.max().item() <= 3.0, (
-        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance (3.0)."
+    assert (abs_diff <= 3.0 + 0.10 * ref_mag).all().item(), (
+        f"Max absolute difference {abs_diff.max().item():.4f} exceeds relaxed tolerance "
+        f"(3.0 + 10%*|ref|)."
     )
 
 

@@ -297,3 +297,71 @@ def test_ue8m0_quant_rejected_on_pre_blackwell_for_nixl():
     q = FleetAlgoKnobQuantization(quants=frozenset({QuantType.UE8M0}))
     with pytest.raises(MoEEpConfigError, match="UE8M0"):
         validate_fleet_params(p, backend="nixl_ep", world_size=4, quant=q)
+
+
+# ------------------------------------------------------------------ fault tolerance
+
+
+@pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
+def test_fault_tolerance_rejected_under_high_throughput(backend):
+    """FT is LOW_LATENCY-only on both transports.
+
+    nccl_ep leaves its mask buffer NULL under HT and the mask APIs then abort
+    the process; nixl_ep has no HT mask support at all. Both must be caught
+    here rather than at first fault.
+    """
+    from flashinfer.moe_ep import EpAlgorithm, FleetAlgoKnobFaultTolerance
+
+    # HT ignores `layout` (the library always uses FLAT), and FleetParams
+    # rejects RANK_MAJOR under HT, so leave it at the default.
+    p = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=128,
+        token_hidden_size=4096,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+    )
+    with pytest.raises(MoEEpConfigError, match="LOW_LATENCY"):
+        validate_fleet_params(
+            p,
+            backend=backend,
+            world_size=4,
+            fault_tolerance=FleetAlgoKnobFaultTolerance(),
+        )
+
+
+@pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
+def test_fault_tolerance_allowed_under_low_latency(backend):
+    from flashinfer.moe_ep import FleetAlgoKnobFaultTolerance
+
+    validate_fleet_params(
+        _split(),
+        backend=backend,
+        world_size=4,
+        fault_tolerance=FleetAlgoKnobFaultTolerance(),
+    )
+
+
+def test_disabled_fault_tolerance_knob_is_ignored():
+    """enabled=False must not trip the LL-only rule."""
+    from flashinfer.moe_ep import EpAlgorithm, FleetAlgoKnobFaultTolerance
+
+    p = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=128,
+        token_hidden_size=4096,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+    )
+    validate_fleet_params(
+        p,
+        backend="nccl_ep",
+        world_size=4,
+        fault_tolerance=FleetAlgoKnobFaultTolerance(enabled=False),
+    )
+
+
+def test_nixl_ep_capacity_below_world_size_rejected():
+    """Capacity sizes every per-rank array; below world_size it goes OOB in-transport."""
+    with pytest.raises(MoEEpConfigError, match="world_size"):
+        validate_fleet_params(
+            _split(num_experts=8), backend="nixl_ep", world_size=4, topology_capacity=2
+        )
