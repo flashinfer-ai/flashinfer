@@ -409,6 +409,9 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
              false,          // is_s_padded
              false);         // has_alibi
 
+  // cu_seqlens is built above as i * q_seqlen, so the batch is uniform by construction.
+  params.is_uniform_q = batch_size > 0;
+
   if (data_type == DATA_TYPE_E4M3 && output_dtype == DATA_TYPE_BF16) {
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
         params, launch_params, stream);

@@ -19,10 +19,11 @@ Kimi Delta Attention Decode - API Layer
 =======================================
 
 This file provides the public API for recurrent KDA decode operations.
-Kernel implementations are in flashinfer/kda_kernels/.
+Kernel implementations are in ``flashinfer.kda_kernels``; callers may
+explicitly select the exported Cake backend.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -59,13 +60,16 @@ def recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    *,
+    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
-    This is the public API layer for the CuTe DSL implementation in
+    This public API supports the existing CuTe DSL implementation and an
+    explicit exported Cake backend in
     ``flashinfer.kda_kernels.recurrent_kda``. It supports single-token decode,
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
-    gate modes as the backend implementation.
+    gate modes as the selected backend implementation.
 
     Args:
         q (torch.Tensor):
@@ -132,6 +136,11 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        backend (Literal["cute-dsl", "cake"]):
+            Implementation backend. ``"cute-dsl"`` preserves the existing
+            FlashInfer implementation. ``"cake"`` strictly selects an
+            exported Cake kernel and raises when the call does not match one
+            of its supported contracts. Default: ``"cute-dsl"``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -139,6 +148,8 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
+    if backend not in ("cute-dsl", "cake"):
+        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
 
@@ -164,4 +175,5 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        backend=backend,
     )

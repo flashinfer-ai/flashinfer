@@ -79,6 +79,19 @@ def probe_ulysses_rank_topology(
     Never raises: the whole probe (including hostname and device resolution)
     runs inside an exception envelope, so any failure lands in ``probe_error``
     and the (conservative) decision layer falls back to NCCL.
+
+    Parameters
+    ----------
+    device : torch.device or str or int, optional
+        CUDA device for this rank. ``None`` uses the current CUDA device.
+    rank : int
+        Rank id to record in the returned topology object.
+
+    Returns
+    -------
+    UlyssesRankTopology
+        Per-rank topology information, including any probe error instead of
+        raising locally.
     """
     topo = UlyssesRankTopology(rank=rank)
     try:
@@ -160,6 +173,20 @@ def decide_ulysses_backend(
     inconsistent, or unverifiable selects NCCL. Raises
     :class:`UlyssesBackendError` only when ``requested == "nvlink"`` and the
     NVLink path cannot be used.
+
+    Parameters
+    ----------
+    requested : str
+        Requested backend policy: ``"auto"``, ``"nvlink"``, or ``"nccl"``.
+    topologies : list[UlyssesRankTopology]
+        Per-rank topology probe results gathered from the process group.
+    supported_world_sizes : Sequence[int], optional
+        World sizes for which the fused NVLink kernel is instantiated.
+
+    Returns
+    -------
+    UlyssesBackendDecision
+        Backend choice and selection or fallback reason.
     """
     if requested not in ULYSSES_BACKENDS:
         raise ValueError(
@@ -267,6 +294,21 @@ def resolve_ulysses_backend(
        catches the result into an outcome, gathers, and cross-checks. Any
        disagreement conservatively selects NCCL — or raises for
        ``backend="nvlink"``.
+
+    Parameters
+    ----------
+    backend : str, default = "auto"
+        Requested backend policy: ``"auto"``, ``"nvlink"``, or ``"nccl"``.
+    group : torch.distributed.ProcessGroup, optional
+        Process group whose ranks must make a consistent backend decision.
+        Defaults to ``torch.distributed.group.WORLD``.
+    device : torch.device or str or int, optional
+        CUDA device to use for probe and metadata collective guards.
+
+    Returns
+    -------
+    UlyssesBackendDecision
+        Group-consistent backend choice and selection or fallback reason.
     """
     if group is None:
         group = dist.group.WORLD

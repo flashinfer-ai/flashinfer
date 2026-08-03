@@ -13,11 +13,14 @@
 # limitations under the License.
 
 """
-KDA (Key-Driven Attention) Kernels - CuTe DSL Implementations
-==============================================================
+KDA (Kimi Delta Attention) Kernels
+==================================
 
 Per-K-dimension gating variant of GDN. Gate g[B,T,HV,K] applied per-lane
 instead of GDN's scalar broadcast.
+
+The recurrent wrapper exposes the existing CuTe DSL implementation and an
+explicit Cake backend backed by frozen SM100a CUDA modules.
 
 Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
