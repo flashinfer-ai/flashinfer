@@ -350,6 +350,14 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     )
 
 
+# The rendered reference must run standalone (tests/trace exec it from the
+# committed JSON), so the module-level helper it calls has to be inlined ahead
+# of it. Without this the emitted source raises NameError on first call.
+_trtllm_fp8_block_scale_moe_ds_routing_reference._trace_reference_dependencies = (
+    _fp8_moe_run_experts,
+)
+
+
 @torch.no_grad()
 def _trtllm_fp8_block_scale_moe_default_routing_reference(
     routing_logits,
