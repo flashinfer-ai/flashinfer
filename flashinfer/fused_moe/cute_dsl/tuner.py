@@ -540,9 +540,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             # cannot reach the device -- but refusing here avoids pointless
             # profiling of a tactic that can only throw, and says why.
             logger.warning(
-                "cute_dsl MoE refuses problem dims "
-                "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d): "
-                "no tactic (incl. default) passes can_implement (gh #3957).",
+                "No valid tactics found for problem dims "
+                "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d). "
+                "Falling back to default tactic.",
                 num_tokens,
                 hidden_size,
                 intermediate_size,
