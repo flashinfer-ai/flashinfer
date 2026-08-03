@@ -2571,6 +2571,44 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             self._max_kv_len = max(kv_lens_arr_host).item()
 
+        # block_extend: reduce effective KV lengths for scheduling.
+        # The C++ scheduler computes kv_len from indptr gaps, so we must shorten
+        # the indptr itself (not just kv_lens_arr_host which is ignored).
+        # We keep the original indptr for kernel access and create a trimmed
+        # copy for plan().
+        self._paged_kv_indptr_for_plan = paged_kv_indptr_host
+        if self._block_extend:
+            qo_lens_host = qo_indptr_host[1:] - qo_indptr_host[:-1]
+            block_size = self._block_size
+            effective_pages = []
+            for i in range(batch_size):
+                qo_len = int(qo_lens_host[i])
+                q_offset = (
+                    int(q_offsets[i])
+                    if q_offsets is not None and i < len(q_offsets)
+                    else 0
+                )
+                q_global_end = q_offset + qo_len - 1
+                q_block = q_global_end // block_size
+                max_kv = min(int(kv_lens_arr_host[i]), (q_block + 1) * block_size)
+                kv_lens_arr_host[i] = max_kv
+                # Effective pages for this request (ceiling division)
+                eff_pages = (max_kv + page_size - 1) // page_size
+                # Clamp to actual pages allocated
+                actual_pages = int(
+                    paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i]
+                )
+                effective_pages.append(min(eff_pages, actual_pages))
+            # Build a modified indptr where gaps reflect effective pages only.
+            # Keep last element consistent so the plan function can validate
+            # total_num_rows / indptr extents.
+            new_paged_indptr = paged_kv_indptr_host.detach().clone()
+            running = int(new_paged_indptr[0])
+            for i in range(batch_size):
+                new_paged_indptr[i + 1] = running + effective_pages[i]
+                running = new_paged_indptr[i + 1]
+            self._paged_kv_indptr_for_plan = new_paged_indptr
+
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
                 self._max_total_num_rows = total_num_rows
@@ -2776,7 +2814,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
-                paged_kv_indptr_host,
+                self._paged_kv_indptr_for_plan,
                 kv_lens_arr_host,
                 self._max_total_num_rows or total_num_rows,
                 batch_size,
@@ -3917,6 +3955,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cached_o_data_type = o_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
+        # block_extend: reduce effective KV lengths for scheduling.
+        # The C++ scheduler computes kv_len from indptr gaps (FA2) or from
+        # kv_len_arr directly (FA3/SM90), so we build a trimmed copy of both
+        # while keeping the originals for kernel memory access.
+        self._kv_indptr_for_plan = kv_indptr_host
+        if self._block_extend:
+            qo_lens_host = qo_indptr_host[1:] - qo_indptr_host[:-1]
+            block_size = self._block_size
+            kv_indptr_plan = kv_indptr_host.detach().clone()
+            kv_len_arr_plan = kv_len_arr.detach().clone()
+            running = int(kv_indptr_plan[0])
+            for i in range(batch_size):
+                qo_len = int(qo_lens_host[i])
+                q_offset = (
+                    int(q_offsets[i])
+                    if q_offsets is not None and i < len(q_offsets)
+                    else 0
+                )
+                q_global_end = q_offset + qo_len - 1
+                q_block = q_global_end // block_size
+                max_kv = min(int(kv_len_arr[i]), (q_block + 1) * block_size)
+                kv_indptr_plan[i + 1] = running + max_kv
+                running = kv_indptr_plan[i + 1]
+                kv_len_arr_plan[i] = max_kv
+            self._kv_indptr_for_plan = kv_indptr_plan
+            kv_len_arr = kv_len_arr_plan
+
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
@@ -4167,7 +4232,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
-                kv_indptr_host,
+                self._kv_indptr_for_plan,
                 kv_len_arr,
                 self._max_total_num_rows or total_num_rows,
                 batch_size,
