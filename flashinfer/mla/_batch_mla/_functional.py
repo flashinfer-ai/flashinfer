@@ -84,6 +84,7 @@ smaller_mla_dimensions = _MLAHeadDimensions(64, 64, 128, 256)
 supported_mla_head_dimensions = [
     deepseek_mla_dimensions,
     smaller_mla_dimensions,
+    _MLAHeadDimensions(256, 0, 256, 512),
 ]
 
 
@@ -126,6 +127,7 @@ def _mla_decode_tuning_config(
     buckets: Tuple[int, ...],
     num_pages: int,
     profile_seq_len: int,
+    sparse_top_k_width: int = 0,
 ) -> TuningConfig:
     """Return a stable per-shape tuning config for the batch sweep.
 
@@ -144,14 +146,27 @@ def _mla_decode_tuning_config(
         tensor.fill_(profile_seq_len)
         return tensor
 
+    def init_sparse_top_k_lens(shapes, dtype, device):
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        tensor.fill_(sparse_top_k_width)
+        return tensor
+
+    has_sparse_lens = sparse_top_k_width > 0
+    input_idx = (0, 1, 2, 3, 4) if has_sparse_lens else (0, 1, 2, 3)
+    initializers = (
+        (None, init_block_tables, init_seq_lens, None, init_sparse_top_k_lens)
+        if has_sparse_lens
+        else (None, init_block_tables, init_seq_lens, None)
+    )
+
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
+                input_idx=input_idx,
+                dim_idx=(0,) * len(input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=(None, init_block_tables, init_seq_lens, None),
+                tensor_initializers=initializers,
             ),
         ),
         use_cuda_graph=True,
@@ -170,6 +185,7 @@ def _build_mla_decode_tuning_config(
     max_seq_len: int,
     device: torch.device,
     cute_dsl_max_batch: Optional[int] = None,
+    sparse_top_k_width: int = 0,
 ) -> TuningConfig:
     """Reduce one dispatch request to the stable tuning-config cache key."""
     page_size = kv_cache.shape[-2]
@@ -184,7 +200,9 @@ def _build_mla_decode_tuning_config(
         device,
         cute_dsl_max_batch,
     )
-    return _mla_decode_tuning_config(buckets, kv_cache.shape[0], profile_seq_len)
+    return _mla_decode_tuning_config(
+        buckets, kv_cache.shape[0], profile_seq_len, sparse_top_k_width
+    )
 
 
 def _run_functional_mla(
@@ -203,6 +221,45 @@ def _run_functional_mla(
         if prepare_for_dispatch is not None:
             prepare_for_dispatch()
         return runner
+
+    def run_cute_direct(
+        direct_request: _FunctionalMLARequest,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Run CuTe features whose dynamic metadata is owned by its public adapter."""
+        if direct_request.seq_lens is None:
+            raise ValueError("seq_lens is required for cute-dsl MLA")
+        if direct_request.multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
+            )
+        from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
+
+        return cute_dsl_mla_decode(
+            query=direct_request.query,
+            kv_cache=direct_request.kv_cache,
+            workspace_buffer=direct_request.workspace_buffer,
+            kv_lora_rank=direct_request.kv_lora_rank,
+            qk_rope_head_dim=direct_request.qk_rope_head_dim,
+            block_tables=direct_request.block_tables,
+            seq_lens=direct_request.seq_lens,
+            max_seq_len=direct_request.max_seq_len,
+            softmax_scale=direct_request.bmm1_scale,
+            output_scale=direct_request.bmm2_scale,
+            out=direct_request.out,
+            out_dtype=torch.bfloat16,
+            is_var_seq=direct_request.is_var_seq,
+            enable_pdl=direct_request.enable_pdl,
+            lse=direct_request.lse,
+            return_lse=direct_request.return_lse,
+            sinks=direct_request.sinks,
+            cute_dsl_impl=direct_request.cute_dsl_impl,
+            cum_seq_lens_q=direct_request.cum_seq_lens_q,
+            max_q_len=direct_request.max_q_len,
+            enable_dcp=direct_request.enable_dcp,
+            cp_world=direct_request.cp_world,
+            cp_rank=direct_request.cp_rank,
+            causal_seqlens_kv_global=direct_request.causal_seqlens_kv_global,
+        )
 
     def make_cute_runner(
         cute_request: _FunctionalMLARequest, *, for_auto: bool
@@ -240,18 +297,38 @@ def _run_functional_mla(
                 _FUNCTIONAL_MLA_RUNNERS["cute-dsl-modular"](modular_request)
             )
 
+    if request.enable_dcp:
+        return run_cute_direct(replace(request, cute_dsl_impl="monolithic"))
+
+    if request.cum_seq_lens_q is not None:
+        if backend in ("cute-dsl", "cute-dsl-monolithic", "cute-dsl-modular"):
+            return run_cute_direct(request)
+        if backend == "trtllm-gen":
+            return run_explicit(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request))
+        if backend == "auto":
+            num_heads = request.query.size(-2)
+            trt_gap = 64 < num_heads < 128
+            needs_cute = trt_gap or request.return_lse or request.lse is not None
+            if not needs_cute:
+                return run_explicit(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request))
+            if request.sparse_mla_top_k > 0:
+                reason = "head-count gap" if trt_gap else "LSE with cum_seq_lens_q"
+                raise ValueError(
+                    "auto: no backend supports this variable-Q sparse "
+                    f"configuration ({reason})"
+                )
+            return run_cute_direct(request)
+
     if backend == "cute-dsl":
         return run_explicit(make_cute_runner(request, for_auto=False))
     if backend != "auto":
         return run_explicit(_FUNCTIONAL_MLA_RUNNERS[backend](request))
 
-    # Ragged queries preserve the established TRTLLM-GEN-only direct path.
-    if request.cum_seq_lens_q is not None:
-        return run_explicit(_FUNCTIONAL_MLA_RUNNERS["trtllm-gen"](request))
-
     runners: List[TunableRunner] = []
     runner_names: List[str] = []
     trtllm_reason = _trtllm_gen_mla_incompatibility_reason(request.kv_cache)
+    if 64 < request.query.size(-2) < 128:
+        trtllm_reason = "trtllm-gen MLA decode does not support 64 < num_heads_q < 128"
     if trtllm_reason is None:
         try:
             trtllm_runner = prepare_candidate(
@@ -301,6 +378,11 @@ def _run_functional_mla(
         kv_lora_rank=request.kv_lora_rank,
         max_seq_len=request.max_seq_len,
         device=request.query.device,
+        sparse_top_k_width=(
+            request.block_tables.shape[-1]
+            if request.sparse_mla_top_k_lens is not None
+            else 0
+        ),
     )
     inputs = [
         request.query,
@@ -308,6 +390,8 @@ def _run_functional_mla(
         request.seq_lens,
         runners[0].inputs[3],
     ]
+    if request.sparse_mla_top_k_lens is not None:
+        inputs.append(request.sparse_mla_top_k_lens)
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm_batch_decode_mla",
         runners,
@@ -443,6 +527,11 @@ def xqa_batch_decode_with_kv_cache_mla(
         cum_seq_lens_q=None,
         max_q_len=None,
         multi_ctas_kv_counter_buffer=None,
+        sparse_mla_top_k_lens=None,
+        enable_dcp=False,
+        cp_world=1,
+        cp_rank=0,
+        causal_seqlens_kv_global=None,
     )
     return _run_functional_mla(request, "xqa")
 

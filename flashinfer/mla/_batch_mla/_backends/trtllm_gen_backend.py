@@ -51,6 +51,7 @@ from .._contracts import (
 _SUPPORTED_MLA_DIMENSIONS = (
     (512, 64, 128),
     (256, 64, 64),
+    (512, 0, 256),
 )
 
 # Keep the trtllm-gen autotune sweep bounded; actual counter storage is sized
@@ -215,6 +216,7 @@ class _TrtllmGenMlaDecodeLauncher:
         lse_stride_tokens: int = 0,
         lse_stride_heads: int = 0,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+        sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
     ) -> None:
         # Functional one-shot callers may not have a separate planning phase,
         # so retain lazy reservation as a compatibility fallback. Stateful
@@ -267,6 +269,7 @@ class _TrtllmGenMlaDecodeLauncher:
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
         )
 
 
@@ -933,6 +936,8 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             normalized.seq_lens,
             normalized.out,
         ]
+        if normalized.sparse_mla_top_k_lens is not None:
+            self._inputs.append(normalized.sparse_mla_top_k_lens)
         self._prepared_functional_state: Optional[_TrtllmGenMlaFunctionalState] = None
         self._dispatch_functional_state: Optional[_TrtllmGenMlaFunctionalState] = None
         self._dispatch_inputs: Optional[Tuple[torch.Tensor, ...]] = None
@@ -1021,8 +1026,6 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
                     )
             elif max_q_len <= 0:
                 raise ValueError("max_q_len must be greater than 0")
-            elif max_q_len > query.size(0):
-                raise ValueError("max_q_len cannot exceed the flattened query length")
             batch_size_for_counter = batch_size
         else:
             if query.ndim != 4:
@@ -1106,7 +1109,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
         return [-1]
 
     def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs
+        q, _, _, out = inputs[:4]
         sinks_key = (
             None
             if self.sinks is None
@@ -1134,6 +1137,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
             self.return_lse,
+            len(inputs) == 5,
         )
         if self._ragged_cache_key_extra is None:
             return base_key
@@ -1368,6 +1372,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             lse_stride_tokens=0 if state.lse is None else state.lse.stride(0),
             lse_stride_heads=0 if state.lse is None else state.lse.stride(1),
             multi_ctas_kv_counter_buffer=counter,
+            sparse_mla_top_k_lens=request.sparse_mla_top_k_lens,
         )
         if not request.return_lse:
             return state.out
@@ -1390,9 +1395,12 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
         del kwargs
         if tactic != -1:
             raise ValueError(f"trtllm-gen MLA only supports tactic -1, got {tactic!r}.")
-        if len(inputs) != 4:
-            raise ValueError("trtllm-gen MLA runner expects four dynamic inputs.")
-        query, block_tables, seq_lens, out = inputs
+        if len(inputs) not in (4, 5):
+            raise ValueError(
+                "trtllm-gen MLA runner expects four or five dynamic inputs."
+            )
+        query, block_tables, seq_lens, out = inputs[:4]
+        sparse_mla_top_k_lens = inputs[4] if len(inputs) == 5 else None
         profile_measurement = is_in_profile_measurement()
         use_dispatch_state = (
             not profile_measurement
@@ -1415,6 +1423,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 out=out,
+                sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             )
         if not use_dispatch_state and profile_measurement and not do_preparation:
             if self._prepared_functional_state is None:

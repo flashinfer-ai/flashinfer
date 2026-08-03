@@ -70,16 +70,17 @@ def _compile_cute_dsl_monolithic_mla_kernel(
         implementation.get_num_sm(device),
     )
     compiled_kernel = implementation._get_compiled_mla_kernel(
-        torch_dtype=q_data_type,
-        torch_out_dtype=out_dtype,
-        page_size=page_size,
-        kv_lora_rank=head_dim_ckv,
-        qk_rope_head_dim=head_dim_kpe,
-        num_heads=num_heads,
-        seq_len_q=q_len,
-        is_persistent=not resolved_is_var_seq,
-        is_var_seq=resolved_is_var_seq,
-        is_var_split_kv=False,
+        q_data_type,
+        out_dtype,
+        page_size,
+        head_dim_ckv,
+        head_dim_kpe,
+        num_heads,
+        q_len,
+        not resolved_is_var_seq,
+        resolved_is_var_seq,
+        False,  # is_var_q; planned wrapper metadata is rectangular
+        False,  # is_var_split_kv
         is_workspace_size_zero=workspace_size == 0,
         enable_pdl=enable_pdl,
     )
@@ -93,7 +94,18 @@ def _launch_cute_dsl_monolithic_mla_kernel(
 ) -> None:
     if sinks is not None:
         raise ValueError("cute-dsl-monolithic does not support sinks.")
-    state.compiled_kernel(*launch_args)
+    # The monolithic kernel's fixed-Q specialization still carries the
+    # variable-Q and DCP ABI slots introduced upstream. Planned wrappers leave
+    # those features disabled, so populate their neutral runtime values here.
+    monolithic_launch_args = (
+        *launch_args[:10],
+        None,  # cum_seq_lens_q
+        None,  # causal_seqlens_kv_global
+        state.Int32(0),  # cp_rank
+        launch_args[10],  # block_split_kvs
+        *launch_args[11:],
+    )
+    state.compiled_kernel(*monolithic_launch_args)
 
 
 class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
