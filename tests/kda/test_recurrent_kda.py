@@ -458,13 +458,15 @@ def test_vllm_decode(
 
 
 @pytest.mark.parametrize(
-    ("B", "H", "D"),
+    ("B", "H", "D", "padded_state"),
     [
-        pytest.param(4, 8, 64, id="grouped"),
-        pytest.param(4, 32, 128, id="register-tile"),
+        pytest.param(4, 8, 64, False, id="grouped-compact"),
+        pytest.param(4, 8, 64, True, id="grouped-padded"),
+        pytest.param(4, 32, 128, False, id="register-tile-compact"),
+        pytest.param(4, 32, 128, True, id="register-tile-padded"),
     ],
 )
-def test_standard_decode_state_indices_update_pool(B, H, D):
+def test_standard_decode_state_indices_update_pool(B, H, D, padded_state):
     """Standard decode with ssm_state_indices updates the caller's state pool."""
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -480,7 +482,14 @@ def test_standard_decode_state_indices_update_pool(B, H, D):
     beta = torch.rand(B, 1, HV, dtype=dtype, device=device).sigmoid()
     scale = D**-0.5
 
-    state_pool = torch.randn(n_slots, HV, D, D, dtype=dtype, device=device) * 0.01
+    state_values = torch.randn(n_slots, HV, D, D, dtype=dtype, device=device) * 0.01
+    if padded_state:
+        slot_stride = HV * D * D + 32
+        backing = torch.empty(n_slots * slot_stride, dtype=dtype, device=device)
+        state_pool = backing.as_strided((n_slots, HV, D, D), (slot_stride, D * D, D, 1))
+        state_pool.copy_(state_values)
+    else:
+        state_pool = state_values
     state_indices = torch.tensor([49, 2, 55, 20], dtype=torch.int32, device=device)
     untouched = torch.ones(n_slots, dtype=torch.bool, device=device)
     untouched[state_indices.long()] = False
@@ -498,7 +507,13 @@ def test_standard_decode_state_indices_update_pool(B, H, D):
         output_final_state=True,
     )
 
-    indexed_pool = state_pool.clone()
+    indexed_pool = torch.empty_strided(
+        state_pool.shape,
+        state_pool.stride(),
+        dtype=state_pool.dtype,
+        device=state_pool.device,
+    )
+    indexed_pool.copy_(state_pool)
     original_untouched = indexed_pool[untouched].clone()
     tri_out, tri_state = recurrent_kda(
         q=q,
@@ -528,8 +543,51 @@ def test_standard_decode_state_indices_update_pool(B, H, D):
     )
 
 
+def test_standard_decode_dense_matches_identity_indices():
+    """Dense CuTe decode remains equivalent to an explicit identity mapping."""
+    torch.manual_seed(44)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    B, H, D = 4, 8, 64
+
+    q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand_like(q)
+    v = torch.rand_like(q)
+    g = F.logsigmoid(torch.randn_like(q, dtype=torch.float32)).to(dtype)
+    beta = torch.rand(B, 1, H, dtype=dtype, device=device).sigmoid()
+    initial = torch.randn(B, H, D, D, dtype=dtype, device=device) * 0.01
+
+    dense_state = initial.clone()
+    indexed_state = initial.clone()
+    dense_output, dense_final_state = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=dense_state,
+        output_final_state=True,
+    )
+    indexed_output, indexed_final_state = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=indexed_state,
+        output_final_state=True,
+        ssm_state_indices=torch.arange(B, dtype=torch.int32, device=device),
+    )
+
+    assert_close("dense output", indexed_output.float(), dense_output.float())
+    assert_close("dense state", indexed_state.float(), dense_state.float())
+    assert_close(
+        "dense returned state", indexed_final_state.float(), dense_final_state.float()
+    )
+
+
 def test_standard_decode_state_indices_cuda_graph():
-    """Direct paged-state standard decode is CUDA graph compatible."""
+    """Indexed decode replays correctly on a non-default CUDA stream."""
     torch.manual_seed(43)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -541,49 +599,65 @@ def test_standard_decode_state_indices_cuda_graph():
     v = torch.rand(B, 1, H, D, dtype=dtype, device=device)
     g = F.logsigmoid(torch.randn(B, 1, H, D, device=device)).to(dtype)
     beta = torch.rand(B, 1, H, dtype=dtype, device=device).sigmoid()
-    state_pool = torch.randn(n_slots, H, D, D, dtype=dtype, device=device) * 0.01
+    initial_state = torch.randn(n_slots, H, D, D, dtype=dtype, device=device) * 0.01
     state_indices = torch.tensor([49, 2, 55, 20], dtype=torch.int32, device=device)
-    output = torch.empty(B, 1, H, D, dtype=dtype, device=device)
-
-    # Compile and initialize module-level dummy buffers before capture.
+    expected_state = initial_state.clone()
+    expected_output = torch.empty(B, 1, H, D, dtype=dtype, device=device)
     recurrent_kda(
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
-        initial_state=state_pool,
+        initial_state=expected_state,
         ssm_state_indices=state_indices,
-        output=output,
+        output=expected_output,
     )
-    untouched = torch.ones(n_slots, dtype=torch.bool, device=device)
-    untouched[state_indices.long()] = False
-    untouched_before = state_pool[untouched].clone()
+
+    graph_state = initial_state.clone()
+    graph_output = torch.empty_like(expected_output)
+    graph_kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "initial_state": graph_state,
+        "ssm_state_indices": state_indices,
+        "output": graph_output,
+    }
+    capture_stream = torch.cuda.Stream(device=device)
+    capture_stream.wait_stream(torch.cuda.current_stream(device))
+    warmup_state = initial_state.clone()
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**{**graph_kwargs, "initial_state": warmup_state})
+    capture_stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_output, _ = recurrent_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=state_pool,
-            ssm_state_indices=state_indices,
-            output=output,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**graph_kwargs)
 
-    assert captured_output.data_ptr() == output.data_ptr()
-    assert torch.isfinite(output).all()
-    assert_close(
-        "graph untouched state",
-        untouched_before.float(),
-        state_pool[untouched].float(),
-        atol=0,
-        rtol=0,
-    )
+    assert captured_state is None
+    assert captured_output.data_ptr() == graph_output.data_ptr()
+    for _ in range(2):
+        with torch.cuda.stream(capture_stream):
+            graph_state.copy_(initial_state)
+            graph_output.fill_(float("nan"))
+        capture_stream.synchronize()
+        with torch.cuda.stream(capture_stream):
+            graph.replay()
+        capture_stream.synchronize()
+
+        assert_close(
+            "graph output",
+            expected_output.float(),
+            graph_output.float(),
+        )
+        assert_close(
+            "graph state",
+            expected_state.float(),
+            graph_state.float(),
+        )
 
 
 # ==============================================================================
@@ -756,9 +830,8 @@ def test_non_compact_state_stride(H: int, D: int):
     The kernel's compiled fake tensor uses a free sym_int64 stride[0], so it must
     handle any stride divisible by 16, not just the compact HV*V*K stride.
 
-    Must use cu_seqlens path: the non-cu_seqlens path always calls .contiguous()
-    on the state tensor, so non-compact stride only matters for the cu_seqlens path
-    where state is passed directly to the kernel without copying.
+    This case exercises the packed path; standard indexed decode covers the
+    same padded outer-slot layout above.
     """
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -1298,27 +1371,57 @@ def test_spec_decode_separate_source_and_beta_logits(D):
 
 
 _BACKEND_SELECTION_CASES = [
-    (128, 1, 1, True, "D128-T1-small-grid"),
-    (128, 1, 1536, True, "D128-T1-last-measured-one-warp-win"),
-    (128, 1, 1919, True, "D128-T1-cutoff-minus-one"),
-    (128, 1, 1920, False, "D128-T1-cutoff"),
-    (128, 1, 3072, False, "D128-T1-large-grid"),
-    (128, 3, 96, False, "D128-spec-decode"),
-    (64, 1, 8, True, "D64-T1-small-grid"),
-    (64, 1, 1536, True, "D64-T1-last-measured-one-warp-win"),
-    (64, 1, 7679, True, "D64-T1-cutoff-minus-one"),
-    (64, 1, 7680, False, "D64-T1-cutoff"),
-    (64, 1, 12288, False, "D64-T1-large-grid"),
-    (64, 3, 96, False, "D64-spec-decode"),
+    (128, 1, 128, 16, 16, False, (10, 0), False, "SM100-D128-T1-grouped-edge"),
+    (128, 1, 129, 16, 16, False, (10, 0), True, "SM100-D128-T1-one-warp-edge"),
+    (64, 1, 256, 8, 8, False, (10, 0), False, "SM100-D64-T1-grouped-edge"),
+    (64, 1, 257, 8, 8, False, (10, 0), True, "SM100-D64-T1-one-warp-edge"),
+    (128, 3, 255, 16, 16, True, (10, 0), False, "SM100-T3-gated-grouped-edge"),
+    (128, 3, 256, 16, 16, True, (10, 0), True, "SM100-T3-gated-one-warp-edge"),
+    (128, 3, 256, 16, 32, True, (10, 0), False, "SM100-T3-GQA-grouped"),
+    (128, 4, 4095, 16, 16, False, (10, 0), True, "SM100-T4-dense-one-warp-edge"),
+    (128, 4, 4096, 16, 16, False, (10, 0), False, "SM100-T4-dense-grouped-edge"),
+    (128, 4, 256, 16, 32, False, (10, 0), False, "SM100-T4-GQA-grouped"),
+    (128, 1, 1919, 16, 16, False, (10, 3), True, "fallback-D128-cutoff-minus-one"),
+    (128, 1, 1920, 16, 16, False, (10, 3), False, "fallback-D128-cutoff"),
+    (64, 1, 7679, 8, 8, False, (10, 3), True, "fallback-D64-cutoff-minus-one"),
+    (64, 1, 7680, 8, 8, False, (10, 3), False, "fallback-D64-cutoff"),
+    (128, 3, 96, 16, 16, True, (10, 3), False, "fallback-spec-decode"),
 ]
 
 
 @pytest.mark.parametrize(
-    ("D", "num_tokens", "sequence_heads", "expected"),
+    (
+        "D",
+        "num_tokens",
+        "sequence_heads",
+        "H",
+        "HV",
+        "use_gate",
+        "compute_capability",
+        "expected",
+    ),
     [pytest.param(*case[:-1], id=case[-1]) for case in _BACKEND_SELECTION_CASES],
 )
-def test_backend_selection(D, num_tokens, sequence_heads, expected):
-    assert recurrent_kda_module._use_one_warp(D, num_tokens, sequence_heads) is expected
+def test_backend_selection(
+    D,
+    num_tokens,
+    sequence_heads,
+    H,
+    HV,
+    use_gate,
+    compute_capability,
+    expected,
+):
+    selected = recurrent_kda_module._use_one_warp(
+        D,
+        num_tokens,
+        sequence_heads,
+        H,
+        HV,
+        use_gate,
+        compute_capability,
+    )
+    assert selected is expected
 
 
 @pytest.mark.parametrize(
@@ -1465,8 +1568,112 @@ def test_kernel_schedule(
         tokens,
         use_gate,
         N * HV,
+        (10, 3),
     )
     assert selected == (expected_rows, expected_reduction)
+
+
+@pytest.mark.parametrize(
+    ("D", "tokens", "use_gate", "sequence_heads", "expected"),
+    [
+        pytest.param(64, 1, False, 512, (32, DUAL_ACCUM_REDUCTION), id="D64"),
+        pytest.param(
+            128,
+            1,
+            True,
+            256,
+            (16, TREE_REDUCTION),
+            id="gated-low",
+        ),
+        pytest.param(
+            128,
+            1,
+            True,
+            512,
+            (32, DUAL_ACCUM_REDUCTION),
+            id="gated-mid",
+        ),
+        pytest.param(
+            128,
+            1,
+            True,
+            1536,
+            (8, TREE_REDUCTION),
+            id="gated-high",
+        ),
+        pytest.param(
+            128,
+            1,
+            True,
+            1537,
+            (16, DUAL_ACCUM_REDUCTION),
+            id="gated-largest",
+        ),
+        pytest.param(
+            128,
+            1,
+            False,
+            256,
+            (16, TREE_REDUCTION),
+            id="precomputed-low",
+        ),
+        pytest.param(
+            128,
+            1,
+            False,
+            257,
+            (8, DUAL_ACCUM_REDUCTION),
+            id="precomputed-high",
+        ),
+        pytest.param(
+            128,
+            4,
+            False,
+            512,
+            (16, DUAL_ACCUM_REDUCTION),
+            id="multi-token",
+        ),
+    ],
+)
+def test_sm100_one_warp_schedule(D, tokens, use_gate, sequence_heads, expected):
+    selected = recurrent_kda_module._select_kernel_schedule(
+        D,
+        tokens,
+        use_gate,
+        sequence_heads,
+        (10, 0),
+    )
+    assert selected == expected
+
+
+@pytest.mark.parametrize(
+    ("tokens", "use_gate", "sequence_heads", "compute_capability", "expected"),
+    [
+        pytest.param(1, True, 96, (10, 0), (8, 8), id="T1-gated-small"),
+        pytest.param(1, True, 97, (10, 0), (4, 4), id="T1-gated-edge"),
+        pytest.param(1, False, 32, (10, 0), (4, 4), id="T1-precomputed"),
+        pytest.param(2, False, 256, (10, 0), (2, 4), id="T2"),
+        pytest.param(3, True, 128, (10, 0), (4, 4), id="T3"),
+        pytest.param(4, False, 512, (10, 0), (2, 4), id="T4"),
+        pytest.param(5, False, 512, (10, 0), (2, 8), id="T5"),
+        pytest.param(6, False, 512, (10, 0), (2, 2), id="T6"),
+        pytest.param(3, True, 128, (10, 3), (2, 4), id="fallback"),
+    ],
+)
+def test_grouped_schedule(
+    tokens,
+    use_gate,
+    sequence_heads,
+    compute_capability,
+    expected,
+):
+    selected = recurrent_kda_module._select_grouped_schedule(
+        tokens,
+        use_gate,
+        sequence_heads,
+        compute_capability,
+    )
+    assert selected == expected
 
 
 # ------------------------------------------------------------------------------

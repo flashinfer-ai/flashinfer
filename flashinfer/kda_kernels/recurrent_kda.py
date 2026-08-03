@@ -36,7 +36,7 @@ which amortizes token preprocessing across its V-column tile.
 
 import functools
 import math
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional, cast
 
 import cutlass
 import cutlass.cute as cute
@@ -47,6 +47,12 @@ from cutlass._mlir.dialects import math as mlir_math
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.utils import SmemAllocator
 import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead kernel dispatch
+
+from ..jit.flash_kda_decode import (
+    FlashKDADecodeVariant,
+    get_flash_kda_decode_module,
+)
+from ..utils import get_compute_capability
 
 # ==============================================================================
 # CONSTANTS
@@ -62,8 +68,27 @@ DOT_REDUCTION_DUAL_ACCUM = 1
 GROUPED_MIN_SEQUENCE_HEADS = {64: 7680, 128: 1920}
 
 
-def _use_one_warp(head_dim: int, num_tokens: int, sequence_heads: int) -> bool:
-    return num_tokens == 1 and sequence_heads < GROUPED_MIN_SEQUENCE_HEADS[head_dim]
+def _use_one_warp(
+    head_dim: int,
+    num_tokens: int,
+    sequence_heads: int,
+    query_heads: int,
+    value_heads: int,
+    use_gate: bool,
+    compute_capability: tuple[int, int],
+) -> bool:
+    """Select the measured kernel architecture for the active GPU."""
+    if compute_capability != (10, 0):
+        return num_tokens == 1 and sequence_heads < GROUPED_MIN_SEQUENCE_HEADS[head_dim]
+
+    if num_tokens == 1:
+        grouped_max = 256 if head_dim == 64 else 128
+        return sequence_heads > grouped_max
+    if num_tokens == 4 and query_heads == value_heads and not use_gate:
+        return sequence_heads < 4096
+    if num_tokens == 3 and query_heads == value_heads and use_gate:
+        return sequence_heads >= 256
+    return False
 
 
 # ==============================================================================
@@ -830,9 +855,7 @@ def _get_grouped_compiled(
 ):
     fn = _grouped_compiled_cache.get(key)
     if fn is None:
-        D, T, H, HV, gm, hdb, bl, ul2, us = key
-        KS = 4 if T == 1 else 2
-        VSPLIT = 4
+        D, T, H, HV, gm, hdb, bl, ul2, us, KS, VSPLIT = key
 
         def dyn(t, ld):
             return from_dlpack(
@@ -1085,8 +1108,26 @@ def _select_kernel_schedule(
     num_tokens,
     use_gate,
     sequence_heads,
+    compute_capability,
 ):
     """Select tile rows and dot-product reduction for the active kernel."""
+    if compute_capability == (10, 0):
+        if num_tokens > 1:
+            return 16, DOT_REDUCTION_DUAL_ACCUM
+        if head_dim == 64:
+            return 32, DOT_REDUCTION_DUAL_ACCUM
+        if use_gate:
+            if sequence_heads <= 256:
+                return 16, DOT_REDUCTION_TREE
+            if sequence_heads <= 512:
+                return 32, DOT_REDUCTION_DUAL_ACCUM
+            if sequence_heads <= 1536:
+                return 8, DOT_REDUCTION_TREE
+            return 16, DOT_REDUCTION_DUAL_ACCUM
+        if sequence_heads <= 256:
+            return 16, DOT_REDUCTION_TREE
+        return 8, DOT_REDUCTION_DUAL_ACCUM
+
     if head_dim == 64:
         if not use_gate and sequence_heads <= 256:
             tile_rows = 8
@@ -1123,13 +1164,320 @@ def _select_kernel_schedule(
     return tile_rows, reduction_schedule
 
 
+def _select_grouped_schedule(
+    num_tokens: int,
+    use_gate: bool,
+    sequence_heads: int,
+    compute_capability: tuple[int, int],
+) -> tuple[int, int]:
+    """Select grouped key slices and value splits for the active GPU."""
+    if compute_capability != (10, 0):
+        return (4 if num_tokens == 1 else 2), 4
+    if num_tokens == 1:
+        return (8, 8) if use_gate and sequence_heads <= 96 else (4, 4)
+    if num_tokens == 3:
+        return 4, 4
+    if num_tokens == 5:
+        return 2, 8
+    if num_tokens == 6:
+        return 2, 2
+    return 2, 4
+
+
+def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return the conservative byte range touched by a strided tensor."""
+
+    begin = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return begin, begin
+    last_element = sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    return begin, begin + (last_element + 1) * tensor.element_size()
+
+
+def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    lhs_begin, lhs_end = _tensor_byte_range(lhs)
+    rhs_begin, rhs_end = _tensor_byte_range(rhs)
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+
+def _select_flash_kda_decode_value_split(
+    num_tokens: int, work: int, sm_count: int
+) -> int:
+    """Select the measured public-export route across frozen value-row splits."""
+
+    if num_tokens == 1:
+        return 16 if work <= 2 * sm_count else 8
+    if num_tokens == 2:
+        return 4
+    if num_tokens == 4:
+        return 2
+    if num_tokens in (5, 6):
+        three_wave_ctas = 3 * sm_count
+        if 8 * work <= three_wave_ctas:
+            return 8
+        if 2 * work <= sm_count:
+            return 2
+        if 4 * work <= three_wave_ctas:
+            return 4
+        if 2 * work <= three_wave_ctas:
+            return 2
+        return 1
+    raise ValueError(f"unsupported precomputed token count: {num_tokens}")
+
+
+def _select_flash_kda_decode_variant(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    num_accepted_tokens: torch.Tensor,
+    scale: float,
+    num_tokens: int,
+    num_spec_tokens: Optional[int],
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: Optional[float],
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    beta_is_logit: bool,
+) -> Optional[FlashKDADecodeVariant]:
+    """Select a frozen B200 decode schedule for the strict Cake contract.
+
+    The exported family covers D128/T=1..6. T=3 preserves its measured
+    lower-bound contract; T=1/2/4/5/6 use precomputed gates, with T1 routed to
+    measured one-warp direct-state schedules. The T3 route is limited to its
+    measured N1/2/4/8/16, H=HV=16 coordinates. ``None`` denotes an unsupported
+    Cake contract and causes the explicit Cake backend to raise.
+    """
+
+    f32_max = torch.finfo(torch.float32).max
+    is_t3_lower_bound = (
+        num_spec_tokens == 2
+        and num_tokens == 3
+        and use_gate_in_kernel
+        and lower_bound is not None
+        and math.isfinite(lower_bound)
+        and -f32_max <= lower_bound < 0.0
+        and A_log is not None
+        and dt_bias is not None
+    )
+    is_precomputed = (
+        num_tokens in (1, 2, 4, 5, 6)
+        and (
+            (num_tokens == 1 and num_spec_tokens is None)
+            or (num_tokens > 1 and num_spec_tokens == num_tokens - 1)
+        )
+        and not use_gate_in_kernel
+        and lower_bound is None
+        and A_log is None
+        and dt_bias is None
+    )
+    if (
+        not q.is_cuda
+        or get_compute_capability(q.device) != (10, 0)
+        or not (is_t3_lower_bound or is_precomputed)
+        or cu_seqlens is None
+        or ssm_state_indices is None
+        or initial_state_source is not None
+        or beta_is_logit
+        or not use_qk_l2norm_in_kernel
+        or not math.isfinite(scale)
+        or abs(scale) > f32_max
+    ):
+        return None
+
+    _, total_tokens, num_heads, head_dim = q.shape
+    _, _, num_value_heads, value_dim = v.shape
+    num_sequences = cu_seqlens.numel() - 1
+    int32_max = torch.iinfo(torch.int32).max
+    route_gate_tensors = (A_log, dt_bias) if is_t3_lower_bound else ()
+    tensors = (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+    ) + route_gate_tensors
+    if (
+        head_dim != 128
+        or value_dim != 128
+        or q.shape[0] != 1
+        or total_tokens <= 0
+        or num_heads <= 0
+        or num_value_heads < num_heads
+        or num_value_heads % num_heads
+        or num_sequences <= 0
+        or num_sequences > 65535
+        or (
+            is_t3_lower_bound
+            and (
+                num_sequences not in (1, 2, 4, 8, 16)
+                or num_heads != 16
+                or num_value_heads != 16
+            )
+        )
+        or total_tokens != num_sequences * num_tokens
+        or total_tokens * num_heads * head_dim > int32_max
+        or total_tokens * num_value_heads * head_dim > int32_max
+        or num_value_heads * 8 > int32_max
+        or any(not tensor.is_cuda or tensor.device != q.device for tensor in tensors)
+        or any(
+            tensor.dtype != torch.bfloat16 for tensor in (q, k, v, g, beta, state, out)
+        )
+        or cu_seqlens.dtype != torch.int32
+        or ssm_state_indices.dtype != torch.int32
+        or num_accepted_tokens.dtype != torch.int32
+        or k.shape != q.shape
+        or v.shape != (1, total_tokens, num_value_heads, value_dim)
+        or g.shape != (1, total_tokens, num_value_heads, head_dim)
+        or beta.shape != (1, total_tokens, num_value_heads)
+        or out.shape != v.shape
+        or not all(tensor.is_contiguous() for tensor in (q, k, v, beta, out))
+        or any(stride < 0 for tensor in tensors for stride in tensor.stride())
+        or g.stride(-1) != 1
+        or g.stride(-2) != head_dim
+        or g.stride(1) <= 0
+        or g.stride(1) < num_value_heads * head_dim
+        or g.stride(1) > int32_max
+        or g.stride(1) % 4
+        or total_tokens * g.stride(1) > int32_max
+        or q.data_ptr() % 8
+        or k.data_ptr() % 8
+        or g.data_ptr() % 8
+        or state.ndim != 4
+        or state.shape[0] <= 0
+        or state.shape[1:] != (num_value_heads, value_dim, head_dim)
+        or state.stride(-1) != 1
+        or state.stride(-2) != head_dim
+        or state.stride(-3) != value_dim * head_dim
+        or state.stride(0) < num_value_heads * value_dim * head_dim
+        or state.stride(0) % 8
+        or state.stride(0) > int32_max
+        or state.shape[0] * state.stride(0) > int32_max
+        or state.data_ptr() % 16
+        or not cu_seqlens.is_contiguous()
+        or cu_seqlens.ndim != 1
+        or not ssm_state_indices.is_contiguous()
+        or ssm_state_indices.numel() != num_sequences * num_tokens
+        or not num_accepted_tokens.is_contiguous()
+        or num_accepted_tokens.ndim != 1
+        or num_accepted_tokens.numel() != num_sequences
+        or (
+            is_t3_lower_bound
+            and (
+                A_log.dtype != torch.float32
+                or dt_bias.dtype != torch.float32
+                or not A_log.is_contiguous()
+                or not dt_bias.is_contiguous()
+                or A_log.numel() < num_heads
+                or dt_bias.numel() < num_heads * head_dim
+            )
+        )
+    ):
+        return None
+
+    read_tensors = (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+    ) + route_gate_tensors
+    if _tensors_overlap(out, state) or any(
+        _tensors_overlap(mutated, read)
+        for mutated in (out, state)
+        for read in read_tensors
+    ):
+        return None
+
+    if is_t3_lower_bound:
+        return "d128_t3_lower_bound_split4"
+
+    work = num_sequences * num_value_heads
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    value_split = _select_flash_kda_decode_value_split(num_tokens, work, sm_count)
+    if num_tokens == 1:
+        return cast(
+            FlashKDADecodeVariant,
+            f"d128_t1_precomputed_direct_split{value_split}",
+        )
+
+    variant_prefixes = {
+        2: "d128_t2_precomputed_split",
+        4: "d128_t4_precomputed_split",
+        5: "d128_t5_precomputed_gram_split",
+        6: "d128_t6_precomputed_gram_split",
+    }
+    return cast(
+        FlashKDADecodeVariant,
+        f"{variant_prefixes[num_tokens]}{value_split}",
+    )
+
+
+def _run_flash_kda_decode(
+    variant: FlashKDADecodeVariant,
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    scale: float,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+) -> None:
+    """Launch one frozen decode specialization on the current CUDA stream."""
+
+    module = get_flash_kda_decode_module(variant)
+    module.run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        state,
+        out,
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        float(scale),
+        float(lower_bound),
+        int(torch.cuda.current_stream(q.device).cuda_stream),
+    )
+
+
 def run_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    ssm_state_indices: torch.Tensor,
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
@@ -1139,12 +1487,15 @@ def run_recurrent_kda(
     use_gate_in_kernel: bool = False,
     lower_bound: Optional[float] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
     num_spec_tokens: Optional[int] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    *,
+    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
@@ -1170,11 +1521,6 @@ def run_recurrent_kda(
         beta (torch.Tensor):
             Delta-rule learning rate of shape ``[B, 1, HV]``. Must be bfloat16.
             Pre-sigmoided unless ``beta_is_logit=True``.
-        ssm_state_indices (torch.Tensor):
-            State cache indices. Shape ``[B]`` int32 for standard decode, or
-            ``[N, 1+S]`` int32 for packed spec decode. Every live index must be
-            in ``[0, initial_state.shape[0] - 1]``; ``-1`` is reserved for
-            padded packed rows.
         A_log (Optional[torch.Tensor]):
             Log decay parameter of shape ``[H]``. Must be float32.
             Required when ``use_gate_in_kernel=True``.
@@ -1198,6 +1544,14 @@ def run_recurrent_kda(
             gate formula instead of softplus. Must be negative.
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
+            The Cake backend's ``T=1`` specialization uses standard dense
+            decode and does not accept explicit ``cu_seqlens`` metadata.
+        ssm_state_indices (Optional[torch.Tensor]):
+            State cache indices. Shape ``[N]`` int32 for standard decode, or
+            ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also be
+            set). Indexed standard decode pages the selected caller-owned slots
+            directly; when omitted, standard decode uses a dense identity
+            mapping. The wrapper flattens 2D speculative indices before launch.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in a single
             fused kernel launch. If ``cu_seqlens`` is provided, requires 2D
@@ -1229,6 +1583,10 @@ def run_recurrent_kda(
         beta_is_logit (bool):
             If True, apply sigmoid to ``beta`` inside the recurrent kernel.
             Default False preserves the pre-sigmoided input contract.
+        backend (Literal["cute-dsl", "cake"]):
+            ``"cute-dsl"`` preserves the existing implementation.
+            ``"cake"`` strictly selects one exported Cake specialization and
+            raises rather than falling back when its contract is unsupported.
 
     Returns:
         Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1253,9 +1611,13 @@ def run_recurrent_kda(
           ``ssm_state_indices == -1``). This caller contract is not validated
           at runtime to preserve CUDA graph compatibility.
     """
+    if backend not in ("cute-dsl", "cake"):
+        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
+
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
     device = q.device
+    compute_capability = get_compute_capability(device)
     if K != V:
         raise ValueError(f"K must equal V, got K={K}, V={V}")
     if K not in (64, 128):
@@ -1300,8 +1662,34 @@ def run_recurrent_kda(
                 f"[{HV}, {V}, {K}], got {list(initial_state_source.shape)}"
             )
 
-    if ssm_state_indices is None:
-        raise ValueError("ssm_state_indices is required")
+    indexed_standard_decode = (
+        cu_seqlens is None and num_spec_tokens is None and ssm_state_indices is not None
+    )
+    if (
+        num_spec_tokens is not None
+        and cu_seqlens is not None
+        and ssm_state_indices is None
+    ):
+        raise ValueError(
+            "ssm_state_indices is required when num_spec_tokens is set with cu_seqlens"
+        )
+
+    if backend == "cake" and cu_seqlens is not None and num_spec_tokens is None:
+        raise ValueError(
+            "backend='cake' does not support explicit T=1 cu_seqlens; "
+            "use standard decode without explicit cu_seqlens"
+        )
+
+    # Cache identity metadata and FFI placeholders outside graph capture. Dense
+    # standard decode uses an identity state mapping through the same directly
+    # paged kernels as indexed decode.
+    global _dummy_cache
+    if device not in _dummy_cache:
+        _dummy_cache[device] = {
+            "f32_1": torch.zeros(1, device=device, dtype=torch.float32),
+            "i32_1": torch.zeros(1, device=device, dtype=torch.int32),
+        }
+    dc = _dummy_cache[device]
 
     # Batched spec-decode shim: auto-converts [B,T,...] to packed [1,B*T,...] format.
     _batched_spec_B = None
@@ -1311,6 +1699,15 @@ def run_recurrent_kda(
             raise ValueError(
                 f"q.shape[1]={T} must equal 1+num_spec_tokens={T_spec} "
                 f"when cu_seqlens is not provided"
+            )
+        if (
+            initial_state is not None
+            and ssm_state_indices is None
+            and initial_state.shape[0] < B * T_spec
+        ):
+            raise ValueError(
+                "initial_state must have at least B*(1+num_spec_tokens) slots "
+                "when batched spec decode auto-generates ssm_state_indices"
             )
         _batched_spec_B = B  # save original B for output reshape
         # Reshape [B, T, ...] -> [1, B*T, ...] -- pure view, no copy
@@ -1323,6 +1720,10 @@ def run_recurrent_kda(
         cu_seqlens = torch.arange(
             0, B * T_spec + 1, step=T_spec, dtype=torch.int32, device=device
         )
+        if ssm_state_indices is None:
+            ssm_state_indices = torch.arange(
+                B * T_spec, dtype=torch.int32, device=device
+            ).reshape(B, T_spec)
         # Output pre-allocation: reshape caller-provided output if shape matches
         if output is not None and output.shape == (B, T_spec, HV, V):
             output = output.reshape(1, B * T_spec, HV, V)
@@ -1359,14 +1760,30 @@ def run_recurrent_kda(
         N = cu_seqlens.shape[0] - 1
         grid_seqs = N
         sequence_heads = grid_seqs * HV
-        use_one_warp = _use_one_warp(K, NUM_TOKENS, sequence_heads)
+        use_one_warp = _use_one_warp(
+            K,
+            NUM_TOKENS,
+            sequence_heads,
+            H,
+            HV,
+            use_gate_in_kernel,
+            compute_capability,
+        )
         if initial_state_indices is not None and initial_state_indices.shape[0] < N:
             raise ValueError(
                 "initial_state_indices must contain one entry per sequence, "
                 f"got {initial_state_indices.shape[0]} entries for N={N}"
             )
         cu_seqlens_i32 = cu_seqlens.to(torch.int32)
-        ssi = ssm_state_indices.to(torch.int32).contiguous().view(-1)
+        if ssm_state_indices is None:
+            state_indices_key = f"packed_state_indices_{N}_{NUM_TOKENS}"
+            if state_indices_key not in dc:
+                dc[state_indices_key] = torch.arange(
+                    N * NUM_TOKENS, dtype=torch.int32, device=device
+                )
+            ssi = dc[state_indices_key]
+        else:
+            ssi = ssm_state_indices.to(torch.int32).contiguous().view(-1)
         if initial_state is None:
             max_idx = (
                 max(0, int(ssi[ssi >= 0].max().item())) + 1 if (ssi >= 0).any() else 1
@@ -1412,23 +1829,39 @@ def run_recurrent_kda(
                 f"Decode only supports T=1 without cu_seqlens, got T={T}. "
                 f"For multi-token decode, use cu_seqlens or num_spec_tokens."
             )
-        if initial_state is not None and not initial_state.is_contiguous():
-            raise ValueError(
-                "non-contiguous initial_state requires cu_seqlens: without cu_seqlens "
-                "the wrapper calls .contiguous() which copies the state, so in-place "
-                "updates would be silently lost on the original tensor"
-            )
         grid_seqs = B
         sequence_heads = grid_seqs * HV
-        use_one_warp = _use_one_warp(K, NUM_TOKENS, sequence_heads)
+        use_one_warp = _use_one_warp(
+            K,
+            NUM_TOKENS,
+            sequence_heads,
+            H,
+            HV,
+            use_gate_in_kernel,
+            compute_capability,
+        )
         cu_seqlens_i32 = None
         if initial_state_indices is not None and initial_state_indices.shape[0] < B:
             raise ValueError(
                 "initial_state_indices must contain one entry per batch row, "
                 f"got {initial_state_indices.shape[0]} entries for B={B}"
             )
+        if ssm_state_indices is None:
+            state_indices_key = f"dense_state_indices_{B}"
+            if state_indices_key not in dc:
+                dc[state_indices_key] = torch.arange(
+                    B, dtype=torch.int32, device=device
+                )
+            ssi = dc[state_indices_key]
+        else:
+            if ssm_state_indices.ndim != 1 or ssm_state_indices.numel() != B:
+                raise ValueError(
+                    f"ssm_state_indices must have shape [{B}] for standard decode, "
+                    f"got {list(ssm_state_indices.shape)}"
+                )
+            ssi = ssm_state_indices.to(torch.int32).contiguous()
         if initial_state is None:
-            max_idx = int(ssm_state_indices.max().item()) + 1
+            max_idx = int(ssi.max().item()) + 1
             state = torch.zeros(
                 max(B, max_idx), HV, V, K, device=device, dtype=torch.bfloat16
             )
@@ -1437,7 +1870,6 @@ def run_recurrent_kda(
             # both kernel architectures. Keeping the indices on device avoids
             # full-state gather and scatter launches around the recurrence.
             state = initial_state
-        ssi = ssm_state_indices.to(torch.int32).contiguous()
         if (
             output is not None
             and output.shape == (B, 1, HV, V)
@@ -1452,6 +1884,10 @@ def run_recurrent_kda(
     # no recurrent update to perform. Output initialization above defines the
     # result while the caller-owned state remains unchanged.
     if cu_seqlens_i32 is not None and q.shape[1] == 0:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' does not support this recurrent_kda decode contract"
+            )
         return (out_buf, state if output_final_state else None)
 
     # Compile-time controls shared by both kernel architectures.
@@ -1460,15 +1896,6 @@ def run_recurrent_kda(
     USE_LB = 1 if lower_bound is not None else 0
     HAS_SOURCE = 1 if initial_state_source is not None else 0
     BETA_LOGIT = 1 if beta_is_logit else 0
-
-    # Dummy tensors for unused optional args (TVM FFI requires all args present)
-    global _dummy_cache
-    if device not in _dummy_cache:
-        _dummy_cache[device] = {
-            "f32_1": torch.zeros(1, device=device, dtype=torch.float32),
-            "i32_1": torch.zeros(1, device=device, dtype=torch.int32),
-        }
-    dc = _dummy_cache[device]
 
     if num_accepted_tokens is not None:
         num_accepted_tokens_i32 = (
@@ -1486,6 +1913,118 @@ def run_recurrent_kda(
     else:
         num_accepted_tokens_i32 = dc["i32_1"]
 
+    # The frozen family uses one packed token axis and explicit sequence
+    # metadata for every T. Standard decode exposes [B, 1, ...] and no
+    # metadata, so normalize its exact dense contract with views plus cached
+    # identity tensors. An explicit Cake request raises if normalization cannot
+    # satisfy the frozen ABI.
+    frozen_q = q
+    frozen_k = k
+    frozen_v = v
+    frozen_g = g
+    frozen_beta = beta
+    frozen_out = out_buf
+    frozen_cu_seqlens = cu_seqlens_i32
+    frozen_ssi = ssi
+    frozen_num_accepted_tokens = num_accepted_tokens_i32
+    if (
+        backend == "cake"
+        and NUM_TOKENS == 1
+        and cu_seqlens_i32 is None
+        and initial_state_indices is None
+        and not indexed_standard_decode
+    ):
+        try:
+            frozen_q = q.view(1, grid_seqs, H, K)
+            frozen_k = k.view(1, grid_seqs, H, K)
+            frozen_v = v.view(1, grid_seqs, HV, V)
+            frozen_beta = beta.view(1, grid_seqs, HV)
+            frozen_out = out_buf.view(1, grid_seqs, HV, V)
+            frozen_g = g.as_strided(
+                (1, grid_seqs, HV, K),
+                (grid_seqs * g.stride(0), g.stride(0), g.stride(2), g.stride(3)),
+            )
+        except RuntimeError:
+            pass
+        else:
+            cu_key = f"flashkda_t1_cu_seqlens_{grid_seqs}"
+            if cu_key not in dc:
+                dc[cu_key] = torch.arange(
+                    grid_seqs + 1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            ssi_key = f"flashkda_t1_state_indices_{grid_seqs}"
+            if ssi_key not in dc:
+                dc[ssi_key] = torch.arange(
+                    grid_seqs,
+                    dtype=torch.int32,
+                    device=device,
+                ).reshape(grid_seqs, 1)
+            nat_key = f"flashkda_t1_num_accepted_tokens_{grid_seqs}"
+            if nat_key not in dc:
+                dc[nat_key] = torch.ones(
+                    grid_seqs,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            frozen_cu_seqlens = dc[cu_key]
+            frozen_ssi = dc[ssi_key].view(-1)
+            frozen_num_accepted_tokens = dc[nat_key]
+
+    effective_scale = scale if scale is not None else 1.0 / math.sqrt(K)
+    flash_kda_decode_variant = (
+        _select_flash_kda_decode_variant(
+            q=frozen_q,
+            k=frozen_k,
+            v=frozen_v,
+            g=frozen_g,
+            beta=frozen_beta,
+            state=state,
+            out=frozen_out,
+            cu_seqlens=frozen_cu_seqlens,
+            ssm_state_indices=frozen_ssi,
+            num_accepted_tokens=frozen_num_accepted_tokens,
+            scale=effective_scale,
+            num_tokens=NUM_TOKENS,
+            num_spec_tokens=num_spec_tokens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state_source=initial_state_source,
+            beta_is_logit=beta_is_logit,
+        )
+        if backend == "cake"
+        else None
+    )
+    if backend == "cake" and flash_kda_decode_variant is None:
+        raise ValueError(
+            "backend='cake' does not support this recurrent_kda decode contract"
+        )
+    if flash_kda_decode_variant is not None:
+        _run_flash_kda_decode(
+            flash_kda_decode_variant,
+            q=frozen_q,
+            k=frozen_k,
+            v=frozen_v,
+            g=frozen_g,
+            beta=frozen_beta,
+            state=state,
+            out=frozen_out,
+            cu_seqlens=frozen_cu_seqlens,
+            ssm_state_indices=frozen_ssi,
+            num_accepted_tokens=frozen_num_accepted_tokens,
+            scale=effective_scale,
+            A_log=A_log if A_log is not None else dc["f32_1"],
+            dt_bias=dt_bias if dt_bias is not None else dc["f32_1"],
+            lower_bound=lower_bound if lower_bound is not None else 0.0,
+        )
+        if _batched_spec_B is not None:
+            out_buf = out_buf.reshape(_batched_spec_B, 1 + num_spec_tokens, HV, V)
+        return (out_buf, state if output_final_state else None)
+
     if use_one_warp:
         USE_GATE = 1 if use_gate_in_kernel else 0
         USE_CU = 1 if cu_seqlens_i32 is not None else 0
@@ -1496,6 +2035,7 @@ def run_recurrent_kda(
             NUM_TOKENS,
             use_gate_in_kernel,
             sequence_heads,
+            compute_capability,
         )
         compiled = _get_compiled_kernel(
             K,
@@ -1572,6 +2112,12 @@ def run_recurrent_kda(
         if a_log_key not in dc:
             dc[a_log_key] = torch.empty(H, dtype=torch.float32, device=device)
         gate_mode = 0 if not use_gate_in_kernel else (2 if USE_LB else 1)
+        key_slices, value_splits = _select_grouped_schedule(
+            NUM_TOKENS,
+            use_gate_in_kernel,
+            sequence_heads,
+            compute_capability,
+        )
         a_log_grouped = A_log if A_log is not None else dc[a_log_key]
         dt_bias_grouped = dt_bias if dt_bias is not None else dc["f32_1"]
         source_grouped = (
@@ -1587,6 +2133,8 @@ def run_recurrent_kda(
             BETA_LOGIT,
             USE_QK_NORM,
             HAS_SOURCE,
+            key_slices,
+            value_splits,
         )
         compiled_grouped = _get_grouped_compiled(
             grouped_key,
@@ -1637,7 +2185,7 @@ def run_recurrent_kda(
         out_buf = out_buf.reshape(_batched_spec_B, T_spec, HV, V)
 
     final_state = state if output_final_state else None
-    if output_final_state and cu_seqlens_i32 is None:
+    if output_final_state and indexed_standard_decode:
         # Preserve the existing return contract: indexed standard decode
         # returns the compact batch view while mutating the full pool in place.
         final_state = state[ssi]

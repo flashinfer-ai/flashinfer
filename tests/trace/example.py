@@ -698,7 +698,7 @@ flashinfer.kda_decode.recurrent_kda(
     rk_v,
     rk_g,
     rk_beta,
-    rk_state_indices,
+    ssm_state_indices=rk_state_indices,
     initial_state=rk_state,
     initial_state_source=rk_source,
     initial_state_indices=rk_source_indices,
