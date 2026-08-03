@@ -50,6 +50,7 @@ from flashinfer.fused_moe.runners import (
     MoERunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
 )
 from flashinfer.fused_moe.api import (
     ActivationConfig,
@@ -648,6 +649,35 @@ class TestMoERunnerSupport:
         runner.config = cfg
         with pytest.raises(NotImplementedError, match="do_finalize=True"):
             runner.check_support()
+
+    @pytest.mark.parametrize(
+        ("runner_type", "variant"),
+        [
+            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
+            (TrtllmFp8PerTensorRunner, QuantVariant.FP8PerTensor),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("compute_capability", "supported"),
+        [((10, 0), True), ((10, 3), True), ((10, 7), False)],
+    )
+    def test_fp8_runner_arch_support(
+        self, monkeypatch, runner_type, variant, compute_capability, supported
+    ):
+        import flashinfer.utils as utils
+
+        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        runner = runner_type.__new__(runner_type)
+        runner.config = cfg
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(
+            utils, "get_compute_capability", lambda _: compute_capability
+        )
+        if supported:
+            runner.check_support()
+        else:
+            with pytest.raises(NotImplementedError, match="SM100/SM103"):
+                runner.check_support()
 
     def test_bf16_unfinalized_not_supported(self, monkeypatch):
         import flashinfer.utils as utils

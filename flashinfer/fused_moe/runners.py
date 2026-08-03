@@ -771,6 +771,16 @@ class TrtllmFp8BlockRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only do_finalize=True."
             )
+        from ..utils import get_compute_capability
+        from .api import TrtllmFp8BlockConfig
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmFp8BlockConfig.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on validated "
+                f"SM100/SM103 targets, got sm{arch}."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
@@ -1057,6 +1067,8 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     def check_support(self) -> None:
         super().check_support()
         from ..tllm_enums import RoutingMethodType
+        from ..utils import get_compute_capability
+        from .api import TrtllmFp8PerTensorConfig
 
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
@@ -1072,6 +1084,13 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         ):
             raise ValueError(
                 f"{type(self).__name__} requires top_k=1 for Llama4 routing."
+            )
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmFp8PerTensorConfig.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on validated "
+                f"SM100/SM103 targets, got sm{arch}."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
