@@ -25,6 +25,7 @@ from flashinfer.triton.norm import (  # noqa: E402
     rms_norm,
     rms_norm_add_residual,
 )
+from flashinfer.utils import get_compute_capability  # noqa: E402
 
 pytestmark = [
     pytest.mark.skipif(
@@ -32,7 +33,11 @@ pytestmark = [
         reason="Triton rms_norm requires a CUDA device",
     ),
     pytest.mark.skipif(
-        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+        # The is_available() guard must stay: get_compute_capability raises on a
+        # non-CUDA device, and skipif conditions are evaluated at collection time
+        # even on CPU-only hosts.
+        torch.cuda.is_available()
+        and get_compute_capability(torch.device("cuda"))[0] < 8,
         reason="The supported Triton version requires SM80 or newer (bf16 cases "
         "also need Ampere+); Turing/SM75 is out of range",
     ),
@@ -153,6 +158,45 @@ def test_triton_rms_norm_noncontiguous_rejected(which):
     assert x.stride(1) != 1 or out.stride(1) != 1 or w.stride(0) != 1
     with pytest.raises(ValueError):
         rms_norm(x, w, out, eps)
+
+
+@pytest.mark.parametrize("which", ["x", "residual", "weight", "x_out"])
+def test_triton_rms_norm_add_residual_noncontiguous_rejected(which):
+    """`rms_norm_add_residual` shares `rms_norm_kernel` and so shares the
+    contiguous-hidden-dim contract. The residual is additionally *written* by the
+    kernel, so a non-contiguous residual would corrupt the caller's tensor."""
+    torch.manual_seed(0)
+    eps = 1e-6
+    dtype = torch.float16
+    batch_size, hidden_size = 16, 4096
+
+    def strided_2d():
+        # Slice out every other column so the inner stride is 2.
+        base = torch.randn(batch_size, hidden_size * 2, dtype=dtype, device="cuda")
+        return base[:, ::2]
+
+    def dense_2d():
+        return torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+
+    x = strided_2d() if which == "x" else dense_2d()
+    residual = strided_2d() if which == "residual" else dense_2d()
+    w = (
+        torch.randn(hidden_size * 2, dtype=dtype, device="cuda")[::2]
+        if which == "weight"
+        else torch.randn(hidden_size, dtype=dtype, device="cuda")
+    )
+    # x_out=None is a valid in-place request, so only pass one when it is the
+    # tensor under test or when the case needs a destination.
+    x_out = strided_2d() if which == "x_out" else None
+
+    assert (
+        x.stride(1) != 1
+        or residual.stride(1) != 1
+        or w.stride(0) != 1
+        or (x_out is not None and x_out.stride(1) != 1)
+    )
+    with pytest.raises(ValueError):
+        rms_norm_add_residual(x, residual, w, eps, x_out=x_out)
 
 
 def test_triton_rms_norm_residual_unaffected():

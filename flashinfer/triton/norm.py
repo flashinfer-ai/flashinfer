@@ -100,6 +100,25 @@ def rms_norm_add_residual(
     b, n = x.shape
 
     assert x.shape == residual.shape
+
+    # Same contiguity contract as `rms_norm` above: `rms_norm_kernel` indexes the
+    # hidden dimension of x, residual, weight and the output with a bare element
+    # offset. Note the residual is also *written* by the kernel (`r = r + x` is
+    # stored back), so a non-contiguous residual would corrupt the caller's tensor
+    # rather than merely produce a wrong result.
+    if (
+        x.stride(1) != 1
+        or residual.stride(1) != 1
+        or weight.stride(0) != 1
+        or (x_out is not None and x_out.stride(1) != 1)
+    ):
+        raise ValueError(
+            "rms_norm_add_residual requires a contiguous hidden dimension for x, "
+            "residual, x_out, and weight (stride 1 along the last axis)."
+        )
+
+    # Checked after the contiguity guard: a strided view typically also has a
+    # different row stride, and the ValueError above names the actual problem.
     assert x.stride(0) == residual.stride(0)
 
     block_size = triton.next_power_of_2(n)
