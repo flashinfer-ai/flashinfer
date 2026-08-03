@@ -287,8 +287,6 @@ class DenseGemmKernel:
 
     def _setup_attributes(self):
         if self.is_mxfp8:
-            # The m16n8k32 .kind::mxf8 atom exists only in cutlass-dsl 4.6.0
-            # and later. Callers gate on hasattr before compiling.
             mma_op = cute.nvgpu.warp.MmaMXF8Op(
                 self.a_dtype,
                 self.acc_dtype,
@@ -1874,8 +1872,9 @@ class DenseGemmKernel:
                         work_tile = tile_sched.get_current_work()
 
             if cutlass.const_expr(not self.swap_ab):
-                # Retire the outstanding store group before PDL may launch
-                # dependent grids below.
+                # Drain outstanding TMA stores: writes are visible to PDL
+                # dependent grids only if they complete before
+                # griddepcontrol_launch_dependents.
                 if warp_idx == 0:
                     tma_store_pipeline.producer_tail()
 
@@ -2410,8 +2409,8 @@ class DenseGemmKernel:
             # cutlass-dsl < 4.6.0 does not expose the MXFP8 warp-MMA atom.
             return False
         if swap_ab:
-            # The MXFP8 path never swaps A and B, its narrow tiles are
-            # M-narrow. Reject rather than accept an unvalidated layout.
+            # MXFP8 never uses the swap (its narrow tiles are M-narrow), so
+            # only the FP4 layout is validated.
             if l != 1:
                 return False
             if (ab_dtype, sf_vec_size) != (cutlass.Float4E2M1FN, 16):
@@ -2421,8 +2420,6 @@ class DenseGemmKernel:
         # SF smem still allocates full 128-element blocks even when the live
         # MMA tile uses only 16 or 32 rows or columns.
         if is_mxfp8:
-            # Outside the small-M whitelist, both tile dims must be
-            # multiples of 64.
             if mma_tiler_mn not in ((16, 64), (16, 128), (32, 64), (32, 128)) and (
                 mma_tiler_mn[0] % 64 != 0
                 or mma_tiler_mn[1] % 64 != 0
@@ -2443,7 +2440,6 @@ class DenseGemmKernel:
             return False
         if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
             return False
-        # MXFP8 pairs only with UE8M0 scales at vector size 32.
         if is_mxfp8 and sf_vec_size != 32:
             return False
         # Public output is 16-bit; split-K internally uses FP32 partial output.
@@ -2459,7 +2455,7 @@ class DenseGemmKernel:
         elif k % 32 != 0:
             # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not
             # tile_k: the mainloop predicates the partial tile, so ragged K
-            # works. Keep in sync with gemm_base.py.
+            # works.
             return False
         return True
 

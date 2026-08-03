@@ -5416,7 +5416,7 @@ def _heuristic_func_mm_mxfp8(
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
 ) -> List[str]:
-    # Prefer b12x where eligible, other setups keep the pre-existing order.
+    # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
         return [c for c in order if c in suitable_backends]
@@ -6490,7 +6490,7 @@ def _b12x_gemm_fp4_runner(
             valid_tactics = []
 
             def _add(mma_tiler_mn, swap_ab):
-                # can_implement is M-independent (takes no `m`)
+                # can_implement takes no m, so validity is M-independent.
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,
@@ -6692,7 +6692,7 @@ def _b12x_gemm_mxfp8_runner(
             valid_tactics = []
 
             def _add(mma_tiler_mn, swap_ab):
-                # can_implement is M-independent (takes no `m`)
+                # can_implement takes no m, so validity is M-independent.
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,
@@ -6714,8 +6714,8 @@ def _b12x_gemm_mxfp8_runner(
                     if tac not in valid_tactics:
                         valid_tactics.append(tac)
 
-            # A small tactic grid keeps the tuner's bucket representative
-            # meaningful.
+            # A few tiles for the tuner to profile (a larger grid overfits the
+            # bucket representative and makes picks noisier).
             for mma_tiler_mn in [
                 (16, 128),
                 (32, 128),
