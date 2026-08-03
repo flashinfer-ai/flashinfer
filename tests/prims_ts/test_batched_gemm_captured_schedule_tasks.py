@@ -815,6 +815,20 @@ def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
     assert load_a.skippable_head_slots == frozenset()
     assert load_a.skippable_tail_slots == frozenset()
 
+def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
+    mma = create_mma_task(
+        _cfg(use_unroll_loop_2x_for_mma=True),
+        _res("SmemA"),
+        _res("SmemB"),
+        None,
+        None,
+        _res("TmemC"),
+        _work_queue(),
+        num_k_tiles=12,
+    )
+
+    assert mma.step == 1
+    assert mma.unroll == 2
 
 def test_mma_task_rejects_partial_sf_pairs():
     with pytest.raises(ValueError, match="smem_sfa and smem_sfb together"):

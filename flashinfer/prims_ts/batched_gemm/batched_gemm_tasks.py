@@ -1271,20 +1271,19 @@ def create_mma_task(
                 tmem_c_res.try_acquire()
                 tmem_c_res.acquire()
                 if getattr(cfg, "use_unroll_loop_2x_for_mma", 0):
-                    with domain_loop(0, num_k_tiles, 2):
-                        for _ in range(2):
-                            _mma_loop_body(
-                                smem_a_res,
-                                smem_b_res,
-                                tmem_c_res,
-                                proxy,
-                                smem_sfa_res,
-                                smem_sfb_res,
-                                tmem_sfa_res,
-                                tmem_sfb_res,
-                                tmem_sfab_res,
-                                tmem_cast_a_res,
-                            )
+                    with domain_loop(0, num_k_tiles, 1, unroll=2):
+                        _mma_loop_body(
+                            smem_a_res,
+                            smem_b_res,
+                            tmem_c_res,
+                            proxy,
+                            smem_sfa_res,
+                            smem_sfb_res,
+                            tmem_sfa_res,
+                            tmem_sfb_res,
+                            tmem_sfab_res,
+                            tmem_cast_a_res,
+                        )
                 else:
                     with domain_loop(0, num_k_tiles, 1):
                         _mma_loop_body(

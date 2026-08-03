@@ -289,9 +289,8 @@ def _runtime_config(cfg, in_hidden: int):
     num_k_tiles = (in_hidden + cfg.tile_k - 1) // cfg.tile_k
     use_unroll_loop_2x_for_mma = cfg.use_unroll_loop_2x_for_mma
     if use_unroll_loop_2x_for_mma and (num_k_tiles < 2 or num_k_tiles % 2 != 0):
-        # The captured unrolled schedule consumes exactly two pipeline stages
-        # per loop iteration. Fall back to the scalar MMA loop when concrete K
-        # does not contain an even number of tile-k slices.
+        # Keep the generated loop structure identical to Gen's 2x-unrolled
+        # steady state. Fall back when concrete K would require a scalar tail.
         use_unroll_loop_2x_for_mma = 0
     runtime_cfg = replace(
         cfg,

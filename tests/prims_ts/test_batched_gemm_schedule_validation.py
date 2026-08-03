@@ -214,7 +214,11 @@ def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
             "num_load_sfb_warps == num_gather_warps",
         ),
         (
-            {"num_stages_b": 1, "num_stages_smem_sfb": 4},
+            {
+                "num_stages_a": 1,
+                "num_stages_b": 1,
+                "num_stages_smem_sfb": 4,
+            },
             "delayed SFB commit depth",
         ),
     ),

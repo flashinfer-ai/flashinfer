@@ -760,8 +760,9 @@ class BatchedGemmConfig:
     use_unroll_loop_2x_for_mma: int = 0
     """Unroll the MMA K loop by two stages. ``0``/``1``.
 
-    The task consumes and releases two consecutive operand stages per captured
-    loop iteration. Odd K-tile counts automatically use the scalar loop.
+    The captured loop keeps a scalar logical step and asks the DSL compiler to
+    unroll it twice, so each K tile retains its own pipeline-stage identity.
+    Odd K-tile counts automatically use the scalar loop.
     """
 
     use_work_throttle: int = 1
