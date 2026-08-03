@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     BackendOptions,
     ExpertConfig,
@@ -216,8 +217,7 @@ def _make_case(
 
 
 def _assert_mxint4_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    close = torch.isclose(actual.float(), expected.float(), atol=0.1, rtol=0.85)
-    assert close.float().mean().item() >= 0.925
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.05, rtol=0.2)
 
 
 @pytest.mark.parametrize("bad_dtype", [torch.float16, torch.float32])
@@ -337,6 +337,16 @@ def test_mxint4_nonzero_expert_offset():
         num_experts=8, local_num_experts=4, local_expert_offset=4
     )
     _assert_mxint4_close(MoELayer(config)(act, weights), reference)
+
+
+@mxint4_required
+def test_mxint4_explicit_autotune_matches_reference():
+    act, weights, config, reference, _ = _make_case()
+    layer = MoELayer(config)
+    with autotune(True):
+        output = layer(act, weights)
+    assert layer.winner_backend == "trtllm_mxint4_routed"
+    _assert_mxint4_close(output, reference)
 
 
 @mxint4_required
@@ -472,10 +482,13 @@ def test_mxint4_cuda_graph_replay(routing_input_mode):
     )
     runner = TrtllmMxInt4RoutedRunner(config, torch.device("cuda"))
     inputs = runner.pack_inputs(act, weights)
-    runner.forward(inputs)
+    eager = runner.forward(inputs).clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         runner.forward(inputs)
+    inputs[0].fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
+    assert torch.isfinite(inputs[0]).all()
+    torch.testing.assert_close(inputs[0], eager, atol=0.05, rtol=0.01)
     _assert_mxint4_close(inputs[0], reference)

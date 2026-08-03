@@ -861,8 +861,9 @@ _DTYPE = {
         reference=_mxint4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        atol_frac=0.1,
-        rtol=0.85,
+        # Curated FromLogits observes max|diff| / ||ref||inf ~= 0.0335.
+        atol_frac=0.04,
+        rtol=0.3,
     ),
 }
 
