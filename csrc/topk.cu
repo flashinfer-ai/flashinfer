@@ -85,7 +85,8 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
                                      Optional<TensorView> maybe_row_to_batch, TensorView lengths,
                                      Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
                                      bool deterministic, int64_t tie_break, bool dsa_graph_safe,
-                                     Optional<TensorView> maybe_row_starts) {
+                                     Optional<TensorView> maybe_row_starts,
+                                     Optional<TensorView> maybe_page_table_row_starts) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_page_table);
   CHECK_INPUT(src_page_table);
@@ -97,6 +98,10 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   if (maybe_row_starts.has_value()) {
     CHECK_INPUT(maybe_row_starts.value());
     CHECK_DIM(1, maybe_row_starts.value());
+  }
+  if (maybe_page_table_row_starts.has_value()) {
+    CHECK_INPUT(maybe_page_table_row_starts.value());
+    CHECK_DIM(1, maybe_page_table_row_starts.value());
   }
 
   unsigned int num_rows = input.size(0);
@@ -129,6 +134,14 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
         << "row_starts must have shape (num_rows,)";
     row_starts_ptr = static_cast<int32_t*>(maybe_row_starts.value().data_ptr());
   }
+  int32_t* page_table_row_starts_ptr = nullptr;
+  if (maybe_page_table_row_starts.has_value()) {
+    TVM_FFI_ICHECK(static_cast<unsigned int>(maybe_page_table_row_starts.value().size(0)) ==
+                   num_rows)
+        << "page_table_row_starts must have shape (num_rows,)";
+    page_table_row_starts_ptr =
+        static_cast<int32_t*>(maybe_page_table_row_starts.value().data_ptr());
+  }
 
   // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
@@ -137,7 +150,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
         static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride,
         static_cast<int32_t*>(lengths.data_ptr()), row_starts_ptr, row_to_batch_ptr, num_rows,
         static_cast<uint32_t>(top_k), max_len, row_states_ptr, deterministic, tie_break_mode,
-        stream, dsa_graph_safe);
+        stream, dsa_graph_safe, page_table_row_starts_ptr);
     return true;
   });
 
