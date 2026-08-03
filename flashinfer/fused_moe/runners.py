@@ -120,7 +120,7 @@ def _pack_prerouted_topk_ids(act: MoEActivationPack) -> torch.Tensor:
     if act.topk_ids is None or act.topk_weights is None:
         raise ValueError("Packed routing requires topk_ids + topk_weights.")
     weight_bits = act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-    return (act.topk_ids << 16) | (weight_bits & 0xFFFF)
+    return ((act.topk_ids << 16) | (weight_bits & 0xFFFF)).contiguous()
 
 
 def _validate_logits_inputs(
@@ -155,6 +155,8 @@ def _validate_logits_inputs(
             f"({num_tokens}, {num_experts}) (num_tokens, num_experts) — "
             "routing scores are over the GLOBAL expert set."
         )
+    if not logits.is_contiguous():
+        raise ValueError(f"{runner}: routing_logits must be contiguous.")
     if act.routing_bias is not None:
         if act.routing_bias.dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(
@@ -166,6 +168,8 @@ def _validate_logits_inputs(
                 f"{runner}: routing_bias shape {tuple(act.routing_bias.shape)} "
                 f"!= ({num_experts},) (num_experts,)."
             )
+        if not act.routing_bias.is_contiguous():
+            raise ValueError(f"{runner}: routing_bias must be contiguous.")
 
 
 class MoERunner(TunableRunner):

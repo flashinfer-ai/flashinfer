@@ -990,6 +990,14 @@ class TestRunnerBoundaryValidation:
         with pytest.raises(ValueError, match="num_experts"):
             _validate_logits_inputs(pack, 4, 16, "T")
 
+    def test_noncontiguous_logits_rejected(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        logits = torch.zeros(16, 4, dtype=torch.float32).T
+        assert logits.shape == (4, 16) and not logits.is_contiguous()
+        with pytest.raises(ValueError, match="routing_logits must be contiguous"):
+            _validate_logits_inputs(self._logits_pack(logits), 4, 16, "T")
+
     @pytest.mark.parametrize("bad_dtype", [torch.float16, torch.float64])
     def test_logits_dtype_rejected(self, bad_dtype):
         from flashinfer.fused_moe.runners import _validate_logits_inputs
@@ -1019,6 +1027,15 @@ class TestRunnerBoundaryValidation:
         with pytest.raises(ValueError, match="num_experts"):
             _validate_logits_inputs(pack, 4, 16, "T")
 
+    def test_noncontiguous_bias_rejected(self):
+        from flashinfer.fused_moe.runners import _validate_logits_inputs
+
+        bias = torch.zeros(32, dtype=torch.bfloat16)[::2]
+        assert bias.shape == (16,) and not bias.is_contiguous()
+        pack = self._logits_pack(torch.zeros(4, 16), bias=bias)
+        with pytest.raises(ValueError, match="routing_bias must be contiguous"):
+            _validate_logits_inputs(pack, 4, 16, "T")
+
     def test_logits_device_mutation_caught_at_runner_boundary(self):
         from flashinfer.fused_moe.runners import _validate_logits_inputs
 
@@ -1028,6 +1045,21 @@ class TestRunnerBoundaryValidation:
         )
         with pytest.raises(ValueError, match="device"):
             _validate_logits_inputs(pack, 4, 16, "T")
+
+    def test_packed_ids_normalize_noncontiguous_inputs(self):
+        from flashinfer.fused_moe.runners import _pack_prerouted_topk_ids
+
+        x, sf, _, _, _ = _pack_tensors()
+        ids = torch.arange(8, dtype=torch.int32).reshape(2, 4).T
+        weights = torch.linspace(-1, 1, 8).reshape(2, 4).T
+        assert not ids.is_contiguous() and not weights.is_contiguous()
+        packed = _pack_prerouted_topk_ids(MoEActivationPack(x, sf, ids, weights))
+        expected_bits = (
+            weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+        )
+        assert packed.is_contiguous()
+        assert torch.equal(packed >> 16, ids)
+        assert torch.equal(packed & 0xFFFF, expected_bits)
 
 
 def _is_unified_nvfp4_arch() -> bool:

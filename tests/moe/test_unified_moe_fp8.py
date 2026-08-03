@@ -742,6 +742,23 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
     assert torch.equal(packed & 0xFFFF, expected_bits)
 
 
+def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=RoutingInputMode.PackedPrecomputed
+    )
+    act.topk_ids = act.topk_ids.T.contiguous().T
+    act.topk_weights = act.topk_weights.T.contiguous().T
+    assert not act.topk_ids.is_contiguous()
+    assert not act.topk_weights.is_contiguous()
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(act, weights)
+    assert MoeRunnerInputs.from_list(inputs).topk_ids.is_contiguous()
+    _assert_per_tensor_fp8_close(runner.forward(inputs), ref)
+
+
 def test_fp8_per_tensor_routing_replay_matches_reference():
     act, weights, config, _, selected_experts = _make_per_tensor_fp8_case()
     runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
