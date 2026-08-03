@@ -305,6 +305,70 @@ def test_mxint4_prepare_matches_flat_test_layout():
 
 
 @mxint4_required
+def test_mxint4_prepare_permute_cache_keys_include_layout_parameters():
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(42)
+
+    def make_weights(hidden_size, intermediate_size):
+        w1 = torch.randn(
+            1,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        w2 = torch.randn(
+            1,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        return w1, w2
+
+    shared_cache = {}
+    for hidden_size, intermediate_size in ((4096, 256), (256, 4096)):
+        large_w1, large_w2 = make_weights(hidden_size, intermediate_size)
+        TrtllmMxInt4Config.prepare_weights(
+            large_w1,
+            large_w2,
+            num_local_experts=1,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=shared_cache,
+        )
+
+    # The large layers' W1/W2 scale shapes equal the small layer's respective
+    # payload shapes. A shared shape-only cache returned the wrong permutations.
+    small_w1, small_w2 = make_weights(256, 256)
+    actual = TrtllmMxInt4Config.prepare_weights(
+        small_w1,
+        small_w2,
+        num_local_experts=1,
+        hidden_size=256,
+        intermediate_size=256,
+        device=device,
+        permute_cache=shared_cache,
+    )
+    expected = TrtllmMxInt4Config.prepare_weights(
+        small_w1,
+        small_w2,
+        num_local_experts=1,
+        hidden_size=256,
+        intermediate_size=256,
+        device=device,
+        permute_cache={},
+    )
+
+    assert actual.keys() == expected.keys()
+    for key in actual:
+        assert torch.equal(actual[key], expected[key]), key
+
+
+@mxint4_required
 @pytest.mark.parametrize(
     "routing_input_mode",
     [RoutingInputMode.PackedPrecomputed, RoutingInputMode.FromLogits],

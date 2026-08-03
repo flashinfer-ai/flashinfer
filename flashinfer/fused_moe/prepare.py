@@ -990,9 +990,10 @@ def _mxint4_quantize(
         .to(torch.int8)
         .reshape(-1, sf_vec_size // 2, 2)
     )
-    packed = (quantized[..., 0] & 0x0F) | ((quantized[..., 1] & 0x0F) << 4)
+    nibbles = (quantized & 0x0F).to(torch.uint8)
+    packed = nibbles[..., 0] | (nibbles[..., 1] << 4)
     return (
-        packed.reshape(*weights.shape[:-1], weights.shape[-1] // 2).to(torch.uint8),
+        packed.reshape(*weights.shape[:-1], weights.shape[-1] // 2),
         scales.to(torch.bfloat16),
     )
 
