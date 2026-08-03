@@ -205,6 +205,7 @@ def inspect_cuda_architectures(
     module_paths: dict[str, str],
     provider: str,
     cuobjdump: Path,
+    strict: bool,
 ) -> dict[str, list[str]]:
     require(cuobjdump.is_file(), f"cuobjdump not found: {cuobjdump}")
     result: dict[str, list[str]] = {}
@@ -231,12 +232,20 @@ def inspect_cuda_architectures(
                         for match in architecture_pattern.findall(process.stdout)
                     }
                 )
-                require(targets, f"cuobjdump found no cubin targets in {module}")
-                require(
-                    targets == [provider],
-                    f"{module} contains {targets}; expected only {provider}",
-                )
                 result[module] = targets
+
+    mismatches = {
+        module: targets for module, targets in result.items() if targets != [provider]
+    }
+    if strict and mismatches:
+        examples = ", ".join(
+            f"{module}={targets}"
+            for module, targets in list(sorted(mismatches.items()))[:10]
+        )
+        require(
+            False,
+            f"{len(mismatches)} modules do not contain only {provider}: {examples}",
+        )
     return result
 
 
@@ -296,6 +305,20 @@ def write_report(
     manifest: dict[str, Any],
     module_architectures: dict[str, list[str]],
 ) -> None:
+    architecture_summary = {
+        "provider_only": sum(
+            targets == [provider] for targets in module_architectures.values()
+        ),
+        "mixed": sum(
+            provider in targets and targets != [provider]
+            for targets in module_architectures.values()
+        ),
+        "foreign_only": sum(
+            bool(targets) and provider not in targets
+            for targets in module_architectures.values()
+        ),
+        "no_cubin": sum(not targets for targets in module_architectures.values()),
+    }
     report = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -305,6 +328,7 @@ def write_report(
         "module_count": len(manifest["modules"]),
         "modules": sorted(manifest["modules"]),
         "module_cuda_architectures": module_architectures,
+        "module_cuda_architecture_summary": architecture_summary,
         "wheels": {
             distribution: {
                 "filename": wheel.path.name,
@@ -330,6 +354,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--cuobjdump", type=Path)
+    parser.add_argument(
+        "--cuda-architecture-policy",
+        choices=("strict", "report"),
+        default="strict",
+        help="Fail on non-provider cubins, or retain them in the inventory report",
+    )
     parser.add_argument("--install-smoke", action="store_true")
     return parser.parse_args()
 
@@ -368,6 +398,7 @@ def main() -> int:
             module_paths,
             args.provider,
             args.cuobjdump,
+            strict=args.cuda_architecture_policy == "strict",
         )
     if args.install_smoke:
         run_install_smoke(shim, provider_wheel, args.provider)

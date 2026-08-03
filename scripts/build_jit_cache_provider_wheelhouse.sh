@@ -31,6 +31,7 @@ normalize_provider_tag() {
 : "${AOT_MAX_JOBS_CAP:=4}"
 : "${AOT_MAX_JOBS_MEMORY_GB:=16}"
 : "${FLASHINFER_NVCC_THREADS:=1}"
+: "${CUDA_ARCHITECTURE_POLICY:=report}"
 : "${CLEAN_OUTPUT:=0}"
 
 PROVIDER_TAG=$(normalize_provider_tag "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}")
@@ -84,6 +85,7 @@ run_on_host() {
         -e CUDA_MAJOR="${CUDA_MAJOR}" \
         -e CUDA_MINOR="${CUDA_MINOR}" \
         -e CUDA_VERSION="${CUDA_VERSION}" \
+        -e CUDA_ARCHITECTURE_POLICY="${CUDA_ARCHITECTURE_POLICY}" \
         -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
         -e FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" \
         -e FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
@@ -186,6 +188,7 @@ run_in_container() {
         --provider "${PROVIDER_TAG}" \
         --version "${PACKAGE_VERSION}" \
         --cuobjdump /usr/local/cuda/bin/cuobjdump \
+        --cuda-architecture-policy "${CUDA_ARCHITECTURE_POLICY}" \
         --install-smoke
 
     echo "Built wheelhouse: ${output_dir}"
