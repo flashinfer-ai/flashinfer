@@ -1381,11 +1381,14 @@ _BACKEND_SELECTION_CASES = [
     (128, 4, 4095, 16, 16, False, (10, 0), True, "SM100-T4-dense-one-warp-edge"),
     (128, 4, 4096, 16, 16, False, (10, 0), False, "SM100-T4-dense-grouped-edge"),
     (128, 4, 256, 16, 32, False, (10, 0), False, "SM100-T4-GQA-grouped"),
-    (128, 1, 1919, 16, 16, False, (10, 3), True, "fallback-D128-cutoff-minus-one"),
-    (128, 1, 1920, 16, 16, False, (10, 3), False, "fallback-D128-cutoff"),
-    (64, 1, 7679, 8, 8, False, (10, 3), True, "fallback-D64-cutoff-minus-one"),
-    (64, 1, 7680, 8, 8, False, (10, 3), False, "fallback-D64-cutoff"),
-    (128, 3, 96, 16, 16, True, (10, 3), False, "fallback-spec-decode"),
+    (128, 1, 128, 16, 16, False, (10, 3), False, "SM103-D128-T1-grouped-edge"),
+    (128, 1, 129, 16, 16, False, (10, 3), True, "SM103-D128-T1-one-warp-edge"),
+    (128, 3, 256, 16, 16, True, (10, 3), True, "SM103-T3-gated-one-warp-edge"),
+    (128, 1, 1919, 16, 16, False, (9, 0), True, "fallback-D128-cutoff-minus-one"),
+    (128, 1, 1920, 16, 16, False, (9, 0), False, "fallback-D128-cutoff"),
+    (64, 1, 7679, 8, 8, False, (9, 0), True, "fallback-D64-cutoff-minus-one"),
+    (64, 1, 7680, 8, 8, False, (9, 0), False, "fallback-D64-cutoff"),
+    (128, 3, 96, 16, 16, True, (9, 0), False, "fallback-spec-decode"),
 ]
 
 
@@ -1568,7 +1571,7 @@ def test_kernel_schedule(
         tokens,
         use_gate,
         N * HV,
-        (10, 3),
+        (9, 0),
     )
     assert selected == (expected_rows, expected_reduction)
 
@@ -1635,13 +1638,24 @@ def test_kernel_schedule(
         ),
     ],
 )
-def test_sm100_one_warp_schedule(D, tokens, use_gate, sequence_heads, expected):
+@pytest.mark.parametrize(
+    "compute_capability",
+    [pytest.param((10, 0), id="SM100"), pytest.param((10, 3), id="SM103")],
+)
+def test_blackwell_one_warp_schedule(
+    D,
+    tokens,
+    use_gate,
+    sequence_heads,
+    expected,
+    compute_capability,
+):
     selected = recurrent_kda_module._select_kernel_schedule(
         D,
         tokens,
         use_gate,
         sequence_heads,
-        (10, 0),
+        compute_capability,
     )
     assert selected == expected
 
@@ -1657,7 +1671,8 @@ def test_sm100_one_warp_schedule(D, tokens, use_gate, sequence_heads, expected):
         pytest.param(4, False, 512, (10, 0), (2, 4), id="T4"),
         pytest.param(5, False, 512, (10, 0), (2, 8), id="T5"),
         pytest.param(6, False, 512, (10, 0), (2, 2), id="T6"),
-        pytest.param(3, True, 128, (10, 3), (2, 4), id="fallback"),
+        pytest.param(5, False, 512, (10, 3), (2, 8), id="SM103-T5"),
+        pytest.param(3, True, 128, (9, 0), (2, 4), id="fallback"),
     ],
 )
 def test_grouped_schedule(

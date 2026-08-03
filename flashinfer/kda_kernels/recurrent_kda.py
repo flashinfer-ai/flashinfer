@@ -63,9 +63,9 @@ from ..utils import get_compute_capability
 DOT_REDUCTION_TREE = 0
 DOT_REDUCTION_DUAL_ACCUM = 1
 
-# B300 crossover sweeps: grouped-CTA wins from these sequence-head cutoffs.
-# Single-token decode below each cutoff stays on one-warp.
+# Conservative fallback for architectures without a tuned dispatch heuristic.
 GROUPED_MIN_SEQUENCE_HEADS = {64: 7680, 128: 1920}
+TUNED_DISPATCH_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 
 
 def _use_one_warp(
@@ -78,7 +78,7 @@ def _use_one_warp(
     compute_capability: tuple[int, int],
 ) -> bool:
     """Select the measured kernel architecture for the active GPU."""
-    if compute_capability != (10, 0):
+    if compute_capability not in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
         return num_tokens == 1 and sequence_heads < GROUPED_MIN_SEQUENCE_HEADS[head_dim]
 
     if num_tokens == 1:
@@ -1111,7 +1111,7 @@ def _select_kernel_schedule(
     compute_capability,
 ):
     """Select tile rows and dot-product reduction for the active kernel."""
-    if compute_capability == (10, 0):
+    if compute_capability in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
         if num_tokens > 1:
             return 16, DOT_REDUCTION_DUAL_ACCUM
         if head_dim == 64:
@@ -1171,7 +1171,7 @@ def _select_grouped_schedule(
     compute_capability: tuple[int, int],
 ) -> tuple[int, int]:
     """Select grouped key slices and value splits for the active GPU."""
-    if compute_capability != (10, 0):
+    if compute_capability not in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
         return (4 if num_tokens == 1 else 2), 4
     if num_tokens == 1:
         return (8, 8) if use_gate and sequence_heads <= 96 else (4, 4)
