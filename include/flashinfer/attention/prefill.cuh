@@ -1368,7 +1368,7 @@ template <typename KTraits, typename Params, typename DTypeQKAccum>
 __device__ __forceinline__ void logits_transform(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
     const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
-    const uint32_t kv_len, const uint_fastdiv group_size,
+    const uint32_t kv_len, const uint32_t chunk_end, const uint_fastdiv group_size,
     DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], const dim3 tid = threadIdx,
     const uint32_t kv_head_idx = blockIdx.z) {
   const uint32_t lane_idx = tid.x;
@@ -1394,6 +1394,14 @@ __device__ __forceinline__ void logits_transform(
                                                                     2 * (lane_idx % 4) +
                                                                     8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
+
+        // Skip lanes beyond this CTA's kv chunk: their s_frag values are stale/garbage
+        // (masked to MaskFillValue right after by logits_mask), and with a non-tile-aligned
+        // chunk_end the variant hook would otherwise observe them with in-range kv_idx and
+        // could leak them through side effects (e.g. dumping logits to global memory).
+        if (kv_idx >= chunk_end) {
+          continue;
+        }
 
 #ifdef FP16_QK_REDUCTION_SUPPORTED
         if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
@@ -2317,7 +2325,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
               lane_idx, s_frag);
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
-                                  qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+                                  qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
 
         // apply mask
         if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
@@ -3010,7 +3018,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
               lane_idx, s_frag);
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                  kv_idx_base, qo_len, kv_len, group_size, s_frag, tid,
+                                  kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                   kv_head_idx);
 
         // apply mask
@@ -3873,7 +3881,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               lane_idx, s_frag);
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-                                  kv_idx_base, qo_len, kv_len, group_size, s_frag, tid,
+                                  kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                   kv_head_idx);
 
         // apply mask

@@ -116,7 +116,18 @@ smaller_mla_dimensions = MLAHeadDimensions(
     kv_lora_rank=256,
 )
 
-supported_mla_head_dimensions = [deepseek_mla_dimensions, smaller_mla_dimensions]
+nope_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=256,
+    qk_rope_head_dim=0,
+    v_head_dim=256,
+    kv_lora_rank=512,
+)
+
+supported_mla_head_dimensions = [
+    deepseek_mla_dimensions,
+    smaller_mla_dimensions,
+    nope_mla_dimensions,
+]
 
 
 @dataclass(frozen=True)
@@ -667,7 +678,13 @@ def _check_trtllm_gen_mla_shape(
         kv_lora_rank == smaller_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == smaller_mla_dimensions.qk_rope_head_dim
     )
-    if not (is_deepseek_dimensions or is_smaller_mla_dimensions):
+    is_nope_mla_dimensions = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if not (
+        is_deepseek_dimensions or is_smaller_mla_dimensions or is_nope_mla_dimensions
+    ):
         raise ValueError(
             f"Unsupported MLA dimensions, got kv_lora_rank={kv_lora_rank} and qk_rope_head_dim={qk_rope_head_dim}, supported dimensions are: {supported_mla_head_dimensions}"
         )
@@ -2247,6 +2264,13 @@ def _cute_dsl_incompatibility_reason(
     cc = get_compute_capability(query.device)
     if cc[0] < 10:
         return f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
+    from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+    if not is_cute_dsl_arch_supported(*cc):
+        return (
+            "cute-dsl backend (MLA decode kernel): the installed CuTe DSL "
+            f"does not support sm_{cc[0]}{cc[1]}"
+        )
     if isinstance(bmm1_scale, torch.Tensor):
         return (
             "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
@@ -2352,6 +2376,8 @@ def _mla_decode_tuning_config(
     buckets: tuple[int, ...],
     num_pages: int,
     profile_seq_len: int,
+    has_sparse_mla_top_k_lens: bool = False,
+    sparse_top_k_width: int = 0,
     enable_dcp: bool = False,
     cp_world: int = 1,
     cp_rank: int = 0,
@@ -2365,12 +2391,14 @@ def _mla_decode_tuning_config(
     identity), so would result in a leak.
 
     The DynamicTensorSpec sweeps batch dim across ``query``, ``block_tables``,
-    ``seq_lens``, ``out``, and, for DCP, ``causal_seqlens_kv_global``.
-    ``block_tables`` is initialized via ``random_(0, num_pages)`` which wraps
-    mod kv_cache size — safe for autotune profiling because MLA decode reads
-    kv_cache and never writes it, so aliased page reads give correct timing
-    measurements. ``seq_lens`` is filled with ``profile_seq_len``; the
-    synthetic DCP global bound preserves that exact rank-local length.
+    ``seq_lens``, ``out``, plus one optional fifth tensor — the sparse top-k
+    lengths tensor (native ``qk_rope_head_dim=0`` MLA) or, for DCP,
+    ``causal_seqlens_kv_global``. ``block_tables`` is initialized via
+    ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
+    profiling because MLA decode reads kv_cache and never writes it, so aliased
+    page reads give correct timing measurements. ``seq_lens`` is filled with
+    ``profile_seq_len``; the synthetic DCP global bound preserves that exact
+    rank-local length.
     """
 
     def init_block_tables(shapes, dtype, device):
@@ -2383,21 +2411,29 @@ def _mla_decode_tuning_config(
         tensor.fill_(profile_seq_len)
         return tensor
 
+    def init_sparse_top_k_lens(shapes, dtype, device):
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        tensor.fill_(sparse_top_k_width)
+        return tensor
+
     def init_causal_seqlens_kv_global(shapes, dtype, device):
         tensor = torch.empty(shapes, dtype=dtype, device=device)
         tensor.fill_(profile_seq_len * cp_world + cp_rank)
         return tensor
 
-    input_idx = (0, 1, 2, 3, 4) if enable_dcp else (0, 1, 2, 3)
+    # At most one optional fifth batch-swept tensor: native qk_rope_head_dim=0
+    # sparse top-k lengths and DCP's global causal bound are mutually exclusive.
+    if has_sparse_mla_top_k_lens:
+        fifth_init = init_sparse_top_k_lens
+    elif enable_dcp:
+        fifth_init = init_causal_seqlens_kv_global
+    else:
+        fifth_init = None
+
+    input_idx = (0, 1, 2, 3, 4) if fifth_init is not None else (0, 1, 2, 3)
     tensor_initializers = (
-        (
-            None,
-            init_block_tables,
-            init_seq_lens,
-            None,
-            init_causal_seqlens_kv_global,
-        )
-        if enable_dcp
+        (None, init_block_tables, init_seq_lens, None, fifth_init)
+        if fifth_init is not None
         else (None, init_block_tables, init_seq_lens, None)
     )
 
@@ -2426,6 +2462,7 @@ def _build_mla_decode_tuning_config(
     kv_lora_rank: int,
     max_seq_len: int,
     device: torch.device,
+    has_sparse_mla_top_k_lens: bool = False,
     cute_dsl_impl: str = "auto",
     sinks: Optional[
         Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]
@@ -2466,6 +2503,8 @@ def _build_mla_decode_tuning_config(
         buckets,
         num_pages,
         profile_seq_len,
+        has_sparse_mla_top_k_lens,
+        block_tables.shape[-1],
         enable_dcp,
         cp_world,
         cp_rank,
@@ -2547,7 +2586,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         return [-1]
 
     def get_cache_key_extras(self, inputs):
-        q, _, _, out = inputs
+        q, _, _, out = inputs[:4]
         sinks_key = (
             None
             if self.sinks is None
@@ -2575,6 +2614,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             sinks_key,
             self.skip_softmax_threshold_scale_factor,
             self.return_lse,
+            len(inputs) == 5,
         )
 
     def forward(
@@ -2585,7 +2625,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        query, block_tables, seq_lens, out = inputs
+        query, block_tables, seq_lens, out = inputs[:4]
+        sparse_mla_top_k_lens = inputs[4] if len(inputs) == 5 else None
         batch_size = query.size(0)
         max_q_len = query.size(1)
         num_qo_heads = query.size(2)
@@ -2660,6 +2701,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
         )
         return out
 
@@ -2887,6 +2929,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
     enable_dcp: bool = False,
     cp_world: int = 1,
     cp_rank: int = 0,
@@ -2925,7 +2968,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
-        RoPE head dimension. Sparse MLA paths use ``64``.
+        RoPE head dimension. Sparse MLA paths use ``64``; the native
+        no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
@@ -3066,6 +3110,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
         for each concurrently executing CUDA stream or graph. Autotune profiling
         uses runner-owned internal storage; the caller buffer is used only for the
         final request.
+    sparse_mla_top_k_lens : Optional[torch.Tensor] = None
+        Flattened active sparse top-k lengths, one INT32 value per query token.
+        Required by the native ``kv_lora_rank=512, qk_rope_head_dim=0``
+        TRTLLM-GEN kernel. Sparse indices must be packed before any ``-1``
+        padding. Zero-length rows are unsupported; padded query rows should
+        contain one valid dummy index and use length 1.
     enable_dcp : bool = False
         Statically enable cyclic decode context parallelism in the monolithic
         CuTeDSL MLA kernel. DCP returns a rank-local output/LSE state, so
@@ -3127,6 +3177,36 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if max_q_len is not None and cum_seq_lens_q is None:
         raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
+
+    is_nope_mla = (
+        kv_lora_rank == nope_mla_dimensions.kv_lora_rank
+        and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
+    )
+    if is_nope_mla and sparse_mla_top_k <= 0:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+        )
+    if is_nope_mla and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
     backend = _validate_mla_dcp_args(
         query=query,
@@ -3479,6 +3559,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             0,  # lse_stride_tokens
             0,  # lse_stride_heads
             False,  # enable_block_sparse_attention
+            sparse_mla_top_k_lens,
         )
         return out
 
@@ -3656,6 +3737,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank=kv_lora_rank,
         max_seq_len=max_seq_len,
         device=query.device,
+        has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
         cute_dsl_impl=cute_dsl_impl,
         sinks=sinks,
         enable_dcp=enable_dcp,
@@ -3663,7 +3745,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cp_rank=cp_rank,
     )
     inputs = [query, block_tables, seq_lens, out]
-    if enable_dcp:
+    if sparse_mla_top_k_lens is not None:
+        inputs.append(sparse_mla_top_k_lens)
+    elif enable_dcp:
         # The global causal bound varies with batch and must be synthesized
         # alongside the other batch-shaped tensors during autotuning.
         inputs.append(causal_seqlens_kv_global)

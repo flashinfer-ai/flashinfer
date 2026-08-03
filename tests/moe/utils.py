@@ -22,7 +22,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from flashinfer import RoutingMethodType, is_gated_activation
+from flashinfer import is_gated_activation
 from flashinfer.fused_moe import WeightLayout
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -104,6 +104,12 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.BF16,
 ]
 
+GEGLU_SUPPORTED_QUANT_MODES = [
+    QuantMode.FP4_NVFP4_NVFP4,
+    QuantMode.FP8_BLOCK_SCALE_MXFP8,
+    QuantMode.FP4_MXFP4_MXFP8,
+]
+
 
 def skip_checks(
     moe_impl,
@@ -131,13 +137,10 @@ def skip_checks(
 
     # Skip incompatible combinations
     if activation_type == ActivationType.Geglu and (
-        not is_fp4_moe
-        or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
-        or routing_config["routing_method_type"] != RoutingMethodType.TopK
-        or num_tokens > 128
+        moe_impl.quant_mode not in GEGLU_SUPPORTED_QUANT_MODES or num_tokens > 128
     ):
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {activation_type} + {routing_config['routing_method_type']} + {num_tokens}"
+            f"Incompatible: {moe_impl.name} + {activation_type} + quant_mode={moe_impl.quant_mode} + {num_tokens}"
         )
     elif activation_type == ActivationType.Swiglu and (
         hidden_size > 1024 or intermediate_size > 1024

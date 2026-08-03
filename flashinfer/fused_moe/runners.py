@@ -705,6 +705,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
             output2_scale_scalar=v.get("output2_scale_scalar"),
             per_token_scale=None,
             num_experts=routing.num_experts,
+            num_fused_shared_experts=0,
             n_group=routing.n_group,
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,

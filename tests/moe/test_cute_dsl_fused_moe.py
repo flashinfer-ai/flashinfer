@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """
-Numerical accuracy tests for CuteDSL Fused MoE NVFP4 on Blackwell GPUs.
+Numerical accuracy tests for CuteDSL Fused MoE NVFP4 on Blackwell and Rubin GPUs.
 
 This test file covers both APIs:
 1. Functional API: `cute_dsl_fused_moe_nvfp4`
@@ -33,6 +33,17 @@ import weakref
 
 import pytest
 import torch
+
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+_requires_dsl_arch = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+
 
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
@@ -200,7 +211,9 @@ class TestTacticEnumeration:
         """Every gemm1 tactic must have mma_tiler[0] == tile_size and
         cluster_shape[0] == tile_size // 128 (1-CTA at tile=128, 2-CTA
         at tile=256)."""
-        from flashinfer.fused_moe.cute_dsl.tuner import get_gemm1_valid_tactics
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            get_gemm1_valid_tactics,
+        )
 
         tactics = get_gemm1_valid_tactics(tile_size)
         assert len(tactics) > 0, f"no gemm1 tactics returned at tile_size={tile_size}"
@@ -223,7 +236,9 @@ class TestTacticEnumeration:
         consumes the upstream gemm1 output layout — a 1-CTA gemm2
         tactic at tile_size=256 cannot consume a 2-CTA gemm1 output
         and produces incorrect results (regression for #3067)."""
-        from flashinfer.fused_moe.cute_dsl.tuner import get_gemm2_valid_tactics
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            get_gemm2_valid_tactics,
+        )
 
         tactics = get_gemm2_valid_tactics(tile_size)
         assert len(tactics) > 0, f"no gemm2 tactics returned at tile_size={tile_size}"
@@ -430,6 +445,13 @@ class TestAutotuneReplayMemsetContract:
         self, monkeypatch, api, is_tuning_mode
     ):
         from flashinfer.fused_moe.cute_dsl import fused_moe
+
+        # CPU-only contract test (see class header): stub out the functional
+        # API's arch guard, which otherwise calls torch.cuda.get_device_capability()
+        # on the CPU input tensors and raises "Expected a cuda device, but got: cpu".
+        monkeypatch.setattr(
+            fused_moe, "_require_cute_dsl_arch_for", lambda *a, **k: None
+        )
 
         calls = []
 
@@ -934,6 +956,8 @@ class TestAutotunerBucketConfig:
 class TestCuteDslFusedMoeFunctional:
     """Tests for the functional API: cute_dsl_fused_moe_nvfp4."""
 
+    pytestmark = _requires_dsl_arch
+
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
@@ -1199,6 +1223,8 @@ class TestCuteDslFusedMoeFunctional:
 @sm100_required
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
+
+    pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
@@ -1722,6 +1748,8 @@ class TestCuteDslMoEWrapper:
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
+    pytestmark = _requires_dsl_arch
+
     def test_functional_vs_wrapper_output(self):
         """Verify functional and wrapper APIs produce the same output."""
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
@@ -1800,6 +1828,8 @@ class TestApiConsistency:
 @sm100_required
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
+
+    pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("ep_size", [1, 8, 32])
     @pytest.mark.parametrize("ep_rank", [0, -1])  # -1 means last rank
@@ -2005,6 +2035,8 @@ class TestMoeSortBufferInitPoisoned:
     routing+gemm pipeline through ``_moe_core_impl`` directly.
     """
 
+    pytestmark = _requires_dsl_arch
+
     @pytest.mark.parametrize(
         "ep_size,num_tokens",
         [
@@ -2200,6 +2232,8 @@ class TestAllValidTactics:
     can_implement checks, then runs CuteDslMoEWrapper with each tactic explicitly
     and verifies numerical accuracy against the reference implementation.
     """
+
+    pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize(
         "num_tokens,hidden_size,intermediate_size,num_experts,top_k",

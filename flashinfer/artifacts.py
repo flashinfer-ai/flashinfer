@@ -142,9 +142,17 @@ class ArtifactPath:
     TRTLLM_GEN_GEMM: str = (
         "10f64528a1172dae8e29601a3b99ab9dc78d37be/gemm-91e0ba0-2710384/"
     )
+    TRTLLM_GEN_BMM_RUBIN: str = (
+        "46d3f3561e3336c131a141191ee6aaa0690723bb/batched_gemm-17629de-61f1bc7/"
+    )
+    TRTLLM_GEN_GEMM_RUBIN: str = (
+        "46d3f3561e3336c131a141191ee6aaa0690723bb/gemm-17629de-25754e6/"
+    )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
+    # (and KernelMap.KERNEL_MAP_HASH_RUBIN for the Rubin variant below).
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
+    DEEPGEMM_RUBIN: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
     DSL_FMHA: str = "801e770219613fbf088bc074c414732b26cc550d/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_110a")
 
@@ -163,8 +171,17 @@ class CheckSumHash:
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
+    DEEPGEMM_RUBIN: str = (
+        "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
+    )
     TRTLLM_GEN_GEMM: str = (
         "f97f90f9ce1dab73eb3d7c90fca4bbd52687642dd87a79dd10b77d7802b25c33"
+    )
+    TRTLLM_GEN_BMM_RUBIN: str = (
+        "31c9f4cdd59299fc6a9a6f3a31b403b817a1fea63238eec2cbcd3009d2feb3f7"
+    )
+    TRTLLM_GEN_GEMM_RUBIN: str = (
+        "2174e60bc8248a8af41a3d0afdc4cac8f2b04893ac983f654065dd14c77ec139"
     )
     # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
     # NOT hashes of individual kernel .so files.
@@ -184,7 +201,14 @@ class CheckSumHash:
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
+        safe_urljoin(ArtifactPath.DEEPGEMM_RUBIN, "checksums.txt"): DEEPGEMM_RUBIN,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "checksums.txt"): TRTLLM_GEN_GEMM,
+        safe_urljoin(
+            ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "checksums.txt"
+        ): TRTLLM_GEN_BMM_RUBIN,
+        safe_urljoin(
+            ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "checksums.txt"
+        ): TRTLLM_GEN_GEMM_RUBIN,
         **{
             safe_urljoin(
                 ArtifactPath.DSL_FMHA, f"{cpu_arch}/{sm_arch}/checksums.txt"
@@ -202,15 +226,26 @@ def get_checksums(subdirs):
             FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
         )
         checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
-        download_file(uri, checksum_path)
+        if not download_file(uri, checksum_path) and not checksum_path.is_file():
+            # Without this the next open() fails with a bare FileNotFoundError on
+            # the local cache path, which hides the real cause: the artifact pin
+            # is unreachable (typo'd/unpublished pin, or network/mirror failure).
+            raise RuntimeError(
+                f"Failed to fetch the checksum manifest for artifact pin '{subdir}' "
+                f"from {uri}. Check that the pin exists in "
+                f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
+            )
         with open(checksum_path, "r") as f:
             for line in f:
                 sha256, filename = line.strip().split()
 
-                # Distinguish between all meta info header files
-                if ".h" in filename:
-                    filename = safe_urljoin(subdir, filename)
-                checksums[filename] = sha256
+                # Key every entry by its full path. Bare filenames are not
+                # unique across subdirs: the per-arch pins (e.g. TRTLLM_GEN_BMM
+                # and TRTLLM_GEN_BMM_RUBIN) ship the same sm100f/sm103a kernel
+                # names built from different sources, so a flat dict would let
+                # the subdir processed last silently overwrite the earlier
+                # one's hashes and fail verification for every shared name.
+                checksums[safe_urljoin(subdir, filename)] = sha256
     return checksums
 
 
@@ -232,7 +267,10 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
+        ArtifactPath.TRTLLM_GEN_BMM_RUBIN,
+        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN,
         ArtifactPath.DEEPGEMM,
+        ArtifactPath.DEEPGEMM_RUBIN,
         # DSL FMHA: per cpu-arch and sm-arch subdirectories
         *(
             safe_urljoin(ArtifactPath.DSL_FMHA, f"{cpu_arch}/{arch}/")
@@ -262,13 +300,32 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
             safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
         ],
     )
+    yield (
+        safe_urljoin(
+            ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
+        ),
+        checksums[
+            safe_urljoin(
+                ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
+            )
+        ],
+    )
+    yield (
+        safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"),
+        checksums[
+            safe_urljoin(
+                ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"
+            )
+        ],
+    )
 
     # All the actual kernel cubin's.
     for cubin_dir in cubin_dirs:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
         for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            yield (safe_urljoin(cubin_dir, name), checksums[name])
+            full_path = safe_urljoin(cubin_dir, name)
+            yield (full_path, checksums[full_path])
         for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
             full_path = safe_urljoin(cubin_dir, name)
             yield (full_path, checksums[full_path])
