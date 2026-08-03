@@ -343,6 +343,100 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
             )
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
+    """Paged FA3 must advance past a zero-visible request without hanging."""
+    device = torch.device("cuda:0")
+    block_size = 32
+    page_size = 16
+    num_heads, num_kv_heads, head_dim = 32, 8, 128
+    qo_len = kv_len = 64
+    batch_size = 2
+    pages_per_request = kv_len // page_size
+    num_pages = batch_size * pages_per_request
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    tol = tolerance_for(dtype)
+
+    q = torch.randn(
+        batch_size * qo_len, num_heads, head_dim, dtype=dtype, device=device
+    )
+    paged_kv = torch.randn(
+        num_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    k = paged_kv[:, 0].reshape(-1, num_kv_heads, head_dim)
+    v = paged_kv[:, 1].reshape(-1, num_kv_heads, head_dim)
+
+    # Request 0 sees no KV (kv_offset=256); request 1 is a normal request.
+    q_offset_values = [0, 0]
+    kv_offset_values = [256, 0]
+    q_offsets = torch.tensor(q_offset_values, dtype=torch.int32, device=device)
+    kv_offsets = torch.tensor(kv_offset_values, dtype=torch.int32, device=device)
+    qo_indptr = torch.tensor(
+        [0, qo_len, 2 * qo_len], dtype=torch.int32, device=device
+    )
+    paged_kv_indptr = torch.tensor(
+        [0, pages_per_request, num_pages], dtype=torch.int32, device=device
+    )
+    paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    paged_kv_last_page_len = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device=device
+    )
+
+    refs = []
+    for i in range(batch_size):
+        start_q, end_q = i * qo_len, (i + 1) * qo_len
+        start_kv, end_kv = i * kv_len, (i + 1) * kv_len
+        refs.append(
+            block_extend_reference(
+                q[start_q:end_q],
+                k[start_kv:end_kv],
+                v[start_kv:end_kv],
+                block_size,
+                q_offset=q_offset_values[i],
+                kv_offset=kv_offset_values[i],
+                sm_scale=sm_scale,
+            )
+        )
+    ref = torch.cat(refs)
+
+    for backend in get_available_backends(device):
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            kv_layout="NHD",
+            backend=backend,
+            block_extend=True,
+            block_size=block_size,
+        )
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            q_data_type=dtype,
+            sm_scale=sm_scale,
+            q_offsets=q_offsets,
+            kv_offsets=kv_offsets,
+        )
+        out = wrapper.run(q, paged_kv)
+        diff = (out.float() - ref.float()).abs().max().item()
+        assert diff < tol, (backend, dtype, diff, tol)
+        del wrapper
+        torch.cuda.empty_cache()
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_block_extend_non_power_of_two_single(dtype: torch.dtype):
     """Non-power-of-2 block sizes should produce correct results for single prefill.
