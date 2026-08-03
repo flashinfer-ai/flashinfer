@@ -16,6 +16,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -95,9 +96,12 @@ class MegaMoEMxfp8Config:
                 "num_total_experts must be divisible by world_size "
                 f"({self.num_total_experts} % {self.world_size} != 0)."
             )
-        if self.hidden % 128 != 0 or self.intermediate % 128 != 0:
+        # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
+        # predicated epilogue stores); 64 covers the TMA 16B row alignment and
+        # SF-word packing. 128-misaligned shapes exist (gpt-oss: 2880).
+        if self.hidden % 64 != 0 or self.intermediate % 64 != 0:
             raise ValueError(
-                "hidden and intermediate must be multiples of 128 "
+                "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
             )
         if self.in_kernel_fc2_reduce and self.token_back_by_dispatch:
@@ -182,6 +186,7 @@ class MegaMoEMxfp8Frontend:
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         if self._gate_up_clamp == clamp:
             return
+        ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
@@ -199,6 +204,7 @@ class MegaMoEMxfp8Frontend:
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
+        ensure_not_capturing("apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
         self._invalidate_compile_cache()
@@ -268,7 +274,9 @@ class MegaMoEMxfp8Frontend:
             # partial num_tokens can't leak from an earlier, larger launch.
             inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
-        if sync:
+        # Zero-break capture gate: a device synchronize would abort stream
+        # capture, so skip it there (the graph replays under stream semantics).
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return mega.launch_output
 
@@ -364,6 +372,7 @@ class MegaMoEMxfp8Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
 
         import cutlass.cute as cute
@@ -452,6 +461,7 @@ class MegaMoEMxfp8Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
     @staticmethod
@@ -815,9 +825,9 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     Expert weights are not allocated here; supply kernel-ready ``(weight, scale)``
     tuples to :func:`mxfp8_mega_moe` instead.
     """
-    if hidden % 128 != 0 or intermediate % 128 != 0:
+    if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
-            "MegaMoE requires hidden and intermediate to be multiples of 128."
+            "MegaMoE requires hidden and intermediate to be multiples of 64."
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
@@ -840,15 +850,35 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
     )
-    from .tuner import default_knobs, with_knobs
+    from .knob_cache import resolve_knobs
+    from .tuner import with_knobs
 
-    # Default tactic: the measured MXFP8 schedule (dtype="mxfp8"; one profile
-    # for all token counts, no tile knob -- MXFP8's mma_tiler is kernel-fixed
-    # at (256, 256)).  An explicit knobs= dict overrides it entirely.
-    cfg = with_knobs(
-        cfg,
-        knobs if knobs is not None else default_knobs(num_max_tokens, dtype="mxfp8"),
-    )
+    # knobs=None -> pure lookup: offline-tuned cache entry for this session
+    # key when present, else the measured MXFP8 heuristic (dtype="mxfp8"; no
+    # tile knob -- MXFP8's mma_tiler is kernel-fixed at (256, 256)).  An
+    # explicit knobs= dict overrides both entirely.
+    if knobs is None:
+        knobs, _ = resolve_knobs(
+            dtype=kind,
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+        )
+    cfg = with_knobs(cfg, knobs)
+    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+        # Caller-owned correctness choice; see the NVFP4 factory. The MXFP8
+        # kernel rejects ikr together with dispatch-warp token-back, so the
+        # restored ikr also forces epi-warps token-back.
+        cfg = dataclasses.replace(
+            cfg,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            token_back_by_dispatch=(
+                False if in_kernel_fc2_reduce else cfg.token_back_by_dispatch
+            ),
+        )
     frontend = MegaMoEMxfp8Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
@@ -903,7 +933,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
 
 
 def mxfp8_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEMxfp8SymmBuffer,
@@ -913,7 +943,7 @@ def mxfp8_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Launch the fused CuTeDSL MXFP8 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
     Caller must stage ``symm_buffer.x`` / routing slices before calling.
@@ -950,13 +980,14 @@ def mxfp8_mega_moe(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
     if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return
-    if y.shape != (n, symm_buffer.hidden):
-        raise ValueError(
-            f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
-        )
-    if y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16, got {y.dtype}.")
+        return symm_buffer.output_activation[:0] if y is None else None
+    if y is not None:
+        if y.shape != (n, symm_buffer.hidden):
+            raise ValueError(
+                f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
+            )
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be bfloat16, got {y.dtype}.")
 
     fc1_weight, fc1_weight_sf = transformed_l1
     fc2_weight, fc2_weight_sf = transformed_l2
@@ -985,10 +1016,17 @@ def mxfp8_mega_moe(
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
-    if out is not None:
-        y.copy_(out[:n])
-    if sync:
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+    else:
+        result = None
+        if out is not None:
+            y.copy_(out[:n])
+    if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
+    return result
 
 
 def mxfp8_mega_launch_thunk(

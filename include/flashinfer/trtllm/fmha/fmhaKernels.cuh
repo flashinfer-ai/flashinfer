@@ -57,8 +57,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
-  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103)) ||
-      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103))) {
+  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107)) ||
+      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107))) {
     return true;
   }
   return false;
@@ -67,6 +67,8 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
 constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
   if (gpuSM == kSM_103) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
+  } else if (gpuSM == kSM_107) {
+    return kernelSM == kSM_100f || kernelSM == kSM_107;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
@@ -117,12 +119,70 @@ class TllmGenFmhaKernel {
         mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV),
         mKernelMeta(pMetaStart),
         mKernelMetaCount(nMetaCount),
-        mSM(smArch) {}
+        mSM(smArch),
+        mMaxDeviceSmemSize(queryMaxDeviceSmemSize(smArch)) {}
+
+  static constexpr unsigned int kSmemOptInThreshold = 48 * 1024;
+  static constexpr unsigned int kRubinLegacySmemCap = 228 * 1024;
+  static constexpr unsigned int kStaticSmemReserve = 1024;
+
+  static bool isRubinOversized(unsigned int sm, unsigned int sharedMemBytes) {
+    return sm == kSM_107 && (sharedMemBytes + kStaticSmemReserve > kRubinLegacySmemCap);
+  }
+
+  void setupKernelSmem(CUfunction func, KernelMeta const& kernelMeta) const {
+#if CUDA_VERSION >= 13030
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
+                                    CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+      return;
+    }
+#endif
+    if (kernelMeta.mSharedMemBytes >= kSmemOptInThreshold) {
+      cuErrCheck(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                    kernelMeta.mSharedMemBytes));
+    }
+  }
+
+  void appendOversizedSmemLaunchAttr(CUlaunchAttribute* launch_attribute,
+                                     CUlaunchConfig& launch_config,
+                                     KernelMeta const& kernelMeta) const {
+#if CUDA_VERSION >= 13030
+    if (isRubinOversized(mSM, kernelMeta.mSharedMemBytes)) {
+      IKL_LOG_DEBUG(
+          "TRTLLM-Gen launch info: using oversized shared memory for kernel %s (smem=%u bytes)",
+          kernelMeta.mFuncName, kernelMeta.mSharedMemBytes);
+      launch_attribute[launch_config.numAttrs].id = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+      launch_attribute[launch_config.numAttrs].value.sharedMemoryMode =
+          CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY;
+      launch_config.numAttrs += 1;
+    }
+#endif
+  }
+
+  static unsigned int queryMaxDeviceSmemSize(unsigned int smArch) {
+    CUdevice device;
+    cuErrCheck(cuCtxGetDevice(&device));
+    int smem_bytes = 0;
+#if CUDA_VERSION >= 13030
+    if (smArch == kSM_107) {
+      cuErrCheck(cuDeviceGetAttribute(
+          &smem_bytes, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
+      return static_cast<unsigned int>(smem_bytes);
+    }
+#endif
+    cuErrCheck(cuDeviceGetAttribute(&smem_bytes,
+                                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
+    return static_cast<unsigned int>(smem_bytes);
+  }
 
   void loadKernels() {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      if (kernelMeta.mSharedMemBytes + kStaticSmemReserve > mMaxDeviceSmemSize) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -278,7 +338,7 @@ class TllmGenFmhaKernel {
     kernelParams.mLogNumEltsPerSageAttnBlkV = sageParamEncode(kernelMeta.mNumEltsPerSageAttnBlkV);
 
     void* kernelParamsList[] = {&kernelParams};
-    CUlaunchAttribute launch_attribute[3];
+    CUlaunchAttribute launch_attribute[4] = {};
     CUlaunchConfig launch_config;
     buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
 
@@ -365,6 +425,7 @@ class TllmGenFmhaKernel {
     launch_attribute[2].value.programmaticStreamSerializationAllowed = params.enable_pdl;
     launch_config.attrs = launch_attribute;
     launch_config.numAttrs = 3;
+    appendOversizedSmemLaunchAttr(launch_attribute, launch_config, kernelMeta);
   }
 
   // Enable non-portable cluster sizes when clusterDimX exceeds the portable limit of 8.
@@ -605,17 +666,31 @@ class TllmGenFmhaKernel {
     return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
   }
 
+  // Return the smallest shipped MLA head tile that contains a non-power-of-two head group below
+  // 64 heads. Power-of-two groups and groups with at least 128 heads return zero so callers
+  // preserve their existing heuristics; the unsupported 65-127 gap has no Q128 MLA cubin.
+  static int getPaddedMlaTileSizeQ(int numHeadsQPerKv) {
+    FLASHINFER_CHECK(numHeadsQPerKv > 0, "The numHeadsQPerKv must be positive, got %d.",
+                     numHeadsQPerKv);
+    if (numHeadsQPerKv >= 128 || (numHeadsQPerKv & (numHeadsQPerKv - 1)) == 0) {
+      return 0;
+    }
+    FLASHINFER_CHECK(numHeadsQPerKv <= 64,
+                     "Non-power-of-two MLA numHeadsQPerKv must be <= 64, got %d.", numHeadsQPerKv);
+    return std::max(8, flashinfer::UpPowerOfTwo(numHeadsQPerKv));
+  }
+
   // Select the sparse MLA generation kernel.
   // Heuristics benchmarked on B200 (SM=148, sparseMlaTopK=2048).
   void selectSparseMlaGenerationKernel(RunnerParams const& params,
                                        SelectKernelParams& selectKernelParams) const {
     // numHeadsQ <= 32 : SwapsMmaAbForGeneration
-    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 (GPU under-utilized with full tile; halving creates
-    //               2x more head-splitting CTAs), or numHeadsQPerKv at batch>=2.
+    //   Non-power-of-two head counts use one padded Q8/Q16/Q32 tile. Power-of-two head counts use
+    //   tileSizeQ = numHeadsQPerKv/2 at batch=1 or numHeadsQPerKv at batch>=2.
     //   Threshold: batchSize * maxNumCtasPerSeqKv <= MP/8  (crossover at batch=1->2 on B200).
     //   Benchmarks (seqLen=8192, topK=2048): half tileSizeQ wins by 2-6% at batch=1;
     //     full tileSizeQ wins by 2-11% at batch>=2.
-    // numHeadsQ >= 64 : KeepsMmaAbForGeneration, tileSizeQ = 64
+    // numHeadsQ > 32 : KeepsMmaAbForGeneration, tileSizeQ = 64
     //   numHeadsQ=128 at large batch : 2CTA (clusterDimX=2, headDimPerCtaV=256)
     //   otherwise                    : 1CTA, headDimPerCtaV fine-tuned later
     //   Note: at small batch e4m3 prefers SwapsMmaAb tileSizeQ=32 (+10%), but fp16 prefers
@@ -645,7 +720,7 @@ class TllmGenFmhaKernel {
                                                               params.mMultiProcessorCount / 8;
       tileSizeQ = useHalfTileSizeQ ? halfTileSizeQ : fullTileSizeQ;
     } else {
-      // numHeadsQ >= 64: use KeepsMmaAbForGeneration.
+      // numHeadsQ > 32: use KeepsMmaAbForGeneration.
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       tileSizeQ = 64;
       selectKernelParams.mTileSizeKv = 128;
@@ -674,6 +749,12 @@ class TllmGenFmhaKernel {
         selectKernelParams.mHeadDimPerCtaV = 256;
       }
     }
+    // Preserve the legacy heuristic above for power-of-two groups. A non-power-of-two group must
+    // fit in one padded tile because the final head CTA cannot process a partial tile.
+    if (int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
+        paddedTileSizeQ != 0) {
+      tileSizeQ = paddedTileSizeQ;
+    }
   }
 
   // Select the MLA generation kernel.
@@ -687,13 +768,16 @@ class TllmGenFmhaKernel {
     if (isSparseMla(params.mSparseMlaType)) {
       selectSparseMlaGenerationKernel(params, selectKernelParams);
     } else {
+      int const paddedTileSizeQ = getPaddedMlaTileSizeQ(params.mNumHeadsQPerKv);
       // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
-      bool const useSwapsMmaAb = params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
+      // Padded Q64 must use KeepsMmaAb so split-KV also follows its standalone-reducer path.
+      bool const useSwapsMmaAb =
+          paddedTileSizeQ != 0 ? paddedTileSizeQ <= 32
+                               : params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
 
       if (useSwapsMmaAb) {
         kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
-        // Non-sparse MLA (legacy): tileSizeQ capped at 16.
-        tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+        tileSizeQ = paddedTileSizeQ != 0 ? paddedTileSizeQ : (params.mNumHeadsQPerKv <= 8 ? 8 : 16);
       } else {
         kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
         tileSizeQ = 64;
@@ -1026,11 +1110,7 @@ class TllmGenFmhaKernel {
       funcInfo.mMetaInfoIndex = metaIndex;
       cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
 
-      if (kernelMeta.mSharedMemBytes >= 48 * 1024) {
-        cuErrCheck(cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                                      CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                      kernelMeta.mSharedMemBytes));
-      }
+      setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
 
       // Cache the loaded function.
       mFunctions[hashId] = funcInfo;
@@ -1051,6 +1131,7 @@ class TllmGenFmhaKernel {
   KernelMeta const* mKernelMeta;
   unsigned int mKernelMetaCount;
   unsigned int mSM;
+  unsigned int mMaxDeviceSmemSize;
   mutable std::unordered_map<std::string, CUmodule> mModules;
 
   mutable std::unordered_map<uint64_t, unsigned int> mKernelMetaMap;
