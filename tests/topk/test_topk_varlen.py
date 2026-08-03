@@ -900,14 +900,26 @@ def test_radix_next_n_compress_ratio():
     (off by up to compress_ratio-1 columns per row).
     """
     dtype, top_k, next_n, compress_ratio = torch.bfloat16, 512, 2, 4
-    # N=4096 logit columns = 16384 uncompressed tokens per column.
-    # Use seq_lens near a compress_ratio boundary (e.g. 16385) so the
-    # integer-division order matters: (16385-2+0+1)//4=4096 vs (16385//4)-2+0+1=4095.
     N, batch_size = 4096, 8
     num_rows = batch_size * next_n
     logits, _, seq_lens = _make_inputs(
         num_rows, N, top_k, dtype, seed=17, next_n=next_n, compress_ratio=compress_ratio
     )
+    # _make_inputs fills seq_lens with N*compress_ratio (16384), which is divisible
+    # by compress_ratio: there adjust-before-divide and the buggy divide-before-
+    # adjust agree (both give 4095), so the regression would slip through. Override
+    # to N*compress_ratio + 1 (16385), where the two orders diverge:
+    # (16385-2+0+1)//4 = 4096 (correct, all N columns) vs
+    # (16385//4)-2+0+1 = 4095 (buggy, one column short).
+    seq_lens = torch.full_like(seq_lens, N * compress_ratio + 1)
+    # Make the last column a guaranteed top-1 value so the off-by-one is
+    # observable. Correct adjust-before-divide gives N_eff = N for every row, so
+    # column N-1 is in range and must be selected. The buggy divide-before-adjust
+    # gives N_eff = N-1 for the ofs=0 rows, dropping column N-1 from their search
+    # window — so its absence from the selected indices flags the regression
+    # deterministically (a k-th-value check misses it here: at seed=17 no
+    # divergence row otherwise places column N-1 in the top-k).
+    logits[:, N - 1] = logits.float().abs().max().item() + 1.0
     indices, _ = flashinfer.top_k_varlen(
         logits,
         seq_lens,
@@ -921,6 +933,14 @@ def test_radix_next_n_compress_ratio():
     assert indices.shape == (num_rows, top_k)
     _check_correct(
         indices, logits, seq_lens, top_k, next_n=next_n, compress_ratio=compress_ratio
+    )
+    # Every row's correct N_eff == N, so the boosted last column must appear in
+    # every row's selected indices; a divide-before-adjust bound would drop it
+    # from the ofs=0 rows.
+    assert (indices == (N - 1)).any(dim=1).all(), (
+        "column N-1 (a guaranteed top-1 value) is missing from some row's "
+        "top-k — the next_n adjustment was applied after the compress_ratio "
+        "divide (divide-before-adjust regression)"
     )
 
 
