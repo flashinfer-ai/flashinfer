@@ -63,13 +63,17 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         self,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
         self.inverse_dtype = cutlass.Float16
         self.BLK = 64
         self.D = 128
-        self.manual_cache_key("dtype", "acc_dtype", "inverse_dtype", "BLK", "D")
+        self.manual_cache_key(
+            "dtype", "acc_dtype", "cu_seqlens_dtype", "inverse_dtype", "BLK", "D"
+        )
 
     @cute.jit
     def load_k_tile_tma(
@@ -1743,8 +1747,13 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         LOAD = 0
         MATH = 1
 
-    def __init__(self, needs_initial_state: bool = False):
+    def __init__(
+        self,
+        needs_initial_state: bool = False,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+    ):
         self.needs_initial_state = needs_initial_state
+        self.cu_seqlens_dtype = cu_seqlens_dtype
         self.D = 128
         self.rows_per_cta = 64
         self.row_ctas = 2
@@ -1760,6 +1769,7 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         self.use_3xtf32 = False
         self.manual_cache_key(
             "needs_initial_state",
+            "cu_seqlens_dtype",
             "D",
             "rows_per_cta",
             "row_ctas",
@@ -2257,8 +2267,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self,
         needs_initial_state: bool = False,
         rows_per_cta: int = 4,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
     ):
         self.needs_initial_state = needs_initial_state
+        self.cu_seqlens_dtype = cu_seqlens_dtype
         self.D = 128
         self.rows_per_cta = rows_per_cta
         self.row_ctas = self.D // self.rows_per_cta
@@ -2268,6 +2280,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self.registers_per_thread = 256
         self.manual_cache_key(
             "needs_initial_state",
+            "cu_seqlens_dtype",
             "D",
             "rows_per_cta",
             "row_ctas",
