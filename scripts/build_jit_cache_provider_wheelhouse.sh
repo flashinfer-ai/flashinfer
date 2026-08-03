@@ -66,6 +66,13 @@ run_on_host() {
     echo "Container: ${DOCKER_IMAGE}"
     echo "Output: ${output_dir}"
 
+    # Older root-run builds may leave ignored generated paths that the
+    # UID-matched build container cannot remove from the bind mount.
+    docker run --rm \
+        -v "${REPO_ROOT}:/workspace" \
+        "${DOCKER_IMAGE}" \
+        rm -rf /workspace/flashinfer/data /workspace/flashinfer/_build_meta.py
+
     docker run --rm \
         --user "${host_uid}:${host_gid}" \
         -v "${REPO_ROOT}:/workspace" \
