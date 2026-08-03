@@ -3851,6 +3851,12 @@ def test_da_and_autotuner_share_boolean_environment_semantics(
     assert autotuner_module._is_value_aware_autotune() is expected
 
 
+def test_da_defaults_to_one_distribution_sample(monkeypatch):
+    """Default DA tuning profiles one realization per routing distribution."""
+    monkeypatch.delenv("FLASHINFER_DA_DISTRIBUTION_SAMPLES", raising=False)
+    assert da_profile.DAConfig().distribution_sample_count == 1
+
+
 def _capture_and_replay_da_graph(
     state: _MoEState,
     routing_logits: torch.Tensor,

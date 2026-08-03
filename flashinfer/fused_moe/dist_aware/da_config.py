@@ -100,7 +100,7 @@ class DAConfig:
     # Repetitions used for each non-single synthetic distribution.
     distribution_sample_count: int = field(
         default_factory=lambda: _env_positive_int(
-            "FLASHINFER_DA_DISTRIBUTION_SAMPLES", 10
+            "FLASHINFER_DA_DISTRIBUTION_SAMPLES", 1
         )
     )
     # Optional path to a serialized DAKNNv2 selector bundle.
