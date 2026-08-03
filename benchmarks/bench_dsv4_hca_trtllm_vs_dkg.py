@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Compare TRTLLM-GEN and CuTe DSL implementations of DSV4 HCA.
 
-The benchmark lowers the same logical HCA page tables to the two backend ABIs:
+The benchmark lowers the same logical HCA metadata to the two backend ABIs:
 
 * TRTLLM-GEN receives one physical token-row index per sparse slot.
-* CuTe DSL receives physical page IDs for the window and compressed pools.
+* CuTe DSL receives the same token-row indices for SWA and physical page IDs
+  for the compressed pool.
 
 Both backends therefore read the same FP8 cache rows in the same logical order.
 The benchmark reports raw backend latency and public FlashInfer API latency with
@@ -16,10 +17,10 @@ DKG-derived CuTe DSL HCA kernel integrated into this FlashInfer checkout. They
 do not invoke the original DKG checkout; original-versus-integrated parity is
 measured by the separate port-parity benchmark.
 
-For causal Q > 1, the current HCA ABI requires one compacted 128-slot window
-pool row per query token. This benchmark materializes that row-private pool
-before timing; its construction cost is intentionally excluded from both
-backends' kernel measurements.
+For causal Q > 1, each query token supplies its own rotated 128-entry SWA index
+row. This benchmark assigns row-private backing regions so wrong row selection
+is visible in the cross-backend comparison; input construction is intentionally
+excluded from both backends' kernel measurements.
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ class HcaInputs:
     query: torch.Tensor
     window_cache: torch.Tensor
     compressed_cache: torch.Tensor
-    window_tables: torch.Tensor
+    window_indices: torch.Tensor
     compressed_tables: torch.Tensor
     sparse_indices: torch.Tensor
     seq_lens: torch.Tensor
@@ -105,6 +106,10 @@ class HcaInputs:
     @property
     def window_cache_hnd(self) -> torch.Tensor:
         return self.window_cache.unsqueeze(1)
+
+    @property
+    def window_cache_flat(self) -> torch.Tensor:
+        return self.window_cache.reshape(-1, HEAD_DIM)
 
     @property
     def compressed_cache_hnd(self) -> torch.Tensor:
@@ -259,6 +264,19 @@ def make_inputs(case: HcaCase, workspace_size: int) -> HcaInputs:
     window_indices = _expand_page_table_to_token_rows(
         window_tables, case.window_page_size
     )
+    # Exercise the actual ring-buffer contract: each query observes a wrapped,
+    # non-identity chronological order rather than dense page order.
+    window_shifts = (
+        torch.arange(rows, dtype=torch.int64, device=device) * 17 + 7
+    ).unsqueeze(1)
+    window_indices = window_indices.gather(
+        1,
+        torch.remainder(
+            torch.arange(WINDOW_CAPACITY, dtype=torch.int64, device=device).unsqueeze(0)
+            + window_shifts,
+            WINDOW_CAPACITY,
+        ),
+    ).contiguous()
     compressed_indices = _expand_page_table_to_token_rows(
         compressed_tables, case.compressed_page_size
     )
@@ -300,7 +318,7 @@ def make_inputs(case: HcaCase, workspace_size: int) -> HcaInputs:
         query=query,
         window_cache=window_cache,
         compressed_cache=compressed_cache,
-        window_tables=window_tables,
+        window_indices=window_indices,
         compressed_tables=compressed_tables,
         sparse_indices=sparse_indices,
         seq_lens=seq_lens,
@@ -342,7 +360,6 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
     )
     compiled = batch_hca._compile_hca_kernel(
         case.compressed_page_size,
-        case.window_page_size,
         case.q_len,
         True,
         case.dkg_persistent,
@@ -362,9 +379,9 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
     def run_raw() -> None:
         compiled(
             inputs.query,
-            inputs.window_cache,
+            inputs.window_cache_flat,
             inputs.compressed_cache,
-            inputs.window_tables,
+            inputs.window_indices,
             inputs.compressed_tables,
             inputs.out_dkg,
             lse,
@@ -394,7 +411,7 @@ def make_dkg_runners(inputs: HcaInputs) -> BackendRunners:
             kv_layout="HND",
             swa_topk_lens=inputs.window_valid_lens,
             backend="cute-dsl",
-            hca_swa_block_tables=inputs.window_tables,
+            hca_swa_indices=inputs.window_indices,
             hca_compressed_block_tables=inputs.compressed_tables,
             hca_seq_lens=inputs.hca_seq_lens,
             hca_use_persistent=case.dkg_persistent,
@@ -549,7 +566,7 @@ def add_derived_metrics(row: dict[str, object], case: HcaCase) -> None:
     row["dkg_metadata_bytes"] = (
         case.batch_size
         * case.q_len
-        * (WINDOW_CAPACITY // case.window_page_size + case.compressed_pages_per_row)
+        * (WINDOW_CAPACITY + case.compressed_pages_per_row)
         * 4
     )
 

@@ -60,8 +60,10 @@ output for the NVIDIA Blackwell SM100 architecture using CuTe DSL.
 This example demonstrates an implementation of inference of heavily compressed attention using a TMA + Blackwell
 SM100 TensorCore warp-specialized persistent kernel. The implementation integrates the (Qc + Qr)*(Kc + Kr)^T
 matrix multiplication, softmax normalization, and softmax((Qc + Qr)*(Kc + Kr)^T)*Vc into a single kernel.
-The kernel provides support for page table storage and variable-length KV cache sequences. It implements KV splitting
-functionality to minimize latency when processing long KV sequences.
+The window KV stream uses token-level absolute indices into a flat pool, while
+the compressed KV stream supports page-table storage and variable-length
+sequences. The kernel implements KV splitting functionality to minimize latency
+when processing long KV sequences.
 
 The kernel implements key optimizations including:
 - Warp specialization for different computation phases (load, MMA, softmax, correction, epilogue)
@@ -89,8 +91,9 @@ The above example runs Heavily Compressed Attention (HCA) with the following con
 - Number of heads: 128
 - Data types: Float8E4M3FN (input), Float8E4M3FN (output), Float32 (accumulation and LSE)
 
-It utilizes page table storage for the KV cache and enables both variable-length KV cache sequences
-and variable split KV processing with persistent scheduling.
+It uses absolute token indices for sliding-window KV, a page table for
+compressed KV, and enables both variable-length sequences and variable split
+KV processing with persistent scheduling.
 
 To collect performance with NCU profiler:
 
@@ -113,11 +116,12 @@ Constraints for this example:
   - Number of attention heads: 128
   - Per-head depth (head_dim): 512 (last `qk_rope_head_dim` lanes pre-rotated)
 * Input query modes should be (NumHeads, HeadDim, SeqLenQ, BatchSize)
-* Input kv modes should be (SeqLenK, HeadDim, BatchSize)
+* Window KV is a flat row-major (PoolRows, HeadDim) tensor
+* Compressed KV uses paged (PageSize, HeadDim, PageCount) storage
 * Query sequence length must be positive. The non-persistent launch grid
   currently requires ``batch_size * seq_len_q <= 65535``.
 * Only supports 2-CTA instructions
-* Variable sequence length requires page table storage enabled
+* Variable sequence length uses the compressed-stream page table
 """
 
 
@@ -133,7 +137,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         mma_pv_tiler_mn: Tuple[int, int],
         max_active_clusters: int,
         page_size_cmp: int,
-        page_size_win: int,
         skip_correction_threshold: float,
         is_persistent: bool,
         is_var_seq: bool,
@@ -156,9 +159,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :type max_active_clusters: int
         :param page_size_cmp: Page size of the compressed-KV page table
         :type page_size_cmp: int
-        :param page_size_win: Page size of the sliding-window page table
-            (must be a power-of-two multiple of page_size_cmp, or vice versa)
-        :type page_size_win: int
         :param skip_correction_threshold: Threshold to skip correction
         :type skip_correction_threshold: float
         :param is_persistent: Whether to use persistent kernel mode
@@ -188,7 +188,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         self.skip_correction_threshold = skip_correction_threshold
         self.is_persistent = is_persistent
         self.page_size_cmp = page_size_cmp
-        self.page_size_win = page_size_win
         self.is_var_seq = is_var_seq
         self.is_var_split_kv = is_var_split_kv
         self.is_causal = is_causal
@@ -314,7 +313,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         q_latent: cute.Tensor,
         c_latent_win: cute.Tensor,
         c_latent_cmp: cute.Tensor,
-        page_table_win: cute.Tensor,
+        window_indices: cute.Tensor,
         page_table_cmp: cute.Tensor,
         o: cute.Tensor,
         lse: cute.Tensor,
@@ -342,14 +341,16 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :param q_latent: The query tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
             (last `qk_rope_head_dim` lanes pre-rotated by caller).
         :type q_latent: cute.Tensor
-        :param c_latent_win: Sliding-window key tensor with shape
-            [mma_qk_tiler[1], latent_dim, batch_size]
+        :param c_latent_win: Flat sliding-window KV pool with shape
+            [window_pool_rows, latent_dim]
         :type c_latent_win: cute.Tensor
-        :param c_latent_cmp: Compressed key tensor with shape
-            [seq_len_k_cmp, latent_dim, batch_size]
+        :param c_latent_cmp: Paged compressed KV tensor with shape
+            [page_size_cmp, latent_dim, compressed_page_count]
         :type c_latent_cmp: cute.Tensor
-        :param page_table_win: Page table for the sliding-window stream
-        :type page_table_win: cute.Tensor
+        :param window_indices: Token-level absolute row indices into
+            ``c_latent_win`` with shape [mma_qk_tiler[1], table_rows]. Every
+            entry must be a legal backing row; ``-1`` is not supported.
+        :type window_indices: cute.Tensor
         :param page_table_cmp: Page table for the compressed stream
         :type page_table_cmp: cute.Tensor
         :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
@@ -366,6 +367,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :type block_split_kvs: cute.Tensor
         :param sparse_mla_topk_lens: Per-query valid sparse HCA length with shape
             [batch_size * seq_len_q] for causal mode, or [batch_size] otherwise.
+            A zero-length row requires a zero window-valid length plus legal
+            window indices and backing rows for the fully masked sink-only tile.
         :type sparse_mla_topk_lens: cute.Tensor
         :param window_valid_lens: Per-query valid length within the sliding-window
             pool, using the same row layout as sparse_mla_topk_lens.
@@ -431,8 +434,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 ),
             )
 
-        def _reinterpret_page_table(tensor):
-            # [rows, page_count] -> [page_count, rows]
+        def _reinterpret_row_table(tensor):
+            # [rows, columns] -> [columns, rows]
             return cute.make_tensor(
                 tensor.iterator,
                 cute.make_layout(
@@ -442,10 +445,9 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             )
 
         q_latent = _reinterpret_4d(q_latent)
-        c_latent_win = _reinterpret_3d_kv(c_latent_win)
         c_latent_cmp = _reinterpret_3d_kv(c_latent_cmp)
-        page_table_win = _reinterpret_page_table(page_table_win)
-        page_table_cmp = _reinterpret_page_table(page_table_cmp)
+        window_indices = _reinterpret_row_table(window_indices)
+        page_table_cmp = _reinterpret_row_table(page_table_cmp)
         o = _reinterpret_4d(o)
         # [B, S_q, H] -> [H, S_q, B]
         lse = cute.make_tensor(
@@ -456,6 +458,17 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             ),
         )
 
+        if cutlass.const_expr(
+            len(c_latent_win.shape) != 2 or len(c_latent_cmp.shape) != 3
+        ):
+            raise ValueError(
+                "c_latent_win must be a flat 2D pool and c_latent_cmp must be paged 3D"
+            )
+        if cutlass.const_expr(
+            len(window_indices.shape) != 2 or len(page_table_cmp.shape) != 2
+        ):
+            raise ValueError("window_indices and page_table_cmp must be rank-2 tensors")
+
         # check leading dimensions of input/output
         if cutlass.const_expr(q_latent.stride[1] != 1):
             raise ValueError("q_latent must have leading dimension 1")
@@ -463,6 +476,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             raise ValueError("c_latent_cmp must have leading dimension 1")
         if cutlass.const_expr(c_latent_win.stride[1] != 1):
             raise ValueError("c_latent_win must have leading dimension 1")
+        if cutlass.const_expr(window_indices.stride[0] != 1):
+            raise ValueError("window_indices must have leading dimension 0")
         if cutlass.const_expr(o.stride[1] != 1):
             raise ValueError("o must have leading dimension 1")
         if cutlass.const_expr(lse.stride[0] != 1):
@@ -482,7 +497,9 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         c_latent_cmp_transpose = cute.make_tensor(
             c_latent_cmp.iterator, c_latent_cmp_transpose_layout
         )
-        c_latent_win_transpose_layout = cute.select(c_latent_win.layout, mode=[1, 0, 2])
+        # The window pool is flat 2D. Batch/query selection is encoded in
+        # token-level absolute indices instead of a source tensor batch mode.
+        c_latent_win_transpose_layout = cute.select(c_latent_win.layout, mode=[1, 0])
         c_latent_win_transpose = cute.make_tensor(
             c_latent_win.iterator, c_latent_win_transpose_layout
         )
@@ -540,7 +557,9 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         )
         cta_kv_m = qk_tiled_mma.op.shape_mnk[0] // qk_tiled_mma.thr_id.shape
         kc_page_tile_size_cmp = min(self.page_size_cmp, cta_kv_m)
-        kc_page_tile_size_win = min(self.page_size_win, cta_kv_m)
+        # Window gather4 is token-level, so there is no page boundary that can
+        # truncate the per-CTA SMEM tile.
+        kc_page_tile_size_win = cta_kv_m
         kc_latent_smem_layout_staged = cute.logical_divide(
             kc_latent_smem_layout_staged, (None, None, None, self.iterations_qk_latent)
         )
@@ -592,7 +611,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             (None, None, None, (self.iterations_pv_n, None)),
         )
         vc_page_tile_size_cmp = min(self.page_size_cmp, self.mma_pv_tiler[2])
-        vc_page_tile_size_win = min(self.page_size_win, self.mma_pv_tiler[2])
+        vc_page_tile_size_win = self.mma_pv_tiler[2]
         vc_pv_n = pv_tiled_mma.op.shape_mnk[1] // pv_tiled_mma.thr_id.shape
         vc_smem_layout_for_tma_base = sm100_utils.make_smem_layout(
             OperandMajorMode.MN,
@@ -646,15 +665,19 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             is_k_load=True,
             page_size=self.page_size_cmp,
         )
+        # Window K gathers flat rows using chronological ring-buffer indices.
+        window_k_coord_layout = cute.make_layout(c_latent_win.shape, stride=(1, 0))
+        window_k_coord = cute.make_tensor(
+            window_indices.iterator, window_k_coord_layout
+        )
         kc_smem_layout_win = cute.select(kc_latent_smem_layout_for_tma_win, mode=[0])
-        tma_atom_c_latent_win, tma_tensor_c_latent_win = self.make_paged_tiled_tma_atom(
-            tma_load_op,
+        tma_atom_c_latent_win, tma_tensor_c_latent_win = self.make_gather4_2sm_tma_atom(
+            cpasync.CopyBulkTensor2DGather4G2SOp(cta_group=tcgen05.CtaGroup.TWO),
             c_latent_win,
             kc_smem_layout_win,
             (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
             qk_tiled_mma,
-            is_k_load=True,
-            page_size=self.page_size_win,
+            window_k_coord,
         )
 
         # TMA load for c latent transpose (cmp + win)
@@ -670,16 +693,22 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 page_size=self.page_size_cmp,
             )
         )
+        # The transposed V view gathers mode 1 and broadcasts mode 0.
+        window_v_coord_layout = cute.make_layout(
+            c_latent_win_transpose.shape, stride=(0, 1)
+        )
+        window_v_coord = cute.make_tensor(
+            window_indices.iterator, window_v_coord_layout
+        )
         vc_smem_layout_win = cute.select(vc_smem_layout_for_tma_win, mode=[0])
         tma_atom_c_latent_transpose_win, tma_tensor_c_latent_transpose_win = (
-            self.make_paged_tiled_tma_atom(
-                tma_load_op,
+            self.make_gather4_2sm_tma_atom(
+                cpasync.CopyBulkTensor2DGather4G2SOp(cta_group=tcgen05.CtaGroup.TWO),
                 c_latent_win_transpose,
                 vc_smem_layout_win,
                 (self.mma_pv_tiler[1], self.mma_pv_tiler[2]),
                 pv_tiled_mma,
-                is_k_load=False,
-                page_size=self.page_size_win,
+                window_v_coord,
             )
         )
 
@@ -777,7 +806,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             tma_tensor_c_latent_transpose_win,
             tma_atom_c_latent_transpose_cmp,
             tma_tensor_c_latent_transpose_cmp,
-            page_table_win,
+            window_indices,
             page_table_cmp,
             o,
             lse,
@@ -824,6 +853,41 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 stream=stream,
                 min_blocks_per_mp=1,
             )
+
+    @cute.jit
+    def make_gather4_2sm_tma_atom(
+        self,
+        gather4_op,
+        gmem: cute.Tensor,
+        smem_layout: cute.Layout,
+        mma_tiler,
+        tiled_mma: cute.TiledMma,
+        gmem_coord_tensor: cute.Tensor,
+    ):
+        """Build a 2-SM gather4 TMA atom for token-level absolute indices."""
+        ident = cute.make_identity_layout(gmem.shape)
+        g_tile = cute.composition(ident, mma_tiler)
+        cta_mn = mma_tiler[0] // tiled_mma.thr_id.shape
+        cta_v_map = cute.flat_divide(g_tile, (cta_mn,))
+        cta_v_map = cute.select(cta_v_map, mode=[0, 2])
+        cta_v_map = cute.zipped_divide(cta_v_map, (cta_mn, mma_tiler[1]))
+        cta_v_map = cute.select(cta_v_map, mode=[0])
+        from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+
+        smem_layout_ir = (
+            smem_layout.value if hasattr(smem_layout, "value") else smem_layout
+        )
+        res = _cute_nvgpu_ir.atom_make_non_exec_2d_gather4_tma_load(
+            gmem.value,
+            gmem_coord_tensor.layout,
+            smem_layout_ir,
+            cta_v_map,
+            gather4_op._to_ir(),
+            num_multicast=1,
+        )
+        return cute.CopyAtom(
+            gather4_op, cpasync.CopyBulkTensor2DGather4G2SNonExecTrait(res[0])
+        ), res[1]
 
     @cute.jit
     def make_paged_tiled_tma_atom(
@@ -877,7 +941,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         mCLT_win: cute.Tensor,
         tma_atom_c_latent_transpose_cmp: Optional[cute.CopyAtom],
         mCLT_cmp: cute.Tensor,
-        mPT_win: cute.Tensor,
+        mWindowIndices: cute.Tensor,
         mPT_cmp: cute.Tensor,
         mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
@@ -939,8 +1003,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :type mCLT_win: cute.Tensor
         :param mCLT_cmp: Compressed-stream V transpose tensor
         :type mCLT_cmp: cute.Tensor
-        :param mPT_win: Window-stream page table tensor
-        :type mPT_win: cute.Tensor
+        :param mWindowIndices: Token-level absolute window-row indices
+        :type mWindowIndices: cute.Tensor
         :param mPT_cmp: Compressed-stream page table tensor
         :type mPT_cmp: cute.Tensor
         :param mO: Output tensor
@@ -1054,7 +1118,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             kc_latent_smem_layout_staged.outer,
             swizzle=kc_latent_smem_layout_staged.inner,
         )
-        # Two TMA-views over the same physical KC SMEM, one per page-size
+        # Two TMA views over the same physical KC SMEM, one per KV stream.
         sKC_for_tma_win = storage.smem_kc_latent.get_tensor(
             kc_latent_smem_layout_for_tma_win.outer,
             swizzle=kc_latent_smem_layout_for_tma_win.inner,
@@ -1091,7 +1155,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Load warps, including page table and data tensors
+        #  Load warps, including window indices, compressed page table, and data
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_tma_k_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
@@ -1121,7 +1185,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
                         load_v_pipeline=load_v_pipeline,
-                        mPT_win=mPT_win,
+                        mWindowIndices=mWindowIndices,
                         mPT_cmp=mPT_cmp,
                     )
                     tma_qk_params = SimpleNamespace(
@@ -1174,7 +1238,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                         blk_coord=blk_coord,
                         local_split_kv=local_split_kv,
                         load_v_pipeline=load_v_pipeline,
-                        mPT_win=mPT_win,
+                        mWindowIndices=mWindowIndices,
                         mPT_cmp=mPT_cmp,
                     )
                     tma_pv_params = SimpleNamespace(
@@ -1768,7 +1832,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
         page_table_row = self.get_page_table_row(common_params.blk_coord)
-        mPT_win_b = common_params.mPT_win[None, page_table_row]
         mPT_cmp_b = common_params.mPT_cmp[None, page_table_row]
 
         # Flatten divide and partition global tensors for QK TMA load
@@ -1785,22 +1848,16 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             // qk_params.tiled_mma_qk.thr_id.shape
         )
 
-        # K partition for window stream
-        cta_m_win = min(cta_kv_m, self.page_size_win)
-        page_tile_size_k_win = min(self.page_size_win, cta_m_win)
-        gCL_win = cute.tiled_divide(
-            qk_params.mCL_win, (page_tile_size_k_win, self.mma_qk_tiler[2])
+        # Window K and its token-level coordinates use identical per-CTA
+        # tiling. The outer tile selects the query row and cluster CTA.
+        per_cta_n_qk = self.mma_qk_tiler[1] // qk_params.tiled_mma_qk.thr_id.shape
+        cta_tiler_qk_win = (per_cta_n_qk, self.mma_qk_tiler[2])
+        gCL_win = cute.zipped_divide(qk_params.mCL_win, cta_tiler_qk_win)
+        window_k_coord_layout = cute.make_layout(qk_params.mCL_win.shape, stride=(1, 0))
+        window_k_coord = cute.make_tensor(
+            common_params.mWindowIndices.iterator, window_k_coord_layout
         )
-        tSgCL_win = (
-            gCL_win[
-                None,
-                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None,
-                None,
-            ]
-            if cta_m_win < self.page_size_win
-            else gCL_win[None, 0, None, None]
-        )
+        gIdx_win_k = cute.zipped_divide(window_k_coord, cta_tiler_qk_win)
 
         # K partition for compressed stream
         cta_m_cmp = min(cta_kv_m, self.page_size_cmp)
@@ -1828,12 +1885,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             cute.group_modes(tSgQL, 0, 3),
         )
 
-        tKCsKC_win, tCLgCL_win = cpasync.tma_partition(
+        tKCsKC_win, tCLgCL_win, tIdxgIdx_win_k = cpasync.tma_partition(
             qk_params.tma_atom_c_latent_win,
             0,
             cute.make_layout(1),
             qk_params.sKC_win,
-            tSgCL_win,
+            [gCL_win, gIdx_win_k],
         )
         tKCsKC_cmp, tCLgCL_cmp = cpasync.tma_partition(
             qk_params.tma_atom_c_latent_cmp,
@@ -1848,10 +1905,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         ]
 
         # set extra params (both streams threaded through)
-        common_params.mPT_win = mPT_win_b
         common_params.mPT_cmp = mPT_cmp_b
         qk_params.tQLgQL = tQLgQL
         qk_params.tCLgCL_win = tCLgCL_win
+        qk_params.tIdxgIdx_win = tIdxgIdx_win_k
         qk_params.tCLgCL_cmp = tCLgCL_cmp
         qk_params.tQsQ = tQsQ
         qk_params.tKCsKC_win = tKCsKC_win
@@ -1902,21 +1959,20 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :rtype: pipeline.PipelineState
         """
         page_table_row = self.get_page_table_row(common_params.blk_coord)
-        mPT_win_b = common_params.mPT_win[None, page_table_row]
         mPT_cmp_b = common_params.mPT_cmp[None, page_table_row]
 
         cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
 
-        # V partition for window stream
-        page_tile_size_v_win = min(self.page_size_win, self.mma_pv_tiler[2])
-        gCLT_win = cute.flat_divide(
-            v_params.mCLT_win, (self.mma_pv_tiler[1], page_tile_size_v_win)
+        # Window V and its coordinates use the same per-CTA tile over the
+        # transposed flat pool.
+        per_cta_m_pv = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
+        cta_tiler_pv_win = (per_cta_m_pv, self.mma_pv_tiler[2])
+        gCLT_win = cute.zipped_divide(v_params.mCLT_win, cta_tiler_pv_win)
+        window_v_coord_layout = cute.make_layout(v_params.mCLT_win.shape, stride=(0, 1))
+        window_v_coord = cute.make_tensor(
+            common_params.mWindowIndices.iterator, window_v_coord_layout
         )
-        gCLT_win = cute.logical_divide(gCLT_win, (cta_n,))[
-            (None, common_params.blk_coord[0]), None, None, None, None
-        ]
-        tOgCLT_win = cute.tiled_divide(gCLT_win, (cta_n, page_tile_size_v_win))
-        tOgCLT_win = tOgCLT_win[None, 0, 0, None, None, None]
+        gIdx_win_v = cute.zipped_divide(window_v_coord, cta_tiler_pv_win)
 
         # V partition for compressed stream
         page_tile_size_v_cmp = min(self.page_size_cmp, self.mma_pv_tiler[2])
@@ -1929,12 +1985,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         tOgCLT_cmp = cute.tiled_divide(gCLT_cmp, (cta_n, page_tile_size_v_cmp))
         tOgCLT_cmp = tOgCLT_cmp[None, 0, 0, None, None, None]
 
-        tVCsVC_win, tCLTgCLT_win = cpasync.tma_partition(
+        tVCsVC_win, tCLTgCLT_win, tIdxgIdx_win_v = cpasync.tma_partition(
             v_params.tma_atom_c_latent_transpose_win,
             0,
             cute.make_layout(1),
             v_params.sVC_win,
-            tOgCLT_win,
+            [gCLT_win, gIdx_win_v],
         )
         tVCsVC_cmp, tCLTgCLT_cmp = cpasync.tma_partition(
             v_params.tma_atom_c_latent_transpose_cmp,
@@ -1945,9 +2001,9 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         )
 
         # set extra params
-        common_params.mPT_win = mPT_win_b
         common_params.mPT_cmp = mPT_cmp_b
         v_params.tCLTgCLT_win = tCLTgCLT_win
+        v_params.tIdxgIdx_win = tIdxgIdx_win_v
         v_params.tCLTgCLT_cmp = tCLTgCLT_cmp
         v_params.tVCsVC_win = tVCsVC_win
         v_params.tVCsVC_cmp = tVCsVC_cmp
@@ -1997,32 +2053,20 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :return: The load q producer state and load kv producer state
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
-        page_per_tile_win = ceil_div(
-            self.mma_qk_tiler[1] // self.page_size_win,
-            qk_params.tiled_mma_qk.thr_id.shape,
-        )
         page_per_tile_cmp = ceil_div(
             self.mma_qk_tiler[1] // self.page_size_cmp,
             qk_params.tiled_mma_qk.thr_id.shape,
         )
-        # Either stream may have the larger per-CTA page count.
-        page_per_tile_max = max(page_per_tile_win, page_per_tile_cmp)
         k_idx = cute.make_rmem_tensor(
-            cute.make_layout(page_per_tile_max), cutlass.Int32
+            cute.make_layout(page_per_tile_cmp), cutlass.Int32
         )
 
-        # k_index == 0 → window stream (page indices come from mPT_win[0]).
-        # k_index >= 1 → compressed stream (offset by 1 into mPT_cmp).
+        # Only the compressed stream consumes page IDs. Initialize the unused
+        # window-path fragment to keep every dynamic branch fully defined.
         is_win_for_idx = k_index == 0
         if is_win_for_idx:
-            if cutlass.const_expr(self.mma_qk_tiler[1] // self.page_size_win == 1):
-                for i in cutlass.range_constexpr(page_per_tile_win):
-                    k_idx[i] = common_params.mPT_win[0]
-            else:
-                for i in cutlass.range_constexpr(page_per_tile_win):
-                    k_idx[i] = common_params.mPT_win[
-                        common_params.blk_coord[0] * page_per_tile_win + i
-                    ]
+            for i in cutlass.range_constexpr(page_per_tile_cmp):
+                k_idx[i] = 0
         else:
             cmp_offset = k_index - 1
             if cutlass.const_expr(self.mma_qk_tiler[1] // self.page_size_cmp == 1):
@@ -2057,17 +2101,23 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             load_k_producer_state
         )
         common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+        cluster_n = qk_params.tiled_mma_qk.thr_id.shape
+        cta_in_cluster = common_params.blk_coord[0] % cluster_n
+        window_tile_idx = (
+            self.get_page_table_row(common_params.blk_coord) * cluster_n
+            + cta_in_cluster
+        )
         for i in range(self.iterations_qk_latent):
             if is_win:
-                for k in range(page_per_tile_win):
-                    cute.copy(
-                        qk_params.tma_atom_c_latent_win,
-                        qk_params.tCLgCL_win[None, i, k_idx[k]],
-                        qk_params.tKCsKC_win[
-                            None, k, 0, (i, load_k_producer_state.index)
-                        ],
-                        tma_bar_ptr=tma_bar_ptr,
-                    )
+                cute.copy(
+                    qk_params.tma_atom_c_latent_win,
+                    [
+                        qk_params.tCLgCL_win[None, (window_tile_idx, i)],
+                        qk_params.tIdxgIdx_win[None, (window_tile_idx, i)],
+                    ],
+                    qk_params.tKCsKC_win[None, 0, 0, (i, load_k_producer_state.index)],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
             else:
                 for k in range(page_per_tile_cmp):
                     cute.copy(
@@ -2104,27 +2154,18 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :return: The load qkv producer state
         :rtype: pipeline.PipelineState
         """
-        page_per_tile_win = (
-            self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size_win
-        )
         page_per_tile_cmp = (
             self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size_cmp
         )
-        page_per_subtile_win = ceil_div(page_per_tile_win, self.iterations_pv_k)
         page_per_subtile_cmp = ceil_div(page_per_tile_cmp, self.iterations_pv_k)
-        page_per_tile_max = max(page_per_tile_win, page_per_tile_cmp)
         k_idx = cute.make_rmem_tensor(
-            cute.make_layout(page_per_tile_max), cutlass.Int32
+            cute.make_layout(page_per_tile_cmp), cutlass.Int32
         )
 
         is_win_for_idx = k_index == 0
         if is_win_for_idx:
-            if cutlass.const_expr(page_per_tile_win == 1):
-                for i in cutlass.range_constexpr(page_per_tile_win):
-                    k_idx[i] = common_params.mPT_win[0]
-            else:
-                for i in cutlass.range_constexpr(page_per_tile_win):
-                    k_idx[i] = common_params.mPT_win[i]
+            for i in cutlass.range_constexpr(page_per_tile_cmp):
+                k_idx[i] = 0
         else:
             cmp_offset = k_index - 1
             if cutlass.const_expr(page_per_tile_cmp == 1):
@@ -2140,29 +2181,29 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         )
         common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
         is_win = k_index == 0
+        cluster_m_pv = v_params.tiled_mma_pv.thr_id.shape
+        cta_in_cluster_pv = common_params.blk_coord[0] % cluster_m_pv
+        window_row = self.get_page_table_row(common_params.blk_coord)
         for j in cutlass.range_constexpr(self.iterations_pv_n):
             for i in cutlass.range_constexpr(self.iterations_pv_k):
                 if is_win:
-                    if cutlass.const_expr(page_per_tile_win > 1):
-                        for k in cutlass.range_constexpr(page_per_subtile_win):
-                            k_idx_i = k_idx[k + i * page_per_subtile_win]
-                            cute.copy(
-                                v_params.tma_atom_c_latent_transpose_win,
-                                v_params.tCLTgCLT_win[None, j, 0, k_idx_i],
-                                v_params.tVCsVC_win[
-                                    None, 0, k, ((j, i), load_v_producer_state.index)
-                                ],
-                                tma_bar_ptr=tma_bar_ptr,
-                            )
-                    else:
-                        cute.copy(
-                            v_params.tma_atom_c_latent_transpose_win,
-                            v_params.tCLTgCLT_win[None, j, i, k_idx[0]],
-                            v_params.tVCsVC_win[
-                                None, 0, 0, ((j, i), load_v_producer_state.index)
+                    latent_block_idx = j * cluster_m_pv + cta_in_cluster_pv
+                    window_tile_idx = window_row * self.iterations_pv_k + i
+                    cute.copy(
+                        v_params.tma_atom_c_latent_transpose_win,
+                        [
+                            v_params.tCLTgCLT_win[
+                                None, (latent_block_idx, window_tile_idx)
                             ],
-                            tma_bar_ptr=tma_bar_ptr,
-                        )
+                            v_params.tIdxgIdx_win[
+                                None, (latent_block_idx, window_tile_idx)
+                            ],
+                        ],
+                        v_params.tVCsVC_win[
+                            None, 0, 0, ((j, i), load_v_producer_state.index)
+                        ],
+                        tma_bar_ptr=tma_bar_ptr,
+                    )
                 else:
                     if cutlass.const_expr(page_per_tile_cmp > 1):
                         for k in cutlass.range_constexpr(page_per_subtile_cmp):
@@ -3812,7 +3853,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         is_var_seq: bool,
         is_var_split_kv: bool,
         page_size_cmp: int,
-        page_size_win: int,
     ) -> bool:
         """Check if the HCA kernel can be implemented.
 
@@ -3849,9 +3889,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         :type is_var_split_kv: bool
         :param page_size_cmp: Page size for compressed-KV stream
         :type page_size_cmp: int
-        :param page_size_win: Page size for window-KV stream (power-of-two
-            multiple of page_size_cmp, or vice versa)
-        :type page_size_win: int
 
         :return: Whether the HCA kernel can be implemented
         :rtype: bool
@@ -3866,22 +3903,14 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             return False
         if split_kv < 1 or split_kv > MAX_SPLITS:
             return False
-        if page_size_cmp <= 1 or page_size_win <= 1:
+        # The compressed stream remains paged and must satisfy the TMA 128B
+        # alignment requirement. Window gather4 splits the sequence tile across
+        # two CTAs, with each CTA issuing groups of four indices.
+        if page_size_cmp <= 1 or mma_qk_tiler_mn[1] % page_size_cmp != 0:
             return False
-        # Both page sizes must divide mma_qk_tiler[1]; neither may equal 1
-        # (TMA 128B alignment requirement).
-        if mma_qk_tiler_mn[1] % page_size_cmp != 0:
+        if page_size_cmp & (page_size_cmp - 1) != 0:
             return False
-        if mma_qk_tiler_mn[1] % page_size_win != 0:
-            return False
-        big, small = (
-            max(page_size_win, page_size_cmp),
-            min(page_size_win, page_size_cmp),
-        )
-        if big % small != 0:
-            return False
-        ratio = big // small
-        if ratio & (ratio - 1) != 0:
+        if mma_qk_tiler_mn[1] % 8 != 0:
             return False
         if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0] or mma_qk_tiler_mn[0] != 128:
             return False

@@ -3,9 +3,10 @@
 
 """PyTorch integration for the Blackwell DeepSeek V4 HCA decode kernel.
 
-HCA scans two independent paged pools: a 128-slot sliding-window pool and a
-dense heavily-compressed pool. Unlike TRTLLM-GEN's dynamic-token-sparse ABI,
-its page tables contain physical page IDs, not arbitrary token-row indices.
+HCA gathers the 128-slot sliding window from a flat KV pool with absolute token
+indices, while its heavily-compressed stream remains paged. Both streams can
+therefore share the logical token order used by TRTLLM-GEN without forcing a
+ring-buffer window into dense page-table order.
 """
 
 from __future__ import annotations
@@ -85,7 +86,6 @@ def _check_can_implement(
     max_hca_len: int,
     split_kv: int,
     page_size_compressed: int,
-    page_size_window: int,
     is_persistent: bool,
 ) -> None:
     """Raise a descriptive error for unsupported static configurations."""
@@ -106,20 +106,17 @@ def _check_can_implement(
         True,
         False,
         page_size_compressed,
-        page_size_window,
     ):
         raise ValueError(
             "CuTe DSL HCA does not support this configuration: "
             f"q_len={q_len}, num_heads={num_heads}, "
             f"max_hca_len={max_hca_len}, split_kv={split_kv}, "
-            f"page_size_compressed={page_size_compressed}, "
-            f"page_size_window={page_size_window}"
+            f"page_size_compressed={page_size_compressed}"
         )
 
 
 def _make_hca_fake_tensors(
     page_size_compressed: int,
-    page_size_window: int,
     workspace_is_empty: bool,
 ):
     """Build symbolic TVM-FFI tensors for one HCA specialization."""
@@ -127,10 +124,9 @@ def _make_hca_fake_tensors(
     sym_q_len = cute.sym_int()
     sym_heads = cute.sym_int()
     sym_head_dim = cute.sym_int(divisibility=16)
-    sym_window_pages = cute.sym_int()
+    sym_window_rows = cute.sym_int()
     sym_compressed_pages = cute.sym_int()
     sym_table_rows = cute.sym_int()
-    sym_window_table_pages = cute.sym_int()
     sym_compressed_table_pages = cute.sym_int()
     sym_workspace_size = cute.sym_int()
 
@@ -142,8 +138,8 @@ def _make_hca_fake_tensors(
     )
     window_cache = cute.runtime.make_fake_compact_tensor(
         cutlass.Float8E4M3FN,
-        (sym_window_pages, page_size_window, sym_head_dim),
-        stride_order=(2, 1, 0),
+        (sym_window_rows, sym_head_dim),
+        stride_order=(1, 0),
         assumed_align=16,
     )
     compressed_cache = cute.runtime.make_fake_compact_tensor(
@@ -152,9 +148,9 @@ def _make_hca_fake_tensors(
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
-    window_block_tables = cute.runtime.make_fake_compact_tensor(
+    window_indices = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (sym_table_rows, sym_window_table_pages),
+        (sym_table_rows, _HCA_WINDOW_CAPACITY),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -199,7 +195,7 @@ def _make_hca_fake_tensors(
         query,
         window_cache,
         compressed_cache,
-        window_block_tables,
+        window_indices,
         compressed_block_tables,
         out,
         lse,
@@ -214,7 +210,6 @@ def _make_hca_fake_tensors(
 @functools.cache
 def _compile_hca_kernel(
     page_size_compressed: int,
-    page_size_window: int,
     q_len: int,
     is_causal: bool,
     is_persistent: bool,
@@ -236,7 +231,6 @@ def _compile_hca_kernel(
             _CLUSTER_SHAPE_MNK[0] * _CLUSTER_SHAPE_MNK[1]
         ),
         page_size_cmp=page_size_compressed,
-        page_size_win=page_size_window,
         skip_correction_threshold=0.0,
         is_persistent=is_persistent,
         is_var_seq=True,
@@ -249,7 +243,7 @@ def _compile_hca_kernel(
         query,
         window_cache,
         compressed_cache,
-        window_block_tables,
+        window_indices,
         compressed_block_tables,
         out,
         lse,
@@ -260,7 +254,6 @@ def _compile_hca_kernel(
         sinks,
     ) = _make_hca_fake_tensors(
         page_size_compressed,
-        page_size_window,
         workspace_is_empty,
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -269,7 +262,7 @@ def _compile_hca_kernel(
         query,
         window_cache,
         compressed_cache,
-        window_block_tables,
+        window_indices,
         compressed_block_tables,
         out,
         lse,
@@ -312,7 +305,7 @@ def _validate_hca_values(
     *,
     window_kv_cache: torch.Tensor,
     compressed_kv_cache: torch.Tensor,
-    window_block_tables: torch.Tensor,
+    window_indices: torch.Tensor,
     compressed_block_tables: torch.Tensor,
     hca_seq_lens: torch.Tensor,
     sparse_topk_lens: torch.Tensor,
@@ -356,19 +349,15 @@ def _validate_hca_values(
     if invalid_window_lens.any().item():
         raise ValueError("window_valid_lens values must be between 0 and 128")
 
-    # The kernel always loads the fixed 128-slot window tile, even when some
-    # slots are masked by window_valid_lens. Extra table columns are padding.
-    window_page_count = (
-        _HCA_WINDOW_CAPACITY + window_kv_cache.shape[1] - 1
-    ) // window_kv_cache.shape[1]
-    active_window_tables = window_block_tables[:, :window_page_count]
-    invalid_window_pages = torch.logical_or(
-        active_window_tables < 0,
-        active_window_tables >= window_kv_cache.shape[0],
+    # Gather4 reads all 128 coordinates before window_valid_lens masks scores,
+    # so even inactive slots must name a legal backing row (use row zero).
+    invalid_window_indices = torch.logical_or(
+        window_indices < 0,
+        window_indices >= window_kv_cache.shape[0],
     )
-    if invalid_window_pages.any().item():
+    if invalid_window_indices.any().item():
         raise ValueError(
-            "window_block_tables active values must be physical page IDs in "
+            "window_indices values must be absolute KV rows in "
             f"[0, {window_kv_cache.shape[0]})"
         )
 
@@ -415,7 +404,7 @@ def cute_dsl_hca_decode(
     window_kv_cache: torch.Tensor,
     compressed_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    window_block_tables: torch.Tensor,
+    window_indices: torch.Tensor,
     compressed_block_tables: torch.Tensor,
     hca_seq_lens: torch.Tensor,
     sparse_topk_lens: torch.Tensor,
@@ -429,9 +418,11 @@ def cute_dsl_hca_decode(
 ) -> torch.Tensor:
     """Run the FP8 DeepSeek V4 HCA decode kernel on SM100/SM103.
 
-    All tensors use PyTorch-native layouts.  ``query`` is ``[B, Q, H, 512]``;
-    each KV pool is ``[num_pages, page_size, 512]``; and each block table is
-    ``[B * Q, max_pages]``. The current DSV4 integration is causal-only.
+    All tensors use PyTorch-native layouts. ``query`` is ``[B, Q, H, 512]``;
+    the window pool is flat ``[pool_rows, 512]`` with absolute
+    ``window_indices[B * Q, 128]``; and the compressed pool remains
+    ``[num_pages, page_size, 512]`` with a page table. The current DSV4
+    integration is causal-only.
     ``hca_seq_lens`` counts HCA slots (128 window slots plus compressed slots),
     not original uncompressed tokens.
     """
@@ -465,17 +456,26 @@ def cute_dsl_hca_decode(
     if num_heads <= 0 or num_heads > _HCA_MAX_HEADS:
         raise ValueError(f"query num_heads must be in [1, 128], got {num_heads}")
 
+    if window_kv_cache.ndim != 2:
+        raise ValueError(
+            f"window_kv_cache must be 2D [pool_rows, 512], got {window_kv_cache.ndim}D"
+        )
+    if window_kv_cache.shape[0] <= 0:
+        raise ValueError("window_kv_cache must contain at least one row")
+    if compressed_kv_cache.ndim != 3:
+        raise ValueError(
+            "compressed_kv_cache must be 3D [num_pages, page_size, 512], got "
+            f"{compressed_kv_cache.ndim}D"
+        )
+    if compressed_kv_cache.shape[0] <= 0 or compressed_kv_cache.shape[1] <= 0:
+        raise ValueError(
+            "compressed_kv_cache num_pages and page_size must be positive, got "
+            f"{compressed_kv_cache.shape[0]} and {compressed_kv_cache.shape[1]}"
+        )
     for cache, name in (
         (window_kv_cache, "window_kv_cache"),
         (compressed_kv_cache, "compressed_kv_cache"),
     ):
-        if cache.ndim != 3:
-            raise ValueError(f"{name} must be 3D, got {cache.ndim}D")
-        if cache.shape[0] <= 0 or cache.shape[1] <= 0:
-            raise ValueError(
-                f"{name} num_pages and page_size must be positive, got "
-                f"{cache.shape[0]} and {cache.shape[1]}"
-            )
         if cache.shape[-1] != _HCA_HEAD_DIM:
             raise ValueError(f"{name} head dim must be 512, got {cache.shape[-1]}")
         if cache.dtype != query.dtype:
@@ -487,17 +487,16 @@ def cute_dsl_hca_decode(
         if cache.data_ptr() % 16 != 0:
             raise ValueError(f"{name} must be 16-byte aligned")
 
-    page_size_window = window_kv_cache.shape[1]
     page_size_compressed = compressed_kv_cache.shape[1]
     table_rows = batch_size * q_len if is_causal else batch_size
-    if window_block_tables.ndim != 2:
-        raise ValueError("window_block_tables must be 2D")
+    if window_indices.ndim != 2:
+        raise ValueError("window_indices must be 2D")
     if compressed_block_tables.ndim != 2:
         raise ValueError("compressed_block_tables must be 2D")
     _check_tensor(
-        window_block_tables,
-        name="window_block_tables",
-        shape=(table_rows, window_block_tables.shape[1]),
+        window_indices,
+        name="window_indices",
+        shape=(table_rows, _HCA_WINDOW_CAPACITY),
         dtype=torch.int32,
         device=query.device,
     )
@@ -508,11 +507,6 @@ def cute_dsl_hca_decode(
         dtype=torch.int32,
         device=query.device,
     )
-    if window_block_tables.shape[1] * page_size_window < _HCA_WINDOW_CAPACITY:
-        raise ValueError(
-            "window_block_tables must cover all 128 window slots; got capacity "
-            f"{window_block_tables.shape[1] * page_size_window}"
-        )
     if compressed_block_tables.shape[1] == 0:
         raise ValueError("compressed_block_tables must contain at least one page")
 
@@ -538,7 +532,7 @@ def cute_dsl_hca_decode(
     _validate_hca_values(
         window_kv_cache=window_kv_cache,
         compressed_kv_cache=compressed_kv_cache,
-        window_block_tables=window_block_tables,
+        window_indices=window_indices,
         compressed_block_tables=compressed_block_tables,
         hca_seq_lens=hca_seq_lens,
         sparse_topk_lens=sparse_topk_lens,
@@ -575,7 +569,6 @@ def cute_dsl_hca_decode(
         max_hca_len,
         split_kv,
         page_size_compressed,
-        page_size_window,
         is_persistent,
     )
     if workspace_buffer.numel() < workspace_size:
@@ -629,7 +622,6 @@ def cute_dsl_hca_decode(
     with torch.cuda.device(query.device):
         compiled_kernel = _compile_hca_kernel(
             page_size_compressed,
-            page_size_window,
             q_len,
             is_causal,
             is_persistent,
@@ -640,7 +632,7 @@ def cute_dsl_hca_decode(
             query,
             window_kv_cache,
             compressed_kv_cache,
-            window_block_tables,
+            window_indices,
             compressed_block_tables,
             out,
             lse,
