@@ -300,6 +300,7 @@ def test_w4a16_direct_micro_shape_guard_rejects_cached_wide_shape(monkeypatch):
     ) = moe_dispatch._w4a16_workspace_geometry(
         routed_rows=routed_rows,
         route_num_experts=32,
+        num_topk=8,
         k=4096,
         n=4096,
         is_gated=True,
