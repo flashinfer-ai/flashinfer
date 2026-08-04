@@ -1444,7 +1444,15 @@ def test_msa_proxy_score_paged_fp8():
     k8_pg = k_pg.to(torch.float8_e4m3fn).contiguous()
     for sq, qdt in ((1, torch.bfloat16), (4, torch.bfloat16), (4, torch.float16)):
         cu_qd = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=dev)
-        qd = torch.randn(B * sq, Hq, 128, dtype=qdt, device=dev) / 3
+        # e4m3-representable q, as deployment provides (M3 quantizes q
+        # upstream): the fp8 key-major schedule groups products into mma
+        # instructions differently from the bf16 path, and exactness under
+        # regrouping needs every dot term exact in f32.
+        qd = (
+            (torch.randn(B * sq, Hq, 128, device=dev) / 3)
+            .to(torch.float8_e4m3fn)
+            .to(qdt)
+        )
         out8 = msa_proxy_score(qd, k8, cu_qd, cu_k, causal=True)
         out_deq8 = msa_proxy_score(qd, k8.to(qdt), cu_qd, cu_k, causal=True)
         pg8 = msa_proxy_score(

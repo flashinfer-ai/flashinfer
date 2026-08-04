@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -462,9 +463,10 @@ def msa_proxy_score(
         p = 1
         while p < max_seqlen_q:
             p *= 2
-        if (
-            group_size * p <= 32
-            and batch_size * num_kv_heads * 4 <= get_device_sm_count(dev)
+        if group_size * p <= 32 and (
+            batch_size * num_kv_heads * 4 <= get_device_sm_count(dev)
+            # Diagnostic override to measure key-major on large grids.
+            or os.environ.get("FLASHINFER_MSA_FORCE_KEYMAJOR") == "1"
         ):
             use_keymajor = True
             pack_q_len = p
