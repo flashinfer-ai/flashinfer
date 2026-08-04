@@ -61,7 +61,7 @@ import torch
 
 try:
     import flashinfer
-    from flashinfer.cute_dsl.top_k.config import GvrTopKLBConfig
+    from flashinfer.top_k.kernels.config import GvrTopKLBConfig
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
     from flashinfer.utils import get_compute_capability
 
@@ -185,7 +185,7 @@ def _make_varlen_inputs(seq_len_list, N, dtype, seed):
 
 def _radix_ctas(N, dtype, batch_size):
     """ctas_per_group the radix (CuTe DSL) backend will use for this shape."""
-    from flashinfer.topk_varlen import _radix_get_chunk_config
+    from flashinfer.top_k.topk_varlen import _radix_get_chunk_config
     from flashinfer.utils import get_device_sm_count, get_shared_bytes_per_block_optin
 
     device = torch.device("cuda")
@@ -736,7 +736,7 @@ def test_auto_gvr_knobs_256bit_alignment_gate():
     only guarantees 16B. The gate keeps a 256-bit kernel from being selected for a
     16B-but-not-32B-aligned N (which would fault). No GPU needed beyond dtype size.
     """
-    from flashinfer.topk_varlen import _n_is_256bit_aligned
+    from flashinfer.top_k.topk_varlen import _n_is_256bit_aligned
 
     # bf16 itemsize 2 -> 256-bit needs N % 16 == 0.
     assert _n_is_256bit_aligned(torch.bfloat16, 4096)
@@ -780,7 +780,7 @@ def test_lb_256bit_misaligned_no_crash():
 def test_auto_gvr_knobs_shape_aware():
     """auto() picks a shape-appropriate config: large-N fp32 small-batch -> 1024
     threads + 256-bit + low min_blocks (vs the frozen 512/mb3 old default)."""
-    from flashinfer.topk_varlen import _auto_gvr_knobs
+    from flashinfer.top_k.topk_varlen import _auto_gvr_knobs
 
     logits = torch.randn(8, 131072, dtype=torch.float32, device="cuda")
     num_threads, knobs = _auto_gvr_knobs(logits, is_lb=False)
@@ -1199,7 +1199,7 @@ def test_backend_heuristic_priority():
     Hardware-independent: exercises the heuristic directly so a regression in
     the backend ordering (e.g. from a future rename) is caught even off-GPU.
     """
-    from flashinfer.topk_varlen import _top_k_varlen_heuristic
+    from flashinfer.top_k.topk_varlen import _top_k_varlen_heuristic
 
     # The heuristic only uses suitable_backends; pass None for the tensor/scalar
     # args required by the full signature (needed so skip_check=True works).
@@ -1411,7 +1411,7 @@ def test_cuda_graph_radix_cutlass(next_n):
 
 def test_lb_max_batch_size_boundaries():
     """_lb_max_batch_size rounds up to the next power-of-2 cap in [64, 1024]."""
-    from flashinfer.topk_varlen import _lb_max_batch_size
+    from flashinfer.top_k.topk_varlen import _lb_max_batch_size
 
     assert _lb_max_batch_size(1) == 64
     assert _lb_max_batch_size(64) == 64

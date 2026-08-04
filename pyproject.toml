@@ -128,9 +128,9 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src",
-  "flashinfer/cute_dsl/top_k/gvr_topk_decode.py",
-  "flashinfer/cute_dsl/top_k/gvr_topk_decode_lb.py",
-  "flashinfer/cute_dsl/top_k/block_scan.py",
+  "flashinfer/top_k/kernels/gvr_topk_decode.py",
+  "flashinfer/top_k/kernels/gvr_topk_decode_lb.py",
+  "flashinfer/top_k/kernels/block_scan.py",
 ]
 force-exclude = true
 

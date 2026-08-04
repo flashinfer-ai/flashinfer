@@ -41,9 +41,9 @@ from typing import Literal, Optional, Tuple
 
 import torch
 
-from .api_logging import flashinfer_api
-from .trace.templates.topk import top_k_varlen_trace
-from .topk import get_topk_module
+from ..api_logging import flashinfer_api
+from ..trace.templates.topk import top_k_varlen_trace
+from ..topk import get_topk_module
 
 # Check for the Python CuTe DSL package without importing it (and without
 # importing cute_dsl/utils.py, which has top-level `import cutlass`).
@@ -53,7 +53,7 @@ _CUTE_DSL_AVAILABLE = (
     and importlib.util.find_spec("cutlass.cute") is not None
 )
 
-from .utils import (
+from ..utils import (
     _get_cache_buf,
     backend_requirement,
     get_device_sm_count,
@@ -175,15 +175,15 @@ def _top_k_varlen_heuristic(
 if _CUTE_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
-    from .cute_dsl.top_k.config import GvrTopKConfig, GvrTopKLBConfig
-    from .cute_dsl.utils import torch_to_cutlass_dtype
-    from .cute_dsl.top_k import (
+    from .kernels.config import GvrTopKConfig, GvrTopKLBConfig
+    from ..cute_dsl.utils import torch_to_cutlass_dtype
+    from .kernels import (
         GvrTopKKernel,
         GvrTopKLBKernel,
         GvrTopKLBPrepareKernel,
         SinglePassMultiCTARadixTopKKernel,
     )
-    from .cute_dsl.top_k.radix_topk import STATE_SIZE as _RADIX_STATE_SIZE
+    from .kernels.radix_topk import STATE_SIZE as _RADIX_STATE_SIZE
 
 
 @functools.cache
@@ -196,7 +196,7 @@ def _gvr_kernel_source_files() -> Tuple[str, ...]:
     # artifact. GvrTopKLBKernel/GvrTopKLBPrepareKernel live in
     # gvr_topk_decode_lb.py, which imports GvrTopKKernel from gvr_topk_decode.py;
     # both decode modules pull warp_scan/block_prefix_sum from block_scan.py.
-    from .cute_dsl.top_k import gvr_topk_decode, gvr_topk_decode_lb, block_scan
+    from .kernels import gvr_topk_decode, gvr_topk_decode_lb, block_scan
 
     return (
         __file__,
@@ -210,7 +210,7 @@ def _gvr_kernel_source_files() -> Tuple[str, ...]:
 def _radix_kernel_source_files() -> Tuple[str, ...]:
     # radix_topk.py defines SinglePassMultiCTARadixTopKKernel and pulls
     # block_prefix_sum_kernel from block_scan.py; both invalidate the cache.
-    from .cute_dsl.top_k import radix_topk, block_scan
+    from .kernels import radix_topk, block_scan
 
     return (__file__, radix_topk.__file__, block_scan.__file__)
 
@@ -223,7 +223,7 @@ def _compile_gvr_lb_prepare(num_threads: int, long_threshold: int, compress_rati
     # the grid is fixed (1,1,1). So seq_lens is compiled with a symbolic length and
     # one kernel serves every batch size. num_threads stays static (it sizes the
     # order_row buffer and the block-prefix-sum SMEM); counters is constant (2,).
-    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     prep = GvrTopKLBPrepareKernel(
         long_threshold=long_threshold,
@@ -297,7 +297,7 @@ def _compile_gvr_lb(
         enable_phase3_unroll=enable_phase3_unroll,
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
     )
-    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
@@ -395,7 +395,7 @@ def _compile_gvr(
         use_constant_hint=False,
         seqlen_sorted=True,
     )
-    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     sym_groups = cute.sym_int()  # request count (= num_rows // next_n)
     sym_n = cute.sym_int()  # per-row logits width
@@ -567,7 +567,7 @@ def _compile_radix(
     # num_rows (batch) and sym_groups are dynamic — one compiled kernel serves all
     # batch sizes at this (dtype, top_k, N, ctas_per_group, chunk_size) specialization.
     # compress_ratio is a const_expr in the kernel so it is a cache key here too.
-    from .jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     kernel = SinglePassMultiCTARadixTopKKernel(
         dtype=cute_dtype,
