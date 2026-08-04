@@ -386,14 +386,19 @@ struct SumNormalizePostprocess {
   }
 };
 
-/// ScaledSumNormalize: recovers un-biased sigmoid scores by subtracting per-expert bias from the
-/// selection scores (sigmoid + bias), then normalizes by sum and applies routeScale.
+/// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
+/// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
+/// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
+/// selected sigmoid(raw) from raw logits to avoid cancellation when a tiny
+/// sigmoid is rounded away by a large bias; block-per-token routing reads the
+/// same un-biased sigmoid from smemAux.
 /// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
-/// DeepSeek uses epsilon=0 (no guard); MiniMax2 uses epsilon=1e-20 to prevent division by zero.
+/// The DeepSeek and MiniMax2 runners use epsilon=1e-20 to prevent division by zero.
 struct ScaledSumNormalizePostprocess {
   /// Opts into the block-per-token kernel (provides applyWithAux below).
   static constexpr bool kSupportsBlockPerToken = true;
   static constexpr bool kSupportsLaneOwnedTopK = true;
+  static constexpr bool kNeedsRawScores = true;
 
   /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
   /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
@@ -403,32 +408,30 @@ struct ScaledSumNormalizePostprocess {
 
   template <typename OutputT>
   struct Params {
-    // Store as void const* to support any bias dtype (float, bfloat16, etc.) without conversion.
-    void const* ptrRoutingBias = nullptr;
-    batchedGemm::trtllm::gen::Dtype dtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
     float routeScale = 1.0f;
     float sumEpsilon = 0.0f;
 
     void set(routingCustom::Data const& data) {
-      ptrRoutingBias = data.mPtrRoutingBias;
-      dtypeBias = data.mDtypeBias;
       routeScale = data.mRouteScale;
       sumEpsilon = data.mSumEpsilon;
     }
   };
 
-  template <typename DataType, int K, typename ParamsT>
-  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& warp,
-                                               DataType (&warpTopKScore)[K],
-                                               int32_t const (&warpTopKExpertIdx)[K],
-                                               int32_t laneIdx, int32_t topK,
-                                               ParamsT const& params) {
-    // Recover sigmoid score: selection_score = sigmoid(raw) + bias, so sigmoid = score - bias
-    float biasVal = laneIdx < topK ? loadScalar(params.ptrRoutingBias, warpTopKExpertIdx[laneIdx],
-                                                params.dtypeBias)
-                                   : 0.f;
-    float sigmoidScore =
-        laneIdx < topK ? (static_cast<float>(warpTopKScore[laneIdx]) - biasVal) : 0.f;
+  /// Warp-per-token variant with access to the original raw scores. SigmoidBias
+  /// selection uses sigmoid(raw) + bias as the topK key, but final weights must
+  /// be normalized from the un-biased sigmoid(raw). Recomputing sigmoid(raw)
+  /// avoids lossy recovery when a tiny sigmoid is rounded away by a large bias.
+  template <typename DataType, typename InputType, int K, typename ParamsT>
+  __forceinline__ __device__ static void applyWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
+      int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
+      InputType const* ptrScores, ParamsT const& params) {
+    float sigmoidScore = 0.f;
+    if (laneIdx < topK) {
+      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
+      sigmoidScore = sigmoid_accurate(static_cast<float>(ptrScores[expertIdx]));
+    }
+
     float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       warpTopKScore[laneIdx] =
@@ -436,18 +439,15 @@ struct ScaledSumNormalizePostprocess {
     }
   }
 
-  /// Lane-owned TopK postprocess for warp-per-token kernels. The selected
-  /// score/expert are scalar values owned by laneIdx, so no K-element output
-  /// arrays need to be materialized in local memory.
-  template <typename DataType, typename ParamsT>
-  __forceinline__ __device__ static void applyForLane(cg::thread_block_tile<WarpSize> const& warp,
-                                                      DataType& laneTopKScore,
-                                                      int32_t laneTopKExpertIdx, int32_t laneIdx,
-                                                      int32_t topK, ParamsT const& params) {
-    float const biasVal =
-        laneIdx < topK ? loadScalar(params.ptrRoutingBias, laneTopKExpertIdx, params.dtypeBias)
-                       : 0.f;
-    float const sigmoidScore = laneIdx < topK ? static_cast<float>(laneTopKScore) - biasVal : 0.f;
+  /// Lane-owned warp-per-token variant with access to the original raw scores.
+  /// This is the scalar counterpart to applyWithScores.
+  template <typename DataType, typename InputType, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, InputType const* ptrScores,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? sigmoid_accurate(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
     float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       laneTopKScore =
@@ -515,8 +515,8 @@ struct ScaledSumNormalizePostprocess {
 /// differs from the topK selection key (via its `kNeedsAux` member).  Today
 /// only `ScaledSumNormalize` sets `kNeedsAux = true`.  For every other
 /// postprocess, `smemAux` aliases `smemBiased` and no extra smem is
-/// allocated.  Postprocess policies that don't declare `kNeedsAux` are
-/// treated as not needing it (safe default).
+/// allocated. Postprocess policies that don't declare `kNeedsAux` are treated
+/// as not needing it (safe default).
 template <typename PostprocessPolicy_, typename = void>
 struct PostprocessNeedsAux : std::false_type {};
 
@@ -526,6 +526,17 @@ struct PostprocessNeedsAux<PostprocessPolicy_, std::void_t<decltype(PostprocessP
 
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct PolicyPairNeedsAux : PostprocessNeedsAux<PostprocessPolicy_> {};
+
+/// Does a postprocess policy need the original raw scores after TopK?
+/// This is intentionally opt-in so generic routing policies do not acquire a
+/// raw-score dependency unless they implement the corresponding overloads.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessNeedsRawScores : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessNeedsRawScores<PostprocessPolicy_,
+                                 std::void_t<decltype(PostprocessPolicy_::kNeedsRawScores)>>
+    : std::bool_constant<PostprocessPolicy_::kNeedsRawScores> {};
 
 /// Does a postprocess policy implement the scalar lane-owned TopK interface?
 /// This is intentionally opt-in: adding a new policy cannot silently select a
@@ -613,8 +624,14 @@ struct TopKExpertSelect {
     topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore, topK);
 
     // Apply postprocess (e.g. renormalize, softmax over top-K, scaled renormalize, ...)
-    PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
-                              params.mExpertSelectParams.mPostprocessParams);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyWithScores<DataType, InputType, K>(
+          warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
+                                params.mExpertSelectParams.mPostprocessParams);
+    }
   }
 
   /// Lane-owned TopK variant. It shares the generic preprocess and exact
@@ -642,8 +659,14 @@ struct TopKExpertSelect {
                              params.mExpertSelectParams.mPreprocessParams);
     topk::reduceTopKForLane<K>(warp, laneTopKScore, laneTopKExpertIdx, score, idx, minScore,
                                laneIdx);
-    PostprocessPolicy_::applyForLane(warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK,
-                                     params.mExpertSelectParams.mPostprocessParams);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyForLaneWithScores<DataType, InputType>(
+          warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::applyForLane(warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK,
+                                       params.mExpertSelectParams.mPostprocessParams);
+    }
   }
 };
 

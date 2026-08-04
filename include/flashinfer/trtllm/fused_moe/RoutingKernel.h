@@ -344,7 +344,7 @@ struct Data : public DataBase {
   // Optional: scaling factor applied to final scores (used by ScaledSumNormalize postprocess).
   float mRouteScale{1.0f};
   // Optional: epsilon added to the sum before division to prevent division by zero.
-  // MiniMax2 uses 1e-20f; DeepSeek uses 0.0f (no epsilon).
+  // DeepSeek and MiniMax2 runners use 1e-20f.
   float mSumEpsilon{0.0f};
 };
 

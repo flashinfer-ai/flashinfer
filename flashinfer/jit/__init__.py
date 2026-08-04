@@ -101,6 +101,21 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .flash_kda import (
+    gen_flash_kda_m64_module as gen_flash_kda_m64_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_module as gen_flash_kda_m128_module,
+)
+from .flash_kda import (
+    get_flash_kda_prefill_module as get_flash_kda_prefill_module,
+)
+from .flash_kda import (
+    load_flash_kda_m64_module as load_flash_kda_m64_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_module as load_flash_kda_m128_module,
+)
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )

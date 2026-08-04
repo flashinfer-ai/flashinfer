@@ -1711,16 +1711,21 @@ def testB12xFusedMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
-    # b12x supports SwiGLU (gated) and ReLU2 (non-gated)
+    # b12x supports SwiGLU / GeGLU (gated) and ReLU2 (non-gated)
     activation_type = args.activation_type
-    _ACT_STR = {ActivationType.Swiglu: "silu", ActivationType.Relu2: "relu2"}
+    _ACT_STR = {
+        ActivationType.Swiglu: "silu",
+        ActivationType.Geglu: "gelu_tanh",
+        ActivationType.GegluTanh: "gelu_tanh",
+        ActivationType.Relu2: "relu2",
+    }
     if activation_type not in _ACT_STR:
         raise ValueError(
-            f"b12x_fused_moe only supports Swiglu and Relu2 activations, "
-            f"got {activation_type.name}"
+            f"b12x_fused_moe only supports Swiglu, Geglu, GegluTanh, and Relu2 "
+            f"activations, got {activation_type.name}"
         )
     activation_str = _ACT_STR[activation_type]
-    is_gated = activation_type == ActivationType.Swiglu
+    is_gated = activation_type.is_gated
 
     # Create b12x-specific NVFP4 test data (weights quantized, input stays bf16)
     tensors = _create_nvfp4_moe_test_data(
