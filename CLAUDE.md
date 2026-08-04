@@ -212,8 +212,8 @@ index to maintain here; discovery is local, two ways:
 1. **The file tells you.** Files covered by a design doc cite it near the top —
    `// Design doc: docs/design_docs/<name>.md §N`, as `csrc/fused_moe/monomoe/` does throughout.
    If the file you are about to edit carries such a pointer, read the doc first.
-2. **The directory tells you.** Every doc opens with a `**Scope**:` line naming the paths it
-   governs, so one command answers "is what I'm touching covered?":
+2. **The directory tells you.** Every doc carries a `**Scope**:` line — immediately after its
+   title — naming the paths it governs, so one command answers "is what I'm touching covered?":
 
    ```bash
    grep -H '^\*\*Scope\*\*:' docs/design_docs/*.md
