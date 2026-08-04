@@ -480,11 +480,43 @@ class TrtllmMxInt4Config:
 
 @dataclass(frozen=True)
 class CutlassConfig:
-    """CUTLASS backend — broadest architecture support."""
+    """SM90 CUTLASS BF16 backend for the unified MoE API.
+
+    The legacy flat CUTLASS API supports additional architectures and
+    quantization modes.  Unified capability is intentionally narrower until
+    each combination has its own preparation and conformance coverage.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        return arch == 90
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``cutlass_bf16_sm90`` canonical BF16 weight view.
+
+        GEMM1 uses the public ``[up, gate]`` row convention.  Unlike TRTLLM's
+        BlockMajorK path, the SM90 CUTLASS BF16 kernel consumes these weights
+        directly and needs no physical reordering.
+        """
+        from .prepare import prepare_cutlass_bf16_weights
+
+        return prepare_cutlass_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
 
     def __repr__(self) -> str:
         return "CutlassConfig()"

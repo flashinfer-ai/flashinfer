@@ -260,8 +260,8 @@ class TestBackendOptions:
         opts = BackendOptions(
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
         )
-        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
-        valid = opts.valid_for(80)
+        # The first unified CUTLASS milestone is SM90 BF16 only.
+        valid = opts.valid_for(90)
         assert len(valid) == 1
         assert isinstance(valid[0], CutlassConfig)
 
@@ -270,7 +270,8 @@ class TestBackendOptions:
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
         )
         valid = opts.valid_for(100)
-        assert len(valid) == 3
+        assert len(valid) == 2
+        assert not CutlassConfig.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)

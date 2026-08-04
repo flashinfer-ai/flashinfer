@@ -1197,6 +1197,43 @@ def prepare_trtllm_bf16_weights(
     }
 
 
+def prepare_cutlass_bf16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the canonical BF16 view consumed by ``CutlassBf16Runner``.
+
+    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order and
+    ``w2_bf16`` is ``[E, H, I]``.  The pure-BF16 SM90 CUTLASS path consumes
+    these dense tensors directly; preparation validates the source contract
+    and materializes contiguous tensors on the requested device.
+    """
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            "prepare_cutlass_bf16_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+    return {
+        "fc1_expert_weights": w1_bf16.to(device).contiguous(),
+        "fc2_expert_weights": w2_bf16.to(device).contiguous(),
+    }
+
+
 def _interleave_linear_and_gate(
     x: torch.Tensor, group_size: int = 64, dim: int = -1
 ) -> torch.Tensor:

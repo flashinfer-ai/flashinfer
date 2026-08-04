@@ -40,6 +40,7 @@ from .layer import MoELayer  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CutlassBf16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -129,6 +130,7 @@ __all__ = [
     "ActivationConfig",
     "B12xNvfp4Config",
     "B12xNvfp4Runner",
+    "CutlassBf16Runner",
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",

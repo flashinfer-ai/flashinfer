@@ -434,6 +434,32 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
+        def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+            # Stage profiling inputs contain only activation/weight tensors, so
+            # fixed launch configuration must distinguish persistent winners.
+            return (
+                self.x_dtype,
+                self.weight_dtype,
+                self.output_dtype,
+                self.top_k,
+                self.tp_size,
+                self.tp_rank,
+                self.ep_size,
+                self.ep_rank,
+                self.cluster_size,
+                self.cluster_rank,
+                self.enable_alltoall,
+                self.use_deepseek_fp8_block_scale,
+                self.use_w4_group_scaling,
+                self.use_mxfp8_act_scaling,
+                self.use_wfp4afp8_humming,
+                self.min_latency_mode,
+                self.enable_pdl,
+                int(self.activation_type),
+                self.use_packed_weights,
+                self.use_fused_finalize,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -878,6 +904,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     # Register the module
     return SimpleNamespace(
+        MoERunner=MoERunner,
         cutlass_fused_moe=cutlass_fused_moe,
         cutlass_fused_moe_workspace_size=_cutlass_fused_moe_workspace_size,
         interleave_moe_weights_for_sm90_mixed_gemm=(

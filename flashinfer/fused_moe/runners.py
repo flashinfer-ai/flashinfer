@@ -27,7 +27,7 @@ from typing import Any, ClassVar, List
 
 import torch
 
-from ..autotuner import TunableRunner, TuningConfig
+from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import (
     ActivationType,
     MoEActivationPack,
@@ -35,6 +35,10 @@ from .api import (
     MoEWeightPack,
     QuantVariant,
     RoutingInputMode,
+)
+from .utils import (
+    make_hybrid_bucket_mapper,
+    map_to_hybrid_bucket,
 )
 
 
@@ -188,6 +192,319 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
+
+
+# ---------------------------------------------------------------------------
+# SM90 CUTLASS BF16 runner — canonical dense weights, pre-routed execution
+# ---------------------------------------------------------------------------
+
+
+class CutlassBf16Runner(MoERunner):
+    """Unified adapter over the legacy SM90 CUTLASS fused-MoE launcher.
+
+    The CUTLASS launcher selects one tactic for each GEMM. This adapter tunes
+    those stages independently, combines the two winners into one compound
+    tactic, and owns a reusable workspace sized for the active token bucket.
+    """
+
+    backend_key = "cutlass_bf16_sm90"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.BF16,)
+    required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
+        if experts.local_expert_offset != 0 or (
+            local_num_experts != self.config.routing.num_experts
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not yet support expert parallelism."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..utils import device_support_pdl, get_compute_capability
+        from .core import get_cutlass_fused_moe_module
+
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"CutlassBf16Runner requires a CUDA device, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        if (major, minor) != (9, 0):
+            raise RuntimeError(
+                f"CutlassBf16Runner requires SM90, got SM{major}{minor}."
+            )
+
+        enable_pdl = config.execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(self.device)
+        self._enable_pdl = enable_pdl
+        self._use_fused_finalize = True
+
+        with torch.cuda.device(self.device):
+            module = get_cutlass_fused_moe_module("90")
+            self._inner = module.MoERunner(
+                x_dtype=torch.bfloat16,
+                weight_dtype=torch.bfloat16,
+                output_dtype=torch.bfloat16,
+                top_k=config.routing.top_k,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                cluster_size=1,
+                cluster_rank=0,
+                enable_alltoall=False,
+                use_deepseek_fp8_block_scale=False,
+                use_w4_group_scaling=False,
+                use_mxfp8_act_scaling=False,
+                min_latency_mode=False,
+                enable_pdl=self._enable_pdl,
+                activation_type=config.activation.type,
+                use_packed_weights=False,
+                use_fused_finalize=self._use_fused_finalize,
+                use_wfp4afp8_humming=False,
+            )
+
+        # pack_inputs replaces this with the current MoELayer token bucket.
+        self.tuning_config = TuningConfig()
+        self._workspace: torch.Tensor | None = None
+        self._workspace_num_tokens = 0
+        self._workspace_hidden_size: int | None = None
+
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Populate synthesized routing inputs with a valid balanced pattern."""
+        num_tokens = inputs[1].shape[0]
+        top_k = self.config.routing.top_k
+        num_experts = self.config.routing.num_experts
+        token_offsets = torch.arange(
+            num_tokens, dtype=torch.int32, device=inputs[2].device
+        ).unsqueeze(1)
+        slots = torch.arange(
+            top_k, dtype=torch.int32, device=inputs[2].device
+        ).unsqueeze(0)
+        inputs[2].copy_((token_offsets * top_k + slots) % num_experts)
+        inputs[3].fill_(1.0 / top_k)
+        return inputs
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        if len(inputs) != 6:
+            raise ValueError(
+                "CutlassBf16Runner expects [output, hidden, ids, scales, w1, w2]."
+            )
+        # The two GEMMs have independent tactic spaces. Preserve the legacy
+        # O(n1+n2) tuning flow, then let the outer unified tuner profile only
+        # the selected pair as one full-MoE candidate.
+        tuner = AutoTuner.get()
+        profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
+        stage_tuning_config = TuningConfig()
+        try:
+            self._inner.gemm_idx_for_tuning = 1
+            _, gemm1 = tuner.choose_one(
+                "moe_cutlass_bf16_sm90_gemm1",
+                [self._inner],
+                stage_tuning_config,
+                profile_inputs,
+                gemm_idx=1,
+            )
+            self._inner.gemm_idx_for_tuning = 2
+            _, gemm2 = tuner.choose_one(
+                "moe_cutlass_bf16_sm90_gemm2",
+                [self._inner],
+                stage_tuning_config,
+                profile_inputs,
+                gemm_idx=2,
+            )
+        finally:
+            self._inner.gemm_idx_for_tuning = None
+        if gemm1 is None or gemm2 is None:
+            return [-1]
+        return [(int(gemm1), int(gemm2))]
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        if (
+            self._workspace is not None
+            and hidden_size == self._workspace_hidden_size
+            and num_tokens <= self._workspace_num_tokens
+        ):
+            return
+        from .core import cutlass_fused_moe_workspace_size
+
+        size = cutlass_fused_moe_workspace_size(
+            num_tokens,
+            hidden_size,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            x_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            activation_type=self.config.activation.type,
+            use_fused_finalize=self._use_fused_finalize,
+            device=self.device,
+        )
+        self._workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._workspace_num_tokens = num_tokens
+        self._workspace_hidden_size = hidden_size
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                "CutlassBf16Runner supports only PackedPrecomputed routing."
+            )
+        hidden_states = act.hidden_states_q
+        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                "CutlassBf16Runner requires 2D BF16 hidden_states_q, got "
+                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device:
+            raise ValueError(
+                f"hidden_states_q is on {hidden_states.device}, expected {self.device}."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError("Cutlass BF16 activations do not use hidden_states_scale.")
+
+        num_tokens, hidden_size = hidden_states.shape
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}. "
+                "Reconstruct the runner with a larger ceiling."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, w2 = (view[key] for key in self.required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
+            raise TypeError("Cutlass BF16 prepared weights must use torch.bfloat16.")
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"Cutlass BF16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if w1.device != self.device or w2.device != self.device:
+            raise ValueError(
+                "Cutlass BF16 prepared weights must match the runner device."
+            )
+        if not w1.is_contiguous() or not w2.is_contiguous():
+            raise ValueError("Cutlass BF16 prepared weights must be contiguous.")
+
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=(bucket,),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
+                        self.config.execution.tune_max_num_tokens
+                    ),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        self._ensure_workspace(bucket, hidden_size)
+        output = hidden_states.new_empty((num_tokens, hidden_size))
+        return [output, hidden_states, act.topk_ids, act.topk_weights, w1, w2]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if len(inputs) != 6:
+            raise ValueError(
+                "CutlassBf16Runner expects [output, hidden, ids, scales, w1, w2]."
+            )
+        if self._workspace is None:
+            raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
+        if tactic == -1:
+            profile_ids = [-1, -1]
+        elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
+            profile_ids = [int(tactic[0]), int(tactic[1])]
+        else:
+            raise ValueError(
+                "CutlassBf16Runner tactic must be -1 or a (gemm1, gemm2) pair."
+            )
+
+        # CUTLASS tactics require a stage-specific preparation launch before
+        # they can be selected by run_moe.  The legacy flat API gets this from
+        # its two internal autotuner passes; the unified compound tactic must
+        # preserve the same contract when the outer autotuner requests setup.
+        if do_preparation:
+            profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
+            self._inner.forward(
+                profile_inputs,
+                tactic=profile_ids[0],
+                do_preparation=True,
+                gemm_idx=1,
+            )
+            self._inner.forward(
+                profile_inputs,
+                tactic=profile_ids[1],
+                do_preparation=True,
+                gemm_idx=2,
+            )
+            return inputs[0]
+
+        from .core import cutlass_fused_moe
+
+        cutlass_fused_moe(
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            output_dtype=torch.bfloat16,
+            quant_scales=[],
+            output=inputs[0],
+            tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
+            enable_pdl=self._enable_pdl,
+            activation_type=self.config.activation.type,
+            use_fused_finalize=self._use_fused_finalize,
+            profile_ids=profile_ids,
+            workspace_buffer=self._workspace,
+        )
+        return inputs[0]
+
+    def __hash__(self):
+        return hash((self.backend_key, self.config))
 
 
 # ---------------------------------------------------------------------------

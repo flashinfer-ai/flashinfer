@@ -121,7 +121,7 @@ backends = [TrtllmFp4Config()]
 # Multiple candidates — autotuner or heuristic picks best
 backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
 # | is associative, returns BackendOptions
-# CutlassConfig is always the universal fallback
+# CutlassConfig currently selects the unified SM90 BF16 runner only
 ```
 
 Each backend config declares its own preconditions:
@@ -134,8 +134,12 @@ class TrtllmFp4Config:
 class CutlassConfig:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        return arch == 90
 ```
+
+The legacy flat CUTLASS MoE API supports a broader architecture and dtype
+matrix. Unified `CutlassConfig` advertises only combinations with a registered
+runner, explicit preparation contract, and unified conformance coverage.
 
 ### 3.3 MoEConfig — \*\*unpack protocol
 
