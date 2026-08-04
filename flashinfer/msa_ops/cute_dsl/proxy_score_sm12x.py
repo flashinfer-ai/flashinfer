@@ -1068,50 +1068,58 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
         # a CTA of occupancy).
         self.cta_sync_barrier.arrive_and_wait()
 
+        # Buffer selection is a pointer pick, not an if/else over cloned fill
+        # and consume bodies: the small-batch grids run one CTA per SM with a
+        # cold instruction cache, where duplicated code costs more than the
+        # pipeline saves.
+        base0 = sK0.iterator.toint()
+        buf_step = sK1.iterator.toint() - base0
+
         n_iter = cute.ceil_div(max_k_tiles, num_splits)
         for it in cutlass.range(n_iter):
             kv_block = split_idx + it * num_splits
             if kv_block < num_kv_blocks:
+                par = it % 2
+                sK_cur = cute.make_tensor(
+                    cute.make_ptr(
+                        self._dtype,
+                        base0 + par * buf_step,
+                        cute.AddressSpace.smem,
+                        assumed_align=1024,
+                    ),
+                    sK_layout,
+                )
+                sK_nxt = cute.make_tensor(
+                    cute.make_ptr(
+                        self._dtype,
+                        base0 + (1 - par) * buf_step,
+                        cute.AddressSpace.smem,
+                        assumed_align=1024,
+                    ),
+                    sK_layout,
+                )
                 # Prefetch the next block into the idle buffer; its loads fly
                 # under this block's mma and epilogue. Exactly two commit
                 # groups go out either way (empty ones at the tail), so the
                 # current block's halves are always the 4th- and 3rd-newest
                 # groups and the wait_group counts below stay static.
                 nxt_block = kv_block + num_splits
-                if (it % 2) == 0:
-                    if nxt_block < num_kv_blocks:
-                        self._fill_k8_tile(
-                            gmem_tiled_copy,
-                            gmem_thr_copy,
-                            mK,
-                            mPageTable,
-                            batch_idx,
-                            kv_head,
-                            k_start,
-                            nxt_block,
-                            seqlen_k,
-                            sK1,
-                        )
-                    else:
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_commit_group()
+                if nxt_block < num_kv_blocks:
+                    self._fill_k8_tile(
+                        gmem_tiled_copy,
+                        gmem_thr_copy,
+                        mK,
+                        mPageTable,
+                        batch_idx,
+                        kv_head,
+                        k_start,
+                        nxt_block,
+                        seqlen_k,
+                        sK_nxt,
+                    )
                 else:
-                    if nxt_block < num_kv_blocks:
-                        self._fill_k8_tile(
-                            gmem_tiled_copy,
-                            gmem_thr_copy,
-                            mK,
-                            mPageTable,
-                            batch_idx,
-                            kv_head,
-                            k_start,
-                            nxt_block,
-                            seqlen_k,
-                            sK0,
-                        )
-                    else:
-                        cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_commit_group()
 
                 # S = Q K^T (unscaled), consumed one 64-key half behind each
                 # fill group so the mma starts before the tile finishes
@@ -1121,36 +1129,20 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                 for h in cutlass.range_constexpr(2):
                     cute.arch.cp_async_wait_group(3 - h)
                     self.cta_sync_barrier.arrive_and_wait()
-                    if (it % 2) == 0:
-                        self._consume_k8_half(
-                            h,
-                            sK0,
-                            smem_tiled_copy_Q,
-                            tSsQ,
-                            tSrQ,
-                            tSrQ_copy_view,
-                            tiled_mma,
-                            tSrK,
-                            tSrK_u32,
-                            kpair,
-                            kpair_u32,
-                            acc_S,
-                        )
-                    else:
-                        self._consume_k8_half(
-                            h,
-                            sK1,
-                            smem_tiled_copy_Q,
-                            tSsQ,
-                            tSrQ,
-                            tSrQ_copy_view,
-                            tiled_mma,
-                            tSrK,
-                            tSrK_u32,
-                            kpair,
-                            kpair_u32,
-                            acc_S,
-                        )
+                    self._consume_k8_half(
+                        h,
+                        sK_cur,
+                        smem_tiled_copy_Q,
+                        tSsQ,
+                        tSrQ,
+                        tSrQ_copy_view,
+                        tiled_mma,
+                        tSrK,
+                        tSrK_u32,
+                        kpair,
+                        kpair_u32,
+                        acc_S,
+                    )
 
                 # Every warp's K fragment loads must land before the next
                 # iteration's prefetch overwrites this buffer.
