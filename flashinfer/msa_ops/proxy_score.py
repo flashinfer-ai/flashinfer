@@ -430,15 +430,7 @@ def msa_proxy_score(
     # MsaProxyScoreDecodeStreamSm12x). total_q == batch_size guarantees exactly
     # one q token per request, which its token == batch indexing relies on.
     use_stream = max_seqlen_q == 1 and total_q == batch_size and group_size <= 8
-    # Right-aligned decode on the stream path computes the causal limit
-    # in-kernel, so no offset tensor (and its build kernels) is needed.
     qoff_default = q_offset is None
-    if use_stream and qoff_default:
-        qoff_dev = _proxy_dummies(dev.index)[1]
-    else:
-        qoff_dev = _q_offset_tensor(
-            q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
-        )
 
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
@@ -477,6 +469,16 @@ def msa_proxy_score(
             use_keymajor = True
             pack_q_len = p
 
+    # Right-aligned decode on the stream and key-major paths computes the
+    # causal limit in-kernel, so no offset tensor (and its build kernels,
+    # which dominate at batch 1) is needed.
+    if (use_stream or use_keymajor) and qoff_default:
+        qoff_dev = _proxy_dummies(dev.index)[1]
+    else:
+        qoff_dev = _q_offset_tensor(
+            q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
+        )
+
     # group_size keys the packed/stream schedules: it is constexpr-baked into
     # the gather/epilogue, so each factorization is its own kernel.
     key = (
@@ -489,7 +491,7 @@ def msa_proxy_score(
         use_packed,
         use_keymajor,
         group_size if use_stream else pack_q_len,
-        qoff_default if use_stream else None,
+        qoff_default if (use_stream or use_keymajor) else None,
     )
     # The packed fp8 schedule takes K as a 16-bit torch view of the e4m3
     # bytes (half the last dim): the kernel moves raw bytes and upconverts in
@@ -530,6 +532,7 @@ def msa_proxy_score(
                 is_causal=causal,
                 paged=paged,
                 kv_fp8=kv_fp8,
+                qoff_default=qoff_default,
             )
         elif use_packed:
             # fp8 K gets the key-split warp layout so the e4m3 upconvert

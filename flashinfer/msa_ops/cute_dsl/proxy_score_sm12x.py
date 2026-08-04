@@ -1441,6 +1441,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         is_causal: bool = True,
         paged: bool = False,
         kv_fp8: bool = False,
+        qoff_default: bool = True,
     ):
         if head_dim != 128:
             raise ValueError("only head_dim == 128 is supported")
@@ -1454,6 +1455,10 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         self._is_causal = is_causal
         self._paged = paged
         self._kv_fp8 = kv_fp8
+        # Right-aligned decode (q_offset=None) computes the causal offset
+        # in-kernel from the seqlens, skipping the host-side offset-tensor
+        # build (two extra kernel launches that dominate at batch 1).
+        self._qoff_default = qoff_default
         self._block_q = group_size * pack_q_len
         self._q_tiles = (self._block_q + 7) // 8
         self._num_threads = 32 * 5
@@ -1747,7 +1752,10 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                     tma_parity ^= 1
 
                 if cutlass.const_expr(self._is_causal):
-                    q_off = mQOffset[batch_idx]
+                    if cutlass.const_expr(self._qoff_default):
+                        q_off = seqlen_k - seqlen_q
+                    else:
+                        q_off = mQOffset[batch_idx]
                 else:
                     q_off = cutlass.Int32(0)
 
