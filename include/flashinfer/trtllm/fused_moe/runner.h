@@ -168,7 +168,8 @@ enum class ActivationType : int64_t {
   SwigluStep = 7,
   GegluTanh = 8,
   Identity = 9,
-  InvalidType = 10,  // Must be last
+  Situ = 10,
+  InvalidType = 11,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -193,6 +194,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "SwigluStep";
     case ActivationType::GegluTanh:
       return "GegluTanh";
+    case ActivationType::Situ:
+      return "Situ";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -202,7 +205,7 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
 }
 
 }  // namespace MoE
@@ -442,6 +445,10 @@ class Runner {
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
                                                            int32_t numTokens) const;
+
+  [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
+                                        int32_t intermediateSize, int32_t numLocalExperts,
+                                        int32_t numTokens) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,

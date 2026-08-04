@@ -204,5 +204,5 @@ docs/sg_execution_times.rst
 
 # moe_ep build artifacts (default in-tree build of NIXL-EP)
 build_nvep/
-flashinfer/moe_ep/*/_libs/
-flashinfer/moe_ep/*/_vendored/
+flashinfer/moe_ep/backends/split/comm/*/_libs/
+flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/

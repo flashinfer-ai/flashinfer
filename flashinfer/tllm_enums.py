@@ -36,6 +36,32 @@ class RoutingMethodType(IntEnum):
         return f"{type(self).__name__}.{self.name}"
 
 
+# Routing input modes for FusedMoE launcher
+# Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
+class RoutingInputMode(IntEnum):
+    # Mode 1: Compute routing from logits
+    # - Input: routing_logits tensor provided
+    # - topk_ids: OUTPUT buffer for computed expert indices
+    # - topk_weights: OUTPUT buffer for computed weights
+    FromLogits = 0
+    # Mode 2: Pre-computed routing with packed format
+    # - Input: topk_ids contains packed ``(expert_id << 16) | weight`` (high
+    #   16 bits = int16 expert id, low 16 bits = float16/bfloat16 weight, see
+    #   PackedScoreIdx in include/flashinfer/trtllm/fused_moe/RoutingKernel.h)
+    # - topk_ids: INPUT with packed values
+    # - topk_weights: OUTPUT buffer for extracted weights
+    PackedPrecomputed = 1
+    # Mode 3: Pre-computed routing with separate tensors
+    # - Input: separate topk_ids (expert indices) and topk_weights (routing weights)
+    # - topk_ids: INPUT - pre-computed expert indices
+    # - topk_weights: INPUT - pre-computed routing weights
+    UnpackedPrecomputed = 2
+
+    # Eval-safe repr — see ``RoutingMethodType.__repr__``.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
+
+
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):
     Gelu = 0
@@ -48,7 +74,8 @@ class ActivationType(IntEnum):
     SwigluStep = 7
     GegluTanh = 8
     Identity = 9
-    InvalidType = 10
+    Situ = 10
+    InvalidType = 11
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
@@ -66,6 +93,7 @@ _GATED_ACTIVATION_TYPES = (
     ActivationType.SwigluBias,
     ActivationType.SwigluStep,
     ActivationType.GegluTanh,
+    ActivationType.Situ,
 )
 
 
@@ -102,7 +130,7 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     -------
     bool
         ``True`` if ``activation_type`` belongs to the gated activation family
-        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``);
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``);
         ``False`` otherwise.
 
     Examples

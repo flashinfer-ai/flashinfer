@@ -17,6 +17,7 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    "quack",
     "numpy",
     "einops",
     "mpi4py",

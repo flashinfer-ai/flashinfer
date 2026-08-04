@@ -24,7 +24,11 @@ except OSError as e:
 from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
-from flashinfer.utils import is_sm12x_supported
+from flashinfer.utils import (
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    is_sm12x_supported,
+)
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
@@ -201,6 +205,19 @@ def parse_attention_args(line, parser):
         help="Causal masking. Note: not padding masking. Only used for prefill tests.",
     )
     parser.add_argument(
+        "--spec_dec_mask",
+        type=str,
+        choices=["causal", "full"],
+        default="causal",
+        help=(
+            "Draft-block mask for speculative decode (--s_qo > 1) in decode tests. "
+            "'causal': draft token i attends to draft tokens j <= i (standard "
+            "speculative decoding, the default). 'full': every draft token attends "
+            "to all draft tokens (e.g. DFlash-style drafters). The KV prefix is "
+            "always fully visible."
+        ),
+    )
+    parser.add_argument(
         "--random_actual_seq_len",
         action="store_true",
         default=False,
@@ -280,21 +297,25 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
     return actual_seq_lens
 
 
-def generate_speculative_causal_mask(batch_size, q_seq_len, device):
-    """
-    Generate a packed causal mask for speculative decode chunks (q_len > 1).
+def generate_speculative_mask(batch_size, q_seq_len, device, mask_mode="causal"):
+    """Packed draft-block mask for speculative decode (q_len > 1).
 
-    Returned shape is [batch_size, q_seq_len, num_packed_masks_per_token * 2]
-    with dtype uint16, where num_packed_masks_per_token = ceil(q_seq_len / 32).
-    Each query row i encodes allowed attention to draft-token columns j <= i
-    (strictly lower-triangular with diagonal) and masks out j > i.
-    The innermost dimension stores packed bits (uint32 words reinterpreted as
-    uint16), matching the mask layout expected by decode APIs.
+    mask_mode "causal": draft token i attends to draft tokens j <= i;
+    "full": every draft token attends to all draft tokens. The KV prefix is
+    always fully visible. Returns [batch_size, q_seq_len,
+    ceil(q_seq_len / 32) * 2] uint16 (bit-packed, as decode APIs expect).
     """
     num_packed_masks_per_token = (q_seq_len + 31) // 32
     q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
     kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
-    causal_bool_mask = kv_indices <= q_indices
+    if mask_mode == "causal":
+        causal_bool_mask = kv_indices <= q_indices
+    elif mask_mode == "full":
+        causal_bool_mask = torch.ones(
+            q_seq_len, q_seq_len, device=device, dtype=torch.bool
+        )
+    else:
+        raise ValueError(f"Unsupported spec-decode mask mode: {mask_mode}")
 
     padded_seq_len = num_packed_masks_per_token * 32
     if padded_seq_len > q_seq_len:
@@ -376,6 +397,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     batch_size = args.batch_size
     s_qo = args.s_qo
     speculative_decode = s_qo > 1
+    spec_dec_mask_mode = args.spec_dec_mask
     s_kv = args.s_kv
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
@@ -433,6 +455,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     if "auto" in backends and speculative_decode:
         print("[INFO] auto backend is disabled for speculative decode. Skipping.")
         backends.remove("auto")
+
+    if speculative_decode and spec_dec_mask_mode == "full" and "trtllm-gen" in backends:
+        print(
+            "[WARNING] trtllm-gen wrapper backend applies implicit causal masking to "
+            "the draft block and ignores the non-causal (DFlash) mask; refcheck "
+            "against trtllm-native may mismatch."
+        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -564,13 +593,21 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         * (s_qo * num_qo_heads * head_dim_qk)
     ).long()  # For cuDNN
     speculative_mask = (
-        generate_speculative_causal_mask(batch_size, s_qo, device)
+        generate_speculative_mask(batch_size, s_qo, device, spec_dec_mask_mode)
         if speculative_decode
         else None
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    gqa_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        gqa_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -699,6 +736,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 mask=speculative_mask,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -839,7 +877,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["num_kv_heads"] = num_kv_heads
                 cur_res["head_dim_qk"] = head_dim_qk
                 cur_res["head_dim_vo"] = head_dim_vo
-                cur_res["causal"] = False
+                cur_res["causal"] = (
+                    spec_dec_mask_mode == "causal" if speculative_decode else False
+                )
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
@@ -2466,6 +2506,14 @@ def testBatchMLAPagedAttentionWrapper(args):
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    mla_multi_ctas_kv_counter_buffer = None
+    if "trtllm-native" in backends:
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, get_device_sm_count(device)
+        )
+        mla_multi_ctas_kv_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
@@ -2575,6 +2623,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm2_scale=1.0,
                 backend="trtllm-gen",
                 enable_pdl=args.enable_pdl,
+                multi_ctas_kv_counter_buffer=mla_multi_ctas_kv_counter_buffer,
                 **mla_api_extra_kwargs,
             ).squeeze(1)
         elif backend == "auto":

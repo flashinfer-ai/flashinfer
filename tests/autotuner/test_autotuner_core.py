@@ -1,9 +1,28 @@
 import random
+import tracemalloc
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
+from flashinfer.autotuner.initializers import autotuner_initializer_randn
+from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
+from flashinfer.fused_moe.utils import (
+    get_hybrid_num_tokens_buckets,
+    make_hybrid_bucket_mapper,
+)
+from flashinfer.mla._core import (
+    CuteDslMlaDecodeRunner,
+    _build_mla_decode_tuning_config,
+    _mla_decode_tuning_config,
+)
+from flashinfer.tllm_enums import (
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    RoutingInputMode,
+)
 from flashinfer.autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -231,9 +250,68 @@ def test_search_cache_hit_and_miss():
     assert miss == (False, 0, -1, None)
 
     key = AutoTuner._get_cache_key("dummy", runner, shapes, config)
-    tuner.profiling_cache[key] = (0, 1, None)
+    tuner.profiling_cache[key] = (1, None)
     hit = tuner.search_cache("dummy", [runner], shapes, config)
     assert hit == (True, 0, 1, None)
+
+
+def test_search_cache_hit_resolves_runner_id_against_current_list():
+    """A cache hit must dispatch to the runner matching its key, not to a
+    position recorded at tuning time (issue #3999 regression test)."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    winner = DummyRunner()
+    other = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+    tuple_tactic = (7, ((1, 2),))  # non-int tactic, like cuDNN engine/knobs
+
+    # Entry recorded when `winner` was tuned alone (position 0 at tuning time).
+    key = AutoTuner._get_cache_key("dummy", winner, shapes, config)
+    tuner.profiling_cache[key] = (tuple_tactic, None)
+
+    # A later call sees a longer runner list where `winner` sits at position 1.
+    hit = tuner.search_cache("dummy", [other, winner], shapes, config)
+    assert hit == (True, 1, tuple_tactic, None)
+
+    inputs = [torch.zeros(8, 16)]
+    chosen_runner, tactic = tuner.choose_one("dummy", [other, winner], config, inputs)
+    assert chosen_runner is winner
+    assert tactic == tuple_tactic
+
+
+def test_search_cache_in_memory_beats_file_config_across_runners():
+    """An in-memory tuning result must win over a file config that matches an
+    earlier-listed runner: sources are searched in priority order across all
+    runners, not per-runner."""
+
+    class OtherDummyRunner(DummyRunner):
+        pass
+
+    tuner = reset_autotuner()
+    config = TuningConfig()
+    a = DummyRunner()
+    b = OtherDummyRunner()
+    shapes = (torch.Size([8, 16]),)
+
+    # File config matches runner `a` (position 0); fresher in-memory result
+    # matches runner `b` (position 1).
+    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
+    tuner._file_configs[key_a.file_key] = ("DummyRunner", 3)
+    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
+    tuner.profiling_cache[key_b] = (5, None)
+
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 1, 5, None)
+
+    # Without the in-memory entry, the file config is used and resolves to
+    # `a`'s position in the current list.
+    tuner.profiling_cache.clear()
+    hit = tuner.search_cache("dummy", [a, b], shapes, config)
+    assert hit == (True, 0, 3, None)
 
 
 def test_search_cache_preserving_leading_dims_hits_while_flattened_misses(monkeypatch):
@@ -306,7 +384,7 @@ def test_choose_one_inference_uses_cache_or_fallback():
 
     # Seed cache -> cache hit.
     key = AutoTuner._get_cache_key("dummy", runner, (inputs[0].shape,), config)
-    tuner.profiling_cache[key] = (0, 2, None)
+    tuner.profiling_cache[key] = (2, None)
     chosen_runner, tactic = tuner.choose_one("dummy", [runner], config, inputs)
     assert chosen_runner is runner
     assert tactic == 2
@@ -821,6 +899,31 @@ def test_prepare_input_tensors_none_input_preserved():
     assert prepared[1] is None  # None stays None
 
 
+@pytest.mark.parametrize(
+    "non_tensor",
+    [torch.bfloat16, None],
+    ids=["dtype", "none"],
+)
+def test_prepare_input_tensors_with_batches_preserves_non_tensor(
+    monkeypatch, non_tensor
+):
+    """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    inputs = [torch.ones(1), non_tensor]
+
+    batches = tuner._prepare_input_tensors_with_batches(
+        inputs, TuningConfig(use_cold_l2_cache=True)
+    )
+
+    assert batches[0] is inputs
+    assert len(batches) > 1
+    for batch in batches[1:]:
+        assert batch[0] is not inputs[0]
+        torch.testing.assert_close(batch[0], inputs[0])
+        assert batch[1] is non_tensor
+
+
 def test_choose_one_with_none_input_no_crash():
     """choose_one inference path should not crash when an input tensor is None."""
     tuner = reset_autotuner()
@@ -1092,8 +1195,6 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     though the shape and bucketing logic are identical, so the cache grows by
     exactly N — the original memory leak.
     """
-    import tracemalloc
-
     AutoTuner._find_nearest_profile.cache_clear()
 
     shapes = ((1024, 128),)
@@ -1131,3 +1232,279 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
         f"Python allocations grew by {allocated_bytes / 1024:.1f} KB "
         f"({allocated_bytes / N:.0f} B/call)."
     )
+
+
+def _build_moe_style_tuning_config(topk_ids_initializer):
+    """Build a config with tensor_initializers present, MoE-style.
+    Mimics ``_make_tuning_config`` in fused_moe/core.py.
+    """
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets(8192, 1),
+                map_to_tuning_buckets=make_hybrid_bucket_mapper(8192),
+                tensor_initializers=[
+                    autotuner_initializer_randn,
+                    topk_ids_initializer,
+                ],
+            ),
+        ),
+    )
+
+
+def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
+    """Regression test: rebuilt MoE-style configs with tensor_initializers
+    must collapse to a single cache entry.
+    """
+    # The factory must return the identical object for the same expert count.
+    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    AutoTuner._find_nearest_profile(
+        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+    )
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == 0, (
+        f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
+        "equivalent MoE-style config with a fixed shape."
+    )
+
+
+@pytest.mark.parametrize(
+    ("routing_input_mode", "packed"),
+    [
+        (RoutingInputMode.PackedPrecomputed, True),
+        (RoutingInputMode.UnpackedPrecomputed, False),
+    ],
+)
+def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
+    """_make_tuning_config must return configs whose topk_ids initializer is the
+    same object across calls and matches the launcher's routing representation.
+    """
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
+    fn.cache_clear()
+    try:
+        mock_module = MagicMock()
+        mock_module.get_library_path.return_value = "/tmp/fake.so"
+        with (
+            patch.object(
+                core_mod,
+                "gen_trtllm_gen_fused_moe_sm100_module",
+                return_value=mock_module,
+            ),
+            patch.object(core_mod, "setup_cubin_loader"),
+        ):
+            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+
+        runner = MoERunner(
+            top_k=8,
+            num_local_experts=128,
+            dtype_act=DtypeTrtllmGen.Bfloat16,
+            dtype_weights=DtypeTrtllmGen.Bfloat16,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_experts=128,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=torch.empty((8, 4096)),
+            routing_logits=None,
+            topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+            expert_weights=None,
+            hidden_states=torch.empty((8, 4096)),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        config_a = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
+        config_b = runner._make_tuning_config(
+            moe_inputs, routing_input_mode=routing_input_mode
+        )
+
+        spec_a = config_a.dynamic_tensor_specs[0]
+        spec_b = config_b.dynamic_tensor_specs[0]
+        topk_idx = MoeRunnerInputs.idx("topk_ids")
+        init_a = spec_a.tensor_initializers[spec_a.input_idx.index(topk_idx)]
+        init_b = spec_b.tensor_initializers[spec_b.input_idx.index(topk_idx)]
+
+        assert init_a is init_b, (
+            "_make_tuning_config returned a different topk_ids initializer object "
+            "on each call. It must reuse _moe_topk_ids_init(num_experts) so that "
+            "rebuilt TuningConfigs collapse to the same _find_nearest_profile "
+            "lru_cache key — a per-call closure reintroduces the memory leak."
+        )
+        assert init_a is _moe_topk_ids_init(128, packed=packed)
+
+        initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        if packed:
+            # Packed routing stores the expert ID in the high 16 bits and a
+            # deterministic BF16 routing weight of 1.0 in the low 16 bits.
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            assert torch.all((initialized >> 16) < 128)
+            assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
+        else:
+            # Unpacked routing contains plain expert IDs, not packed bitfields.
+            assert torch.all((initialized >= 0) & (initialized < 128))
+    finally:
+        fn.cache_clear()
+
+
+def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
+    """Negative control: a fresh initializer closure per call leaks one
+    entry per call DESPITE equal hashes.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+    shapes = ((1024, 4096), (1024, 8))
+
+    def make_fresh_closure():
+        def _init(s, dt, dev):
+            return None
+
+        return _init
+
+    ref_config = _build_moe_style_tuning_config(make_fresh_closure())
+    other_config = _build_moe_style_tuning_config(make_fresh_closure())
+    assert hash(ref_config) == hash(other_config), "hashes should match"
+    assert ref_config != other_config, "equality should fail on fresh closures"
+
+    AutoTuner._find_nearest_profile(shapes, ref_config)
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    N = 1_000
+    for _ in range(N):
+        config = _build_moe_style_tuning_config(make_fresh_closure())
+        AutoTuner._find_nearest_profile(shapes, config)
+
+    cache_growth = AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    assert cache_growth == N, (
+        f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
+    )
+
+
+def _call_build_mla_decode_tuning_config():
+    """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
+
+    runner_names is restricted to trtllm-gen so bucket computation stays
+    host-only (no SM count query), letting the test run without a GPU.
+    """
+    num_pages, page_size, head_dim = 128, 32, 576
+    return _build_mla_decode_tuning_config(
+        kv_cache=torch.empty((num_pages, page_size, head_dim)),
+        block_tables=torch.zeros((8, 64), dtype=torch.int32),
+        workspace_buffer=torch.empty(1024, dtype=torch.uint8),
+        runner_names=("trtllm-gen",),
+        q_len=4,
+        num_heads=128,
+        kv_lora_rank=512,
+        max_seq_len=1024,
+        device=torch.device("cpu"),
+    )
+
+
+def test_mla_decode_tuning_config_is_memoized():
+    """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
+
+    A fresh config per call embeds two fresh initializer closures; those hash
+    identically to but never compare equal with previous ones, so each call
+    would leak one _find_nearest_profile cache entry and lookups would scan the
+    whole collision chain (observed as GC gen-2 pause growth and decaying
+    decode throughput in serving).
+    """
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        config_a = _call_build_mla_decode_tuning_config()
+        config_b = _call_build_mla_decode_tuning_config()
+
+        assert config_a is config_b, (
+            "_build_mla_decode_tuning_config returned a different TuningConfig "
+            "object for equivalent arguments. It must memoize on "
+            "(buckets, num_pages, profile_seq_len) so rebuilt configs collapse to "
+            "the same _find_nearest_profile lru_cache key — a per-call config "
+            "reintroduces the memory leak."
+        )
+    finally:
+        _mla_decode_tuning_config.cache_clear()
+
+
+def test_find_nearest_profile_cache_dedups_mla_decode_config():
+    """Regression test: rebuilt MLA-decode configs must collapse to a single
+    _find_nearest_profile cache entry.
+    """
+    AutoTuner._find_nearest_profile.cache_clear()
+    _mla_decode_tuning_config.cache_clear()
+    try:
+        # [query, block_tables, seq_lens, out] as passed by the MLA dispatcher.
+        shapes = ((8, 4, 128, 576), (8, 64), (8,), (8, 4, 128, 512))
+
+        AutoTuner._find_nearest_profile(shapes, _call_build_mla_decode_tuning_config())
+        cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+        N = 1_000
+        for _ in range(N):
+            AutoTuner._find_nearest_profile(
+                shapes, _call_build_mla_decode_tuning_config()
+            )
+
+        cache_growth = (
+            AutoTuner._find_nearest_profile.cache_info().currsize - cache_before
+        )
+
+        assert cache_growth == 0, (
+            f"Cache grew by {cache_growth} entries across {N} rebuilds of an "
+            "equivalent MLA-decode tuning config with a fixed shape."
+        )
+    finally:
+        AutoTuner._find_nearest_profile.cache_clear()
+        _mla_decode_tuning_config.cache_clear()
+
+
+def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(CuteDslMlaDecodeRunner)
+    runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
+    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner.qk_nope_head_dim = 512
+    runner.kv_lora_rank = 512
+    runner.qk_rope_head_dim = 64
+    runner.page_size = 32
+    runner.max_seq_len = max_seq_len
+    runner.is_var_seq = True
+    runner.uses_shared_paged_kv_idx = True
+    runner.enable_pdl = False
+    runner.sinks = None
+    runner.cute_dsl_impl = "auto"
+    runner._resolved_cute_dsl_impl = "monolithic"
+
+    query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
+    out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
+    return runner.get_cache_key_extras([query, None, None, out])
+
+
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+    """Cache hits must not bypass sequence- or capacity-dependent validity."""
+    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
+    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
+    assert key_257 != key_385
+
+    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    assert key_257 != key_small_workspace
