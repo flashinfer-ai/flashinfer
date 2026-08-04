@@ -133,7 +133,14 @@ class TopKSelectRadixSm12x:
         #   [6] need: slots still to fill this stage (target - found)
 
         if cutlass.const_expr(self._per_token_nvp):
-            nvp = mNumValidPages[q]
+            # Clamp the device-side count to the score tensor's own block extent;
+            # see TopKSelectCountRankSm12x. Nothing on the host bounds it, and an
+            # out-of-range entry would read mBits past its end and emit block
+            # indices the attend kernel cannot address.
+            nvp = cutlass.max(
+                cutlass.Int32(0),
+                cutlass.min(mNumValidPages[q], cutlass.Int32(mBits.shape[1])),
+            )
         else:
             nvp = num_valid_pages
 

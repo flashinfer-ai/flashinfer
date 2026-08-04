@@ -100,7 +100,17 @@ class TopKSelectCountRankSm12x:
         cnt = st.cnt.get_tensor(cute.make_layout(1))
 
         if cutlass.const_expr(self._per_token_nvp):
-            nvp = mNumValidPages[q]
+            # Per-token counts arrive on device, so nothing on the host bounds
+            # them (reading them would sync). Clamp to the score tensor's own
+            # block extent, which is also the `score` staging bound because the
+            # host only dispatches here when max_k_tiles fits _MAX_BLOCKS: an
+            # out-of-range entry would otherwise read mScore past its end,
+            # overrun smem, and emit block indices the attend kernel cannot
+            # address. An over-large count degrades to the full block range.
+            cap = cutlass.min(
+                cutlass.Int32(mScore.shape[1]), cutlass.Int32(_MAX_BLOCKS)
+            )
+            nvp = cutlass.max(cutlass.Int32(0), cutlass.min(mNumValidPages[q], cap))
         else:
             nvp = num_valid_pages
 

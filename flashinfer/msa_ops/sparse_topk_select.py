@@ -118,6 +118,9 @@ def msa_topk_select(
         kernel launches per call and is easy to get wrong.  ``force_end_blocks``
         then denotes each token's own trailing local window, and no selected
         index can exceed that token's extent, so no masking pass is needed.
+        Entries are clamped in-kernel to ``[0, max_k_tiles]`` (checking them on
+        the host would sync), so an over-large count degrades to the full block
+        range rather than reading out of bounds.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
         ``(total_qo_len, num_qo_heads, topk)``, dtype int32.  Allocated
@@ -180,9 +183,12 @@ def msa_topk_select(
         if num_valid_pages.device != max_score.device:
             raise ValueError("num_valid_pages must be on max_score's device")
         # Values stay on device (reading them would force a sync, which is
-        # illegal under CUDA graph capture), so the per-token forced-region fit
-        # is clamped in-kernel instead of checked here. Entries must still be in
-        # (0, max_k_tiles]; the caller owns that invariant.
+        # illegal under CUDA graph capture), so both the max_k_tiles bound and
+        # the per-token forced-region fit are clamped in-kernel instead of
+        # checked here. Unchecked, an out-of-range entry reads max_score out of
+        # bounds and emits block indices the attend kernel cannot address --
+        # reachable in practice, since callers derive the count and max_k_tiles
+        # from different metadata.
         nvp_dev = num_valid_pages
         nvp_scalar = 0
         # Cannot dispatch on the runtime values without a sync, so bound by the

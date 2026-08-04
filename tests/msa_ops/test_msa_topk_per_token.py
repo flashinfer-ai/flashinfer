@@ -90,6 +90,39 @@ def test_per_token_output_contract(P):
             assert (row[len(valid) :] == -1).all(), f"token {s} head {h} mid-array -1"
 
 
+@pytest.mark.parametrize("P", [24, 160])
+def test_per_token_out_of_range_is_clamped(P):
+    """Entries outside ``[0, max_k_tiles]`` must be clamped in-kernel.
+
+    Nothing on the host bounds the tensor's values (checking them would sync),
+    and callers derive the count and ``max_k_tiles`` from different metadata, so
+    a too-large entry is reachable. Unclamped it reads ``max_score`` out of
+    bounds -- and on the count-rank path overruns the smem staging buffer -- and
+    emits block indices the attend kernel cannot address.
+    """
+    H, S = 2, 6
+    fb, fe = 1, 2
+    max_score = _distinct_scores(H, P, S, seed=41 + P)
+    raw = [P + 1, 2 * P, 2**31 - 1, 0, -5, P]
+    nvp = torch.tensor(raw, dtype=torch.int32, device="cuda")
+
+    got = msa_topk_select(
+        max_score, TOPK, num_valid_pages=nvp, force_begin_blocks=fb, force_end_blocks=fe
+    ).cpu()
+    # Every over-range entry must behave exactly like a full-extent one.
+    full = msa_topk_select(
+        max_score, TOPK, num_valid_pages=P, force_begin_blocks=fb, force_end_blocks=fe
+    ).cpu()
+
+    for s, v in enumerate(raw):
+        if min(max(v, 0), P) == 0:
+            assert (got[s] == -1).all(), f"token {s}: empty extent must be all -1"
+        else:
+            torch.testing.assert_close(
+                got[s], full[s], msg=f"token {s} (nvp={v}) not clamped to {P}"
+            )
+
+
 def test_per_token_forces_each_tokens_own_local_window():
     """``force_end_blocks`` must denote each token's own trailing blocks, which
     is the property a batch-wide scalar cannot express."""
