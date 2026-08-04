@@ -363,7 +363,7 @@ class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
                 raise _FunctionalBackendUnsupportedError(str(error)) from error
             raise
 
-    def _prepare_for_dispatch(self) -> None:
+    def prepare_for_dispatch(self) -> None:
         """Prepare the caller shape before admitting this auto/family candidate."""
         self._dispatch_execution_state = self._prepare_execution_state(self.request)
         self._dispatch_inputs = tuple(self._inputs)

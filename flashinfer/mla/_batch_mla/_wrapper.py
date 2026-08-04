@@ -43,21 +43,12 @@ from ._backends.cute_dsl_monolithic_backend import (
     _BatchMLAPagedAttentionCuteDslMonolithicBackend,
 )
 
-# Private imports plus assignments preserve the Batch MLA core's compatibility surface.
-from ._backends.cutlass_backend import (
-    _BatchMLAPagedAttentionCutlassBackend,
-    get_mla_module as _get_mla_module,
-)
+# Private imports preserve the Batch MLA core's compatibility surface.
+from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
-from ._backends._fa_common import (
-    _BatchMLAGeneratedFaWorkspace,
-    get_batch_mla_module as _get_batch_mla_module,
-)
-from ._backends.trtllm_gen_backend import (
-    _BatchMLAPagedAttentionTrtllmGenBackend,
-    get_trtllm_gen_fmha_module as _get_trtllm_gen_fmha_module,
-)
+from ._backends._fa_common import _BatchMLAGeneratedFaWorkspace
+from ._backends.trtllm_gen_backend import _BatchMLAPagedAttentionTrtllmGenBackend
 from ._backends.xqa_backend import (
     _BatchMLAPagedAttentionXqaBackend,
 )
@@ -100,11 +91,6 @@ def _warn_on_positional_mla_arguments(method: Any) -> Any:
         return method(self, *args, **kwargs)
 
     return wrapped
-
-
-get_mla_module = _get_mla_module
-get_batch_mla_module = _get_batch_mla_module
-get_trtllm_gen_fmha_module = _get_trtllm_gen_fmha_module
 
 
 def _raise_planned_run_argument_mismatch(
@@ -468,23 +454,7 @@ class BatchMLAPagedAttentionWrapper:
         backend_type = _BATCH_MLA_BACKENDS[backend]
         self._backend_impl = backend_type.plan_from_wrapper(args)
         self._selected_backend = backend
-        self._input_contract = MLAInputContract(
-            query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
-            q_data_type=args.q_data_type,
-            kv_data_type=args.kv_data_type,
-            kv_layout=args.kv_layout,
-            lse_mode=args.lse_mode,
-            output_dtype=args.output_dtype,
-            output_scale=args.output_scale,
-            scale_mode=args.scale_mode,
-            skip_softmax=args.skip_softmax,
-        )
-        # Backend adapters consume the contract when resolving value-object
-        # representations.  Lightweight test doubles may be immutable objects.
-        if hasattr(self._backend_impl, "__dict__"):
-            backend_impl = cast(Any, self._backend_impl)
-            backend_impl._input_contract = self._input_contract
+        self._input_contract = args.input_contract
 
     # Preferred value-object form
     @overload

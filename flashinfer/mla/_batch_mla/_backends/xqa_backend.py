@@ -17,11 +17,7 @@ from flashinfer.utils import (
 )
 from flashinfer.xqa import get_xqa_module_mla
 
-from ._capabilities import (
-    BACKEND_OPERATIONAL_PLAN_FIELDS,
-    MLAPlanCapabilities,
-    validate_plan_capabilities,
-)
+from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
 from .._planning import (
     _MLAPlanArguments,
 )
@@ -105,7 +101,6 @@ class _BatchMLAPagedAttentionXqaBackend:
         scale_modes=frozenset({"default", "bmm-scalar"}),
         supports_enable_pdl=True,
     )
-    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self.device = float_workspace_buffer.device

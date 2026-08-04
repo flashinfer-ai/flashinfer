@@ -10,7 +10,7 @@ from typing import Literal, Optional, Protocol, Tuple
 
 import torch
 
-from ._contracts import MLAPlanMetadata
+from ._contracts import MLAInputContract, MLAPlanMetadata
 
 
 _MLALSEMode = Literal["none", "base2", "basee"]
@@ -657,6 +657,22 @@ class _MLAPlanArguments:
                 self.metadata.seq_lens,
                 self.metadata.max_q_len,
             )
+        )
+
+    @property
+    def input_contract(self) -> MLAInputContract:
+        """Return the run-time value-object contract for this plan."""
+        return MLAInputContract(
+            query_split_widths=(self.head_dim_ckv, self.head_dim_kpe),
+            kv_split_widths=(self.head_dim_ckv, self.head_dim_kpe),
+            q_data_type=self.q_data_type,
+            kv_data_type=self.kv_data_type,
+            kv_layout=self.kv_layout,
+            lse_mode=self.lse_mode,
+            output_dtype=self.output_dtype,
+            output_scale=self.output_scale,
+            scale_mode=self.scale_mode,
+            skip_softmax=self.skip_softmax,
         )
 
     @property

@@ -29,6 +29,7 @@ from flashinfer.jit import gen_batch_mla_module
 
 from ....utils import MaskMode, check_shape_dtype_device
 from .._contracts import _FunctionalMLARequest, _FunctionalMLARunner
+from .._contracts import MLAInputContract
 from .._planning import (
     _CSRPlanMetadata,
     _MLAGeneratedFaWorkspace,
@@ -133,6 +134,7 @@ class _BatchMLAGeneratedFaMechanics:
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
+        input_contract: Optional[MLAInputContract] = None,
     ) -> None:
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -147,6 +149,7 @@ class _BatchMLAGeneratedFaMechanics:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
+        self._input_contract = input_contract
 
     def _validate_metadata_tensor(self, name: str, tensor: torch.Tensor) -> None:
         if not isinstance(tensor, torch.Tensor):
