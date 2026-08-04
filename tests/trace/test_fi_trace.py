@@ -174,6 +174,50 @@ def test_attention_trace_check_tolerances_match_unit_tests():
     assert not single_prefill_with_kv_cache_trace.check([ref], [ref + 5e-3])
 
 
+def test_alphamoe_fused_router_fi_trace():
+    from flashinfer.fused_moe import AlphaMoERoutePlan, alphamoe_fused_router
+
+    num_tokens, num_experts, top_k, block_m = 32, 512, 8, 16
+    logits = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    defn = alphamoe_fused_router.fi_trace(
+        logits=logits,
+        top_k=top_k,
+        block_m=block_m,
+        has_shared_expert=False,
+    )
+
+    _check_defn(defn, "moe_routing", "alphamoe_fused_router")
+    assert defn["name"] == "alphamoe_fused_router_e512_k8_bm16_shared0"
+    assert defn["axes"]["num_tokens"]["type"] == "var"
+    assert defn["axes"]["num_experts"]["value"] == num_experts
+    assert list(defn["outputs"]) == list(AlphaMoERoutePlan._fields)
+    assert defn["outputs"]["sorted_token_ids"]["shape"] == ["max_padded_pairs"]
+    assert defn["outputs"]["expert_ids"]["shape"] == ["max_route_blocks"]
+
+    init_namespace: dict[str, object] = {}
+    exec(defn["init"], init_namespace)
+    init = cast(
+        Callable[..., dict[str, object]], init_namespace["_alphamoe_fused_router_init"]
+    )
+    init_inputs = init(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        block_m=block_m,
+        has_shared_expert=False,
+        max_route_blocks=32,
+        max_padded_pairs=512,
+        num_experts_plus_one=513,
+        one=1,
+        device="cpu",
+    )
+    assert cast(torch.Tensor, init_inputs["logits"]).shape == (
+        num_tokens,
+        num_experts,
+    )
+    assert init_inputs["top_k"] == top_k
+
+
 def test_recurrent_kda_fi_trace():
     import flashinfer.kda_decode
 

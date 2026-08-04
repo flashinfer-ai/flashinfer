@@ -3973,3 +3973,89 @@ hash_topk_trace = TraceTemplate(
     reference=_hash_topk_reference,
     init=_hash_topk_init,
 )
+
+
+def _alphamoe_fused_router_init(
+    *,
+    num_tokens: int,
+    max_route_blocks: int,
+    max_padded_pairs: int,
+    num_experts_plus_one: int,
+    one: int,
+    num_experts: int = 512,
+    top_k: int = 8,
+    block_m: int = 16,
+    has_shared_expert: bool = False,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build finite FP32 logits for the standalone AlphaMoE router API."""
+
+    del max_route_blocks, max_padded_pairs, num_experts_plus_one, one
+    torch.manual_seed(seed)
+    return {
+        "logits": torch.randn(
+            num_tokens, num_experts, dtype=torch.float32, device=device
+        ),
+        "top_k": int(top_k),
+        "block_m": int(block_m),
+        "has_shared_expert": bool(has_shared_expert),
+    }
+
+
+alphamoe_fused_router_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="alphamoe_fused_router",
+    description=(
+        "AlphaMoE logits-to-plan frontend: deterministic top-k, selected-logit "
+        "softmax, per-expert block padding, and expert-grouped route scatter in "
+        "one cooperative SM100/SM103 kernel."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of routed tokens."),
+        "num_experts": Const(abbrev="e", description="Number of experts."),
+        "top_k": Const(abbrev="k", description="Routes per token."),
+        "block_m": Const(abbrev="bm", description="Per-expert plan alignment."),
+        "has_shared_expert": Const(
+            abbrev="shared", description="Whether the last expert is forced."
+        ),
+        "max_route_blocks": Var(description="Allocated route-block capacity."),
+        "max_padded_pairs": Var(description="Allocated padded-pair capacity."),
+        "num_experts_plus_one": Var(description="num_experts + 1."),
+        "one": Var(description="Singleton device-scalar extent."),
+    },
+    inputs={
+        "logits": Tensor(
+            ["num_tokens", "num_experts"],
+            dtype="float32",
+            description="Finite contiguous FP32 router logits.",
+        ),
+        "top_k": Scalar("int32"),
+        "block_m": Scalar("int32"),
+        "has_shared_expert": Scalar("bool"),
+    },
+    outputs={
+        "topk_weights": Tensor(["num_tokens", "top_k"], dtype="float32"),
+        "topk_ids": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "sorted_token_ids": Tensor(["max_padded_pairs"], dtype="int32"),
+        "expert_ids": Tensor(["max_route_blocks"], dtype="int32"),
+        "num_tokens_post_padded": Tensor(["one"], dtype="int32"),
+        "expert_counts": Tensor(["num_experts"], dtype="int32"),
+        "expert_offsets": Tensor(["num_experts_plus_one"], dtype="int32"),
+        "expert_scatter_offsets": Tensor(["num_experts"], dtype="int32"),
+    },
+    constraints=[
+        "num_tokens > 0",
+        "1 <= num_experts <= 512",
+        "1 <= top_k <= min(num_experts, 16)",
+        "1 <= block_m <= 16",
+        "not has_shared_expert or top_k >= 2",
+        "max_route_blocks == min(num_experts, num_tokens * top_k) + "
+        "(num_tokens * top_k - min(num_experts, num_tokens * top_k)) // block_m",
+        "max_padded_pairs == max_route_blocks * block_m",
+        "num_experts_plus_one == num_experts + 1",
+        "one == 1",
+    ],
+    tags=["status:experimental", "moe", "sm100", "sm103"],
+    init=_alphamoe_fused_router_init,
+)

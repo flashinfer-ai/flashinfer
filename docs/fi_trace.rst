@@ -194,6 +194,9 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.fused_moe``
      - ``trtllm_fp4_block_scale_moe`` (6 routing types)
      - ``moe``
+   * - ``flashinfer.fused_moe``
+     - ``alphamoe_fused_router``
+     - ``moe_routing``
 
 MoE Routing Types
 -----------------
