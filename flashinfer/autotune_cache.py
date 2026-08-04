@@ -1,5 +1,9 @@
 """Managed on-disk autotune cache (v2, experimental).
 
+Design doc: ``docs/design_docs/autotuner_v2.md`` — read it before changing the
+store layout, the environment identity, or the attach semantics, and update it
+in the same PR if this file's behavior changes.
+
 This module owns *persistence only*: given an already-canonical lookup key
 (the same ``str((custom_op, runner_class_name, profile, extras))`` string the
 :class:`~flashinfer.autotuner.AutoTuner` uses for its JSON config files), it
