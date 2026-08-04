@@ -2925,6 +2925,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         needs_initial_state: bool = False,
+        store_final_state: bool = True,
     ):
         self.needs_alpha = True
         self.dtype = dtype
@@ -2933,6 +2934,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         self.BLK_KV = 64
         self.D = 128
         self.needs_initial_state = needs_initial_state
+        self.store_final_state = store_final_state
         self.q_stage = 1
         self.k_stage = 1
         self.v_stage = 1
@@ -2944,6 +2946,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         self.manual_cache_key(
             "needs_alpha",
             "needs_initial_state",
+            "store_final_state",
             "dtype",
             "acc_dtype",
             "BLK_Q",
@@ -4202,8 +4205,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-        if store_state:
-            self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+        if cutlass.const_expr(self.store_final_state):
+            if store_state:
+                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
     @cute.jit
     def __call__(
@@ -4792,7 +4796,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
 
 def cp_delta_rule_prefill_dsl_sm120(
     o: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4891,14 +4895,14 @@ def cp_delta_rule_prefill_dsl_sm120(
             )
         expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, d, d)
         expected_state_shape = (num_seqs, num_sab_heads, d, d)
-        if (
-            fixed_state.shape != expected_fixed_state_shape
-            or state.shape != expected_state_shape
+        if fixed_state.shape != expected_fixed_state_shape or (
+            state is not None and state.shape != expected_state_shape
         ):
             raise RuntimeError(
                 "fixed_state/state must have shapes "
                 f"{expected_fixed_state_shape} and {expected_state_shape}, "
-                f"got {tuple(fixed_state.shape)} and {tuple(state.shape)}"
+                f"got {tuple(fixed_state.shape)} and "
+                f"{None if state is None else tuple(state.shape)}"
             )
         if initial_state is not None and initial_state.shape != expected_state_shape:
             raise RuntimeError(
@@ -4991,14 +4995,18 @@ def cp_delta_rule_prefill_dsl_sm120(
         )
 
     needs_initial_state = initial_state is not None
+    store_final_state = state is not None
     initial_state_cute = (
         from_dlpack(initial_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
         if needs_initial_state
         else None
     )
     kernel = CPDeltaRulePrefillSm120(
-        kernel_dtype, needs_initial_state=needs_initial_state
+        kernel_dtype,
+        needs_initial_state=needs_initial_state,
+        store_final_state=store_final_state,
     )
+    state_arg = state if store_final_state else fixed_state
     kernel_args = (
         from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
@@ -5006,7 +5014,7 @@ def cp_delta_rule_prefill_dsl_sm120(
         from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
         from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
         from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+        from_dlpack(state_arg.reshape(-1), assumed_align=16).mark_layout_dynamic(),
         from_dlpack(fixed_state.reshape(-1), assumed_align=16).mark_layout_dynamic(),
         initial_state_cute,
         from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
@@ -5030,7 +5038,7 @@ def cp_delta_rule_prefill_dsl_sm120(
 
 def cp_delta_rule_dsl_sm120(
     o: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -5123,7 +5131,7 @@ def cp_delta_rule_dsl_sm120(
             f"of k heads, got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
     expected_state_shape = (num_seqs, num_sab_heads, d, d)
-    if state.shape != expected_state_shape:
+    if state is not None and state.shape != expected_state_shape:
         raise RuntimeError(
             f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
         )
