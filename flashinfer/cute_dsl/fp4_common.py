@@ -223,6 +223,22 @@ def ld_global_nc_v4_u32(
 
 
 @dsl_user_op
+def prefetch_global_l2(base_ptr: Int64, *, loc=None, ip=None) -> None:
+    """Prefetch a global memory line into L2."""
+    llvm.inline_asm(
+        None,
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
     """Store 64 bits to global memory."""
     llvm.inline_asm(
@@ -257,15 +273,18 @@ def st_global_u32(base_ptr: Int64, value: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
+def get_ptr_as_int64(tensor: cute.Tensor, offset, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64.
+
+    ``offset`` may be Int32 or Int64 and is added to the iterator unchanged,
+    so 64-bit offsets are not truncated.
 
     WARNING: This uses ptrtoint which strips address space information.
     For SMEM tensors, the resulting Int64 is a raw SMEM offset that does NOT
     work with generic-addressing loads (ld.v4.u32). Use only with explicit
     address-space loads (ld.global.*) or for global memory tensors.
     """
-    elem_ptr = tensor.iterator + Int32(offset)
+    elem_ptr = tensor.iterator + offset
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
 
@@ -1130,6 +1149,150 @@ def ue8m0_to_output_scale(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+    )
+
+
+@dsl_user_op
+def pow2_ceil_ue8m0(
+    scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Uint32]:
+    """Round a positive FP32 ``scale`` up to a power of two, bit-exactly.
+
+    Returns ``(rounded_fp32, ue8m0_byte)`` with ``ue8m0_byte`` the biased
+    exponent of the rounded value. Unlike ``cvt_f32_to_ue8m0``, this matches
+    the fp8_quant.cuh and scale_convert.cuh fp32_to_ue8m0 references
+    bit-for-bit.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.i32()]),
+        [Float32(scale).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred  p_mant;
+            .reg .b32   bits, mant;
+
+            // bits = __float_as_uint(scale)
+            mov.b32 bits, $2;
+            // mant = bits & 0x007FFFFF  (mantissa field)
+            and.b32 mant, bits, 8388607;
+            setp.ne.u32 p_mant, mant, 0;
+            // if (mant) bits = (bits + 0x00800000) & 0x7F800000
+            @p_mant add.u32 bits, bits, 8388608;
+            @p_mant and.b32 bits, bits, 2139095040;
+            // rounded fp32 scale = __uint_as_float(bits)
+            mov.b32 $0, bits;
+            // ue8m0 = (bits >> 23) & 0xFF
+            bfe.u32 $1, bits, 23, 8;
+        }
+        """,
+        "=f,=r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    rounded = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    ue8m0 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Float32(rounded), Uint32(ue8m0)
+
+
+@dsl_user_op
+def cvt_e8m0_to_f32(e8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
+    """Convert a single E8M0 scale byte to its true f32 value 2**(byte-127).
+
+    Byte 0 maps to 0.0.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(e8m0_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p0;
+                .reg .u32 b0;
+                .reg .s32 e0;
+                .reg .f32 ef0;
+                and.b32 b0, $1, 0x000000ff;
+                setp.eq.u32 p0, b0, 0;
+                cvt.s32.u32 e0, b0;
+                sub.s32 e0, e0, 127;
+                cvt.rn.f32.s32 ef0, e0;
+                ex2.approx.f32 $0, ef0;
+                selp.f32 $0, 0f00000000, $0, p0;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_e8m0x4_to_f32x4(
+    packed: Uint32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Decode 4 E8M0 scale bytes (packed u32) to 4 x true f32 (2**(byte-127))."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Uint32(packed).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred p0, p1, p2, p3;
+            .reg .u32 b0, b1, b2, b3;
+            .reg .s32 e0, e1, e2, e3;
+            .reg .f32 ef0, ef1, ef2, ef3;
+            and.b32 b0, $4, 0x000000ff;
+            shr.u32 b1, $4, 8;
+            and.b32 b1, b1, 0x000000ff;
+            shr.u32 b2, $4, 16;
+            and.b32 b2, b2, 0x000000ff;
+            shr.u32 b3, $4, 24;
+            setp.eq.u32 p0, b0, 0;
+            setp.eq.u32 p1, b1, 0;
+            setp.eq.u32 p2, b2, 0;
+            setp.eq.u32 p3, b3, 0;
+            cvt.s32.u32 e0, b0;
+            cvt.s32.u32 e1, b1;
+            cvt.s32.u32 e2, b2;
+            cvt.s32.u32 e3, b3;
+            sub.s32 e0, e0, 127;
+            sub.s32 e1, e1, 127;
+            sub.s32 e2, e2, 127;
+            sub.s32 e3, e3, 127;
+            cvt.rn.f32.s32 ef0, e0;
+            cvt.rn.f32.s32 ef1, e1;
+            cvt.rn.f32.s32 ef2, e2;
+            cvt.rn.f32.s32 ef3, e3;
+            ex2.approx.f32 $0, ef0;
+            ex2.approx.f32 $1, ef1;
+            ex2.approx.f32 $2, ef2;
+            ex2.approx.f32 $3, ef3;
+            selp.f32 $0, 0f00000000, $0, p0;
+            selp.f32 $1, 0f00000000, $1, p1;
+            selp.f32 $2, 0f00000000, $2, p2;
+            selp.f32 $3, 0f00000000, $3, p3;
+        }
+        """,
+        "=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
     )
 
 
@@ -2044,6 +2207,38 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def cvt_w4a16_packed_e4m3_scale_to_f32(
+    packed_byte: Uint32, *, loc=None, ip=None
+) -> Float32:
+    """Scalar mirror of packed_dequant_e4m3x4_to_bfloat2x2 for W4A16 scales."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(packed_byte).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 bits, tmp;
+                .reg .b16 bf;
+                and.b32 bits, $1, 0x80;
+                shl.b32 bits, bits, 7;
+                and.b32 tmp, $1, 0x7f;
+                shl.b32 tmp, tmp, 4;
+                or.b32 bits, bits, tmp;
+                cvt.u16.u32 bf, bits;
+                cvt.f32.bf16 $0, bf;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_s0e5m3_to_f16x2_broadcast(fp8_val: Uint32, *, loc=None, ip=None) -> Uint32:
     """Convert one S0E5M3 scale byte to an f16x2 with the scale in both lanes.
 
@@ -2166,6 +2361,35 @@ def quant_dequant_2(
     h2 = fp4_decode_2(fp4_byte)
     f0, f1 = f16x2_to_f32x2(h2)
     return f0 * sf_f32, f1 * sf_f32
+
+
+@cute.jit
+def mx_scale_from_amax32(amax: Float32) -> Tuple[Float32, Float32]:
+    """Per-32 MXFP8 block scale from a precomputed amax.
+
+    Returns ``(scale, inv_scale)`` with ``scale = pow2_ceil(amax/448)``
+    (zero amax yields (0, 0), silencing the block).
+    """
+    rounded, byte = pow2_ceil_ue8m0(amax * Float32(1.0 / FLOAT8_E4M3_MAX))
+    inv_scale = ue8m0_to_output_scale(byte)
+    return rounded, inv_scale
+
+
+@cute.jit
+def quant_dequant_e4m3_2(
+    v0: Float32,
+    v1: Float32,
+    inv_scale: Float32,
+    scale: Float32,
+) -> Tuple[Float32, Float32]:
+    """Quantize-dequantize a pair through E4M3 with a power-of-two block scale.
+
+    Keeps a8_mx decode numerics matched to the w4a8 prefill activation
+    quantizer.
+    """
+    q0 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v0 * inv_scale)) * scale
+    q1 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v1 * inv_scale)) * scale
+    return q0, q1
 
 
 @dsl_user_op

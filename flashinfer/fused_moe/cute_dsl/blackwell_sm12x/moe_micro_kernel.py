@@ -380,9 +380,10 @@ class MoEMicroKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
@@ -771,6 +772,9 @@ class MoEMicroKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -824,7 +828,7 @@ class MoEMicroKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)

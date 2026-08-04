@@ -242,7 +242,13 @@ _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
-    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes."""
+    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
+
+    ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
+    restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
+    NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
+    and remains disabled on SM103.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -446,9 +452,8 @@ class TrtllmMxInt4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
         # Same trtllm-gen routed batched-GEMM path as the FP4/BF16 backends, so it
-        # inherits the same manifest coverage.  Whether sm107a MxE2m1 cubins exist
-        # is not verifiable from this repo; this only narrows the previous
-        # ``arch >= 100``, leaving SM100/103/107 behaviour unchanged.
+        # inherits the same manifest coverage. The pinned Rubin manifest includes
+        # MxInt4 sm107a kernels, although unified MxInt4 still has no runner.
         return arch in _TRTLLM_ROUTED_ARCHS
 
     def __repr__(self) -> str:
@@ -626,12 +631,26 @@ ALL_BACKEND_CONFIGS = (
 
 @dataclass(frozen=True)
 class BackendOptions:
-    """Ordered list of backend candidates for dispatch / autotuning."""
+    """Ordered list of backend candidates for dispatch and autotuning.
+
+    Each backend config implements ``supported(arch)``, where ``arch`` uses the
+    CUDA compute-capability encoding documented by :meth:`valid_for`.
+    """
 
     candidates: Tuple[BackendConfigType, ...] = ()  # type: ignore[type-arg]
 
     def valid_for(self, arch: int) -> list:
-        """Return candidates whose hardware preconditions are met."""
+        """Return candidates whose hardware preconditions are met.
+
+        Parameters
+        ----------
+        arch : int
+            CUDA compute capability encoded as ``major * 10 + minor``. For
+            example, SM90 is ``90``, SM100 is ``100``, and SM103 is ``103``.
+            :class:`MoELayer` derives it from its selected CUDA device via
+            ``get_compute_capability(self.device)``. This is not a CUDA device
+            ordinal or CUDA toolkit version.
+        """
         return [c for c in self.candidates if c.__class__.supported(arch)]
 
     def __len__(self) -> int:
@@ -762,8 +781,8 @@ class MoEActivationPack:
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
       back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
-      block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches a logits
-      pack only to capable backends (see each runner's ``supported_routing_modes``).
+      BF16, block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches
+      a logits pack only to capable backends (see each runner's ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so

@@ -17,7 +17,6 @@
 #include <flashinfer/trtllm/common.h>
 #include <flashinfer/trtllm/fmha/decoder_impl_common.h>
 #include <flashinfer/trtllm/fmha/fmhaRunnerParams.h>
-#include <nvrtc.h>
 #include <tvm/ffi/container/variant.h>
 
 #include <algorithm>
