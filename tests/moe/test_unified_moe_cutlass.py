@@ -1,4 +1,4 @@
-"""Unified SM90 CUTLASS BF16 MoE adapter tests."""
+"""Unified CUTLASS BF16 MoE adapter tests."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from flashinfer.fused_moe import (
     ActivationConfig,
     BackendOptions,
     CutlassBf16Runner,
-    CutlassConfig,
+    CutlassBf16Config,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -34,7 +34,7 @@ def _config(**overrides) -> MoEConfig:
         quant=QuantConfig(variant=QuantVariant.BF16),
         experts=ExpertConfig(intermediate_size=256),
         activation=ActivationConfig.swiglu,
-        backend=BackendOptions((CutlassConfig(),)),
+        backend=BackendOptions((CutlassBf16Config(),)),
         execution=ExecutionConfig(
             do_finalize=True, enable_pdl=False, tune_max_num_tokens=64
         ),
@@ -43,11 +43,13 @@ def _config(**overrides) -> MoEConfig:
     return MoEConfig(**values)
 
 
-def test_cutlass_config_is_sm90_only_and_registered():
-    assert CutlassConfig.supported(90)
-    assert not CutlassConfig.supported(89)
-    assert not CutlassConfig.supported(100)
-    assert _BACKEND_RUNNERS[CutlassConfig] is CutlassBf16Runner
+def test_cutlass_bf16_config_architectures_and_registration():
+    supported = (89, 90, 100, 103, 110, 120, 121)
+    assert all(CutlassBf16Config.supported(arch) for arch in supported)
+    assert not CutlassBf16Config.supported(80)
+    assert not CutlassBf16Config.supported(107)
+    assert not CutlassBf16Config.supported(130)
+    assert _BACKEND_RUNNERS[CutlassBf16Config] is CutlassBf16Runner
 
 
 def test_prepare_cutlass_bf16_weights_preserves_canonical_layout():
@@ -55,7 +57,7 @@ def test_prepare_cutlass_bf16_weights_preserves_canonical_layout():
     w2 = torch.randn(2, 32, 64, dtype=torch.bfloat16)[..., ::2]
     assert not w1.is_contiguous()
     assert not w2.is_contiguous()
-    view = CutlassConfig.prepare_weights(
+    view = CutlassBf16Config.prepare_weights(
         w1,
         w2,
         num_local_experts=2,
@@ -142,14 +144,15 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner._inner = Inner()
+    runner._device_arch = 100
     inputs = [torch.empty(1) for _ in range(6)]
 
     tactics = runner.get_valid_tactics(inputs, None)
 
     assert tactics == [(3, 9)]
     assert tuner.calls == [
-        ("moe_cutlass_bf16_sm90_gemm1", 1),
-        ("moe_cutlass_bf16_sm90_gemm2", 2),
+        ("moe_cutlass_bf16_sm100_gemm1", 1),
+        ("moe_cutlass_bf16_sm100_gemm2", 2),
     ]
     assert runner._inner.gemm_idx_for_tuning is None
 
@@ -172,11 +175,16 @@ def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
         runner.pack_inputs(act, MoEWeightPack())
 
 
-def _is_sm90() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+def _is_cutlass_bf16_arch() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return CutlassBf16Config.supported(major * 10 + minor)
 
 
-sm90_required = pytest.mark.skipif(not _is_sm90(), reason="requires an SM90 GPU")
+cutlass_bf16_required = pytest.mark.skipif(
+    not _is_cutlass_bf16_arch(), reason="requires a CUTLASS BF16 GPU"
+)
 
 
 def _make_case(num_tokens: int = 16):
@@ -221,8 +229,8 @@ def _make_case(num_tokens: int = 16):
     act = MoEActivationPack(x, None, topk_ids, topk_weights)
     weights = MoEWeightPack()
     weights.prepare_for(
-        "cutlass_bf16_sm90",
-        CutlassConfig.prepare_weights(
+        "cutlass_bf16",
+        CutlassBf16Config.prepare_weights(
             w1,
             w2,
             num_local_experts=num_experts,
@@ -256,7 +264,7 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
     return runner
 
 
-@sm90_required
+@cutlass_bf16_required
 def test_cutlass_bf16_moe_layer_matches_independent_reference():
     config, act, weights, w1, w2 = _make_case()
     layer = MoELayer(config)
@@ -265,12 +273,12 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference():
     actual = layer(act, weights)
     expected = _reference(act, w1, w2)
 
-    assert layer.winner_backend == "cutlass_bf16_sm90"
+    assert layer.winner_backend == "cutlass_bf16"
     assert runner._workspace is not None
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@sm90_required
+@cutlass_bf16_required
 def test_cutlass_stage_file_cache_key_includes_top_k():
     config, act, weights, _, _ = _make_case()
     runner = MoELayer(config).runners[0]
@@ -285,14 +293,14 @@ def test_cutlass_stage_file_cache_key_includes_top_k():
     finally:
         runner._inner.top_k = original_top_k
     original_key = AutoTuner._get_cache_key(
-        "moe_cutlass_bf16_sm90_gemm1",
+        f"moe_cutlass_bf16_sm{runner._device_arch}_gemm1",
         runner._inner,
         input_shapes,
         TuningConfig(),
         original_extras,
     )
     other_key = AutoTuner._get_cache_key(
-        "moe_cutlass_bf16_sm90_gemm1",
+        f"moe_cutlass_bf16_sm{runner._device_arch}_gemm1",
         runner._inner,
         input_shapes,
         TuningConfig(),
@@ -302,7 +310,7 @@ def test_cutlass_stage_file_cache_key_includes_top_k():
     assert original_key.file_key != other_key.file_key
 
 
-@sm90_required
+@cutlass_bf16_required
 def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     config, act, weights, w1, w2 = _make_case(num_tokens=17)
     runner = MoELayer(config).runners[0]
@@ -314,7 +322,7 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
 
     with autotune(True):
         _, tactic = AutoTuner.get().choose_one(
-            "test_moe_cutlass_bf16_sm90_compound",
+            "test_moe_cutlass_bf16_compound",
             [runner],
             runner.tuning_config,
             inputs,

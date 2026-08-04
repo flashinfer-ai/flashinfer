@@ -1209,8 +1209,8 @@ def prepare_cutlass_bf16_weights(
     """Build the canonical BF16 view consumed by ``CutlassBf16Runner``.
 
     ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order and
-    ``w2_bf16`` is ``[E, H, I]``.  The pure-BF16 SM90 CUTLASS path consumes
-    these dense tensors directly; preparation validates the source contract
+    ``w2_bf16`` is ``[E, H, I]``.  CUTLASS BF16 paths consume these dense
+    tensors directly; preparation validates the source contract
     and materializes contiguous tensors on the requested device.
     """
     if device is None:

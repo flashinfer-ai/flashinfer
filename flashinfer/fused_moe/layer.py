@@ -30,7 +30,7 @@ from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
-    CutlassConfig,
+    CutlassBf16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -72,7 +72,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
-    CutlassConfig: CutlassBf16Runner,
+    CutlassBf16Config: CutlassBf16Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,

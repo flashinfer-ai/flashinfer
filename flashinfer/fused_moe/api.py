@@ -234,6 +234,9 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
+# Architectures covered by the flat CUTLASS BF16 fused-MoE path.
+_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 110, 120, 121)
+
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
@@ -479,17 +482,16 @@ class TrtllmMxInt4Config:
 
 
 @dataclass(frozen=True)
-class CutlassConfig:
-    """SM90 CUTLASS BF16 backend for the unified MoE API.
+class CutlassBf16Config:
+    """CUTLASS BF16 backend for the unified MoE API.
 
-    The legacy flat CUTLASS API supports additional architectures and
-    quantization modes.  Unified capability is intentionally narrower until
-    each combination has its own preparation and conformance coverage.
+    Architecture coverage follows the legacy flat CUTLASS BF16 path. Other
+    quantization contracts use separate unified backend configs and runners.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 90
+        return arch in _CUTLASS_BF16_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -501,11 +503,11 @@ class CutlassConfig:
         intermediate_size: int,
         device=None,
     ):
-        """Build the ``cutlass_bf16_sm90`` canonical BF16 weight view.
+        """Build the ``cutlass_bf16`` canonical BF16 weight view.
 
         GEMM1 uses the public ``[up, gate]`` row convention.  Unlike TRTLLM's
-        BlockMajorK path, the SM90 CUTLASS BF16 kernel consumes these weights
-        directly and needs no physical reordering.
+        BlockMajorK path, CUTLASS BF16 kernels consume these weights directly
+        and need no physical reordering.
         """
         from .prepare import prepare_cutlass_bf16_weights
 
@@ -519,7 +521,7 @@ class CutlassConfig:
         )
 
     def __repr__(self) -> str:
-        return "CutlassConfig()"
+        return "CutlassBf16Config()"
 
 
 @dataclass(frozen=True)
@@ -655,7 +657,7 @@ BackendConfigType = Union[
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
+    CutlassBf16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -667,7 +669,7 @@ ALL_BACKEND_CONFIGS = (
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
-    CutlassConfig,
+    CutlassBf16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -722,7 +724,7 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmFp8PerTensorConfig(),
         TrtllmBf16Config(),
         TrtllmMxInt4Config(),
-        CutlassConfig(),
+        CutlassBf16Config(),
         CuteDslConfig(),
     )
 )

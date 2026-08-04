@@ -29,6 +29,7 @@ import torch
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import (
+    _CUTLASS_BF16_ARCHS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -195,19 +196,19 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# SM90 CUTLASS BF16 runner — canonical dense weights, pre-routed execution
+# CUTLASS BF16 runner — canonical dense weights, pre-routed execution
 # ---------------------------------------------------------------------------
 
 
 class CutlassBf16Runner(MoERunner):
-    """Unified adapter over the legacy SM90 CUTLASS fused-MoE launcher.
+    """Unified adapter over the legacy CUTLASS BF16 fused-MoE launcher.
 
     The CUTLASS launcher selects one tactic for each GEMM. This adapter tunes
     those stages independently, combines the two winners into one compound
     tactic, and owns a reusable workspace sized for the active token bucket.
     """
 
-    backend_key = "cutlass_bf16_sm90"
+    backend_key = "cutlass_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.BF16,)
     required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
@@ -242,9 +243,12 @@ class CutlassBf16Runner(MoERunner):
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = get_compute_capability(self.device)
-        if (major, minor) != (9, 0):
+        self._device_arch = major * 10 + minor
+        if self._device_arch not in _CUTLASS_BF16_ARCHS:
             raise RuntimeError(
-                f"CutlassBf16Runner requires SM90, got SM{major}{minor}."
+                "CutlassBf16Runner does not support "
+                f"SM{self._device_arch}; supported architectures are "
+                f"{_CUTLASS_BF16_ARCHS}."
             )
 
         enable_pdl = config.execution.enable_pdl
@@ -254,7 +258,7 @@ class CutlassBf16Runner(MoERunner):
         self._use_fused_finalize = True
 
         with torch.cuda.device(self.device):
-            module = get_cutlass_fused_moe_module("90")
+            module = get_cutlass_fused_moe_module(str(self._device_arch))
             self._inner = module.MoERunner(
                 x_dtype=torch.bfloat16,
                 weight_dtype=torch.bfloat16,
@@ -313,7 +317,7 @@ class CutlassBf16Runner(MoERunner):
         try:
             self._inner.gemm_idx_for_tuning = 1
             _, gemm1 = tuner.choose_one(
-                "moe_cutlass_bf16_sm90_gemm1",
+                f"moe_cutlass_bf16_sm{self._device_arch}_gemm1",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
@@ -321,7 +325,7 @@ class CutlassBf16Runner(MoERunner):
             )
             self._inner.gemm_idx_for_tuning = 2
             _, gemm2 = tuner.choose_one(
-                "moe_cutlass_bf16_sm90_gemm2",
+                f"moe_cutlass_bf16_sm{self._device_arch}_gemm2",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
@@ -504,7 +508,10 @@ class CutlassBf16Runner(MoERunner):
         return inputs[0]
 
     def __hash__(self):
-        return hash((self.backend_key, self.config))
+        return hash((self.backend_key, self.config, self._device_arch))
+
+    def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+        return (self._device_arch,)
 
 
 # ---------------------------------------------------------------------------
