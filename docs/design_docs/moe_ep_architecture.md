@@ -188,12 +188,13 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
 - **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_pull_fp8 mega kernel
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
+- **sm90_push** — 2-GPU Hopper push-FP8 kernel/backend correctness by default (`NPROC_SM90_PUSH` overrides the world size)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_pull_fp8 mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
@@ -274,6 +275,7 @@ unless noted):
 | mega nvfp4_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega mxfp8_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
 | mega sm90_pull_fp8 (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
+| mega sm90_push_fp8 | 2026-08-04 | H20: EP1 113/0; EP2 and EP4 15/0 per rank |
 
 ## Forward flow
 

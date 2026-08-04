@@ -74,6 +74,41 @@ class _FakeGemmRunner:
         self._log.append("fc1" if self._calls == 1 else "fc2")
 
 
+def test_pipe_ep_size_validation_uses_guarded_handshake_with_a_comm() -> None:
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushPipe
+
+    arguments = {
+        "ep_size": 0,
+        "rank": 0,
+        "num_local_experts": 1,
+        "hidden_size": 128,
+        "top_k": 1,
+        "token_capacity": 1,
+        "device_index": 0,
+    }
+    with pytest.raises(ValueError, match="ep_size"):
+        Sm90PushPipe(**arguments)
+
+    class TwoRankComm:
+        def __init__(self):
+            self.allgather_calls = 0
+
+        def Get_size(self):
+            return 2
+
+        def Get_rank(self):
+            return 0
+
+        def allgather(self, value):
+            self.allgather_calls += 1
+            return [value, (None, None)]
+
+    comm = TwoRankComm()
+    with pytest.raises(RuntimeError, match="all ranks abort together.*ep_size"):
+        Sm90PushPipe(**arguments, comm_backend=comm)
+    assert comm.allgather_calls == 1
+
+
 class _FakePipe:
     def __init__(self, log):
         self.log = log
