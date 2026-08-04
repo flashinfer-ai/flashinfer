@@ -33,13 +33,13 @@ _SF_VEC_SIZE = 16
 
 
 def _resolve_proxy_dims(
-    cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=False
+    cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=False
 ):
     """Resolve grid dims ``(max_seqlen_q, max_k_tiles)`` as Python ints; deriving
     them reads ``cu_seqlens`` on host, so under CUDA-graph capture we raise.
 
-    ``k_is_lengths`` says ``cu_k`` holds per-request lengths rather than a
-    prefix sum (the paged path)."""
+    ``k_len_or_cu`` is per-request lengths when ``k_is_lengths`` (the paged
+    path), else a prefix sum."""
     if max_k_tiles is None and output is not None:
         max_k_tiles = int(output.shape[1])
     if max_seqlen_q is not None and max_k_tiles is not None:
@@ -54,8 +54,8 @@ def _resolve_proxy_dims(
         cu_q_cpu = cu_seqlens_q.cpu()
         max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
     if max_k_tiles is None:
-        cu_k_cpu = cu_k.cpu()
-        seqlens_k = cu_k_cpu if k_is_lengths else (cu_k_cpu[1:] - cu_k_cpu[:-1])
+        k_cpu = k_len_or_cu.cpu()
+        seqlens_k = k_cpu if k_is_lengths else (k_cpu[1:] - k_cpu[:-1])
         max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
     return max_seqlen_q, max_k_tiles
 
@@ -391,21 +391,21 @@ def msa_proxy_score(
         # only each request's length. Pass seqused_k through instead of building
         # a prefix sum (zeros + cumsum + slice-copy on every call) for the
         # kernel to difference back apart; `paged` tells it which form this is.
-        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
-        cu_k = cu_k.contiguous()
+        k_len_or_cu = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        k_len_or_cu = k_len_or_cu.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
             raise ValueError("flat proxy requires cu_seqlens_k")
         if k.ndim != 3:
             raise ValueError("flat k must be (total_k, num_kv_heads, head_dim)")
-        cu_k = cu_seqlens_k.to(dev)
+        k_len_or_cu = cu_seqlens_k.to(dev)
         pt_dev = _proxy_dummies(dev.index)[0]
-        batch_size = cu_k.numel() - 1
+        batch_size = k_len_or_cu.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
-        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
+        cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
@@ -436,7 +436,9 @@ def msa_proxy_score(
     if use_stream and qoff_default:
         qoff_dev = _proxy_dummies(dev.index)[1]
     else:
-        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev, k_is_lengths=paged)
+        qoff_dev = _q_offset_tensor(
+            q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
+        )
 
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
@@ -557,12 +559,12 @@ def msa_proxy_score(
     if use_stream:
         # One CTA per (KV block, token, kv_head): the grid is already maximally
         # split, so there is no split factor to tune.
-        _call([q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev], 1)
+        _call([q, k, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev], 1)
     else:
         _run_proxy_autotuned(
             "msa_proxy_score",
             _call,
-            [q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
+            [q, k, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev],
             max_seqlen_q=max_seqlen_q,
             max_k_tiles=max_k_tiles,
             base_ctas=base_ctas,
@@ -731,22 +733,24 @@ def msa_proxy_score_fp4(
         # only each request's length. Pass seqused_k through instead of building
         # a prefix sum (zeros + cumsum + slice-copy on every call) for the
         # kernel to difference back apart; `paged` tells it which form this is.
-        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
-        cu_k = cu_k.contiguous()
+        k_len_or_cu = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        k_len_or_cu = k_len_or_cu.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
             raise ValueError("flat proxy requires cu_seqlens_k")
         if k_fp4.ndim != 3:
             raise ValueError("flat k_fp4 must be (total_k, num_kv_heads, 64)")
-        cu_k = cu_seqlens_k.to(dev)
+        k_len_or_cu = cu_seqlens_k.to(dev)
         pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
-        batch_size = cu_k.numel() - 1
+        batch_size = k_len_or_cu.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
-    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev, k_is_lengths=paged)
+    qoff_dev = _q_offset_tensor(
+        q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
+    )
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
-        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
+        cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
@@ -868,7 +872,17 @@ def msa_proxy_score_fp4(
     _run_proxy_autotuned(
         "msa_proxy_score_fp4",
         _call,
-        [q_fp4, k_fp4, q_scale, k_scale, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
+        [
+            q_fp4,
+            k_fp4,
+            q_scale,
+            k_scale,
+            pt_dev,
+            per_head,
+            cu_q_dev,
+            k_len_or_cu,
+            qoff_dev,
+        ],
         max_seqlen_q=max_seqlen_q,
         max_k_tiles=max_k_tiles,
         base_ctas=base_ctas,

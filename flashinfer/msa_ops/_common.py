@@ -29,7 +29,7 @@ _compile_cache: dict = {}
 def _q_offset_tensor(
     q_offset,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    k_len_or_cu: torch.Tensor,
     device,
     k_is_lengths: bool = False,
 ) -> torch.Tensor:
@@ -39,12 +39,12 @@ def _q_offset_tensor(
     semantics). When ``q_offset`` is None, queries are right-aligned to the end
     of the KV sequence: ``q_offset[b] = seqlen_k[b] - seqlen_q[b]``.
 
-    ``k_is_lengths`` says ``cu_seqlens_k`` already holds per-request lengths
-    rather than a prefix sum (the paged paths pass ``seqused_k`` straight
-    through), which skips differencing it back apart."""
+    ``k_len_or_cu`` is per-request lengths ``(B,)`` when ``k_is_lengths`` (the
+    paged paths pass ``seqused_k`` straight through), else a ``(B+1,)`` prefix
+    sum to difference back apart."""
     if q_offset is None:
         seqlens_k = (
-            cu_seqlens_k if k_is_lengths else (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+            k_len_or_cu if k_is_lengths else (k_len_or_cu[1:] - k_len_or_cu[:-1])
         )
         return (seqlens_k - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])).to(torch.int32)
     return _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, device)

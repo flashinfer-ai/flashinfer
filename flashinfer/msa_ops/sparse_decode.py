@@ -346,8 +346,8 @@ def msa_sparse_decode_attention(
         # seqused_k directly instead of building a prefix sum (a zeros + cumsum
         # + slice-copy on every decode call) just for the kernel to difference
         # it back apart. The kernel reads this as lengths when `paged`.
-        cu_k = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
-        cu_k = cu_k.contiguous()
+        k_len_or_cu = seqused_k if seqused_k.device == dev else seqused_k.to(dev)
+        k_len_or_cu = k_len_or_cu.contiguous()
         pt_dev = page_table.contiguous()
     else:
         if cu_seqlens_k is None:
@@ -358,7 +358,7 @@ def msa_sparse_decode_attention(
             raise ValueError("cu_seqlens_k must have batch_size + 1 entries")
         if k.ndim != 3:
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
-        cu_k = cu_seqlens_k.to(dev)
+        k_len_or_cu = cu_seqlens_k.to(dev)
         pt_dev = _dummy_tensors(dev.index)[0]
 
     # v mirrors k (same layout/dtype for bf16/fp16, fp8, and packed NVFP4); the
@@ -539,7 +539,7 @@ def msa_sparse_decode_attention(
         split_counts,
         out_buf,
         lse_buf,
-        cu_k,
+        k_len_or_cu,
         qoff_dev,
         float(softmax_scale),
         float(v_global_scale) if v_global_scale is not None else 1.0,
