@@ -59,22 +59,15 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 |---------|------|----------|
 | `bash tests/moe_ep/run_tests.sh unit` | 1 (host-only) | none — mocks + single GPU, no multirank |
 | `bash tests/moe_ep/run_tests.sh multirank` | 4 | NCCL-EP (NIXL-EP too if built) |
-| `bash tests/moe_ep/run_tests.sh oracle_sm90` | 1 | Hopper pull-style FP8 oracle |
-| `bash tests/moe_ep/run_tests.sh sm90_push` | 2 | Hopper; `torch.distributed`; CUDA 12.8+ |
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
-| `bash tests/moe_ep/run_tests.sh mega_sm90` | 4 | Hopper pull-style FP8 multirank |
 
 - **unit** — host-only pytest (mocks + single-GPU).
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
-- **oracle_sm90** — 1-GPU SM90 pull FP8 kernel against its torch oracle.
-- **sm90_push** — 2-GPU SM90 push FP8 kernel and backend tests; no NCCL-EP
-  backend is required.
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank
   MXFP8 preprocess-vs-reference check.
-- **mega_sm90** — 4-GPU SM90 pull FP8 layer-versus-shim parity.
 
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
 now.
@@ -154,7 +147,7 @@ Notes:
 ### SM90 mega token sweep
 
 Hopper-only (`sm90_pull_fp8`) correctness targets run in their own pytest
-process (the SM90 pull-style and SM100 CuTeDSL trees are mutually exclusive):
+process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
 `bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
 
@@ -634,25 +627,23 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
 - `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
-- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 A2A and
-  grouped GEMM
+  (a fork of the same kernel repo; a push-style tree will be added later)
 
-The sm100 and sm90 pull trees expose their kernels through package public APIs
-(e.g. the sm100 tree's `mxfp8_mega_moe`,
-`get_symm_buffer_for_mxfp8_mega_moe`). They duplicate the shared kernel-repo
-runtime (`common`, `src`, …) at their own drop revision and are
-**process-exclusive** — the top-level kernel module names collide, so each
-tree's `shim/_paths.py` refuses to bootstrap when the sibling tree's modules
-are already imported. The push tree is an independent CUDA/JIT package and
-does not share that module namespace. Use the existing `mxfp8_cutedsl`
-backend as the CuTeDSL reference template.
+Each tree exposes its kernels through its own package public API (e.g. the
+sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
+trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
+own drop revision and are **process-exclusive** — the top-level kernel module
+names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
+sibling tree's modules are already imported (a process runs on one
+architecture anyway). Use the existing `mxfp8_cutedsl` backend as the
+reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
-The buffer-oriented mega kernels expose **two entry points** through a thin
-frontend, and the `MegaKernelBackend` subclass links to nothing else. Keep this
-contract stable so new kernels drop in behind the same backend shape without
+Every mega kernel exposes exactly **two entry points** through a thin frontend,
+and the `MegaKernelBackend` subclass links to nothing else. Keep this contract
+stable so new kernels — including future **SM90 (Hopper)** and **SM120
+(Blackwell-consumer)** variants — drop in behind the same backend shape without
 touching `modes/` or the registry:
 
 **(a) Workspace allocator** — problem sizes first, tuning knobs keyword-only;
@@ -677,8 +668,8 @@ def get_symm_buffer_for_<name>_mega_moe(
 
 The returned buffer must expose the staging tensors the backend's `stage_inputs`
 writes — at minimum `x`, `x_sf` (quantized paths), `topk_idx`, `topk_weights` —
-plus `destroy()`. In this variant, expert weights are passed to the compute call
-each launch.
+plus `destroy()`. Expert weights are **not** owned by the workspace; they are
+passed to the compute call each launch.
 
 **(b) Compute entry** — output tensor first, then the two kernel-ready
 `(weight, scale)` weight tuples, the workspace, and keyword-only knobs. Model it
@@ -700,20 +691,13 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-`sm90_push_fp8` is the equivalent stateful variant: runner construction binds
-the transformed static weights, the layer allocates the destination before
-`stage_inputs()`, and `compute(output=...)` validates and fills it. The
-`MegaKernelBackend` lifecycle is unchanged.
-
 Add both functions under the owning tree's `shim/` — e.g.
 `kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
-`nvfp4.py` / `mxfp8.py`),
-`kernel_src/sm90/pull_style_cutedsl_megakernel/shim/` for the Hopper pull-style
-kernel, or `kernel_src/sm90/push_style_megamoe/shim/` for the Hopper push-style
-kernel — and re-export them from that package's `__init__.py` (or point at your
-own kernel module). Raw kernel sources live under the tree's `src/` — see the
-tree's `SKILL.md` where present for how to update that directory. The
-kernel-specific tuning knobs
+`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+for Hopper — and re-export them from that package's `__init__.py` (or point at
+your own kernel module). Raw kernel sources live under the tree's `src/` — see
+the tree's `SKILL.md` for how to update that directory when the kernel team
+ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
 these two calls by the backend in step 4 — so an SM90/SM120 kernel that needs

@@ -245,18 +245,6 @@ def test_sm90_push_private_gemm_requires_cuda_12_8(tmp_path, monkeypatch):
     assert not any(tmp_path.iterdir())
 
 
-def test_sm90_push_aot_keeps_a2a_and_gates_gemm_on_cuda_12_8():
-    project_root = Path(__file__).resolve().parents[2]
-    source = (project_root / "flashinfer" / "aot.py").read_text(encoding="utf-8")
-
-    a2a = source.index("jit_specs.append(gen_sm90_push_a2a_module())")
-    guard = source.index('if get_cuda_version() >= Version("12.8"):', a2a)
-    gemm = source.index("jit_specs.append(gen_sm90_push_fp8_moe_gemm_module())", guard)
-    skip = source.index("Skipping SM90 push FP8 MoE GEMM AOT module", gemm)
-
-    assert a2a < guard < gemm < skip
-
-
 def test_sm90_push_private_gemm_cubin_digest_covers_dependencies():
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
 

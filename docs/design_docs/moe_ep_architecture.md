@@ -23,7 +23,7 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,sm90_pull_fp8,sm90_push_fp8,…}
+  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
@@ -34,9 +34,6 @@ moe_ep/
   kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
     src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
-  kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 A2A/GEMM sources + FI shim
-    src/{a2a,fp8_gemm}/        ← package-local CUDA sources
-    shim/, __init__.py         ← JIT, protocol, runner, and weight adapters
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -49,7 +46,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, optional `process_group` (EP comm; defaults to WORLD), `auto_bootstrap=True` |
 | `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
-| `MoEWeightPack` | Factory returning `UnquantizedMoEWeights` or `PrequantizedMoEWeights`; scale planes are both present or both absent; required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
+| `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
@@ -90,8 +87,6 @@ classDiagram
     MegaKernelBackend <|-- DeepGemmMegaKernelBackend
     MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
     MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
-    MegaKernelBackend <|-- Sm90PullFp8MegaKernelBackend
-    MegaKernelBackend <|-- Sm90PushFp8MegaKernelBackend
 ```
 
 ## Built-in plugins
@@ -105,14 +100,6 @@ classDiagram
 | Mega kernel | `deep_gemm_mega` | `DeepGemmMegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `nvfp4_cutedsl` | `Nvfp4CutedslMegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `mxfp8_cutedsl` | `Mxfp8CutedslMegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
-| Mega kernel | `sm90_pull_fp8` | `Sm90PullFp8MegaMoeConfig` — FP8, sm_90; pull-style CuTeDSL |
-| Mega kernel | `sm90_push_fp8` | `Sm90PushFp8MegaMoeConfig` — FP8, sm_90; `torch_dist` only |
-
-**`sm90_push_fp8` notes:** its grouped GEMM requires CUDA Toolkit and loaded `cudart` 12.8+.
-Without a Toolkit, detection falls back to `torch.version.cuda`; a warm cache needs a cu128+ PyTorch build.
-AOT packages include the wrapper, not every shape-specialized FC1/FC2 cubin; cold shapes may invoke NVCC,
-while a complete warm cache avoids it. After a sticky CUDA error, device-side abort is best-effort;
-the launcher must terminate the complete rank group from the CPU.
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
@@ -125,7 +112,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `nvfp4_cutedsl`, `mxfp8_cutedsl`, `sm90_pull_fp8` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `nvfp4_cutedsl`, `mxfp8_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
@@ -188,13 +175,12 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
 - **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_pull_fp8 mega kernel
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
-- **sm90_push** — 2-GPU Hopper push-FP8 kernel/backend correctness by default (`NPROC_SM90_PUSH` overrides the world size)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_pull_fp8 mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
@@ -275,7 +261,6 @@ unless noted):
 | mega nvfp4_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega mxfp8_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
 | mega sm90_pull_fp8 (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
-| mega sm90_push_fp8 | 2026-08-04 | H20: EP1 113/0; EP2 and EP4 15/0 per rank |
 
 ## Forward flow
 
