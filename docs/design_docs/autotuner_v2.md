@@ -1,4 +1,8 @@
-# Autotuner v2 — Managed Persistence and Graduation Plan
+# Autotuner v2 — Managed Persistence, Deployment-Matched Measurement, and the Runner Contract
+
+**Scope**: `flashinfer/autotune_cache.py` and `flashinfer/autotuner/` — the managed store, the
+measurement policy, the runner contract that tactic identities must satisfy, and the v1 → v2
+graduation plan (§5).
 
 **Status**: proposed. RFC [#3920](https://github.com/flashinfer-ai/flashinfer/issues/3920); this
 document ships with the v2 MVP in
