@@ -1,5 +1,8 @@
 # moe_ep Design
 
+**Scope**: `flashinfer/moe_ep/` — expert-parallel MoE: core types, backend plugins, runtime,
+lifetimes, and the forward flow for the split and mega paths.
+
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and

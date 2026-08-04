@@ -1,5 +1,9 @@
 # vLLM ⇄ `flashinfer.moe_ep` all2all integration — changes, correctness, benchmarks
 
+**Scope**: none — this is an integration report (cross-repo changes, validation runs, measured
+numbers), not a normative design. The normative designs are
+[`moe_ep_architecture.md`](./moe_ep_architecture.md) and [`MoE_EP_impl.md`](./MoE_EP_impl.md).
+
 This document summarizes the integration of FlashInfer's MoE expert-parallel transport
 (`flashinfer.moe_ep`, NCCL-EP backend) as two vLLM all2all backends
 (`flashinfer_ep_low_latency`, `flashinfer_ep_high_throughput`), and how to build, test for

@@ -1,5 +1,9 @@
 # moe_ep Runbook
 
+**Scope**: none — this is a how-to (build, test, benchmark), not a normative design. Changing
+`flashinfer/moe_ep/` does not require updating it, but changing the *workflow* does. The
+normative design is [`moe_ep_architecture.md`](./moe_ep_architecture.md).
+
 Practical how-to for building, testing, and extending the Expert-Parallel MoE
 stack. For the design/architecture, see
 [`moe_ep_architecture.md`](./moe_ep_architecture.md).

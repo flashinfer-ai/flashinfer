@@ -1,5 +1,9 @@
 # MonoMoe kernel — design
 
+**Scope**: `csrc/fused_moe/monomoe/` — the five-phase pipeline, software grid barriers, the
+co-residency invariant, scratchpad layout, TMA descriptors, and warp roles. Sources cite this
+doc by section number; keep those `§N` references correct when renumbering.
+
 A single-kernel ("mono") top-K MoE for the Qwen3.5-35B block-FP8 shape on
 Hopper (SM90a). One `cudaLaunchKernel` of `moe_kernel_topk<Dims>` runs the whole
 MoE — routing, up-projection + SiLU, down-projection, reduction — with grid-wide

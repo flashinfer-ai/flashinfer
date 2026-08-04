@@ -2,6 +2,9 @@
 
 *Design Document  ·  v0.1  ·  March 2026*
 
+**Scope**: `flashinfer/fused_moe/` — the unified MoE API surface: config hierarchy, backend
+selection, and the eager / autotuned / production call paths.
+
 ## 1. Motivation
 
 FlashInfer currently exposes MoE functionality through a family of flat, positional-argument functions:

@@ -196,6 +196,32 @@ kernel logic and report bugs, labeling findings by confidence.
 
 → **For the complete review rule set, see [`docs/code_review_guidance.md`](docs/code_review_guidance.md)**
 
+## Design Docs
+
+`docs/design_docs/` holds the normative design for the subsystems that have one — the invariants,
+the rationale behind them, and the alternatives already tried and rejected. A doc that has drifted
+from the code is worse than no doc, because the next contributor will trust it.
+
+**Before changing a subsystem, find out whether it has a design doc.** There is deliberately no
+index to maintain here; discovery is local, two ways:
+
+1. **The file tells you.** Files covered by a design doc cite it near the top —
+   `// Design doc: docs/design_docs/<name>.md §N`, as `csrc/fused_moe/monomoe/` does throughout.
+   If the file you are about to edit carries such a pointer, read the doc first.
+2. **The directory tells you.** Every doc opens with a `**Scope**:` line naming the paths it
+   governs, so one command answers "is what I'm touching covered?":
+
+   ```bash
+   grep -H '^\*\*Scope\*\*:' docs/design_docs/*.md
+   ```
+
+Then: **if the code diverges from the doc, update the doc in the same PR**, with the rationale.
+Silently contradicting a design doc is a defect, not a style nit.
+
+Adding a design doc? Two obligations, and they are what keep it discoverable with no central list:
+give it a `**Scope**:` line listing the paths it governs, and cite it from at least one of them.
+A doc that is reachable only by browsing `docs/` will not be read.
+
 ## Architecture: JIT Compilation System
 
 FlashInfer's JIT system has three layers:
@@ -691,8 +717,9 @@ These dependencies are included in FlashInfer's `3rdparty/` directory or `requir
 
 > Because practical engineering involves the accumulated experience of trial and error, match the coding style, efficiency, complexity, verbosity, and defensiveness by learning from existing code as much as possible—this document contains many pointers on where to find examples. Document intentional departures with rationale. Mentioning "AI-assisted" in the git commit message is good transparency. For performance-critical hot paths, leave justification for the special algorithmic choices and other potential alternatives in a comment for review.
 
-**Keep documentation in sync with code changes:** When modifying code that is referenced in this document or in `.claude/skills/`, update the corresponding documentation immediately. This includes:
+**Keep documentation in sync with code changes:** When modifying code that is referenced in this document, in `.claude/skills/`, or in `docs/design_docs/`, update the corresponding documentation immediately. This includes:
 - Important infrastructure changes (e.g., `@flashinfer_api`, `@backend_requirement`, TVM-FFI macros) → Update examples in `CLAUDE.md` and relevant skill files
 - New patterns or conventions → Document them for future reference
 - Deprecated approaches → Remove or mark as deprecated in docs
 - New error handling patterns, macros, or utilities → Add to relevant skill tutorials
+- Subsystem invariants or rationale (see [Design Docs](#design-docs)) → Update the subsystem's design doc in the same PR
