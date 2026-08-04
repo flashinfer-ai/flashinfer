@@ -130,6 +130,8 @@ python wan/transformer_wan_flashinfer.py
 | `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8/FP4-family activation scaling: online scale from the current tensor vs fixed default scale. Backends that ignore this flag: `torch`, `bf16`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`. |
 | `FLASHINFER_USE_SKIP_SOFTMAX_SPARSE` | `1/0`, `true/false`, `yes/no`, `on/off` | Enables skip-softmax sparse attention when the GPU supports it; this forces the TRT-LLM attention path. |
 | `FLASHINFER_SKIP_SOFTMAX_THRESHOLD` | Float, for example `1.0` | Threshold scale passed to the TRT-LLM sparse attention path. |
+| `FLASHINFER_USE_VSA` | `1/0`, `true/false`, `yes/no`, `on/off` | Enables Video Sparse Attention for self-attention (WAN example only). |
+| `FLASHINFER_VSA_SPARSITY` | Float in `[0, 1)`, for example `0.9` | Fraction of KV blocks VSA drops per query block. |
 
 ## WAN Example
 
@@ -138,7 +140,9 @@ The WAN example lives in `wan/` and provides:
 | File | Description |
 |------|-------------|
 | `wan/transformer_wan_flashinfer.py` | FlashInfer implementation of `WanTransformer3DModel` |
-| `wan/pipeline_wan_flashinfer.py` | Diffusers `WanPipeline` loader that swaps in FlashInfer transformer(s) |
+| `wan/pipeline_wan_flashinfer.py` | Diffusers `WanPipeline` loader that swaps in FlashInfer transformer(s), plus the Ulysses multi-GPU launcher |
+| `wan/vsa_attention.py` | Video Sparse Attention (VSA) on FlashInfer's `bsa_attn_blk64_fwd` |
+| `wan/vsa_sanity.py` | Correctness checks for the VSA path |
 
 ### Load a Transformer Checkpoint
 
@@ -191,6 +195,54 @@ python wan/pipeline_wan_flashinfer.py \
   --output wan_flashinfer.mp4
 ```
 
+### Video Sparse Attention (VSA)
+
+`--use-vsa` swaps dense self-attention for the two-stage VSA of
+[arXiv:2505.13389](https://arxiv.org/abs/2505.13389), running the fine stage on
+FlashInfer's `bsa_attn_blk64_fwd` kernel. The token grid is permuted so each
+`(4, 4, 4)` spatio-temporal cube becomes one 64-token block, a coarse stage
+attends over one pooled token per cube, and the top
+`ceil((1 - sparsity) * num_blocks)` blocks per query block go through the sparse
+kernel. `--vsa-sparsity` (default `0.9`) sets the fraction of blocks dropped.
+
+Requirements: SM100, bf16, `head_dim == 128`, and a **VSA-finetuned checkpoint** —
+the gated combine reads a per-block `to_gate_compress` projection that only such
+checkpoints carry. Running `--use-vsa` on a stock Wan checkpoint loads a randomly
+initialized gate and degrades quality.
+
+```bash
+python wan/vsa_sanity.py   # layout, kernel-vs-reference, head independence
+
+python wan/pipeline_wan_flashinfer.py \
+  --model-id FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers \
+  --height 720 --width 1280 --num-frames 81 \
+  --num-inference-steps 50 --guidance-scale 5.0 --flow-shift 5.0 \
+  --gemm-backend fp4 --use-vsa --vsa-sparsity 0.9 \
+  --output wan_vsa.mp4
+```
+
+### Multi-GPU (Ulysses context parallelism)
+
+Launching the same script under `torchrun` shards the visual token sequence
+across ranks and uses `flashinfer.comm.UlyssesCommunicator` for the
+pre/post-attention all-to-all. `--ulysses-backend` picks the transport:
+`nvlink` is FlashInfer's NVLink-P2P kernel, `nccl` is
+`dist.all_to_all_single`, `auto` (default) takes NVLink when the topology
+supports it. The two are numerically identical.
+
+The sequence length must divide by the world size, as must the head count.
+`--check-rank-sync` asserts every rank holds identical latents at each denoising
+step, which is what lets the ranks run the scheduler independently.
+
+```bash
+torchrun --nproc_per_node=8 wan/pipeline_wan_flashinfer.py \
+  --model-id FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers \
+  --height 720 --width 1280 --num-frames 81 \
+  --num-inference-steps 50 --guidance-scale 5.0 --flow-shift 5.0 \
+  --gemm-backend fp4 --use-vsa --ulysses-backend nvlink \
+  --warmup-steps 2 --timing-json timing.json --output wan_vsa_8gpu.mp4
+```
+
 ### WAN Config Fields
 
 `WanTransformer3DConfig` exposes the same backend controls as constructor fields:
@@ -202,6 +254,8 @@ python wan/pipeline_wan_flashinfer.py \
 | `attention_backend` | `auto` | Attention backend. `auto` uses `single` for `batch_size == 1` and `cudnn` for `batch_size > 1`; explicit values are `single`, `cudnn`, and `trtllm` |
 | `use_skip_softmax_sparse` | `False` | Enables sparse attention through TRT-LLM when supported |
 | `skip_softmax_threshold_scale_factor` | `1.0` | Sparse attention threshold scale |
+| `use_vsa` | `False` | Replaces dense self-attention with Video Sparse Attention (SM100, bf16, `head_dim == 128`, VSA-finetuned checkpoint) |
+| `vsa_sparsity` | `0.9` | Fraction of KV blocks VSA drops per query block |
 
 ## Notes
 
