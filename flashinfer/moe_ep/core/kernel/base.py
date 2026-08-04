@@ -209,6 +209,10 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
 
+    def supports_output_view(self) -> bool:
+        """Whether ``compute(output=None)`` returns a workspace-backed view."""
+        return False
+
     @abstractmethod
     def compute(
         self,

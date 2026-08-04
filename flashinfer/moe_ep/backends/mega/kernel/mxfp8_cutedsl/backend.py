@@ -206,6 +206,9 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
+    def supports_output_view(self) -> bool:
+        return True
+
     def compute(
         self,
         workspace: Any,
