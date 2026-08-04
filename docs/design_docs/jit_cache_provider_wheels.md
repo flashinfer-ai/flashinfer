@@ -17,6 +17,10 @@ split such as `flashinfer-jit-cache+cu130.sm90` does not solve installation:
 those artifacts are versions of the same distribution, and pip can install only
 one of them at a time.
 
+The published jit-cache wheels contain host code plus architecture-specific
+SASS cubins. They do not contain PTX, so an sm80 cubin cannot provide a
+forward-compatible fallback for a later GPU architecture.
+
 The new layout must support both of these workflows:
 
 - A normal installation gets every provider published for its CUDA and CPU
@@ -94,16 +98,27 @@ flashinfer install-jit-cache-wheel --mode minimal --sm sm120f
 
 Without `--sm`, the CLI uses the visible CUDA devices. `--sm` may be repeated
 when preparing an image on a different machine. The current prototype provider
-is self-contained for one target, so minimal mode does not add an sm80 wheel.
+is self-contained for one target. Minimal mode installs exactly the detected or
+requested providers and never adds an implicit sm80 baseline.
 
-## What "Core" Means
+## SM80 Is Not a Baseline Provider
 
-There is currently no evidence that an sm80 shared library is a portable binary
-base for later architectures. FlashInfer's NVCC flags emit SASS targets such as
-`code=sm_80`; they do not emit a PTX fallback such as `code=compute_80`. NVIDIA
-documents cubin compatibility within a GPU architecture family, while PTX is
-the forward-compatible representation. An sm80-only `.so` therefore cannot be
-assumed to load on Hopper or Blackwell.
+FlashInfer's NVCC flags emit SASS targets such as `code=sm_80`; they do not emit
+a PTX fallback such as `code=compute_80`. NVIDIA documents cubin compatibility
+within a GPU architecture family, while PTX is the forward-compatible
+representation. An sm80 cubin therefore cannot run on Hopper or Blackwell.
+
+Artifact inspection confirms that this is also true of the published wheels,
+not just the current source flags. Every CUDA-bearing `.so` in the complete
+v0.4.0 cu128, cu129, and cu130 matrix for both x86_64 and AArch64 contained SASS
+and no PTX. A complete scan of the v0.6.16.post1 cu130 AArch64 wheel also found
+no PTX. The standalone `flashinfer-jit-cache` package has therefore never
+provided the proposed compute_80 PTX fallback in the audited release range.
+
+The sm80 provider remains useful for systems that actually contain Ampere GPUs.
+It is an independent provider, not a dependency of sm90, sm100, sm120, or sm121
+providers. Shim dependency lists are literal: sm80 is installed only when the
+published all-provider set or an explicit user selection includes it.
 
 The existing `sm80` capability in `flashinfer/aot.py` is a source and module
 enumeration condition: it selects kernels whose implementation requires the
@@ -119,15 +134,13 @@ For this design, use these terms precisely:
   dispatch.
 - **Provider coverage**: the SASS or PTX targets actually present in every
   `.so` in a provider.
-- **Core wheel**: reserved for a future wheel containing an explicitly audited
-  common module set with declared binary coverage. It must not mean "sm80".
 
 The initial provider build compiles the common and architecture modules together
 for one target. This duplicates common modules across the complete provider set,
 but it gives minimal installations correct native binaries and makes each wheel
-small enough to publish independently. A later common-module split is useful
-only if inventory data shows that it materially reduces total size without
-reintroducing a large fat-binary core.
+small enough to publish independently. A later common-module split would be a
+size optimization only. It is not needed for compatibility and should be added
+only if inventory data shows that it materially reduces total size.
 
 The first SM121 experiment found 652 SM121a-only modules, one host-only module,
 and four SM90a-only FA3 attention-sink modules in a 657-module provider. The
@@ -158,6 +171,7 @@ python -m build --wheel flashinfer-jit-cache-provider
 Build a shim whose default dependencies include the tested provider set:
 
 ```bash
+# sm80 is an independent provider in this explicit all-provider set.
 FLASHINFER_JIT_CACHE_WHEEL_KIND=shim \
 FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="8.0 9.0a 12.0f" \
 FLASHINFER_LOCAL_VERSION=cu130 \
@@ -215,8 +229,9 @@ Before changing release workflows or making shim mode the default:
 
 1. Build each CUDA and CPU matrix entry on the fork and record compressed size,
    uncompressed size, module count, and build time per provider.
-2. Use `cuobjdump --list-elf` on every packaged `.so` and compare actual code
-   targets with the provider manifest.
+2. Use `cuobjdump --list-elf` and `cuobjdump --list-ptx` on every packaged `.so`.
+   Compare actual cubin targets with the provider manifest and require native
+   providers to contain no PTX.
 3. Compare module inventories from one-target builds with the current multi-arch
    build. Any module that appears only when `8.0` is added needs its AOT
    registration condition corrected or an explicit support decision.
@@ -233,7 +248,8 @@ Before changing release workflows or making shim mode the default:
 
 - Whether provider granularity should remain exact SM targets or combine targets
   only when every `.so` contains compatible code for the combined set.
-- Whether a measured common module set warrants separate core providers.
+- Whether a measured common module set warrants separate common-module
+  providers as a size optimization.
 - Whether provider manifests should include hashes and per-module code targets,
   rather than the provider-wide target list used by the prototype.
 - How long to retain legacy monolithic wheel production after the shim becomes

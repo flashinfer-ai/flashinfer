@@ -206,9 +206,10 @@ def inspect_cuda_architectures(
     provider: str,
     cuobjdump: Path,
     strict: bool,
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], list[str]]:
     require(cuobjdump.is_file(), f"cuobjdump not found: {cuobjdump}")
     result: dict[str, list[str]] = {}
+    ptx_modules: list[str] = []
     architecture_pattern = re.compile(r"\bsm[_-]?([0-9]{2,3}[af]?)\b", re.IGNORECASE)
 
     with tempfile.TemporaryDirectory(prefix="flashinfer-cuobjdump-") as temp_dir:
@@ -239,6 +240,23 @@ def inspect_cuda_architectures(
                     }
                 )
                 result[module] = targets
+                ptx_process = subprocess.run(
+                    [str(cuobjdump), "--list-ptx", str(extracted_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                ptx_output = "\n".join(
+                    output.strip()
+                    for output in (ptx_process.stdout, ptx_process.stderr)
+                    if output.strip()
+                )
+                require(
+                    ptx_process.returncode == 0,
+                    f"cuobjdump PTX inspection failed for {module}: {ptx_output}",
+                )
+                if "No PTX file found" not in ptx_output:
+                    ptx_modules.append(module)
 
     mismatches = {
         module: targets
@@ -254,7 +272,13 @@ def inspect_cuda_architectures(
             False,
             f"{len(mismatches)} modules do not contain only {provider}: {examples}",
         )
-    return result
+    if strict and ptx_modules:
+        examples = ", ".join(sorted(ptx_modules)[:10])
+        require(
+            False,
+            f"{len(ptx_modules)} native-provider modules contain PTX: {examples}",
+        )
+    return result, sorted(ptx_modules)
 
 
 def run_install_smoke(shim: Wheel, provider: Wheel, provider_id: str) -> None:
@@ -312,6 +336,7 @@ def write_report(
     provider: str,
     manifest: dict[str, Any],
     module_architectures: dict[str, list[str]],
+    ptx_modules: list[str],
 ) -> None:
     architecture_summary = {
         "provider_only": sum(
@@ -337,6 +362,8 @@ def write_report(
         "modules": sorted(manifest["modules"]),
         "module_cuda_architectures": module_architectures,
         "module_cuda_architecture_summary": architecture_summary,
+        "ptx_module_count": len(ptx_modules),
+        "ptx_modules": ptx_modules,
         "wheels": {
             distribution: {
                 "filename": wheel.path.name,
@@ -400,8 +427,9 @@ def main() -> int:
     validate_shim(shim, args.provider, args.version)
 
     module_architectures: dict[str, list[str]] = {}
+    ptx_modules: list[str] = []
     if args.cuobjdump is not None:
-        module_architectures = inspect_cuda_architectures(
+        module_architectures, ptx_modules = inspect_cuda_architectures(
             provider_wheel,
             module_paths,
             args.provider,
@@ -417,10 +445,11 @@ def main() -> int:
         args.provider,
         manifest,
         module_architectures,
+        ptx_modules,
     )
     print(
         f"Validated {args.provider}: {len(module_paths)} modules, "
-        f"{len(wheel_paths)} wheels"
+        f"{len(ptx_modules)} PTX modules, {len(wheel_paths)} wheels"
     )
     return 0
 
