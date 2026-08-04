@@ -1,13 +1,12 @@
 """XQA validation and concrete launch assembly for MLA decode."""
 
 import math
-from dataclasses import dataclass, replace
-from typing import Any, List, Optional, Tuple, Union, cast
+from dataclasses import replace
+from typing import Optional, Tuple, Union, cast
 
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
-from flashinfer.autotuner import is_in_profile_measurement
 from flashinfer.utils import (
     _check_block_tables_shape,
     check_shape_dtype_device,
@@ -15,7 +14,6 @@ from flashinfer.utils import (
     get_compute_capability,
     get_device_sm_count,
     is_sm12x_supported,
-    next_positive_power_of_2,
 )
 from flashinfer.xqa import get_xqa_module_mla
 
@@ -30,7 +28,6 @@ from .._planning import (
 from .._contracts import (
     _FunctionalMLARequest,
     _FunctionalMLARunner,
-    _concat_adjacent_views_or_cat,
     MLAKVCache,
     MLAQuery,
 )
@@ -113,6 +110,217 @@ class _BatchMLAPagedAttentionXqaBackend:
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self.device = float_workspace_buffer.device
         self._float_workspace_buffer = float_workspace_buffer
+
+    @staticmethod
+    def run_functional(request: _FunctionalMLARequest) -> torch.Tensor:
+        """Launch a one-shot XQA request without planned-wrapper state."""
+        query = request.query
+        kv_cache = request.kv_cache
+        if query.ndim != 4 or query.size(1) != 1:
+            raise ValueError(
+                "XQA MLA requires query shape [batch_size, 1, num_heads, head_dim]"
+            )
+        if query.size(2) != 128:
+            raise ValueError(
+                f"XQA MLA only supports 128 query heads, got {query.size(2)}"
+            )
+        if request.sparse_mla_top_k > 0:
+            raise ValueError("XQA MLA does not support sparse_mla_top_k")
+        if request.cum_seq_lens_q is not None or request.max_q_len is not None:
+            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
+        if request.multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only supported by the "
+                "trtllm-gen backend"
+            )
+        if request.skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("skip_softmax is not supported for XQA backend")
+        if not request.uses_shared_paged_kv_idx:
+            raise ValueError("XQA MLA does not support separate KV page indices")
+        if request.sinks is not None:
+            raise ValueError("XQA MLA does not support sinks")
+        if request.lse is not None or request.return_lse:
+            raise ValueError("XQA MLA does not support LSE output")
+        if request.seq_lens is None:
+            raise ValueError("seq_lens is required for XQA MLA")
+        if kv_cache.ndim == 4:
+            if kv_cache.size(1) != 1:
+                raise ValueError("XQA MLA expects a single KV cache head")
+            kv_cache = kv_cache.squeeze(1)
+        elif kv_cache.ndim != 3:
+            raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
+
+        workspace_buffer = request.workspace_buffer
+        if not isinstance(workspace_buffer, torch.Tensor):
+            raise ValueError("workspace_buffer must be a torch.Tensor")
+        device = query.device
+        if workspace_buffer.device != device:
+            raise ValueError(
+                "workspace_buffer must be on the same device as query, got "
+                f"{workspace_buffer.device} and {device}"
+            )
+        if not _is_xqa_wrapper_arch_supported(device):
+            raise _BackendPlanUnsupportedError(
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
+            )
+
+        page_size = kv_cache.shape[-2]
+        if (
+            request.kv_lora_rank,
+            request.qk_rope_head_dim,
+        ) not in _SUPPORTED_MLA_DIMENSIONS:
+            raise _BackendPlanUnsupportedError(
+                "Unsupported MLA dimensions for XQA, got "
+                f"kv_lora_rank={request.kv_lora_rank} and "
+                f"qk_rope_head_dim={request.qk_rope_head_dim}; "
+                f"supported dimensions are {_SUPPORTED_MLA_DIMENSIONS}."
+            )
+        if page_size not in _SUPPORTED_XQA_PAGE_SIZES:
+            raise _BackendPlanUnsupportedError(
+                "XQA MLA page_size must be one of "
+                f"{_SUPPORTED_XQA_PAGE_SIZES}, got {page_size}."
+            )
+        if query.dtype != kv_cache.dtype:
+            raise _BackendPlanUnsupportedError(
+                "XQA MLA query and KV cache must use the same dtype, got "
+                f"{query.dtype} and {kv_cache.dtype}."
+            )
+        if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise _BackendPlanUnsupportedError(
+                f"XQA MLA supports BF16 or FP8 E4M3 inputs only, got {query.dtype}."
+            )
+        check_shape_dtype_device(
+            query,
+            (
+                query.shape[0],
+                1,
+                128,
+                request.kv_lora_rank + request.qk_rope_head_dim,
+            ),
+            query.dtype,
+            device,
+            "query",
+        )
+        check_shape_dtype_device(
+            kv_cache,
+            (
+                kv_cache.shape[0],
+                page_size,
+                request.kv_lora_rank + request.qk_rope_head_dim,
+            ),
+            kv_cache.dtype,
+            device,
+            "kv_cache",
+        )
+
+        batch_size = query.size(0)
+        check_shape_dtype_device(
+            request.block_tables,
+            None,
+            torch.int32,
+            device,
+            "block_tables",
+        )
+        _check_block_tables_shape(request.block_tables, True)
+        if request.block_tables.shape[0] != batch_size:
+            raise ValueError(
+                "XQA MLA block_tables batch dimension must match query, got "
+                f"{request.block_tables.shape[0]} and {batch_size}."
+            )
+        if not request.block_tables.is_contiguous():
+            raise ValueError("block_tables must be contiguous for XQA MLA")
+        alignment = 128 // page_size
+        if (
+            request.block_tables.shape[1] == 0
+            or request.block_tables.shape[1] % alignment != 0
+        ):
+            raise ValueError(
+                "XQA MLA block_tables width must be a positive multiple of "
+                f"{alignment} for page_size={page_size}."
+            )
+        check_shape_dtype_device(
+            request.seq_lens,
+            (batch_size,),
+            torch.int32,
+            device,
+            "seq_lens",
+        )
+        if not request.seq_lens.is_contiguous():
+            raise ValueError("seq_lens must be contiguous for XQA MLA")
+
+        resolved_enable_pdl = (
+            device_support_pdl(device)
+            if request.enable_pdl is None
+            else request.enable_pdl
+        )
+        if type(resolved_enable_pdl) is not bool:
+            raise TypeError(
+                "XQA MLA expects enable_pdl to be bool or None, got "
+                f"{request.enable_pdl!r}."
+            )
+        if not workspace_buffer.is_contiguous():
+            raise ValueError("workspace_buffer must be contiguous for XQA MLA")
+        workspace_u8 = workspace_buffer.view(torch.uint8).flatten()
+        if workspace_u8.numel() < _XQA_MIN_WORKSPACE_BYTES:
+            raise _BackendPlanUnsupportedError(
+                "XQA MLA workspace must contain at least 128 MiB, got "
+                f"{workspace_u8.numel()} bytes."
+            )
+        _validate_xqa_mla_scales(
+            query,
+            kv_cache,
+            bmm1_scale=request.bmm1_scale,
+            bmm2_scale=request.bmm2_scale,
+        )
+
+        native_shape = (batch_size, query.size(2), request.kv_lora_rank)
+        legacy_shape = (batch_size, 1, query.size(2), request.kv_lora_rank)
+        out = request.out
+        if out is None:
+            out = torch.empty(native_shape, dtype=torch.bfloat16, device=query.device)
+            result = out
+        elif tuple(out.shape) == native_shape:
+            check_shape_dtype_device(
+                out, native_shape, torch.bfloat16, query.device, "out"
+            )
+            result = out
+        else:
+            check_shape_dtype_device(
+                out, legacy_shape, torch.bfloat16, query.device, "out"
+            )
+            result = out
+            out = out.squeeze(1)
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous for XQA MLA")
+
+        semaphore = workspace_u8[:_XQA_SEMAPHORE_BYTES]
+        scratch = workspace_u8[_XQA_SEMAPHORE_BYTES:]
+        semaphore.zero_()
+        module = get_xqa_module_mla(
+            query.dtype,
+            kv_cache.dtype,
+            page_size,
+            request.kv_lora_rank + request.qk_rope_head_dim,
+            query.size(2),
+            False,
+        )
+        module.xqa_mla(
+            get_device_sm_count(device),
+            request.bmm1_scale,
+            out,
+            query,
+            kv_cache.unsqueeze(2),
+            kv_cache.unsqueeze(2),
+            request.block_tables,
+            request.block_tables.shape[1] * page_size,
+            request.seq_lens.unsqueeze(1),
+            batch_size,
+            request.bmm2_scale,
+            semaphore,
+            scratch,
+            resolved_enable_pdl,
+        )
+        return result
 
     @classmethod
     def plan_from_wrapper(
@@ -513,384 +721,47 @@ class _BatchMLAPagedAttentionXqaBackend:
         return out
 
 
-@dataclass
-class _XqaMlaFunctionalState:
-    """Concrete XQA launch state owned by the functional runner."""
-
-    module: Any
-    block_tables: torch.Tensor
-    seq_lens_2d: torch.Tensor
-    batch_size: int
-    num_heads: int
-    kv_lora_rank: int
-    qk_rope_head_dim: int
-    page_size: int
-    q_dtype: torch.dtype
-    kv_dtype: torch.dtype
-    bmm1_scale: float
-    bmm2_scale: float
-    enable_pdl: bool
-    sm_count: int
-    max_seq_len: int
-    semaphore: torch.Tensor
-    scratch: torch.Tensor
-
-
-def _prepare_xqa_mla_functional_state(
-    *,
-    request: _FunctionalMLARequest,
-    initialize_semaphore: bool,
-) -> _XqaMlaFunctionalState:
-    """Validate and reserve the launch state without entering wrapper lifecycle."""
-    query = request.query
-    seq_lens = request.seq_lens
-    assert seq_lens is not None
-    workspace_buffer = request.workspace_buffer
-    device = workspace_buffer.device
-    page_size = request.kv_cache.shape[-2]
-    num_heads = query.size(2)
-    max_q_len = query.size(1)
-    sm_scale = request.bmm1_scale if isinstance(request.bmm1_scale, float) else 1.0
-
-    if not _is_xqa_wrapper_arch_supported(device):
-        raise _BackendPlanUnsupportedError(
-            "XQA MLA wrapper requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
-        )
-    if num_heads != 128:
-        raise _BackendPlanUnsupportedError(
-            f"XQA MLA only supports 128 query heads, got {num_heads}."
-        )
-    if (
-        request.kv_lora_rank,
-        request.qk_rope_head_dim,
-    ) not in _SUPPORTED_MLA_DIMENSIONS:
-        raise _BackendPlanUnsupportedError(
-            "Unsupported MLA dimensions for XQA wrapper, got "
-            f"head_dim_ckv={request.kv_lora_rank} and "
-            f"head_dim_kpe={request.qk_rope_head_dim}; "
-            f"supported dimensions are {_SUPPORTED_MLA_DIMENSIONS}."
-        )
-    if page_size not in _SUPPORTED_XQA_PAGE_SIZES:
-        raise _BackendPlanUnsupportedError(
-            "XQA MLA page_size must be one of "
-            f"{_SUPPORTED_XQA_PAGE_SIZES}, got {page_size}."
-        )
-    if query.dtype != request.kv_cache.dtype:
-        raise _BackendPlanUnsupportedError(
-            "XQA MLA query and KV cache must use the same dtype, got "
-            f"{query.dtype} and {request.kv_cache.dtype}."
-        )
-    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise _BackendPlanUnsupportedError(
-            f"XQA MLA wrapper supports BF16 or FP8 E4M3 inputs only, got {query.dtype}."
-        )
-    if type(sm_scale) is not float or not math.isfinite(sm_scale):
-        raise TypeError(
-            "XQA MLA wrapper expects sm_scale to be a finite Python float, "
-            f"got {sm_scale!r}."
-        )
-    if max_q_len != 1:
-        raise _BackendPlanUnsupportedError(
-            f"XQA MLA wrapper requires max_q_len/query length == 1, got {max_q_len}."
-        )
-
-    batch_size = request.block_tables.shape[0]
-    check_shape_dtype_device(
-        request.block_tables,
-        None,
-        torch.int32,
-        device,
-        "block_tables",
-    )
-    _check_block_tables_shape(request.block_tables, True)
-    if not request.block_tables.is_contiguous():
-        raise ValueError("block_tables must be contiguous for XQA MLA wrapper.")
-    alignment = 128 // page_size
-    if (
-        request.block_tables.shape[1] == 0
-        or request.block_tables.shape[1] % alignment != 0
-    ):
-        raise ValueError(
-            "XQA MLA block_tables width must be a positive multiple of "
-            f"{alignment} for page_size={page_size}."
-        )
-    check_shape_dtype_device(
-        seq_lens,
-        (batch_size,),
-        torch.int32,
-        device,
-        "seq_lens",
-    )
-    if not seq_lens.is_contiguous():
-        raise ValueError("seq_lens must be contiguous for XQA MLA wrapper.")
-
-    resolved_enable_pdl = (
-        device_support_pdl(device) if request.enable_pdl is None else request.enable_pdl
-    )
-    if type(resolved_enable_pdl) is not bool:
-        raise TypeError(
-            "XQA MLA wrapper expects enable_pdl to be bool or None, got "
-            f"{request.enable_pdl!r}."
-        )
-    workspace_u8 = workspace_buffer.view(torch.uint8).flatten()
-    if initialize_semaphore and not workspace_buffer.is_contiguous():
-        raise ValueError("workspace buffer must be contiguous for XQA MLA wrapper.")
-    if initialize_semaphore and workspace_u8.numel() < _XQA_MIN_WORKSPACE_BYTES:
-        raise _BackendPlanUnsupportedError(
-            "XQA MLA wrapper workspace must contain at least 128 MiB, got "
-            f"{workspace_u8.numel()} bytes."
-        )
-    module = get_xqa_module_mla(
-        query.dtype,
-        request.kv_cache.dtype,
-        page_size,
-        request.kv_lora_rank + request.qk_rope_head_dim,
-        num_heads,
-        False,
-    )
-    semaphore = workspace_u8[:_XQA_SEMAPHORE_BYTES]
-    scratch = workspace_u8[_XQA_SEMAPHORE_BYTES:]
-    if initialize_semaphore:
-        semaphore.zero_()
-
-    return _XqaMlaFunctionalState(
-        module=module,
-        block_tables=request.block_tables,
-        seq_lens_2d=seq_lens.unsqueeze(1),
-        batch_size=batch_size,
-        num_heads=num_heads,
-        kv_lora_rank=request.kv_lora_rank,
-        qk_rope_head_dim=request.qk_rope_head_dim,
-        page_size=page_size,
-        q_dtype=query.dtype,
-        kv_dtype=request.kv_cache.dtype,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        enable_pdl=resolved_enable_pdl,
-        sm_count=get_device_sm_count(device),
-        max_seq_len=request.block_tables.shape[1] * page_size,
-        semaphore=semaphore,
-        scratch=scratch,
-    )
-
-
 class XqaMlaDecodeRunner(_FunctionalMLARunner):
-    """Direct functional XQA runner with the single current tactic."""
+    """Tunable-runner compatibility adapter for functional XQA dispatch."""
 
     name = "xqa"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
-        _FunctionalMLARunner.__init__(self, request)
-        self.request = self._normalize_request(request)
-        self.kv_cache = self.request.kv_cache
-        self.workspace_buffer = self.request.workspace_buffer
-        self.kv_lora_rank = self.request.kv_lora_rank
-        self.qk_rope_head_dim = self.request.qk_rope_head_dim
-        self.page_size = self.kv_cache.shape[-2]
-        self.max_seq_len = self.request.max_seq_len
-        self.bmm1_scale = self.request.bmm1_scale
-        self.bmm2_scale = self.request.bmm2_scale
-        self.enable_pdl = self.request.enable_pdl
+        super().__init__(request)
         self._inputs = [
-            self.request.query,
-            self.request.block_tables,
-            self.request.seq_lens,
-            self.request.out,
+            request.query,
+            request.block_tables,
+            request.seq_lens,
+            request.out,
         ]
-        self._prepared_functional_state: Optional[_XqaMlaFunctionalState] = None
-
-    @staticmethod
-    def _normalize_request(request: _FunctionalMLARequest) -> _FunctionalMLARequest:
-        if request.seq_lens is None:
-            raise ValueError("seq_lens is required for XQA MLA")
-        if request.sparse_mla_top_k > 0:
-            raise ValueError("XQA MLA does not support sparse_mla_top_k")
-        if request.cum_seq_lens_q is not None or request.max_q_len is not None:
-            raise ValueError("XQA MLA does not support cum_seq_lens_q / max_q_len")
-        if request.multi_ctas_kv_counter_buffer is not None:
-            raise ValueError(
-                "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
-            )
-        if request.skip_softmax_threshold_scale_factor is not None:
-            raise ValueError("skip_softmax is not supported for XQA backend")
-        if not request.uses_shared_paged_kv_idx:
-            raise ValueError(
-                "XQA MLA does not support separate KV page indices "
-                "(uses_shared_paged_kv_idx=False)"
-            )
-        if request.sinks is not None:
-            raise ValueError("XQA MLA does not support sinks")
-        if request.lse is not None or request.return_lse:
-            raise ValueError("XQA MLA does not support LSE output.")
-
-        kv_cache = request.kv_cache
-        if kv_cache.ndim == 4:
-            if kv_cache.size(1) != 1:
-                raise ValueError(
-                    "XQA MLA expects a single KV cache head, "
-                    f"got kv_cache.shape[1] == {kv_cache.size(1)}"
-                )
-            kv_cache = kv_cache.squeeze(1)
-        elif kv_cache.ndim != 3:
-            raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
-        return replace(request, kv_cache=kv_cache)
 
     @property
     def inputs(self) -> list[torch.Tensor]:
         return self._inputs
 
-    def __hash__(self) -> int:
-        return hash(type(self))
-
-    def get_valid_tactics(self, inputs, profile) -> List[int]:
+    def get_valid_tactics(self, inputs, profile) -> list[int]:
         del inputs, profile
         return [-1]
 
-    def get_cache_key_extras(self, inputs):
-        query, _, _, out = inputs
-        return (
-            query.dtype,
-            self.kv_cache.dtype,
-            out.dtype,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            self.page_size,
-            next_positive_power_of_2(self.max_seq_len),
-            self.enable_pdl,
-            "bmm1_tensor"
-            if isinstance(self.bmm1_scale, torch.Tensor)
-            else "bmm1_float",
-            "bmm2_tensor"
-            if isinstance(self.bmm2_scale, torch.Tensor)
-            else "bmm2_float",
-        )
-
-    def _request_from_inputs(self, inputs) -> _FunctionalMLARequest:
-        query, block_tables, seq_lens, out = inputs
-        return replace(
-            self.request,
-            query=query,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            out=out,
-        )
-
-    def _prepare_output(
-        self,
-        *,
-        query: torch.Tensor,
-        out: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        native_shape = (query.size(0), query.size(2), self.kv_lora_rank)
-        legacy_shape = (query.size(0), 1, query.size(2), self.kv_lora_rank)
-        if out is None:
-            native_out = torch.empty(
-                native_shape, dtype=torch.bfloat16, device=query.device
-            )
-            return native_out, native_out.unsqueeze(1)
-        if tuple(out.shape) == native_shape:
-            check_shape_dtype_device(
-                out, native_shape, torch.bfloat16, query.device, "out"
-            )
-            return out, out
-        check_shape_dtype_device(out, legacy_shape, torch.bfloat16, query.device, "out")
-        return out.squeeze(1), out
-
-    def _launch_functional_state(
-        self,
-        *,
-        request: _FunctionalMLARequest,
-        state: _XqaMlaFunctionalState,
-    ) -> torch.Tensor:
-        native_out, result = self._prepare_output(
-            query=request.query,
-            out=request.out,
-        )
-        q_nope = request.query[..., : self.kv_lora_rank].squeeze(1)
-        q_pe = request.query[..., self.kv_lora_rank :].squeeze(1)
-        check_shape_dtype_device(
-            q_nope,
-            (state.batch_size, state.num_heads, state.kv_lora_rank),
-            state.q_dtype,
-            request.workspace_buffer.device,
-            "q_nope",
-        )
-        check_shape_dtype_device(
-            q_pe,
-            (state.batch_size, state.num_heads, state.qk_rope_head_dim),
-            state.q_dtype,
-            request.workspace_buffer.device,
-            "q_pe",
-        )
-        check_shape_dtype_device(
-            request.kv_cache,
-            (
-                request.kv_cache.shape[0],
-                state.page_size,
-                state.kv_lora_rank + state.qk_rope_head_dim,
-            ),
-            state.kv_dtype,
-            request.workspace_buffer.device,
-            "kv_cache",
-        )
-        if not native_out.is_contiguous():
-            raise ValueError("out must be contiguous for XQA MLA wrapper.")
-
-        query = _concat_adjacent_views_or_cat(q_nope, q_pe).reshape(
-            state.batch_size,
-            1,
-            state.num_heads,
-            state.kv_lora_rank + state.qk_rope_head_dim,
-        )
-        kv_cache = request.kv_cache.unsqueeze(2)
-        _validate_xqa_mla_scales(
-            query,
-            kv_cache,
-            bmm1_scale=request.bmm1_scale,
-            bmm2_scale=request.bmm2_scale,
-        )
-        state.module.xqa_mla(
-            state.sm_count,
-            request.bmm1_scale,
-            native_out,
-            query,
-            kv_cache,
-            kv_cache,
-            state.block_tables,
-            state.max_seq_len,
-            state.seq_lens_2d,
-            state.batch_size,
-            request.bmm2_scale,
-            state.semaphore,
-            state.scratch,
-            state.enable_pdl,
-        )
-        return result
-
     def forward(
         self,
-        inputs,
+        inputs: list[torch.Tensor],
         tactic: int = -1,
         do_preparation: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        del tactic, kwargs
-        request = self._request_from_inputs(inputs)
-        if do_preparation:
-            self._prepared_functional_state = _prepare_xqa_mla_functional_state(
-                request=request,
-                initialize_semaphore=False,
+        del do_preparation, kwargs
+        if tactic != -1:
+            raise ValueError(f"XQA MLA only supports tactic -1, got {tactic!r}.")
+        if len(inputs) != 4:
+            raise ValueError("XQA MLA runner expects four dynamic inputs.")
+        query, block_tables, seq_lens, out = inputs
+        return _BatchMLAPagedAttentionXqaBackend.run_functional(
+            replace(
+                self.request,
+                query=query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                out=out,
             )
-            state = self._prepared_functional_state
-        elif is_in_profile_measurement():
-            if self._prepared_functional_state is None:
-                raise RuntimeError(
-                    "XQA autotuner launch was not prepared before profiling."
-                )
-            state = self._prepared_functional_state
-        else:
-            state = _prepare_xqa_mla_functional_state(
-                request=request,
-                initialize_semaphore=True,
-            )
-        return self._launch_functional_state(request=request, state=state)
+        )

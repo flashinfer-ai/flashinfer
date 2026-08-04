@@ -17,8 +17,9 @@ limitations under the License.
 from collections import namedtuple
 from dataclasses import replace
 import functools
+import threading
+from typing import Any, Callable, cast, List, Optional, Protocol, Sequence, Tuple, Union
 import warnings
-from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -64,7 +65,34 @@ get_batch_mla_module = _get_batch_mla_module
 get_trtllm_gen_fmha_module = _get_trtllm_gen_fmha_module
 
 
-_FUNCTIONAL_MLA_RUNNERS = {
+_xqa_batch_decode_with_kv_cache_mla_warning_emitted = False
+_xqa_batch_decode_with_kv_cache_mla_warning_lock = threading.Lock()
+
+
+def _warn_xqa_batch_decode_with_kv_cache_mla_once() -> None:
+    global _xqa_batch_decode_with_kv_cache_mla_warning_emitted
+    if _xqa_batch_decode_with_kv_cache_mla_warning_emitted:
+        return
+    with _xqa_batch_decode_with_kv_cache_mla_warning_lock:
+        if _xqa_batch_decode_with_kv_cache_mla_warning_emitted:
+            return
+        warnings.warn(
+            "xqa_batch_decode_with_kv_cache_mla is deprecated; use "
+            'batch_mla_paged_attention(..., backend="xqa") instead.',
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        _xqa_batch_decode_with_kv_cache_mla_warning_emitted = True
+
+
+class _MLAFunctionalRunner(Protocol):
+    @property
+    def inputs(self) -> list[torch.Tensor]: ...
+
+    def __call__(self, inputs: list[torch.Tensor], **kwargs: Any) -> Any: ...
+
+
+_FUNCTIONAL_MLA_RUNNERS: dict[str, Callable[[_FunctionalMLARequest], Any]] = {
     "fa2": Fa2MlaRunner,
     "fa3": Fa3MlaRunner,
     "cutlass": CutlassMlaRunner,
@@ -213,10 +241,13 @@ def _run_functional_mla(
     if backend not in ("auto", "cute-dsl", *_FUNCTIONAL_MLA_RUNNERS):
         raise ValueError(f"Backend {backend} not supported by functional MLA")
 
-    def run_explicit(runner: TunableRunner):
+    def run_explicit(runner: _MLAFunctionalRunner):
+        runner = prepare_candidate(runner)
         return runner(inputs=runner.inputs, tactic=-1)
 
-    def prepare_candidate(runner: TunableRunner) -> TunableRunner:
+    def prepare_candidate(
+        runner: _MLAFunctionalRunner,
+    ) -> _MLAFunctionalRunner:
         prepare_for_dispatch = getattr(runner, "_prepare_for_dispatch", None)
         if prepare_for_dispatch is not None:
             prepare_for_dispatch()
@@ -263,7 +294,7 @@ def _run_functional_mla(
 
     def make_cute_runner(
         cute_request: _FunctionalMLARequest, *, for_auto: bool
-    ) -> TunableRunner:
+    ) -> _MLAFunctionalRunner:
         implementation = cute_request.cute_dsl_impl
         if implementation not in ("auto", "monolithic", "modular"):
             raise ValueError(
@@ -324,7 +355,7 @@ def _run_functional_mla(
     if backend != "auto":
         return run_explicit(_FUNCTIONAL_MLA_RUNNERS[backend](request))
 
-    runners: List[TunableRunner] = []
+    runners: List[_MLAFunctionalRunner] = []
     runner_names: List[str] = []
     trtllm_reason = _trtllm_gen_mla_incompatibility_reason(request.kv_cache)
     if 64 < request.query.size(-2) < 128:
@@ -366,7 +397,7 @@ def _run_functional_mla(
             f"(trtllm-gen: {trtllm_reason}; cute-dsl: {cute_reason})"
         )
 
-    tuning_kv_cache = runners[0].kv_cache
+    tuning_kv_cache = request.kv_cache
     _, q_len, num_heads, _ = request.query.shape
     tuning_config = _build_mla_decode_tuning_config(
         kv_cache=tuning_kv_cache,
@@ -394,7 +425,7 @@ def _run_functional_mla(
         inputs.append(request.sparse_mla_top_k_lens)
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm_batch_decode_mla",
-        runners,
+        cast(List[TunableRunner], runners),
         tuning_config,
         inputs,
     )
@@ -423,9 +454,6 @@ def xqa_batch_decode_with_kv_cache_mla(
     enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     r"""XQA-backend batched MLA decode.
-
-    .. deprecated::
-        Use :func:`batch_mla_paged_attention` with ``backend="xqa"`` instead.
 
     Single-query (MTP-aware) MLA decode kernel optimized for SM120a / SM121a tensor cores.
     Accepts the concatenated ``(q_nope || q_rope)`` query and ``(ckv || kpe)`` paged KV
@@ -495,12 +523,7 @@ def xqa_batch_decode_with_kv_cache_mla(
     ``(bmm1_scale_log2_tensor, bmm2_scale_tensor)`` tensor pair may be passed.
     When tensor inputs are supplied, the on-device path is taken (FP8 only).
     """
-    warnings.warn(
-        "xqa_batch_decode_with_kv_cache_mla is deprecated; use "
-        'batch_mla_paged_attention(..., backend="xqa") instead.',
-        DeprecationWarning,
-        stacklevel=3,
-    )
+    _warn_xqa_batch_decode_with_kv_cache_mla_once()
     request = _FunctionalMLARequest(
         query=query,
         kv_cache=kv_cache,
@@ -542,16 +565,11 @@ _xqa_batch_decode_with_kv_cache_mla_fi_trace = (
 
 
 @functools.wraps(_xqa_batch_decode_with_kv_cache_mla_fi_trace)
-def _deprecated_xqa_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs):
-    warnings.warn(
-        "xqa_batch_decode_with_kv_cache_mla is deprecated; use "
-        'batch_mla_paged_attention(..., backend="xqa") instead.',
-        DeprecationWarning,
-        stacklevel=2,
-    )
+def _warn_once_xqa_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs):
+    _warn_xqa_batch_decode_with_kv_cache_mla_once()
     return _xqa_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs)
 
 
 xqa_batch_decode_with_kv_cache_mla.fi_trace = (  # type: ignore[attr-defined]
-    _deprecated_xqa_batch_decode_with_kv_cache_mla_fi_trace
+    _warn_once_xqa_batch_decode_with_kv_cache_mla_fi_trace
 )

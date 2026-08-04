@@ -369,15 +369,17 @@ def _normalize_trtllm_gen_mla_metadata(
     device: torch.device,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    cum_seq_lens_q: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cum_seq_lens_q: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Copy native launch metadata to stable contiguous int32 storage."""
     return (
         block_tables.to(
             device=device, dtype=torch.int32, non_blocking=True
         ).contiguous(),
         seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous(),
-        cum_seq_lens_q.to(
+        None
+        if cum_seq_lens_q is None
+        else cum_seq_lens_q.to(
             device=device, dtype=torch.int32, non_blocking=True
         ).contiguous(),
     )
@@ -888,7 +890,8 @@ class _TrtllmGenMlaFunctionalState:
     launcher: _TrtllmGenMlaDecodeLauncher
     block_tables: torch.Tensor
     seq_lens: torch.Tensor
-    cum_seq_lens_q: torch.Tensor
+    cum_seq_lens_q: Optional[torch.Tensor]
+    batch_size: int
     max_q_len: int
     out: torch.Tensor
     lse: Optional[torch.Tensor]
@@ -1152,21 +1155,28 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
         if request.cum_seq_lens_q is None:
             batch_size = query.size(0)
             max_q_len = query.size(1)
-            cum_seq_lens_q = torch.arange(
-                batch_size + 1, device=query.device, dtype=torch.int32
-            ).mul_(max_q_len)
+            total_q = batch_size * max_q_len
+            actual_max_q_len = max_q_len
+            q_len = max_q_len
+            is_uniform = True
+            cum_seq_lens_q = None
             has_ragged_query = False
         else:
             cum_seq_lens_q = request.cum_seq_lens_q
             assert request.max_q_len is not None
             max_q_len = request.max_q_len
+            batch_size, total_q, actual_max_q_len, is_uniform, q_len = _get_q_layout(
+                cum_seq_lens_q
+            )
             has_ragged_query = True
 
-        for name, tensor in (
-            ("cum_seq_lens_q", cum_seq_lens_q),
+        metadata_tensors = [
             ("block_tables", request.block_tables),
             ("seq_lens", seq_lens),
-        ):
+        ]
+        if cum_seq_lens_q is not None:
+            metadata_tensors.insert(0, ("cum_seq_lens_q", cum_seq_lens_q))
+        for name, tensor in metadata_tensors:
             if tensor.dtype != torch.int32:
                 raise _BackendPlanUnsupportedError(
                     f"trtllm-gen backend expects {name} to have dtype "
@@ -1204,9 +1214,6 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             )
         except _BackendPlanUnsupportedError as error:
             raise _FunctionalBackendUnsupportedError(str(error)) from error
-        batch_size, total_q, actual_max_q_len, is_uniform, q_len = _get_q_layout(
-            cum_seq_lens_q
-        )
         if max_q_len < actual_max_q_len:
             raise _BackendPlanUnsupportedError(
                 "trtllm-gen backend expects max_q_len to be at least the "
@@ -1294,6 +1301,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             block_tables=block_tables,
             seq_lens=seq_lens,
             cum_seq_lens_q=cum_seq_lens_q,
+            batch_size=batch_size,
             max_q_len=max_q_len,
             out=request.out,
             lse=lse,
@@ -1314,7 +1322,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         query = request.query
         has_ragged_query = request.cum_seq_lens_q is not None
-        batch_size = state.cum_seq_lens_q.numel() - 1
+        batch_size = state.batch_size
         sinks = request.sinks
         if isinstance(sinks, (list, tuple)):
             sinks = sinks[0]
@@ -1363,7 +1371,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
                 else request.enable_pdl
             ),
             sinks=sinks,
-            cum_seq_lens_q=(state.cum_seq_lens_q if has_ragged_query else None),
+            cum_seq_lens_q=state.cum_seq_lens_q,
             skip_softmax_threshold_scale_factor=(
                 request.skip_softmax_threshold_scale_factor
             ),
