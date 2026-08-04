@@ -22,11 +22,14 @@ namespace flashinfer {
 namespace group_gemm {
 
 {% for tile_m in [128] %}
-{% for tile_n in [32, 64, 128] %}
+{% for tile_n in [8, 16, 32, 64, 128] %}
 {% for tile_k in [128, 256] %}
 {% for swap_ab in ["true", "false"] %}
 {% for dtype_sfa in ["cutlass::float_ue4m3_t"] %}
 {% for dtype_sfb in ["cutlass::float_ue4m3_t"] %}
+{# tile_n=8 is a single MMA N-atom and is only valid for the decode orientation
+   (swap_ab=true, Out^T = Weight^T Act^T); the swap_ab=false kernel cannot initialize. #}
+{% if not (tile_n == 8 and swap_ab == "false") %}
 
 
 INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120(
@@ -46,6 +49,7 @@ INSTANTIATE_GROUP_GEMM_NVFP4_GROUPWISE_SM120(
     {{ dtype_d  | replace("cutlass::", "")}}
 )
 
+{% endif %}
 {% endfor %}
 {% endfor %}
 {% endfor %}

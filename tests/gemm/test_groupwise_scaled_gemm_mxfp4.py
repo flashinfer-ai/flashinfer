@@ -331,7 +331,7 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
     if compute_capability[0] == 12:
         mma_sm_list = [1]
         tile_m_list = [128]
-        tile_n_list = [32, 64, 128]
+        tile_n_list = [16, 32, 64, 128]
         tile_k_list = [128]
         swap_ab_list = [True, False]
     else:

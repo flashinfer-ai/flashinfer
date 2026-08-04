@@ -134,7 +134,7 @@ def test_group_gemm_nvfp4(
     out_ref = gemm_nvfp4_nt_groupwise_ref(a_float, b_float, out_dtype)
 
     for swap_ab in [True, False]:
-        for tile_n in [32, 64, 128]:
+        for tile_n in [16, 32, 64, 128]:
             for tile_k in [128, 256]:
                 out = group_gemm_nvfp4_nt_groupwise(
                     a_fp4,
