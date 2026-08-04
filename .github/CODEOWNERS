@@ -16,9 +16,9 @@ include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 
 # ── GEMM ──
-flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
-include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
-tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
+flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
+include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
+tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
 
 # ── Grouped GEMM ──
 flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
