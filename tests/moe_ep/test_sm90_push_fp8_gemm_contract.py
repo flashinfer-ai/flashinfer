@@ -50,6 +50,16 @@ def test_private_fp8_host_headers_resolve_deep_gemm_symbols() -> None:
     assert "#include <tensorrt_llm/deep_gemm/compiler.cuh>" in jit
 
 
+def test_private_fp8_runtime_shapes_require_complete_scale_blocks() -> None:
+    binding = "".join(_private_source("fp8_moe_binding.cu").split())
+    start = binding.index("inlinevoidcheck_shape_scalars")
+    end = binding.index("inline", start + len("inline"))
+    shape_checks = binding[start:end]
+
+    assert "TVM_FFI_ICHECK_EQ(shape_n%128,0)" in shape_checks
+    assert "TVM_FFI_ICHECK_EQ(shape_k%128,0)" in shape_checks
+
+
 def test_private_fp8_jit_requires_a_source_digest() -> None:
     jit = _private_source("fp8_moe_jit.cuh")
 
@@ -436,6 +446,10 @@ def test_moe_gemm_rejects_invalid_ffi_arguments() -> None:
         call(offsets=torch.zeros(6, dtype=torch.int64, device="cuda")[::2])
     with pytest.raises(Exception, match="positive"):
         call(n=0)
+    with pytest.raises(Exception, match="N must be divisible by 128"):
+        call(n=2 * case.intermediate - 64)
+    with pytest.raises(Exception, match="K must be divisible by 128"):
+        call(k=case.hidden - 64)
     with pytest.raises(Exception, match="bfloat16"):
         call(output=case.output.float())
     with pytest.raises(Exception, match="input K does not match"):
@@ -521,6 +535,7 @@ def test_fc1_fused_gemm_rejects_invalid_ffi_arguments() -> None:
         a=None,
         offsets=None,
         n=None,
+        k=None,
         scales_a=None,
     ) -> None:
         case.runner.moe_gemm_fc1_fused(
@@ -530,7 +545,7 @@ def test_fc1_fused_gemm_rejects_invalid_ffi_arguments() -> None:
             case.b,
             case.offsets if offsets is None else offsets,
             2 * case.intermediate if n is None else n,
-            case.hidden,
+            case.hidden if k is None else k,
             case.scales_a if scales_a is None else scales_a,
             case.scales_b,
             False,
@@ -544,6 +559,8 @@ def test_fc1_fused_gemm_rejects_invalid_ffi_arguments() -> None:
         call(offsets=torch.zeros(6, dtype=torch.int64, device="cuda")[::2])
     with pytest.raises(Exception, match="positive"):
         call(n=0)
+    with pytest.raises(Exception, match="K must be divisible by 128"):
+        call(k=case.hidden - 64)
     with pytest.raises(Exception, match="divisible by 256"):
         call(n=2 * case.intermediate + 128)
     with pytest.raises(Exception, match="float32"):

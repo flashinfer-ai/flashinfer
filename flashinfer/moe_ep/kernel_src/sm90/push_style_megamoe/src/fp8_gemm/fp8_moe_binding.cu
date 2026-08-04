@@ -34,6 +34,8 @@ inline bool is_fp8_e4m3fn(DLDataType) { return false; }
 inline void check_shape_scalars(char const* name, int64_t shape_n, int64_t shape_k) {
   TVM_FFI_ICHECK(shape_n > 0 && shape_k > 0)
       << name << ": N and K must be positive, got N=" << shape_n << " K=" << shape_k;
+  TVM_FFI_ICHECK_EQ(shape_n % 128, 0) << name << ": N must be divisible by 128";
+  TVM_FFI_ICHECK_EQ(shape_k % 128, 0) << name << ": K must be divisible by 128";
 }
 
 inline size_t check_offsets(char const* name, TensorView offsets, TensorView input) {

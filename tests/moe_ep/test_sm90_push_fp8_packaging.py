@@ -275,7 +275,7 @@ def test_sm90_push_private_gemm_cubin_digest_covers_dependencies():
     assert "FLASHINFER_SM90_PUSH_FP8_MOE_SOURCE_DIGEST +" in jit_source
 
 
-def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch):
+def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch, request):
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
 
     built = []
@@ -301,6 +301,7 @@ def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch):
     )
     monkeypatch.setattr(gemm.jit_env, "FLASHINFER_GEN_SRC_DIR", Path("generated"))
     gemm._load_sm90_push_fp8_moe_gemm_module_cached.cache_clear()
+    request.addfinalizer(gemm._load_sm90_push_fp8_moe_gemm_module_cached.cache_clear)
 
     first = gemm._load_sm90_push_fp8_moe_gemm_module()
     assert gemm._load_sm90_push_fp8_moe_gemm_module() is first
@@ -309,7 +310,6 @@ def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch):
 
     assert second is not first
     assert built == ["private_gemm_a", "private_gemm_b"]
-    gemm._load_sm90_push_fp8_moe_gemm_module_cached.cache_clear()
 
 
 def test_sm90_push_snapshot_replaces_from_unique_sibling_files(tmp_path, monkeypatch):

@@ -17,7 +17,7 @@ limitations under the License.
 Non-fused SM90 MoE baseline compute path (local grouped GEMMs).
 """
 
-from typing import Dict, Tuple
+import weakref
 
 import torch
 
@@ -25,7 +25,13 @@ COMPACT_EMPTY_EXPERTS = False  # the grouped GEMM handles zero-token groups
 EXPERT_PAD = 1  # the kernel needs no per-expert row alignment
 
 _runner = None
-_weight_cache: Dict[int, Tuple[torch.Tensor, ...]] = {}
+_QuantizedWeights = tuple[torch.Tensor, ...]
+_WeightCacheEntry = tuple[
+    weakref.ReferenceType[torch.Tensor],
+    weakref.ReferenceType[torch.Tensor],
+    _QuantizedWeights,
+]
+_weight_cache: dict[tuple[int, int], _WeightCacheEntry] = {}
 
 
 def get_runner():
@@ -41,9 +47,12 @@ def get_runner():
 
 def quant_weights(w13: torch.Tensor, w2: torch.Tensor):
     """Per-expert 128x128 block quant, cached by weight identity (offline cost)."""
-    key = w13.data_ptr()
-    if key in _weight_cache:
-        return _weight_cache[key]
+    key = (w13.data_ptr(), w2.data_ptr())
+    cached = _weight_cache.get(key)
+    if cached is not None:
+        cached_w13, cached_w2, result = cached
+        if cached_w13() is w13 and cached_w2() is w2:
+            return result
     from flashinfer.testing.utils import per_block_cast_to_fp8
 
     E, two_i, H = w13.shape
@@ -62,8 +71,9 @@ def quant_weights(w13: torch.Tensor, w2: torch.Tensor):
         f, s = per_block_cast_to_fp8(w2[e])
         w2_fp8[e].copy_(f)
         w2_sf[e].copy_(s)
-    _weight_cache[key] = (w13_fp8, w13_sf, w2_fp8, w2_sf)
-    return _weight_cache[key]
+    result = (w13_fp8, w13_sf, w2_fp8, w2_sf)
+    _weight_cache[key] = (weakref.ref(w13), weakref.ref(w2), result)
+    return result
 
 
 def quant_act(runner, x_bf16: torch.Tensor):

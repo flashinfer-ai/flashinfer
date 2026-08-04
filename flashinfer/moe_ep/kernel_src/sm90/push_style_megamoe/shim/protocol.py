@@ -197,11 +197,12 @@ class Sm90PushPipe:
     ):
         if config is None:
             config = Sm90PushConfig()
-        if ep_size < 1 or ep_size > 32:
-            raise ValueError(f"ep_size must be in [1, 32], got {ep_size}")
-        comm = (
-            comm_backend if comm_backend is not None else _default_comm_backend(ep_size)
-        )
+        if comm_backend is None:
+            if ep_size < 1 or ep_size > 32:
+                raise ValueError(f"ep_size must be in [1, 32], got {ep_size}")
+            comm = _default_comm_backend(ep_size)
+        else:
+            comm = comm_backend
         comm_size, comm_rank = comm.Get_size(), comm.Get_rank()
 
         def _validate_arguments():
