@@ -47,6 +47,15 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def is_sm120_dsl_available() -> bool:
+    """Return ``True`` when the SM120 CuTe DSL stack is importable.
+
+    SM120 FMHA requires a package providing ``cutlass.experimental`` in
+    addition to the base ``cutlass`` package.
+    """
+    return is_cute_dsl_experimental_available()
+
+
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
     dtype_map = {
         "float16": cutlass.Float16,

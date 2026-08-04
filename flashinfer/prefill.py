@@ -1535,6 +1535,85 @@ def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
     return native_fp4 is not None and kv_data_type == native_fp4
 
 
+def _build_block_tables_from_paged_kv_indices(
+    paged_kv_indptr_host: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert flat paged-KV indices to a shared ``[B, M]`` block table.
+
+    This is the input format consumed by the existing backend and SM120 PRIMS.
+    K and V share every logical-to-physical page mapping.
+    """
+    blocks_per_seq = [
+        int(paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i])
+        for i in range(batch_size)
+    ]
+    max_num_blocks_per_seq = max(blocks_per_seq)
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device=device,
+    )
+    for i, num_blocks_needed in enumerate(blocks_per_seq):
+        start = int(paged_kv_indptr_host[i])
+        end = int(paged_kv_indptr_host[i + 1])
+        block_tables[i, :num_blocks_needed] = paged_kv_indices[start:end]
+    return block_tables
+
+
+def _validate_sm120_prims_plan_options(
+    *,
+    kv_layout: str,
+    custom_mask: Optional[torch.Tensor],
+    packed_custom_mask: Optional[torch.Tensor],
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    prefix_len_ptr: Optional[torch.Tensor],
+    token_pos_in_items_ptr: Optional[torch.Tensor],
+    max_item_len_ptr: Optional[torch.Tensor],
+    fixed_split_size: int,
+) -> None:
+    """Fail fast for features outside the first PRIMS backend contract."""
+    backend = "backend='cute-dsl-prims'"
+    if kv_layout != "NHD":
+        raise ValueError(f"{backend} requires kv_layout='NHD'; got {kv_layout!r}")
+    if custom_mask is not None or packed_custom_mask is not None:
+        raise NotImplementedError(f"{backend} does not support custom masks")
+    if pos_encoding_mode != "NONE":
+        raise NotImplementedError(
+            f"{backend} requires pos_encoding_mode='NONE'; got "
+            f"{pos_encoding_mode!r}. Apply RoPE to Q/K before attention."
+        )
+    if use_fp16_qk_reduction:
+        raise NotImplementedError(
+            f"{backend} uses FP32 accumulation and does not support "
+            "use_fp16_qk_reduction=True"
+        )
+    if window_left >= 0:
+        raise NotImplementedError(
+            f"{backend} does not support sliding window; got window_left={window_left}"
+        )
+    if logits_soft_cap > 0:
+        raise NotImplementedError(
+            f"{backend} does not support logits_soft_cap={logits_soft_cap}"
+        )
+    if any(
+        value is not None
+        for value in (prefix_len_ptr, token_pos_in_items_ptr, max_item_len_ptr)
+    ):
+        raise NotImplementedError(
+            f"{backend} does not support multi-item scoring/prefix metadata"
+        )
+    if fixed_split_size not in (-1, None):
+        raise NotImplementedError(
+            f"{backend} does not support fixed_split_size={fixed_split_size}"
+        )
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -1707,11 +1786,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
-            or ``cute-dsl``.
+            ``cute-dsl``/``cute-dsl-prims``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            ``cute-dsl-prims`` is an explicit SM120-only FP8 prefill backend. It requires
+            ``NHD`` layout, a contiguous ``(k_cache, v_cache)`` tuple, equal QK/VO head
+            dimensions, and page size 16, 32, 64, or 128. It does not use the wrapper's
+            split-K workspace and rejects custom masks, positional encoding, sliding
+            windows, logits soft cap, fixed split, and tensor-valued scales.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1751,6 +1835,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
+        if jit_args is not None and backend == "cute-dsl-prims":
+            raise ValueError(
+                "jit_args cannot be combined with backend='cute-dsl-prims'"
             )
 
         if jit_args is not None and backend != "cute-dsl":
@@ -1844,6 +1932,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._prims_backend = None
+        if backend == "cute-dsl-prims":
+            try:
+                from .attention.cute_dsl.sm120_fmha import (
+                    SM120PrimsBatchPrefillBackend,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "backend='cute-dsl-prims' requires the SM120 CuTe DSL stack "
+                    "providing cutlass.experimental"
+                ) from exc
+            self._prims_backend = SM120PrimsBatchPrefillBackend(self.device)
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1922,6 +2022,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         way as :meth:`plan`.  The wrapper's float workspace buffer is only used
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
+        For ``backend="cute-dsl-prims"``, this method returns ``(0, 0)`` because
+        that backend does not use FlashInfer's float/int split-K workspaces.
 
         Parameters
         ----------
@@ -2017,6 +2119,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if self._backend == "cute-dsl-prims":
+            return (0, 0)
+
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2182,6 +2287,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        qo_indptr_host: Optional[torch.Tensor] = None,
+        paged_kv_indptr_host: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_host: Optional[torch.Tensor] = None,
+        kv_lens_host: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2225,7 +2334,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal : bool
             Whether to apply causal mask to the attention matrix.
             This is only effective when :attr:`custom_mask` is not provided in
-            :meth:`plan`.
+            :meth:`plan`. The ``cute-dsl-prims`` backend uses balanced causal
+            scheduling unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1``.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -2359,8 +2469,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
+        # Explicit host metadata lets runtimes that already track lengths avoid
+        # synchronizing device indptr tensors during eager planning.
+        if qo_indptr_host is None:
+            qo_indptr_host = qo_indptr.to("cpu")
+        elif qo_indptr_host.device.type != "cpu":
+            raise ValueError("qo_indptr_host must be a CPU tensor")
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
@@ -2368,12 +2482,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
 
-        if max_sequence_kv is not None:
+        if max_sequence_kv is not None and self._backend != "cute-dsl-prims":
             self._max_kv_len = max_sequence_kv
         else:
-            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-            if seq_lens is None:
+            if paged_kv_indptr_host is None:
+                paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+            elif paged_kv_indptr_host.device.type != "cpu":
+                raise ValueError("paged_kv_indptr_host must be a CPU tensor")
+            if paged_kv_last_page_len_host is None:
+                paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+            elif paged_kv_last_page_len_host.device.type != "cpu":
+                raise ValueError("paged_kv_last_page_len_host must be a CPU tensor")
+            if kv_lens_host is not None:
+                if kv_lens_host.device.type != "cpu":
+                    raise ValueError("kv_lens_host must be a CPU tensor")
+                kv_lens_arr_host = kv_lens_host.flatten()
+            elif seq_lens is None:
                 kv_lens_arr_host = get_seq_lens(
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
@@ -2534,6 +2658,50 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_last_page_len=self._paged_kv_last_page_len_buf,
                 kv_layout=self._kv_layout,
             )
+        elif self._backend == "cute-dsl-prims":
+            _validate_sm120_prims_plan_options(
+                kv_layout=self._kv_layout,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                max_item_len_ptr=max_item_len_ptr,
+                fixed_split_size=fixed_split_size,
+            )
+            if block_tables is None:
+                block_tables = _build_block_tables_from_paged_kv_indices(
+                    paged_kv_indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                )
+            else:
+                block_tables = block_tables.to(
+                    device=self.device, dtype=torch.int32, non_blocking=non_blocking
+                ).contiguous()
+            self._block_tables = block_tables
+            assert self._prims_backend is not None
+            self._prims_backend.plan_paged(
+                qo_indptr=self._qo_indptr_buf,
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv=self._kv_lens_buffer[:batch_size],
+                seqlens_kv_host=kv_lens_arr_host,
+                block_tables=self._block_tables,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                o_dtype=o_data_type,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
@@ -2566,7 +2734,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        self._block_tables = block_tables
+        if self._backend != "cute-dsl-prims":
+            self._block_tables = block_tables
         if self._backend == "trtllm-gen":
             # Allocated once per plan and reused across run() launches; the
             # trtllm-gen kernel self-resets the counters after each launch.
@@ -2588,26 +2757,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "Use window_left=-1 for dense bidirectional attention."
                 )
             if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int,
-                    device=self.device,
+                self._block_tables = _build_block_tables_from_paged_kv_indices(
+                    paged_kv_indptr_host,
+                    paged_kv_indices,
+                    batch_size,
+                    self.device,
                 )
-                block_id = paged_kv_indptr_host[0]
-                for i in range(batch_size):
-                    num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
-                    )
-                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
-                        block_id : block_id + num_blocks_needed
-                    ]
-                    block_id += num_blocks_needed
 
         if self._cached_module is not None:
             args = [
@@ -2841,6 +2996,101 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if self._backend == "cute-dsl-prims":
+            if enable_pdl:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support enable_pdl=True"
+                )
+            if args:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not accept custom run arguments"
+                )
+            if sinks is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support attention sinks"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
+                )
+            if skip_softmax_threshold_scale_factor is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    "skip_softmax_threshold_scale_factor"
+                )
+            if window_left is not None and window_left != self._window_left:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support a run-time "
+                    "window_left override"
+                )
+            if not isinstance(paged_kv_cache, tuple) or len(paged_kv_cache) != 2:
+                raise ValueError(
+                    "backend='cute-dsl-prims' paged prefill requires a contiguous "
+                    "NHD (k_cache, v_cache) tuple; a combined 5-D cache produces "
+                    "non-contiguous plane views"
+                )
+            k_cache, v_cache = paged_kv_cache
+            _check_cached_qkv_data_type(
+                q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            )
+            if (
+                k_cache.ndim != 4
+                or v_cache.shape != k_cache.shape
+                or not k_cache.is_contiguous()
+                or not v_cache.is_contiguous()
+            ):
+                raise ValueError(
+                    "backend='cute-dsl-prims' requires contiguous NHD K/V pools "
+                    "with shape [num_pages, page_size, num_kv_heads, head_dim]"
+                )
+            if q.size(0) != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match planned total "
+                    f"query tokens ({self._qo_indptr_last})"
+                )
+            out_shape = q.shape[:-1] + (v_cache.shape[-1],)
+            if out is None:
+                out = torch.empty(
+                    out_shape,
+                    dtype=self._cached_o_data_type,
+                    device=q.device,
+                )
+            else:
+                check_shape_dtype_device(
+                    out,
+                    out_shape,
+                    self._cached_o_data_type,
+                    q.device,
+                    "out",
+                )
+            if return_lse:
+                if lse is None:
+                    lse = torch.empty(
+                        (q.size(0), q.size(1)),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                else:
+                    check_shape_dtype_device(
+                        lse,
+                        (q.size(0), q.size(1)),
+                        torch.float32,
+                        q.device,
+                        "lse",
+                    )
+            assert self._prims_backend is not None
+            self._prims_backend.run_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                lse=lse if return_lse else None,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return (out, lse) if return_lse else out
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
@@ -3372,11 +3622,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``.
+            or ``cute-dsl``/``cute-dsl-prims``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
+            ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend. It
+            requires ``NHD`` layout, equal QK/VO head dimensions, and contiguous packed
+            Q/K/V. It rejects custom masks, positional encoding, sliding windows, logits
+            soft cap, fixed split, and tensor-valued scales.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3405,6 +3659,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
                 "under MaskMode.CUSTOM."
             )
+        if jit_args is not None and backend == "cute-dsl-prims":
+            raise ValueError(
+                "jit_args cannot be combined with backend='cute-dsl-prims'"
+            )
         if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
@@ -3427,11 +3685,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._variant_owns_mask = variant_owns_mask
 
         self._cute_dsl_wrapper = None
+        self._prims_backend = None
         if backend == "cute-dsl":
             from .cute_dsl.attention import BatchPrefillCuteDSLWrapper
 
             self._cute_dsl_wrapper = BatchPrefillCuteDSLWrapper(
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
+            )
+        elif backend == "cute-dsl-prims":
+            try:
+                from .attention.cute_dsl.sm120_fmha import (
+                    SM120PrimsBatchPrefillBackend,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "backend='cute-dsl-prims' requires the SM120 CuTe DSL stack "
+                    "providing cutlass.experimental"
+                ) from exc
+            self._prims_backend = SM120PrimsBatchPrefillBackend(
+                float_workspace_buffer.device
             )
 
         self._kv_layout = kv_layout
@@ -3537,6 +3809,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        qo_indptr_host: Optional[torch.Tensor] = None,
+        kv_indptr_host: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3576,6 +3850,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         causal : bool
             Whether to apply causal mask to the attention matrix.
             This argument is ignored if ``mask`` is provided in :meth:`plan`.
+            The ``cute-dsl-prims`` backend uses balanced causal scheduling
+            unless ``PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING=1``.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -3689,9 +3965,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bitorder="little",
             )
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        kv_indptr_host = kv_indptr.to("cpu")
+        # Explicit host metadata lets runtimes that already track lengths avoid
+        # synchronizing device indptr tensors during eager planning.
+        if qo_indptr_host is None:
+            qo_indptr_host = qo_indptr.to("cpu")
+        elif qo_indptr_host.device.type != "cpu":
+            raise ValueError("qo_indptr_host must be a CPU tensor")
+        if kv_indptr_host is None:
+            kv_indptr_host = kv_indptr.to("cpu")
+        elif kv_indptr_host.device.type != "cpu":
+            raise ValueError("kv_indptr_host must be a CPU tensor")
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
@@ -3774,7 +4057,37 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_seq_in_batch = int(kv_len_arr.max().item())
         max_qo_len = int((qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item())
 
-        if self._backend == "cute-dsl":
+        if self._backend == "cute-dsl-prims":
+            _validate_sm120_prims_plan_options(
+                kv_layout=self._kv_layout,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                max_item_len_ptr=max_item_len_ptr,
+                fixed_split_size=fixed_split_size,
+            )
+            assert self._prims_backend is not None
+            self._prims_backend.plan_ragged(
+                qo_indptr=self._qo_indptr_buf,
+                kv_indptr=self._kv_indptr_buf,
+                qo_indptr_host=qo_indptr_host,
+                kv_indptr_host=kv_indptr_host,
+                q_dtype=q_data_type,
+                kv_dtype=kv_data_type,
+                o_dtype=o_data_type,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
+        elif self._backend == "cute-dsl":
             if custom_mask is not None or packed_custom_mask is not None:
                 raise NotImplementedError(
                     "cute-dsl backend does not support custom_mask"
@@ -3968,7 +4281,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
-        elif self._backend not in ("cudnn", "cute-dsl"):
+        elif self._backend not in ("cudnn", "cute-dsl", "cute-dsl-prims"):
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -4136,6 +4449,78 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if self._backend == "cute-dsl-prims":
+            if enable_pdl:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support enable_pdl=True"
+                )
+            if args:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not accept custom run arguments"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
+                )
+            if o_scale is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support o_scale"
+                )
+            _check_cached_qkv_data_type(
+                q, k, self._cached_q_data_type, self._cached_kv_data_type
+            )
+            if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+                raise ValueError(
+                    "backend='cute-dsl-prims' requires contiguous packed Q/K/V"
+                )
+            if q.size(0) != self._qo_indptr_last:
+                raise ValueError(
+                    f"q.shape[0] ({q.size(0)}) does not match planned total "
+                    f"query tokens ({self._qo_indptr_last})"
+                )
+            out_shape = q.shape[:-1] + (v.shape[-1],)
+            if out is None:
+                out = torch.empty(
+                    out_shape,
+                    dtype=self._cached_o_data_type,
+                    device=q.device,
+                )
+            else:
+                check_shape_dtype_device(
+                    out,
+                    out_shape,
+                    self._cached_o_data_type,
+                    q.device,
+                    "out",
+                )
+            if return_lse:
+                if lse is None:
+                    lse = torch.empty(
+                        (q.size(0), q.size(1)),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                else:
+                    check_shape_dtype_device(
+                        lse,
+                        (q.size(0), q.size(1)),
+                        torch.float32,
+                        q.device,
+                        "lse",
+                    )
+            assert self._prims_backend is not None
+            self._prims_backend.run_ragged(
+                q,
+                k,
+                v,
+                out,
+                lse=lse if return_lse else None,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return (out, lse) if return_lse else out
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(

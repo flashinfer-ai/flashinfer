@@ -318,6 +318,7 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
+            "cute-dsl-prims",
         ],
         help="Kernel backends to test. Default: fa2. prims-ts selects the experimental task-scheduled Blackwell backend for all attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
@@ -1315,7 +1316,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     res = []
 
     q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
-    if q_dtype not in [torch.float16, torch.bfloat16, torch.float8_e4m3fn]:
+    if q_dtype not in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ]:
         print(f"[ERROR] Unsupported q_dtype: {args.q_dtype}")
         return res
     q_init_dtype = torch.float16 if q_dtype == torch.float16 else torch.bfloat16
@@ -1326,6 +1332,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         torch.float16,
         torch.bfloat16,
         torch.float8_e4m3fn,
+        torch.float8_e5m2,
         torch.uint8,
     ]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
@@ -1338,6 +1345,16 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if o_data_type not in [torch.bfloat16, torch.float16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported out_dtype: {args.out_dtype}")
         return res
+    if "cute-dsl-prims" in args.backends:
+        if args.out_dtype is None:
+            print(
+                "[ERROR] --out_dtype must be set to bfloat16 or float16 for cute-dsl-prims."
+            )
+            return res
+        prims_out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+        if prims_out_dtype not in (torch.bfloat16, torch.float16):
+            print(f"[ERROR] Unsupported cute-dsl-prims out_dtype: {args.out_dtype}")
+            return res
 
     # Increase tolerances for FP8 due to lower precision
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1652,8 +1669,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         q, q_scale_t = to_float8(q, q_dtype)
         q_scale = q_scale_t.item()
         q_scale_tensor = q_scale_t.reshape(1, 1, 1, 1)
-        # o_data_type stays as q_dtype (FP8 output)
-
     if is_nvfp4_kv:
         kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
             kv_cache[:, 0], kv_cache[:, 1]
@@ -1712,6 +1727,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             output_scale=prims_ts_output_scale,
             out_dtype=o_data_type,
         )
+    prims_k_cache = k_cache_cudnn.transpose(1, 2).contiguous()
+    prims_v_cache = v_cache_cudnn.transpose(1, 2).contiguous()
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
@@ -1721,11 +1738,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = backend_wrappers_prims_ts
             resolved_backends[backend] = backend
             continue
-        if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa3", "auto", "trtllm-gen", "cute-dsl-prims"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "HND",
+                    "NHD" if backend == "cute-dsl-prims" else "HND",
                     use_cuda_graph=is_cuda_graph_compatible
                     if backend != "fa2"
                     else False,
@@ -1825,6 +1842,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 out=out,
+            )
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                (prims_k_cache, prims_v_cache),
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -2142,7 +2167,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backend = resolved_backends.get(backend, backend)
             display_backend = (
-                f"auto({resolved_backend})" if backend == "auto" else backend
+                f"auto({resolved_backend})" if backend == "auto" else resolved_backend
             )
             print_perf_metrics(
                 display_backend, median_time, std_time, tflops, tb_per_sec
@@ -2558,7 +2583,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in [
+            "cutlass",
+            "fa2",
+            "fa3",
+            "trtllm-gen",
+            "cute-dsl-prims",
+        ]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -2699,6 +2730,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
