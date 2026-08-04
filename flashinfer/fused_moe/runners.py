@@ -223,11 +223,7 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
-    # Fused shared experts are opt-in per backend. A runner that does not set
-    # this either pins num_fused_shared_experts=0 on its launch path or never
-    # forwards the argument at all, so honoring S>0 would silently drop the
-    # shared experts from the result rather than fail. Default False keeps that
-    # failure mode unreachable for backends that have not been wired.
+    # Backends must opt in so unsupported runners cannot silently ignore S.
     supports_fused_shared_experts: ClassVar[bool] = False
 
     config: MoEConfig
@@ -251,16 +247,7 @@ class MoERunner(TunableRunner):
         self._assert_shared_experts_supported()
 
     def _assert_shared_experts_supported(self) -> None:
-        """Reject S>0 on a backend that does not implement it.
-
-        Called from ``check_support()`` *and* from every ``pack_inputs()``.
-        ``check_support()`` alone is not enough: only ``MoELayer.__init__``
-        calls it (and swallows the result to filter candidates), so anything
-        holding a runner directly — tests, benchmarks, a caller reusing one
-        backend — would otherwise reach the launch path. A non-supporting
-        runner pins ``num_fused_shared_experts=0`` or never forwards it, so the
-        shared experts would be dropped from the result with no error.
-        """
+        """Reject S>0 on unsupported backends, including direct runner use."""
         s = self.config.experts.num_fused_shared_experts
         if s > 0 and not self.supports_fused_shared_experts:
             raise NotImplementedError(
@@ -287,25 +274,9 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__}.build() must be called before execution."
             )
 
-    # ---- Autotune cache keying -------------------------------------------
-    #
-    # The autotuner keys a profiling result on
-    # (custom_op, runner_class_name, runner_hash, nearest_profile, extras).
-    # ``custom_op`` is ``f"moe_{backend_key}"`` — constant per backend — and
-    # ``nearest_profile`` sees only the *profiled tensor list*, which for the
-    # trtllm-gen adapters carries activations and routing but NOT the weights:
-    # those travel in ``_static_kwargs``. So intermediate_size, the expert
-    # counts, the activation, and the layout flags are all invisible to the
-    # profile, and two configs differing only in those would share one entry.
-    #
-    # ``file_key`` additionally drops ``runner_hash`` on purpose (it is runtime
-    # identity and would differ across processes), so the on-disk cache is
-    # keyed by ``extras`` alone. Both therefore derive from one tuple below.
-    #
-    # Contents mirror the instance key that ``core.MoERunner.get_valid_tactics``
-    # feeds to ``trtllm_get_valid_moe_configs`` — that is what actually decides
-    # which tactics are legal. hidden_size and num_tokens are omitted because
-    # they *are* recoverable from the profiled shapes.
+    # Values absent from profiled tensor shapes must be explicit cache-key
+    # extras. The persistent key excludes runner_hash, so both keys share this
+    # stable tuple. Tensor-derived hidden_size and num_tokens are omitted.
 
     def _cache_key_extras(self) -> tuple:
         """Tactic-relevant configuration, as a hashable, str()-stable tuple."""
@@ -318,35 +289,22 @@ class MoERunner(TunableRunner):
         )
         return (
             self.backend_key,
-            # Name, not the enum object: this tuple is serialized via str()
-            # into the on-disk cache key, so every element needs a stable
-            # cross-process repr.
+            # The persistent key uses str(), so prefer stable scalar values.
             self.config.quant.variant.name,
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
             int(experts.local_expert_offset),
             int(experts.intermediate_size),
-            # Fused shared experts widen the counts the tactic enumeration
-            # keys on (top_k + S, num_local_experts + S) without changing any
-            # profiled shape, so S=0 and S>0 would otherwise share a tactic.
+            # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
             int(self.config.activation.type),
             bool(self.config.execution.do_finalize),
-            # Routing shape. These do not change which tactics are *legal*, but
-            # they change the expert-token distribution, and therefore the
-            # per-expert GEMM shapes and padding a tactic is ranked on. Two
-            # configs differing only here can genuinely want different winners.
-            # routed_scaling_factor is deliberately absent: it is a pure output
-            # scale with no bearing on ranking.
+            # Routing shape affects expert-token distribution and tactic ranking.
             int(routing.method),
             routing.n_group,
             routing.topk_group,
-            # Declared but not yet consumed by any TRTLLM runner (they all pass
-            # per_token_scale=None today). Keyed anyway: both feed the upstream
-            # tactic enumeration once a runner honors them, and re-deriving that
-            # at the point of use is exactly the omission this method exists to
-            # prevent.
+            # Declared quant flags are keyed before runners begin consuming them.
             self.config.quant.per_token_scale,
             self.config.quant.swizzled_scale_factors,
         ) + tuple(self._backend_cache_key_parts())
@@ -364,9 +322,7 @@ class MoERunner(TunableRunner):
         return hash(self._cache_key_extras())
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        # Synthesis-invariant: derived from configuration scalars only, never
-        # from tensor contents, so the autotuner's synthesized profiling
-        # tensors produce the same key as the caller's real inputs.
+        # Configuration-only, so synthesized profiling inputs use the same key.
         return self._cache_key_extras()
 
 
@@ -1580,10 +1536,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
-        # Fused shared experts append S weight rows after the routed experts,
-        # so every expert-major tensor carries local + S rows. Keep the routed
-        # count separate: the kernel takes routed-only num_local_experts and
-        # widens it itself.
+        # Weights have local + S rows; the kernel still takes the routed count.
         self._num_fused_shared_experts = experts.num_fused_shared_experts
         self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
 
@@ -1760,15 +1713,8 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
             expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
-            # Matches the flat API, where num_fused_shared_experts is
-            # deliberately absent from the *_routed_moe entry points. Widening
-            # a caller's [num_tokens, top_k] row-major ids/weights to top_k + S
-            # here would cost a full re-strided copy -- O(tokens x top_k) of
-            # pure data movement -- or dual-stride awareness through the whole
-            # post-topk pipeline. A pre-routed caller that wants shared experts
-            # can express them directly instead: append the slots to
-            # topk_ids/topk_weights and declare num_experts + S experts with
-            # top_k + S, which needs no support from this runner.
+            # The flat pre-routed API has no shared-expert argument. Callers can
+            # append shared slots themselves and declare the fused totals.
             if self._num_fused_shared_experts > 0:
                 raise NotImplementedError(
                     "TrtllmFp8BlockRunner requires FromLogits routing when "
