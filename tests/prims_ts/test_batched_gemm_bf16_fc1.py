@@ -232,6 +232,8 @@ class TestBf16Fc1GatherGPU:
         swap_ab=False,
         cluster_m=1,
         problem_k=None,
+        pipeline_stages_a=None,
+        pipeline_stages_b=None,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -248,6 +250,11 @@ class TestBf16Fc1GatherGPU:
             cfg["tile_scheduler"] = 1
             cfg["num_stages_tmem_acc"] = 2
             # num_gather_warps computed by kernel's compute_warp_layout
+        stage_overrides = uniform_pipeline_stage_overrides(pipeline_stages)
+        if pipeline_stages_a is not None:
+            stage_overrides["num_stages_a"] = pipeline_stages_a
+        if pipeline_stages_b is not None:
+            stage_overrides["num_stages_b"] = pipeline_stages_b
         result = reference_check(
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -257,7 +264,7 @@ class TestBf16Fc1GatherGPU:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             problem_k=problem_k,
-            **uniform_pipeline_stage_overrides(pipeline_stages),
+            **stage_overrides,
             **cfg,
         )
         assert result, (
@@ -322,6 +329,24 @@ class TestBf16Fc1GatherGPU:
             num_tokens=64,
             problem_k=1024,
             pipeline_stages=4,
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.parametrize("pipeline_stages_a,pipeline_stages_b", [(3, 4), (4, 3)])
+    def test_gather_2cta_unequal_pipeline_stages(
+        self, swap_ab, pipeline_stages_a, pipeline_stages_b
+    ):
+        """Preserve each operand ring phase when A/B stage depths differ."""
+        self._run(
+            tile_n=64,
+            swap_ab=swap_ab,
+            cluster_m=2,
+            num_experts=1,
+            num_tokens=64,
+            problem_k=1664,
+            pipeline_stages=4,
+            pipeline_stages_a=pipeline_stages_a,
+            pipeline_stages_b=pipeline_stages_b,
         )
 
 
