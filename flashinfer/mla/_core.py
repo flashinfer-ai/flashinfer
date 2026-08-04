@@ -1218,7 +1218,7 @@ def _reject_hca_conversion_during_capture(device: torch.device) -> None:
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "page-aligned HCA metadata conversion is not CUDA Graph "
+                "compressed-page-aligned HCA metadata conversion is not CUDA Graph "
                 "capture safe; precompute HCA metadata before capture"
             )
 
@@ -1286,7 +1286,7 @@ def _recover_hca_page_ids(
 
     if invalid.item():
         raise ValueError(
-            f"active {name} sparse_indices are not a canonical page-aligned "
+            f"active {name} sparse_indices are not a canonical {name}-page "
             "expansion with valid physical page IDs"
         )
     return torch.where(active_pages, page_ids, torch.zeros_like(page_ids)).to(
@@ -1294,7 +1294,7 @@ def _recover_hca_page_ids(
     )
 
 
-def _convert_page_aligned_sparse_indices_to_hca_metadata(
+def _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     sparse_indices: torch.Tensor,
     sparse_topk_lens: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1372,7 +1372,7 @@ def _convert_page_aligned_sparse_indices_to_hca_metadata(
         )
     if (sparse_topk_lens != expected_sparse_topk_lens).any().item():
         raise ValueError(
-            "hca_sparse_indices_format='page-aligned' requires "
+            "hca_sparse_indices_format='compressed-page-aligned' requires "
             "sparse_topk_lens == 128 + floor(visible_raw_len / 128)"
         )
     hca_seq_lens = (
@@ -1434,7 +1434,7 @@ def _convert_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
-def convert_page_aligned_sparse_indices_to_hca_metadata(
+def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     sparse_indices: torch.Tensor,
     sparse_topk_lens: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1444,7 +1444,7 @@ def convert_page_aligned_sparse_indices_to_hca_metadata(
     q_len: int,
     kv_layout: Literal["HND", "NHD"] = "HND",
 ) -> DSV4HCAMetadata:
-    r"""Convert HCA token-row indices into reusable HCA metadata.
+    r"""Convert combined sparse indices into reusable HCA metadata.
 
     Active SWA entries remain arbitrary absolute token-row indices and may
     express ring-buffer rotation or wraparound. The compressed segment must be
@@ -1473,7 +1473,7 @@ def convert_page_aligned_sparse_indices_to_hca_metadata(
             raise ValueError(
                 f"{name} must be on {sparse_indices.device}, got {cache.device}"
             )
-    return _convert_page_aligned_sparse_indices_to_hca_metadata(
+    return _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
         sparse_indices,
         sparse_topk_lens,
         seq_lens,
@@ -1509,7 +1509,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_seq_lens: Optional[torch.Tensor] = None,
     hca_is_causal: bool = True,
     hca_use_persistent: bool = False,
-    hca_sparse_indices_format: Optional[Literal["page-aligned"]] = None,
+    hca_sparse_indices_format: Optional[Literal["compressed-page-aligned"]] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1554,9 +1554,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
         Pass ``None`` for the explicit ``backend="cute-dsl"`` metadata path.
-        Combined HCA tables whose compressed segment is page-aligned may
-        instead be converted by setting
-        ``hca_sparse_indices_format="page-aligned"``.
+        Combined HCA tables whose compressed segment is a canonical page
+        expansion may instead be converted by setting
+        ``hca_sparse_indices_format="compressed-page-aligned"``. SWA entries
+        remain arbitrary absolute token rows in this mode.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
         ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, and by SM120
@@ -1569,7 +1570,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         there it describes the visible window-plus-compressed slot count.
     seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
-        by ``trtllm-gen`` and by page-aligned HCA metadata conversion.
+        by ``trtllm-gen`` and by compressed-page-aligned HCA metadata
+        conversion.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
         HCA currently accepts only a Python float.
@@ -1625,18 +1627,19 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_use_persistent : bool
         Select the CuTe DSL persistent tile scheduler. This removes the
         non-persistent ``B * Q <= 65535`` launch-grid restriction.
-    hca_sparse_indices_format : Optional[Literal["page-aligned"]]
+    hca_sparse_indices_format : Optional[Literal["compressed-page-aligned"]]
         Opt-in compatibility mode for legacy TRTLLM-GEN metadata. With
-        ``"page-aligned"``, active SWA entries may be arbitrary absolute token
-        rows, while the active compressed segment must be the canonical
-        expansion ``page_id * page_size + page_offset``. The dispatcher
-        validates and converts them into HCA gather indices, a compressed block
-        table, ``hca_seq_lens``, and ``swa_topk_lens``. This tagged path is a
-        one-shot compatibility path: it allocates, synchronizes the device,
-        immediately launches the decode, and is not CUDA Graph capture safe.
-        Performance-sensitive callers must precompute with
-        :func:`convert_page_aligned_sparse_indices_to_hca_metadata` and reuse
-        the returned metadata through the explicit HCA arguments.
+        ``"compressed-page-aligned"``, active SWA entries remain arbitrary
+        absolute token rows, while the active compressed segment must be the
+        canonical expansion ``page_id * page_size + page_offset``. The
+        dispatcher validates and converts them into HCA gather indices, a
+        compressed block table, ``hca_seq_lens``, and ``swa_topk_lens``. This
+        tagged path is a one-shot compatibility path: it allocates,
+        synchronizes the device, immediately launches the decode, and is not
+        CUDA Graph capture safe. Performance-sensitive callers must precompute
+        with
+        :func:`convert_compressed_page_aligned_sparse_indices_to_hca_metadata`
+        and reuse the returned metadata through the explicit HCA arguments.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
 
@@ -1655,9 +1658,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             )
         if enable_pdl:
             raise ValueError("backend='cute-dsl' HCA does not support enable_pdl")
-        if hca_sparse_indices_format not in (None, "page-aligned"):
+        if hca_sparse_indices_format not in (None, "compressed-page-aligned"):
             raise ValueError(
-                "hca_sparse_indices_format must be None or 'page-aligned', got "
+                "hca_sparse_indices_format must be None or "
+                "'compressed-page-aligned', got "
                 f"{hca_sparse_indices_format!r}"
             )
 
@@ -1673,7 +1677,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             compressed_kv_cache, kv_layout, "compressed_kv_cache"
         ).squeeze(1)
 
-        if hca_sparse_indices_format == "page-aligned":
+        if hca_sparse_indices_format == "compressed-page-aligned":
             generated_inputs = {
                 "hca_swa_indices": hca_swa_indices,
                 "hca_compressed_block_tables": hca_compressed_block_tables,
@@ -1685,23 +1689,23 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             ]
             if conflicts:
                 raise ValueError(
-                    "hca_sparse_indices_format='page-aligned' generates "
+                    "hca_sparse_indices_format='compressed-page-aligned' generates "
                     + ", ".join(conflicts)
                     + "; do not pass them explicitly"
                 )
             if sparse_indices is None or sparse_topk_lens is None or seq_lens is None:
                 raise ValueError(
-                    "hca_sparse_indices_format='page-aligned' requires "
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
                     "sparse_indices, sparse_topk_lens, and seq_lens"
                 )
             if query.ndim != 4:
                 raise ValueError(
-                    "hca_sparse_indices_format='page-aligned' requires dense "
-                    "query shape [B, Q, H, D]"
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
+                    "dense query shape [B, Q, H, D]"
                 )
             if seq_lens.numel() != query.shape[0]:
                 raise ValueError(
-                    "hca_sparse_indices_format='page-aligned' requires "
+                    "hca_sparse_indices_format='compressed-page-aligned' requires "
                     f"seq_lens with {query.shape[0]} entries, got {seq_lens.numel()}"
                 )
             for tensor, name in (
@@ -1716,7 +1720,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                         f"{name} must be on {query.device}, got {tensor.device}"
                     )
             _reject_hca_conversion_during_capture(query.device)
-            metadata = _convert_page_aligned_sparse_indices_to_hca_metadata(
+            metadata = _convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
                 sparse_indices,
                 sparse_topk_lens,
                 seq_lens,
@@ -1734,12 +1738,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 raise ValueError(
                     "backend='cute-dsl' consumes explicit HCA metadata, so "
                     "sparse_indices must be None unless "
-                    "hca_sparse_indices_format='page-aligned'"
+                    "hca_sparse_indices_format='compressed-page-aligned'"
                 )
             if seq_lens is not None:
                 raise ValueError(
                     "backend='cute-dsl' uses hca_seq_lens, so seq_lens must be "
-                    "None unless hca_sparse_indices_format='page-aligned'"
+                    "None unless "
+                    "hca_sparse_indices_format='compressed-page-aligned'"
                 )
 
         required_hca_inputs = {

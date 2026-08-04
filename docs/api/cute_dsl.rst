@@ -113,15 +113,16 @@ effective top-k. Each compressed block-table row must therefore contain legal
 page IDs for that footprint rounded up to 128-slot tiles, including slots later
 masked by a shorter ``sparse_topk_lens``.
 
-Callers whose existing ``sparse_indices`` are a canonical page-aligned HCA
-expansion may set ``hca_sparse_indices_format="page-aligned"`` to generate SWA
-gather indices, the compressed block table, and HCA lengths. Active SWA entries
-may be arbitrary absolute rows; only the compressed segment must be a canonical
+Callers whose existing ``sparse_indices`` have a canonical compressed-page
+expansion may set
+``hca_sparse_indices_format="compressed-page-aligned"`` to generate SWA gather
+indices, the compressed block table, and HCA lengths. SWA entries remain
+arbitrary absolute rows; only the compressed segment must be the canonical
 page expansion. This one-shot compatibility path validates values, allocates
 metadata, synchronizes the device, immediately launches the decode, and is not
 CUDA Graph capture safe. It is not a hot-loop path.
 Latency-sensitive callers must precompute with
-``convert_page_aligned_sparse_indices_to_hca_metadata`` and reuse the returned
-metadata through the explicit HCA arguments. Arbitrary TRTLLM-GEN token-row
-selections in the compressed segment cannot be represented by an HCA page table
-without repacking the compressed KV pool.
+``convert_compressed_page_aligned_sparse_indices_to_hca_metadata`` and reuse the
+returned metadata through the explicit HCA arguments. Arbitrary TRTLLM-GEN
+token-row selections in the compressed segment cannot be represented by an HCA
+page table without repacking the compressed KV pool.
