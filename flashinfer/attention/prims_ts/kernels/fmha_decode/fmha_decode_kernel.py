@@ -132,7 +132,7 @@ def _resolve_block_sparse_per_inst_load_topology(
 
     The return value contains the two load warp indices and an optional
     residual padding task ``(warp_idx, num_warps)``. ``None`` identifies a
-    noncanonical override that the caller must reject explicitly.
+    noncanonical override for which the caller keeps the common load task.
     """
 
     if cfg.load_num_warps != 1:
@@ -708,16 +708,15 @@ def _build_decode_gen_schedule(
     use_clc_dynamic = cfg.use_persistent_scheduler
     per_inst_block_sparse_load_topology = None
     if supports_per_inst_block_sparse_load_tasks:
+        # Dual issuers are a performance choice. If a future recipe has no
+        # compatible idle-warp placement, the common one-warp load task remains
+        # correct and consumes the same disjoint K/V metadata pipelines.
         per_inst_block_sparse_load_topology = (
             _resolve_block_sparse_per_inst_load_topology(
                 cfg,
                 use_clc_dynamic=use_clc_dynamic,
             )
         )
-        if per_inst_block_sparse_load_topology is None:
-            raise ValueError(
-                "parallel sparse K/V loads require the canonical idle-warp topology"
-            )
     use_per_inst_block_sparse_load_tasks = (
         per_inst_block_sparse_load_topology is not None
     )

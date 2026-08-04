@@ -66,11 +66,14 @@ def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
     )
 
 
-def _prepared_kv_routes_are_block_aligned(kv_block_size: int) -> bool:
-    """Return whether every KV128 route stays within one semantic BSR block."""
+def _prepared_kv_routes_are_block_aligned(
+    kv_block_size: int,
+    kv_route_size: int = _PREPARED_KV_ROUTE_SIZE,
+) -> bool:
+    """Return whether each prepared route stays within one semantic BSR block."""
 
     return (
         _validate_sparse_block_size(kv_block_size, "kv_block_size")
-        % _PREPARED_KV_ROUTE_SIZE
+        % kv_route_size
         == 0
     )

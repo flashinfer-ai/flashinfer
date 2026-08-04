@@ -79,12 +79,7 @@ def _validate_bsr_row_lane(
                     and error_code < _BSR_ERROR_NOT_STRICTLY_INCREASING
                 ):
                     error_code = cutlass.Int32(_BSR_ERROR_NOT_STRICTLY_INCREASING)
-        remaining_entries = selected_kv_block_count - bsr_entry_offset
-        bsr_entry_offset = (
-            bsr_entry_offset + _WARP_SIZE
-            if remaining_entries > _WARP_SIZE
-            else selected_kv_block_count
-        )
+        bsr_entry_offset += _WARP_SIZE
     return error_code
 
 

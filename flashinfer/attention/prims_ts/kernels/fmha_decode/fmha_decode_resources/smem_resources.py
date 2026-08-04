@@ -709,7 +709,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                         origin0 = Int32(self.max_seq_len_kv)
                     stage_base = self._stage_base(stage_info)
                     if cutlass.const_expr(
-                        _prepared_kv_routes_are_block_aligned(cfg.kv_block_size)
+                        _prepared_kv_routes_are_block_aligned(
+                            cfg.kv_block_size, cfg.tile_size_kv
+                        )
                     ):
                         for chunk_idx in cutlass.range_constexpr(num_chunks):
                             local_head_dim_offset = chunk_idx * chunk_hd

@@ -40,31 +40,12 @@ from ..._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_FULL_FLAG,
     _PreparedBlockSparseLayout,
 )
+from .fmha_decode_resources.helpers_common import _warp_broadcast_i32
 
 
 _WARPS_PER_CTA = 4
 _WARP_SIZE = 32
 _THREADS_PER_CTA = _WARPS_PER_CTA * _WARP_SIZE
-
-
-@cute.jit
-def _warp_broadcast_i32(
-    value: cutlass.Int32,
-    source_lane: cutlass.Constexpr[int],
-) -> cutlass.Int32:
-    """Broadcast one source-lane scalar as a warp-uniform Int32."""
-
-    return cute.arch.make_warp_uniform(
-        cutlass.Int32(
-            prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=value,
-                offset=source_lane,
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.IDX,
-            )
-        )
-    )
 
 
 @cute.jit
@@ -143,7 +124,7 @@ def _resolve_route_atom(
 
 
 @cute.jit
-def _load_logical_token_word(
+def _load_coarse_token_word(
     block_indices: cute.Tensor,
     kv_valid_bits: cute.Tensor,
     row_begin: cutlass.Int32,
@@ -157,80 +138,75 @@ def _load_logical_token_word(
     seq_len_kv: cutlass.Constexpr[int],
     num_kv_valid_words: cutlass.Constexpr[int],
 ) -> cutlass.Uint32:
-    """Assemble one logical K32 word from one or more physical atoms."""
+    """Load one logical K32 word from a coarse atom larger than K32."""
 
     logical_word = cutlass.Uint32(0)
-    if cutlass.const_expr(atom_size >= 32):
-        words_per_atom = atom_size // 32
-        atom_in_route = logical_word_idx // cutlass.Int32(words_per_atom)
-        word_in_atom = logical_word_idx % cutlass.Int32(words_per_atom)
-        origin, valid = _resolve_route_atom(
-            block_indices,
-            row_begin,
-            row_end,
-            route_idx,
-            atom_in_route,
-            kv_block_size,
-            atom_size,
-            origins_per_route,
-            seq_len_kv,
-        )
-        physical_word_origin = origin + word_in_atom * cutlass.Int32(32)
+    words_per_atom = atom_size // 32
+    atom_in_route = logical_word_idx // cutlass.Int32(words_per_atom)
+    word_in_atom = logical_word_idx % cutlass.Int32(words_per_atom)
+    origin, valid = _resolve_route_atom(
+        block_indices,
+        row_begin,
+        row_end,
+        route_idx,
+        atom_in_route,
+        kv_block_size,
+        atom_size,
+        origins_per_route,
+        seq_len_kv,
+    )
+    physical_word_origin = origin + word_in_atom * cutlass.Int32(32)
+    if (
+        valid
+        and physical_word_origin >= cutlass.Int32(0)
+        and physical_word_origin < cutlass.Int32(seq_len_kv)
+    ):
+        physical_word_idx = physical_word_origin >> cutlass.Int32(5)
         if (
-            valid
-            and physical_word_origin >= cutlass.Int32(0)
-            and physical_word_origin < cutlass.Int32(seq_len_kv)
+            physical_word_idx >= cutlass.Int32(0)
+            and physical_word_idx < cutlass.Int32(num_kv_valid_words)
         ):
-            physical_word_idx = physical_word_origin >> cutlass.Int32(5)
-            if (
-                physical_word_idx >= cutlass.Int32(0)
-                and physical_word_idx < cutlass.Int32(num_kv_valid_words)
-            ):
-                logical_word = cutlass.Uint32(
-                    kv_valid_bits[batch_idx, physical_word_idx]
+            logical_word = cutlass.Uint32(
+                kv_valid_bits[batch_idx, physical_word_idx]
+            )
+            remaining_tokens = cutlass.Int32(seq_len_kv) - physical_word_origin
+            if remaining_tokens < cutlass.Int32(32):
+                logical_word = logical_word & (
+                    (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
                 )
-                remaining_tokens = cutlass.Int32(seq_len_kv) - physical_word_origin
-                if remaining_tokens < cutlass.Int32(32):
-                    logical_word = logical_word & (
-                        (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
-                    )
-    else:
-        atoms_per_word = 32 // atom_size
-        first_atom_in_route = logical_word_idx * cutlass.Int32(atoms_per_word)
-        for atom_in_word in cutlass.range_constexpr(atoms_per_word):
-            atom_in_route = first_atom_in_route + cutlass.Int32(atom_in_word)
-            origin, valid = _resolve_route_atom(
-                block_indices,
-                row_begin,
-                row_end,
-                route_idx,
-                atom_in_route,
-                kv_block_size,
-                atom_size,
-                origins_per_route,
-                seq_len_kv,
-            )
-            token_chunk = cutlass.Uint32(0)
-            if valid and origin >= cutlass.Int32(0):
-                physical_word_idx = origin >> cutlass.Int32(5)
-                if (
-                    physical_word_idx >= cutlass.Int32(0)
-                    and physical_word_idx < cutlass.Int32(num_kv_valid_words)
-                ):
-                    source_word = cutlass.Uint32(
-                        kv_valid_bits[batch_idx, physical_word_idx]
-                    )
-                    token_chunk = source_word >> (origin & cutlass.Int32(31))
-                    token_chunk = token_chunk & cutlass.Uint32((1 << atom_size) - 1)
-                    remaining_tokens = cutlass.Int32(seq_len_kv) - origin
-                    if remaining_tokens < cutlass.Int32(atom_size):
-                        token_chunk = token_chunk & (
-                            (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
-                        )
-            logical_word = logical_word | (
-                token_chunk << cutlass.Int32(atom_in_word * atom_size)
-            )
     return logical_word
+
+
+@cute.jit
+def _load_atom_token_chunk(
+    kv_valid_bits: cute.Tensor,
+    batch_idx: cutlass.Int32,
+    origin: cutlass.Int32,
+    origin_is_valid: cutlass.Boolean,
+    atom_size: cutlass.Constexpr[int],
+    seq_len_kv: cutlass.Constexpr[int],
+    num_kv_valid_words: cutlass.Constexpr[int],
+) -> cutlass.Uint32:
+    """Load the <=K32 mask chunk owned by one resolved-origin lane."""
+
+    token_chunk = cutlass.Uint32(0)
+    if origin_is_valid and origin >= cutlass.Int32(0):
+        physical_word_idx = origin >> cutlass.Int32(5)
+        if (
+            physical_word_idx >= cutlass.Int32(0)
+            and physical_word_idx < cutlass.Int32(num_kv_valid_words)
+        ):
+            source_word = cutlass.Uint32(
+                kv_valid_bits[batch_idx, physical_word_idx]
+            )
+            token_chunk = source_word >> (origin & cutlass.Int32(31))
+            token_chunk = token_chunk & cutlass.Uint32((1 << atom_size) - 1)
+            remaining_tokens = cutlass.Int32(seq_len_kv) - origin
+            if remaining_tokens < cutlass.Int32(atom_size):
+                token_chunk = token_chunk & (
+                    (cutlass.Uint32(1) << remaining_tokens) - cutlass.Uint32(1)
+                )
+    return token_chunk
 
 
 class _PrepareBlockSparseRoutes:
@@ -444,30 +420,79 @@ class _PrepareBlockSparseRoutes:
                 assert kv_valid_bits is not None
                 assert self.token_words_word_offset is not None
                 token_word = cutlass.Uint32(0)
-                if lane_idx < cutlass.Int32(self.token_words_per_route):
-                    token_word = _load_logical_token_word(
-                        block_indices,
+                if cutlass.const_expr(self.atom_size <= 32):
+                    # Reuse each atom lane's origin instead of resolving and
+                    # loading the same BSR entry again from the word lanes.
+                    token_chunk = _load_atom_token_chunk(
                         kv_valid_bits,
-                        row_begin,
-                        row_end,
-                        route_idx,
-                        lane_idx,
                         batch_idx,
-                        self.kv_block_size,
+                        origin,
+                        origin_is_valid,
                         self.atom_size,
-                        self.origins_per_route,
                         self.seq_len_kv,
                         self.num_kv_valid_words,
                     )
-                    route_workspace[
-                        route_metadata_word_index
-                        + cutlass.Int32(self.token_words_word_offset)
-                        + lane_idx
-                    ] = cutlass.Int32(token_word)
-                token_route_is_full = cute.arch.vote_all_sync(
-                    lane_idx >= cutlass.Int32(self.token_words_per_route)
-                    or token_word == cutlass.Uint32(0xFFFFFFFF)
-                )
+                    atoms_per_word = 32 // self.atom_size
+                    if lane_idx < cutlass.Int32(self.origins_per_route):
+                        atom_in_word = lane_idx % cutlass.Int32(atoms_per_word)
+                        token_word = token_chunk << (
+                            atom_in_word * cutlass.Int32(self.atom_size)
+                        )
+                        # Active lanes form an aligned power-of-two prefix, so
+                        # butterfly peers stay inside their logical K32 group.
+                        active_origin_lanes = (1 << self.origins_per_route) - 1
+                        for shuffle_step in cutlass.range_constexpr(
+                            int(math.log2(atoms_per_word))
+                        ):
+                            peer_word = cutlass.Uint32(
+                                prims.shfl_sync(
+                                    thread_mask=active_origin_lanes,
+                                    val=token_word,
+                                    offset=1 << shuffle_step,
+                                    mask_and_clamp=0x1F,
+                                    kind=prims.Shfl.BFLY,
+                                )
+                            )
+                            token_word = token_word | peer_word
+                        if atom_in_word == cutlass.Int32(0):
+                            logical_word_idx = lane_idx // cutlass.Int32(
+                                atoms_per_word
+                            )
+                            route_workspace[
+                                route_metadata_word_index
+                                + cutlass.Int32(self.token_words_word_offset)
+                                + logical_word_idx
+                            ] = cutlass.Int32(token_word)
+                    full_atom_mask = cutlass.Uint32((1 << self.atom_size) - 1)
+                    token_route_is_full = cute.arch.vote_all_sync(
+                        lane_idx >= cutlass.Int32(self.origins_per_route)
+                        or token_chunk == full_atom_mask
+                    )
+                else:
+                    if lane_idx < cutlass.Int32(self.token_words_per_route):
+                        token_word = _load_coarse_token_word(
+                            block_indices,
+                            kv_valid_bits,
+                            row_begin,
+                            row_end,
+                            route_idx,
+                            lane_idx,
+                            batch_idx,
+                            self.kv_block_size,
+                            self.atom_size,
+                            self.origins_per_route,
+                            self.seq_len_kv,
+                            self.num_kv_valid_words,
+                        )
+                        route_workspace[
+                            route_metadata_word_index
+                            + cutlass.Int32(self.token_words_word_offset)
+                            + lane_idx
+                        ] = cutlass.Int32(token_word)
+                    token_route_is_full = cute.arch.vote_all_sync(
+                        lane_idx >= cutlass.Int32(self.token_words_per_route)
+                        or token_word == cutlass.Uint32(0xFFFFFFFF)
+                    )
                 route_is_full = cutlass.Boolean(
                     structural_route_is_full and token_route_is_full
                 )

@@ -67,6 +67,7 @@ from .fmha_decode_resources.helpers_common import (
     ResourceVars,
     _q_group_token_base,
     _q_seq_bounds,
+    _warp_broadcast_i32,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_total_kv_tiles,
@@ -652,28 +653,8 @@ def _load_prepared_sparse_row_warp(
     if lane_idx == cutlass.Int32(0):
         loaded_row_route_begin = cutlass.Int32(row_route_offsets[row_address])
         loaded_route_count = cutlass.Int32(row_route_counts[row_address])
-    row_route_begin = cute.arch.make_warp_uniform(
-        cutlass.Int32(
-            prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=loaded_row_route_begin,
-                offset=0,
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.IDX,
-            )
-        )
-    )
-    route_count = cute.arch.make_warp_uniform(
-        cutlass.Int32(
-            prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=loaded_route_count,
-                offset=0,
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.IDX,
-            )
-        )
-    )
+    row_route_begin = _warp_broadcast_i32(loaded_row_route_begin, 0)
+    route_count = _warp_broadcast_i32(loaded_route_count, 0)
     # Prepare encodes an invalid range or capacity overflow as a negative
     # header. Fail closed without touching that row's metadata slice.
     route_count = cute.math.max(route_count, cutlass.Int32(0))
@@ -727,15 +708,7 @@ class DecodeGenTask(Task):
             # context. Broadcast it so all lanes issue TMEM operations from the
             # same base column.
             loaded = cutlass.Int32(context.tmem_ptr_i32.load())
-            self._tmem_base_offset = cute.arch.make_warp_uniform(
-                prims.shfl_sync(
-                    thread_mask=0xFFFFFFFF,
-                    val=loaded,
-                    offset=0,
-                    mask_and_clamp=0x1F,
-                    kind=prims.Shfl.IDX,
-                )
-            )
+            self._tmem_base_offset = _warp_broadcast_i32(loaded, 0)
 
     @cute.jit
     def make_task_cache(

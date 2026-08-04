@@ -1018,8 +1018,11 @@ class SmemPResource(DecodeGenResourceBase):
                 and cfg.total_kv_tiles > 0
                 and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
             ):
-                # Dense full-tile cases can compute P and both local sums with
-                # the straight-line helper because no mask can suppress entries.
+                # The straight-line helper may synthesize P for an entirely
+                # masked sparse instance whose maximum stayed at -inf. This is
+                # intentionally safe: reduce_sums' guarded rescale and the
+                # correction path's uses_instN gate both key on that sentinel
+                # and discard the instance before its P/O contribution is visible.
                 p_result = _compute_p_values_and_local_sums_dense(
                     self.scale_softmax_log2,
                     new_max_arr[0],

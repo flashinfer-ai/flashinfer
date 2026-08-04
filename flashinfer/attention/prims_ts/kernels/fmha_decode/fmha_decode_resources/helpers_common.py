@@ -73,6 +73,23 @@ _TASK_CACHE_KV_VALID_TILE_END = 8
 _TASK_CACHE_KV_WINDOW_START = 9
 
 
+@cute.jit
+def _warp_broadcast_i32(value: Int32, source_lane: Constexpr[int]) -> Int32:
+    """Broadcast one source-lane scalar as a warp-uniform Int32 value."""
+
+    return cute.arch.make_warp_uniform(
+        Int32(
+            prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=value,
+                offset=source_lane,
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.IDX,
+            )
+        )
+    )
+
+
 def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
     """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
     return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16

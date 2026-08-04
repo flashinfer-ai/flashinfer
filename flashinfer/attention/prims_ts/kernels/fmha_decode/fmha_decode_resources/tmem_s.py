@@ -82,7 +82,7 @@ from .helpers_common import (
 )
 from .smem_block_sparse_metadata import (
     _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG,
-    _swaps_uses_packed_route_full_summary,
+    _swaps_forwards_packed_route_full,
 )
 from .helpers_kv_tile_idx import (
     _kv_tile_is_fully_unmasked_for_q_group,
@@ -108,6 +108,39 @@ from .helpers_softmax import (
 # 2**8. As in the FlashInfer/TRT-LLM policy, this assumes normal model tensor
 # ranges rather than adversarial values near the BF16 finite limit.
 _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 = 8.0
+
+
+def _swaps_uses_origin0_k32_full_guard(cfg: FmhaDecodeConfig) -> bool:
+    """Whether one staged origin can prove this warp's K32 slice valid."""
+
+    return (
+        cfg.kv_block_size >= 32
+        and not cfg.use_kv_valid_bits
+        and not cfg.uses_uniform_causal_mask
+        and not cfg.uses_per_row_causal_mask
+    )
+
+
+def _swaps_token_word_covers_kv_tail(cfg: FmhaDecodeConfig) -> bool:
+    """Whether SWAP's prepared token word covers the physical KV tail."""
+
+    return (
+        cfg.use_kv_valid_bits
+        and not cfg.uses_uniform_causal_mask
+        and not cfg.uses_per_row_causal_mask
+    )
+
+
+def _swaps_uses_token_only_score_validity(cfg: FmhaDecodeConfig) -> bool:
+    """Whether prepared token words replace SWAP's atom-origin guard."""
+
+    return (
+        cfg.use_block_sparse
+        and _swaps_token_word_covers_kv_tail(cfg)
+        and cfg.tile_size_q < 64
+        and cfg.use_persistent_scheduler
+        and (cfg.kv_block_size >= 16 or cfg.use_parallel_sparse_kv_loads)
+    )
 
 
 @cute.jit
@@ -1801,21 +1834,14 @@ class TmemSResource(DecodeGenResourceBase):
             # K, so one predicate masks the adjacent pair of Q-row registers.
             should_apply_sparse_mask = cutlass.Boolean(True)
             if cutlass.const_expr(
-                not cfg.uses_uniform_causal_mask
-                and not cfg.uses_per_row_causal_mask
-                and not cfg.use_kv_valid_bits
-                and (
-                    _swaps_uses_packed_route_full_summary(cfg)
-                    or min(cfg.kv_block_size, 32) == 32
-                )
+                _swaps_forwards_packed_route_full(cfg)
+                or _swaps_uses_origin0_k32_full_guard(cfg)
             ):
-                if cutlass.const_expr(
-                    _swaps_uses_packed_route_full_summary(cfg)
-                ):
+                if cutlass.const_expr(_swaps_forwards_packed_route_full(cfg)):
                     # Prepare already proved structural fullness for the
                     # complete KV128 route and staging replicated the summary
                     # for this Softmax warp's logical K32 slice.
-                    route_is_full = cute.arch.make_warp_uniform(
+                    k32_is_full = cute.arch.make_warp_uniform(
                         cutlass.Boolean(
                             (
                                 sparse_route_flags
@@ -1825,28 +1851,20 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                     )
                 else:
-                    # One origin covers this warp's K32 slice, so a complete
-                    # route can bypass all four lane-local K8 predicates. B16
-                    # stays on the straight-line predicate path: its two-origin
-                    # guard is not cheaper after code generation.
-                    route_is_full = cute.arch.make_warp_uniform(
+                    # One origin covers this warp's K32 slice, so it can
+                    # bypass all four lane-local K8 predicates. B16 stays on
+                    # the straight-line path: its two-origin guard is not
+                    # cheaper after code generation.
+                    k32_is_full = cute.arch.make_warp_uniform(
                         cutlass.Boolean(
                             sparse_origin0 >= Int32(0)
                             and sparse_origin0 <= seq_len_kv - Int32(32)
                         )
                     )
-                should_apply_sparse_mask = cutlass.Boolean(not route_is_full)
+                should_apply_sparse_mask = cutlass.Boolean(not k32_is_full)
             if should_apply_sparse_mask:
                 lane_k_offset = Int32(task_cache[_TASK_CACHE_LANE_IDX]) >> Int32(2)
-                token_word_covers_kv_tail = (
-                    cfg.use_kv_valid_bits
-                    and not cfg.uses_uniform_causal_mask
-                    and not cfg.uses_per_row_causal_mask
-                    and (
-                        min(cfg.kv_block_size, 32) >= 16
-                        or cfg.use_prepared_route_validity
-                    )
-                )
+                token_word_covers_kv_tail = _swaps_token_word_covers_kv_tail(cfg)
                 for token_group_idx in cutlass.range_constexpr(4):
                     atom_origin, physical_k = self._sparse_swaps_physical_k(
                         lane_k_offset,
@@ -1856,12 +1874,13 @@ class TmemSResource(DecodeGenResourceBase):
                         sparse_origin3,
                         token_group_idx=token_group_idx,
                     )
-                    # Prepared words zero absent routes and the KV tail. The
-                    # host policy decides whether they also replace the local
-                    # origin predicate; this choice is independent of which
-                    # warp issued the K/V load.
+                    # Prepared words zero absent atoms and the physical KV
+                    # tail. Qualified profiles can therefore omit the local
+                    # atom-origin guard, independently of the K/V issuer warp.
                     score_is_valid = cutlass.Boolean(True)
-                    if cutlass.const_expr(not cfg.use_prepared_route_validity):
+                    if cutlass.const_expr(
+                        not _swaps_uses_token_only_score_validity(cfg)
+                    ):
                         score_is_valid = cutlass.Boolean(atom_origin >= Int32(0))
                     if cutlass.const_expr(not token_word_covers_kv_tail):
                         score_is_valid = cutlass.Boolean(

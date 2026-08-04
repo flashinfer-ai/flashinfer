@@ -28,7 +28,6 @@ from typing import ClassVar
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32
-from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import (
     ResourceContext,
@@ -63,6 +62,7 @@ from .helpers_common import (
     ResourceVars,
     _decode_gen_task_cache,
     _keeps_col_base,
+    _warp_broadcast_i32,
 )
 
 
@@ -77,17 +77,17 @@ _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 2
 _SWAPS_PACKED_ROUTE_FULL_CLEAR_MASK = ~_PREPARED_ROUTE_IS_FULL_FLAG
 
 
-def _swaps_uses_packed_route_full_summary(cfg: FmhaDecodeConfig) -> bool:
+def _swaps_forwards_packed_route_full(cfg: FmhaDecodeConfig) -> bool:
     """Whether SWAP forwards prepare's route-full bit in a staged origin.
 
-    B8 would otherwise need four origin checks, so it uses the separately
-    prepared summary. B16 keeps straight-line per-score predicates because
-    neither its two-origin guard nor this prepared-summary path improves its
-    generated kernel; B32 uses a cheaper single-origin guard instead.
+    Q8/B8 would otherwise need four origin checks, so it forwards the prepared
+    summary. Larger Q tiles keep straight-line per-score predicates: forwarding
+    the summary lengthens their hot path more than the skipped checks save.
     """
 
     return (
-        cfg.kv_block_size == 8
+        cfg.tile_size_q == 8
+        and cfg.kv_block_size == 8
         and not cfg.use_kv_valid_bits
         and not cfg.uses_uniform_causal_mask
         and not cfg.uses_per_row_causal_mask
@@ -117,7 +117,7 @@ class _BlockSparseSoftmaxStagingLayout:
     The words are staged unconditionally; the route-full flag lets Softmax
     skip token-mask setup and the substantially more expensive per-score
     predicate. SWAP stores execution-ordered origins followed by optional
-    logical K32 token words, one for each consumer warp. Its noncausal B8
+    logical K32 token words, one for each consumer warp. Its noncausal Q8/B8
     profile without token bits packs route-full into the otherwise-zero low
     bit of each warp's first aligned origin.
     """
@@ -173,26 +173,6 @@ class _BlockSparseSoftmaxStagingLayout:
             stage_stride_words=stage_stride_words,
             total_words=num_stages * stage_stride_words,
         )
-
-
-@cute.jit
-def _warp_broadcast_i32(
-    value: Int32,
-    src_lane: Constexpr[int],
-) -> Int32:
-    """Broadcast one source-lane scalar as a warp-uniform Int32 value."""
-
-    return cute.arch.make_warp_uniform(
-        Int32(
-            prims.shfl_sync(
-                thread_mask=0xFFFFFFFF,
-                val=value,
-                offset=src_lane,
-                mask_and_clamp=0x1F,
-                kind=prims.Shfl.IDX,
-            )
-        )
-    )
 
 
 @dataclass(kw_only=True)
@@ -335,9 +315,10 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
 
         num_origins = self.route_layout.origins_per_route
         uses_two_fragment_route = num_origins == 2
-        # Fine routes use at most lanes 0-15 for origins, so lane 31 is a
-        # stable broadcast source for B8/B16/B32 validity masks.
-        valid_mask_lane = 2 if uses_two_fragment_route else 31
+        # Keep the validity load adjacent to the lane-distributed origins.
+        # For the maximal 32-origin layout, lane 31 can retain its origin and
+        # load the independent validity scalar before the warp broadcasts it.
+        valid_mask_lane = min(num_origins, 31)
         origin = Int32(-1)
         atom_valid_mask = Int32(0)
         route_record_is_valid = route_record_word_offset >= Int32(0)
@@ -611,7 +592,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     ) -> None:
         """Stage SWAP origins and optional logical-K32 token metadata.
 
-        The noncausal B8 profile without token bits also packs prepare's
+        The noncausal Q8/B8 profile without token bits also packs prepare's
         route-full summary into bit 0 of each warp's first aligned origin.
         """
 
@@ -622,7 +603,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         route_record_is_valid = route_record_word_offset >= Int32(0)
 
         packed_route_full = Int32(0)
-        if cutlass.const_expr(_swaps_uses_packed_route_full_summary(self.cfg)):
+        if cutlass.const_expr(_swaps_forwards_packed_route_full(self.cfg)):
             if lane_idx == Int32(0) and route_record_is_valid:
                 packed_route_full = Int32(
                     self.route_metadata[
@@ -639,7 +620,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 if resolved_atom_validity == Int32(0):
                     softmax_origin = Int32(-1)
                 if cutlass.const_expr(
-                    _swaps_uses_packed_route_full_summary(self.cfg)
+                    _swaps_forwards_packed_route_full(self.cfg)
                 ):
                     # Replicate route-full in each K32 slice's first origin;
                     # B8 alignment leaves bit 0 free for the summary.
@@ -841,7 +822,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 ]
             )
         route_flags = Uint32(0)
-        if cutlass.const_expr(_swaps_uses_packed_route_full_summary(self.cfg)):
+        if cutlass.const_expr(_swaps_forwards_packed_route_full(self.cfg)):
             route_flags = Uint32(origin0 & Int32(1))
             origin0 = origin0 & Int32(_SWAPS_PACKED_ROUTE_FULL_CLEAR_MASK)
         return (
