@@ -29,7 +29,7 @@ import torch
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import (
-    _CUTLASS_BF16_ARCHS,
+    _CUTLASS_SM90_ARCHS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -196,22 +196,18 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# CUTLASS BF16 runner — canonical dense weights, pre-routed execution
+# SM90 CUTLASS runners — dense BF16 and mixed-input W4A16
 # ---------------------------------------------------------------------------
 
 
-class CutlassBf16Runner(MoERunner):
-    """Unified adapter over the legacy CUTLASS BF16 fused-MoE launcher.
+class _CutlassSm90Runner(MoERunner):
+    """Shared launch, tuning, and workspace mechanics for SM90 CUTLASS MoE."""
 
-    The CUTLASS launcher selects one tactic for each GEMM. This adapter tunes
-    those stages independently, combines the two winners into one compound
-    tactic, and owns a reusable workspace sized for the active token bucket.
-    """
-
-    backend_key = "cutlass_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.BF16,)
-    required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+    _weight_dtype: ClassVar[torch.dtype]
+    _use_w4_group_scaling: ClassVar[bool]
+    _required_weight_keys: ClassVar[tuple[str, ...]]
+    _expected_num_inputs: ClassVar[int]
 
     def check_support(self) -> None:
         super().check_support()
@@ -239,16 +235,16 @@ class CutlassBf16Runner(MoERunner):
         self.config = config
         self.device = torch.device(device)
         if self.device.type != "cuda":
-            raise ValueError(f"CutlassBf16Runner requires a CUDA device, got {device}.")
+            raise ValueError(f"{type(self).__name__} requires CUDA, got {device}.")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
-        if self._device_arch not in _CUTLASS_BF16_ARCHS:
+        if self._device_arch not in _CUTLASS_SM90_ARCHS:
             raise RuntimeError(
-                "CutlassBf16Runner does not support "
+                f"{type(self).__name__} does not support "
                 f"SM{self._device_arch}; supported architectures are "
-                f"{_CUTLASS_BF16_ARCHS}."
+                f"{_CUTLASS_SM90_ARCHS}."
             )
 
         enable_pdl = config.execution.enable_pdl
@@ -261,7 +257,7 @@ class CutlassBf16Runner(MoERunner):
             module = get_cutlass_fused_moe_module(str(self._device_arch))
             self._inner = module.MoERunner(
                 x_dtype=torch.bfloat16,
-                weight_dtype=torch.bfloat16,
+                weight_dtype=self._weight_dtype,
                 output_dtype=torch.bfloat16,
                 top_k=config.routing.top_k,
                 tp_size=1,
@@ -272,7 +268,7 @@ class CutlassBf16Runner(MoERunner):
                 cluster_rank=0,
                 enable_alltoall=False,
                 use_deepseek_fp8_block_scale=False,
-                use_w4_group_scaling=False,
+                use_w4_group_scaling=self._use_w4_group_scaling,
                 use_mxfp8_act_scaling=False,
                 min_latency_mode=False,
                 enable_pdl=self._enable_pdl,
@@ -284,6 +280,7 @@ class CutlassBf16Runner(MoERunner):
 
         # pack_inputs replaces this with the current MoELayer token bucket.
         self.tuning_config = TuningConfig()
+        self._workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._workspace: torch.Tensor | None = None
         self._workspace_num_tokens = 0
         self._workspace_hidden_size: int | None = None
@@ -291,6 +288,7 @@ class CutlassBf16Runner(MoERunner):
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
         num_tokens = inputs[1].shape[0]
+        self._ensure_workspace(num_tokens, inputs[1].shape[1])
         top_k = self.config.routing.top_k
         num_experts = self.config.routing.num_experts
         token_offsets = torch.arange(
@@ -304,10 +302,7 @@ class CutlassBf16Runner(MoERunner):
         return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
-        if len(inputs) != 6:
-            raise ValueError(
-                "CutlassBf16Runner expects [output, hidden, ids, scales, w1, w2]."
-            )
+        self._validate_input_count(inputs)
         # The two GEMMs have independent tactic spaces. Preserve the legacy
         # O(n1+n2) tuning flow, then let the outer unified tuner profile only
         # the selected pair as one full-MoE candidate.
@@ -317,7 +312,7 @@ class CutlassBf16Runner(MoERunner):
         try:
             self._inner.gemm_idx_for_tuning = 1
             _, gemm1 = tuner.choose_one(
-                f"moe_cutlass_bf16_sm{self._device_arch}_gemm1",
+                f"moe_{self.backend_key}_sm{self._device_arch}_gemm1",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
@@ -325,7 +320,7 @@ class CutlassBf16Runner(MoERunner):
             )
             self._inner.gemm_idx_for_tuning = 2
             _, gemm2 = tuner.choose_one(
-                f"moe_cutlass_bf16_sm{self._device_arch}_gemm2",
+                f"moe_{self.backend_key}_sm{self._device_arch}_gemm2",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
@@ -338,11 +333,12 @@ class CutlassBf16Runner(MoERunner):
         return [(int(gemm1), int(gemm2))]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
-        if (
-            self._workspace is not None
-            and hidden_size == self._workspace_hidden_size
-            and num_tokens <= self._workspace_num_tokens
-        ):
+        key = (num_tokens, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is not None:
+            self._workspace = workspace
+            self._workspace_num_tokens = num_tokens
+            self._workspace_hidden_size = hidden_size
             return
         from .core import cutlass_fused_moe_workspace_size
 
@@ -353,13 +349,18 @@ class CutlassBf16Runner(MoERunner):
             self.config.routing.num_experts,
             self.config.routing.top_k,
             x_dtype=torch.bfloat16,
-            weight_dtype=torch.bfloat16,
+            weight_dtype=self._weight_dtype,
             output_dtype=torch.bfloat16,
             activation_type=self.config.activation.type,
+            use_w4_group_scaling=self._use_w4_group_scaling,
             use_fused_finalize=self._use_fused_finalize,
             device=self.device,
         )
-        self._workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        # Keep every allocation alive: a captured CUDA graph retains the raw
+        # pointer even after a later call activates a different token bucket.
+        self._workspace_cache[key] = workspace
+        self._workspace = workspace
         self._workspace_num_tokens = num_tokens
         self._workspace_hidden_size = hidden_size
 
@@ -368,12 +369,12 @@ class CutlassBf16Runner(MoERunner):
     ) -> List[torch.Tensor]:
         if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
             raise NotImplementedError(
-                "CutlassBf16Runner supports only PackedPrecomputed routing."
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
             )
         hidden_states = act.hidden_states_q
         if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
             raise TypeError(
-                "CutlassBf16Runner requires 2D BF16 hidden_states_q, got "
+                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
                 f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
             )
         if hidden_states.device != self.device:
@@ -381,7 +382,9 @@ class CutlassBf16Runner(MoERunner):
                 f"hidden_states_q is on {hidden_states.device}, expected {self.device}."
             )
         if act.hidden_states_scale is not None:
-            raise ValueError("Cutlass BF16 activations do not use hidden_states_scale.")
+            raise ValueError(
+                f"{type(self).__name__} activations do not use hidden_states_scale."
+            )
 
         num_tokens, hidden_size = hidden_states.shape
         ceiling = self.config.execution.tune_max_num_tokens
@@ -400,29 +403,12 @@ class CutlassBf16Runner(MoERunner):
         )
 
         view = weights.get_view(self.backend_key)
-        missing = [key for key in self.required_weight_keys if key not in view]
+        missing = [key for key in self._required_weight_keys if key not in view]
         if missing:
             raise KeyError(
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
-        w1, w2 = (view[key] for key in self.required_weight_keys)
-        num_experts = self.config.routing.num_experts
-        intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
-        expected_w2 = (num_experts, hidden_size, intermediate_size)
-        if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
-            raise TypeError("Cutlass BF16 prepared weights must use torch.bfloat16.")
-        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
-            raise ValueError(
-                f"Cutlass BF16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
-                f"!= expected {expected_w1}/{expected_w2}."
-            )
-        if w1.device != self.device or w2.device != self.device:
-            raise ValueError(
-                "Cutlass BF16 prepared weights must match the runner device."
-            )
-        if not w1.is_contiguous() or not w2.is_contiguous():
-            raise ValueError("Cutlass BF16 prepared weights must be contiguous.")
+        weight_inputs = self._pack_weight_inputs(view, hidden_size)
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
@@ -443,7 +429,34 @@ class CutlassBf16Runner(MoERunner):
         )
         self._ensure_workspace(bucket, hidden_size)
         output = hidden_states.new_empty((num_tokens, hidden_size))
-        return [output, hidden_states, act.topk_ids, act.topk_weights, w1, w2]
+        return [
+            output,
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *weight_inputs,
+        ]
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        raise NotImplementedError
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return []
+
+    def _validate_weight_storage(self, tensors: tuple[torch.Tensor, ...]) -> None:
+        if any(t.device != self.device for t in tensors):
+            raise ValueError("CUTLASS prepared weights must match the runner device.")
+        if any(not t.is_contiguous() for t in tensors):
+            raise ValueError("CUTLASS prepared weights must be contiguous.")
+
+    def _validate_input_count(self, inputs: List[torch.Tensor]) -> None:
+        if len(inputs) != self._expected_num_inputs:
+            raise ValueError(
+                f"{type(self).__name__} expects {self._expected_num_inputs} inputs, "
+                f"got {len(inputs)}."
+            )
 
     def forward(
         self,
@@ -452,10 +465,7 @@ class CutlassBf16Runner(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if len(inputs) != 6:
-            raise ValueError(
-                "CutlassBf16Runner expects [output, hidden, ids, scales, w1, w2]."
-            )
+        self._validate_input_count(inputs)
         if self._workspace is None:
             raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
         if tactic == -1:
@@ -464,7 +474,7 @@ class CutlassBf16Runner(MoERunner):
             profile_ids = [int(tactic[0]), int(tactic[1])]
         else:
             raise ValueError(
-                "CutlassBf16Runner tactic must be -1 or a (gemm1, gemm2) pair."
+                f"{type(self).__name__} tactic must be -1 or a (gemm1, gemm2) pair."
             )
 
         # CUTLASS tactics require a stage-specific preparation launch before
@@ -496,11 +506,12 @@ class CutlassBf16Runner(MoERunner):
             inputs[4],
             inputs[5],
             output_dtype=torch.bfloat16,
-            quant_scales=[],
+            quant_scales=self._quant_scales(inputs),
             output=inputs[0],
             tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
             enable_pdl=self._enable_pdl,
             activation_type=self.config.activation.type,
+            use_w4_group_scaling=self._use_w4_group_scaling,
             use_fused_finalize=self._use_fused_finalize,
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
@@ -512,6 +523,95 @@ class CutlassBf16Runner(MoERunner):
 
     def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
         return (self._device_arch,)
+
+
+class CutlassBf16Runner(_CutlassSm90Runner):
+    """SM90 unified adapter for dense BF16 CUTLASS fused MoE."""
+
+    backend_key = "cutlass_bf16"
+    supported_quant_variants = (QuantVariant.BF16,)
+    _weight_dtype = torch.bfloat16
+    _use_w4_group_scaling = False
+    _required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+    _expected_num_inputs = 6
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2 = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
+            raise TypeError("Cutlass BF16 prepared weights must use torch.bfloat16.")
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"Cutlass BF16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        self._validate_weight_storage((w1, w2))
+        return [w1, w2]
+
+
+class CutlassW4A16Runner(_CutlassSm90Runner):
+    """SM90 unified adapter for MXFP4-weight x BF16-activation fused MoE."""
+
+    backend_key = "cutlass_w4a16"
+    supported_quant_variants = (QuantVariant.W4A16,)
+    _weight_dtype = torch.uint8
+    _use_w4_group_scaling = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+    )
+    _expected_num_inputs = 8
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_scale, w2_scale = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        expected_s1 = (
+            num_experts,
+            2 * intermediate_size // 64,
+            hidden_size // 128,
+            16,
+            16,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            16,
+            16,
+        )
+        if any(t.dtype is not torch.uint8 for t in (w1, w2, w1_scale, w2_scale)):
+            raise TypeError("Cutlass W4A16 prepared weights and scales must be uint8.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass W4A16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if (tuple(w1_scale.shape), tuple(w2_scale.shape)) != (
+            expected_s1,
+            expected_s2,
+        ):
+            raise ValueError(
+                "Cutlass W4A16 scale shapes "
+                f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale))
+        return [w1, w2, w1_scale, w2_scale]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [inputs[6].view(torch.int32), inputs[7].view(torch.int32)]
 
 
 # ---------------------------------------------------------------------------

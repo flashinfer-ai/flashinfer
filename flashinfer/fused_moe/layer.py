@@ -31,6 +31,7 @@ from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -45,6 +46,7 @@ from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
@@ -60,6 +62,7 @@ from .utils import map_to_hybrid_bucket
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
     CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
@@ -73,6 +76,7 @@ _RunnerT = Union[
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassBf16Config: CutlassBf16Runner,
+    CutlassW4A16Config: CutlassW4A16Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
@@ -116,6 +120,11 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
+            # Some runner constructors load or JIT-build their backend module.
+            # Reject incompatible quantization contracts before construction so
+            # an unrelated candidate cannot trigger that expensive side effect.
+            if config.quant.variant not in runner_cls.supported_quant_variants:
+                continue
             runner = runner_cls(config, device=self.device)
             try:
                 runner.check_support()

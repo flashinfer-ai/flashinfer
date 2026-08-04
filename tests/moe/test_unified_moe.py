@@ -58,6 +58,8 @@ from flashinfer.fused_moe.api import (
     BackendOptions,
     CuteDslConfig,
     CutlassBf16Config,
+    CutlassConfig,
+    CutlassW4A16Config,
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
@@ -204,6 +206,10 @@ class TestReprRoundTrip:
         assert isinstance(reconstructed.candidates[0], TrtllmFp4Config)
         assert isinstance(reconstructed.candidates[1], CutlassBf16Config)
 
+    def test_cutlass_concrete_and_placeholder_configs_round_trip(self):
+        for config in (CutlassConfig(), CutlassBf16Config(), CutlassW4A16Config()):
+            assert _eval_repr(config) == config
+
     def test_backend_options_single(self):
         opts = BackendOptions(candidates=(TrtllmFp8PerTensorConfig(),))
         reconstructed = _eval_repr(opts)
@@ -268,9 +274,9 @@ class TestBackendOptions:
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
         valid = opts.valid_for(100)
-        assert len(valid) == 3
+        assert len(valid) == 2
         assert not CutlassConfig.supported(100)
-        assert CutlassBf16Config.supported(100)
+        assert not CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)

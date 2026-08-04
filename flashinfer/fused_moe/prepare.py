@@ -1234,6 +1234,71 @@ def prepare_cutlass_bf16_weights(
     }
 
 
+def prepare_cutlass_w4a16_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the SM90 mixed-input MXFP4 view for ``CutlassW4A16Runner``.
+
+    The stable MXFP4 quantizer first produces logical packed E2M1 weights and
+    linear UE8M0 scales. Both are then folded into the byte layouts consumed by
+    the Hopper mixed-input GEMM.
+    """
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise TypeError(
+            "prepare_cutlass_w4a16_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+        raise ValueError(
+            "Cutlass W4A16 requires hidden_size and intermediate_size divisible by 128."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"Cutlass W4A16 preparation requires CUDA, got {device}.")
+
+    from ..fp4_quantization import fp4_quantize
+
+    def quantize(weight: torch.Tensor, rows: int, cols: int):
+        weight = weight.to(device).contiguous().view(num_local_experts * rows, cols)
+        packed, scales = fp4_quantize(
+            weight,
+            global_scale=None,
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
+        )
+        packed = packed.view(num_local_experts, rows, cols // 2).view(torch.uint8)
+        scales = scales.view(torch.uint8).reshape(num_local_experts, rows, cols // 32)
+        return (
+            interleave_moe_weights_for_sm90_mixed_gemm(packed, "fp4"),
+            interleave_moe_scales_for_sm90_mixed_gemm(scales),
+        )
+
+    w1, w1_scale = quantize(w1_bf16, 2 * intermediate_size, hidden_size)
+    w2, w2_scale = quantize(w2_bf16, hidden_size, intermediate_size)
+    return {
+        "fc1_expert_weights": w1,
+        "fc1_expert_scales": w1_scale,
+        "fc2_expert_weights": w2,
+        "fc2_expert_scales": w2_scale,
+    }
+
+
 def _interleave_linear_and_gate(
     x: torch.Tensor, group_size: int = 64, dim: int = -1
 ) -> torch.Tensor:

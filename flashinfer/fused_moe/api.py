@@ -234,8 +234,10 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
-# Architectures covered by the flat CUTLASS BF16 fused-MoE path.
-_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 110, 120, 121)
+# This PR intentionally validates the concrete unified CUTLASS runners only on
+# Hopper. Other architectures remain available through the legacy flat API and
+# can be enabled here by follow-up runners with architecture-specific coverage.
+_CUTLASS_SM90_ARCHS = (90,)
 
 
 @dataclass(frozen=True)
@@ -482,16 +484,34 @@ class TrtllmMxInt4Config:
 
 
 @dataclass(frozen=True)
-class CutlassBf16Config:
-    """CUTLASS BF16 backend for the unified MoE API.
+class CutlassConfig:
+    """Legacy quantization-neutral CUTLASS configuration placeholder.
 
-    Architecture coverage follows the legacy flat CUTLASS BF16 path. Other
-    quantization contracts use separate unified backend configs and runners.
+    This type is preserved for source compatibility, but it is intentionally
+    not registered with :class:`MoELayer` and therefore is not runnable. Select
+    a concrete tensor contract such as :class:`CutlassBf16Config` or
+    :class:`CutlassW4A16Config` instead.
     """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _CUTLASS_BF16_ARCHS
+        return True
+
+    def __repr__(self) -> str:
+        return "CutlassConfig()"
+
+
+@dataclass(frozen=True)
+class CutlassBf16Config:
+    """SM90 CUTLASS BF16 backend for the unified MoE API.
+
+    Other architectures remain available through the legacy flat API until
+    their unified runner coverage is validated separately.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_SM90_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -522,6 +542,40 @@ class CutlassBf16Config:
 
     def __repr__(self) -> str:
         return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CutlassW4A16Config:
+    """SM90 CUTLASS MXFP4-weight x BF16-activation backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_SM90_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Quantize and interleave canonical BF16 weights for SM90 W4A16."""
+        from .prepare import prepare_cutlass_w4a16_weights
+
+        return prepare_cutlass_w4a16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassW4A16Config()"
 
 
 @dataclass(frozen=True)
@@ -657,7 +711,9 @@ BackendConfigType = Union[
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
+    CutlassConfig,
     CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -669,7 +725,9 @@ ALL_BACKEND_CONFIGS = (
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
+    CutlassConfig,
     CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -725,6 +783,7 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmBf16Config(),
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
+        CutlassW4A16Config(),
         CuteDslConfig(),
     )
 )

@@ -40,20 +40,20 @@ config = MoEConfig(
         top_k=8,
         method=RoutingMethodType.DeepSeekV3,
     ),
-    quant=QuantConfig(variant=QuantVariant.BF16),
+    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmBf16Config(extra_backend_params...), CutlassBf16Config(extra_backend_params...)],
+    backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
 )
 # --- Find possible backends ---
 backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_bf16":TrtllmBf16Config(), "cutlass_bf16":CutlassBf16Config()}
-# or {"trtllm_bf16":"unsupported reason...", "cutlass_bf16":CutlassBf16Config()}
+# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_fp4":CutlassConfig()}
+# or {"trtllm_fp4":"unsupported reason...", "cutlass_fp4":CutlassConfig()}
 # more modification to the backends' parameters could be done here
-backends=["trtllm_bf16":TrtllmBf16Config(extra_backend_params...),"cutlass_bf16":CutlassBf16Config(extra_backend_params...)]
+backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_fp4":CutlassConfig(extra_backend_params...)]
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
-weight_pack.prepare_for("trtllm_bf16", trtllm_weights) weight_pack.prepare_for("cutlass_bf16", cutlass_weights)
+weight_pack.prepare_for("trtllm_fp4", trtllm_weights) weight_pack.prepare_for("cutlass_fp4", cutlass_weights)
 act_pack = MoEActivationPack(
     hidden_states_q=cute_dsl_data["x"],
     hidden_states_scale=x_sf,
@@ -119,9 +119,9 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 # Single backend
 backends = [TrtllmFp4Config()]
 # Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmBf16Config(), CutlassBf16Config()]
+backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
 # | is associative, returns BackendOptions
-# CutlassBf16Config selects the unified BF16 runner across supported CUTLASS architectures
+# CutlassConfig is always the universal fallback
 ```
 
 Each backend config declares its own preconditions:
@@ -131,15 +131,11 @@ class TrtllmFp4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
         return arch >= 90  # Hopper+
-class CutlassBf16Config:
+class CutlassConfig:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (89, 90, 100, 103, 110, 120, 121)
+        return True  # universal fallback
 ```
-
-The legacy flat CUTLASS MoE API supports additional quantization contracts.
-Unified `CutlassBf16Config` advertises the BF16 contract across architectures
-with a corresponding CUTLASS module; other quantizations use separate configs.
 
 ### 3.3 MoEConfig — \*\*unpack protocol
 
@@ -148,9 +144,9 @@ MoEConfig implements keys() and __getitem__ so it can be unpacked directly with 
 ```
 config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
-    quant=QuantConfig(variant=QuantVariant.BF16),
+    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmBf16Config(), CutlassBf16Config()],
+    backends=[TrtllmFp4Config(), CutlassConfig()],
 )
 # Unpack into any call accepting these kwargs
 output = moe_layer(tensors, **config)
@@ -261,7 +257,7 @@ repro.benchmark_all()
 # FinalizeConfig    0.11ms
 # Total             3.13ms
 # Isolate backend to narrow regression
-repro.isolate_backend(CutlassBf16Config())
+repro.isolate_backend(CutlassConfig())
 repro.isolate_backend(TrtllmFp4Config())
 ```
 
@@ -300,7 +296,7 @@ flashinfer/
       __init__.py     # BACKEND_REGISTRY, DEFAULT_PRIORITY
       trtllm_fp4.py   # TrtllmFp4Config + adapter
       trtllm_fp8.py   # Fp8Block + Fp8PerTensor + adapters
-      cutlass.py      # CutlassBf16Config + adapter
+      cutlass.py      # CutlassConfig + adapter
     repro.py          # MoERepro
     tensors.py        # MoETensors, Gemm1Tensors, Gemm2Tensors
 ```
@@ -422,13 +418,13 @@ These comments were transcribed from the DOCX review metadata. Anchors refer to 
 
 ### C16 — Reviewer 8
 
-**Anchor:** `backends=[TrtllmBf16Config(extra_backend_params...), CutlassBf16Config(extra_backend_params...)]`
+**Anchor:** `backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)]`
 
 > Very often community developers are not aware of which backends are supported for a given routing + quant config. Agree with Reviewer 7 here that there should be an interface where users can query for a list of backends given quant config, hardware architecture. This can also extend to a benchmark option where we give the users an option to also see which backend performs best for a set of shapes of interest.
 
 ### C17 — Reviewer 3
 
-**Anchor:** `backends=[TrtllmBf16Config(extra_backend_params...), CutlassBf16Config(extra_backend_params...)]`
+**Anchor:** `backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)]`
 
 > added a "Find possible backends" step in the example
 
@@ -500,31 +496,31 @@ These comments were transcribed from the DOCX review metadata. Anchors refer to 
 
 ### C29 — Reviewer 10
 
-**Anchor:** `backends = [TrtllmBf16Config(), CutlassBf16Config()]`
+**Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > I'm not sure how realistic this is since usually each backend requires different weight processing at model load time or different checkpoints entirely.
 
 ### C30 — Reviewer 7
 
-**Anchor:** `backends = [TrtllmBf16Config(), CutlassBf16Config()]`
+**Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > Agree with Reviewer 10: these backends are different operations with different inputs and potentially different outputs. I'm not sure there's a way of hiding that from the caller.
 
 ### C31 — Reviewer 8
 
-**Anchor:** `backends = [TrtllmBf16Config(), CutlassBf16Config()]`
+**Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > Agree, is the framework still defining and calling weight processing methods like swizzling, shuffling etc?
 
 ### C32 — Reviewer 8
 
-**Anchor:** `backends = [TrtllmBf16Config(), CutlassBf16Config()]`
+**Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > >I'm not sure there's a way of hiding that from the caller.It would be nice to have something like `moe_wrapper.process_weights_after_loading(layer.weight, ... , Backend=<>`1 total reactionReviewer 10 reacted with ➕ at 2026-05-12 19:27 PM
 
 ### C33 — Reviewer 3
 
-**Anchor:** `backends = [TrtllmBf16Config(), CutlassBf16Config()]`
+**Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > sorry it was not meant to be hidden. the doc got a bit old but i sync'd back the idea from the WIP PR. please see "Example Overview"
 
@@ -588,7 +584,7 @@ Review lens: the current WIP is the MVP for PR #3093, not the full long-range de
 
 ### MVP Gaps In Current WIP
 
-**CR1 — Config/test API drift.** The current implementation exposes `QuantVariant` and explicit `BackendOptions(candidates=...)`, while `tests/moe/test_moe_api.py` still imports `QuantDtype`, `QuantGranularity`, and `Fp8Variant`, and uses `TrtllmBf16Config() | CutlassBf16Config()`. This is not a request to widen the MVP; it is a request to make the MVP API and its CPU config tests agree.
+**CR1 — Config/test API drift.** The current implementation exposes `QuantVariant` and explicit `BackendOptions(candidates=...)`, while `tests/moe/test_moe_api.py` still imports `QuantDtype`, `QuantGranularity`, and `Fp8Variant`, and uses `TrtllmFp4Config() | CutlassConfig()`. This is not a request to widen the MVP; it is a request to make the MVP API and its CPU config tests agree.
 
 **CR2 — Backend preparation is proven but not yet first-class.** `MoEActivationPack` and `MoEWeightPack.prepare_for(...)` give the MVP a clean canonical input shape, but the actual TRTLLM NVFP4 preparation logic still lives in benchmark/test helpers. The MVP goal says per-backend prepare funcs should handle differences, so the shared CuteDSL/TRTLLM NVFP4 prepare entrypoints should move into the implementation surface.
 
