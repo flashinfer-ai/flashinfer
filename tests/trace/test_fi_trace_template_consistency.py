@@ -31,10 +31,11 @@ Two levels of checking
 
 How to add a new template
 --------------------------
-When you add ``@flashinfer_api(trace=my_trace)`` to a function, add an
-entry to ``_TEMPLATE_FUNC_PAIRS`` and optionally a targeted end-to-end test.
-See the docstring in ``flashinfer/trace/templates/__init__.py`` for the full
-how-to guide.
+When you add ``@flashinfer_api(trace=my_trace)`` to the first traced function
+in a module, add that module to ``_TRACE_REGISTRATION_MODULES`` in
+``tests.trace.template_registry``.  Add a targeted end-to-end test when the
+generic checks are insufficient.  See the docstring in
+``flashinfer/trace/templates/__init__.py`` for the full how-to guide.
 """
 
 import inspect
@@ -44,6 +45,7 @@ import pytest
 import torch
 
 from flashinfer.trace.template import Const, Scalar, Tensor, TraceTemplate, Var
+from tests.trace.template_registry import collect_registered_trace_templates
 
 # ---------------------------------------------------------------------------
 # Structural checker utilities
@@ -303,42 +305,24 @@ def assert_fi_trace_complete(
 
 
 # ---------------------------------------------------------------------------
-# Auto-discovery via _TRACE_REGISTRY
+# Deterministic auto-discovery via _TRACE_REGISTRY
 #
 # @flashinfer_api(trace=...) automatically registers every (func, template)
-# pair in flashinfer.api_logging._TRACE_REGISTRY at decoration time.
-# We just need to import the modules that contain the decorated functions to
-# trigger those decorators, then read the registry.
+# pair in flashinfer.api_logging._TRACE_REGISTRY at decoration time.  The
+# shared collector imports the complete module inventory and returns a stable
+# snapshot, independent of modules imported by earlier pytest files.
 #
-# To add a new kernel: no changes needed here — simply add
-# @flashinfer_api(trace=my_template) to your function and the tests will
-# pick it up automatically.
+# To add a new kernel, add @flashinfer_api(trace=my_template) to the function.
+# If it lives in a new registration module, add that module to
+# tests.trace.template_registry._TRACE_REGISTRATION_MODULES; the inventory
+# regression test reports omissions.
 # ---------------------------------------------------------------------------
 
 
 def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
-    """
-    Return all (func, template, label) pairs by reading _TRACE_REGISTRY.
+    """Return all available (func, template, label) triples."""
 
-    Imports are done lazily here so that missing GPU drivers don't prevent
-    the structural tests from running.
-    """
-    # Trigger @flashinfer_api decorators by importing all modules that use them.
-    import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
-    import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
-    import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
-    import flashinfer.gdn_prefill  # chunk_gated_delta_rule
-    import flashinfer.gemm  # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
-    import flashinfer.kda_decode  # recurrent_kda
-    import flashinfer.mla  # BatchMLAPagedAttentionWrapper
-    import flashinfer.msa_ops  # msa_proxy_score, msa_sparse_attention, decode
-    import flashinfer.norm  # rmsnorm, fused_add_rmsnorm
-    import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
-    import flashinfer.sampling  # noqa: F401  # top_k_sampling_from_probs, etc.
-
-    from flashinfer.api_logging import _TRACE_REGISTRY
-
-    return list(_TRACE_REGISTRY)
+    return collect_registered_trace_templates()
 
 
 _ALL_PAIRS = _collect_template_func_pairs()

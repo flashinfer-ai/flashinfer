@@ -113,6 +113,16 @@ _TASK_SLICE_CHUNK = 4
 _PRODUCER_PAIRS_PER_WARP = 2
 _FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
 
+# The upstream compact queue exposes two int32 metadata planes.  Pack the
+# optimized scheduler's complete descriptor into those planes so task claim
+# and prefetch use shifts/masks instead of integer division in the hot loop.
+# word0 = expert[9:0] | m_tile[23:10]
+# word1 = valid_rows[7:0] | slice_begin[19:8] | slice_count[31:20]
+_TASK_EXPERT_MASK = 0x3FF
+_TASK_M_TILE_MASK = 0x3FFF
+_TASK_VALID_ROWS_MASK = 0xFF
+_TASK_SLICE_MASK = 0xFFF
+
 
 # For small routed worksets, retain Q0's packed-A output for the later FC1 TMA
 # reads.  Large worksets use the original store to avoid competing with the
@@ -1020,53 +1030,9 @@ class MoEGatedDynamicKernel:
         cute.arch.sync_threads()
 
     @cute.jit
-    def publish_ready_tasks(
-        self,
-        task_tail: cute.Tensor,
-        task_ready: cute.Tensor,
-        task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
-        task_valid_rows: cute.Tensor,
-        gate_tile_cnt: Int32,
-        slice_chunk: Int32,
-        expert_idx: Int32,
-        m_tile_idx: Int32,
-        valid_rows: Int32,
-    ):
-        num_groups = (gate_tile_cnt + slice_chunk - Int32(1)) // slice_chunk
-        start = atomic_add_global_i32(get_ptr_as_int64(task_tail, Int32(0)), num_groups)
-
-        g = Int32(0)
-        while g < num_groups:
-            slot = start + g
-            slice_begin = g * slice_chunk
-            slice_count = gate_tile_cnt - slice_begin
-            if slice_count > slice_chunk:
-                slice_count = slice_chunk
-            task_expert[slot] = expert_idx
-            task_m_tile[slot] = m_tile_idx
-            task_slice_begin[slot] = slice_begin
-            task_slice_count[slot] = slice_count
-            task_valid_rows[slot] = valid_rows
-            g += Int32(1)
-
-        _threadfence()
-
-        g = Int32(0)
-        while g < num_groups:
-            slot = start + g
-            _st_global_release_i32(get_ptr_as_int64(task_ready, slot), Int32(1))
-            g += Int32(1)
-
-    @cute.jit
     def publish_uniform_deferred_tasks(
         self,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
         gate_tile_cnt: Int32,
         slice_chunk: Int32,
@@ -1084,20 +1050,16 @@ class MoEGatedDynamicKernel:
             slice_count = gate_tile_cnt - slice_begin
             if slice_count > slice_chunk:
                 slice_count = slice_chunk
-            task_expert[slot] = expert_idx
-            task_m_tile[slot] = m_tile_idx
-            task_slice_begin[slot] = slice_begin
-            task_slice_count[slot] = slice_count
-            task_valid_rows[slot] = valid_rows
+            task_expert[slot] = expert_idx | (m_tile_idx << Int32(10))
+            task_valid_rows[slot] = (
+                valid_rows | (slice_begin << Int32(8)) | (slice_count << Int32(20))
+            )
             g += Int32(1)
 
     @cute.jit
     def publish_variable_deferred_tasks(
         self,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
         gate_tile_cnt: Int32,
         split_tile_count: Int32,
@@ -1125,11 +1087,10 @@ class MoEGatedDynamicKernel:
             slice_count = gate_tile_cnt - slice_begin
             if slice_count > slice_chunk:
                 slice_count = slice_chunk
-            task_expert[slot] = expert_idx
-            task_m_tile[slot] = m_tile_idx
-            task_slice_begin[slot] = slice_begin
-            task_slice_count[slot] = slice_count
-            task_valid_rows[slot] = valid_rows
+            task_expert[slot] = expert_idx | (m_tile_idx << Int32(10))
+            task_valid_rows[slot] = (
+                valid_rows | (slice_begin << Int32(8)) | (slice_count << Int32(20))
+            )
             g += Int32(1)
 
     @cute.jit
@@ -1141,9 +1102,6 @@ class MoEGatedDynamicKernel:
         ctrl_base_addr: Int32,
         task_head: cute.Tensor,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
         token_map: cute.Tensor,
         token_weights: cute.Tensor,
@@ -1189,12 +1147,19 @@ class MoEGatedDynamicKernel:
                     Int32(1),
                 )
                 if slot < tail:
+                    descriptor0 = task_expert[slot].to(Int32)
+                    descriptor1 = task_valid_rows[slot].to(Int32)
+                    expert = descriptor0 & Int32(_TASK_EXPERT_MASK)
+                    m_tile = (descriptor0 >> Int32(10)) & Int32(_TASK_M_TILE_MASK)
+                    valid_rows = descriptor1 & Int32(_TASK_VALID_ROWS_MASK)
+                    slice_begin = (descriptor1 >> Int32(8)) & Int32(_TASK_SLICE_MASK)
+                    slice_count = (descriptor1 >> Int32(20)) & Int32(_TASK_SLICE_MASK)
                     _st_shared_i32(ctrl_base_addr + Int32(0), Int32(1))
-                    _st_shared_i32(ctrl_base_addr + Int32(8), task_expert[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(12), task_m_tile[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(16), task_slice_begin[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(20), task_slice_count[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(24), task_valid_rows[slot])
+                    _st_shared_i32(ctrl_base_addr + Int32(8), expert)
+                    _st_shared_i32(ctrl_base_addr + Int32(12), m_tile)
+                    _st_shared_i32(ctrl_base_addr + Int32(16), slice_begin)
+                    _st_shared_i32(ctrl_base_addr + Int32(20), slice_count)
+                    _st_shared_i32(ctrl_base_addr + Int32(24), valid_rows)
                 else:
                     _st_shared_i32(ctrl_base_addr + Int32(4), Int32(1))
         cute.arch.sync_threads()
@@ -1233,9 +1198,6 @@ class MoEGatedDynamicKernel:
         ctrl_base_addr: Int32,
         task_head: cute.Tensor,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
     ):
         if lane_id == Int32(0):
@@ -1248,11 +1210,18 @@ class MoEGatedDynamicKernel:
                     Int32(1),
                 )
                 if slot < tail:
-                    _st_shared_i32(ctrl_base_addr + Int32(40), task_expert[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(44), task_m_tile[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(48), task_slice_begin[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(52), task_slice_count[slot])
-                    _st_shared_i32(ctrl_base_addr + Int32(56), task_valid_rows[slot])
+                    descriptor0 = task_expert[slot].to(Int32)
+                    descriptor1 = task_valid_rows[slot].to(Int32)
+                    expert = descriptor0 & Int32(_TASK_EXPERT_MASK)
+                    m_tile = (descriptor0 >> Int32(10)) & Int32(_TASK_M_TILE_MASK)
+                    valid_rows = descriptor1 & Int32(_TASK_VALID_ROWS_MASK)
+                    slice_begin = (descriptor1 >> Int32(8)) & Int32(_TASK_SLICE_MASK)
+                    slice_count = (descriptor1 >> Int32(20)) & Int32(_TASK_SLICE_MASK)
+                    _st_shared_i32(ctrl_base_addr + Int32(40), expert)
+                    _st_shared_i32(ctrl_base_addr + Int32(44), m_tile)
+                    _st_shared_i32(ctrl_base_addr + Int32(48), slice_begin)
+                    _st_shared_i32(ctrl_base_addr + Int32(52), slice_count)
+                    _st_shared_i32(ctrl_base_addr + Int32(56), valid_rows)
                     _membar_cta()
                     _st_shared_i32(ctrl_base_addr + Int32(32), Int32(1))
                 else:
@@ -2933,7 +2902,6 @@ class MoEGatedDynamicKernel:
         resident_barriers,
         shared_addresses,
         launch_params: DynamicLaunchParams,
-        full_tile_publish_enabled: Int32,
     ):
         tidx, bidz, gdim_z, warp_idx, is_cta_leader = thread_info
         a_input, topk_ids, topk_weights, input_global_scale = route_inputs
@@ -2944,23 +2912,12 @@ class MoEGatedDynamicKernel:
             token_map,
             token_weights,
         ) = route_outputs
-        (
-            expert_write_rows,
-            expert_tile_base,
-            pair_head,
-            producers_done_count,
-            all_work_published,
-        ) = routing_state
+        expert_write_rows, expert_tile_base, pair_head = routing_state
         (
             task_head,
             task_tail,
-            task_ready,
             task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
             task_valid_rows,
-            tile_write_count,
         ) = task_queue
         barrier_count, barrier_epoch = resident_barriers
         (
@@ -2991,8 +2948,6 @@ class MoEGatedDynamicKernel:
             task_slice_chunk = Int32(2)
 
         # Phase 0: cooperative init — zero routing state, queue state, and output.
-        _task_capacity = Int32(task_ready.shape[0])
-        tile_write_slots = Int32(tile_write_count.shape[0])
         i = flat_tid
         while i < num_experts:
             row_counts[i] = Int32(0)
@@ -3020,21 +2975,8 @@ class MoEGatedDynamicKernel:
             scatter_output_u32[j // cols_u32, j % cols_u32] = Uint32(0)
             j += flat_stride
 
-        # Deferred publication is hard-wired for this kernel.  Every
-        # consumed task slot is fully overwritten by
-        # publish_deferred_tasks, and task_ready is never read.  Do not
-        # clear unused capacity in six global task arrays.
-
-        if full_tile_publish_enabled > Int32(0):
-            tw = flat_tid
-            while tw < tile_write_slots:
-                tile_write_count[tw] = Int32(0)
-                tw += flat_stride
-
         if flat_tid == Int32(0):
             pair_head[Int32(0)] = Int32(0)
-            producers_done_count[Int32(0)] = Int32(0)
-            all_work_published[Int32(0)] = Int32(0)
             task_head[Int32(0)] = Int32(0)
             task_tail[Int32(0)] = Int32(0)
 
@@ -3414,44 +3356,6 @@ class MoEGatedDynamicKernel:
                                     topk_slot += Int32(1)
                                 sf_idx += Int32(32)
 
-                        if full_tile_publish_enabled > Int32(0):
-                            cute.arch.sync_warp()
-                            _threadfence()
-                            cute.arch.sync_warp()
-
-                            if lane_id == Int32(0):
-                                topk_slot = Int32(0)
-                                while topk_slot < num_topk:
-                                    slot = route_slot_base + topk_slot
-                                    phys_row = _ld_shared_i32(
-                                        route_phys_rows_addr + slot * Int32(4)
-                                    )
-                                    expert_id = _ld_shared_i32(
-                                        route_expert_ids_addr + slot * Int32(4)
-                                    )
-                                    phys_tile = phys_row // Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self.publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
-                                        )
-                                    topk_slot += Int32(1)
                 else:
                     # Each math warp owns one token and handles all of its
                     # routes.  Keep a 16-entry register cache so both the
@@ -3653,46 +3557,6 @@ class MoEGatedDynamicKernel:
                                     cache_slot += Int32(1)
                             sf_idx += Int32(32)
 
-                        # Retain the enabled publication protocol even though
-                        # exp_016 explicitly runs deferred publication (0).
-                        if full_tile_publish_enabled > Int32(0):
-                            cute.arch.sync_warp()
-                            _threadfence()
-                            cute.arch.sync_warp()
-                            if lane_id == Int32(0):
-                                topk_slot = Int32(0)
-                                while topk_slot < num_topk:
-                                    route_slot = route_slot_base + topk_slot
-                                    phys_row = _ld_shared_i32(
-                                        route_phys_rows_addr + route_slot * Int32(4)
-                                    )
-                                    expert_id = _ld_shared_i32(
-                                        route_expert_ids_addr + route_slot * Int32(4)
-                                    )
-                                    phys_tile = phys_row // Int32(
-                                        self.tile_shape_mnk[0]
-                                    )
-                                    completed = atomic_add_global_i32(
-                                        get_ptr_as_int64(tile_write_count, phys_tile),
-                                        Int32(1),
-                                    ) + Int32(1)
-                                    if completed == Int32(self.tile_shape_mnk[0]):
-                                        self.publish_ready_tasks(
-                                            task_tail,
-                                            task_ready,
-                                            task_expert,
-                                            task_m_tile,
-                                            task_slice_begin,
-                                            task_slice_count,
-                                            task_valid_rows,
-                                            route_gate_tile_cnt,
-                                            task_slice_chunk,
-                                            expert_id,
-                                            phys_tile,
-                                            Int32(self.tile_shape_mnk[0]),
-                                        )
-                                    topk_slot += Int32(1)
-
                 q0_bulk_phase = Int32(1) - q0_bulk_phase
 
         cute.arch.sync_threads()
@@ -3702,148 +3566,98 @@ class MoEGatedDynamicKernel:
         _threadfence()
         cute.arch.sync_threads()
 
-        if full_tile_publish_enabled == Int32(0):
-            # Micro batches cannot fill a full M tile, so overlap is impossible.
-            # Rendezvous once, publish the final partial tiles, then consume.
-            self.resident_grid_barrier(
-                barrier_count,
-                barrier_epoch,
-                Int32(gdim_z),
-                is_cta_leader,
-            )
+        self.resident_grid_barrier(
+            barrier_count,
+            barrier_epoch,
+            Int32(gdim_z),
+            is_cta_leader,
+        )
 
-            if is_cta_leader > Int32(0):
-                total_m_tiles = expert_tile_base[num_experts]
-                split_groups = (route_gate_tile_cnt + Int32(1)) // Int32(2)
-                extra_per_split = split_groups - Int32(1)
-                split_tile_count = Int32(0)
-                if extra_per_split > Int32(0):
-                    if num_tokens > Int32(256):
-                        if num_tokens <= Int32(4096):
-                            target_task_count = Int32(4) * Int32(gdim_z)
-                            if num_tokens > Int32(2048):
-                                target_task_count = (
-                                    Int32(125) * Int32(gdim_z) + Int32(31)
-                                ) // Int32(32)
-                            missing_tasks = target_task_count - total_m_tiles
-                            if missing_tasks > Int32(0):
-                                split_tile_count = (
-                                    missing_tasks + extra_per_split - Int32(1)
-                                ) // extra_per_split
-                                if split_tile_count > total_m_tiles:
-                                    split_tile_count = total_m_tiles
+        total_m_tiles = expert_tile_base[num_experts]
+        split_groups = (route_gate_tile_cnt + Int32(1)) // Int32(2)
+        extra_per_split = split_groups - Int32(1)
+        split_tile_count = Int32(0)
+        if extra_per_split > Int32(0):
+            if num_tokens > Int32(256):
+                if num_tokens <= Int32(4096):
+                    target_task_count = Int32(4) * Int32(gdim_z)
+                    if num_tokens > Int32(2048):
+                        target_task_count = (
+                            Int32(125) * Int32(gdim_z) + Int32(31)
+                        ) // Int32(32)
+                    missing_tasks = target_task_count - total_m_tiles
+                    if missing_tasks > Int32(0):
+                        split_tile_count = (
+                            missing_tasks + extra_per_split - Int32(1)
+                        ) // extra_per_split
+                        if split_tile_count > total_m_tiles:
+                            split_tile_count = total_m_tiles
 
-                expert_flush = Int32(bidz)
-                while expert_flush < num_experts:
-                    rows_remaining = row_counts[expert_flush]
-                    m_tile_offset = Int32(0)
-                    while rows_remaining > Int32(0):
-                        valid_rows = rows_remaining
-                        if valid_rows > Int32(self.tile_shape_mnk[0]):
-                            valid_rows = Int32(self.tile_shape_mnk[0])
-                        if num_tokens <= Int32(256):
-                            self.publish_uniform_deferred_tasks(
-                                task_expert,
-                                task_m_tile,
-                                task_slice_begin,
-                                task_slice_count,
-                                task_valid_rows,
-                                route_gate_tile_cnt,
-                                task_slice_chunk,
-                                expert_flush,
-                                expert_tile_base[expert_flush] + m_tile_offset,
-                                valid_rows,
-                            )
-                        elif num_tokens <= Int32(4096):
-                            self.publish_variable_deferred_tasks(
-                                task_expert,
-                                task_m_tile,
-                                task_slice_begin,
-                                task_slice_count,
-                                task_valid_rows,
-                                route_gate_tile_cnt,
-                                split_tile_count,
-                                expert_flush,
-                                expert_tile_base[expert_flush] + m_tile_offset,
-                                valid_rows,
-                            )
-                        else:
-                            self.publish_uniform_deferred_tasks(
-                                task_expert,
-                                task_m_tile,
-                                task_slice_begin,
-                                task_slice_count,
-                                task_valid_rows,
-                                route_gate_tile_cnt,
-                                task_slice_chunk,
-                                expert_flush,
-                                expert_tile_base[expert_flush] + m_tile_offset,
-                                valid_rows,
-                            )
-                        rows_remaining -= Int32(self.tile_shape_mnk[0])
-                        m_tile_offset += Int32(1)
-                    expert_flush += Int32(gdim_z)
-
-                if flat_tid == Int32(0):
-                    uniform_groups = (
-                        route_gate_tile_cnt + task_slice_chunk - Int32(1)
-                    ) // task_slice_chunk
-                    published_task_count = total_m_tiles * uniform_groups
-                    if num_tokens > Int32(256):
-                        if num_tokens <= Int32(4096):
-                            published_task_count = (
-                                total_m_tiles + split_tile_count * extra_per_split
-                            )
-                    st_global_i32(
-                        get_ptr_as_int64(task_tail, Int32(0)),
-                        published_task_count,
-                    )
-
-            self.resident_grid_barrier(
-                barrier_count,
-                barrier_epoch,
-                Int32(gdim_z),
-                is_cta_leader,
-            )
-            if flat_tid == Int32(0):
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
-                )
-        elif is_cta_leader > Int32(0):
-            prev_done = atomic_add_global_i32(
-                get_ptr_as_int64(producers_done_count, Int32(0)),
-                Int32(1),
-            )
-            if prev_done == Int32(gdim_z) - Int32(1):
-                expert_flush = Int32(0)
-                while expert_flush < num_experts:
-                    rows = row_counts[expert_flush]
-                    rem = rows % Int32(self.tile_shape_mnk[0])
-                    if rem != Int32(0):
-                        partial_m_tile = expert_tile_base[expert_flush] + rows // Int32(
-                            self.tile_shape_mnk[0]
-                        )
-                        self.publish_ready_tasks(
-                            task_tail,
-                            task_ready,
+        if is_cta_leader > Int32(0):
+            expert_flush = Int32(bidz)
+            while expert_flush < num_experts:
+                rows_remaining = row_counts[expert_flush]
+                m_tile_offset = Int32(0)
+                while rows_remaining > Int32(0):
+                    valid_rows = rows_remaining
+                    if valid_rows > Int32(self.tile_shape_mnk[0]):
+                        valid_rows = Int32(self.tile_shape_mnk[0])
+                    if num_tokens <= Int32(256):
+                        self.publish_uniform_deferred_tasks(
                             task_expert,
-                            task_m_tile,
-                            task_slice_begin,
-                            task_slice_count,
                             task_valid_rows,
                             route_gate_tile_cnt,
                             task_slice_chunk,
                             expert_flush,
-                            partial_m_tile,
-                            rem,
+                            expert_tile_base[expert_flush] + m_tile_offset,
+                            valid_rows,
                         )
-                    expert_flush += Int32(1)
-                _threadfence()
-                _st_global_release_i32(
-                    get_ptr_as_int64(all_work_published, Int32(0)),
-                    Int32(1),
-                )
+                    elif num_tokens <= Int32(4096):
+                        self.publish_variable_deferred_tasks(
+                            task_expert,
+                            task_valid_rows,
+                            route_gate_tile_cnt,
+                            split_tile_count,
+                            expert_flush,
+                            expert_tile_base[expert_flush] + m_tile_offset,
+                            valid_rows,
+                        )
+                    else:
+                        self.publish_uniform_deferred_tasks(
+                            task_expert,
+                            task_valid_rows,
+                            route_gate_tile_cnt,
+                            task_slice_chunk,
+                            expert_flush,
+                            expert_tile_base[expert_flush] + m_tile_offset,
+                            valid_rows,
+                        )
+                    rows_remaining -= Int32(self.tile_shape_mnk[0])
+                    m_tile_offset += Int32(1)
+                expert_flush += Int32(gdim_z)
+
+        if flat_tid == Int32(0):
+            uniform_groups = (
+                route_gate_tile_cnt + task_slice_chunk - Int32(1)
+            ) // task_slice_chunk
+            published_task_count = expert_tile_base[num_experts] * uniform_groups
+            if num_tokens > Int32(256):
+                if num_tokens <= Int32(4096):
+                    published_task_count = (
+                        expert_tile_base[num_experts]
+                        + split_tile_count * extra_per_split
+                    )
+            st_global_i32(
+                get_ptr_as_int64(task_tail, Int32(0)),
+                published_task_count,
+            )
+
+        self.resident_grid_barrier(
+            barrier_count,
+            barrier_epoch,
+            Int32(gdim_z),
+            is_cta_leader,
+        )
 
     @cute.jit
     def __call__(
@@ -3858,17 +3672,10 @@ class MoEGatedDynamicKernel:
         barrier_count: cute.Tensor,  # [1] int32 (host-zeroed)
         barrier_epoch: cute.Tensor,  # [1] int32 (host-zeroed)
         pair_head: cute.Tensor,  # [1] int32
-        producers_done_count: cute.Tensor,  # [1] int32
-        all_work_published: cute.Tensor,  # [1] int32
         task_head: cute.Tensor,  # [1] int32
         task_tail: cute.Tensor,  # [1] int32
-        task_ready: cute.Tensor,  # [max_tasks] int32
         task_expert: cute.Tensor,  # [max_tasks] int32
-        task_m_tile: cute.Tensor,  # [max_tasks] int32
-        task_slice_begin: cute.Tensor,  # [max_tasks] int32
-        task_slice_count: cute.Tensor,  # [max_tasks] int32
         task_valid_rows: cute.Tensor,  # [max_tasks] int32
-        tile_write_count: cute.Tensor,  # [E * max_m_tiles] int32
         b_w13: cute.Tensor,  # [2*I_tp, K, E] (gated) or [I_tp, K, E] (relu2)
         sfb_w13_ptr: cute.Pointer,  # scale factors for w13
         b_down: cute.Tensor,  # [K, I_tp, E]
@@ -3975,17 +3782,10 @@ class MoEGatedDynamicKernel:
             barrier_count,
             barrier_epoch,
             pair_head,
-            producers_done_count,
-            all_work_published,
             task_head,
             task_tail,
-            task_ready,
             task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
             task_valid_rows,
-            tile_write_count,
             tma_a,
             gA,
             tma_sfa,
@@ -4027,6 +3827,7 @@ class MoEGatedDynamicKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            cooperative=True,
             stream=stream,
         )
 
@@ -4041,17 +3842,10 @@ class MoEGatedDynamicKernel:
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
         pair_head: cute.Tensor,
-        producers_done_count: cute.Tensor,
-        all_work_published: cute.Tensor,
         task_head: cute.Tensor,
         task_tail: cute.Tensor,
-        task_ready: cute.Tensor,
         task_expert: cute.Tensor,
-        task_m_tile: cute.Tensor,
-        task_slice_begin: cute.Tensor,
-        task_slice_count: cute.Tensor,
         task_valid_rows: cute.Tensor,
-        tile_write_count: cute.Tensor,
         tma_a: cute.CopyAtom,
         mA: cute.Tensor,
         tma_sfa: cute.CopyAtom,
@@ -4318,7 +4112,6 @@ class MoEGatedDynamicKernel:
         scatter_tok_base_addr = shared_ptr_to_u32(storage.scatter_tok_cache.data_ptr())
         scatter_weight_base_addr = scatter_tok_base_addr + Int32(4)
 
-        full_tile_publish_enabled = Int32(0)
         self.initialize_route_q0_and_publish(
             (tidx, bidz, gdim_z, warp_idx, is_cta_leader),
             (a_input, topk_ids, topk_weights, input_global_scale),
@@ -4329,23 +4122,12 @@ class MoEGatedDynamicKernel:
                 token_map,
                 token_weights,
             ),
-            (
-                expert_write_rows,
-                expert_tile_base,
-                pair_head,
-                producers_done_count,
-                all_work_published,
-            ),
+            (expert_write_rows, expert_tile_base, pair_head),
             (
                 task_head,
                 task_tail,
-                task_ready,
                 task_expert,
-                task_m_tile,
-                task_slice_begin,
-                task_slice_count,
                 task_valid_rows,
-                tile_write_count,
             ),
             (barrier_count, barrier_epoch),
             (
@@ -4356,7 +4138,6 @@ class MoEGatedDynamicKernel:
                 q0_bulk_barrier_addr,
             ),
             launch_params,
-            full_tile_publish_enabled,
         )
 
         # Deferred publication is complete after the resident-grid barrier
@@ -4654,9 +4435,6 @@ class MoEGatedDynamicKernel:
                 ctrl_base_addr,
                 task_head,
                 task_expert,
-                task_m_tile,
-                task_slice_begin,
-                task_slice_count,
                 task_valid_rows,
                 token_map,
                 token_weights,
@@ -5051,9 +4829,6 @@ class MoEGatedDynamicKernel:
                     ctrl_base_addr,
                     task_head,
                     task_expert,
-                    task_m_tile,
-                    task_slice_begin,
-                    task_slice_count,
                     task_valid_rows,
                 )
 

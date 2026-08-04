@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from ._moe_dynamic.generic import MoEDynamicKernel as _GenericMoEDynamicKernel
+from ._moe_dynamic.generic import (
+    _TASK_SLICE_CHUNK,
+    MoEDynamicKernel as _GenericMoEDynamicKernel,
+)
 from ._moe_dynamic.gated import MoEGatedDynamicKernel
 from .moe_activation import is_gated_activation
 
@@ -12,8 +15,9 @@ from .moe_activation import is_gated_activation
 class MoEDynamicKernel:
     """Construct the compatible dynamic kernel for the requested activation.
 
-    Gated activations use the branch-paired optimized implementation. Non-gated
-    activations use the generic implementation.
+    The branch-paired gated implementation currently targets the logical
+    M128xN128 dynamic tile. Smaller dynamic M tiles and non-gated activations
+    use the current generic implementation from upstream.
     """
 
     def __new__(
@@ -29,10 +33,12 @@ class MoEDynamicKernel:
         swiglu_limit: float | None = None,
         share_input_across_experts: bool = False,
     ):
+        use_gated_optimized = is_gated_activation(activation) and mma_tiler_mn == (
+            128,
+            128,
+        )
         implementation = (
-            MoEGatedDynamicKernel
-            if is_gated_activation(activation)
-            else _GenericMoEDynamicKernel
+            MoEGatedDynamicKernel if use_gated_optimized else _GenericMoEDynamicKernel
         )
         return implementation(
             sf_vec_size=sf_vec_size,
@@ -47,4 +53,4 @@ class MoEDynamicKernel:
         )
 
 
-__all__ = ["MoEDynamicKernel"]
+__all__ = ["MoEDynamicKernel", "_TASK_SLICE_CHUNK"]
