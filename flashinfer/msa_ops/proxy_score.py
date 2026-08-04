@@ -458,7 +458,7 @@ def msa_proxy_score(
     # packed schedule: its smaller smem footprint co-resides 3 CTAs per SM,
     # which wins once the grid can fill the machine.
     use_keymajor = False
-    if use_packed and not kv_fp8:
+    if use_packed:
         p = 1
         while p < max_seqlen_q:
             p *= 2

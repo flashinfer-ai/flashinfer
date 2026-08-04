@@ -1447,8 +1447,6 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
             raise ValueError("only head_dim == 128 is supported")
         if group_size * pack_q_len > 32:
             raise ValueError("group_size * pack_q_len must be <= 32")
-        if kv_fp8:
-            raise NotImplementedError("fp8 K key-major schedule not yet wired")
         self._head_dim = head_dim
         self._group = group_size
         self._pack_q_len = pack_q_len
@@ -1513,18 +1511,21 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
             cta_tiler=(pack, group, hd),
         )
 
+        # fp8 K arrives as a 16-bit view of the e4m3 bytes (half head_dim),
+        # so its tiles are half as wide as Q's.
+        kw = hd // 2 if cutlass.const_expr(self._kv_fp8) else hd
         if cutlass.const_expr(self._paged):
             sK_layout = cute.make_composed_layout(
                 swizzle_128b,
                 0,
                 cute.make_layout(
-                    (1, 1, self._BLOCK_K, (elems, hd // elems), self._NUM_STAGES),
+                    (1, 1, self._BLOCK_K, (elems, kw // elems), self._NUM_STAGES),
                     stride=(
                         0,
                         0,
                         elems,
                         (1, self._BLOCK_K * elems),
-                        self._BLOCK_K * hd,
+                        self._BLOCK_K * kw,
                     ),
                 ),
             )
@@ -1532,19 +1533,19 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 tma_g2s,
                 cute.logical_divide(mK, (None, None, None, elems)),
                 sK_layout,
-                cta_tiler=(1, 1, self._BLOCK_K, hd),
+                cta_tiler=(1, 1, self._BLOCK_K, kw),
             )
         else:
             sK_layout = cute.make_composed_layout(
                 swizzle_128b,
                 0,
                 cute.make_layout(
-                    (self._BLOCK_K, 1, (elems, hd // elems), self._NUM_STAGES),
+                    (self._BLOCK_K, 1, (elems, kw // elems), self._NUM_STAGES),
                     stride=(
                         elems,
                         0,
                         (1, self._BLOCK_K * elems),
-                        self._BLOCK_K * hd,
+                        self._BLOCK_K * kw,
                     ),
                 ),
             )
@@ -1552,7 +1553,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 tma_g2s,
                 cute.logical_divide(mK, (None, None, elems)),
                 sK_layout,
-                cta_tiler=(self._BLOCK_K, 1, hd),
+                cta_tiler=(self._BLOCK_K, 1, kw),
             )
 
         self.kernel(
@@ -1600,6 +1601,8 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         epi_q = q_tiles * 8
         elems = 128 // dtype.width
         mma_k = 32 * 8 // dtype.width
+
+        kw = hd // 2 if self._kv_fp8 else hd
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
@@ -1688,7 +1691,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                 cute.domain_offset(
                                     (k_start, kv_head, 0), k_tma.tma_tensor
                                 ),
-                                tiler=(block_k, 1, hd),
+                                tiler=(block_k, 1, kw),
                                 coord=(kv_block, 0, 0),
                             )
                         k_mbar = tma_full_mbar + tma_stage
@@ -1697,7 +1700,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                             tma_empty_mbar + tma_stage, tma_parity
                         )
                         with cute.arch.elect_one():
-                            k_size = block_k * hd * (dtype.width // 8)
+                            k_size = block_k * kw * (dtype.width // 8)
                             cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, k_size)
                         _tma_copy_g2s(
                             k_tma.atom,
@@ -1714,15 +1717,11 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
             else:
                 # MMA warps: each owns 32 contiguous keys across all q rows.
                 sK_warp = cute.local_tile(
-                    sK, (32, hd, num_stages), (warp_id, 0, 0)
-                )
-                sK_ldsm = cute.zipped_divide(
-                    sK_warp, (16, cute.make_layout((elems, 2)), 1)
+                    sK, (32, kw, num_stages), (warp_id, 0, 0)
                 )
                 sQ_ldsm = cute.zipped_divide(
                     sQ, (8, cute.make_layout((elems, 4)))
                 )
-                sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
                 sQ_ldsm = sQ_ldsm[(lane_id % 8, (None, lane_id // 8)), None]
 
                 ldsm_atom = cute.make_copy_atom(
@@ -1732,8 +1731,27 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 rQ = cute.make_rmem_tensor(
                     ((elems // 2, 2), hd // (mma_k * 2), q_tiles), dtype
                 )
-                rK = cute.make_rmem_tensor((elems, 2, hd // mma_k), dtype)
                 rC = cute.make_rmem_tensor((4, 2, q_tiles), cutlass.Float32)
+                if cutlass.const_expr(self._kv_fp8):
+                    # Raw e4m3 K: per canonical k16 group, each lane reads the
+                    # two u32s that hold its own fragment columns and converts
+                    # in registers (see the fp8 loop below).
+                    rK8 = cute.make_rmem_tensor((8,), dtype)
+                    rK8_u32 = cute.recast_tensor(rK8, cutlass.Uint32)
+                    kpair = cute.make_rmem_tensor(cute.make_layout(2), dtype)
+                    kpair_u32 = cute.recast_tensor(kpair, cutlass.Uint32)
+                    # Branchless lo/hi pair pick by lane-quad parity.
+                    par_mask = cutlass.Uint32(0) - cutlass.Uint32(
+                        (lane_id % 4) % 2
+                    )
+                else:
+                    sK_ldsm = cute.zipped_divide(
+                        sK_warp, (16, cute.make_layout((elems, 2)), 1)
+                    )
+                    sK_ldsm = sK_ldsm[
+                        (lane_id % 16, (None, lane_id // 16), 0), None
+                    ]
+                    rK = cute.make_rmem_tensor((elems, 2, hd // mma_k), dtype)
 
                 if warp_id == 0:
                     cute.arch.mbarrier_wait(tma_full_mbar, 0)
@@ -1772,19 +1790,66 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                             barrier_id=self._BAR_MMA, number_of_threads=128
                         )
 
-                        for k in cutlass.range_constexpr(hd // mma_k):
-                            cute.copy(
-                                ldsm_atom,
-                                sK_ldsm[None, (None, k, tma_stage)],
-                                rK[None, None, k],
-                            )
-                            for m in cutlass.range_constexpr(2):
-                                for n in cutlass.range_constexpr(q_tiles):
-                                    _mma_m16n8k16(
-                                        rK[None, m, k],
-                                        rQ[(None, k % 2), k // 2, n],
-                                        rC[None, m, n],
-                                    )
+                        if cutlass.const_expr(self._kv_fp8):
+                            # Per canonical k16 group g, lane (quad q4) reads
+                            # the raw u32 holding its fragment columns
+                            # 16g + 8cp + 2*q4 (+1), converts, and keeps the
+                            # lo/hi pair by quad parity. Every product stays
+                            # in the same mma instruction as the bf16
+                            # schedule, so the fp8 path is bit-identical to
+                            # running on dequantized K.
+                            q4 = lane_id % 4
+                            row_l = lane_id // 4
+                            for g in cutlass.range_constexpr(hd // 16):
+                                for m in cutlass.range_constexpr(2):
+                                    for u in cutlass.range_constexpr(2):
+                                        for cp in cutlass.range_constexpr(2):
+                                            row_sm = cute.coalesce(
+                                                sK_warp[
+                                                    16 * m + 8 * u + row_l,
+                                                    None,
+                                                    tma_stage,
+                                                ]
+                                            )
+                                            src = cute.local_tile(
+                                                row_sm,
+                                                (2,),
+                                                (4 * g + 2 * cp + q4 // 2,),
+                                            )
+                                            cute.autovec_copy(src, kpair)
+                                            if cutlass.const_expr(
+                                                dtype is cutlass.BFloat16
+                                            ):
+                                                lo, hi = _fp8x4_to_bf16x4(
+                                                    kpair_u32[0]
+                                                )
+                                            else:
+                                                lo, hi = _fp8x4_to_f16x4(
+                                                    kpair_u32[0]
+                                                )
+                                            rK8_u32[u + 2 * cp] = lo ^ (
+                                                (lo ^ hi) & par_mask
+                                            )
+                                    for n in cutlass.range_constexpr(q_tiles):
+                                        _mma_m16n8k16(
+                                            rK8,
+                                            rQ[(None, g % 2), g // 2, n],
+                                            rC[None, m, n],
+                                        )
+                        else:
+                            for k in cutlass.range_constexpr(hd // mma_k):
+                                cute.copy(
+                                    ldsm_atom,
+                                    sK_ldsm[None, (None, k, tma_stage)],
+                                    rK[None, None, k],
+                                )
+                                for m in cutlass.range_constexpr(2):
+                                    for n in cutlass.range_constexpr(q_tiles):
+                                        _mma_m16n8k16(
+                                            rK[None, m, k],
+                                            rQ[(None, k % 2), k // 2, n],
+                                            rC[None, m, n],
+                                        )
 
                         cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
