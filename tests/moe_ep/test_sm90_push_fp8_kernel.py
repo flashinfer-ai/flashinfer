@@ -191,7 +191,7 @@ def _run(
             dtype=runner.pipe.out_dtype,
             device=x.device,
         )
-    runner.stage_inputs(x, topk_ids, topk_weights, output=output)
+    runner.stage_inputs(x, topk_ids, topk_weights)
     result = runner.compute(output=output)
     assert result is output
     return output
@@ -583,32 +583,36 @@ def test_runner_state_machine_and_poison() -> None:
         runner.compute(output=output)
     assert runner.state == "idle"
 
-    runner.stage_inputs(x, ids, weights, output=output)
+    runner.stage_inputs(x, ids, weights)
     assert runner.state == "staged"
     with pytest.raises(RuntimeError, match="called twice"):
-        runner.stage_inputs(x, ids, weights, output=output)
+        runner.stage_inputs(x, ids, weights)
     assert runner.state == "staged"
     assert runner.compute(output=output) is output
-    assert runner.state == "idle"
-
-    invalid_output = torch.empty(6, HIDDEN, dtype=torch.float32, device=pipe.device)
-    with pytest.raises(ValueError, match="output must be"):
-        runner.stage_inputs(x, ids, weights, output=invalid_output)
-    assert runner.state == "idle"
-
-    runner.stage_inputs(x, ids, weights, output=output)
-    with pytest.raises(RuntimeError, match="same output tensor"):
-        runner.compute(output=torch.empty_like(output))
     assert runner.state == "idle"
 
     runner.abort()
     assert runner.state == "poisoned"
     with pytest.raises(RuntimeError, match="poisoned"):
-        runner.stage_inputs(x, ids, weights, output=output)
+        runner.stage_inputs(x, ids, weights)
     runner.destroy()
     assert runner.state == "destroyed"
     with pytest.raises(RuntimeError, match="destroyed"):
         runner.compute(output=output)
+
+
+@requires_sm90
+def test_runner_invalid_output_poisoned_after_stage() -> None:
+    pipe, runner, _, _ = _build()
+    x = _make_x(7, 43, pipe.device)
+    ids, weights = _make_routing(7, LOCAL_EXPERTS, TOP_K, 44, pipe.device)
+    invalid_output = torch.empty(6, HIDDEN, dtype=torch.float32, device=pipe.device)
+
+    runner.stage_inputs(x, ids, weights)
+    with pytest.raises(ValueError, match="output must be"):
+        runner.compute(output=invalid_output)
+
+    assert runner.state == "poisoned"
 
 
 @requires_sm90
@@ -619,9 +623,8 @@ def test_runner_abort_poison_is_idempotent() -> None:
     assert runner.state == "poisoned"
     x = _make_x(1, 43, pipe.device)
     ids, weights = _make_routing(1, LOCAL_EXPERTS, TOP_K, 44, pipe.device)
-    output = torch.empty(1, HIDDEN, dtype=torch.float32, device=pipe.device)
     with pytest.raises(RuntimeError, match="poisoned"):
-        runner.stage_inputs(x, ids, weights, output=output)
+        runner.stage_inputs(x, ids, weights)
 
 
 @requires_sm90
@@ -751,7 +754,7 @@ x = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
 ids = torch.randint(0, E, (T, K), dtype=torch.int32, device="cuda")
 weights = torch.rand(T, K, dtype=torch.float32, device="cuda")
 output = torch.empty(T, H, dtype=torch.float32, device="cuda")
-runner.stage_inputs(x, ids, weights, output=output)
+runner.stage_inputs(x, ids, weights)
 runner.compute(output=output)
 torch.cuda.synchronize()
 print("UNEXPECTED-SURVIVAL")
@@ -842,7 +845,7 @@ ids = torch.randint(0, E, (T, K), dtype=torch.int32, device=\"cuda\")
 {route_setup}
 weights = torch.rand(T, K, dtype=torch.float32, device=\"cuda\")
 output = torch.empty(T, H, dtype=torch.float32, device=\"cuda\")
-runner.stage_inputs(x, ids, weights, output=output)
+runner.stage_inputs(x, ids, weights)
 runner.compute(output=output)
 torch.cuda.synchronize()
 print(\"UNEXPECTED-SURVIVAL\")

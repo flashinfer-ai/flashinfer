@@ -164,9 +164,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
-        output: torch.Tensor | None = None,
     ) -> None:
-        del output
         num_tokens = t.hidden_states.shape[0]
         k = self._kernel_config
         if quantize_input:

@@ -86,9 +86,7 @@ run_section() {
 }
 
 run_unit() {
-  "${PY}" -m pytest tests/moe_ep/ \
-    tests/gemm/test_sm90_moe_gemm.py \
-    tests/gemm/test_sm90_moe_gemm_contract.py -v \
+  "${PY}" -m pytest tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \

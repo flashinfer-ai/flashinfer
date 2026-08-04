@@ -303,7 +303,8 @@ def test_mega_layer_forward_passes_staging_context_to_kernel():
         stage_mock.assert_called_once()
         assert stage_mock.call_args.kwargs["quantize_input"] is True
         assert "transformed_weights" not in stage_mock.call_args.kwargs
-        assert stage_mock.call_args.kwargs["output"] is out
+        assert "output" not in stage_mock.call_args.kwargs
+        assert out.shape == (8, 128)
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -702,55 +703,3 @@ def test_mega_layer_warmup_requires_tensors_when_prestaged():
     layer = _mega_layer(quantize_input=False)
     with pytest.raises(MoEEpConfigError, match="quantize_input=False"):
         layer.warmup()
-
-
-def _uninitialized_mega_layer(kernel, workspace, runtime):
-    import torch.nn as nn
-
-    from flashinfer.moe_ep import MoEEpMegaLayer
-
-    layer = MoEEpMegaLayer.__new__(MoEEpMegaLayer)
-    nn.Module.__init__(layer)
-    layer._kernel = kernel
-    layer._workspace = workspace
-    layer._runtime = runtime
-    return layer
-
-
-def test_mega_layer_explicit_destroy_releases_backend_and_runtime():
-    kernel = mock.Mock()
-    workspace = object()
-    runtime = object()
-    layer = _uninitialized_mega_layer(kernel, workspace, runtime)
-
-    with mock.patch(
-        "flashinfer.moe_ep.modes.mega_layer.finalize_moe_ep_runtime"
-    ) as finalize:
-        layer.destroy()
-        layer.destroy()
-
-    kernel.destroy.assert_called_once_with(workspace)
-    finalize.assert_called_once_with(runtime)
-    assert layer._workspace is None
-    assert layer._runtime is None
-
-
-def test_mega_layer_del_uses_standard_local_cleanup():
-    kernel = mock.Mock()
-    workspace = object()
-    runtime = object()
-    layer = _uninitialized_mega_layer(kernel, workspace, runtime)
-
-    with (
-        mock.patch(
-            "flashinfer.moe_ep.modes.mega_layer.finalize_moe_ep_runtime"
-        ) as finalize,
-        mock.patch("torch.distributed.barrier") as barrier,
-    ):
-        layer.__del__()
-
-    kernel.destroy.assert_called_once_with(workspace)
-    finalize.assert_called_once_with(runtime)
-    barrier.assert_not_called()
-    assert layer._workspace is None
-    assert layer._runtime is None

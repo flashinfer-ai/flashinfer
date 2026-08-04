@@ -62,7 +62,6 @@ class Sm90PushMoERunner:
         self._staged_tokens: int | None = None
         self._staged_stream: torch.cuda.Stream | None = None
         self._staged_stream_capturing = False
-        self._staged_output: torch.Tensor | None = None
         self._caller_ready_event: torch.cuda.Event | None = None
         self._round_event: torch.cuda.Event | None = None
         self._round_stream_id: int | None = None
@@ -461,15 +460,12 @@ class Sm90PushMoERunner:
         self._staged_tokens = None
         self._staged_stream = None
         self._staged_stream_capturing = False
-        self._staged_output = None
 
     def stage_inputs(
         self,
         x: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
-        *,
-        output: torch.Tensor,
     ) -> None:
         """Validate one round, then dispatch its BF16 input and routing tensors."""
         self._require_usable()
@@ -490,8 +486,6 @@ class Sm90PushMoERunner:
                 "sm90_push cannot start a round on a different stream while "
                 "the previous round is still executing"
             )
-        self._validate_output(output, T)
-
         nv = self.record_stages
         try:
             with _record_stage("begin_round", nv):
@@ -504,7 +498,6 @@ class Sm90PushMoERunner:
         self._staged_tokens = T
         self._staged_stream = stream
         self._staged_stream_capturing = capturing
-        self._staged_output = output
         self._state = _RunnerState.STAGED
 
     def compute(self, *, output: torch.Tensor) -> torch.Tensor:
@@ -522,14 +515,16 @@ class Sm90PushMoERunner:
         T = self._staged_tokens
         staged_stream = self._staged_stream
         staged_capturing = self._staged_stream_capturing
-        staged_output = self._staged_output
         assert T is not None
         assert staged_stream is not None
-        assert staged_output is not None
+        try:
+            self._validate_output(output, T)
+        except Exception:
+            self._poison()
+            raise
         staged_stream_id = int(staged_stream.cuda_stream)
         caller_stream, _caller_capturing = self._current_stream()
         caller_stream_id = int(caller_stream.cuda_stream)
-        output_mismatch = output is not staged_output
         streams_differ = caller_stream_id != staged_stream_id
         if streams_differ:
             if self._caller_ready_event is None:
@@ -618,7 +613,7 @@ class Sm90PushMoERunner:
                 with _record_stage("wait_combine", nv):
                     pipe.proto_wait_combine()
                 with _record_stage("reduce", nv):
-                    pipe.proto_reduce(staged_output, T)
+                    pipe.proto_reduce(output, T)
                 with _record_stage("ack", nv):
                     pipe.proto_ack()
         except Exception:
@@ -629,7 +624,6 @@ class Sm90PushMoERunner:
         self._staged_tokens = None
         self._staged_stream = None
         self._staged_stream_capturing = False
-        self._staged_output = None
         if not staged_capturing or streams_differ:
             if self._round_event is None:
                 self._round_event = torch.cuda.Event()
@@ -637,13 +631,7 @@ class Sm90PushMoERunner:
             self._round_stream_id = staged_stream_id
             if streams_differ:
                 caller_stream.wait_event(self._round_event)
-        if output_mismatch:
-            raise RuntimeError(
-                "sm90_push compute must receive the same output tensor that was "
-                "validated by stage_inputs; the staged round was completed into the "
-                "validated output"
-            )
-        return staged_output
+        return output
 
     def forward(
         self,
@@ -654,7 +642,9 @@ class Sm90PushMoERunner:
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Submit a complete round while preserving the two-phase entry points."""
-        self.stage_inputs(x, topk_ids, topk_weights, output=output)
+        num_tokens = self._validate_round_inputs(x, topk_ids, topk_weights)
+        self._validate_output(output, num_tokens)
+        self.stage_inputs(x, topk_ids, topk_weights)
         return self.compute(output=output)
 
     def abort(self) -> None:
@@ -674,7 +664,6 @@ class Sm90PushMoERunner:
         self._staged_tokens = None
         self._staged_stream = None
         self._staged_stream_capturing = False
-        self._staged_output = None
         self._caller_ready_event = None
         self._round_event = None
         self._workspace = None

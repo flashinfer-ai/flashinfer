@@ -701,9 +701,9 @@ caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
 `sm90_push_fp8` is the equivalent stateful variant: runner construction binds
-the transformed static weights, and `stage_inputs(..., output=...)` pre-binds
-the caller's destination tensor. `compute()` completes that staged round and
-returns the same output tensor; the `MegaKernelBackend` lifecycle is unchanged.
+the transformed static weights, the layer allocates the destination before
+`stage_inputs()`, and `compute(output=...)` validates and fills it. The
+`MegaKernelBackend` lifecycle is unchanged.
 
 Add both functions under the owning tree's `shim/` — e.g.
 `kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside

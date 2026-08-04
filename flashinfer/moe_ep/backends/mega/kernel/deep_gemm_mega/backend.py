@@ -112,9 +112,7 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
-        output: torch.Tensor | None = None,
     ) -> None:
-        del output
         num_tokens = t.hidden_states.shape[0]
         if quantize_input:
             x_slot = workspace.x[:num_tokens]

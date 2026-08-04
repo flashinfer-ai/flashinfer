@@ -139,7 +139,6 @@ def _runner():
     runner._staged_tokens = None
     runner._staged_stream = None
     runner._staged_stream_capturing = False
-    runner._staged_output = None
     runner._caller_ready_event = _FakeEvent(log)
     runner._round_event = _FakeEvent(log)
     runner._round_stream_id = None
@@ -329,7 +328,7 @@ def test_runner_preserves_protocol_and_compute_order():
     runner, pipe, log = _runner()
     output = object()
 
-    runner.stage_inputs(object(), object(), object(), output=output)
+    runner.stage_inputs(object(), object(), object())
     result = runner.compute(output=output)
 
     assert result is output
@@ -349,7 +348,6 @@ def test_runner_preserves_protocol_and_compute_order():
         "ack",
     ]
     assert runner.state == "idle"
-    assert runner._staged_output is None
 
 
 def test_runner_rejects_compute_before_stage_and_double_stage():
@@ -358,9 +356,9 @@ def test_runner_rejects_compute_before_stage_and_double_stage():
     with pytest.raises(RuntimeError, match="preceding stage_inputs"):
         runner.compute(output=output)
 
-    runner.stage_inputs(object(), object(), object(), output=output)
+    runner.stage_inputs(object(), object(), object())
     with pytest.raises(RuntimeError, match="called twice"):
-        runner.stage_inputs(object(), object(), object(), output=object())
+        runner.stage_inputs(object(), object(), object())
     assert runner.state == "staged"
 
 
@@ -372,7 +370,7 @@ def test_runner_rejects_cross_stream_round_while_previous_event_is_incomplete():
     runner._current_stream = lambda: (runner._test_current_stream, False)
 
     with pytest.raises(RuntimeError, match="previous round is still executing"):
-        runner.stage_inputs(object(), object(), object(), output=object())
+        runner.stage_inputs(object(), object(), object())
 
     assert runner.state == "idle"
     assert log == []
@@ -389,35 +387,31 @@ def test_runner_rejects_invalid_output_before_dispatch():
 
     runner._validate_output = reject_output
     with pytest.raises(ValueError, match="invalid output"):
-        runner.stage_inputs(object(), object(), object(), output=invalid_output)
+        runner.forward(object(), object(), object(), output=invalid_output)
 
     assert runner.state == "idle"
-    assert runner._staged_output is None
     assert log == []
 
 
-def test_runner_finishes_round_before_rejecting_a_different_output():
+def test_runner_poisoned_when_compute_receives_invalid_output():
     runner, _, log = _runner()
-    staged_output = object()
+    invalid_output = object()
 
-    runner.stage_inputs(object(), object(), object(), output=staged_output)
-    with pytest.raises(RuntimeError, match="same output tensor"):
-        runner.compute(output=object())
+    def reject_output(output, num_tokens):
+        assert output is invalid_output
+        assert num_tokens == 3
+        raise ValueError("invalid output")
 
-    assert runner.state == "idle"
-    assert runner._staged_output is None
+    runner._validate_output = reject_output
+    runner.stage_inputs(object(), object(), object())
+    with pytest.raises(ValueError, match="invalid output"):
+        runner.compute(output=invalid_output)
+
+    assert runner.state == "poisoned"
     assert log == [
         "begin",
         "dispatch",
-        "wait_prefix",
-        "compact",
-        "fc1",
-        "act",
-        "fc2",
-        "combine",
-        "wait_combine",
-        "reduce",
-        "ack",
+        "abort",
     ]
 
 
@@ -430,20 +424,20 @@ def test_runner_poisoned_after_mid_round_failure():
         raise RuntimeError("injected failure")
 
     pipe.proto_wait_prefix = fail_wait_prefix
-    runner.stage_inputs(object(), object(), object(), output=output)
+    runner.stage_inputs(object(), object(), object())
     with pytest.raises(RuntimeError, match="injected failure"):
         runner.compute(output=output)
 
     assert runner.state == "poisoned"
     assert log == ["begin", "dispatch", "wait_prefix", "abort"]
     with pytest.raises(RuntimeError, match="poisoned"):
-        runner.stage_inputs(object(), object(), object(), output=output)
+        runner.stage_inputs(object(), object(), object())
 
 
 def test_runner_completes_on_staged_stream_before_joining_caller_stream():
     runner, _, log = _runner()
     output = object()
-    runner.stage_inputs(object(), object(), object(), output=output)
+    runner.stage_inputs(object(), object(), object())
     runner._test_current_stream = _FakeStream(23, log)
 
     assert runner.compute(output=output) is output
@@ -474,13 +468,11 @@ def test_runner_destroy_is_idempotent():
     runner, _, log = _runner()
     runner._staged_stream = _FakeStream(17, log)
     runner._staged_stream_capturing = True
-    runner._staged_output = object()
     runner.destroy()
     runner.destroy()
     assert runner.state == "destroyed"
     assert runner._staged_stream is None
     assert not runner._staged_stream_capturing
-    assert runner._staged_output is None
     assert log == ["destroy"]
 
 
