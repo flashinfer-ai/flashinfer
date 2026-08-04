@@ -1530,56 +1530,78 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         use_state_indices: bool = False,
         store_initial_state: bool = False,
     ):
-        self.needs_initial_state   = needs_initial_state
-        self.store_final_state     = store_final_state
-        self.initial_state_dtype   = initial_state_dtype
-        self.state_dtype           = state_dtype
-        self.cu_seqlens_dtype      = cu_seqlens_dtype
-        self.use_state_indices     = use_state_indices
-        self.store_initial_state   = store_initial_state
-        self.acc_dtype             = cutlass.Float32
-        self.mma_dtype             = cutlass.TFloat32
-        self.D                     = 128
+        self.needs_initial_state = needs_initial_state
+        self.store_final_state = store_final_state
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.use_state_indices = use_state_indices
+        self.store_initial_state = store_initial_state
+        self.acc_dtype = cutlass.Float32
+        self.mma_dtype = cutlass.TFloat32
+        self.D = 128
         if rows_per_cta not in (64, 128):
             raise ValueError(f"rows_per_cta must be 64 or 128, got {rows_per_cta}")
-        self.rows_per_cta          = rows_per_cta
-        self.row_ctas              = self.D // rows_per_cta
+        self.rows_per_cta = rows_per_cta
+        self.row_ctas = self.D // rows_per_cta
         # A second M stage hides the exposed UTC64 TMA load; UTC128 is unchanged by it.
-        self.m_stage               = 2 if rows_per_cta == 64 else 1
-        self.n_stage               = 1
-        self.threads_per_cta       = 256
+        self.m_stage = 2 if rows_per_cta == 64 else 1
+        self.n_stage = 1
+        self.threads_per_cta = 256
         self.compute_warp_group_id = 0
-        self.mma_warp_id           = 4
-        self.tma_warp_id           = 5
-        self.num_regs_compute      = 120 if rows_per_cta == 64 else 256
-        self.num_regs_other        = 32
-        self.cta_group             = tcgen05.CtaGroup.ONE
-        self.tmem_acc_offset       = 0
-        self.tmem_opd_offset       = 128
-        self.tmem_alloc_barrier    = pipeline.NamedBarrier(barrier_id=1, num_threads=160)
+        self.mma_warp_id = 4
+        self.tma_warp_id = 5
+        self.num_regs_compute = 120 if rows_per_cta == 64 else 256
+        self.num_regs_other = 32
+        self.cta_group = tcgen05.CtaGroup.ONE
+        self.tmem_acc_offset = 0
+        self.tmem_opd_offset = 128
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=160)
         self.manual_cache_key(
-            "rows_per_cta", "row_ctas", "needs_initial_state", "store_final_state",
-            "initial_state_dtype", "state_dtype",
-            "cu_seqlens_dtype", "use_state_indices", "store_initial_state", "m_stage", "n_stage",
-            "num_regs_compute", "num_regs_other",
+            "rows_per_cta",
+            "row_ctas",
+            "needs_initial_state",
+            "store_final_state",
+            "initial_state_dtype",
+            "state_dtype",
+            "cu_seqlens_dtype",
+            "use_state_indices",
+            "store_initial_state",
+            "m_stage",
+            "n_stage",
+            "num_regs_compute",
+            "num_regs_other",
         )
 
     @cute.jit
     def load_tensor_tma(
-        self, tma_atom, tma_tensor, sTensor, tensor_pipeline, head_idx, chunk_idx,
-        row_cta_idx: cutlass.Int32, is_transfer: bool,
+        self,
+        tma_atom,
+        tma_tensor,
+        sTensor,
+        tensor_pipeline,
+        head_idx,
+        chunk_idx,
+        row_cta_idx: cutlass.Int32,
+        is_transfer: bool,
     ):
         handle = tensor_pipeline.acquire_and_advance()
         sTensor_stage = sTensor[None, None, handle.index]
         mTensor = tma_tensor[None, None, head_idx, chunk_idx]
         if cutlass.const_expr(is_transfer):
-            gTensor = cute.zipped_divide(mTensor, (self.D, self.D))[((None, None), (0, 0))]
+            gTensor = cute.zipped_divide(mTensor, (self.D, self.D))[
+                ((None, None), (0, 0))
+            ]
         else:
             gTensor = cute.zipped_divide(mTensor, (self.rows_per_cta, self.D))[
                 ((None, None), (row_cta_idx, 0))
             ]
         tTsT, tTgT = cpasync.tma_partition(
-            tma_atom, 0, cute.make_layout(1), cute.group_modes(sTensor_stage, 0, 2), cute.group_modes(gTensor, 0, 2)
+            tma_atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sTensor_stage, 0, 2),
+            cute.group_modes(gTensor, 0, 2),
         )
         cute.copy(tma_atom, tTgT, tTsT, tma_bar_ptr=handle.barrier)
         return tensor_pipeline
@@ -1628,7 +1650,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         tRT_rAcc = cute.make_rmem_tensor_like(tRT_cAcc, self.acc_dtype)
         for sub in cutlass.range(cute.size(tRT_rAcc, mode=[2]), unroll_full=True):
             if cutlass.const_expr(convert_src):
-                tRT_rAcc[None, 0, sub].store(tRT_src[None, 0, sub].load().to(self.acc_dtype))
+                tRT_rAcc[None, 0, sub].store(
+                    tRT_src[None, 0, sub].load().to(self.acc_dtype)
+                )
             else:
                 cute.autovec_copy(tRT_src[None, 0, sub], tRT_rAcc[None, 0, sub])
             cute.copy(tiled_r2t, tRT_rAcc[None, 0, sub], tRT_tAcc[None, 0, sub, stage])
@@ -1666,13 +1690,20 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         tRT_rOpd = cute.make_rmem_tensor_like(tTR_cAcc, self.mma_dtype)
 
         for iter_m in cutlass.range(cute.size(tTR_rAcc, mode=[1]), unroll_full=True):
-            for iter_n in cutlass.range(cute.size(tTR_rAcc, mode=[2]), unroll_full=True):
-                cute.copy(tiled_t2r, tTR_tAcc[None, iter_m, iter_n, 0], tTR_rAcc[None, iter_m, iter_n])
+            for iter_n in cutlass.range(
+                cute.size(tTR_rAcc, mode=[2]), unroll_full=True
+            ):
+                cute.copy(
+                    tiled_t2r,
+                    tTR_tAcc[None, iter_m, iter_n, 0],
+                    tTR_rAcc[None, iter_m, iter_n],
+                )
                 tRT_rOpd[None, iter_m, iter_n].store(
                     tTR_rAcc[None, iter_m, iter_n].load().to(self.mma_dtype)
                 )
                 cute.copy(
-                    tiled_r2t, tRT_rOpd[None, iter_m, iter_n],
+                    tiled_r2t,
+                    tRT_rOpd[None, iter_m, iter_n],
                     tRT_tOpd[None, iter_m, iter_n, 0],
                 )
         cute.arch.fence_view_async_tmem_store()
@@ -1717,8 +1748,12 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             cute.copy(tiled_t2r, tTR_tAcc[None, 0, sub, stage], tTR_rAcc[None, 0, sub])
             cute.autovec_copy(tTR_rAcc[None, 0, sub], tTR_gFixedState[None, 0, sub])
             if cutlass.const_expr(store_output):
-                tTR_rOutput[None, 0, sub].store(tTR_rAcc[None, 0, sub].load().to(self.state_dtype))
-                cute.autovec_copy(tTR_rOutput[None, 0, sub], tTR_gOutputState[None, 0, sub])
+                tTR_rOutput[None, 0, sub].store(
+                    tTR_rAcc[None, 0, sub].load().to(self.state_dtype)
+                )
+                cute.autovec_copy(
+                    tTR_rOutput[None, 0, sub], tTR_gOutputState[None, 0, sub]
+                )
 
     @cute.jit
     def run_compute_role(
@@ -1743,22 +1778,42 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         state_stage = cutlass.Int32(0)
         if cutlass.const_expr(self.needs_initial_state):
             self.copy_tensor_to_acc(
-                tiled_mma, tCtAcc, gInitialState, tidx,
-                self.initial_state_dtype != self.acc_dtype, state_stage,
+                tiled_mma,
+                tCtAcc,
+                gInitialState,
+                tidx,
+                self.initial_state_dtype != self.acc_dtype,
+                state_stage,
             )
             if cutlass.const_expr(self.store_initial_state):
                 self.store_acc(
-                    tiled_mma, tCtAcc, tidx, gInitialStateWorkspace, gOutputState, False, state_stage
+                    tiled_mma,
+                    tCtAcc,
+                    tidx,
+                    gInitialStateWorkspace,
+                    gOutputState,
+                    False,
+                    state_stage,
                 )
         else:
             start = cutlass.Int32(1)
             n_init_handle = n_consumer.wait_and_advance()
             self.copy_tensor_to_acc(
-                tiled_mma, tCtAcc, sN[None, None, n_init_handle.index], tidx, False, state_stage,
+                tiled_mma,
+                tCtAcc,
+                sN[None, None, n_init_handle.index],
+                tidx,
+                False,
+                state_stage,
             )
             self.store_acc(
-                tiled_mma, tCtAcc, tidx, gFixedState[None, None, chunk_start],
-                gOutputState, False, state_stage,
+                tiled_mma,
+                tCtAcc,
+                tidx,
+                gFixedState[None, None, chunk_start],
+                gOutputState,
+                False,
+                state_stage,
             )
             n_init_handle.release()
 
@@ -1767,26 +1822,48 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             n_handle = n_consumer.wait_and_advance()
             ready_handle = mma_ready_producer.acquire_and_advance()
             self.copy_tensor_to_acc(
-                tiled_mma, tCtAcc, sN[None, None, n_handle.index], tidx, False, state_stage
+                tiled_mma,
+                tCtAcc,
+                sN[None, None, n_handle.index],
+                tidx,
+                False,
+                state_stage,
             )
             ready_handle.commit()
             n_handle.release()
             done_handle = mma_done_consumer.wait_and_advance()
             self.store_acc(
-                tiled_mma, tCtAcc, tidx, gFixedState[None, None, chunk_start + chunk_idx],
-                gOutputState, False, state_stage,
+                tiled_mma,
+                tCtAcc,
+                tidx,
+                gFixedState[None, None, chunk_start + chunk_idx],
+                gOutputState,
+                False,
+                state_stage,
             )
             done_handle.release()
         if cutlass.const_expr(self.store_final_state):
             self.store_acc(
-                tiled_mma, tCtAcc, tidx, gFixedState[None, None, chunk_start + num_chunks - 1],
-                gOutputState, True, state_stage,
+                tiled_mma,
+                tCtAcc,
+                tidx,
+                gFixedState[None, None, chunk_start + num_chunks - 1],
+                gOutputState,
+                True,
+                state_stage,
             )
 
     @cute.jit
     def run_mma_role(
-        self, tiled_mma, tmem_ptr, sM, m_consumer, mma_ready_consumer,
-        mma_done_producer, num_iters, tidx
+        self,
+        tiled_mma,
+        tmem_ptr,
+        sM,
+        m_consumer,
+        mma_ready_consumer,
+        mma_done_producer,
+        num_iters,
+        tidx,
     ):
         tCtAcc = self.make_tmem_tensor(tmem_ptr, tiled_mma)
         tCrS = self.make_tmem_operand(tmem_ptr, tiled_mma)
@@ -1798,7 +1875,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             for kphase in cutlass.range(cute.size(tCrS, mode=[2]), unroll_full=True):
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 cute.gemm(
-                    tiled_mma, tCtAcc[None, None, None, 0],
+                    tiled_mma,
+                    tCtAcc[None, None, None, 0],
                     tCrS[None, None, kphase, 0],
                     tCrM[None, None, kphase, m_handle.index],
                     tCtAcc[None, None, None, 0],
@@ -1826,23 +1904,35 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
     ):
         tiled_mma = cute.make_tiled_mma(
             tcgen05.MmaTF32Op(
-                (self.rows_per_cta, 64, 8), self.cta_group, tcgen05.OperandSource.TMEM,
-                OperandMajorMode.K, OperandMajorMode.MN,
+                (self.rows_per_cta, 64, 8),
+                self.cta_group,
+                tcgen05.OperandSource.TMEM,
+                OperandMajorMode.K,
+                OperandMajorMode.MN,
             )
         )
         m_layout = sm100_utils.make_smem_layout_b(
             tiled_mma, (self.rows_per_cta, self.D, self.D), self.acc_dtype, self.m_stage
         )
         n_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma, (self.rows_per_cta, self.D, self.D), self.acc_dtype, self.n_stage,
+            tiled_mma,
+            (self.rows_per_cta, self.D, self.D),
+            self.acc_dtype,
+            self.n_stage,
             is_k_major=True,
         )
-        m_semantic_layout = CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_layout(m_layout)
-        n_semantic_layout = CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_layout(n_layout)
+        m_semantic_layout = (
+            CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_layout(m_layout)
+        )
+        n_semantic_layout = (
+            CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_layout(n_layout)
+        )
         tma_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         m_tma_layout = cute.slice_(m_semantic_layout, (None, None, 0))
         n_tma_layout = cute.slice_(n_semantic_layout, (None, None, 0))
-        tma_m = cpasync.make_tiled_tma_atom(tma_op, g_transfer_t, m_tma_layout, (self.D, self.D))
+        tma_m = cpasync.make_tiled_tma_atom(
+            tma_op, g_transfer_t, m_tma_layout, (self.D, self.D)
+        )
         tma_n = cpasync.make_tiled_tma_atom(
             tma_op, g_local_state_t, n_tma_layout, (self.rows_per_cta, self.D)
         )
@@ -1858,20 +1948,39 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             mma_ready_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             mma_done_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             tmem_holding_buf: cutlass.Int32
-            sM: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(m_layout)], 1024]
-            sN: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(n_layout)], 1024]
+            sM: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, cute.cosize(m_layout)], 1024
+            ]
+            sN: cute.struct.Align[
+                cute.struct.MemRange[self.acc_dtype, cute.cosize(n_layout)], 1024
+            ]
 
         self.shared_storage = SharedStorage
         self.kernel(
-            tiled_mma, tma_atom_m, tma_tensor_m, tma_atom_n, tma_tensor_n,
-            g_initial_state_t, g_initial_state_workspace_t, g_fixed_state_t, g_output_state_t,
-            g_state_indices_t, g_cu_seqlens, m_layout, n_layout, chunk_len,
-            total_cp_chunks, num_seqs, num_heads,
+            tiled_mma,
+            tma_atom_m,
+            tma_tensor_m,
+            tma_atom_n,
+            tma_tensor_n,
+            g_initial_state_t,
+            g_initial_state_workspace_t,
+            g_fixed_state_t,
+            g_output_state_t,
+            g_state_indices_t,
+            g_cu_seqlens,
+            m_layout,
+            n_layout,
+            chunk_len,
+            total_cp_chunks,
+            num_seqs,
+            num_heads,
         ).launch(
-            grid=(num_seqs * num_heads * self.row_ctas, 1, 1), block=(self.threads_per_cta, 1, 1),
+            grid=(num_seqs * num_heads * self.row_ctas, 1, 1),
+            block=(self.threads_per_cta, 1, 1),
             max_number_threads=(self.threads_per_cta, 1, 1),
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
-            stream=stream, min_blocks_per_mp=1,
+            stream=stream,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
@@ -1906,37 +2015,61 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         seq_end = cutlass.Int32(g_cu_seqlens[seq_idx + 1])
         num_chunks = chunks_for_len(seq_end - seq_start, chunk_len)
         chunk_start = varlen_chunk_idx(seq_idx, seq_start, 0, chunk_len)
-        start = cutlass.Int32(0) if cutlass.const_expr(self.needs_initial_state) else cutlass.Int32(1)
+        start = (
+            cutlass.Int32(0)
+            if cutlass.const_expr(self.needs_initial_state)
+            else cutlass.Int32(1)
+        )
         num_iters = num_chunks - start
 
         allocator = utils.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         sM = storage.sM.get_tensor(m_layout.outer, swizzle=m_layout.inner)
         sN = storage.sN.get_tensor(n_layout.outer, swizzle=n_layout.inner)
-        sM_tma = CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_tensor_layout(sM)
-        sN_tma = CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_tensor_layout(sN)
+        sM_tma = (
+            CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_tensor_layout(sM)
+        )
+        sN_tma = (
+            CPDeltaRuleMNPrecomputeUtcmma1Sm100.transform_partitioned_tensor_layout(sN)
+        )
         cg_tma = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         cg_mma = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         cg_compute = pipeline.CooperativeGroup(pipeline.Agent.Thread, 128)
         cg_compute_tma = pipeline.CooperativeGroup(pipeline.Agent.Thread, 4)
         m_producer, m_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.m_stage, producer_group=cg_tma, consumer_group=cg_mma,
-            tx_count=self.tma_m_bytes, barrier_storage=storage.m_mbar.data_ptr(), defer_sync=True,
+            num_stages=self.m_stage,
+            producer_group=cg_tma,
+            consumer_group=cg_mma,
+            tx_count=self.tma_m_bytes,
+            barrier_storage=storage.m_mbar.data_ptr(),
+            defer_sync=True,
         ).make_participants()
         n_producer, n_consumer = pipeline.PipelineTmaAsync.create(
-            num_stages=self.n_stage, producer_group=cg_tma, consumer_group=cg_compute_tma,
-            tx_count=self.tma_n_bytes, barrier_storage=storage.n_mbar.data_ptr(), defer_sync=True,
+            num_stages=self.n_stage,
+            producer_group=cg_tma,
+            consumer_group=cg_compute_tma,
+            tx_count=self.tma_n_bytes,
+            barrier_storage=storage.n_mbar.data_ptr(),
+            defer_sync=True,
             enable_multicast_signaling=False,
         ).make_participants()
         mma_ready_producer, mma_ready_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=1, producer_group=cg_compute, consumer_group=cg_mma,
-            barrier_storage=storage.mma_ready_mbar.data_ptr(), defer_sync=True,
+            num_stages=1,
+            producer_group=cg_compute,
+            consumer_group=cg_mma,
+            barrier_storage=storage.mma_ready_mbar.data_ptr(),
+            defer_sync=True,
         ).make_participants()
         mma_done_producer, mma_done_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=1, producer_group=cg_mma, consumer_group=cg_compute,
-            barrier_storage=storage.mma_done_mbar.data_ptr(), defer_sync=True,
+            num_stages=1,
+            producer_group=cg_mma,
+            consumer_group=cg_compute,
+            barrier_storage=storage.mma_done_mbar.data_ptr(),
+            defer_sync=True,
         ).make_participants()
-        pipeline.pipeline_init_arrive(cluster_shape_mn=cute.make_layout((1, 1)), is_relaxed=True)
+        pipeline.pipeline_init_arrive(
+            cluster_shape_mn=cute.make_layout((1, 1)), is_relaxed=True
+        )
         pipeline.pipeline_init_wait(cluster_shape_mn=cute.make_layout((1, 1)))
 
         out_layout = cute.make_layout(
@@ -1946,7 +2079,8 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         gFixedState = cute.make_tensor(g_fixed_state_t.iterator.align(128), out_layout)
         gFixedStateCta = cute.local_tile(
             gFixedState[None, None, head_idx, None],
-            (self.rows_per_cta, self.D, total_cp_chunks), (row_cta_idx, 0, 0),
+            (self.rows_per_cta, self.D, total_cp_chunks),
+            (row_cta_idx, 0, 0),
         )
         state_layout = cute.make_layout(
             (self.D, self.D, num_heads, num_seqs),
@@ -1959,19 +2093,32 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             if cutlass.const_expr(self.use_state_indices):
                 initial_layout = cute.make_layout(
                     (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
-                    stride=(g_initial_state_t.stride[2], g_initial_state_t.stride[3], g_initial_state_t.stride[1], g_initial_state_t.stride[0]),
+                    stride=(
+                        g_initial_state_t.stride[2],
+                        g_initial_state_t.stride[3],
+                        g_initial_state_t.stride[1],
+                        g_initial_state_t.stride[0],
+                    ),
                 )
-                gInitialStateTensor = cute.make_tensor(g_initial_state_t.iterator, initial_layout)
+                gInitialStateTensor = cute.make_tensor(
+                    g_initial_state_t.iterator, initial_layout
+                )
             else:
-                gInitialStateTensor = cute.make_tensor(g_initial_state_t.iterator, state_layout)
+                gInitialStateTensor = cute.make_tensor(
+                    g_initial_state_t.iterator, state_layout
+                )
             gInitialState = cute.local_tile(
                 gInitialStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D), (row_cta_idx, 0),
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
             )
-            gInitialStateWorkspaceTensor = cute.make_tensor(g_initial_state_workspace_t.iterator, state_layout)
+            gInitialStateWorkspaceTensor = cute.make_tensor(
+                g_initial_state_workspace_t.iterator, state_layout
+            )
             gInitialStateWorkspace = cute.local_tile(
                 gInitialStateWorkspaceTensor[None, None, head_idx, seq_idx],
-                (self.rows_per_cta, self.D), (row_cta_idx, 0),
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
             )
         else:
             gInitialState = gFixedStateCta[None, None, chunk_start]
@@ -1980,20 +2127,31 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             if cutlass.const_expr(self.use_state_indices):
                 output_layout = cute.make_layout(
                     (self.D, self.D, num_heads, g_output_state_t.shape[0]),
-                    stride=(g_output_state_t.stride[2], g_output_state_t.stride[3], g_output_state_t.stride[1], g_output_state_t.stride[0]),
+                    stride=(
+                        g_output_state_t.stride[2],
+                        g_output_state_t.stride[3],
+                        g_output_state_t.stride[1],
+                        g_output_state_t.stride[0],
+                    ),
                 )
-                gOutputStateTensor = cute.make_tensor(g_output_state_t.iterator, output_layout)
+                gOutputStateTensor = cute.make_tensor(
+                    g_output_state_t.iterator, output_layout
+                )
             else:
-                gOutputStateTensor = cute.make_tensor(g_output_state_t.iterator, state_layout)
+                gOutputStateTensor = cute.make_tensor(
+                    g_output_state_t.iterator, state_layout
+                )
             gOutputState = cute.local_tile(
                 gOutputStateTensor[None, None, head_idx, state_idx],
-                (self.rows_per_cta, self.D), (row_cta_idx, 0),
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
             )
         else:
             gOutputState = gFixedStateCta[None, None, chunk_start]
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr, barrier_for_retrieve=self.tmem_alloc_barrier,
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=0,
         )
         tmem.allocate(256)
@@ -2005,13 +2163,26 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
                 tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
                 tmem.relinquish_alloc_permit()
                 tmem.free(tmem_ptr)
-        elif warp_idx >= self.compute_warp_group_id and warp_idx < self.compute_warp_group_id + 4:
+        elif (
+            warp_idx >= self.compute_warp_group_id
+            and warp_idx < self.compute_warp_group_id + 4
+        ):
             cute.arch.setmaxregister_increase(self.num_regs_compute)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             self.run_compute_role(
-                tiled_mma, tmem_ptr, sN_tma, n_consumer, mma_ready_producer, mma_done_consumer,
-                gInitialState, gInitialStateWorkspace, gFixedStateCta,
-                gOutputState, chunk_start, num_chunks, tidx,
+                tiled_mma,
+                tmem_ptr,
+                sN_tma,
+                n_consumer,
+                mma_ready_producer,
+                mma_done_consumer,
+                gInitialState,
+                gInitialStateWorkspace,
+                gFixedStateCta,
+                gOutputState,
+                chunk_start,
+                num_chunks,
+                tidx,
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
@@ -2019,8 +2190,14 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             self.run_mma_role(
-                tiled_mma, tmem_ptr, sM, m_consumer, mma_ready_consumer,
-                mma_done_producer, num_iters, tidx
+                tiled_mma,
+                tmem_ptr,
+                sM,
+                m_consumer,
+                mma_ready_consumer,
+                mma_done_producer,
+                num_iters,
+                tidx,
             )
         elif warp_idx == self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
@@ -2028,13 +2205,25 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             cpasync.prefetch_descriptor(tma_atom_n)
             for chunk_idx in cutlass.range(num_chunks, unroll=1):
                 n_producer = self.load_tensor_tma(
-                    tma_atom_n, tma_tensor_n, sN_tma, n_producer, head_idx,
-                    chunk_start + chunk_idx, row_cta_idx, False,
+                    tma_atom_n,
+                    tma_tensor_n,
+                    sN_tma,
+                    n_producer,
+                    head_idx,
+                    chunk_start + chunk_idx,
+                    row_cta_idx,
+                    False,
                 )
                 if chunk_idx >= start:
                     m_producer = self.load_tensor_tma(
-                        tma_atom_m, tma_tensor_m, sM_tma, m_producer, head_idx,
-                        chunk_start + chunk_idx, row_cta_idx, True,
+                        tma_atom_m,
+                        tma_tensor_m,
+                        sM_tma,
+                        m_producer,
+                        head_idx,
+                        chunk_start + chunk_idx,
+                        row_cta_idx,
+                        True,
                     )
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_other)

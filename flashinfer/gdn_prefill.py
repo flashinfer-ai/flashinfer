@@ -16,7 +16,7 @@ limitations under the License.
 
 import math
 import warnings
-from typing import Literal, Optional, Union, Tuple
+from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
@@ -425,12 +425,14 @@ def chunk_gated_delta_rule(
                     total_seq_len, num_sab_heads, dtype=torch.float32, device=device
                 )
             )
-            cp_delta_rule_dsl = {
-                9: cp_delta_rule_dsl_sm90,
-                10: cp_delta_rule_dsl_sm100,
-                12: cp_delta_rule_dsl_sm120,
-            }[_arch_major]
-            assert cp_delta_rule_dsl is not None
+            cp_delta_rule_dsl = cast(
+                Callable[..., None],
+                {
+                    9: cp_delta_rule_dsl_sm90,
+                    10: cp_delta_rule_dsl_sm100,
+                    12: cp_delta_rule_dsl_sm120,
+                }[_arch_major],
+            )
             state_indices_kwargs = (
                 {"state_indices": state_indices} if state_indices is not None else {}
             )
