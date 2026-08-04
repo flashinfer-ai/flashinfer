@@ -1,0 +1,202 @@
+{
+  "name": "alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8",
+  "description": "Fused AlphaMoE NVFP4 up projection, SwiGLU requantization, and down projection over a caller-provided aligned routing plan. Mutates the preallocated BF16 out accumulator in place.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.alphamoe_nvfp4_sm100.alphamoe_nvfp4_aligned_moe",
+    "status:experimental",
+    "backend:alphamoe",
+    "quantization:nvfp4",
+    "routing:prealigned"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2,
+      "description": "Routes per token."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 4,
+      "description": "Number of experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 256,
+      "description": "Logical hidden size K."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 256,
+      "description": "Combined gate/up row count N."
+    },
+    "block_m": {
+      "type": "const",
+      "value": 8,
+      "description": "Aligned-plan block size."
+    },
+    "num_packed_hidden": {
+      "type": "const",
+      "value": 128
+    },
+    "num_hidden_scale_blocks": {
+      "type": "const",
+      "value": 16
+    },
+    "num_packed_intermediate": {
+      "type": "const",
+      "value": 64
+    },
+    "num_intermediate_scale_blocks": {
+      "type": "const",
+      "value": 8
+    },
+    "sorted_token_capacity": {
+      "type": "var",
+      "description": "Aligned-plan entry capacity."
+    },
+    "route_block_capacity": {
+      "type": "var",
+      "description": "Aligned-plan block capacity."
+    },
+    "one": {
+      "type": "const",
+      "value": 1,
+      "description": "One-element device extent."
+    }
+  },
+  "constraints": [
+    "hidden_size == 2 * num_packed_hidden",
+    "hidden_size == 16 * num_hidden_scale_blocks",
+    "gemm1_out_size == 4 * num_packed_intermediate",
+    "gemm1_out_size == 32 * num_intermediate_scale_blocks",
+    "hidden_size >= 256 and hidden_size % 256 == 0",
+    "gemm1_out_size >= 256 and gemm1_out_size % 256 == 0",
+    "top_k <= num_experts",
+    "block_m >= 8 and block_m % 8 == 0",
+    "sorted_token_capacity >= route_block_capacity * block_m",
+    "one == 1"
+  ],
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "num_tokens",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "Packed E2M1 activations (even logical value in low nibble)."
+    },
+    "hidden_states_scale": {
+      "shape": [
+        "num_tokens",
+        "num_hidden_scale_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Linear E4M3 scales, one per 16 logical values."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_experts",
+        "gemm1_out_size",
+        "num_packed_hidden"
+      ],
+      "dtype": "uint8",
+      "description": "Packed E2M1 gate/up weights in conventional row order."
+    },
+    "gemm1_weights_scale": {
+      "shape": [
+        "num_experts",
+        "gemm1_out_size",
+        "num_hidden_scale_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Linear per-16 E4M3 gate/up weight scales."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_experts",
+        "hidden_size",
+        "num_packed_intermediate"
+      ],
+      "dtype": "uint8",
+      "description": "Packed E2M1 down-projection weights."
+    },
+    "gemm2_weights_scale": {
+      "shape": [
+        "num_experts",
+        "hidden_size",
+        "num_intermediate_scale_blocks"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Linear per-16 E4M3 down-projection weight scales."
+    },
+    "sorted_token_ids": {
+      "shape": [
+        "sorted_token_capacity"
+      ],
+      "dtype": "int32",
+      "description": "Capacity-sized aligned-plan token/route positions."
+    },
+    "expert_ids": {
+      "shape": [
+        "route_block_capacity"
+      ],
+      "dtype": "int32",
+      "description": "Expert id for each capacity-sized routing block."
+    },
+    "num_tokens_post_padded": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "int32",
+      "description": "Device-side valid aligned-plan extent."
+    },
+    "topk_weights": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "float32",
+      "description": "Routing weight for each token/route pair."
+    },
+    "out": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Caller-owned BF16 accumulator mutated in place."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Routes per token."
+    },
+    "block_m": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Aligned-plan block size."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Additional routed contribution scale."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "param": "out",
+      "description": "Updated caller-owned BF16 accumulator."
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

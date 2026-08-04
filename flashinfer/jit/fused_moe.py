@@ -20,6 +20,7 @@ from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
 from .core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     current_compilation_context,
     sm90a_nvcc_flags,
@@ -53,6 +54,32 @@ BMM_EXPORT_HEADERS = [
     "trtllm/gen/SfLayoutDecl.h",
     "trtllm/gen/SparsityDecl.h",
 ]
+
+
+def _alphamoe_nvfp4_sm100_nvcc_flags() -> List[str]:
+    """Return flags for exactly the AlphaMoE-supported Blackwell targets.
+
+    Filtering only by CUDA major version is not sufficient here: major 10
+    also contains targets such as SM107 whose instruction and cubin contracts
+    differ from the frozen SM100/SM103 Loom schedule.
+    """
+
+    supported_archs = {(10, "0a"), (10, "3a")}
+    target_archs = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS.intersection(supported_archs)
+    )
+    if not target_archs:
+        raise RuntimeError(
+            "alphamoe_nvfp4_sm100 requires an exact SM100a or SM103a compilation target"
+        )
+    return [
+        *(
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            for major, minor in target_archs
+        ),
+        "--use_fast_math",
+        *common_nvcc_flags,
+    ]
 
 
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
@@ -340,4 +367,15 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
+    )
+
+
+def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
+    """Generate the frozen SM100/SM103 AlphaMoE NVFP4 module."""
+
+    return gen_jit_spec(
+        "alphamoe_nvfp4_sm100",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_sm100.cu"],
+        extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )

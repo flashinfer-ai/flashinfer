@@ -91,6 +91,10 @@ from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
 
+from .alphamoe_nvfp4_sm100 import (  # noqa: F401
+    alphamoe_nvfp4_aligned_moe as alphamoe_nvfp4_aligned_moe,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -181,6 +185,7 @@ __all__ = [
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
     "hash_topk",
+    "alphamoe_nvfp4_aligned_moe",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",

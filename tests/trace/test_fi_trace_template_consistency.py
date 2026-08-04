@@ -374,6 +374,9 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
+    # Packed dimensions and the capacity-sized in-place output contract are
+    # covered by the targeted AlphaMoE trace test below.
+    "alphamoe_nvfp4_aligned_moe",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
@@ -417,6 +420,46 @@ def test_fi_trace_complete_gqa_paged_decode():
         f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
     )
     assert "unknown" not in str(defn["outputs"])
+
+
+def test_fi_trace_complete_alphamoe_nvfp4_aligned_moe():
+    """AlphaMoE trace preserves packed NVFP4 and in-place output semantics."""
+
+    from flashinfer.fused_moe import alphamoe_nvfp4_aligned_moe
+
+    kwargs = {
+        "hidden_states": torch.zeros(8, 128, dtype=torch.uint8),
+        "hidden_states_scale": torch.ones(8, 16, dtype=torch.float8_e4m3fn),
+        "gemm1_weights": torch.zeros(4, 256, 128, dtype=torch.uint8),
+        "gemm1_weights_scale": torch.ones(4, 256, 16, dtype=torch.float8_e4m3fn),
+        "gemm2_weights": torch.zeros(4, 256, 64, dtype=torch.uint8),
+        "gemm2_weights_scale": torch.ones(4, 256, 8, dtype=torch.float8_e4m3fn),
+        "sorted_token_ids": torch.zeros(48, dtype=torch.int32),
+        "expert_ids": torch.zeros(6, dtype=torch.int32),
+        "num_tokens_post_padded": torch.zeros(1, dtype=torch.int32),
+        "topk_weights": torch.zeros(8, 2, dtype=torch.float32),
+        "out": torch.zeros(8, 256, dtype=torch.bfloat16),
+        "top_k": 2,
+        "block_m": 8,
+        "routed_scaling_factor": 2.5,
+    }
+    defn = alphamoe_nvfp4_aligned_moe.fi_trace(**kwargs)
+    assert defn["name"] == ("alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8")
+    assert defn["axes"]["hidden_size"]["value"] == 256
+    assert defn["axes"]["gemm1_out_size"]["value"] == 256
+    assert defn["axes"]["num_packed_hidden"]["value"] == 128
+    assert defn["axes"]["num_hidden_scale_blocks"]["value"] == 16
+    assert defn["axes"]["num_packed_intermediate"]["value"] == 64
+    assert defn["axes"]["num_intermediate_scale_blocks"]["value"] == 8
+    assert defn["axes"]["one"]["value"] == 1
+    assert defn["inputs"]["hidden_states"]["dtype"] == "uint8"
+    assert defn["inputs"]["hidden_states_scale"]["dtype"] == "float8_e4m3fn"
+    assert defn["inputs"]["topk_weights"]["dtype"] == "float32"
+    assert defn["inputs"]["out"]["dtype"] == "bfloat16"
+    assert "optional" not in defn["inputs"]["out"]
+    assert defn["outputs"]["out"]["dtype"] == "bfloat16"
+    assert defn["outputs"]["out"]["param"] == "out"
+    assert "unknown" not in str(defn)
 
 
 @pytest.mark.parametrize(

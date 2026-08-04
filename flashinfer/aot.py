@@ -73,6 +73,7 @@ from .jit.flash_kda_decode import (
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -517,6 +518,7 @@ def gen_all_modules(
     )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
     has_sm107 = sm_capabilities.get("sm107", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
@@ -567,6 +569,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_nvfp4_sm100_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
         # DSv4 hash-based MoE routing (SM-portable)
@@ -1027,6 +1031,8 @@ def detect_sm_capabilities():
         ),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
+        "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("12.9"),
         "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),

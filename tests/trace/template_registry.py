@@ -48,6 +48,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.cute_dsl.rmsnorm_fp4quant",
     "flashinfer.decode",
     "flashinfer.fused_moe.core",
+    "flashinfer.fused_moe.alphamoe_nvfp4_sm100",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
     "flashinfer.fused_moe.fused_routing_dsv3",

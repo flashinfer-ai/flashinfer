@@ -45,6 +45,7 @@ output_column_dict = {
         "intermediate_size",
         "num_experts",
         "top_k",
+        "block_m",
         "n_group",
         "topk_group",
         "routed_scaling_factor",
@@ -223,6 +224,7 @@ benchmark_apis = {
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
         "b12x_fused_moe",
+        "alphamoe_nvfp4_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
     ],
@@ -565,6 +567,10 @@ routine_cc_to_supported_backends = {
         "10.3": [],
         "12.0": ["b12x"],
         "12.1": ["b12x"],
+    },
+    "alphamoe_nvfp4_aligned_moe": {
+        "10.0": ["alphamoe"],
+        "10.3": ["alphamoe"],
     },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
     # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
