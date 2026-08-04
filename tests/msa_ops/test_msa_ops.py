@@ -1437,6 +1437,25 @@ def test_msa_proxy_score_paged_fp8():
     )
     torch.cuda.synchronize()
     assert torch.equal(out_paged, out_flat)
+    # Decode shapes dispatch fp8 K to the stream (q_len 1) and packed (q_len 4)
+    # schedules; both upconvert e4m3 exactly, so results stay bit-identical to
+    # the same call on dequantized K. Flat and paged (production shape) layouts;
+    # one fp16-q case covers the f16 convert target in the packed schedule.
+    k8_pg = k_pg.to(torch.float8_e4m3fn).contiguous()
+    for sq, qdt in ((1, torch.bfloat16), (4, torch.bfloat16), (4, torch.float16)):
+        cu_qd = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=dev)
+        qd = torch.randn(B * sq, Hq, 128, dtype=qdt, device=dev) / 3
+        out8 = msa_proxy_score(qd, k8, cu_qd, cu_k, causal=True)
+        out_deq8 = msa_proxy_score(qd, k8.to(qdt), cu_qd, cu_k, causal=True)
+        pg8 = msa_proxy_score(
+            qd, k8_pg, cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+        )
+        pg_deq8 = msa_proxy_score(
+            qd, k8_pg.to(qdt), cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out8, out_deq8)
+        assert torch.equal(pg8, pg_deq8)
 
 
 def test_e2e_full_pipeline_from_raw_tensors():

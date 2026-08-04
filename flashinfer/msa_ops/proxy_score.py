@@ -293,8 +293,8 @@ def msa_proxy_score(
     Single-token decode uses a dim-parallel scalar schedule that streams
     index-K straight to registers. Short multi-token decode (MTP) uses a
     head-fused packed schedule that scores all ``group_size`` heads of a
-    kv_head from one shared index-K read. fp8 K and prefill use the general
-    schedule; see the dispatch below for the exact regime bounds.
+    kv_head from one shared index-K read. Prefill uses the general schedule;
+    see the dispatch below for the exact regime bounds.
 
     Parameters
     ----------
@@ -427,9 +427,7 @@ def msa_proxy_score(
     # Single-token decode uses the dim-parallel stream schedule (see
     # MsaProxyScoreDecodeStreamSm12x). total_q == batch_size guarantees exactly
     # one q token per request, which its token == batch indexing relies on.
-    use_stream = (
-        not kv_fp8 and max_seqlen_q == 1 and total_q == batch_size and group_size <= 8
-    )
+    use_stream = max_seqlen_q == 1 and total_q == batch_size and group_size <= 8
     # Right-aligned decode on the stream path computes the causal limit
     # in-kernel, so no offset tensor (and its build kernels) is needed.
     qoff_default = q_offset is None
@@ -442,11 +440,10 @@ def msa_proxy_score(
 
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
-    # (prefill, fp8 K, group_size not dividing 64) use the general schedule.
+    # (prefill, group_size not dividing 64) use the general schedule.
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
     use_packed = (
         not use_stream
-        and not kv_fp8
         and group_size >= 2
         and _PACK_ROWS % group_size == 0
         and max_seqlen_q <= _PACK_ROWS // group_size
@@ -487,6 +484,7 @@ def msa_proxy_score(
                 group_size=group_size,
                 is_causal=causal,
                 paged=paged,
+                kv_fp8=kv_fp8,
                 qoff_default=qoff_default,
             )
         elif use_packed:

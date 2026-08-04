@@ -23,7 +23,81 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+
+@dsl_user_op
+def _fp8x4_to_f16x4(x: cutlass.Uint32, *, loc=None, ip=None):
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [x.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $1, hi;\n\t"
+        "}\n",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Uint32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
+        cutlass.Uint32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _fp8x4_to_bf16x4(x: cutlass.Uint32, *, loc=None, ip=None):
+    # There is no e4m3 -> bf16 cvt; round-trip through f16, which is exact
+    # (every e4m3 value is representable in both f16 and bf16).
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [x.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 lo, hi, t00, t01, t10, t11;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 $1, hi;\n\t"
+        "mov.b32 {t00, t01}, $0;\n\t"
+        "mov.b32 {t10, t11}, $1;\n\t"
+        "cvt.rn.bf16.f16 t00, t00;\n\t"
+        "cvt.rn.bf16.f16 t01, t01;\n\t"
+        "cvt.rn.bf16.f16 t10, t10;\n\t"
+        "cvt.rn.bf16.f16 t11, t11;\n\t"
+        "mov.b32 $0, {t00, t01};\n\t"
+        "mov.b32 $1, {t10, t11};\n\t"
+        "}\n",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Uint32(llvm.extractvalue(T.i32(), out, [0], loc=loc, ip=ip)),
+        cutlass.Uint32(llvm.extractvalue(T.i32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def _cvt_fp8_frag(src: cute.Tensor, dst: cute.Tensor):
+    """Convert an e4m3 register fragment to dst's f16/bf16 element type with
+    packed cvt (one instruction per four elements); element-wise ``.to()``
+    lowers to a byte-extract sequence."""
+    src_u32 = cute.recast_tensor(src, cutlass.Uint32)
+    dst_u32 = cute.recast_tensor(dst, cutlass.Uint32)
+    for i in cutlass.range_constexpr(cute.size(src.shape) // 4):
+        if cutlass.const_expr(dst.element_type is cutlass.BFloat16):
+            lo, hi = _fp8x4_to_bf16x4(src_u32[i])
+        else:
+            lo, hi = _fp8x4_to_f16x4(src_u32[i])
+        dst_u32[i * 2] = lo
+        dst_u32[i * 2 + 1] = hi
 
 
 class MsaProxyScoreSm12x:
@@ -49,20 +123,15 @@ class MsaProxyScoreSm12x:
         self._is_causal = is_causal
         self._paged = paged
         self._kv_fp8 = kv_fp8
-        self._pad_stride = head_dim + 8
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
         )
 
     def _make_sk_layout(self):
-        """K SMEM layout (built in-kernel for region isolation): swizzled for
-        the cp.async path, plain padded for the fp8 convert path."""
-        if self._kv_fp8:
-            return cute.make_layout(
-                (self._n_block_size, self._head_dim),
-                stride=(self._pad_stride, 1),
-            )
+        """K SMEM layout (built in-kernel for region isolation). The fp8
+        convert path stores 16B-aligned chunks, so the swizzle works for it
+        too; a padded layout would cost a second CTA per SM (48KB -> >50KB)."""
         atom = cute.make_composed_layout(
             cute.make_swizzle(3, 3, 3),
             0,
@@ -447,8 +516,9 @@ class MsaProxyScoreSm12x:
 
 
 class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
-    """Head-fused packed-decode bf16/fp16 schedule: packs qhead_per_kv heads x
-    pack_q_len tokens into the M rows so the shared index-K is read once per kv_head."""
+    """Head-fused packed-decode schedule (bf16/fp16 or fp8 K): packs qhead_per_kv
+    heads x pack_q_len tokens into the M rows so the shared index-K is read once
+    per kv_head. fp8 K loads e4m3 bytes and packed-converts into smem."""
 
     def __init__(
         self,
@@ -669,28 +739,33 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                             (k_start, 0), mK[None, kv_head, None]
                         )
                         row_off8 = kv_block * self._n_block_size
-                    chunks_per_row = self._head_dim // 8
-                    total_chunks = self._n_block_size * chunks_per_row
-                    cvt_frag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
-                    for kv_it in cutlass.range_constexpr(
-                        total_chunks // self._num_threads
-                    ):
+                    chunks_per_row = self._head_dim // 16
+                    n_chunks = (
+                        self._n_block_size * chunks_per_row // self._num_threads
+                    )
+                    # Issue every 16B K load before the convert+store loop so the
+                    # gmem latencies overlap (the loads have no cp.async here).
+                    k_frag = cute.make_rmem_tensor(
+                        cute.make_layout((16, n_chunks)), mK.element_type
+                    )
+                    cvt_frag = cute.make_rmem_tensor(cute.make_layout(16), self._dtype)
+                    for kv_it in cutlass.range_constexpr(n_chunks):
                         kv_chunk = tidx + kv_it * self._num_threads
                         kv_m = kv_chunk // chunks_per_row
-                        kv_c8 = kv_chunk % chunks_per_row
-                        sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
+                        kv_c16 = kv_chunk % chunks_per_row
                         if (kv_block * self._n_block_size + kv_m) < seqlen_k:
                             gKc = cute.local_tile(
-                                mK_h8[row_off8 + kv_m, None], (8,), (kv_c8,)
+                                mK_h8[row_off8 + kv_m, None], (16,), (kv_c16,)
                             )
-                            cvt_frag.store(
-                                gKc.load()
-                                .to(cutlass.Float16)
-                                .to(cutlass.Float32)
-                                .to(self._dtype)
-                            )
+                            cute.autovec_copy(gKc, k_frag[None, kv_it])
                         else:
-                            cvt_frag.fill(0)
+                            k_frag[None, kv_it].fill(0)
+                    for kv_it in cutlass.range_constexpr(n_chunks):
+                        kv_chunk = tidx + kv_it * self._num_threads
+                        kv_m = kv_chunk // chunks_per_row
+                        kv_c16 = kv_chunk % chunks_per_row
+                        sK_chunk = cute.local_tile(sK[kv_m, None], (16,), (kv_c16,))
+                        _cvt_fp8_frag(k_frag[None, kv_it], cvt_frag)
                         cute.autovec_copy(cvt_frag, sK_chunk)
                 else:
                     if cutlass.const_expr(self._paged):
@@ -833,6 +908,7 @@ class MsaProxyScoreDecodeStreamSm12x:
         group_size: int = 4,
         is_causal: bool = True,
         paged: bool = False,
+        kv_fp8: bool = False,
         qoff_default: bool = True,
     ):
         if head_dim != 128:
@@ -846,6 +922,7 @@ class MsaProxyScoreDecodeStreamSm12x:
         self._G = group_size
         self._is_causal = is_causal
         self._paged = paged
+        self._kv_fp8 = kv_fp8
         # Right-aligned decode (q_offset=None): the single query sits at
         # seqlen_k - 1, so the causal limit is just seqlen_k and no offset
         # tensor is needed.
@@ -943,9 +1020,11 @@ class MsaProxyScoreDecodeStreamSm12x:
                 mK_h = mK[None, kv_head, None]  # (total_k, d)
 
             # Keep this loop separate from the compute loop below: issuing all
-            # loads before any consumption is the latency hiding.
+            # loads before any consumption is the latency hiding. fp8 K stays
+            # e4m3 through the loads (half the DRAM bytes) and upconverts per
+            # iteration in the compute loop.
             kfrag = cute.make_rmem_tensor(
-                cute.make_layout(self._num_iters * 8), self._dtype
+                cute.make_layout(self._num_iters * 8), mK.element_type
             )
             for it in cutlass.range_constexpr(self._num_iters):
                 off = warp * self._keys_per_warp + it * self._KEYS_PER_ITER + lane_key
@@ -961,7 +1040,18 @@ class MsaProxyScoreDecodeStreamSm12x:
                 cute.autovec_copy(k_chunk, dst)
 
             for it in cutlass.range_constexpr(self._num_iters):
-                ks = [cutlass.Float32(kfrag[it * 8 + i]) for i in range(8)]
+                if cutlass.const_expr(self._kv_fp8):
+                    # f16 intermediate (exact for e4m3), packed cvt.
+                    k8 = cute.make_tensor(
+                        kfrag.iterator + it * 8, cute.make_layout(8)
+                    )
+                    kf16 = cute.make_rmem_tensor(
+                        cute.make_layout(8), cutlass.Float16
+                    )
+                    _cvt_fp8_frag(k8, kf16)
+                    ks = [cutlass.Float32(kf16[i]) for i in range(8)]
+                else:
+                    ks = [cutlass.Float32(kfrag[it * 8 + i]) for i in range(8)]
                 es = [
                     qs[g][0] * ks[0]
                     + qs[g][1] * ks[1]
