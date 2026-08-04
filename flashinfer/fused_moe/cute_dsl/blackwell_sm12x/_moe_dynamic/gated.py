@@ -116,10 +116,10 @@ _FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
 # The upstream compact queue exposes two int32 metadata planes.  Pack the
 # optimized scheduler's complete descriptor into those planes so task claim
 # and prefetch use shifts/masks instead of integer division in the hot loop.
-# word0 = expert[9:0] | m_tile[23:10]
+# word0 = expert[15:0] | m_tile[31:16]
 # word1 = valid_rows[7:0] | slice_begin[19:8] | slice_count[31:20]
-_TASK_EXPERT_MASK = 0x3FF
-_TASK_M_TILE_MASK = 0x3FFF
+_TASK_EXPERT_MASK = 0xFFFF
+_TASK_M_TILE_MASK = 0xFFFF
 _TASK_VALID_ROWS_MASK = 0xFF
 _TASK_SLICE_MASK = 0xFFF
 
@@ -1050,7 +1050,7 @@ class MoEGatedDynamicKernel:
             slice_count = gate_tile_cnt - slice_begin
             if slice_count > slice_chunk:
                 slice_count = slice_chunk
-            task_expert[slot] = expert_idx | (m_tile_idx << Int32(10))
+            task_expert[slot] = expert_idx | (m_tile_idx << Int32(16))
             task_valid_rows[slot] = (
                 valid_rows | (slice_begin << Int32(8)) | (slice_count << Int32(20))
             )
@@ -1087,7 +1087,7 @@ class MoEGatedDynamicKernel:
             slice_count = gate_tile_cnt - slice_begin
             if slice_count > slice_chunk:
                 slice_count = slice_chunk
-            task_expert[slot] = expert_idx | (m_tile_idx << Int32(10))
+            task_expert[slot] = expert_idx | (m_tile_idx << Int32(16))
             task_valid_rows[slot] = (
                 valid_rows | (slice_begin << Int32(8)) | (slice_count << Int32(20))
             )
@@ -1150,7 +1150,7 @@ class MoEGatedDynamicKernel:
                     descriptor0 = task_expert[slot].to(Int32)
                     descriptor1 = task_valid_rows[slot].to(Int32)
                     expert = descriptor0 & Int32(_TASK_EXPERT_MASK)
-                    m_tile = (descriptor0 >> Int32(10)) & Int32(_TASK_M_TILE_MASK)
+                    m_tile = (descriptor0 >> Int32(16)) & Int32(_TASK_M_TILE_MASK)
                     valid_rows = descriptor1 & Int32(_TASK_VALID_ROWS_MASK)
                     slice_begin = (descriptor1 >> Int32(8)) & Int32(_TASK_SLICE_MASK)
                     slice_count = (descriptor1 >> Int32(20)) & Int32(_TASK_SLICE_MASK)
@@ -1213,7 +1213,7 @@ class MoEGatedDynamicKernel:
                     descriptor0 = task_expert[slot].to(Int32)
                     descriptor1 = task_valid_rows[slot].to(Int32)
                     expert = descriptor0 & Int32(_TASK_EXPERT_MASK)
-                    m_tile = (descriptor0 >> Int32(10)) & Int32(_TASK_M_TILE_MASK)
+                    m_tile = (descriptor0 >> Int32(16)) & Int32(_TASK_M_TILE_MASK)
                     valid_rows = descriptor1 & Int32(_TASK_VALID_ROWS_MASK)
                     slice_begin = (descriptor1 >> Int32(8)) & Int32(_TASK_SLICE_MASK)
                     slice_count = (descriptor1 >> Int32(20)) & Int32(_TASK_SLICE_MASK)
