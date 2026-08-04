@@ -23,9 +23,6 @@ from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
 
 
-_topk_compile_cache: dict = {}
-
-
 @functools.cache
 def _dummy_nvp(device_index: int) -> torch.Tensor:
     """Signature filler for the scalar-``num_valid_pages`` path, which never
@@ -33,16 +30,15 @@ def _dummy_nvp(device_index: int) -> torch.Tensor:
     return torch.zeros(1, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
-def _get_compiled_topk(topk: int, small: bool, per_token_nvp: bool = False):
+@functools.cache
+def _get_compiled_topk(topk: int, small: bool, per_token_nvp: bool):
     """``small`` picks the O(N^2) count-rank kernel, else the radix kernel; the
-    two give identical selections only on distinct-score inputs (ties may differ)."""
+    two give identical selections only on distinct-score inputs (ties may differ).
+
+    No default on ``per_token_nvp``: it keys the cache, and a call that omitted
+    it would compile a second copy of an identical kernel."""
     import cutlass
     import cutlass.cute as cute
-
-    key = (topk, small, per_token_nvp)
-    compiled = _topk_compile_cache.get(key)
-    if compiled is not None:
-        return compiled
 
     if small:
         from .cute_dsl.topk_select_countrank_sm12x import (
@@ -76,7 +72,6 @@ def _get_compiled_topk(topk: int, small: bool, per_token_nvp: bool = False):
         stream_fake,
         options="--enable-tvm-ffi",
     )
-    _topk_compile_cache[key] = compiled
     return compiled
 
 
