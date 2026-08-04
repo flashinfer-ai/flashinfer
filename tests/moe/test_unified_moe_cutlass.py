@@ -48,10 +48,10 @@ def _config(**overrides) -> MoEConfig:
 
 
 def test_cutlass_bf16_config_architectures_and_registration():
-    assert CutlassBf16Config.supported(90)
+    for arch in (89, 90, 100, 103, 107, 110, 120, 121):
+        assert CutlassBf16Config.supported(arch)
     assert CutlassW4A16Config.supported(90)
     assert not CutlassBf16Config.supported(80)
-    assert not CutlassBf16Config.supported(100)
     assert not CutlassW4A16Config.supported(100)
     assert not CutlassBf16Config.supported(130)
     assert CutlassConfig is not CutlassBf16Config
@@ -390,7 +390,7 @@ def _is_cutlass_sm90_arch() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    return CutlassBf16Config.supported(major * 10 + minor)
+    return major * 10 + minor == 90
 
 
 cutlass_sm90_required = pytest.mark.skipif(

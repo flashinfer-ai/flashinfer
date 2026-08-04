@@ -276,9 +276,9 @@ class TestBackendOptions:
             candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
         valid = opts.valid_for(100)
-        assert len(valid) == 2
+        assert len(valid) == 3
         assert not CutlassConfig.supported(100)
-        assert not CutlassBf16Config.supported(100)
+        assert CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
