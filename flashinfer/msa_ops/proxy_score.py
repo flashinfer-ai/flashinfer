@@ -352,6 +352,7 @@ def msa_proxy_score(
     import cutlass.cute as cute
 
     from .cute_dsl.proxy_score_sm12x import (
+        MsaProxyScoreDecodePackedFp8Sm12x,
         MsaProxyScoreDecodePackedSm12x,
         MsaProxyScoreDecodeStreamSm12x,
         MsaProxyScoreSm12x,
@@ -449,6 +450,14 @@ def msa_proxy_score(
         and max_seqlen_q <= _PACK_ROWS // group_size
     )
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
+    if use_packed and kv_fp8:
+        # The key-split fp8 kernel takes any 16-multiple row tile, so size it
+        # to the spec-decode length instead of always packing 64 rows: at the
+        # common 4-head sq<=4 shapes this quarters the mma work per CTA.
+        p = 1
+        while p < max_seqlen_q or group_size * p < 16:
+            p *= 2
+        pack_q_len = min(p, _PACK_ROWS // group_size)
 
     # group_size keys the packed/stream schedules: it is constexpr-baked into
     # the gather/epilogue, so each factorization is its own kernel.
@@ -463,10 +472,16 @@ def msa_proxy_score(
         group_size if use_stream else pack_q_len,
         qoff_default if use_stream else None,
     )
+    # The packed fp8 schedule takes K as a 16-bit torch view of the e4m3
+    # bytes (half the last dim): the kernel moves raw bytes and upconverts in
+    # registers, and a typed view keeps the cp.async source alignment provable
+    # where an in-kernel recast of a symbolic layout does not.
+    kv16 = kv_fp8 and use_packed
+    k_call = k.contiguous().view(q.dtype) if kv16 else k
     compiled = _compile_cache.get(key)
     if compiled is None:
         cdt = _cutlass_dtype(q.dtype)
-        kdt = _cutlass_dtype(k.dtype)
+        kdt = _cutlass_dtype(k_call.dtype)
         i32 = _cutlass_dtype(torch.int32)
         f32 = _cutlass_dtype(torch.float32)
         # s_bk is mCuK's own symbol: on the paged path it holds per-request
@@ -475,7 +490,8 @@ def msa_proxy_score(
         s_tq, s_hq, s_tk, s_hkv, s_b1, s_bk, s_b0, s_pb, s_pm, s_mt = (
             cute.sym_int() for _ in range(10)
         )
-        k_shape = (s_tk, s_hkv, _BLK_KV, head_dim) if paged else (s_tk, s_hkv, head_dim)
+        kd = head_dim // 2 if kv16 else head_dim
+        k_shape = (s_tk, s_hkv, _BLK_KV, kd) if paged else (s_tk, s_hkv, kd)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj: Union["MsaProxyScoreDecodeStreamSm12x", "MsaProxyScoreSm12x"]
         if use_stream:
@@ -488,9 +504,16 @@ def msa_proxy_score(
                 qoff_default=qoff_default,
             )
         elif use_packed:
-            kernel_obj = MsaProxyScoreDecodePackedSm12x(
+            # fp8 K gets the key-split warp layout so the e4m3 upconvert
+            # is not replicated across warps.
+            packed_cls = (
+                MsaProxyScoreDecodePackedFp8Sm12x
+                if kv_fp8
+                else MsaProxyScoreDecodePackedSm12x
+            )
+            kernel_obj = packed_cls(
                 head_dim=head_dim,
-                m_block_size=64,
+                m_block_size=group_size * pack_q_len,
                 n_block_size=_BLK_KV,
                 num_threads=128,
                 is_causal=causal,
@@ -557,12 +580,12 @@ def msa_proxy_score(
     if use_stream:
         # One CTA per (KV block, token, kv_head): the grid is already maximally
         # split, so there is no split factor to tune.
-        _call([q, k, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev], 1)
+        _call([q, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev], 1)
     else:
         _run_proxy_autotuned(
             "msa_proxy_score",
             _call,
-            [q, k, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev],
+            [q, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev],
             max_seqlen_q=max_seqlen_q,
             max_k_tiles=max_k_tiles,
             base_ctas=base_ctas,

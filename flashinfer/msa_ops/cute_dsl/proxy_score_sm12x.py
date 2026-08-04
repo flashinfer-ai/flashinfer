@@ -887,6 +887,364 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 sQ_chunk.fill(0)
 
 
+class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
+    """fp8-K packed-decode schedule. Same head-fused M rows as the packed
+    schedule, but warps split over keys instead of query rows (after Thien
+    Nguyen's indexer kernel): each warp owns its own key columns, so the
+    e4m3 -> f16/bf16 upconvert runs once per K element instead of once per
+    warp. K stays raw e4m3 through cp.async and smem (half the bytes and half
+    the smem of a converted tile) and upconverts in registers between the
+    smem loads and the mma. mK arrives as a 16-bit view of the e4m3 bytes with half the
+    head dim (see msa_proxy_score), which keeps the cp.async source alignment
+    provable. Q is stored column-permuted to match the converted K fragments
+    (see _gather_packed_q).
+
+    The score tile is 64 rows x 128 keys from a (16, 32)-tiled m16n8k16 mma
+    with the 4 warps side by side along N, so every warp computes all 64 rows
+    for its own 32 key columns and the epilogue joins the per-warp row maxes
+    through smem.
+    """
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuQ: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
+        max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        split_idx, batch_idx, kv_head = cute.arch.block_idx()
+
+        q_start = mCuQ[batch_idx]
+        seqlen_q = mCuQ[batch_idx + 1] - q_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
+        num_kv_blocks = cute.ceil_div(seqlen_k, self._n_block_size)
+
+        # K tile is raw e4m3 viewed 16-bit, so it is half as wide as Q's.
+        kw = self._head_dim // 2
+        sQ_layout = self._make_sq_layout()
+        sK_layout = self._make_sk8_layout()
+
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)],
+                1024,
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sK_layout)],
+                1024,
+            ]
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sQ = storage.sQ.get_tensor(sQ_layout)
+        sK = storage.sK.get_tensor(sK_layout)
+        # Full-width layout on the same pointer: shapes the mma B fragment
+        # only, no accesses go through it.
+        sK_frag_ref = cute.make_tensor(sK.iterator, self._make_sk_layout())
+        # Cross-warp epilogue staging (64 rows x 4 warps f32) aliased onto
+        # sK's first 1KB: dead between the last fragment load of one kv-block
+        # and the next block's fill, which is exactly the epilogue window.
+        sMax = cute.recast_tensor(
+            cute.make_tensor(sK.iterator, cute.make_layout(512)), cutlass.Float32
+        )
+
+        universal_copy_bits = 128
+        async_copy_elems = universal_copy_bits // self._dtype.width
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self._dtype,
+            num_bits_per_copy=universal_copy_bits,
+        )
+        t_dim1 = 64 // async_copy_elems
+        t_layout = cute.make_layout(
+            (self._num_threads // t_dim1, t_dim1), stride=(t_dim1, 1)
+        )
+        v_layout = cute.make_layout((1, async_copy_elems))
+        gmem_tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, t_layout, v_layout)
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+
+        self._gather_packed_q(mQ, sQ, q_start, kv_head, seqlen_q, tidx)
+
+        # Warps side by side along N: each owns interleaved 8-column slices
+        # of the 128 keys (32 columns total), so the fp8 K fragments are
+        # converted once instead of replicated across the M-split warps.
+        num_warps = self._num_threads // 32
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
+            (1, num_warps, 1),
+            permutation_mnk=(16, num_warps * 8, 16),
+        )
+        thr_mma = tiled_mma.get_slice(tidx)
+        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
+        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK_frag_ref))
+        acc_S = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((self._m_block_size, self._n_block_size)),
+            cutlass.Float32,
+        )
+
+        smem_copy_atom_Q = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self._dtype,
+        )
+        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
+        smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
+        tSsQ = smem_thr_copy_Q.partition_S(sQ)
+        tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+
+        # B loads are plain 4B reads, not ldmatrix: a warp's slice per
+        # (n-tile, k-step pair) is only 8 rows x 16B, which the ldmatrix tiled
+        # copies cannot partition here (the source collapses to one matrix).
+        # Each lane reads the two 16-bit pairs its own fragment needs; the
+        # swizzle keeps the reads bank-spread. kpair holds one such pair (four
+        # consecutive e4m3 key columns); the convert splits it into the
+        # even/odd mma k-steps, and the resulting K-axis column permutation is
+        # mirrored by the Q gather (a permutation shared by both operands
+        # leaves Q K^T unchanged).
+        kpair = cute.make_rmem_tensor(cute.make_layout(2), self._dtype)
+        kpair_u32 = cute.recast_tensor(kpair, cutlass.Uint32)
+        tSrK_u32 = cute.recast_tensor(
+            cute.make_tensor(
+                tSrK.iterator, cute.make_layout(cute.cosize(tSrK.layout))
+            ),
+            cutlass.Uint32,
+        )
+        warp_idx = tidx // 32
+        lane = tidx % 32
+        # Fragment geometry of the m16n8k16 B atom: lane covers key row
+        # n = 32*nt + 8*warp + lane//4 and k16 pairs at 2*(lane%4) (+8).
+        nb_row = 8 * warp_idx + lane // 4
+        m4 = lane % 4
+
+        cS = cute.make_identity_tensor((self._m_block_size, self._n_block_size))
+        tScS_mn = self._make_acc_tensor_mn_view(thr_mma.partition_C(cS))
+        acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
+        n_rows = cute.size(acc_S_mn.shape[0])
+
+        # K gmem views, as in the packed kernel but on the half-width view.
+        if cutlass.const_expr(self._paged):
+            pass  # per-block page lookup happens inside the loop
+        else:
+            mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
+            gK = cute.local_tile(mK_h, (self._n_block_size, kw), (None, 0))
+            tKgK_flat = gmem_thr_copy.partition_S(gK)
+        tKsK = gmem_thr_copy.partition_D(sK)
+        cKV = cute.make_identity_tensor((self._n_block_size, kw))
+        tKVcKV = gmem_thr_copy.partition_S(cKV)
+
+        # Gather stores are synchronous; order them before the Q fragment
+        # reads. Q fragments are loaded per k-step inside the block loop (a
+        # full-tile preload would hold 4x the M-split fragment count and cost
+        # a CTA of occupancy).
+        self.cta_sync_barrier.arrive_and_wait()
+
+        n_iter = cute.ceil_div(max_k_tiles, num_splits)
+        for it in cutlass.range(n_iter):
+            kv_block = split_idx + it * num_splits
+            if kv_block < num_kv_blocks:
+                # Also orders the previous epilogue's sMax reads before this
+                # block's fill of the aliased sK bytes.
+                self.cta_sync_barrier.arrive_and_wait()
+                if cutlass.const_expr(self._paged):
+                    page = mPageTable[batch_idx, kv_block]
+                    gK_pg = cute.local_tile(
+                        mK[page, kv_head, None, None],
+                        (self._n_block_size, kw),
+                        (None, 0),
+                    )
+                    tKgK_pg = gmem_thr_copy.partition_S(gK_pg)
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if (
+                            kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
+                        ) < seqlen_k:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK_pg[None, n, None, 0],
+                                tKsK[None, n, None],
+                            )
+                        else:
+                            tKsK[None, n, None].fill(0)
+                else:
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if (
+                            kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
+                        ) < seqlen_k:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK_flat[None, n, None, kv_block],
+                                tKsK[None, n, None],
+                            )
+                        else:
+                            tKsK[None, n, None].fill(0)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                self.cta_sync_barrier.arrive_and_wait()
+
+                # S = Q K^T (unscaled). Per k-step pair: read the lane's raw
+                # 16-bit pairs, packed-convert into the pair's fragments, then
+                # the two mma steps; Q fragments load just in time so ptxas
+                # keeps the per-thread A footprint at one k-step.
+                acc_S.fill(0.0)
+                for kk8 in cutlass.range_constexpr(self._head_dim // 32):
+                    for nt in cutlass.range_constexpr(
+                        self._n_block_size // (8 * self._num_threads // 32)
+                    ):
+                        n_row = 32 * nt + nb_row
+                        for g in cutlass.range_constexpr(2):
+                            src = cute.local_tile(
+                                sK[n_row, None], (2,), (8 * kk8 + 4 * g + m4,)
+                            )
+                            cute.autovec_copy(src, kpair)
+                            if cutlass.const_expr(self._dtype is cutlass.BFloat16):
+                                lo, hi = _fp8x4_to_bf16x4(kpair_u32[0])
+                            else:
+                                lo, hi = _fp8x4_to_f16x4(kpair_u32[0])
+                            # All four e4m3 of this u32 belong to the same
+                            # canonical 16-column group g, so both converted
+                            # pairs go into mma step 2*kk8 + g: this keeps
+                            # each product in the same instruction as the
+                            # reference schedules, and the chained f32
+                            # accumulation stays bit-identical.
+                            kk = 2 * kk8 + g
+                            d0 = cute.crd2idx(((0, 0), nt, kk), tSrK.layout)
+                            d1 = cute.crd2idx(((0, 1), nt, kk), tSrK.layout)
+                            tSrK_u32[d0 // 2] = lo
+                            tSrK_u32[d1 // 2] = hi
+                    for s in cutlass.range_constexpr(2):
+                        kk = 2 * kk8 + s
+                        cute.copy(
+                            smem_tiled_copy_Q,
+                            tSsQ[None, None, kk],
+                            tSrQ_copy_view[None, None, kk],
+                        )
+                        cute.gemm(
+                            tiled_mma,
+                            acc_S,
+                            tSrQ[None, None, kk],
+                            tSrK[None, None, kk],
+                            acc_S,
+                        )
+
+                # Orders every warp's sK fragment loads before the epilogue
+                # overwrites the aliased sMax bytes.
+                self.cta_sync_barrier.arrive_and_wait()
+
+                # Per-warp row maxes over the warp's 32 key columns, staged to
+                # smem; one thread per row then joins the 4 warps and stores.
+                for r in cutlass.range_constexpr(n_rows):
+                    row = tScS_mn[r, 0][0]
+                    token = row % self._pack_q_len
+                    if cutlass.const_expr(self._is_causal):
+                        col_limit = cutlass.min(
+                            token + mQOffset[batch_idx] + 1, seqlen_k
+                        )
+                    else:
+                        col_limit = seqlen_k
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                        k_pos = kv_block * self._n_block_size + tScS_mn[0, c][1]
+                        if cute.elem_less(col_limit, k_pos + 1):
+                            acc_S_mn[r, c] = -cutlass.Float32.inf
+                    tile_max = (
+                        acc_S_mn[r, None]
+                        .load()
+                        .reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+                    )
+                    tile_max = self._threadquad_reduce_max(tile_max)
+                    if tidx % 4 == 0:
+                        sMax[row * 4 + warp_idx] = tile_max
+                self.cta_sync_barrier.arrive_and_wait()
+                if tidx < self._m_block_size:
+                    row_max = sMax[tidx * 4]
+                    for w in cutlass.range_constexpr(1, 4):
+                        row_max = cute.arch.fmax(row_max, sMax[tidx * 4 + w])
+                    token_f = tidx % self._pack_q_len
+                    head_f = kv_head * self._qhead_per_kv + tidx // self._pack_q_len
+                    if cute.elem_less(token_f, seqlen_q):
+                        mMaxScore[head_f, kv_block, q_start + token_f] = row_max
+            elif kv_block < max_k_tiles:
+                # Padding tile in [num_kv_blocks, max_k_tiles) -> -inf, as in
+                # the packed kernel.
+                for r in cutlass.range_constexpr(n_rows):
+                    row2 = tScS_mn[r, 0][0]
+                    token2 = row2 % self._pack_q_len
+                    local_head2 = row2 // self._pack_q_len
+                    head2 = kv_head * self._qhead_per_kv + local_head2
+                    if cute.elem_less(token2, seqlen_q):
+                        mMaxScore[
+                            head2, kv_block, q_start + token2
+                        ] = -cutlass.Float32.inf
+
+    def _make_sk8_layout(self):
+        """K smem layout for the raw e4m3 bytes viewed as 16-bit pairs: half
+        the width of the converted tile, same swizzle."""
+        atom = cute.make_composed_layout(
+            cute.make_swizzle(3, 3, 3),
+            0,
+            cute.make_layout((8, 64), stride=(64, 1)),
+        )
+        return cute.tile_to_shape(
+            atom, (self._n_block_size, self._head_dim // 2), (0, 1)
+        )
+
+    @cute.jit
+    def _gather_packed_q(self, mQ, sQ, q_start, kv_head, seqlen_q, tidx):
+        """Gather the packed Q tile into swizzled smem, column-permuted to
+        match the converted K fragments; rows past seqlen_q are zero-filled
+        (epilogue masks them).
+
+        The packed K convert places column ``16g + 4m + 2h + j`` of each
+        32-wide block in the mma slot that canonically holds
+        ``16g + 8h + 2m + j``, and Q must follow the same K-axis permutation
+        for ``Q K^T`` to be unchanged."""
+        elems = 128 // self._dtype.width
+        chunks = self._head_dim // elems
+        total = self._m_block_size * chunks
+        frag = cute.make_rmem_tensor(cute.make_layout(elems), self._dtype)
+        for it in cutlass.range_constexpr(total // self._num_threads):
+            e = tidx + it * self._num_threads
+            r = e // chunks
+            c8 = e % chunks
+            local_head = r // self._pack_q_len
+            token = r % self._pack_q_len
+            head = kv_head * self._qhead_per_kv + local_head
+            if cute.elem_less(token, seqlen_q):
+                gQ_chunk = cute.local_tile(
+                    mQ[q_start + token, head, None], (elems,), (c8,)
+                )
+                frag.store(gQ_chunk.load())
+                # Chunk column a = 8*c8 + 2*i + j goes to permuted pair
+                # position p2 (see the docstring); pairs stay contiguous.
+                for i in cutlass.range_constexpr(4):
+                    pr = cute.make_tensor(frag.iterator + 2 * i, cute.make_layout(2))
+                    p2 = (
+                        16 * (c8 // 4)
+                        + 8 * ((c8 % 4) // 2)
+                        + 4 * (i % 2)
+                        + 2 * (c8 % 2)
+                        + i // 2
+                    )
+                    dst = cute.local_tile(sQ[r, None], (2,), (p2,))
+                    cute.autovec_copy(pr, dst)
+            else:
+                sQ_chunk0 = cute.local_tile(sQ[r, None], (elems,), (c8,))
+                sQ_chunk0.fill(0)
+
+
 class MsaProxyScoreDecodeStreamSm12x:
     """Single-token decode schedule: at one query token the score tile is only
     group_size rows, too skinny for the MMA atom, so K streams straight from
