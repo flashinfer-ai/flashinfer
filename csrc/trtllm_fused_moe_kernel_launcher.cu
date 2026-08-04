@@ -13,7 +13,6 @@
  */
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
-#include <nvrtc.h>
 
 #include <algorithm>
 #include <cmath>
