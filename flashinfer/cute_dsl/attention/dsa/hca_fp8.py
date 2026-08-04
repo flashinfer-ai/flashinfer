@@ -227,6 +227,16 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         self.load_tma_v_warp_id = 10
         self.mma_pv_warp_id = 11
         self.second_compute_warp_ids = (12, 13, 14, 15)
+        # The second softmax group owns the four window K/V subtiles. Each warp
+        # issues one quarter of both gather trees before entering compute.
+        self.swa_load_warp_ids = self.second_compute_warp_ids
+        assert self.iterations_qk_latent % len(self.swa_load_warp_ids) == 0
+        self.swa_k_iters_per_warp = self.iterations_qk_latent // len(
+            self.swa_load_warp_ids
+        )
+        swa_v_iters = self.iterations_pv_n * self.iterations_pv_k
+        assert swa_v_iters % len(self.swa_load_warp_ids) == 0
+        self.swa_v_iters_per_warp = swa_v_iters // len(self.swa_load_warp_ids)
         self.num_total_compute_warps = self.num_compute_warps + len(
             self.second_compute_warp_ids
         )
@@ -280,6 +290,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         self.softmax_warps_initial_sync_bar = pipeline.NamedBarrier(
             barrier_id=7,
             num_threads=(self.threads_per_warp * self.num_total_compute_warps),
+        )
+        # W12 acquires both window stages; W9/W10 join the handoff so their
+        # canonical states stay aligned while W12-W15 issue K/V quarters.
+        self.swa_load_handoff_bar = pipeline.NamedBarrier(
+            barrier_id=8,
+            num_threads=(self.threads_per_warp * (len(self.swa_load_warp_ids) + 2)),
         )
         self.init_row_max = -float("inf")
         self.tmem_corr_stage_cols = 4
@@ -1171,7 +1187,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                k_index, k_tile_count, _ = self.get_k_tile_count(
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
@@ -1181,23 +1197,17 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
-                        load_v_pipeline=load_v_pipeline,
-                        mWindowIndices=mWindowIndices,
                         mPT_cmp=mPT_cmp,
                     )
                     tma_qk_params = SimpleNamespace(
                         tiled_mma_qk=tiled_mma_qk,
                         tma_atom_q_latent=tma_atom_q_latent,
-                        tma_atom_c_latent_win=tma_atom_c_latent_win,
                         tma_atom_c_latent_cmp=tma_atom_c_latent_cmp,
                         mQL=mQL,
-                        mCL_win=mCL_win,
                         mCL_cmp=mCL_cmp,
                         sQ=sQ,
-                        sKC_win=sKC_for_tma_win,
                         sKC_cmp=sKC_for_tma_cmp,
                     )
                     # Load tma
@@ -1226,7 +1236,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                k_index, k_tile_count, _ = self.get_k_tile_count(
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
@@ -1236,18 +1246,13 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     # Construct fixed common/tma_qk/tma_pv params for load_tma
                     tma_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
                         load_v_pipeline=load_v_pipeline,
-                        mWindowIndices=mWindowIndices,
                         mPT_cmp=mPT_cmp,
                     )
                     tma_pv_params = SimpleNamespace(
                         tiled_mma_pv=tiled_mma_pv,
-                        tma_atom_c_latent_transpose_win=tma_atom_c_latent_transpose_win,
                         tma_atom_c_latent_transpose_cmp=tma_atom_c_latent_transpose_cmp,
-                        mCLT_win=mCLT_win,
                         mCLT_cmp=mCLT_cmp,
-                        sVC_win=sVC_for_tma_win,
                         sVC_cmp=sVC_for_tma_cmp,
                     )
                     # Load tma
@@ -1498,6 +1503,60 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     split_kv, cache_seqs, block_split_kvs, blk_coord
                 )
                 if k_tile_count > 0:
+                    if k_index == 0:
+                        # This group stays one stage ahead of the canonical K/V
+                        # producer states. Rebase onto their current count.
+                        swa_load_producer_count = p_mma_producer_state.count - 1
+                        swa_load_handoff_params = SimpleNamespace(
+                            load_k_pipeline=load_k_pipeline,
+                            load_v_pipeline=load_v_pipeline,
+                        )
+                        if warp_idx == self.swa_load_warp_ids[0]:
+                            self.load_tma_swa_handoff(
+                                swa_load_handoff_params,
+                                swa_load_producer_count,
+                            )
+                        self.swa_load_handoff_bar.arrive_and_wait()
+
+                        # Materialize K and V arguments just in time so neither
+                        # gather4 tensor tree crosses the other copy segment.
+                        swa_load_qk_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            load_k_pipeline=load_k_pipeline,
+                            mWindowIndices=mWindowIndices,
+                            swa_load_warp_idx=(warp_idx - self.swa_load_warp_ids[0]),
+                        )
+                        swa_load_qk_params = SimpleNamespace(
+                            tiled_mma_qk=tiled_mma_qk,
+                            tma_atom_c_latent_win=tma_atom_c_latent_win,
+                            mCL_win=mCL_win,
+                            sKC_win=sKC_for_tma_win,
+                        )
+                        self.load_tma_swa_k(
+                            swa_load_qk_common_params,
+                            swa_load_qk_params,
+                            swa_load_producer_count,
+                        )
+
+                        swa_load_pv_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            load_v_pipeline=load_v_pipeline,
+                            mWindowIndices=mWindowIndices,
+                            swa_load_warp_idx=(warp_idx - self.swa_load_warp_ids[0]),
+                        )
+                        swa_load_pv_params = SimpleNamespace(
+                            tiled_mma_pv=tiled_mma_pv,
+                            tma_atom_c_latent_transpose_win=(
+                                tma_atom_c_latent_transpose_win
+                            ),
+                            mCLT_win=mCLT_win,
+                            sVC_win=sVC_for_tma_win,
+                        )
+                        self.load_tma_swa_v(
+                            swa_load_pv_common_params,
+                            swa_load_pv_params,
+                            swa_load_producer_count,
+                        )
                     compute_common_params = SimpleNamespace(
                         blk_coord=blk_coord,
                         split_kv=split_kv,
@@ -1804,6 +1863,136 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         return k_index, k_tile_count, split_kv
 
     @cute.jit
+    def load_tma_swa_handoff(
+        self,
+        common_params: SimpleNamespace,
+        producer_count: cutlass.Int32,
+    ) -> None:
+        """Acquire the window K/V stages from the second softmax warp group.
+
+        The caller rebases the second group's one-stage-ahead P producer count
+        onto the canonical logical K tile. Deriving both load states here keeps
+        them aligned with W9/W10 without carrying either state across softmax.
+        """
+        load_k_producer_state = pipeline.PipelineState(
+            self.load_k_stage,
+            producer_count,
+            producer_count % self.load_k_stage,
+            ((producer_count // self.load_k_stage) % 2) ^ 1,
+        )
+        load_v_producer_state = pipeline.PipelineState(
+            self.load_v_stage,
+            producer_count,
+            producer_count % self.load_v_stage,
+            ((producer_count // self.load_v_stage) % 2) ^ 1,
+        )
+        common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
+        common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+
+    @cute.jit
+    def load_tma_swa_k(
+        self,
+        common_params: SimpleNamespace,
+        qk_params: SimpleNamespace,
+        producer_count: cutlass.Int32,
+    ) -> None:
+        """Issue one quarter of the window K gather4 copies from each W12-W15."""
+        load_k_producer_state = pipeline.PipelineState(
+            self.load_k_stage,
+            producer_count,
+            producer_count % self.load_k_stage,
+            ((producer_count // self.load_k_stage) % 2) ^ 1,
+        )
+        per_cta_n_qk = self.mma_qk_tiler[1] // qk_params.tiled_mma_qk.thr_id.shape
+        cta_tiler_qk_win = (per_cta_n_qk, self.mma_qk_tiler[2])
+        gCL_win = cute.zipped_divide(qk_params.mCL_win, cta_tiler_qk_win)
+        window_k_coord_layout = cute.make_layout(qk_params.mCL_win.shape, stride=(1, 0))
+        window_k_coord = cute.make_tensor(
+            common_params.mWindowIndices.iterator, window_k_coord_layout
+        )
+        gIdx_win_k = cute.zipped_divide(window_k_coord, cta_tiler_qk_win)
+        tKCsKC_win, tCLgCL_win, tIdxgIdx_win_k = cpasync.tma_partition(
+            qk_params.tma_atom_c_latent_win,
+            0,
+            cute.make_layout(1),
+            qk_params.sKC_win,
+            [gCL_win, gIdx_win_k],
+        )
+        tma_k_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
+            load_k_producer_state
+        )
+        cluster_n_qk = qk_params.tiled_mma_qk.thr_id.shape
+        cta_in_cluster_qk = common_params.blk_coord[0] % cluster_n_qk
+        window_k_tile_idx = (
+            self.get_page_table_row(common_params.blk_coord) * cluster_n_qk
+            + cta_in_cluster_qk
+        )
+        k_iter_offset = common_params.swa_load_warp_idx * self.swa_k_iters_per_warp
+        for local_iter in cutlass.range_constexpr(self.swa_k_iters_per_warp):
+            k_iter = k_iter_offset + local_iter
+            cute.copy(
+                qk_params.tma_atom_c_latent_win,
+                [
+                    tCLgCL_win[None, (window_k_tile_idx, k_iter)],
+                    tIdxgIdx_win_k[None, (window_k_tile_idx, k_iter)],
+                ],
+                tKCsKC_win[None, 0, 0, (k_iter, load_k_producer_state.index)],
+                tma_bar_ptr=tma_k_bar_ptr,
+            )
+
+    @cute.jit
+    def load_tma_swa_v(
+        self,
+        common_params: SimpleNamespace,
+        v_params: SimpleNamespace,
+        producer_count: cutlass.Int32,
+    ) -> None:
+        """Issue one quarter of the window V gather4 copies from each W12-W15."""
+        load_v_producer_state = pipeline.PipelineState(
+            self.load_v_stage,
+            producer_count,
+            producer_count % self.load_v_stage,
+            ((producer_count // self.load_v_stage) % 2) ^ 1,
+        )
+        per_cta_m_pv = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
+        cta_tiler_pv_win = (per_cta_m_pv, self.mma_pv_tiler[2])
+        gCLT_win = cute.zipped_divide(v_params.mCLT_win, cta_tiler_pv_win)
+        window_v_coord_layout = cute.make_layout(v_params.mCLT_win.shape, stride=(0, 1))
+        window_v_coord = cute.make_tensor(
+            common_params.mWindowIndices.iterator, window_v_coord_layout
+        )
+        gIdx_win_v = cute.zipped_divide(window_v_coord, cta_tiler_pv_win)
+        tVCsVC_win, tCLTgCLT_win, tIdxgIdx_win_v = cpasync.tma_partition(
+            v_params.tma_atom_c_latent_transpose_win,
+            0,
+            cute.make_layout(1),
+            v_params.sVC_win,
+            [gCLT_win, gIdx_win_v],
+        )
+        tma_v_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
+            load_v_producer_state
+        )
+        cluster_m_pv = v_params.tiled_mma_pv.thr_id.shape
+        cta_in_cluster_pv = common_params.blk_coord[0] % cluster_m_pv
+        window_row = self.get_page_table_row(common_params.blk_coord)
+        v_iter_offset = common_params.swa_load_warp_idx * self.swa_v_iters_per_warp
+        for local_iter in cutlass.range_constexpr(self.swa_v_iters_per_warp):
+            v_iter = v_iter_offset + local_iter
+            j = v_iter // self.iterations_pv_k
+            i = v_iter % self.iterations_pv_k
+            latent_block_idx = j * cluster_m_pv + cta_in_cluster_pv
+            window_v_tile_idx = window_row * self.iterations_pv_k + i
+            cute.copy(
+                v_params.tma_atom_c_latent_transpose_win,
+                [
+                    tCLTgCLT_win[None, (latent_block_idx, window_v_tile_idx)],
+                    tIdxgIdx_win_v[None, (latent_block_idx, window_v_tile_idx)],
+                ],
+                tVCsVC_win[None, 0, 0, ((j, i), load_v_producer_state.index)],
+                tma_bar_ptr=tma_v_bar_ptr,
+            )
+
+    @cute.jit
     def load_tma_qk(
         self,
         common_params: SimpleNamespace,
@@ -1848,17 +2037,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             // qk_params.tiled_mma_qk.thr_id.shape
         )
 
-        # Window K and its token-level coordinates use identical per-CTA
-        # tiling. The outer tile selects the query row and cluster CTA.
-        per_cta_n_qk = self.mma_qk_tiler[1] // qk_params.tiled_mma_qk.thr_id.shape
-        cta_tiler_qk_win = (per_cta_n_qk, self.mma_qk_tiler[2])
-        gCL_win = cute.zipped_divide(qk_params.mCL_win, cta_tiler_qk_win)
-        window_k_coord_layout = cute.make_layout(qk_params.mCL_win.shape, stride=(1, 0))
-        window_k_coord = cute.make_tensor(
-            common_params.mWindowIndices.iterator, window_k_coord_layout
-        )
-        gIdx_win_k = cute.zipped_divide(window_k_coord, cta_tiler_qk_win)
-
         # K partition for compressed stream
         cta_m_cmp = min(cta_kv_m, self.page_size_cmp)
         page_tile_size_k_cmp = min(self.page_size_cmp, cta_m_cmp)
@@ -1876,7 +2054,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             else gCL_cmp[None, 0, None, None]
         )
 
-        # tma partition for q (one stream) and k (two streams sharing SMEM)
+        # TMA partition for Q and compressed K. Window K is partitioned only
+        # inside the W12-W15 distributed loader to keep its gather tree local.
         tQsQ, tQLgQL_mkl = cpasync.tma_partition(
             qk_params.tma_atom_q_latent,
             0,
@@ -1885,13 +2064,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             cute.group_modes(tSgQL, 0, 3),
         )
 
-        tKCsKC_win, tCLgCL_win, tIdxgIdx_win_k = cpasync.tma_partition(
-            qk_params.tma_atom_c_latent_win,
-            0,
-            cute.make_layout(1),
-            qk_params.sKC_win,
-            [gCL_win, gIdx_win_k],
-        )
         tKCsKC_cmp, tCLgCL_cmp = cpasync.tma_partition(
             qk_params.tma_atom_c_latent_cmp,
             0,
@@ -1904,14 +2076,11 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
         ]
 
-        # set extra params (both streams threaded through)
+        # Set extra parameters for Q and compressed K.
         common_params.mPT_cmp = mPT_cmp_b
         qk_params.tQLgQL = tQLgQL
-        qk_params.tCLgCL_win = tCLgCL_win
-        qk_params.tIdxgIdx_win = tIdxgIdx_win_k
         qk_params.tCLgCL_cmp = tCLgCL_cmp
         qk_params.tQsQ = tQsQ
-        qk_params.tKCsKC_win = tKCsKC_win
         qk_params.tKCsKC_cmp = tKCsKC_cmp
 
         k_tile_count_init = k_tile_count
@@ -1963,17 +2132,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
 
         cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
 
-        # Window V and its coordinates use the same per-CTA tile over the
-        # transposed flat pool.
-        per_cta_m_pv = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
-        cta_tiler_pv_win = (per_cta_m_pv, self.mma_pv_tiler[2])
-        gCLT_win = cute.zipped_divide(v_params.mCLT_win, cta_tiler_pv_win)
-        window_v_coord_layout = cute.make_layout(v_params.mCLT_win.shape, stride=(0, 1))
-        window_v_coord = cute.make_tensor(
-            common_params.mWindowIndices.iterator, window_v_coord_layout
-        )
-        gIdx_win_v = cute.zipped_divide(window_v_coord, cta_tiler_pv_win)
-
         # V partition for compressed stream
         page_tile_size_v_cmp = min(self.page_size_cmp, self.mma_pv_tiler[2])
         gCLT_cmp = cute.flat_divide(
@@ -1985,13 +2143,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         tOgCLT_cmp = cute.tiled_divide(gCLT_cmp, (cta_n, page_tile_size_v_cmp))
         tOgCLT_cmp = tOgCLT_cmp[None, 0, 0, None, None, None]
 
-        tVCsVC_win, tCLTgCLT_win, tIdxgIdx_win_v = cpasync.tma_partition(
-            v_params.tma_atom_c_latent_transpose_win,
-            0,
-            cute.make_layout(1),
-            v_params.sVC_win,
-            [gCLT_win, gIdx_win_v],
-        )
         tVCsVC_cmp, tCLTgCLT_cmp = cpasync.tma_partition(
             v_params.tma_atom_c_latent_transpose_cmp,
             0,
@@ -2000,12 +2151,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             tOgCLT_cmp,
         )
 
-        # set extra params
+        # Set extra parameters for compressed V. Window V is partitioned only
+        # inside the W12-W15 distributed loader.
         common_params.mPT_cmp = mPT_cmp_b
-        v_params.tCLTgCLT_win = tCLTgCLT_win
-        v_params.tIdxgIdx_win = tIdxgIdx_win_v
         v_params.tCLTgCLT_cmp = tCLTgCLT_cmp
-        v_params.tVCsVC_win = tVCsVC_win
         v_params.tVCsVC_cmp = tVCsVC_cmp
 
         while k_tile_count > 0:
@@ -2095,30 +2244,16 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     tma_bar_ptr=tma_bar_ptr,
                 )
             load_q_producer_state.advance()
-        # K load: branch on stream
+        # W12-W15 own the window K stage. W9 participates in the same handoff
+        # and then advances its canonical state without issuing a duplicate.
         is_win = k_index == 0
-        tma_bar_ptr = common_params.load_k_pipeline.producer_get_barrier(
-            load_k_producer_state
-        )
-        common_params.load_k_pipeline.producer_acquire(load_k_producer_state)
-        cluster_n = qk_params.tiled_mma_qk.thr_id.shape
-        cta_in_cluster = common_params.blk_coord[0] % cluster_n
-        window_tile_idx = (
-            self.get_page_table_row(common_params.blk_coord) * cluster_n
-            + cta_in_cluster
-        )
-        for i in range(self.iterations_qk_latent):
-            if is_win:
-                cute.copy(
-                    qk_params.tma_atom_c_latent_win,
-                    [
-                        qk_params.tCLgCL_win[None, (window_tile_idx, i)],
-                        qk_params.tIdxgIdx_win[None, (window_tile_idx, i)],
-                    ],
-                    qk_params.tKCsKC_win[None, 0, 0, (i, load_k_producer_state.index)],
-                    tma_bar_ptr=tma_bar_ptr,
-                )
-            else:
+        if is_win:
+            self.swa_load_handoff_bar.arrive_and_wait()
+        else:
+            load_k_pipeline = common_params.load_k_pipeline
+            tma_bar_ptr = load_k_pipeline.producer_get_barrier(load_k_producer_state)
+            load_k_pipeline.producer_acquire(load_k_producer_state)
+            for i in range(self.iterations_qk_latent):
                 for k in range(page_per_tile_cmp):
                     cute.copy(
                         qk_params.tma_atom_c_latent_cmp,
@@ -2175,36 +2310,17 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 for i in cutlass.range_constexpr(page_per_tile_cmp):
                     k_idx[i] = common_params.mPT_cmp[cmp_offset * page_per_tile_cmp + i]
 
-        # get the mbar ptr from pipeline.
-        tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
-            load_v_producer_state
-        )
-        common_params.load_v_pipeline.producer_acquire(load_v_producer_state)
+        # W12-W15 own the window V stage. W10 participates in the same handoff
+        # and then advances its canonical state without issuing a duplicate.
         is_win = k_index == 0
-        cluster_m_pv = v_params.tiled_mma_pv.thr_id.shape
-        cta_in_cluster_pv = common_params.blk_coord[0] % cluster_m_pv
-        window_row = self.get_page_table_row(common_params.blk_coord)
-        for j in cutlass.range_constexpr(self.iterations_pv_n):
-            for i in cutlass.range_constexpr(self.iterations_pv_k):
-                if is_win:
-                    latent_block_idx = j * cluster_m_pv + cta_in_cluster_pv
-                    window_tile_idx = window_row * self.iterations_pv_k + i
-                    cute.copy(
-                        v_params.tma_atom_c_latent_transpose_win,
-                        [
-                            v_params.tCLTgCLT_win[
-                                None, (latent_block_idx, window_tile_idx)
-                            ],
-                            v_params.tIdxgIdx_win[
-                                None, (latent_block_idx, window_tile_idx)
-                            ],
-                        ],
-                        v_params.tVCsVC_win[
-                            None, 0, 0, ((j, i), load_v_producer_state.index)
-                        ],
-                        tma_bar_ptr=tma_bar_ptr,
-                    )
-                else:
+        if is_win:
+            self.swa_load_handoff_bar.arrive_and_wait()
+        else:
+            load_v_pipeline = common_params.load_v_pipeline
+            tma_bar_ptr = load_v_pipeline.producer_get_barrier(load_v_producer_state)
+            load_v_pipeline.producer_acquire(load_v_producer_state)
+            for j in cutlass.range_constexpr(self.iterations_pv_n):
+                for i in cutlass.range_constexpr(self.iterations_pv_k):
                     if cutlass.const_expr(page_per_tile_cmp > 1):
                         for k in cutlass.range_constexpr(page_per_subtile_cmp):
                             k_idx_i = k_idx[k + i * page_per_subtile_cmp]
@@ -2528,6 +2644,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         """
 
         k_tile_count_init = k_tile_count
+        row_sum = self.acc_dtype(0.0)
+        row_max = self.acc_dtype(self.init_row_max)
         while k_tile_count > 0:
             p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction = (
                 self.get_correction_factor(common_params, p_cor_consumer_state)
@@ -2540,14 +2658,18 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     no_correction,
                 )
             k_tile_count = k_tile_count - 1
-            if k_tile_count == 0:
-                mma_o_consumer_state = self.epilogue(
-                    common_params,
-                    epilogue_params,
-                    mma_o_consumer_state,
-                    row_sum,
-                    row_max,
-                )
+
+        # The caller guarantees at least one K tile, so row_sum and row_max
+        # contain the final correction metadata here. Keeping the epilogue
+        # outside the dynamic loop prevents its global LSE address from being
+        # hoisted across every rescale iteration.
+        mma_o_consumer_state = self.epilogue(
+            common_params,
+            epilogue_params,
+            mma_o_consumer_state,
+            row_sum,
+            row_max,
+        )
         return p_cor_consumer_state, mma_o_consumer_state
 
     @cute.jit
@@ -2697,6 +2819,14 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             k_tile_count = k_tile_count // 2
         else:
             k_tile_count = (k_tile_count + 1) // 2
+        # Only the first even tile uses the window-stream valid length. Keep
+        # that value off the loop backedge; after the first iteration every
+        # remaining tile is bounded by the compressed-stream valid length.
+        tile_valid_len = common_params.K_valid
+        if cutlass.const_expr(self.is_causal):
+            if cutlass.const_expr(not is_second_compute_warp):
+                if k_index == 0:
+                    tile_valid_len = common_params.window_valid_len
         valid_k_tile_count = k_tile_count > 0
         self.softmax_warps_initial_sync_bar.arrive_and_wait()
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
@@ -2732,6 +2862,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 common_params,
                 softmax_params,
                 k_index,
+                tile_valid_len,
                 mma_s_consumer_state,
                 p_mma_producer_state,
                 p_cor_producer_state,
@@ -2742,6 +2873,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 apply_mask,
                 is_local_last_tile,
             )
+            tile_valid_len = common_params.K_valid
             k_index = k_index + 2
             k_tile_count = k_tile_count - 1
             if k_tile_count > 0:
@@ -2903,6 +3035,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         common_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
         k_index: cutlass.Int32,
+        tile_valid_len: cutlass.Int32,
         mma_s_consumer_state: pipeline.PipelineState,
         p_mma_producer_state: pipeline.PipelineState,
         p_cor_producer_state: pipeline.PipelineState,
@@ -2956,10 +3089,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         tTR_tS = tmem_thr_copy.partition_D(cS)
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
 
-        window_valid_len = cutlass.Int32(0)
-        if cutlass.const_expr(self.is_causal):
-            window_valid_len = common_params.window_valid_len
-
         row_max_new = row_max
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
@@ -2967,17 +3096,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
                     sparse_k_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.is_causal):
-                        is_valid = cute.elem_less(sparse_k_idx, common_params.K_valid)
-                        if cute.elem_less(sparse_k_idx, self.mma_qk_tiler[1]):
-                            is_valid = cute.elem_less(sparse_k_idx, window_valid_len)
-                        tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
-                    else:
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if cute.elem_less(sparse_k_idx, common_params.K_valid)
-                            else -self.acc_dtype.inf
-                        )
+                    is_valid = cute.elem_less(sparse_k_idx, tile_valid_len)
+                    tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
             tmem_load_red_atom = cute.make_copy_atom(
@@ -3000,17 +3120,8 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             if apply_mask:
                 for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                     sparse_k_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.is_causal):
-                        is_valid = cute.elem_less(sparse_k_idx, common_params.K_valid)
-                        if cute.elem_less(sparse_k_idx, self.mma_qk_tiler[1]):
-                            is_valid = cute.elem_less(sparse_k_idx, window_valid_len)
-                        tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
-                    else:
-                        tTR_rAcc[i] = (
-                            tTR_rAcc[i]
-                            if cute.elem_less(sparse_k_idx, common_params.K_valid)
-                            else -self.acc_dtype.inf
-                        )
+                    is_valid = cute.elem_less(sparse_k_idx, tile_valid_len)
+                    tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
                 row_max_new = tTR_rAcc.load().reduce(
                     cute.ReductionOp.MAX, row_max_new, 0
                 )
@@ -3400,7 +3511,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
     ) -> pipeline.PipelineState:
-        """Epilogue for one k-tile. Updates the related pipeline state.
+        """Normalize and store the output after all local K tiles are consumed.
 
         :param common_params: The common parameters
         :type common_params: SimpleNamespace
@@ -3430,6 +3541,70 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     (tidx + 64) % (self.num_compute_warps * self.threads_per_warp)
                 ]
             )
+
+            # LSE is shared by every PV-N output tile. Store it once before
+            # materializing the large O fragment so its global pointer and
+            # scalar temporaries do not overlap the epilogue's peak live set.
+            cta_pv_tiler = (
+                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
+                self.mma_pv_tiler[1],
+                self.mma_pv_tiler[2],
+            )
+            if cutlass.const_expr(epilogue_params.mAccLSE is None):
+                gLSE = cute.local_tile(
+                    epilogue_params.mLSE,
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, 1, 1),
+                )
+                cLSE = cute.local_tile(
+                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, 1, 1),
+                )
+            else:
+                gLSE = cute.local_tile(
+                    epilogue_params.mAccLSE[
+                        None, common_params.blk_coord[3], None, None
+                    ],
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, 1, 1),
+                )
+                cLSE = cute.local_tile(
+                    cute.make_identity_tensor(
+                        epilogue_params.mAccLSE[
+                            None, common_params.blk_coord[3], None, None
+                        ].shape
+                    ),
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, 1, 1),
+                )
+            lse = (
+                cute.math.log2(row_sum, fastmath=True)
+                + epilogue_params.softmax_scale_log2 * row_max
+            )
+            if cute.elem_less(cLSE[tidx][0], common_params.H):
+                gLSE[tidx] = lse
+
         # mma_o pipeline consumer wait
         for iter_n in cutlass.range_constexpr(self.iterations_pv_n):
             common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
@@ -3473,71 +3648,6 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     tR2G_rO_dst,
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
-
-            # store the lse to global memory
-            cta_pv_tiler = (
-                self.mma_pv_tiler[0] // self.cluster_shape_mnk[0],
-                self.mma_pv_tiler[1],
-                self.mma_pv_tiler[2],
-            )
-            gLSE = None
-            cLSE = None
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                gLSE = cute.local_tile(
-                    epilogue_params.mLSE,
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(epilogue_params.mLSE.shape),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-
-            else:
-                gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[
-                        None, common_params.blk_coord[3], None, None
-                    ],
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-                cLSE = cute.local_tile(
-                    cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[
-                            None, common_params.blk_coord[3], None, None
-                        ].shape
-                    ),
-                    (cta_pv_tiler[0], 1, 1),
-                    (
-                        common_params.blk_coord[0],
-                        common_params.blk_coord[1],
-                        common_params.blk_coord[2],
-                    ),
-                    (1, 1, 1),
-                )
-            lse = (
-                cute.math.log2(row_sum, fastmath=True)
-                + epilogue_params.softmax_scale_log2 * row_max
-            )
-            if cutlass.const_expr(self.warps_in_n == 2):
-                if cute.elem_less(cLSE[tidx][0], common_params.H):
-                    gLSE[tidx] = lse
 
             cute.arch.fence_view_async_tmem_load()
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)

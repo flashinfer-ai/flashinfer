@@ -580,6 +580,35 @@ def test_hca_static_contract_accepts_fp8_to_bf16():
     assert supports(B=8, S=8192, is_persistent=True)
 
 
+def test_hca_static_contract_distributes_swa_gather():
+    pytest.importorskip("cutlass")
+    import cutlass
+
+    from flashinfer.cute_dsl.attention.dsa.hca_fp8 import (
+        BlackwellHeavilyCompressedAttentionForwardFP8,
+    )
+
+    kernel = BlackwellHeavilyCompressedAttentionForwardFP8(
+        cutlass.Float32,
+        cutlass.Float32,
+        (128, 128),
+        (128, 256),
+        1,
+        128,
+        0.0,
+        True,
+        False,
+        False,
+    )
+    kernel._setup_attributes()
+
+    assert kernel.swa_load_warp_ids == (12, 13, 14, 15)
+    assert kernel.swa_k_iters_per_warp == 1
+    assert kernel.swa_v_iters_per_warp == 1
+    assert kernel.load_k_stage == 3
+    assert kernel.load_v_stage == 2
+
+
 def _reference_hca(
     query,
     window_cache,
@@ -662,7 +691,10 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
     compressed_tables = torch.tensor(
         [[3, 4], [3, 4], [1, 0], [1, 0]], dtype=torch.int32, device=device
     )
-    hca_seq_lens = torch.tensor([129, 257], dtype=torch.int32, device=device)
+    # Keep three backing tiles for every request while the effective lengths
+    # remain partial. This catches any causal mask optimization that assumes
+    # the scheduler drops backing-cache tiles beyond sparse_topk_lens.
+    hca_seq_lens = torch.tensor([384, 384], dtype=torch.int32, device=device)
     sparse_topk_lens = torch.tensor(
         [128, 129, 256, 257], dtype=torch.int32, device=device
     )

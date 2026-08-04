@@ -1188,7 +1188,12 @@ _DSV4_HCA_WINDOW_CAPACITY = 128
 
 @dataclass(frozen=True)
 class DSV4HCAMetadata:
-    """HCA metadata generated from a sparse token-index table."""
+    """Reusable metadata for the CuTe DSL causal HCA backend.
+
+    ``hca_swa_indices`` contains absolute rows into the flattened SWA cache;
+    ``hca_compressed_block_tables`` contains physical compressed-cache page
+    IDs. Both are ordered by flattened query row (``B * Q``).
+    """
 
     hca_swa_indices: torch.Tensor
     hca_compressed_block_tables: torch.Tensor

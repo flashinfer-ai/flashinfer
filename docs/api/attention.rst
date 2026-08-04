@@ -155,10 +155,14 @@ PageAttention for MLA
 
 .. note::
 
-    With ``backend="cute-dsl"``, canonical page-aligned token-row tables can
-    opt into HCA metadata conversion with
-    ``hca_sparse_indices_format="page-aligned"``. Arbitrary sparse token
-    indices are not convertible without repacking the KV pools.
+    With ``backend="cute-dsl"``, pass ``hca_swa_indices`` as absolute rows into
+    the flattened SWA cache and ``hca_compressed_block_tables`` as physical
+    compressed-cache page IDs. The SWA table has shape ``[B * Q, 128]`` and may
+    express ring rotation or wraparound. Canonical page-aligned combined tables
+    can opt into compatibility conversion with
+    ``hca_sparse_indices_format="page-aligned"``; only their compressed segment
+    must be page-aligned. Precompute that conversion before a CUDA Graph or a
+    latency-sensitive loop.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:
