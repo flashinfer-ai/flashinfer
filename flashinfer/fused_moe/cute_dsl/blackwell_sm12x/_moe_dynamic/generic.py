@@ -8,11 +8,11 @@ static implementation. It keeps the proven FC1 / activation / quant / FC2 /
 scatter compute body, but replaces the resident-grid route/pack -> compute
 barrier with a global ready-task queue.
 
-Supports two activation modes selected at construction time:
-  SiLU (gated, activation="silu"):
+Supports gated and non-gated activations selected at construction time:
+  Gated (activation="silu", "gelu_tanh", "swigluoai_uninterleave"):
     FC1:     A x gate^T, A x up^T     (paired FP4 block-scaled GEMMs)
-    Act:     SiLU(gate) * up           (fused SwiGLU activation)
-  ReLU2 (non-gated, activation="relu2"):
+    Act:     act(gate) * up_term       (see moe_activation.gated_activation_f32)
+  Non-gated (activation="relu2"):
     FC1:     A x W1^T                  (single FP4 block-scaled GEMM)
     Act:     max(0, x)^2               (squared ReLU activation)
 
@@ -42,8 +42,8 @@ What changes relative to the static path
   - route/pack is warp-private instead of CTA-broadcast
   - compute work is driven by a global append-only ready-task queue
 
-This file is a first implementation pass, not a compiled or profiled artifact.
-It is meant as a concrete CuTeDSL starting point for the next iteration.
+This implementation remains the compatibility fallback for dynamic shapes that
+the specialized gated kernel does not support.
 """
 
 from __future__ import annotations
@@ -781,7 +781,7 @@ class MoEDynamicKernel:
         from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, bidz = cute.arch.block_idx()
+        _bidx, _, bidz = cute.arch.block_idx()
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)

@@ -730,7 +730,7 @@ def load_shared_bf16x16_to_f32x16(addr: Int32, *, loc=None, ip=None):
 
 
 class MoEGatedDynamicKernel:
-    """Queue-driven dynamic MoE kernel for branch-paired gated activations."""
+    """Queue-driven gated kernel for the validated M128N128 staging geometry."""
 
     def __init__(
         self,
@@ -749,9 +749,14 @@ class MoEGatedDynamicKernel:
             raise ValueError(
                 f"MoEGatedDynamicKernel requires a gated activation; got {activation!r}"
             )
-        if mma_tiler_mn[1] != 128:
+        if sf_vec_size != _SF_VEC_SIZE:
             raise ValueError(
-                "the gated dynamic kernel requires a logical N128 CTA tile"
+                "the gated dynamic kernel requires 16-element scale blocks; "
+                f"got sf_vec_size={sf_vec_size}"
+            )
+        if mma_tiler_mn != (128, 128):
+            raise ValueError(
+                "the gated dynamic kernel requires a logical M128xN128 CTA tile"
             )
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
@@ -3703,6 +3708,13 @@ class MoEGatedDynamicKernel:
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
         hidden_size = a_input.shape[1]
+        if cutlass.const_expr(
+            hidden_size > self.tile_shape_mnk[0] * self.tile_shape_mnk[1]
+        ):
+            raise ValueError(
+                "the gated dynamic kernel requires one BF16 input row to fit "
+                "in its 16384-element Q0 staging buffer"
+            )
         self._setup_attributes(hidden_size=hidden_size)
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
@@ -3768,9 +3780,13 @@ class MoEGatedDynamicKernel:
         )
 
         # W13 concatenates equally-sized Gate and Up branches along N.
-        gate_tile_cnt = (
-            Int32(b_w13.shape[0]) // Int32(self.tile_shape_mnk[1]) // Int32(2)
-        )
+        gate_tile_cnt_static = b_w13.shape[0] // self.tile_shape_mnk[1] // 2
+        if cutlass.const_expr(gate_tile_cnt_static > _TASK_SLICE_CHUNK):
+            raise ValueError(
+                "the gated dynamic kernel retains at most four intermediate "
+                "slices per task"
+            )
+        gate_tile_cnt = Int32(gate_tile_cnt_static)
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
@@ -3886,7 +3902,7 @@ class MoEGatedDynamicKernel:
     ):
         """Kernel entry point."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, bidz = cute.arch.block_idx()
+        _bidx, _, bidz = cute.arch.block_idx()
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -4061,12 +4077,6 @@ class MoEGatedDynamicKernel:
             cute.slice_(self.fc1_tile_shape_mnk, (0, None, None)),
             (1, 0, None),
         )
-        cute.recast_tensor(sA, cutlass.Uint8)
-        cute.recast_tensor(sB, cutlass.Uint8)
-        cute.recast_tensor(sB_phase2_extra, cutlass.Uint8)
-        cute.recast_tensor(sB_fc1_all, cutlass.Uint8)
-        cute.recast_tensor(sB_fc1, cutlass.Uint8)
-        cute.recast_tensor(sB_up_fc1, cutlass.Uint8)
         sSFA = storage.sSFA.get_tensor(sfa_smem_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_staged)
         # sSFB_phase2_extra is the immediately following aligned field, so
@@ -4088,12 +4098,6 @@ class MoEGatedDynamicKernel:
             dtype=self.sf_dtype,
         )
         sSFB_up_fc1_extra = cute.make_tensor(sSFB_up_fc1_extra_ptr, fc1_sfb_smem_one)
-        cute.recast_tensor(sSFA, cutlass.Uint8)
-        cute.recast_tensor(sSFB, cutlass.Uint8)
-        cute.recast_tensor(sSFB_phase2, cutlass.Uint8)
-        cute.recast_tensor(sSFB_fc1, cutlass.Uint8)
-        cute.recast_tensor(sSFB_up_fc1, cutlass.Uint8)
-        cute.recast_tensor(sSFB_up_fc1_extra, cutlass.Uint8)
         sC = storage.sC.get_tensor(
             epi_smem_staged.outer,
             swizzle=epi_smem_staged.inner,
