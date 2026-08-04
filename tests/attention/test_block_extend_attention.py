@@ -1,5 +1,6 @@
 """Tests for the native Block Extend prefill option."""
 
+import inspect
 import math
 
 import pytest
@@ -26,6 +27,15 @@ def get_available_backends(device: torch.device) -> list[str]:
     from flashinfer.utils import is_sm90a_supported
 
     return ["fa2", "fa3"] if is_sm90a_supported(device) else ["fa2"]
+
+
+def test_block_extend_mask_mode_is_not_public_plan_api():
+    """Block Extend is enabled through wrapper configuration, not a raw mode."""
+    for wrapper_cls in (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    ):
+        assert "mask_mode" not in inspect.signature(wrapper_cls.plan).parameters
 
 
 def block_extend_reference(
