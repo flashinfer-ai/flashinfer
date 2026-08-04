@@ -1183,7 +1183,7 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
 @pytest.mark.parametrize(
     "B,Hq,Hkv,seqlen_q,seqlen_k,causal",
     [
-        (4, 4, 1, 1, 8192, True),  # group 4, q_len 1 -> key-major
+        (4, 4, 1, 1, 8192, True),  # group 4, q_len 1 -> stream (bf16 single-token)
         (2, 4, 1, 16, 4096, True),  # group 4, q_len at the gate edge (16) -> packed
         (3, 8, 2, 8, 2048, True),  # group 4 (Hq/Hkv), q_len 8 -> key-major
         (2, 4, 1, 16, 4096, False),  # non-causal packed
@@ -1191,8 +1191,8 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
 )
 def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
     """Short-q decode dispatches the head-fused kernels: key-major for fused
-    tiles of at most 32 rows, packed row-major above. Group 4 with q_len <= 16
-    is the MiniMax-M3 indexer shape."""
+    multi-token tiles of at most 32 rows, packed row-major above. Group 4 with
+    q_len <= 16 is the MiniMax-M3 indexer shape."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
 
@@ -1281,23 +1281,23 @@ def test_msa_proxy_score_decode_packed_paged(Hq, Hkv, seqs_q, seqs_k):
 @pytest.mark.parametrize(
     "Hq,Hkv,paged,explicit_qoff",
     [
-        (4, 1, False, False),  # M3 shape, ragged flat -> key-major
-        (8, 2, False, False),  # multi kv-head -> key-major
-        (1, 1, False, False),  # group 1 -> stream
-        (8, 1, True, False),  # group 8, paged -> key-major
+        (4, 1, False, False),  # M3 shape, ragged flat
+        (8, 2, False, False),  # multi kv-head
+        (1, 1, False, False),  # group 1 (below the packed gate)
+        (8, 1, True, False),  # group 8 (stream upper gate), paged
         (4, 1, False, True),  # explicit q_offset masks mid-sequence
         (4, 1, True, True),
-        (3, 1, False, False),  # group 3 (does not divide 64) -> stream
-        (3, 1, True, False),  # stream, paged
-        (3, 1, False, True),  # stream, explicit q_offset
-        (1, 1, True, True),  # stream group 1, paged + explicit q_offset
+        (3, 1, False, False),  # group 3 (does not divide 64)
+        (3, 1, True, False),  # group 3, paged
+        (3, 1, False, True),  # group 3, explicit q_offset
+        (1, 1, True, True),  # group 1, paged + explicit q_offset
     ],
 )
 def test_msa_proxy_score_decode_stream(Hq, Hkv, paged, explicit_qoff):
-    """Single-token decode dispatches the key-major kernel for the group sizes
-    it takes and the stream kernel otherwise (group 1, or not dividing 64);
-    cover ragged varlen with non-128 tails, an empty sequence, multi kv-head,
-    paged KV, and an explicit causal q_offset on both kernels."""
+    """Single-token bf16 decode dispatches the stream kernel; cover ragged
+    varlen with non-128 tails, an empty sequence, multi kv-head, group sizes
+    1-8 including ones not dividing 64, paged KV, and an explicit causal
+    q_offset."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
 

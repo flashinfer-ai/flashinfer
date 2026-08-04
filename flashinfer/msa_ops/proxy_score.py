@@ -437,12 +437,13 @@ def msa_proxy_score(
         p *= 2
     # Fused tiles of at most 32 rows (group_size * next_pow2(q_len)) take the
     # key-major TMA schedule (see MsaProxyScoreDecodeKeyMajorSm12x); larger
-    # fused tiles keep the row-major/key-split schedules. Single-token decode
-    # falls back to the dim-parallel stream schedule (see
-    # MsaProxyScoreDecodeStreamSm12x) for the group sizes key-major cannot
-    # take (1, or not dividing the 64-row tile); total_q == batch_size
-    # guarantees exactly one q token per request, which the stream schedule's
-    # token == batch indexing relies on.
+    # fused tiles keep the row-major/key-split schedules. bf16 single-token
+    # decode stays on the dim-parallel stream schedule (see
+    # MsaProxyScoreDecodeStreamSm12x), which also covers the group sizes
+    # key-major cannot take; fp8 single-token decode goes key-major, whose
+    # in-register convert beats the stream schedule's per-element CUDA-core
+    # convert. total_q == batch_size guarantees exactly one q token per
+    # request, which the stream schedule's token == batch indexing relies on.
     keymajor_ok = (
         group_size >= 2 and _PACK_ROWS % group_size == 0 and group_size * p <= 32
     )
@@ -450,7 +451,7 @@ def msa_proxy_score(
         max_seqlen_q == 1
         and total_q == batch_size
         and group_size <= 8
-        and not keymajor_ok
+        and not (kv_fp8 and keymajor_ok)
     )
     qoff_default = q_offset is None
 
