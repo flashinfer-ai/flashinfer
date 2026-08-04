@@ -432,18 +432,25 @@ def msa_proxy_score(
 
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
-    # Single-token decode prefers the key-major schedule whenever it can take
-    # the shape; the dim-parallel stream schedule (see
-    # MsaProxyScoreDecodeStreamSm12x) remains for the group sizes it cannot
-    # (1, or not dividing the 64-row tile). total_q == batch_size guarantees
-    # exactly one q token per request, which the stream schedule's
+    p = 1
+    while p < max_seqlen_q:
+        p *= 2
+    # Fused tiles of at most 32 rows (group_size * next_pow2(q_len)) take the
+    # key-major TMA schedule (see MsaProxyScoreDecodeKeyMajorSm12x); larger
+    # fused tiles keep the row-major/key-split schedules. Single-token decode
+    # falls back to the dim-parallel stream schedule (see
+    # MsaProxyScoreDecodeStreamSm12x) for the group sizes key-major cannot
+    # take (1, or not dividing the 64-row tile); total_q == batch_size
+    # guarantees exactly one q token per request, which the stream schedule's
     # token == batch indexing relies on.
-    keymajor_sq1 = 2 <= group_size <= 32 and _PACK_ROWS % group_size == 0
+    keymajor_ok = (
+        group_size >= 2 and _PACK_ROWS % group_size == 0 and group_size * p <= 32
+    )
     use_stream = (
         max_seqlen_q == 1
         and total_q == batch_size
         and group_size <= 8
-        and not keymajor_sq1
+        and not keymajor_ok
     )
     qoff_default = q_offset is None
 
@@ -456,25 +463,11 @@ def msa_proxy_score(
         and _PACK_ROWS % group_size == 0
         and max_seqlen_q <= _PACK_ROWS // group_size
     )
-    pack_q_len = _PACK_ROWS // group_size if use_packed else 0
-    if use_packed and kv_fp8:
-        # The key-split fp8 kernel takes any 16-multiple row tile, so size it
-        # to the spec-decode length instead of always packing 64 rows.
-        p = 1
-        while p < max_seqlen_q or group_size * p < 16:
-            p *= 2
-        pack_q_len = min(p, _PACK_ROWS // group_size)
-    # Small fused tiles (<= 32 rows) take the key-major TMA schedule (see
-    # MsaProxyScoreDecodeKeyMajorSm12x); the row-major/key-split schedules
-    # remain only for > 32-row tiles.
-    use_keymajor = False
-    if use_packed:
-        p = 1
-        while p < max_seqlen_q:
-            p *= 2
-        if group_size * p <= 32:
-            use_keymajor = True
-            pack_q_len = p
+    use_keymajor = use_packed and keymajor_ok
+    if use_keymajor:
+        pack_q_len = p
+    else:
+        pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
     # fp8 q (the vLLM M3 fp8-cache contract) is consumed natively only by the
     # key-major schedule; other shapes upconvert once (e4m3 -> bf16 is
@@ -493,8 +486,9 @@ def msa_proxy_score(
             q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
         )
 
-    # group_size keys the packed/stream schedules: it is constexpr-baked into
-    # the gather/epilogue, so each factorization is its own kernel.
+    # group_size and pack_q_len are constexpr-baked into the decode schedules'
+    # gather/epilogue, so each factorization is its own kernel; both must key
+    # the cache (key-major's pack_q_len does not determine group_size).
     key = (
         "proxy",
         str(q.dtype),
@@ -504,7 +498,8 @@ def msa_proxy_score(
         use_stream,
         use_packed,
         use_keymajor,
-        group_size if use_stream else pack_q_len,
+        group_size,
+        pack_q_len,
         qoff_default if (use_stream or use_keymajor) else None,
     )
     # The packed fp8 schedules take e4m3 operands as 16-bit torch views (half
