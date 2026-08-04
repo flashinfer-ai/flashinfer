@@ -401,7 +401,9 @@ def _cute_dsl_splitk_mm_bf16_requirement(
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL split-K backend requires bfloat16 output.")
-    if not is_sm100a_supported(a.device):
+    if out is not None and out.dtype != torch.bfloat16:
+        raise ValueError("The CuTeDSL split-K backend requires a bfloat16 out tensor.")
+    if not _match_sm_version(a.device, ["100", "103"]):
         raise ValueError(
             "The CuTeDSL split-K backend requires SM100/SM103 with CUDA 12.8+."
         )
@@ -647,8 +649,11 @@ def mm_bf16(
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
-        ``"cute-dsl"`` uses the standalone Blackwell low-M split-K kernel. It is
-        never auto-selected; serving frameworks must select it explicitly.
+        ``"cute-dsl"`` uses standalone Blackwell low-M direct and split-K
+        kernels for M <= 32. It is never auto-selected; serving frameworks
+        must select it explicitly. Without autotuning, a measured shape
+        heuristic chooses between the algorithms. With autotuning, both tactic
+        spaces are profiled when bias is disabled; bias uses split-K only.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -1553,6 +1558,62 @@ def _cute_dsl_splitk_bf16_gemm_runner(
     return CuteDSLSplitKBf16Runner()
 
 
+@functools.cache
+def _cute_dsl_direct_bf16_gemm_runner(
+    compute_capability: int,
+):
+    from .kernels.dense_bf16_gemm_direct import (
+        DirectTactic,
+        autotune_tactics,
+        default_tactic,
+        run_direct_dense,
+    )
+
+    class CuteDSLDirectBf16Runner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (
+                str(inputs[0].dtype),
+                str(inputs[4].dtype),
+                bool(inputs[3]),
+                compute_capability,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list[tuple[int, int, int]]:
+            if inputs[2] is not None:
+                return []
+            m, k = inputs[0].shape
+            n = inputs[1].shape[1]
+            return [astuple(config) for config in autotune_tactics(m, n, k)]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            if bias is not None:
+                raise ValueError("CuTeDSL direct GEMM does not support bias.")
+            if tactic == -1:
+                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            else:
+                try:
+                    tactic = DirectTactic(*tactic)
+                except TypeError as error:
+                    raise ValueError(
+                        "CuTeDSL direct tactics must be "
+                        "(block_size, outputs_per_block, rows_per_block)."
+                    ) from error
+            return run_direct_dense(a, b, out, bool(pdl), tactic)
+
+    return CuteDSLDirectBf16Runner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1591,11 +1652,24 @@ def bf16_gemm_sm100(
         runners.append(_tinygemm_bf16_gemm_runner())
     if "cute-dsl" in runner_names:
         compute_capability = torch.cuda.get_device_capability(a.device)
-        runners.append(
-            _cute_dsl_splitk_bf16_gemm_runner(
-                compute_capability[0] * 10 + compute_capability[1],
+        compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+        splitk_runner = _cute_dsl_splitk_bf16_gemm_runner(compute_capability_number)
+        if bias is None:
+            from .kernels.dense_bf16_gemm_direct import (
+                prefer_direct_bf16_gemm_sm100,
             )
-        )
+
+            direct_runner = _cute_dsl_direct_bf16_gemm_runner(compute_capability_number)
+            prefer_direct = prefer_direct_bf16_gemm_sm100(
+                a.shape[0], b.shape[1], a.shape[1]
+            )
+            runners.extend(
+                (direct_runner, splitk_runner)
+                if prefer_direct
+                else (splitk_runner, direct_runner)
+            )
+        else:
+            runners.append(splitk_runner)
     assert runners, "No suitable runners found"
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]

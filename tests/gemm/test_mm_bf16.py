@@ -203,5 +203,73 @@ def test_cublaslt_bf16_runner_zero_algos():
         runner._get_algos = original_get_algos
 
 
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
+    """The no-autotune fallback uses direct in its measured crossover band."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    m, n, k = 1, 256, 8192
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, b.T, pdl=pdl, backend="cute-dsl")
+    torch.testing.assert_close(out, a @ b.T, rtol=2e-2, atol=5e-1)
+
+
+@pytest.mark.parametrize("enable_bias", [False, True])
+def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
+    """K=128 exercises the shallow one-stage tensor-core pipeline."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    m, n, k = 1, 1024, 128
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    bias = (
+        torch.randn((n,), device="cuda", dtype=torch.bfloat16) if enable_bias else None
+    )
+    out = mm_bf16(a, b.T, bias=bias, pdl=True, backend="cute-dsl")
+    reference = F.linear(a, b, bias)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-1)
+
+
+def test_cute_dsl_low_m_tactic_policies():
+    from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
+        DirectTactic,
+        autotune_tactics as direct_autotune_tactics,
+        prefer_direct_bf16_gemm_sm100,
+    )
+    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+        autotune_tactics as splitk_autotune_tactics,
+        default_tactic as splitk_default_tactic,
+    )
+
+    assert prefer_direct_bf16_gemm_sm100(1, 4608, 8192)
+    assert prefer_direct_bf16_gemm_sm100(4, 512, 8192)
+    assert prefer_direct_bf16_gemm_sm100(8, 256, 8192)
+    assert not prefer_direct_bf16_gemm_sm100(2, 4608, 8192)
+    assert not prefer_direct_bf16_gemm_sm100(8, 512, 8192)
+    assert not prefer_direct_bf16_gemm_sm100(1, 4608, 4096)
+
+    assert DirectTactic(256, 2, 8) in direct_autotune_tactics(8, 256, 8192)
+    assert splitk_default_tactic(1, 1024, 128).ab_stages == 1
+    assert (
+        min(tactic.ab_stages for tactic in splitk_autotune_tactics(1, 1024, 128)) == 1
+    )
+    assert (
+        min(tactic.ab_stages for tactic in splitk_autotune_tactics(1, 1024, 256)) == 2
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

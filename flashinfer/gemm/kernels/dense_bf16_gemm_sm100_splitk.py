@@ -11,6 +11,7 @@ use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
@@ -25,7 +26,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
-_SMEM_CAPACITY_BYTES = 227 * 1024
+_SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
 #: K extent of one CTA tile.
 _CTA_K = 128
@@ -60,12 +61,13 @@ _AB_ELEMENT_BYTES = 2
 #: Alignment of the A/B shared-memory buffers.
 _AB_BUFFER_ALIGN_BYTES = 1024
 
-#: A/B pipeline stage bounds.
-_MIN_AB_STAGES = 2
+#: A/B pipeline stage bounds. One stage is useful only for a single K tile.
+_MIN_AB_STAGES = 1
+_DEFAULT_MIN_AB_STAGES = 2
 _MAX_AB_STAGES = 12
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True)
 class SplitKTactic:
     """One specialization; mma_m carries public N and mma_n carries public M."""
 
@@ -175,7 +177,8 @@ def autotune_tactics(
     for mma_m in _SUPPORTED_MMA_M:
         for mma_n in _SUPPORTED_MMA_N:
             for split_k in _SUPPORTED_SPLIT_K:
-                base = SplitKTactic(mma_m, mma_n, split_k, _MIN_AB_STAGES)
+                min_stages = _MIN_AB_STAGES if k == _CTA_K else _DEFAULT_MIN_AB_STAGES
+                base = SplitKTactic(mma_m, mma_n, split_k, min_stages)
                 try:
                     validate_tactic(base, m, n, k, smem_capacity=smem_capacity)
                 except ValueError:
@@ -185,7 +188,7 @@ def autotune_tactics(
                 tactics.extend(
                     dataclasses.replace(base, ab_stages=ab_stages)
                     for ab_stages in (
-                        range(_MIN_AB_STAGES, min(max_stages, 6) + 1)
+                        range(min_stages, min(max_stages, 6) + 1)
                         if k <= 4 * _CTA_K
                         else range(
                             min(max(5, max_stages - 2), max_stages),
@@ -227,6 +230,8 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
         tactic,
         ab_stages=(
             _MIN_AB_STAGES
+            if k == _CTA_K
+            else _DEFAULT_MIN_AB_STAGES
             if k <= 2 * _CTA_K and m > 8
             else min(max_stages, 6)
             if k <= 4 * _CTA_K
@@ -884,10 +889,10 @@ def _make_compile_repr_tensors(
         _from_dlpack_dynamic(
             _make_layout_tensor(shape, dtype, leading_dim), leading_dim
         )
-        for shape, leading_dim in zip(
-            ((batch, n, k), (batch, k, m), (batch, n, m)),
-            (a_leading, b_leading, c_leading),
-            strict=True,
+        for shape, leading_dim in (
+            ((batch, n, k), a_leading),
+            ((batch, k, m), b_leading),
+            ((batch, n, m), c_leading),
         )
     )
     if not has_bias:
@@ -932,10 +937,7 @@ def _to_cute_swap(a, b, out, bias):
     )
 
 
-# Tactic hashes all compile-time tile, split, and stage fields.
-_SPLITK_COMPILE_CACHE: dict = {}
-
-
+@functools.cache
 def _get_compiled_splitk_kernel(
     dtype,
     tactic: SplitKTactic,
@@ -943,17 +945,6 @@ def _get_compiled_splitk_kernel(
     has_bias: bool,
     leading_dims: tuple[int, int, int],
 ):
-    key = (
-        dtype,
-        tactic,
-        use_pdl,
-        has_bias,
-        *leading_dims,
-    )
-    cached = _SPLITK_COMPILE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(
             f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
@@ -970,7 +961,6 @@ def _get_compiled_splitk_kernel(
         compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
-    _SPLITK_COMPILE_CACHE[key] = compiled
     return compiled
 
 
