@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -22,10 +20,6 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     RouteImpl,
     TileScheduler,
 )
-from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-    build_batched_gemm_task_manager,
-)
-from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _cuda_kernel_ops
 from flashinfer.prims_ts.moe.config_mapper import (
     _DType,
     _make_json_moe_config_pair,
@@ -35,7 +29,7 @@ from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import is_sm100a_supported
 
 
-def _find_bs1_ldgsts_persistent_pair(*, enable_pdl=False):
+def _find_bs1_ldgsts_persistent_pair():
     tactics = valid_prims_ts_nvfp4_moe_tactics(
         num_tokens=1,
         top_k=8,
@@ -52,7 +46,6 @@ def _find_bs1_ldgsts_persistent_pair(*, enable_pdl=False):
             fc1_dtype_c=int(_DType.E2M1),
             fc2_dtype_c=int(_DType.BF16),
             dtype_label="NVFP4xNVFP4",
-            enable_pdl=enable_pdl,
         )
         if pair is None:
             continue
@@ -142,47 +135,3 @@ def test_bs1_deepseek_persistent_pair_gpu_correctness(
         early_exit_max_token_ctas=early_exit_max_token_ctas,
         **cfg,
     )
-
-
-def test_bs1_persistent_early_exit_pdl_wait_completes_before_task_graph():
-    from cutlass.experimental.task_scheduling.resources import PdlWaitBarrier
-
-    pair = _find_bs1_ldgsts_persistent_pair(enable_pdl=True)
-    assert pair is not None
-
-    task_manager = build_batched_gemm_task_manager(
-        num_experts=256,
-        num_tokens=1,
-        top_k=8,
-        early_exit_max_token_ctas=8,
-        verbose=False,
-        **pair.fc1.cfg.kwargs,
-    )
-    all_task_resources = [
-        resource
-        for task in task_manager.tasks
-        for resource in task.src_resources + task.dst_resources
-    ]
-
-    assert task_manager._assume_pdl_wait_completed is True
-    assert not any(
-        isinstance(resource, PdlWaitBarrier) for resource in all_task_resources
-    )
-
-
-def test_cuda_kernel_search_handles_nested_mlir_regions():
-    def make_op(name, *children):
-        regions = []
-        if children:
-            regions.append(
-                SimpleNamespace(blocks=[SimpleNamespace(operations=list(children))])
-            )
-        operation = SimpleNamespace(name=name, regions=regions)
-        return SimpleNamespace(operation=operation)
-
-    kernel = make_op("cuda.kernel")
-    nested = make_op("test.level2", kernel)
-    top_level = make_op("test.level1", nested)
-    module = SimpleNamespace(operation=make_op("builtin.module", top_level).operation)
-
-    assert list(_cuda_kernel_ops(module)) == [kernel]

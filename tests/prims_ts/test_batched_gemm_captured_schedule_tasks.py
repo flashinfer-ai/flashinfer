@@ -39,6 +39,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+    ActKind,
     BatchMode,
     BiasType,
     DType,
@@ -48,6 +49,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     TileScheduler,
     _ldgsts_sfb_producer_commit_prefetch_depth,
     make_config,
+    uniform_pipeline_stage_overrides,
     validate_config,
 )
 from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -1320,3 +1322,49 @@ def test_proxy_cluster_barrier_uses_ts_async_umma_pipeline():
 
     assert proxy_cfg.pipeline_type == PipelineType.AsyncUmma
     assert "create_pipeline" not in ProxyClusterBarrierResource.__dict__
+
+
+def test_bs1_nvfp4_persistent_pdl_wait_completes_before_task_graph():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        build_batched_gemm_task_manager,
+    )
+
+    task_manager = build_batched_gemm_task_manager(
+        num_experts=256,
+        num_tokens=1,
+        top_k=8,
+        early_exit_max_token_ctas=8,
+        verbose=False,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        act_kind=int(ActKind.SWIGLU),
+        batch_mode=int(BatchMode.BATCH_N),
+        transpose_mma_output=1,
+        route_act=int(RouteImpl.LDGSTS),
+        route_sfs_act=int(RouteImpl.LDGSTS),
+        tile_n=8,
+        mma_n=8,
+        epi_tile_n=8,
+        tile_k=512,
+        mma_k=64,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        num_stages_tmem_acc=2,
+        use_clc_fast_drain=1,
+        use_work_throttle=1,
+        use_tma_store=1,
+        use_pdl=1,
+        use_early_exit=1,
+        do_pdl_wait_for_num_non_exiting_ctas=1,
+        **uniform_pipeline_stage_overrides(5),
+    )
+    all_task_resources = [
+        resource
+        for task in task_manager.tasks
+        for resource in task.src_resources + task.dst_resources
+    ]
+
+    assert task_manager._assume_pdl_wait_completed is True
+    assert not any(
+        isinstance(resource, PdlWaitBarrier) for resource in all_task_resources
+    )
