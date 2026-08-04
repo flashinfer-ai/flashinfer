@@ -45,18 +45,19 @@ def test_sm90_push_backend_import_defers_kernel_package():
     assert result.returncode == 0, result.stderr
 
 
-def test_torch_dist_timeout_requires_supported_setter():
-    try:
-        from flashinfer.comm.mnnvl import TorchDistBackend
-    except ImportError as exc:
-        pytest.skip(f"requires cuda-python to import mnnvl: {exc}")
+def test_sm90_push_timeout_requires_supported_setter():
+    import torch.distributed as dist
 
-    backend = object.__new__(TorchDistBackend)
-    backend._dist = SimpleNamespace(distributed_c10d=SimpleNamespace())
-    backend._group = object()
+    from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
+        _set_process_group_timeout,
+    )
 
-    with pytest.raises(RuntimeError, match="exposes neither set_timeout"):
-        backend.set_timeout(1.0)
+    with (
+        mock.patch.object(dist, "set_timeout", None, create=True),
+        mock.patch.object(dist, "distributed_c10d", SimpleNamespace(), create=True),
+        pytest.raises(RuntimeError, match="exposes neither set_timeout"),
+    ):
+        _set_process_group_timeout(object(), 1.0)
 
 
 def test_sm90_push_unfused_intermediate_size_limit():
@@ -106,7 +107,6 @@ def test_sm90_push_fp8_config_defaults_to_unfused_fc1():
 
 
 def test_sm90_push_staging_validates_context_before_runner():
-    from flashinfer.moe_ep import MoEEpConfigError
     from flashinfer.moe_ep.backends.mega.kernel.sm90_push_fp8.backend import (
         Sm90PushFp8MegaKernelBackend,
         _Sm90PushFp8Workspace,
@@ -132,39 +132,25 @@ def test_sm90_push_staging_validates_context_before_runner():
         topk_weights=object(),
         num_tokens=3,
     )
-    output = object()
-
     backend._transformed_weights = object()
     with pytest.raises(RuntimeError, match="workspace bundle"):
         backend.stage_inputs(
             inputs,
             workspace,
             quantize_input=True,
-            output=output,
         )
     runner.stage_inputs.assert_not_called()
     backend._transformed_weights = transformed
-
-    with pytest.raises(MoEEpConfigError, match="destination output"):
-        backend.stage_inputs(
-            inputs,
-            workspace,
-            quantize_input=True,
-            output=None,
-        )
-    runner.stage_inputs.assert_not_called()
 
     backend.stage_inputs(
         inputs,
         workspace,
         quantize_input=True,
-        output=output,
     )
     runner.stage_inputs.assert_called_once_with(
         inputs.hidden_states,
         inputs.topk_ids,
         inputs.topk_weights,
-        output=output,
     )
     assert workspace.staged_tokens == 3
 

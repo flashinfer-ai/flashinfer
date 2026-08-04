@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -48,6 +49,22 @@ def _validate_sm90_arch() -> None:
             "sm90_push_fp8 requires an SM90 (Hopper) device; "
             f"host has sm_{major}{minor}"
         )
+
+
+def _set_process_group_timeout(group: Any, timeout_s: float) -> None:
+    import torch.distributed as dist
+
+    timeout = timedelta(seconds=timeout_s)
+    set_pg_timeout = getattr(dist, "set_timeout", None)
+    if set_pg_timeout is None:
+        distributed_c10d = getattr(dist, "distributed_c10d", None)
+        set_pg_timeout = getattr(distributed_c10d, "_set_pg_timeout", None)
+    if set_pg_timeout is None:
+        raise RuntimeError(
+            "torch.distributed exposes neither set_timeout nor "
+            "distributed_c10d._set_pg_timeout"
+        )
+    set_pg_timeout(timeout, group)
 
 
 @register_mega_kernel("sm90_push_fp8")
@@ -192,7 +209,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         timeout_s = float(kcfg.init_timeout_s)
         timeout_error = None
         try:
-            comm.set_timeout(timeout_s)
+            _set_process_group_timeout(self.ep_comm_group, timeout_s)
         except Exception as exc:  # noqa: BLE001 - report the failure on every EP rank
             timeout_error = f"{type(exc).__name__}: {exc}"
         timeout_reports = comm.allgather((timeout_s, timeout_error))
@@ -281,7 +298,6 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
-        output: torch.Tensor | None = None,
     ) -> None:
         if not quantize_input:
             raise MoEEpConfigError(
@@ -293,16 +309,11 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
                 "sm90_push_fp8 backend weights differ from the workspace bundle; "
                 "rebuild the layer after replacing transformed weights"
             )
-        if output is None:
-            raise MoEEpConfigError(
-                "sm90_push_fp8 stage_inputs requires the destination output tensor"
-            )
         try:
             ws.runner.stage_inputs(
                 t.hidden_states,
                 t.topk_ids,
                 t.topk_weights,
-                output=output,
             )
         except Exception:
             if ws.runner.state == "poisoned":
