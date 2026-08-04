@@ -11,8 +11,8 @@ from flashinfer.fused_moe import (
     ActivationConfig,
     BackendOptions,
     CutlassBf16Runner,
-    CutlassBf16Config,
     CutlassConfig,
+    CutlassBf16Config,
     CutlassW4A16Config,
     CutlassW4A16Runner,
     ExecutionConfig,
@@ -55,6 +55,8 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert not CutlassW4A16Config.supported(100)
     assert not CutlassBf16Config.supported(130)
     assert CutlassConfig is not CutlassBf16Config
+    assert not CutlassConfig.supported(90)
+    assert BackendOptions((CutlassConfig(),)).valid_for(90) == []
     assert CutlassConfig not in _BACKEND_RUNNERS
     assert _BACKEND_RUNNERS[CutlassBf16Config] is CutlassBf16Runner
     assert _BACKEND_RUNNERS[CutlassW4A16Config] is CutlassW4A16Runner
@@ -133,6 +135,77 @@ def test_cutlass_mxfp4_linear_quantizer_code_points():
     ).repeat(2, 1)
     torch.testing.assert_close(packed, expected_bytes)
     torch.testing.assert_close(scales, torch.full((2, 1), 127, dtype=torch.uint8))
+
+
+def _dequantize_mxfp4_linear(
+    packed: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    lut = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=packed.device,
+    )
+    nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(
+        packed.shape[0], -1
+    )
+    scale = torch.exp2(scales.to(torch.float32) - 127.0).repeat_interleave(32, dim=-1)
+    return lut[nibbles.long()] * scale
+
+
+def test_cutlass_mxfp4_linear_quantizer_rounds_scale_up():
+    values = torch.zeros(2, 32, dtype=torch.bfloat16)
+    values[0, 0] = 5.0
+    values[1, 0] = 7.0
+
+    packed, scales = _quantize_mxfp4_linear(values)
+    dequantized = _dequantize_mxfp4_linear(packed, scales)
+
+    torch.testing.assert_close(
+        scales[:, 0], torch.tensor([127, 128], dtype=torch.uint8)
+    )
+    torch.testing.assert_close(dequantized[:, 0], torch.tensor([4.0, 6.0]))
+    actual_scale = torch.exp2(scales[:, 0].to(torch.float32) - 127.0)
+    assert torch.all(values[:, 0].abs().float() <= 6.0 * actual_scale)
+    assert not torch.any(scales == 255)
+
+
+def test_cutlass_mxfp4_linear_quantizer_zero_block_uses_minimum_scale():
+    packed, scales = _quantize_mxfp4_linear(torch.zeros(2, 64, dtype=torch.bfloat16))
+
+    assert torch.count_nonzero(packed) == 0
+    assert torch.count_nonzero(scales) == 0
+    assert torch.count_nonzero(_dequantize_mxfp4_linear(packed, scales)) == 0
+
+
+def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
+    values = torch.zeros(2, 32, dtype=torch.bfloat16)
+    values[0, 0] = torch.finfo(torch.bfloat16).tiny
+    values[1, 0] = torch.finfo(torch.bfloat16).max
+
+    packed, scales = _quantize_mxfp4_linear(values)
+
+    assert int(scales[0, 0]) == 0
+    assert int(scales[1, 0]) <= 254
+    assert not torch.any(scales == 255)
+    assert int(packed[0, 0] & 0x0F) != 0
+    assert int(packed[1, 0] & 0x0F) != 0
 
 
 @pytest.mark.parametrize(
@@ -431,7 +504,15 @@ def _make_w4a16_case(num_tokens: int = 16):
         device=device,
     )
     weights.prepare_for("cutlass_w4a16", view)
-    return config, act, weights, w1, w2, view
+    w1_packed, w1_scale = _quantize_mxfp4_linear(
+        w1.view(num_experts * 2 * intermediate_size, hidden_size)
+    )
+    w2_packed, w2_scale = _quantize_mxfp4_linear(
+        w2.view(num_experts * hidden_size, intermediate_size)
+    )
+    w1_quantized = _dequantize_mxfp4_linear(w1_packed, w1_scale).view_as(w1)
+    w2_quantized = _dequantize_mxfp4_linear(w2_packed, w2_scale).view_as(w2)
+    return config, act, weights, w1_quantized, w2_quantized, view
 
 
 def _reference(act: MoEActivationPack, w1: torch.Tensor, w2: torch.Tensor):
@@ -471,7 +552,7 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference():
 
 
 @cutlass_sm90_required
-def test_cutlass_w4a16_moe_layer_matches_bf16_reference():
+def test_cutlass_w4a16_moe_layer_matches_quantized_reference():
     config, act, weights, w1, w2, view = _make_w4a16_case()
     assert view["fc1_expert_weights"].dtype is torch.uint8
     assert view["fc1_expert_scales"].ndim == 5
@@ -484,7 +565,7 @@ def test_cutlass_w4a16_moe_layer_matches_bf16_reference():
     assert layer.winner_backend == "cutlass_w4a16"
     assert runner._workspace is not None
     assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
-    torch.testing.assert_close(actual, expected, rtol=2e-1, atol=2e-1)
+    torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
 
 
 @cutlass_sm90_required
@@ -579,6 +660,31 @@ def test_cutlass_autotune_override_bucket_grows_and_retains_workspace():
 
 
 @cutlass_sm90_required
+def test_cutlass_forward_reactivates_runtime_workspace_after_smaller_override():
+    config, act, weights, w1, w2 = _make_case(num_tokens=50)
+    runner = MoELayer(config).runners[0]
+    inputs = runner.pack_inputs(act, weights)
+    workspace_64 = runner._workspace
+
+    with autotune(True, tuning_buckets=(32,)):
+        _, tactic = AutoTuner.get().choose_one(
+            "test_moe_cutlass_bf16_smaller_override_workspace",
+            [runner],
+            runner.tuning_config,
+            inputs,
+        )
+
+    assert runner._workspace_num_tokens == 32
+    assert runner._workspace is runner._workspace_cache[(32, 128)]
+    actual = runner.forward(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+
+    assert runner._workspace_num_tokens == 64
+    assert runner._workspace is workspace_64
+    torch.testing.assert_close(actual, _reference(act, w1, w2), rtol=2e-2, atol=2e-2)
+
+
+@cutlass_sm90_required
 def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     config, act, weights, w1, w2, _ = _make_w4a16_case(num_tokens=17)
     runner = MoELayer(config).runners[0]
@@ -598,7 +704,7 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     torch.cuda.synchronize()
     expected = _reference(act, w1, w2)
     assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
-    torch.testing.assert_close(actual, expected, rtol=2e-1, atol=2e-1)
+    torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -610,4 +716,4 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(captured, expected, rtol=2e-1, atol=2e-1)
+    torch.testing.assert_close(captured, expected, rtol=1e-1, atol=1e-1)

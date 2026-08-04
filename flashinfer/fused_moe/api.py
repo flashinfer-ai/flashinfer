@@ -495,7 +495,9 @@ class CutlassConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True
+        # Compatibility-only placeholder: it has no registered runner and must
+        # never be surfaced as a dispatch candidate by BackendOptions.valid_for().
+        return False
 
     def __repr__(self) -> str:
         return "CutlassConfig()"

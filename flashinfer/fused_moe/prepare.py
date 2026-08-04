@@ -1264,11 +1264,14 @@ def _quantize_mxfp4_linear(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
         end = min(begin + chunk_rows, rows)
         blocks = weight[begin:end].to(torch.float32).reshape(-1, columns // 32, 32)
         block_scale = blocks.abs().amax(dim=-1) / 6.0
-        safe_scale = torch.where(
-            block_scale > 0, block_scale, torch.ones_like(block_scale)
-        )
-        exponent = torch.floor(torch.log2(safe_scale)).to(torch.int64)
-        exponent = exponent.clamp(-127, 128)
+        nonzero = block_scale > 0
+        safe_scale = torch.where(nonzero, block_scale, torch.ones_like(block_scale))
+        # MX block scales round upward so every finite value remains within the
+        # E2M1 magnitude range. E8M0 byte 255 is NaN; finite exponents stop at
+        # 127 (byte 254). All-zero blocks use the minimum scale byte 0.
+        exponent = torch.ceil(torch.log2(safe_scale)).to(torch.int64)
+        exponent = exponent.clamp(-127, 127)
+        exponent = torch.where(nonzero, exponent, -127)
         scales[begin:end].copy_((exponent + 127).to(torch.uint8))
         actual_scale = torch.exp2(exponent.to(torch.float32)).unsqueeze(-1)
         scaled = blocks / actual_scale

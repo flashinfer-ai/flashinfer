@@ -499,6 +499,15 @@ class _CutlassRunnerBase(MoERunner):
             )
             return inputs[0]
 
+        # A tuning override may leave a different profile bucket active. Select
+        # the workspace for the actual launch shape before passing its pointer
+        # to C++; cached allocations remain stable for captured CUDA graphs.
+        num_tokens, hidden_size = inputs[1].shape
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self._ensure_workspace(bucket, hidden_size)
+
         from .core import cutlass_fused_moe
 
         cutlass_fused_moe(
