@@ -2587,26 +2587,15 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         nv_handle = cg1_acc_producer.acquire_and_advance()
         vks_ready_consumer.wait_and_advance()
         ainv_handle = a_inv_ready_consumer.wait_and_advance()
-        if valid_state:
-            for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qkv,
-                    tCtShared[None, None, None, nv_handle.index],
-                    tCtSharedInp[None, None, kphase_idx, 0],
-                    tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
-                    tCtShared[None, None, None, nv_handle.index],
-                )
-        else:
-            for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qkv,
-                    tCtShared[None, None, None, nv_handle.index],
-                    tCtSharedInp[None, None, kphase_idx, 0],
-                    tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
-                    tCtShared[None, None, None, nv_handle.index],
-                )
+        for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
+            tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
+            cute.gemm(
+                tiled_mma_qkv,
+                tCtShared[None, None, None, nv_handle.index],
+                tCtSharedInp[None, None, kphase_idx, 0],
+                tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
+                tCtShared[None, None, None, nv_handle.index],
+            )
         nv_handle.commit()
         ainv_handle.release()
 

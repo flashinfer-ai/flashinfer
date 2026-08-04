@@ -49,6 +49,7 @@ def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
+    cuda_major: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -65,6 +66,8 @@ def _cp_delta_rule_rejection_reason(
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
+        if cuda_major < 13:
+            return "CP delta rule SM100 requires CUDA 13 or newer"
         if cp_delta_rule_dsl_sm100 is None:
             return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
@@ -383,6 +386,7 @@ def chunk_gated_delta_rule(
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
+            cuda_major=_cuda_major,
             q=q,
             k=k,
             v=v,
