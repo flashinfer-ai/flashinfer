@@ -24,6 +24,7 @@ from .core import (
     current_compilation_context,
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
+    sm100a_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
 from .cubin_loader import (
@@ -340,4 +341,20 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
+    )
+
+
+def gen_alphamoe_sm100_module() -> JitSpec:
+    """Generate the JIT spec for the alphamoe_sm100 fused W8A8 MoE kernel.
+
+    ``csrc/alphamoe_sm100.cu`` is a single translation unit holding the frozen
+    generated Loom schedule plus its TVM-FFI binding, mirroring the
+    ``csrc/tinygemm2_sm100.cu`` layout.
+    """
+    return gen_jit_spec(
+        "alphamoe_sm100",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_sm100.cu"],
+        extra_cuda_cflags=sm100a_nvcc_flags
+        + ["-gencode=arch=compute_103a,code=sm_103a"],
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
