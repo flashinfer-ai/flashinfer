@@ -300,6 +300,8 @@ def msa_proxy_score(
     ----------
     q : torch.Tensor
         ``(total_q, num_qo_heads, 128)``, bf16 or fp16 (the cheap proxy Q).
+        May be fp8 E4M3 when ``k`` is fp8: decode shapes consume it natively
+        (the fastest path); other shapes upconvert it once internally.
     k : torch.Tensor
         Flat ``(total_k, num_kv_heads, 128)`` with ``cu_seqlens_k``, or
         paged ``(num_pages, num_kv_heads, 128, 128)`` with ``page_table`` +
@@ -367,8 +369,9 @@ def msa_proxy_score(
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError("msa_proxy_score requires SM120 or SM121 and CUDA >= 12.8")
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"q must be bf16 or fp16, got {q.dtype}")
+    q_fp8 = q.dtype == torch.float8_e4m3fn
+    if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
+        raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")
     total_q, num_qo_heads, head_dim = q.shape
     if head_dim != 128:
         raise ValueError(f"head_dim must be 128, got {head_dim}")
@@ -376,6 +379,8 @@ def msa_proxy_score(
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
     kv_fp8 = k.dtype == torch.float8_e4m3fn
+    if q_fp8 and not kv_fp8:
+        raise ValueError("fp8 q requires fp8 k")
     if not kv_fp8 and k.dtype != q.dtype:
         raise ValueError("k dtype must match q (or be float8_e4m3fn)")
     dev = q.device
@@ -477,6 +482,13 @@ def msa_proxy_score(
             use_keymajor = True
             pack_q_len = p
 
+    # fp8 q (the vLLM M3 fp8-cache contract) is consumed natively only by the
+    # key-major schedule; other shapes upconvert once (e4m3 -> bf16 is
+    # lossless) and take their usual route.
+    if q_fp8 and not use_keymajor:
+        q = q.to(torch.bfloat16)
+        q_fp8 = False
+
     # Right-aligned decode on the stream and key-major paths computes the
     # causal limit in-kernel, so no offset tensor (and its build kernels,
     # which dominate at batch 1) is needed.
@@ -501,15 +513,18 @@ def msa_proxy_score(
         group_size if use_stream else pack_q_len,
         qoff_default if (use_stream or use_keymajor) else None,
     )
-    # The packed fp8 schedule takes K as a 16-bit torch view of the e4m3
-    # bytes (half the last dim): the kernel moves raw bytes and upconverts in
-    # registers, and a typed view keeps the cp.async source alignment provable
-    # where an in-kernel recast of a symbolic layout does not.
+    # The packed fp8 schedules take e4m3 operands as 16-bit torch views (half
+    # the last dim): the kernel moves raw bytes and upconverts in registers,
+    # and a typed view keeps the TMA/cp.async source alignment provable where
+    # an in-kernel recast of a symbolic layout does not. fp8 q rides an f16
+    # carrier so both register converts hit the native e4m3 -> f16 path.
     kv16 = kv_fp8 and use_packed
-    k_call = k.contiguous().view(q.dtype) if kv16 else k
+    carrier = torch.float16 if q_fp8 else q.dtype
+    q_call = q.contiguous().view(carrier) if q_fp8 else q
+    k_call = k.contiguous().view(carrier) if kv16 else k
     compiled = _compile_cache.get(key)
     if compiled is None:
-        cdt = _cutlass_dtype(q.dtype)
+        cdt = _cutlass_dtype(q_call.dtype)
         kdt = _cutlass_dtype(k_call.dtype)
         i32 = _cutlass_dtype(torch.int32)
         f32 = _cutlass_dtype(torch.float32)
@@ -519,6 +534,7 @@ def msa_proxy_score(
         s_tq, s_hq, s_tk, s_hkv, s_b1, s_bk, s_b0, s_pb, s_pm, s_mt = (
             cute.sym_int() for _ in range(10)
         )
+        qd = head_dim // 2 if q_fp8 else head_dim
         kd = head_dim // 2 if kv16 else head_dim
         k_shape = (s_tk, s_hkv, _BLK_KV, kd) if paged else (s_tk, s_hkv, kd)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -540,6 +556,7 @@ def msa_proxy_score(
                 is_causal=causal,
                 paged=paged,
                 kv_fp8=kv_fp8,
+                q_fp8=q_fp8,
                 qoff_default=qoff_default,
             )
         elif use_packed:
@@ -573,7 +590,7 @@ def msa_proxy_score(
             )
         compiled = cute.compile(
             kernel_obj,
-            _fake(cdt, (s_tq, s_hq, head_dim)),
+            _fake(cdt, (s_tq, s_hq, qd)),
             _fake(kdt, k_shape),
             _fake(i32, (s_pb, s_pm), align=4),
             _fake(f32, (s_hq, s_mt, s_tq), align=4),
@@ -619,12 +636,12 @@ def msa_proxy_score(
     if use_stream:
         # One CTA per (KV block, token, kv_head): the grid is already maximally
         # split, so there is no split factor to tune.
-        _call([q, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev], 1)
+        _call([q_call, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev], 1)
     else:
         _run_proxy_autotuned(
             "msa_proxy_score",
             _call,
-            [q, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev],
+            [q_call, k_call, pt_dev, per_head, cu_q_dev, k_len_or_cu, qoff_dev],
             max_seqlen_q=max_seqlen_q,
             max_k_tiles=max_k_tiles,
             base_ctas=base_ctas,

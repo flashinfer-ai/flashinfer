@@ -1464,6 +1464,26 @@ def test_msa_proxy_score_paged_fp8():
         torch.cuda.synchronize()
         assert torch.equal(out8, out_deq8)
         assert torch.equal(pg8, pg_deq8)
+        if qdt is torch.bfloat16:
+            # Native fp8 q (the vLLM M3 fp8-cache contract): same exact math,
+            # so bit-identical to the bf16-q call on the same values.
+            qd8 = qd.to(torch.float8_e4m3fn)
+            out_q8 = msa_proxy_score(qd8, k8, cu_qd, cu_k, causal=True)
+            pg_q8 = msa_proxy_score(
+                qd8, k8_pg, cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out_q8, out8)
+            assert torch.equal(pg_q8, pg8)
+    # Prefill-shape fp8 q takes the internal upconvert fallback; identical to
+    # upconverting at the call site.
+    q8_pre = q.to(torch.float8_e4m3fn)
+    out_pre8 = msa_proxy_score(q8_pre, k8, cu_q, cu_k, causal=True)
+    out_pre_ref = msa_proxy_score(
+        q8_pre.to(torch.bfloat16), k8, cu_q, cu_k, causal=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_pre8, out_pre_ref)
 
 
 def test_e2e_full_pipeline_from_raw_tensors():

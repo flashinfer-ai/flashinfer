@@ -1443,18 +1443,26 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         is_causal: bool = True,
         paged: bool = False,
         kv_fp8: bool = False,
+        q_fp8: bool = False,
         qoff_default: bool = True,
     ):
         if head_dim != 128:
             raise ValueError("only head_dim == 128 is supported")
         if group_size * pack_q_len > 32:
             raise ValueError("group_size * pack_q_len must be <= 32")
+        if q_fp8 and not kv_fp8:
+            raise ValueError("q_fp8 requires kv_fp8")
         self._head_dim = head_dim
         self._group = group_size
         self._pack_q_len = pack_q_len
         self._is_causal = is_causal
         self._paged = paged
         self._kv_fp8 = kv_fp8
+        # fp8 q arrives as a 16-bit view like fp8 K (the vLLM M3 fp8 path
+        # emits e4m3 index-q). With both operands raw e4m3 the ldmatrix
+        # column order matches on both sides, so the Q fragments need only
+        # the same split converts as K -- no cross-lane permute.
+        self._q_fp8 = q_fp8
         # Right-aligned decode (q_offset=None) computes the causal offset
         # in-kernel from the seqlens, skipping the host-side offset-tensor
         # build (two extra kernel launches that dominate at batch 1).
@@ -1498,11 +1506,14 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
         swizzle_128b = cute.make_swizzle(3, 4, 3)
 
+        # fp8 operands arrive as 16-bit views of the e4m3 bytes (half
+        # head_dim), so their tiles are half as wide.
+        qw = hd // 2 if cutlass.const_expr(self._q_fp8) else hd
         sQ_layout = cute.make_composed_layout(
             swizzle_128b,
             0,
             cute.make_layout(
-                (pack, group, (elems, hd // elems)),
+                (pack, group, (elems, qw // elems)),
                 stride=(elems, pack * elems, (1, block_q * elems)),
             ),
         )
@@ -1510,11 +1521,9 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
             tma_g2s,
             cute.logical_divide(mQ, (None, None, elems)),
             sQ_layout,
-            cta_tiler=(pack, group, hd),
+            cta_tiler=(pack, group, qw),
         )
 
-        # fp8 K arrives as a 16-bit view of the e4m3 bytes (half head_dim),
-        # so its tiles are half as wide as Q's.
         kw = hd // 2 if cutlass.const_expr(self._kv_fp8) else hd
         if cutlass.const_expr(self._paged):
             sK_layout = cute.make_composed_layout(
@@ -1605,6 +1614,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         mma_k = 32 * 8 // dtype.width
 
         kw = hd // 2 if self._kv_fp8 else hd
+        qw = hd // 2 if self._q_fp8 else hd
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
@@ -1635,7 +1645,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         q_tma_elems = 128 * 8 // dtype.width
         sQ = cute.coalesce(
             cute.group_modes(sQ_tma, 0, 2),
-            target_profile=(block_q, (q_tma_elems, hd // q_tma_elems)),
+            target_profile=(block_q, (q_tma_elems, qw // q_tma_elems)),
         )
         epi_buffer = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((epi_q, 4))
@@ -1669,12 +1679,12 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                     cute.domain_offset(
                         (q_start, kv_head * group, 0), q_tma.tma_tensor
                     ),
-                    tiler=(pack, group, hd),
+                    tiler=(pack, group, qw),
                     coord=(0, 0, 0),
                 )
                 cute.arch.mbarrier_wait(tma_empty_mbar, tma_parity)
                 with cute.arch.elect_one():
-                    q_size = block_q * hd * (dtype.width // 8)
+                    q_size = block_q * qw * (dtype.width // 8)
                     cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar, q_size)
                 _tma_copy_g2s(q_tma.atom, gq_tile, sQ_tma, tma_full_mbar)
 
@@ -1731,7 +1741,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 )
 
                 rQ = cute.make_rmem_tensor(
-                    ((elems // 2, 2), hd // (mma_k * 2), q_tiles), dtype
+                    ((elems // 2, 2), qw // (mma_k * 2), q_tiles), dtype
                 )
                 rC = cute.make_rmem_tensor((4, 2, q_tiles), cutlass.Float32)
                 sK_ldsm = cute.zipped_divide(
@@ -1768,37 +1778,58 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 if cutlass.const_expr(self._kv_fp8):
-                    # One-time cross-lane permute of the Q B-fragments into
-                    # the fp8 K column order: per 32-column group, lane quad
-                    # position q4 needs columns 4*q4..4*q4+3, which sit as u32
-                    # pairs on quad lanes 2*(q4%2) (lower half) and
-                    # 2*(q4%2)+1 (upper half) of the canonical fragments.
-                    q4 = lane_id % 4
-                    src_lo = lane_id - q4 + 2 * (q4 % 2)
-                    sel_mask = cutlass.Uint32(0) - cutlass.Uint32(q4 // 2)
                     rQ_u32 = cute.recast_tensor(rQ, cutlass.Uint32)
-                    for g in cutlass.range_constexpr(kw // mma_k):
-                        for n in cutlass.range_constexpr(q_tiles):
-                            for h in cutlass.range_constexpr(2):
-                                src = src_lo + h
-                                p0 = cute.arch.shuffle_sync(
-                                    rQ_u32[(0, 0), g, n], src
-                                )
-                                p1 = cute.arch.shuffle_sync(
-                                    rQ_u32[(1, 0), g, n], src
-                                )
-                                p2 = cute.arch.shuffle_sync(
-                                    rQ_u32[(0, 1), g, n], src
-                                )
-                                p3 = cute.arch.shuffle_sync(
-                                    rQ_u32[(1, 1), g, n], src
-                                )
-                                rQp_u32[0, g, n, h] = p0 ^ (
-                                    (p0 ^ p1) & sel_mask
-                                )
-                                rQp_u32[1, g, n, h] = p2 ^ (
-                                    (p2 ^ p3) & sel_mask
-                                )
+                    if cutlass.const_expr(self._q_fp8):
+                        # Raw e4m3 q: ldmatrix hands q the same fp8 column
+                        # order as K, so the split converts already are the
+                        # matching B-fragments.
+                        for g in cutlass.range_constexpr(kw // mma_k):
+                            for n in cutlass.range_constexpr(q_tiles):
+                                for j in cutlass.range_constexpr(2):
+                                    if cutlass.const_expr(
+                                        dtype is cutlass.BFloat16
+                                    ):
+                                        q_lo, q_hi = _fp8x4_to_bf16x4(
+                                            rQ_u32[(j, g % 2), g // 2, n]
+                                        )
+                                    else:
+                                        q_lo, q_hi = _fp8x4_to_f16x4(
+                                            rQ_u32[(j, g % 2), g // 2, n]
+                                        )
+                                    rQp_u32[j, g, n, 0] = q_lo
+                                    rQp_u32[j, g, n, 1] = q_hi
+                    else:
+                        # One-time cross-lane permute of the bf16/f16 Q
+                        # B-fragments into the fp8 K column order: per
+                        # 32-column group, lane quad position q4 needs columns
+                        # 4*q4..4*q4+3, which sit as u32 pairs on quad lanes
+                        # 2*(q4%2) (lower half) and 2*(q4%2)+1 (upper half) of
+                        # the canonical fragments.
+                        q4 = lane_id % 4
+                        src_lo = lane_id - q4 + 2 * (q4 % 2)
+                        sel_mask = cutlass.Uint32(0) - cutlass.Uint32(q4 // 2)
+                        for g in cutlass.range_constexpr(kw // mma_k):
+                            for n in cutlass.range_constexpr(q_tiles):
+                                for h in cutlass.range_constexpr(2):
+                                    src = src_lo + h
+                                    p0 = cute.arch.shuffle_sync(
+                                        rQ_u32[(0, 0), g, n], src
+                                    )
+                                    p1 = cute.arch.shuffle_sync(
+                                        rQ_u32[(1, 0), g, n], src
+                                    )
+                                    p2 = cute.arch.shuffle_sync(
+                                        rQ_u32[(0, 1), g, n], src
+                                    )
+                                    p3 = cute.arch.shuffle_sync(
+                                        rQ_u32[(1, 1), g, n], src
+                                    )
+                                    rQp_u32[0, g, n, h] = p0 ^ (
+                                        (p0 ^ p1) & sel_mask
+                                    )
+                                    rQp_u32[1, g, n, h] = p2 ^ (
+                                        (p2 ^ p3) & sel_mask
+                                    )
 
                 tma_stage = 1 % num_stages
                 tma_parity = 0
