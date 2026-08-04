@@ -1234,6 +1234,53 @@ def prepare_cutlass_bf16_weights(
     }
 
 
+@torch.no_grad()
+def _quantize_mxfp4_linear(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to packed E2M1 with linear per-32 UE8M0 scales.
+
+    The generic CUDA ``fp4_quantize`` kernel currently produces incorrect
+    MXFP4 output on SM90, so the Hopper W4A16 preparation path uses this
+    architecture-independent Torch implementation. Work is chunked by rows to
+    keep temporary FP32 storage bounded for model-sized expert tensors.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 32 != 0:
+        raise ValueError(
+            "MXFP4 linear quantization requires a 2D tensor with K divisible by 32."
+        )
+    rows, columns = weight.shape
+    packed = torch.empty((rows, columns // 2), dtype=torch.uint8, device=weight.device)
+    scales = torch.empty((rows, columns // 32), dtype=torch.uint8, device=weight.device)
+    # Midpoints between the positive E2M1 values
+    # [0, .5, 1, 1.5, 2, 3, 4, 6]. ``right=False`` keeps midpoint ties on the
+    # lower value, matching argmin over the ordered code-point table.
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    max_chunk_elements = 8 * 1024 * 1024
+    chunk_rows = max(1, max_chunk_elements // columns)
+    for begin in range(0, rows, chunk_rows):
+        end = min(begin + chunk_rows, rows)
+        blocks = weight[begin:end].to(torch.float32).reshape(-1, columns // 32, 32)
+        block_scale = blocks.abs().amax(dim=-1) / 6.0
+        safe_scale = torch.where(
+            block_scale > 0, block_scale, torch.ones_like(block_scale)
+        )
+        exponent = torch.floor(torch.log2(safe_scale)).to(torch.int64)
+        exponent = exponent.clamp(-127, 128)
+        scales[begin:end].copy_((exponent + 127).to(torch.uint8))
+        actual_scale = torch.exp2(exponent.to(torch.float32)).unsqueeze(-1)
+        scaled = blocks / actual_scale
+        magnitude_code = torch.bucketize(scaled.abs(), boundaries, right=False)
+        nibbles = magnitude_code | ((scaled < 0).to(torch.int64) << 3)
+        nibbles = nibbles.reshape(end - begin, columns)
+        packed[begin:end].copy_(
+            (nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)).to(torch.uint8)
+        )
+    return packed, scales
+
+
 def prepare_cutlass_w4a16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -1245,7 +1292,7 @@ def prepare_cutlass_w4a16_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the SM90 mixed-input MXFP4 view for ``CutlassW4A16Runner``.
 
-    The stable MXFP4 quantizer first produces logical packed E2M1 weights and
+    An SM90-safe Torch quantizer first produces logical packed E2M1 weights and
     linear UE8M0 scales. Both are then folded into the byte layouts consumed by
     the Hopper mixed-input GEMM.
     """
@@ -1271,19 +1318,11 @@ def prepare_cutlass_w4a16_weights(
     if device.type != "cuda":
         raise ValueError(f"Cutlass W4A16 preparation requires CUDA, got {device}.")
 
-    from ..fp4_quantization import fp4_quantize
-
     def quantize(weight: torch.Tensor, rows: int, cols: int):
         weight = weight.to(device).contiguous().view(num_local_experts * rows, cols)
-        packed, scales = fp4_quantize(
-            weight,
-            global_scale=None,
-            sf_vec_size=32,
-            sf_use_ue8m0=True,
-            is_sf_swizzled_layout=False,
-        )
-        packed = packed.view(num_local_experts, rows, cols // 2).view(torch.uint8)
-        scales = scales.view(torch.uint8).reshape(num_local_experts, rows, cols // 32)
+        packed, scales = _quantize_mxfp4_linear(weight)
+        packed = packed.view(num_local_experts, rows, cols // 2)
+        scales = scales.view(num_local_experts, rows, cols // 32)
         return (
             interleave_moe_weights_for_sm90_mixed_gemm(packed, "fp4"),
             interleave_moe_scales_for_sm90_mixed_gemm(scales),

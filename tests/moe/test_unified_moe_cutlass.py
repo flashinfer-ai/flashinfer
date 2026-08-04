@@ -27,6 +27,7 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
 from flashinfer.tllm_enums import ActivationType
 
@@ -100,6 +101,38 @@ def test_prepare_cutlass_w4a16_weights_rejects_invalid_source_contract():
             hidden_size=128,
             intermediate_size=255,
         )
+
+
+def test_cutlass_mxfp4_linear_quantizer_code_points():
+    values = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+            0.0,
+        ],
+        dtype=torch.bfloat16,
+    ).repeat(2, 2)
+    packed, scales = _quantize_mxfp4_linear(values)
+
+    expected_bytes = torch.tensor(
+        [0x10, 0x32, 0x54, 0x76, 0xA9, 0xCB, 0xED, 0x0F] * 2,
+        dtype=torch.uint8,
+    ).repeat(2, 1)
+    torch.testing.assert_close(packed, expected_bytes)
+    torch.testing.assert_close(scales, torch.full((2, 1), 127, dtype=torch.uint8))
 
 
 @pytest.mark.parametrize(
@@ -450,6 +483,7 @@ def test_cutlass_w4a16_moe_layer_matches_bf16_reference():
 
     assert layer.winner_backend == "cutlass_w4a16"
     assert runner._workspace is not None
+    assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
     torch.testing.assert_close(actual, expected, rtol=2e-1, atol=2e-1)
 
 
@@ -563,6 +597,7 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     actual = runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
     expected = _reference(act, w1, w2)
+    assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
     torch.testing.assert_close(actual, expected, rtol=2e-1, atol=2e-1)
 
     graph = torch.cuda.CUDAGraph()
