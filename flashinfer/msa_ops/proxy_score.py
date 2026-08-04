@@ -432,20 +432,18 @@ def msa_proxy_score(
 
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
-    # Single-token bf16 decode uses the dim-parallel stream schedule (see
-    # MsaProxyScoreDecodeStreamSm12x). total_q == batch_size guarantees exactly
-    # one q token per request, which its token == batch indexing relies on.
-    # fp8 K skips it when the key-major schedule can take the shape instead:
-    # the stream schedule pays a CUDA-core convert per K element, while
-    # key-major converts in-register nearly for free.
-    keymajor_fp8_sq1 = (
-        kv_fp8 and 2 <= group_size <= 32 and _PACK_ROWS % group_size == 0
-    )
+    # Single-token decode prefers the key-major schedule whenever it can take
+    # the shape; the dim-parallel stream schedule (see
+    # MsaProxyScoreDecodeStreamSm12x) remains for the group sizes it cannot
+    # (1, or not dividing the 64-row tile). total_q == batch_size guarantees
+    # exactly one q token per request, which the stream schedule's
+    # token == batch indexing relies on.
+    keymajor_sq1 = 2 <= group_size <= 32 and _PACK_ROWS % group_size == 0
     use_stream = (
         max_seqlen_q == 1
         and total_q == batch_size
         and group_size <= 8
-        and not keymajor_fp8_sq1
+        and not keymajor_sq1
     )
     qoff_default = q_offset is None
 
