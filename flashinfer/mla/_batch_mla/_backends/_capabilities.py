@@ -6,37 +6,6 @@ from typing import Optional, Protocol
 from flashinfer._backend import _BackendPlanUnsupportedError
 
 
-CAPABILITY_CONTROLLED_PLAN_FIELDS = frozenset(
-    {
-        "lse_mode",
-        "kv_layout",
-        "output_scale",
-        "scale_mode",
-        "skip_softmax",
-        "enable_pdl",
-        "is_var_seq",
-        "use_sinks",
-        "qk_nope_head_dim",
-    }
-)
-
-BACKEND_OPERATIONAL_PLAN_FIELDS = frozenset(
-    {
-        "metadata",
-        "num_heads",
-        "head_dim_ckv",
-        "head_dim_kpe",
-        "page_size",
-        "causal",
-        "sm_scale",
-        "q_data_type",
-        "kv_data_type",
-        "output_dtype",
-        "use_profiler",
-    }
-)
-
-
 @dataclass(frozen=True, slots=True)
 class MLAPlanCapabilities:
     """Cross-backend plan options accepted by one concrete backend."""

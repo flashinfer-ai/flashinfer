@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from collections import namedtuple
 from dataclasses import replace
 import functools
 import threading
-from typing import Any, Callable, cast, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import torch
@@ -27,7 +26,6 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import (
     AutoTuner,
     DynamicTensorSpec,
-    TunableRunner,
     TuningConfig,
     make_bucket_mapper,
 )
@@ -36,11 +34,7 @@ from flashinfer.trace.templates.attention import xqa_batch_decode_mla_trace
 from ._backends._cute_dsl_functional_common import (
     _cute_dsl_max_supported_batch,
 )
-from ._backends._fa_common import get_batch_mla_module as _get_batch_mla_module
-from ._backends.cutlass_backend import (
-    CutlassMlaRunner,
-    get_mla_module as _get_mla_module,
-)
+from ._backends.cutlass_backend import CutlassMlaRunner
 from ._backends.cute_dsl_modular_backend import CuteDslModularMlaDecodeRunner
 from ._backends.cute_dsl_monolithic_backend import (
     CuteDslMonolithicMlaDecodeRunner,
@@ -50,19 +44,14 @@ from ._backends.fa3_backend import Fa3MlaRunner
 from ._backends.trtllm_gen_backend import (
     _TRTLLM_GEN_MLA_MAX_BATCH,
     _trtllm_gen_mla_incompatibility_reason,
-    get_trtllm_gen_fmha_module as _get_trtllm_gen_fmha_module,
     TrtllmGenMlaDecodeRunner,
 )
 from ._backends.xqa_backend import XqaMlaDecodeRunner
 from ._contracts import (
     _FunctionalBackendUnsupportedError,
     _FunctionalMLARequest,
+    _FunctionalMLARunner,
 )
-
-
-get_mla_module = _get_mla_module
-get_batch_mla_module = _get_batch_mla_module
-get_trtllm_gen_fmha_module = _get_trtllm_gen_fmha_module
 
 
 _xqa_batch_decode_with_kv_cache_mla_warning_emitted = False
@@ -85,14 +74,9 @@ def _warn_xqa_batch_decode_with_kv_cache_mla_once() -> None:
         _xqa_batch_decode_with_kv_cache_mla_warning_emitted = True
 
 
-class _MLAFunctionalRunner(Protocol):
-    @property
-    def inputs(self) -> list[torch.Tensor]: ...
-
-    def __call__(self, inputs: list[torch.Tensor], **kwargs: Any) -> Any: ...
-
-
-_FUNCTIONAL_MLA_RUNNERS: dict[str, Callable[[_FunctionalMLARequest], Any]] = {
+_FUNCTIONAL_MLA_RUNNERS: dict[
+    str, Callable[[_FunctionalMLARequest], _FunctionalMLARunner]
+] = {
     "fa2": Fa2MlaRunner,
     "fa3": Fa3MlaRunner,
     "cutlass": CutlassMlaRunner,
@@ -101,19 +85,6 @@ _FUNCTIONAL_MLA_RUNNERS: dict[str, Callable[[_FunctionalMLARequest], Any]] = {
     "cute-dsl-modular": CuteDslModularMlaDecodeRunner,
     "xqa": XqaMlaDecodeRunner,
 }
-
-
-_MLAHeadDimensions = namedtuple(
-    "_MLAHeadDimensions",
-    ("qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "kv_lora_rank"),
-)
-deepseek_mla_dimensions = _MLAHeadDimensions(128, 64, 128, 512)
-smaller_mla_dimensions = _MLAHeadDimensions(64, 64, 128, 256)
-supported_mla_head_dimensions = [
-    deepseek_mla_dimensions,
-    smaller_mla_dimensions,
-    _MLAHeadDimensions(256, 0, 256, 512),
-]
 
 
 def _compute_mla_decode_buckets(
@@ -241,16 +212,14 @@ def _run_functional_mla(
     if backend not in ("auto", "cute-dsl", *_FUNCTIONAL_MLA_RUNNERS):
         raise ValueError(f"Backend {backend} not supported by functional MLA")
 
-    def run_explicit(runner: _MLAFunctionalRunner):
+    def run_explicit(runner: _FunctionalMLARunner):
         runner = prepare_candidate(runner)
         return runner(inputs=runner.inputs, tactic=-1)
 
     def prepare_candidate(
-        runner: _MLAFunctionalRunner,
-    ) -> _MLAFunctionalRunner:
-        prepare_for_dispatch = getattr(runner, "_prepare_for_dispatch", None)
-        if prepare_for_dispatch is not None:
-            prepare_for_dispatch()
+        runner: _FunctionalMLARunner,
+    ) -> _FunctionalMLARunner:
+        runner.prepare_for_dispatch()
         return runner
 
     def run_cute_direct(
@@ -294,7 +263,7 @@ def _run_functional_mla(
 
     def make_cute_runner(
         cute_request: _FunctionalMLARequest, *, for_auto: bool
-    ) -> _MLAFunctionalRunner:
+    ) -> _FunctionalMLARunner:
         implementation = cute_request.cute_dsl_impl
         if implementation not in ("auto", "monolithic", "modular"):
             raise ValueError(
@@ -355,7 +324,7 @@ def _run_functional_mla(
     if backend != "auto":
         return run_explicit(_FUNCTIONAL_MLA_RUNNERS[backend](request))
 
-    runners: List[_MLAFunctionalRunner] = []
+    runners: List[_FunctionalMLARunner] = []
     runner_names: List[str] = []
     trtllm_reason = _trtllm_gen_mla_incompatibility_reason(request.kv_cache)
     if 64 < request.query.size(-2) < 128:
@@ -425,7 +394,7 @@ def _run_functional_mla(
         inputs.append(request.sparse_mla_top_k_lens)
     runner, tactic = AutoTuner.get().choose_one(
         "trtllm_batch_decode_mla",
-        cast(List[TunableRunner], runners),
+        runners,
         tuning_config,
         inputs,
     )

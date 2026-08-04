@@ -16,11 +16,7 @@ import torch
 from flashinfer._backend import _BackendPlanUnsupportedError
 from flashinfer.utils import get_compute_capability
 
-from ._capabilities import (
-    BACKEND_OPERATIONAL_PLAN_FIELDS,
-    MLAPlanCapabilities,
-    validate_plan_capabilities,
-)
+from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
 from .._planning import (
     _MLAGeneratedFaWorkspace,
     _MLAPlanArguments,
@@ -29,6 +25,7 @@ from .._contracts import (
     _FunctionalBackendUnsupportedError,
     _FunctionalMLARequest,
     MLAKVCache,
+    MLAInputContract,
     MLAQuery,
     _split_mla_value_objects,
 )
@@ -51,7 +48,6 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "kv-per-tensor"}),
     )
-    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
 
     def __init__(
         self,
@@ -62,6 +58,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
         kv_indptr: Optional[torch.Tensor],
         kv_indices: Optional[torch.Tensor],
         kv_len_arr: Optional[torch.Tensor],
+        input_contract: Optional[MLAInputContract] = None,
     ) -> None:
         self._backend = "fa3"
         super().__init__(
@@ -72,6 +69,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             kv_indptr,
             kv_indices,
             kv_len_arr,
+            input_contract,
         )
 
     @classmethod
@@ -103,6 +101,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAGeneratedFaMechanics):
             args._kv_indptr_buf,
             args._kv_indices_buf,
             args._kv_len_arr_buf,
+            args.input_contract,
         )
         backend.plan(
             qo_indptr=csr.qo_indptr,

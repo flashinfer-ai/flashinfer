@@ -31,11 +31,7 @@ from flashinfer.utils import (
     next_positive_power_of_2,
 )
 
-from ._capabilities import (
-    BACKEND_OPERATIONAL_PLAN_FIELDS,
-    MLAPlanCapabilities,
-    validate_plan_capabilities,
-)
+from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
 from .._planning import (
     _MLAPlanArguments,
 )
@@ -398,7 +394,6 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         supports_sinks=True,
         supports_qk_nope_head_dim=True,
     )
-    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self._backend = "trtllm-gen"
@@ -1307,7 +1302,7 @@ class TrtllmGenMlaDecodeRunner(_FunctionalMLARunner):
             lse=lse,
         )
 
-    def _prepare_for_dispatch(self) -> None:
+    def prepare_for_dispatch(self) -> None:
         """Prepare the caller shape before admitting this automatic candidate."""
         self._dispatch_functional_state = self._prepare_functional_state(self.request)
         self._dispatch_inputs = tuple(self._inputs)

@@ -115,3 +115,28 @@ def test_explicit_unsupported_backend_does_not_substitute(monkeypatch):
         wrapper.plan(**_plan_kwargs())
 
     assert calls == ["fa2"]
+
+
+def test_planned_query_dtype_requires_exact_fp8_format(monkeypatch):
+    monkeypatch.setattr(
+        fa2_backend._BatchMLAPagedAttentionFa2Backend,
+        "plan_from_wrapper",
+        classmethod(lambda _cls, _args: _SuccessfulBackend()),
+    )
+    plan_kwargs = _plan_kwargs()
+    plan_kwargs["q_data_type"] = torch.float8_e4m3fn
+
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="fa2")
+    wrapper.plan(**plan_kwargs)
+
+    with pytest.raises(ValueError, match="q_nope dtype planned"):
+        wrapper.run(
+            query=MLAQuery.split(
+                torch.empty(1, 1, 2, dtype=torch.float8_e5m2),
+                torch.empty(1, 1, 1, dtype=torch.float8_e5m2),
+            ),
+            kv=MLAKVCache.split(
+                torch.empty(1, 1, 2),
+                torch.empty(1, 1, 1),
+            ),
+        )

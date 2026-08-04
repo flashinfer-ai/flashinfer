@@ -1157,12 +1157,11 @@ _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 # Re-export internal Batch MLA implementations through the package façade.
 from ._batch_mla._functional import (
-    _compute_mla_decode_buckets as _compute_mla_decode_buckets,
     _run_functional_mla,
-    get_batch_mla_module as get_batch_mla_module,
-    get_mla_module as get_mla_module,
-    get_trtllm_gen_fmha_module as get_trtllm_gen_fmha_module,
     xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
+)
+from ._batch_mla._backends.trtllm_gen_backend import (
+    get_trtllm_gen_fmha_module as get_trtllm_gen_fmha_module,
 )
 from ._batch_mla._contracts import _FunctionalMLARequest
 from ._batch_mla._wrapper import (
@@ -1612,8 +1611,10 @@ def batch_mla_paged_attention(
         scales; ``"arbitrary_fp32"`` selects arbitrary FP32 inline scales.
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support,
-        shape ``[batch_size + 1]`` and dtype ``torch.int32``. Only supported by
-        TRTLLM-GEN. When provided, ``query`` must have shape
+        shape ``[batch_size + 1]`` and dtype ``torch.int32``. TRTLLM-GEN owns
+        the native variable-Q path; CuTe DSL handles configurations that require
+        its compact variable-Q fallback, including LSE and unsupported TRTLLM-GEN
+        head counts. When provided, ``query`` must have shape
         ``[total_q, num_heads, head_dim_qk]``.
     max_q_len : Optional[int] = None
         Maximum query sequence length represented by ``cum_seq_lens_q``.

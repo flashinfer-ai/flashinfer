@@ -17,18 +17,14 @@ from typing import Any, Optional, Tuple, Union
 import torch
 
 from flashinfer._backend import _BackendPlanUnsupportedError
-from flashinfer.autotuner import TunableRunner
 from flashinfer.jit.mla import gen_mla_module
-from ._capabilities import (
-    BACKEND_OPERATIONAL_PLAN_FIELDS,
-    MLAPlanCapabilities,
-    validate_plan_capabilities,
-)
+from ._capabilities import MLAPlanCapabilities, validate_plan_capabilities
 from .._planning import _MLAPlanArguments
 from .._contracts import (
     MLAKVCache,
     MLAQuery,
     _FunctionalMLARequest,
+    _FunctionalMLARunner,
     _concat_adjacent_views_or_cat,
     _split_mla_value_objects,
 )
@@ -153,7 +149,6 @@ class _BatchMLAPagedAttentionCutlassBackend:
         output_scales=frozenset({"none", "per-tensor"}),
         scale_modes=frozenset({"default"}),
     )
-    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
 
     def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         self._backend = "cutlass"
@@ -565,13 +560,13 @@ class _BatchMLAPagedAttentionCutlassBackend:
         return out
 
 
-class CutlassMlaRunner(TunableRunner):
+class CutlassMlaRunner(_FunctionalMLARunner):
     """Direct functional runner for the fixed-shape CUTLASS MLA kernel."""
 
     name = "cutlass"
 
     def __init__(self, request: _FunctionalMLARequest) -> None:
-        self.request = request
+        super().__init__(request)
         self._validate_functional_options(request)
         initial_out = request.out
         if initial_out is None:

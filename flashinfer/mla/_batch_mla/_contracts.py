@@ -9,19 +9,6 @@ import torch
 from flashinfer.autotuner import TunableRunner
 
 
-def _is_fp8_dtype(dtype: torch.dtype) -> bool:
-    return dtype in {
-        candidate
-        for candidate in (
-            getattr(torch, "float8_e4m3fn", None),
-            getattr(torch, "float8_e4m3fnuz", None),
-            getattr(torch, "float8_e5m2", None),
-            getattr(torch, "float8_e5m2fnuz", None),
-        )
-        if candidate is not None
-    }
-
-
 def _adjacent_last_dim_view(
     left: torch.Tensor, right: torch.Tensor
 ) -> Optional[torch.Tensor]:
@@ -38,7 +25,7 @@ def _adjacent_last_dim_view(
     ):
         return None
     storage = left.untyped_storage()
-    if storage._cdata != right.untyped_storage()._cdata:
+    if storage.data_ptr() != right.untyped_storage().data_ptr():
         return None
     stride = left.stride()
     storage_offset = left.storage_offset()
@@ -95,7 +82,7 @@ class MLAInputContract:
                 "the needed arguments."
             )
         for name, tensor in (("q_nope", q_nope), ("q_pe", q_pe)):
-            if tensor.dtype != self.q_data_type and not _is_fp8_dtype(tensor.dtype):
+            if tensor.dtype != self.q_data_type:
                 raise ValueError(
                     "MLA planned input contract mismatch: "
                     f"{name} dtype planned {self.q_data_type!r}, got "
@@ -432,6 +419,9 @@ class _FunctionalMLARunner(TunableRunner):
     @abstractmethod
     def inputs(self) -> list[torch.Tensor]:
         raise NotImplementedError
+
+    def prepare_for_dispatch(self) -> None:
+        """Prepare caller-specific state before explicit or tuned dispatch."""
 
 
 class _FunctionalBackendUnsupportedError(RuntimeError):

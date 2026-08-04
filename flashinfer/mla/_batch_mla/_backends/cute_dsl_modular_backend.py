@@ -4,10 +4,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from ._capabilities import (
-    BACKEND_OPERATIONAL_PLAN_FIELDS,
-    MLAPlanCapabilities,
-)
+from ._capabilities import MLAPlanCapabilities
 from .._contracts import _FunctionalMLARequest
 from ._cute_dsl_common import (
     _BatchMLAPagedAttentionCuteDslBackendBase,
@@ -112,7 +109,6 @@ class _BatchMLAPagedAttentionCuteDslModularBackend(
         supports_is_var_seq=True,
         supports_sinks=True,
     )
-    _backend_operational_plan_fields = BACKEND_OPERATIONAL_PLAN_FIELDS
 
     def _compile_kernel(
         self,
