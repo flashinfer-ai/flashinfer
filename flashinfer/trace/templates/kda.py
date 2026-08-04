@@ -87,7 +87,7 @@ fused_kda_decode_trace = TraceTemplate(
     op_type="kda",
     name_prefix="fused_kda_decode",
     description=(
-        "Kimi K3 width-four causal convolution, recurrent KDA update, and "
+        "Kimi width-four causal convolution, recurrent KDA update, and "
         "gated RMSNorm fused into one decode kernel. The convolution and "
         "recurrent state pools are mutated in-place."
     ),
@@ -137,7 +137,7 @@ fused_kda_decode_trace = TraceTemplate(
         "singleton == 1",
         "projection_groups == 3",
         "head_dim == 128",
-        "num_heads in (12, 24, 48, 96)",
+        "num_heads in (12, 24, 32, 48, 96)",
         "conv_width == 4",
         "conv_history == 3",
     ],

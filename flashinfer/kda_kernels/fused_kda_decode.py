@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused Kimi K3 KDA decode kernel for SM100.
+Fused Kimi KDA decode kernel for SM100.
 
 The kernel combines the width-four depthwise causal convolution, SiLU,
 per-key-dimension gated delta-rule recurrence, and gated RMSNorm into one
-launch. It is specialized for the Kimi K3 decode shapes: head dimension 128
-and 12, 24, 48, or 96 heads.
+launch. It is specialized for head dimension 128 and 12, 24, 32, 48, or 96
+heads.
 """
 
 import functools
@@ -43,7 +43,7 @@ _ROWS_PER_WARP = _HEAD_DIM // _NUM_WARPS
 _CONV_THREADS = 3 * _HEAD_DIM // 4
 _Q_SCALE = _HEAD_DIM**-0.5
 _L2_EPS = 1.0e-6
-_SUPPORTED_HEADS = (12, 24, 48, 96)
+_SUPPORTED_HEADS = (12, 24, 32, 48, 96)
 _CUTE_DSL_MODULE = "fused_kda_decode"
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
 
@@ -81,6 +81,8 @@ def _fused_kda_decode_kernel(
     output_gate,
     norm_weight,
     output,
+    state_is_bf16: cutlass.Constexpr,
+    use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
 ):
@@ -219,7 +221,16 @@ def _fused_kda_decode_kernel(
             raw_gate[(channel_vector, channel_lane, head_idx, row_idx)].to(F32)
             + dt_bias[(channel_vector, channel_lane, head_idx)]
         )
-        gate_decay[channel_idx] = cute.exp(lower_bound * _sigmoid(A * gate))
+        if cutlass.const_expr(use_lower_bound):
+            gate_value = lower_bound * _sigmoid(A * gate)
+        else:
+            softplus = gate
+            if gate <= 20.0:
+                softplus = cute.log(
+                    F32(1.0) + cute.exp(gate, fastmath=True), fastmath=True
+                )
+            gate_value = -A * softplus
+        gate_decay[channel_idx] = cute.exp(gate_value)
         output_gate_value = output_gate[
             (channel_vector, channel_lane, head_idx, row_idx)
         ].to(F32)
@@ -233,7 +244,20 @@ def _fused_kda_decode_kernel(
         state[(None, lane_idx, None, warp_idx, head_idx, slot)], 16
     )
     state_registers = cute.make_rmem_tensor((4, _ROWS_PER_WARP), F32)
-    cute.copy(copy_f32x4, global_state, state_registers)
+    if cutlass.const_expr(state_is_bf16):
+        for local_row in cutlass.range_constexpr(_ROWS_PER_WARP):
+            state_bf16 = cute.make_rmem_tensor((4,), BF16)
+            cute.copy(
+                copy_bf16x4,
+                _aligned_tensor(global_state[(None, local_row)], 8),
+                state_bf16,
+            )
+            for channel_idx in cutlass.range_constexpr(4):
+                state_registers[(channel_idx, local_row)] = state_bf16[channel_idx].to(
+                    F32
+                )
+    else:
+        cute.copy(copy_f32x4, global_state, state_registers)
 
     cute.arch.barrier()
 
@@ -290,11 +314,23 @@ def _fused_kda_decode_kernel(
                 delta_key_scale * key[channel_idx]
             )
         if is_live:
-            cute.copy(
-                copy_f32x4,
-                state_registers[(None, local_row)],
-                _aligned_tensor(global_state[(None, local_row)], 16),
-            )
+            if cutlass.const_expr(state_is_bf16):
+                updated_state_bf16 = cute.make_rmem_tensor((4,), BF16)
+                for channel_idx in cutlass.range_constexpr(4):
+                    updated_state_bf16[channel_idx] = state_registers[
+                        (channel_idx, local_row)
+                    ].to(BF16)
+                cute.copy(
+                    copy_bf16x4,
+                    updated_state_bf16,
+                    _aligned_tensor(global_state[(None, local_row)], 8),
+                )
+            else:
+                cute.copy(
+                    copy_f32x4,
+                    state_registers[(None, local_row)],
+                    _aligned_tensor(global_state[(None, local_row)], 16),
+                )
         if lane_idx == 0:
             recurrence_output[output_row] = recurrent_value.to(BF16).to(F32)
 
@@ -356,6 +392,8 @@ def _fused_kda_decode_launch(
     norm_weight,
     output,
     stream: cuda.CUstream,
+    state_is_bf16: cutlass.Constexpr,
+    use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
 ):
@@ -451,6 +489,8 @@ def _fused_kda_decode_launch(
         output_gate_layout,
         norm_weight_layout,
         output_layout,
+        state_is_bf16,
+        use_lower_bound,
         lower_bound,
         norm_eps,
     ).launch(
@@ -461,7 +501,7 @@ def _fused_kda_decode_launch(
     )
 
 
-def _make_compile_inputs():
+def _make_compile_inputs(state_dtype):
     """Build shape- and stride-dynamic inputs for CuTe compilation."""
     num_rows = cute.sym_int()
     num_heads = cute.sym_int()
@@ -497,7 +537,7 @@ def _make_compile_inputs():
         assumed_align=16,
     )
     state = cute.runtime.make_fake_tensor(
-        F32,
+        state_dtype,
         shape=(state_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
         stride=(
             cute.sym_int64(),
@@ -531,10 +571,20 @@ def _make_compile_inputs():
 
 
 @functools.cache
-def _get_compiled_kernel(lower_bound, norm_eps):
+def _get_compiled_kernel(state_dtype, lower_bound, norm_eps):
     """Get a shape-dynamic specialization from the two-level CuTe DSL cache."""
+    state_is_bf16 = state_dtype == torch.bfloat16
+    compile_state_dtype = BF16 if state_is_bf16 else F32
+    state_name = "bf16" if state_is_bf16 else "f32"
+    use_lower_bound = lower_bound is not None
+    gate_name = (
+        f"lb{str(float(lower_bound)).replace('.', '_').replace('-', 'm')}"
+        if use_lower_bound
+        else "softplus"
+    )
+    compile_lower_bound = float(lower_bound) if use_lower_bound else -5.0
     kernel_name = (
-        f"d128_w4_lb{str(float(lower_bound)).replace('.', '_').replace('-', 'm')}"
+        f"d128_w4_{gate_name}_state{state_name}"
         f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
     )
     return build_and_load_cute_dsl_kernel(
@@ -542,8 +592,10 @@ def _get_compiled_kernel(lower_bound, norm_eps):
         kernel_name,
         lambda: cute.compile(
             _fused_kda_decode_launch,
-            *_make_compile_inputs(),
-            float(lower_bound),
+            *_make_compile_inputs(compile_state_dtype),
+            state_is_bf16,
+            use_lower_bound,
+            compile_lower_bound,
             float(norm_eps),
             options="--enable-tvm-ffi --generate-line-info",
         ),
@@ -554,7 +606,8 @@ def _get_compiled_kernel(lower_bound, norm_eps):
 def _check_cuda_tensor(name, tensor, dtype):
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
-    if tensor.dtype != dtype:
+    expected_dtypes = dtype if isinstance(dtype, tuple) else (dtype,)
+    if tensor.dtype not in expected_dtypes:
         raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
 
 
@@ -571,11 +624,11 @@ def run_fused_kda_decode(
     state: torch.Tensor,
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
-    lower_bound: float = -5.0,
+    lower_bound: float | None = -5.0,
     norm_eps: float = 1e-5,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run fused Kimi K3 decode and update both cache tensors in-place."""
+    """Run fused Kimi decode and update both cache tensors in-place."""
     _check_cuda_tensor("x", x, torch.bfloat16)
     _check_cuda_tensor("weight", weight, torch.float32)
     _check_cuda_tensor("conv_state", conv_state, torch.bfloat16)
@@ -584,7 +637,7 @@ def run_fused_kda_decode(
     _check_cuda_tensor("A_log", A_log, torch.float32)
     _check_cuda_tensor("dt_bias", dt_bias, torch.float32)
     _check_cuda_tensor("state_indices", state_indices, torch.int32)
-    _check_cuda_tensor("state", state, torch.float32)
+    _check_cuda_tensor("state", state, (torch.float32, torch.bfloat16))
     _check_cuda_tensor("output_gate", output_gate, torch.bfloat16)
     _check_cuda_tensor("norm_weight", norm_weight, torch.float32)
     for name, tensor in (
@@ -670,7 +723,7 @@ def run_fused_kda_decode(
         raise ValueError("output_gate must have contiguous head rows")
     if norm_weight.shape != (_HEAD_DIM,) or not norm_weight.is_contiguous():
         raise ValueError("norm_weight must be contiguous with shape [128]")
-    if lower_bound >= 0:
+    if lower_bound is not None and lower_bound >= 0:
         raise ValueError("lower_bound must be negative")
     if norm_eps < 0:
         raise ValueError("norm_eps must be non-negative")
@@ -687,7 +740,7 @@ def run_fused_kda_decode(
                 "output must be contiguous with shape [1, num_rows, H, 128]"
             )
 
-    kernel = _get_compiled_kernel(float(lower_bound), float(norm_eps))
+    kernel = _get_compiled_kernel(state.dtype, lower_bound, float(norm_eps))
     kernel(
         x,
         weight,

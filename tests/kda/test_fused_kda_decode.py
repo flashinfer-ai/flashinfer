@@ -40,6 +40,10 @@ _KIMI_K3_CASES = (
     (48, 4),
     (48, 32),
     (48, 128),
+    (32, 1),
+    (32, 4),
+    (32, 32),
+    (32, 128),
     (24, 1),
     (24, 4),
     (24, 32),
@@ -61,14 +65,15 @@ def _require_fused_kda_decode():
         pytest.skip("fused_kda_decode is unavailable (missing CuTe DSL dependencies)")
 
 
-def _page_strides(num_heads):
+def _page_strides(num_heads, state_dtype):
     conv_slot_bytes = 3 * num_heads * 128 * 3 * 2
-    state_slot_bytes = num_heads * 128 * 128 * 4
+    state_element_bytes = torch.empty((), dtype=state_dtype).element_size()
+    state_slot_bytes = num_heads * 128 * 128 * state_element_bytes
     page_bytes = conv_slot_bytes + state_slot_bytes
-    return page_bytes // 2, page_bytes // 4
+    return page_bytes // 2, page_bytes // state_element_bytes
 
 
-def _make_inputs(num_heads, num_rows, seed=42):
+def _make_inputs(num_heads, num_rows, seed=42, state_dtype=torch.float32):
     device = torch.device("cuda")
     num_slots = num_rows + 1
     hidden_size = num_heads * 128
@@ -83,7 +88,7 @@ def _make_inputs(num_heads, num_rows, seed=42):
     x = x_storage[:, : 3 * hidden_size]
     weight = 0.1 * randn((3, 4, hidden_size))
 
-    conv_slot_stride, state_slot_stride = _page_strides(num_heads)
+    conv_slot_stride, state_slot_stride = _page_strides(num_heads, state_dtype)
     conv_state = torch.empty_strided(
         (num_slots, 3 * hidden_size, 3),
         (conv_slot_stride, 1, 3 * hidden_size),
@@ -94,10 +99,10 @@ def _make_inputs(num_heads, num_rows, seed=42):
     state = torch.empty_strided(
         (num_slots, num_heads, 128, 128),
         (state_slot_stride, 128 * 128, 128, 1),
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
-    state.copy_(0.01 * randn((num_slots, num_heads, 128, 128)))
+    state.copy_(0.01 * randn((num_slots, num_heads, 128, 128), state_dtype))
 
     beta_storage = randn((1, num_rows, num_heads + 1), torch.bfloat16)
     gate_storage = randn((num_rows, hidden_size + 7), torch.bfloat16)
@@ -129,7 +134,7 @@ def _clone_strided(tensor):
 
 
 @torch.no_grad()
-def _reference(inputs, conv_state, state):
+def _reference(inputs, conv_state, state, lower_bound=-5.0):
     x = inputs["x"]
     num_rows = x.shape[0]
     num_heads = inputs["A_log"].numel()
@@ -148,7 +153,10 @@ def _reference(inputs, conv_state, state):
     query *= 128**-0.5
     key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
     gate = inputs["raw_gate"][0].float() + inputs["dt_bias"].view(num_heads, 128)
-    gate = -5.0 * torch.sigmoid(inputs["A_log"].exp()[None, :, None] * gate)
+    if lower_bound is None:
+        gate = -inputs["A_log"].exp()[None, :, None] * F.softplus(gate)
+    else:
+        gate = lower_bound * torch.sigmoid(inputs["A_log"].exp()[None, :, None] * gate)
 
     selected_state = state.index_select(0, slots)
     selected_state = selected_state * gate.exp().unsqueeze(-2)
@@ -156,7 +164,7 @@ def _reference(inputs, conv_state, state):
     delta = value - state_key
     delta *= inputs["raw_beta"][0].float().sigmoid().unsqueeze(-1)
     selected_state += delta.unsqueeze(-1) * key.unsqueeze(-2)
-    state.index_copy_(0, slots, selected_state)
+    state.index_copy_(0, slots, selected_state.to(state.dtype))
 
     output = torch.einsum("nhvk,nhk->nhv", selected_state, query)
     output = output.to(torch.bfloat16).float()
@@ -204,12 +212,47 @@ def test_fused_kda_decode_kimi_k3_shapes(num_heads, num_rows):
     torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
 
 
-def test_fused_kda_decode_cuda_graph():
-    inputs = _make_inputs(num_heads=12, num_rows=4)
-    output = torch.empty(
-        (1, 4, 12, 128), dtype=torch.bfloat16, device=torch.device("cuda")
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_rows", [1, 4, 32, 128])
+def test_fused_kda_decode_kimi_linear_softplus(num_rows, state_dtype):
+    inputs = _make_inputs(num_heads=32, num_rows=num_rows, state_dtype=state_dtype)
+    reference_conv_state = _clone_strided(inputs["conv_state"])
+    reference_state = _clone_strided(inputs["state"])
+    actual_conv_state = _clone_strided(inputs["conv_state"])
+    actual_state = _clone_strided(inputs["state"])
+
+    expected = _reference(
+        inputs, reference_conv_state, reference_state, lower_bound=None
     )
-    kwargs = {**inputs, "output": output}
+    kwargs = {
+        **inputs,
+        "conv_state": actual_conv_state,
+        "state": actual_state,
+        "lower_bound": None,
+    }
+    actual = fused_kda_decode(**kwargs)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "lower_bound", "state_dtype"),
+    [
+        (12, -5.0, torch.float32),
+        (12, -5.0, torch.bfloat16),
+        (32, -5.0, torch.float32),
+        (32, None, torch.float32),
+        (32, None, torch.bfloat16),
+    ],
+)
+def test_fused_kda_decode_cuda_graph(num_heads, lower_bound, state_dtype):
+    inputs = _make_inputs(num_heads=num_heads, num_rows=4, state_dtype=state_dtype)
+    output = torch.empty(
+        (1, 4, num_heads, 128), dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    kwargs = {**inputs, "lower_bound": lower_bound, "output": output}
 
     # Compile and allocate before capture. Replays then contain only the fused
     # kernel and preserve the in-place cache update semantics.
@@ -224,8 +267,9 @@ def test_fused_kda_decode_cuda_graph():
     assert torch.isfinite(output).all()
 
 
-def test_fused_kda_decode_null_slots():
-    inputs = _make_inputs(num_heads=12, num_rows=3)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_fused_kda_decode_null_slots(state_dtype):
+    inputs = _make_inputs(num_heads=12, num_rows=3, state_dtype=state_dtype)
     inputs["state_indices"].copy_(
         torch.tensor([0, -1, 1], dtype=torch.int32, device=torch.device("cuda"))
     )
@@ -252,3 +296,29 @@ def test_fused_kda_decode_requires_matching_cache_slots():
         match="conv_state and state must have the same number of cache slots",
     ):
         fused_kda_decode(**inputs)
+
+
+def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
+    import importlib
+
+    kernel_module = importlib.import_module("flashinfer.kda_kernels.fused_kda_decode")
+
+    kernel_names = []
+
+    def record_kernel_name(module_name, kernel_name, compile_fn, extra_key_files):
+        del module_name, compile_fn, extra_key_files
+        kernel_names.append(kernel_name)
+        return kernel_name
+
+    monkeypatch.setattr(
+        kernel_module, "build_and_load_cute_dsl_kernel", record_kernel_name
+    )
+    kernel_module._get_compiled_kernel.cache_clear()
+    try:
+        for state_dtype in (torch.float32, torch.bfloat16):
+            for lower_bound in (-5.0, None):
+                kernel_module._get_compiled_kernel(state_dtype, lower_bound, 1e-5)
+    finally:
+        kernel_module._get_compiled_kernel.cache_clear()
+
+    assert len(kernel_names) == len(set(kernel_names)) == 4

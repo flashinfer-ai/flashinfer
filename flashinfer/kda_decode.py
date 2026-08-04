@@ -202,15 +202,15 @@ def fused_kda_decode(
     state: torch.Tensor,
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
-    lower_bound: float = -5.0,
+    lower_bound: Optional[float] = -5.0,
     norm_eps: float = 1e-5,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Run the fused Kimi K3 KDA decode pipeline.
+    r"""Run the fused Kimi KDA decode pipeline.
 
     This operator fuses a width-four depthwise causal convolution with SiLU,
     one recurrent KDA update, and gated RMSNorm. It is specialized for
-    head dimension 128 and 12, 24, 48, or 96 heads. ``conv_state`` and
+    head dimension 128 and 12, 24, 32, 48, or 96 heads. ``conv_state`` and
     ``state`` are updated in-place.
 
     Slot zero is reserved as a null slot. Rows whose ``state_indices`` value
@@ -244,9 +244,11 @@ def fused_kda_decode(
             ``[1, num_slots)``; non-positive indices select the null path.
         state:
             Paged recurrent state with shape
-            ``[num_slots, H, 128, 128]`` and dtype float32. Each slot's
-            ``[H, 128, 128]`` contents must be contiguous. ``state`` and
-            ``conv_state`` must have the same ``num_slots``.
+            ``[num_slots, H, 128, 128]`` and dtype float32 or bfloat16. The
+            recurrence is evaluated in float32; a bfloat16 state is rounded
+            when written back. Each slot's ``[H, 128, 128]`` contents must be
+            contiguous. ``state`` and ``conv_state`` must have the same
+            ``num_slots``.
         output_gate:
             Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
             ``[1, num_rows, H, 128]`` and dtype bfloat16.
@@ -254,7 +256,8 @@ def fused_kda_decode(
             RMSNorm weight with 128 elements and dtype float32.
         lower_bound:
             Negative lower bound used by the recurrence gate. Defaults to
-            ``-5.0``.
+            ``-5.0`` for Kimi K3. Pass ``None`` to use the original
+            Kimi-Linear softplus gate.
         norm_eps:
             Non-negative RMSNorm epsilon. Defaults to ``1e-5``.
         output:
