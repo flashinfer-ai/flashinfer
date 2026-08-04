@@ -1713,7 +1713,7 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     outs = []
     for small in (True, False, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-        _get_compiled_topk(topk, small)(score, out, nvp_unused, P, 0, 0, S, H)
+        _get_compiled_topk(topk, small, False)(score, out, nvp_unused, P, 0, 0, S, H)
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"
