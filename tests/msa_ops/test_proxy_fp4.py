@@ -443,7 +443,10 @@ def test_proxy_split_k_heuristic():
     """The kv-block split factor is 1 once the base grid fills the SMs and grows
     as the base grid shrinks (low-batch decode), capped by max_k_tiles."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops.proxy_score import _proxy_split_k_fp4
+    from flashinfer.msa_ops.proxy_score import (
+        _proxy_split_k_fp4,
+        _split_k_makespan_argmin,
+    )
 
     dev = torch.device("cuda")
     sm = torch.cuda.get_device_properties(dev).multi_processor_count
@@ -452,8 +455,10 @@ def test_proxy_split_k_heuristic():
     # Trivial / degenerate -> no split.
     assert _proxy_split_k_fp4(8, 1, dev) == 1
     assert _proxy_split_k_fp4(0, 512, dev) == 1
-    # Small base grid -> split enough to reach ~2 CTAs/SM, capped by max_k_tiles.
-    assert _proxy_split_k_fp4(8, 512, dev) == -(-2 * sm // 8)
+    # Small base grid -> split toward ~2 CTAs/SM, capped by max_k_tiles. Assert
+    # against the makespan model itself (wave/tile quantization make it diverge
+    # from a closed form); keeps this independent of the runtime SM count.
+    assert _proxy_split_k_fp4(8, 512, dev) == _split_k_makespan_argmin(8, 512, 2 * sm)
     assert _proxy_split_k_fp4(4, 8, dev) == 8  # clamped to max_k_tiles
 
 

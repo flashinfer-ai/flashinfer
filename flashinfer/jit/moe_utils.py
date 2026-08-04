@@ -59,7 +59,7 @@ def gen_moe_utils_module() -> JitSpec:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
+        jit_env.FLASHINFER_GEN_SRC_DIR
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"
@@ -74,8 +74,14 @@ def gen_moe_utils_module() -> JitSpec:
         "-DENABLE_FP4",
     ]
 
+    # SM107 (Rubin) must be built for the sm100f family target: no public CUDA
+    # toolkit (13.0 or 13.2) accepts ``compute_107a``, so without this mapping
+    # nvcc aborts with "Unsupported gpu architecture 'compute_107a'". Every other
+    # MoE JitSpec already opts in; this one was missed. Because these flags are
+    # passed as ``extra_cuda_cflags`` they override the correctly-mapped global
+    # flags, so omitting it here is not merely redundant -- it breaks the build.
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
@@ -119,6 +125,7 @@ def gen_moe_utils_module() -> JitSpec:
             / "kernels"
             / "cutlass_kernels",
             # Include paths for routing kernels and downloaded headers
+            jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
     )

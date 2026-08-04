@@ -40,6 +40,7 @@ Utility Functions
     interleave_moe_scales_for_sm90_mixed_gemm
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
     fused_topk_deepseek
+    hash_topk
 
 The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
 scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted
@@ -81,6 +82,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
+    trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 

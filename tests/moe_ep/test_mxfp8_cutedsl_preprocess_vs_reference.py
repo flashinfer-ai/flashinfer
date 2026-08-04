@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
+# This test verifies MXFP8 preprocess + kernel output only through the
+# cutedsl_megamoe shim public API (including the torch reference it re-exports);
+# it never imports the src/ kernel packages directly, so a new src/ drop can't
+# silently break it.
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -182,12 +186,16 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from common.megamoe_constants import Mxfp8BlockSize
-    from moe_mxfp8_glu.mega_runner import (
+
+    # Verify only against the cutedsl_megamoe shim boundary: pull constants and
+    # reference tensor-makers from the package public API, never from the src/
+    # kernel packages directly (so a new src/ drop can't silently break tests).
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        Mxfp8ScaleDtype,
         _make_e8m0_scale_tensor,
         _make_fp8_tensor,
     )
-    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
     problem = _single_rank_problem()
     num_experts = problem["num_experts"]
@@ -280,7 +288,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -291,7 +299,12 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from moe_mxfp8_glu.mega_reference_mxfp8 import compute_megamoe_reference_mxfp8
+
+    # The MXFP8 torch reference is consumed via the shim boundary, not the src/
+    # package directly, so tests verify against a stable public surface.
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        compute_megamoe_reference_mxfp8,
+    )
 
     # monkeypatch (not os.environ): restored after the test, so it cannot
     # silently downgrade later nvshmem-path tests in the same process.
@@ -349,6 +362,11 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
         topk_idx = symm_buffer.topk_idx[:num_tokens]
         topk_weights = symm_buffer.topk_weights[:num_tokens]
 
+        # The kernel folds the per-token topk weight into fc1 (apply_topk_in_fc1
+        # defaults to True) *before* the MXFP8 fc1-out round-trip; post-hoc
+        # weighting would NOT match, because the quant step changes the effective
+        # magnitude. Apply it in the reference the same way and reduce with a
+        # plain sum over topk (the weight is already folded in).
         combine_ref = compute_megamoe_reference_mxfp8(
             input_activation=act.unsqueeze(0),
             input_activation_sf=act_sf.unsqueeze(0),
@@ -360,15 +378,9 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             fc2_weight_sf=fc2_plain_sf.unsqueeze(0),
             ab_dtype=data_dtype,
             gate_up_clamp=problem["gate_up_clamp"],
+            apply_topk_in_fc1=True,
         )
-        y_ref = (
-            (
-                combine_ref[0].to(torch.float32)
-                * topk_weights[:, :, None].to(torch.float32)
-            )
-            .sum(dim=1)
-            .to(torch.bfloat16)
-        )
+        y_ref = combine_ref[0].to(torch.float32).sum(dim=1).to(torch.bfloat16)
 
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
@@ -383,19 +395,13 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
         )
         torch.cuda.synchronize()
 
-        # Per-(token, topk) cells first (Form A); then the host top-k reduction.
-        # Random bf16 activations/weights yield |y|~1e2–1e3; kernel vs torch
-        # ref can differ by ~1 bf16 ULP (|Δ|≈8) on a handful of cells.
+        # The kernel now reduces the top-k combine internally, so only the
+        # reduced (T, hidden) output is exposed (the old form-A per-(token, topk)
+        # ``combine_output`` is gone). Random bf16 activations/weights yield
+        # |y|~1e2–1e3; kernel vs torch ref can differ by ~1 bf16 ULP (|Δ|≈8) on
+        # a handful of cells.
         _atol = 8.0
         _rtol = 0.05
-        y_kernel_per_topk = symm_buffer.combine_output[:num_tokens].to(torch.float32)
-        y_ref_per_topk = combine_ref[0].to(torch.float32)
-        torch.testing.assert_close(
-            y_kernel_per_topk,
-            y_ref_per_topk,
-            atol=_atol,
-            rtol=_rtol,
-        )
         torch.testing.assert_close(
             y_kernel.to(torch.float32),
             y_ref.to(torch.float32),

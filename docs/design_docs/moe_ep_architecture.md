@@ -2,6 +2,9 @@
 
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
+> For the CuTeDSL mega backends' tuning surface, measured performance, and
+> benchmark methodology, see
+> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -21,6 +24,13 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
+  kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
+    src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
+    shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
+    SKILL.md                   ← how to resync src/ when kernel team drops a new version
+    TUNING.md                  ← tuning surface, measured perf, benchmark methodology
+    ACKNOWLEDGEMENT.md         ← kernel authors
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -36,6 +46,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
+| `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
 **Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune transport. Fleet is lazy-created on first `forward()`; a new Handle per forward. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
 
@@ -260,3 +271,48 @@ sequenceDiagram
         Layer->>Runtime: finalize
     end
 ```
+
+## Fault tolerance
+
+Opt-in per Fleet with `FleetAlgoKnobFaultTolerance()`. Without it, a peer that
+stops responding during dispatch/combine trips a GPU `trap()` and takes the job
+down; with it, both transports mask the offending rank, skip it, and let the
+collective complete.
+
+**LOW_LATENCY only, on both transports** — `nccl_ep` leaves its mask buffer
+NULL under HIGH_THROUGHPUT (the mask APIs then abort the process) and `nixl_ep`
+has no HT mask at all. `validate_fleet_params` rejects the combination.
+
+### Mask convention
+
+Canonical across the package: **`int32[world_size]`, `1 = active`, `0 = masked`**,
+a CUDA tensor. This matches `ncclEpMaskQuery` and vLLM's `query_active_mask()`
+naming, so `nccl_ep` is a pass-through.
+
+`nixl_ep` differs on both axes and normalizes inside its own Fleet, so nothing
+else in the tree ever sees its convention:
+
+| | nccl_ep | nixl_ep |
+|---|---|---|
+| polarity | `1 = active` | **nonzero = masked** (buffer is `0xFF`-memset, so an untouched entry reads back as `-1`; kernels test `!= 0`) |
+| length | `world_size` | topology **capacity** (`query_mask_buffer` asserts on it) |
+| normalization | identity | `active = (raw[:world_size] == 0)` — **not** `1 - raw`, which yields `2` for never-connected tail ranks |
+
+### Fleet API
+
+| Method | Collective? | Blocks host? | Stream-ordered? |
+|---|---|---|---|
+| `supports_fault_tolerance` | — | no | no |
+| `query_fault()` | local | nccl no / nixl yes (small D2H) | nccl no / nixl yes |
+| `query_active_mask(out=None)` | local | no | **yes** |
+| `set_active_mask(mask)` | local (but must be applied identically everywhere) | no | **yes** |
+| `reconcile_active_mask()` | **store-collective**, tolerates dead ranks | yes (≤ timeout) | yes |
+| `clear_faults(readmit=False)` | local | no | no |
+| `clear_faults(readmit=True)` | **collective over survivors** | **yes** | yes |
+| `active_mask_epoch` | — | no | no |
+
+Reconciliation goes through the bootstrap rendezvous store
+(`resolve_rendezvous_store(..., subsystem="ft")`), never a `torch.distributed`
+allreduce: an allreduce over the EP group would hang on exactly the rank being
+masked out. See `core/comm/fault_tolerance.py` and the runbook for the protocol
+and the recovery state machine.

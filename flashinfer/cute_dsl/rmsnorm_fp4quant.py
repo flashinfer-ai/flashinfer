@@ -32,6 +32,7 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ..api_logging import flashinfer_api
+from .utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ..trace.templates.norm import rmsnorm_fp4quant_trace
 from ..utils import device_support_pdl
 from .fp4_common import (
@@ -861,6 +862,7 @@ def rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    _require_cute_dsl_arch_for(input.device)
     # Handle 2D vs 3D input
     is_3d = input.dim() == 3
     if is_3d:

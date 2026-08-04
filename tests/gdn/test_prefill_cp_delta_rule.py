@@ -25,7 +25,7 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
-from flashinfer.utils import is_sm90a_supported, is_sm120a_supported
+from flashinfer.utils import is_sm90a_supported, is_sm12x_supported
 
 if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
@@ -35,7 +35,7 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
         cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
     )
-elif torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda")):
+elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm120 import (
         cp_delta_rule_dsl_sm120 as cp_delta_rule_dsl,
         cp_delta_rule_fixup_dsl_sm120 as cp_delta_rule_fixup_dsl,
@@ -65,8 +65,8 @@ FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not (is_sm90a_supported(device) or is_sm120a_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM120")
+    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
+        pytest.skip("CP GDN prefill requires SM90 or SM12x")
 
 
 def _seed_all(seed):

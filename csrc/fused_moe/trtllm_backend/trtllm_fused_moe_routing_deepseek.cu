@@ -335,7 +335,7 @@ __global__ void routingMainKernel(KernelParams params) {
 
       float scoreNorm = laneIdx < params.mTopK ? smemScoreSigmoid[expertIdx] : 0.F;
       auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-      auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
+      auto finalScore = OutputT{scoreNorm * params.mRouteScale / (redNorm + params.mSumEpsilon)};
 
       // write expert idx out already
       auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
