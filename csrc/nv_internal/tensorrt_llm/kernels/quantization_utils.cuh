@@ -908,15 +908,10 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
-    // Saturate inf / finite-overflow to +/-E4M3 max (448) while preserving NaN.
-    // Comparison-based clamp: NaN fails both comparisons and passes through
-    // unchanged, matching torch's saturating float8_e4m3fn cast (inf -> +/-448,
-    // NaN -> NaN) and cvt.rn.satfinite's own NaN propagation. fminf/fmaxf must
-    // not be used here as they would collapse NaN to 448.
-    fp2Vals[i].x =
-        fp2Vals[i].x > 448.0f ? 448.0f : (fp2Vals[i].x < -448.0f ? -448.0f : fp2Vals[i].x);
-    fp2Vals[i].y =
-        fp2Vals[i].y > 448.0f ? 448.0f : (fp2Vals[i].y < -448.0f ? -448.0f : fp2Vals[i].y);
+    // Saturate to +/-E4M3 max (448) so inf / overflow map to the max finite
+    // value instead of NaN. This matches torch's saturating float8_e4m3fn cast.
+    fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
+    fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
   }
 
   // Convert to e4m3 values. Overload selected by `fp2Vals` array length:

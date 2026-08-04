@@ -268,14 +268,12 @@ def half2_to_fp8x2_scaled(
                 cvt.f32.f16 f1, h1;
                 mul.f32 f0, f0, $2;
                 mul.f32 f1, f1, $2;
-                // Saturate inf/overflow to +/-448 (E4M3 max) while preserving
-                // NaN, matching torch's saturating float8_e4m3fn cast. The .NaN
-                // qualifier propagates NaN (a plain min/max.f32 would return the
-                // non-NaN operand and collapse NaN to 448).
-                min.NaN.f32 f0, f0, 0f43E00000;
-                max.NaN.f32 f0, f0, 0fC3E00000;
-                min.NaN.f32 f1, f1, 0f43E00000;
-                max.NaN.f32 f1, f1, 0fC3E00000;
+                // Saturate to +/-448 (E4M3 max) so inf/overflow -> max finite,
+                // not NaN, matching torch's saturating float8_e4m3fn cast.
+                min.f32 f0, f0, 0f43E00000;
+                max.f32 f0, f0, 0fC3E00000;
+                min.f32 f1, f1, 0f43E00000;
+                max.f32 f1, f1, 0fC3E00000;
                 cvt.rn.satfinite.e4m3x2.f32 fp8_pair, f1, f0;
                 cvt.u32.u16 $0, fp8_pair;
             }
@@ -316,14 +314,12 @@ def bfloat2_to_fp8x2_scaled(
                 mov.b32 f1, hi;
                 mul.f32 f0, f0, $2;
                 mul.f32 f1, f1, $2;
-                // Saturate inf/overflow to +/-448 (E4M3 max) while preserving
-                // NaN, matching torch's saturating float8_e4m3fn cast. The .NaN
-                // qualifier propagates NaN (a plain min/max.f32 would return the
-                // non-NaN operand and collapse NaN to 448).
-                min.NaN.f32 f0, f0, 0f43E00000;
-                max.NaN.f32 f0, f0, 0fC3E00000;
-                min.NaN.f32 f1, f1, 0f43E00000;
-                max.NaN.f32 f1, f1, 0fC3E00000;
+                // Saturate to +/-448 (E4M3 max) so inf/overflow -> max finite,
+                // not NaN, matching torch's saturating float8_e4m3fn cast.
+                min.f32 f0, f0, 0f43E00000;
+                max.f32 f0, f0, 0fC3E00000;
+                min.f32 f1, f1, 0f43E00000;
+                max.f32 f1, f1, 0fC3E00000;
                 cvt.rn.satfinite.e4m3x2.f32 fp8_pair, f1, f0;
                 cvt.u32.u16 $0, fp8_pair;
             }
