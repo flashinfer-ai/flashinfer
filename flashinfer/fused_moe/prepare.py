@@ -44,8 +44,8 @@ from ..trace.templates.moe import (
 )
 from ..utils import get_compute_capability
 
-# Module-level permute-index cache.  Permute indices depend only on weight
-# dims, so the cache is safe to reuse across shapes and calls.
+# Module-level permute-index caches. Permute indices depend on weight geometry
+# and layout parameters, so matching keys are safe to reuse across calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE: dict = {}

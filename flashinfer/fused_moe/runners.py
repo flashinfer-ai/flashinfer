@@ -1673,19 +1673,11 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
                     f"{type(self).__name__}: FromLogits currently requires "
                     f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
                 )
-            if not act.routing_logits.is_contiguous():
-                raise ValueError(
-                    f"{type(self).__name__}: routing_logits must be contiguous."
-                )
             if act.routing_bias is not None:
                 if act.routing_bias.dtype != torch.bfloat16:
                     raise TypeError(
                         f"{type(self).__name__}: routing_bias must be bfloat16, "
                         f"got {act.routing_bias.dtype}."
-                    )
-                if not act.routing_bias.is_contiguous():
-                    raise ValueError(
-                        f"{type(self).__name__}: routing_bias must be contiguous."
                     )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
@@ -1701,10 +1693,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            weight_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = ((act.topk_ids << 16) | (weight_bits & 0xFFFF)).contiguous()
+            topk_ids = _pack_prerouted_topk_ids(act)
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )

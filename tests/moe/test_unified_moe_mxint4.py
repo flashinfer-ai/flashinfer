@@ -22,6 +22,10 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4Config,
     TrtllmMxInt4RoutedRunner,
 )
+from flashinfer.fused_moe.core import (
+    _maybe_get_cached_w3_w1_permute_indices,
+    get_w2_permute_indices_with_cache,
+)
 from flashinfer.fused_moe.prepare import _mxint4_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
@@ -304,68 +308,32 @@ def test_mxint4_prepare_matches_flat_test_layout():
     assert torch.equal(actual["gemm2_weights_scale"], expected["gemm2_scales"])
 
 
-@mxint4_required
-def test_mxint4_prepare_permute_cache_keys_include_layout_parameters():
-    device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(42)
+def test_w2_permute_cache_key_includes_epilogue_tile_m():
+    weight = torch.empty(128, 64, dtype=torch.uint8)
+    cache = {}
+    tile_64 = get_w2_permute_indices_with_cache(cache, weight, 64)
+    actual_tile_128 = get_w2_permute_indices_with_cache(cache, weight, 128)
+    expected_tile_128 = get_w2_permute_indices_with_cache({}, weight, 128)
 
-    def make_weights(hidden_size, intermediate_size):
-        w1 = torch.randn(
-            1,
-            2 * intermediate_size,
-            hidden_size,
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-        )
-        w2 = torch.randn(
-            1,
-            hidden_size,
-            intermediate_size,
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-        )
-        return w1, w2
+    assert not torch.equal(tile_64, expected_tile_128)
+    assert torch.equal(actual_tile_128, expected_tile_128)
 
-    shared_cache = {}
-    for hidden_size, intermediate_size in ((4096, 256), (256, 4096)):
-        large_w1, large_w2 = make_weights(hidden_size, intermediate_size)
-        TrtllmMxInt4Config.prepare_weights(
-            large_w1,
-            large_w2,
-            num_local_experts=1,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=device,
-            permute_cache=shared_cache,
-        )
 
-    # The large layers' W1/W2 scale shapes equal the small layer's respective
-    # payload shapes. A shared shape-only cache returned the wrong permutations.
-    small_w1, small_w2 = make_weights(256, 256)
-    actual = TrtllmMxInt4Config.prepare_weights(
-        small_w1,
-        small_w2,
-        num_local_experts=1,
-        hidden_size=256,
-        intermediate_size=256,
-        device=device,
-        permute_cache=shared_cache,
+def test_w3_w1_permute_cache_key_includes_gated_activation_mode():
+    weight = torch.empty(256, 64, dtype=torch.uint8)
+    cache = {}
+    gated = _maybe_get_cached_w3_w1_permute_indices(
+        cache, weight, 128, is_gated_act_gemm=True
     )
-    expected = TrtllmMxInt4Config.prepare_weights(
-        small_w1,
-        small_w2,
-        num_local_experts=1,
-        hidden_size=256,
-        intermediate_size=256,
-        device=device,
-        permute_cache={},
+    actual_ungated = _maybe_get_cached_w3_w1_permute_indices(
+        cache, weight, 128, is_gated_act_gemm=False
+    )
+    expected_ungated = _maybe_get_cached_w3_w1_permute_indices(
+        {}, weight, 128, is_gated_act_gemm=False
     )
 
-    assert actual.keys() == expected.keys()
-    for key in actual:
-        assert torch.equal(actual[key], expected[key]), key
+    assert not torch.equal(gated, expected_ungated)
+    assert torch.equal(actual_ungated, expected_ungated)
 
 
 @mxint4_required
