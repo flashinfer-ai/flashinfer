@@ -44,11 +44,12 @@ from ..trace.templates.moe import (
 )
 from ..utils import get_compute_capability
 
-# Module-level permute-index cache.  Permute indices depend only on weight
-# dims, so the cache is safe to reuse across shapes and calls.
+# Module-level permute-index caches. Permute indices depend on weight geometry
+# and layout parameters, so matching keys are safe to reuse across calls.
 _TRTLLM_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PERMUTE_CACHE: dict = {}
 _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE: dict = {}
+_TRTLLM_MXINT4_PERMUTE_CACHE: dict = {}
 
 
 # The E8M0 range clamp and residual-scale factorization are adapted from
@@ -969,6 +970,138 @@ def prepare_trtllm_fp8_per_tensor_activations(
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     quantized = (hidden_states_bf16.float() * scale).clamp(-fp8_max, fp8_max)
     return quantized.to(torch.float8_e4m3fn), None
+
+
+def _mxint4_quantize(
+    weights: torch.Tensor, sf_vec_size: int = 32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the last dimension to signed packed INT4 with BF16 block scales."""
+    blocks = weights.reshape(-1, sf_vec_size)
+    block_max = blocks.amax(dim=-1, keepdim=True).to(torch.float32)
+    block_min = blocks.amin(dim=-1, keepdim=True).to(torch.float32)
+    block_max = block_max * (8.0 / 7.0)
+    amax = torch.where(block_max > -block_min, block_max, -block_min)
+    scales = amax / 8.0
+    scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    quantized = (
+        (blocks * scales.reciprocal())
+        .round()
+        .clamp(-8, 7)
+        .to(torch.int8)
+        .reshape(-1, sf_vec_size // 2, 2)
+    )
+    nibbles = (quantized & 0x0F).to(torch.uint8)
+    packed = nibbles[..., 0] | (nibbles[..., 1] << 4)
+    return (
+        packed.reshape(*weights.shape[:-1], weights.shape[-1] // 2),
+        scales.to(torch.bfloat16),
+    )
+
+
+def prepare_trtllm_mxint4_weights(
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: Optional[torch.device] = None,
+    permute_cache: Optional[dict] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build the TRTLLM MxInt4 ``trtllm_mxint4_routed`` weight view.
+
+    Canonical BF16 expert weights are quantized in 32-element K blocks, then
+    shuffled for fused SwiGLU / transposed-MMA output. Packed INT4 payloads use
+    BlockMajorK while BF16 scale tensors use TRTLLM's block-scale interleave.
+    """
+    from ..quantization.fp4_quantization import block_scale_interleave
+    from .core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
+
+    if device is None:
+        device = w1_bf16.device
+    device = torch.device(device)
+    if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
+        raise ValueError(
+            "prepare_trtllm_mxint4_weights expects BF16 weights, got "
+            f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
+        )
+    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size)
+    if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
+        raise ValueError(
+            f"weight shapes {tuple(w1_bf16.shape)}/{tuple(w2_bf16.shape)} != "
+            f"expected {expected_w1}/{expected_w2}."
+        )
+    if hidden_size % 256 != 0 or intermediate_size % 256 != 0:
+        raise ValueError(
+            "TRTLLM MxInt4 requires hidden_size and intermediate_size divisible by 256."
+        )
+
+    w1 = w1_bf16.to(device).contiguous()
+    w2 = w2_bf16.to(device).contiguous()
+    w1_q, w1_sf = _mxint4_quantize(w1)
+    w2_q, w2_sf = _mxint4_quantize(w2)
+    w1_sf = w1_sf.reshape(num_local_experts, 2 * intermediate_size, hidden_size // 32)
+    w2_sf = w2_sf.reshape(num_local_experts, hidden_size, intermediate_size // 32)
+
+    if permute_cache is None:
+        permute_cache = _TRTLLM_MXINT4_PERMUTE_CACHE
+    epilogue_tile_m = 128
+    block_k = 128
+    w1_views, w1_scale_views, w2_views, w2_scale_views = [], [], [], []
+    for expert in range(num_local_experts):
+        w1_permute = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache, w1_q[expert], epilogue_tile_m
+        )
+        w1_scale_permute = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            w1_sf[expert],
+            epilogue_tile_m,
+            num_elts_per_sf=32,
+        )
+        w2_permute = get_w2_permute_indices_with_cache(
+            permute_cache, w2_q[expert], epilogue_tile_m
+        )
+        # Keep the established flat-test MxInt4 scale permutation contract;
+        # preparation parity tests cover this asymmetric GEMM1/GEMM2 setting.
+        w2_scale_permute = get_w2_permute_indices_with_cache(
+            permute_cache,
+            w2_sf[expert],
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+
+        w1_views.append(
+            convert_to_block_layout(
+                w1_q[expert][w1_permute.to(device)].contiguous(), block_k
+            )
+        )
+        w1_scale_views.append(
+            block_scale_interleave(
+                w1_sf[expert][w1_scale_permute.to(device)].contiguous()
+            )
+        )
+        w2_views.append(
+            convert_to_block_layout(
+                w2_q[expert][w2_permute.to(device)].contiguous(), block_k
+            )
+        )
+        w2_scale_views.append(
+            block_scale_interleave(
+                w2_sf[expert][w2_scale_permute.to(device)].contiguous()
+            )
+        )
+
+    return {
+        "gemm1_weights": torch.stack(w1_views),
+        "gemm1_weights_scale": torch.stack(w1_scale_views).view(torch.bfloat16),
+        "gemm2_weights": torch.stack(w2_views),
+        "gemm2_weights_scale": torch.stack(w2_scale_views).view(torch.bfloat16),
+    }
 
 
 def prepare_trtllm_bf16_weights(
