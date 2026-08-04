@@ -342,9 +342,10 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads)};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
-  auto kernel = (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                                LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND, Scheduler,
-                                                /*MULTIITEMSCORING=*/false, USE_CUSTOM_MASK>;
+  auto kernel =
+      (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND, Scheduler,
+                                      /*MULTIITEMSCORING=*/false, USE_CUSTOM_MASK>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

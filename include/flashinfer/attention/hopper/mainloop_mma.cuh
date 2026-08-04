@@ -18,9 +18,10 @@
 namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND,
-          bool MULTIITEMSCORING, bool USE_CUSTOM_MASK, typename WarpScheduler, typename AttentionVariant, typename Params,
-          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+          bool MULTIITEMSCORING, bool USE_CUSTOM_MASK, typename WarpScheduler,
+          typename AttentionVariant, typename Params, typename MainloopPipeline,
+          typename PipelineState, typename SharedStorage, typename FrgTensorO,
+          typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
     const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
     MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -190,11 +191,12 @@ CUTLASS_DEVICE void mma_f16(
   // DefaultAttention::LogitsMask. SFINAE-guarded so FP8 (no maybe_custom_mask)
   // still compiles. Returns true if the element is masked out.
   auto apply_custom_mask = [&](int qo_idx, int kv_idx) -> bool {
-    if constexpr (USE_CUSTOM_MASK && has_maybe_custom_mask_v<decltype(mainloop_params.additional_params)>) {
+    if constexpr (USE_CUSTOM_MASK &&
+                  has_maybe_custom_mask_v<decltype(mainloop_params.additional_params)>) {
       const bool valid = (qo_idx < qo_len) && (kv_idx < kv_len);
       const uint64_t off = static_cast<uint64_t>(qo_idx) * kv_len + kv_idx;
-      return !valid || !((mainloop_params.additional_params.maybe_custom_mask[off >> 3] >>
-                          (off & 7)) & 1);
+      return !valid ||
+             !((mainloop_params.additional_params.maybe_custom_mask[off >> 3] >> (off & 7)) & 1);
     } else {
       return false;
     }

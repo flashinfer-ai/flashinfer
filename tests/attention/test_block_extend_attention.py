@@ -561,9 +561,9 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
             )
             out = wrapper.run(q, k, v)
             diff = (out.float() - ref.float()).abs().max().item()
-            assert (
-                diff < tol
-            ), f"ragged backend={backend} block_size={block_size} diff={diff:.6f}"
+            assert diff < tol, (
+                f"ragged backend={backend} block_size={block_size} diff={diff:.6f}"
+            )
 
         # --- Paged path ---
         num_pages = (kv_len + page_size - 1) // page_size
@@ -638,6 +638,6 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
             )
             out = wrapper.run(q, paged_kv)
             diff = (out.float() - ref.float()).abs().max().item()
-            assert (
-                diff < tol
-            ), f"paged backend={backend} block_size={block_size} diff={diff:.6f}"
+            assert diff < tol, (
+                f"paged backend={backend} block_size={block_size} diff={diff:.6f}"
+            )
