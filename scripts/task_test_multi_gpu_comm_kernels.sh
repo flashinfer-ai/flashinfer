@@ -22,7 +22,7 @@ source "${SCRIPT_DIR}/test_utils.sh"
 # Define the specific test files for multi-GPU comm tests (single-node)
 # TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
 # Add others back once they are fixed
-TEST_FILES="tests/comm/test_allreduce_unified_api.py"
+TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_quantized_allreduce.py"
 
 # Tests that require torchrun instead of mpirun
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py"

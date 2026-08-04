@@ -42,6 +42,7 @@ layout helpers used by the FP4 GEMM/MoE pipelines.
     block_scale_interleave
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize
+    silu_and_mul_nvfp4_quantize
     shuffle_matrix_a
     shuffle_matrix_sf_a
 
@@ -59,6 +60,7 @@ GPU-accelerated quantization / dequantization for KV-cache data using the
 linear (non-swizzled) block-scale layout.
 
 - :func:`nvfp4_kv_dequantize`: SM80+ (Ampere and later)
+- :func:`nvfp4_kv_dequantize_paged`: SM80+ (Ampere and later)
 - :func:`nvfp4_kv_quantize`: SM100+ (Blackwell and later)
 - :func:`nvfp4_quantize_paged_kv_cache`
 
@@ -67,6 +69,7 @@ linear (non-swizzled) block-scale layout.
 
     nvfp4_kv_quantize
     nvfp4_kv_dequantize
+    nvfp4_kv_dequantize_paged
     nvfp4_quantize_paged_kv_cache
 
 FP8 Quantization

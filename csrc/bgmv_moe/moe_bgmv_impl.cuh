@@ -47,7 +47,7 @@ namespace cg = cooperative_groups;
 // ============================================================
 template <int feat_in, int feat_out, int RANK_TILE, int PAIRS_PER_BLOCK, int NUM_STAGES,
           size_t vec_size, size_t X_copy_size, size_t W_copy_size, int tx, int ty, typename in_T,
-          typename out_T, typename W_T>
+          typename out_T, typename W_T, bool PER_PAIR_INPUT = false>
 __global__ void moe_bgmv_shrink_sliced_kernel(
     out_T* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
     const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
@@ -77,7 +77,9 @@ __global__ void moe_bgmv_shrink_sliced_kernel(
         const int64_t eid = expert_ids[pair_idx];
         const int64_t lid = lora_indices[token_idx];
         if (lid >= 0) {
-          X_tok[pp] = X + token_idx * feat_in;
+          // PER_PAIR_INPUT: input row = pair (FC2 activation) vs token (FC1).
+          const int64_t in_row = PER_PAIR_INPUT ? static_cast<int64_t>(pair_idx) : token_idx;
+          X_tok[pp] = X + in_row * feat_in;
           W_base[pp] = w_ptr[slice_id * num_experts + eid] + lid * lora_stride + j0 * feat_in;
           pair_valid[pp] = true;
           continue;
@@ -260,8 +262,11 @@ __global__ void moe_bgmv_shrink_sliced_kernel(
 // ============================================================
 // MoE BGMV Expand Sliced Kernel
 // ============================================================
+// FINALIZE=true: combine a token's experts (output row = token, *topk_w, atomicAdd).
+// FINALIZE=false: per-pair, unweighted plain store (output row = pair). Both early-return
+// skipped pairs into a caller-pre-zeroed Y; only the final write differs (if constexpr).
 template <int feat_in, int feat_out, size_t vec_size, int tx, int ty, int tz, typename in_T,
-          typename W_T>
+          typename W_T, bool FINALIZE = true>
 __global__ void moe_bgmv_expand_sliced_kernel(
     float* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
     const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
@@ -277,7 +282,6 @@ __global__ void moe_bgmv_expand_sliced_kernel(
   if (lora_id < 0) return;
   int slice_id = blockIdx.z;
   int64_t expert_id = expert_ids[pair_idx];
-  float topk_w = topk_weights[pair_idx];
   int64_t col_offset = slice_start_loc[slice_id];
   const W_T* W = w_ptr[slice_id * num_experts + expert_id] + lora_id * lora_stride;
   auto block = cg::this_thread_block();
@@ -294,7 +298,12 @@ __global__ void moe_bgmv_expand_sliced_kernel(
   sum = g.shfl(sum, 0);
   if (threadIdx.x == 0) {
     int out_col = col_offset + tile_idx * (tz * ty) + threadIdx.z * ty + threadIdx.y;
-    atomicAdd(Y + token_idx * total_feat_out + out_col, sum * topk_w);
+    if constexpr (FINALIZE) {
+      float topk_w = topk_weights[pair_idx];
+      atomicAdd(Y + token_idx * total_feat_out + out_col, sum * topk_w);
+    } else {
+      Y[pair_idx * total_feat_out + out_col] = sum;
+    }
   }
 }
 
@@ -302,7 +311,9 @@ __global__ void moe_bgmv_expand_sliced_kernel(
 // Host-side dispatch: Shrink
 // ============================================================
 
-template <int feat_in, int feat_out, typename in_T, typename out_T, typename W_T>
+// Default for PER_PAIR_INPUT lives on the forward declaration in moe_bgmv_config.h.
+template <int feat_in, int feat_out, typename in_T, typename out_T, typename W_T,
+          bool PER_PAIR_INPUT>
 void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
                             W_T** __restrict__ w_ptr, const int64_t* sorted_token_ids,
                             const int64_t* expert_ids, const int64_t* lora_indices,
@@ -338,7 +349,7 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
                              (PPB) * RT * cfg_ty * sizeof(float);                              \
     auto kfn = &moe_bgmv_shrink_sliced_kernel<feat_in, feat_out, RT, (PPB), (NSTG), (VS),      \
                                               (VS) * sizeof(in_T), (VS) * sizeof(W_T), cfg_tx, \
-                                              cfg_ty, in_T, out_T, W_T>;                       \
+                                              cfg_ty, in_T, out_T, W_T, PER_PAIR_INPUT>;       \
     if constexpr (shmem > 48 * 1024)                                                           \
       cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);      \
     dim3 g((int)((num_pairs + (PPB) - 1) / (PPB)), gy, num_slices);                            \
@@ -374,7 +385,8 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
 // Host-side dispatch: Expand
 // ============================================================
 
-template <int feat_in, int feat_out, typename in_T, typename W_T>
+// Default for FINALIZE lives on the forward declaration in moe_bgmv_config.h.
+template <int feat_in, int feat_out, typename in_T, typename W_T, bool FINALIZE>
 void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
                             W_T** __restrict__ w_ptr, const int64_t* sorted_token_ids,
                             const int64_t* expert_ids, const int64_t* lora_indices,
@@ -391,21 +403,21 @@ void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
 
   if constexpr (32 % tx == 0 && feat_out % (32 / tx * tz) == 0) {
     constexpr int ty = 32 / tx;
-    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T>
+    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
         <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(
             Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc,
             num_pairs, num_experts, total_feat_out, current_feat_out, num_tokens, lora_stride,
             scale);
   } else if constexpr (16 % tx == 0 && feat_out % (16 / tx * tz) == 0) {
     constexpr int ty = 16 / tx;
-    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T>
+    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
         <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(
             Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc,
             num_pairs, num_experts, total_feat_out, current_feat_out, num_tokens, lora_stride,
             scale);
   } else if constexpr (8 % tx == 0 && feat_out % (8 / tx * tz) == 0) {
     constexpr int ty = 8 / tx;
-    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T>
+    moe_bgmv_expand_sliced_kernel<feat_in, feat_out, vec_size, tx, ty, tz, in_T, W_T, FINALIZE>
         <<<dim3(num_pairs, feat_out / (ty * tz), num_slices), dim3(tx, ty, tz), 0, stream>>>(
             Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices, topk_weights, slice_start_loc,
             num_pairs, num_experts, total_feat_out, current_feat_out, num_tokens, lora_stride,
@@ -416,13 +428,21 @@ void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
 // ============================================================
 // Instantiation macros
 // ============================================================
+// Instantiate both PER_PAIR_INPUT values.
 #define INST_MOE_BGMV_SHRINK_SLICED(feat_in, feat_out, in_T, out_T, W_T)                   \
-  template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T>(               \
+  template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T, false>(        \
+      out_T*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, int64_t, \
+      int64_t, int64_t, int64_t, int64_t, float);                                          \
+  template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T, true>(         \
       out_T*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, int64_t, \
       int64_t, int64_t, int64_t, int64_t, float);
 
+// Instantiate both FINALIZE values.
 #define INST_MOE_BGMV_EXPAND_SLICED(feat_in, feat_out, in_T, W_T)                               \
-  template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T>(                           \
+  template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T, true>(                     \
+      float*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, const float*, \
+      const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float);    \
+  template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T, false>(                    \
       float*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, const float*, \
       const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float);
 

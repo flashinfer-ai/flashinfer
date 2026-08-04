@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Reference Dockerfile for building FlashInfer with the moe_ep transport
-# backends enabled: NIXL-EP is compiled from the in-tree git submodule;
-# NCCL-EP is the released `nccl4py>=0.3.1` wheel (the `[nvep]` extra), which
-# ships the `nccl.ep` API + bundled libnccl_ep.so (no in-tree NCCL build).
+# backends enabled (the default): NIXL-EP is compiled from the in-tree git
+# submodule; NCCL-EP is the released `nccl4py>=0.3.1` wheel (a base
+# dependency), which ships the `nccl.ep` API + bundled libnccl_ep.so (no
+# in-tree NCCL build).
 #
 # Usage:
 #   cd /path/to/flashinfer
@@ -12,7 +13,7 @@
 #
 # Build args:
 #   BUILD_NVEP  — 0 to skip the moe_ep submodule builds (still installs
-#                 FlashInfer). Defaults to 1.
+#                 FlashInfer). Defaults to 1 (also the build hook's default).
 #   CUDA_IMAGE  — base image. Defaults to a CUDA 13 devel image.
 
 ARG CUDA_IMAGE=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
@@ -145,22 +146,21 @@ RUN uv pip install --python ${VENV}/bin/python --no-deps \
 # sys.executable inside build_backend.py points at uv's isolated env, meson
 # can't find torch, and NIXL EP is silently skipped.
 #
-# Backend selection — three knobs, all honored by build_backend.py:
-#   BUILD_NVEP=1      → legacy alias, turns both on (default for this image)
-#   BUILD_NCCL_EP=1   → build only the NCCL-EP backend
-#   BUILD_NIXL_EP=1   → build only the NIXL-EP backend
-# Override at build time, e.g.: `docker build --build-arg BUILD_NVEP=0
-# --build-arg BUILD_NCCL_EP=1 ...` for an NCCL-only image.
+# Backend selection — three knobs, all honored by build_backend.py (all
+# default ON in the hook; unset means "on, best-effort"):
+#   BUILD_NVEP=0      → legacy alias, turns both off
+#   BUILD_NCCL_EP=0/1 → disable / strictly require the NCCL-EP backend
+#   BUILD_NIXL_EP=0/1 → disable / strictly require the NIXL-EP backend
+# Override at build time, e.g.: `docker build --build-arg BUILD_NIXL_EP=0 ...`
+# for an NCCL-only image.
 #
-# Both backends default to a wheel-linked build: NCCL-EP points contrib's
-# Makefile BUILDDIR at the nvidia-nccl-cu13 wheel (skipping `make src.build`);
-# NIXL-EP applies a meson overlay (3rdparty_patches/nixl/0002-ep-only-build.patch)
-# that skips `subdir('src')` and links nixl_ep_cpp.so against the nixl-cu13
-# wheel's libnixl.so. The runtime loaders in flashinfer/moe_ep/{nccl,nixl}_ep
-# ctypes-preload the base libs from the same wheels. Set
-# BUILD_NCCL_EP_HERMETIC=1 / BUILD_NIXL_EP_HERMETIC=1 to opt back into the
-# full from-source build for either backend (for hosts without PyPI access
-# or when investigating ABI mismatches).
+# NIXL-EP defaults to a wheel-linked build: a meson overlay
+# (3rdparty_patches/nixl/0002-ep-only-build.patch) skips `subdir('src')` and
+# links nixl_ep_cpp.so against the nixl-cu13 wheel's libnixl.so. The runtime
+# loader in flashinfer/moe_ep/nixl_ep ctypes-preloads the base libs from the
+# same wheel. Set BUILD_NIXL_EP_HERMETIC=1 to opt back into the full
+# from-source build (for hosts without PyPI access or when investigating ABI
+# mismatches). NCCL-EP has no build step — it ships in the nccl4py wheel.
 ARG BUILD_NVEP=1
 ARG BUILD_NCCL_EP=
 ARG BUILD_NIXL_EP=
@@ -172,17 +172,17 @@ WORKDIR ${FLASHINFER_SRC}
 # the submodule .git pointers reference the host superproject's .git/modules/
 # tree which isn't copied, and `git apply` in _apply_patches works on a plain
 # directory without a git repo.
-# The `[nvep]` extra pulls the released `nccl4py>=0.3.1` wheel (NCCL-EP: the
-# `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. BUILD_NIXL_EP
-# still builds NIXL-EP from the submodule via the build hook.
+# The base deps pull the released `nccl4py>=0.3.1` wheel (NCCL-EP: the
+# `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. The build
+# hook builds NIXL-EP from the submodule by default.
 RUN BUILD_NVEP=${BUILD_NVEP} \
     BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
     uv pip install --python ${VENV}/bin/python \
-        --no-build-isolation -e ".[nvep]"
+        --no-build-isolation -e .
 
 # Smoke probe. Assertions fail the build if the EP backends weren't
-# actually produced — without these, a silent skip in BUILD_NVEP=1's
+# actually produced — without these, a silent skip in the default
 # best-effort mode (e.g. a probe miss on UCX, DOCA, or a wheel) would
 # ship a working FlashInfer image with no EP support and the failure
 # wouldn't surface until first use.

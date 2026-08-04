@@ -22,7 +22,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 #include <cuda_runtime_api.h>
 
@@ -65,7 +65,9 @@ void expandInputRowsKernelLauncher(
     bool use_per_expert_act_scale, int64_t* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    void const* prequant_scales, bool enable_pdl, cudaStream_t stream);
+    void const* prequant_scales, float* fp8_token_dequant_scale,
+    float const* fp8_token_residual_scale, float const** fp8_token_scale_ptr_array, bool enable_pdl,
+    cudaStream_t stream);
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(

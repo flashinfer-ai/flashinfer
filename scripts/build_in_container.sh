@@ -6,8 +6,8 @@
 # --container-image=nvcr.io/nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
 # --container-writable` session; it installs system deps, builds UCX
 # v1.21.x + GDRCopy v2.5.1 from source, creates a venv with FlashInfer
-# pinned, and finally runs `BUILD_NCCL_EP=1 BUILD_NIXL_EP=1 pip install
-# -e ".[nvep]"`.
+# pinned, and finally runs `BUILD_NIXL_EP=1 pip install -e .` (the EP
+# backends build by default; the explicit flag makes missing deps fatal).
 #
 # Env knobs:
 #   REPO_ROOT          path to the flashinfer checkout (defaults to PWD)
@@ -118,8 +118,9 @@ uv pip install --python "${VENV}/bin/python" \
 uv pip install --python "${VENV}/bin/python" --no-deps \
     "nixl-cu13>=1.0.1"
 
-# FlashInfer runtime deps + the [nvep] extra, installed explicitly here (WITH
-# their own deps) so the editable flashinfer install below can use --no-deps.
+# FlashInfer runtime deps (incl. the moe_ep deps, now part of the base
+# dependencies), installed explicitly here (WITH their own deps) so the
+# editable flashinfer install below can use --no-deps.
 # Why: torch 2.12's `cuda-toolkit[nvjitlink]` metapackage pin trips uv's
 # resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
 # mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.

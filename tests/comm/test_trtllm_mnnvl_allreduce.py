@@ -458,7 +458,7 @@ def run_mnnvl_ar_full(
 
             multicast_ptr = legacy_workspace.mc_ptr
             buffer_ptrs_dev = legacy_workspace.uc_ptrs_dev
-            unicast_ptr = legacy_workspace.handle.buffer_ptrs[mapping.tp_rank]
+            unicast_ptr = legacy_workspace.uc_ptr_local
 
         else:
             workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(

@@ -83,8 +83,15 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     return;
   }
 
-  // The actual number of seqLenKv.
-  int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
+  // The actual number of seqLenKv. Block-sparse attention uses per-KV-head sequence lengths
+  // laid out as [numHeadsKv, batchSize].
+  int32_t seqLenKv;
+  if (params.mUseBlockSparseAttention) {
+    int32_t const headIdxKv{headIdxO / params.mNumHeadsQPerKv};
+    seqLenKv = params.ptrSeqLensKv[headIdxKv * params.mBatchSize + batchIdx];
+  } else {
+    seqLenKv = params.ptrSeqLensKv[batchIdx];
+  }
   // Consider the causal-mask speculative decoding.
   seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
   // Consider sparseAttnTopK and variable sparse MLA topK lengths.

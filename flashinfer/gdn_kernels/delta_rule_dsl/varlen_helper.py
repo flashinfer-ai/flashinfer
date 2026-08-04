@@ -1,13 +1,29 @@
+import math
+
 import torch
 import cutlass
 import cutlass.cute as cute
 
 
+BLK = 64
 CP_CHUNK_LEN_GRANULARITY = 512
+CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
+CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 1
+CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
+CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
+CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
 CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
 CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_GDDR_PARALLELISM_THRESHOLD_DENOMINATOR = 3
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _round_up(a, b):
+    return _ceil_div(a, b) * b
 
 
 def chunk_bound_host(num_items: int, total: int, chunk_size: int) -> int:
@@ -53,6 +69,23 @@ def cp_parallelism_threshold_host(device_name: str) -> tuple[int, int]:
     )
 
 
+def cp_short_workload_ratio_host(
+    device_capability: tuple[int, int] | None = None,
+    num_heads: int | None = None,
+) -> tuple[int, int] | None:
+    if device_capability is not None and device_capability[0] == 12:
+        if num_heads is None or num_heads > CP_SM120_SHORT_HEURISTIC_MAX_HEADS:
+            return None
+        return (
+            CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR,
+            CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR,
+        )
+    return (
+        CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR,
+        CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR,
+    )
+
+
 def should_use_cp_host(num_parallel_work: int, num_sms: int, device_name: str) -> bool:
     """Return whether a public wrapper should dispatch to the CP path.
 
@@ -69,6 +102,9 @@ def choose_cp_chunk_len_host(
     num_heads: int,
     num_sms: int,
     chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
+    device_capability: tuple[int, int] | None = None,
+    total_seqlen: int | None = None,
+    device_name: str = "",
 ) -> int:
     """Choose a CP chunk length for the CP workspace kernels.
 
@@ -76,26 +112,35 @@ def choose_cp_chunk_len_host(
     launches `ceil_div(max_seqlen, chunk_len) * num_heads` CTAs. Pick the
     smallest granularity-aligned chunk length whose CTA count is at most one wave.
     """
-    if max_seqlen <= 0:
-        raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
-    if num_heads <= 0:
-        raise RuntimeError(f"num_heads must be positive, got {num_heads}")
-    if num_sms <= 0:
-        raise RuntimeError(f"num_sms must be positive, got {num_sms}")
-    if chunk_len_granularity <= 0:
-        raise RuntimeError(
-            f"chunk_len_granularity must be positive, got {chunk_len_granularity}"
-        )
-    if chunk_len_granularity % 64 != 0:
-        raise RuntimeError(
-            f"chunk_len_granularity must be a multiple of 64, got {chunk_len_granularity}"
-        )
+    assert chunk_len_granularity % 64 == 0
+    if total_seqlen is None:
+        total_seqlen = max_seqlen
 
+    # Short sequences are dominated by the fixup recurrence and
+    # prefill recurrence. Balance S / C * F against C / BLK * P, with tunable
+    # F/P measured from fixed-iteration profiles.
+    # S / C: Number of chunks per sequence
+    # C / BLK: Number of prefill iterations per chunk
+    # F: Fixup recurrence cost per iteration
+    # P: Prefill recurrence cost per iteration
+    # Then S / C * F = C / BLK * P => C = sqrt(S * BLK * F / P)
+    ratio = cp_short_workload_ratio_host(device_capability, num_heads)
+    if ratio is not None:
+        ratio_num, ratio_den = ratio
+        threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
+
+        approx_ctas = _ceil_div(total_seqlen, chunk_len_granularity) * num_heads
+        if approx_ctas * threshold_den < num_sms * threshold_num:
+            square = _ceil_div(max_seqlen * BLK * ratio_num, ratio_den)
+            balanced_chunk_len = math.isqrt(square)
+            if balanced_chunk_len * balanced_chunk_len < square:
+                balanced_chunk_len += 1
+            return max(BLK, _round_up(balanced_chunk_len, BLK))
+
+    # target for one wave of CTAs
     target_chunks = max(1, num_sms // num_heads)
-    min_chunk_len = (max_seqlen + target_chunks - 1) // target_chunks
-    return (
-        (min_chunk_len + chunk_len_granularity - 1) // chunk_len_granularity
-    ) * chunk_len_granularity
+    min_chunk_len = _ceil_div(max_seqlen, target_chunks)
+    return _round_up(min_chunk_len, chunk_len_granularity)
 
 
 @cute.jit

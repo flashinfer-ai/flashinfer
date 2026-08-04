@@ -230,12 +230,25 @@ The ``_metadata`` key records the environment that created the cache file
 
 On load, ``_metadata`` is compared against the current environment.  If any
 field differs (e.g. different GPU, FlashInfer version, or cuBLAS version),
-the **entire cache is skipped** — no configs are loaded, and the file will
-not be overwritten on exit; i.e. the autotuner would behave as if the cache
-file input was not provided (cache=None). This prevents silently using invalid
-tactics and avoids destroying configs tuned for a different environment.  A
-warning is logged with the mismatch details and a suggestion to use a
-different cache path for the current environment.
+the **entire cache is skipped** — no configs are loaded.  This prevents
+silently using invalid tactics.  A warning is logged once per process with
+the mismatch details; repeats for further cache files are logged at DEBUG.
+
+What happens to the file on the next save depends on the kind of mismatch:
+
+* The saved value is **definite** (e.g. ``"cudnn_version": "91900"`` vs
+  current ``92101``): the file belongs to a different environment sharing
+  this cache path.  It is never overwritten — the autotuner behaves as if
+  ``cache=None`` — so configs tuned for that environment survive.  Use a
+  different cache path for the current environment, or delete the file to
+  re-prime it.
+* The saved value is **indeterminate** (``"unknown"``, recorded when the
+  writer could not detect e.g. its cuDNN version, or a field missing from
+  files written by older FlashInfer versions): the file's configs cannot
+  be attributed to any environment, so the next tuned save **replaces**
+  the file with freshly tuned configs stamped with the current
+  environment's metadata.  The cache heals itself instead of forcing a
+  full re-tune on every startup forever.
 
 Advanced users can bypass individual checks by manually editing the JSON file
 and setting a metadata field to ``"*"``.  For example, setting

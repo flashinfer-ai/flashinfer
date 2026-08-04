@@ -45,8 +45,7 @@ except OSError as e:
 # Constants / enums
 # ---------------------------------------------------------------------------
 
-_CUDNN_MOE_MIN_VERSION = 91800  # 9.18.0
-_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION = 92100  # 9.21.0
+_CUDNN_MOE_MIN_VERSION = 92100  # 9.21.0
 
 
 class _CUDNN_UIDs(Enum):
