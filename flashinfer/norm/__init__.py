@@ -226,7 +226,8 @@ def rmsnorm_quant(
     Parameters
     ----------
     out: torch.Tensor
-        The output tensor, will quantize the output to the dtype of this tensor.
+        The output tensor, will quantize the output to the dtype of this tensor,
+        which must be float8_e4m3fn or float8_e5m2.
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size).
     weight: torch.Tensor
@@ -339,7 +340,8 @@ def fused_add_rmsnorm_quant(
     Parameters
     ----------
     out: torch.Tensor
-        The output tensor, will quantize the output to the dtype of this tensor.
+        The output tensor, will quantize the output to the dtype of this tensor,
+        which must be float8_e4m3fn or float8_e5m2.
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor

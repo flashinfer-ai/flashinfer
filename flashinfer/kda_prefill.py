@@ -20,7 +20,7 @@ Kimi Delta Attention Prefill - Backend Layer
 
 This file provides workspace management, validation, and frozen-kernel launch
 support for recurrent KDA prefill.  The stable public dispatcher remains in
-``flashinfer.kda_decode``.
+``flashinfer.kda``.
 """
 
 import math
@@ -32,11 +32,11 @@ import torch
 from .utils import get_compute_capability
 
 if TYPE_CHECKING:
-    from .jit.flash_kda import FlashKDAVariant
+    from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
 _FLASH_KDA_BETA_TMA_MIN_HEADS = 8
-_FLASH_KDA_B200_COMPUTE_CAPABILITY = (10, 0)
+_FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
@@ -166,7 +166,8 @@ def _flash_kda_prefill_is_eligible(
         return False
     if (
         not q.is_cuda
-        or get_compute_capability(q.device) != _FLASH_KDA_B200_COMPUTE_CAPABILITY
+        or get_compute_capability(q.device)
+        not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
     ):
         return False
     if not _is_contiguous_cuda_tensor(q, dtype=torch.bfloat16, device=q.device):
@@ -395,10 +396,10 @@ def _beta_tma_source(
             "this stream before capture"
         ),
     ).view(shape)
-    # The descriptor may fetch a full (32 token, 8 head) box at the tail.
-    # Clear reused padding so every legal OOB-adjacent fetch has defined data.
-    padded.zero_()
-    padded[:total_tokens, :num_heads].copy_(beta_flat)
+    # The frozen binding refreshes head-padded storage from ``beta`` immediately
+    # before launching the frozen kernel. Keeping pack + main-kernel submission
+    # in one FFI call avoids two Python-dispatched activities and their host gap,
+    # while retaining stable storage for the TMA descriptor and CUDA graphs.
     return padded
 
 
@@ -518,10 +519,41 @@ def _validate_prefill_seq_order(
     return seq_order
 
 
-def _get_flash_kda_prefill_module(variant: "FlashKDAVariant"):
+def _is_cuda_version_at_least(version: str) -> bool:
+    # Keep JIT imports lazy so importing the public KDA facade does not
+    # initialize the extension toolchain.
+    from .jit.cpp_ext import is_cuda_version_at_least
+
+    return is_cuda_version_at_least(version)
+
+
+def _select_flash_kda_prefill_target(device: torch.device) -> "FlashKDATarget":
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+        raise RuntimeError(
+            "frozen recurrent-KDA prefill requires compute capability 10.0 "
+            "(SM100a; B200/GB200) or 10.3 (SM103a; B300/GB300); got "
+            f"{compute_capability[0]}.{compute_capability[1]}"
+        )
+    if _is_cuda_version_at_least("12.9"):
+        return "sm100f"
+    if compute_capability == (10, 0) and _is_cuda_version_at_least("12.8"):
+        return "sm100a"
+    if compute_capability == (10, 3):
+        raise RuntimeError(
+            "frozen recurrent-KDA prefill on compute capability 10.3 requires "
+            "CUDA 12.9 or newer for the sm_100f family target"
+        )
+    raise RuntimeError(
+        "frozen recurrent-KDA prefill on compute capability 10.0 requires "
+        "CUDA 12.8 or newer"
+    )
+
+
+def _get_flash_kda_prefill_module(variant: "FlashKDAVariant", target: "FlashKDATarget"):
     from .jit.flash_kda import get_flash_kda_prefill_module
 
-    return get_flash_kda_prefill_module(variant)
+    return get_flash_kda_prefill_module(variant, target)
 
 
 def _run_flash_kda_prefill(
@@ -634,6 +666,7 @@ def _run_flash_kda_prefill(
         num_sequences=num_sequences,
         num_heads=num_heads,
     )
+    target = _select_flash_kda_prefill_target(q.device)
     stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase
@@ -681,7 +714,7 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        module = _get_flash_kda_prefill_module(variant)
+        module = _get_flash_kda_prefill_module(variant, target)
         try:
             module.run(
                 q,

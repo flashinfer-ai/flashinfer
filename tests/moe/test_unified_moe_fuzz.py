@@ -76,9 +76,10 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
     every mode, so a kernel that routes wrong is caught by check #2. In-kernel routing is
     single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
-Coverage today: NVFP4 (CuteDSL pre-routed + TRTLLM-FP4 packed/unpacked pre-routed/in-kernel) on
-SM100 -- CuteDSL is pre-routed-only, while FromLogits and UnpackedPrecomputed restrict to the
-TRTLLM FP4 backend.
+Coverage today: NVFP4, BF16, block-FP8, and per-tensor FP8 on SM100. TRTLLM
+FP4 supports packed/unpacked pre-routed and in-kernel routing; BF16, block-FP8,
+and per-tensor FP8 support packed pre-routed and in-kernel routing. CuteDSL is
+pre-routed-only.
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
 SKIPPED unless that env var is set -- waived in CI pending root-cause of a
@@ -387,6 +388,16 @@ def _bf16_act_pack(x, selected_experts, final_scales):
     )
 
 
+def _bf16_act_pack_logits(x, routing_logits, routing_bias):
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+    )
+
+
 def _bf16_reference(
     x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
 ):
@@ -634,6 +645,21 @@ def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
     )
 
 
+def _fp8_per_tensor_act_pack(x, selected_experts, final_scales):
+    input_scale = _fp8_per_tensor_global_scale(x)
+    q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=input_scale
+    )
+    assert sf is None
+    return MoEActivationPack(
+        hidden_states_q=q,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
+    )
+
+
 def _fp8_per_tensor_dequant_experts(weights):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     amax = weights.float().abs().amax(dim=(-1, -2))
@@ -652,6 +678,7 @@ def _fp8_per_tensor_reference(
     expert_offset=0,
 ):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    final_scales = final_scales.to(torch.bfloat16).float()
     input_scale = _fp8_per_tensor_global_scale(x)
     intermediate_scale = torch.tensor(64.0, device=x.device)
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
@@ -692,7 +719,7 @@ _DTYPE = {
         candidate_configs=(TrtllmBf16Config,),
         snap=_bf16_snap,
         make_act_pack=_bf16_act_pack,
-        make_act_pack_logits=None,
+        make_act_pack_logits=_bf16_act_pack_logits,
         reference=_bf16_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
@@ -737,7 +764,7 @@ _DTYPE = {
         variant=QuantVariant.FP8PerTensor,
         candidate_configs=(TrtllmFp8PerTensorConfig,),
         snap=_block_fp8_snap,
-        make_act_pack=None,
+        make_act_pack=_fp8_per_tensor_act_pack,
         make_act_pack_logits=_fp8_per_tensor_act_pack_logits,
         reference=_fp8_per_tensor_reference,
         poison=_poison_bf16_out,
@@ -993,11 +1020,15 @@ def _gen(seed):
         )  # route within the local shard
 
     fromlogits_variants = _FROMLOGITS_VARIANT_IDS
+    prerouted_variants = _PREROUTED_VARIANT_IDS
     if method == RoutingMethodType.Llama4:
         # Per-tensor FP8 applies the Llama4 route scale on GEMM1 input rather
         # than in finalization, so it needs a method-aware reference.
         fromlogits_variants = tuple(
             variant for variant in fromlogits_variants if variant != "fp8pertensor"
+        )
+        prerouted_variants = tuple(
+            variant for variant in prerouted_variants if variant != "fp8pertensor"
         )
 
     variant = (
@@ -1005,7 +1036,7 @@ def _gen(seed):
         if fromlogits
         else rng.choice(_UNPACKED_VARIANT_IDS)
         if unpacked
-        else rng.choice(_PREROUTED_VARIANT_IDS)
+        else rng.choice(prerouted_variants)
     )
     # The legacy TRTLLM MXFP4 modes are validated only with BF16 router logits.
     logits_dtype = (
@@ -1113,6 +1144,34 @@ _CURATED = [
         2048, 1024, 1024, 128, 6, "bf16", "imbalanced", 900_010
     ),  # bf16 mid size + empty-expert load
     Cfg(
+        64,
+        512,
+        512,
+        32,
+        4,
+        "bf16",
+        "uniform",
+        900_032,
+        routing_method=RoutingMethodType.Default,
+        routing_input_mode="fromlogits",
+        logits_dtype="fp32",
+    ),  # BF16 FromLogits with FP32 logits; seed % 4 == 0 exercises autotuning
+    Cfg(
+        64,
+        512,
+        512,
+        32,
+        4,
+        "bf16",
+        "uniform",
+        900_033,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        routing_input_mode="fromlogits",
+        n_group=4,
+        topk_group=2,
+        routed_scaling=1.0,
+    ),  # BF16 FromLogits bias/group routing
+    Cfg(
         16,
         7168,
         2048,
@@ -1161,7 +1220,18 @@ _CURATED = [
         routing_method=RoutingMethodType.Default,
         routing_input_mode="fromlogits",
         logits_dtype="fp32",
-    ),  # per-tensor FP8 is FromLogits-only; seed % 4 == 0 exercises autotuning
+    ),  # per-tensor FP8 FromLogits; seed % 4 == 0 exercises autotuning
+    Cfg(
+        256,
+        1024,
+        512,
+        32,
+        4,
+        "fp8pertensor",
+        "uniform",
+        900_036,
+        routing_input_mode="prerouted",
+    ),  # per-tensor FP8 packed routing; seed % 4 == 0 exercises autotuning
     Cfg(
         64,
         512,
