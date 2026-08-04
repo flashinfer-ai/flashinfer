@@ -7,6 +7,8 @@ import pytest
 import torch
 
 import flashinfer
+import flashinfer.mla._core as mla_core
+import flashinfer.mla._batch_mla._functional as mla_functional
 from tests.test_helpers.mla import (
     MLATestCase,
     assert_mla_close,
@@ -172,6 +174,7 @@ _AUTO_CASES = (
 _PUBLIC_MLA_API = {
     "MLAHeadDimensions",
     "deepseek_mla_dimensions",
+    "nope_mla_dimensions",
     "smaller_mla_dimensions",
     "supported_mla_head_dimensions",
     "MLALayerDimensions",
@@ -274,7 +277,13 @@ def test_supported_functional_api_emits_no_deprecation_warning():
     assert not [item for item in caught if item.category is DeprecationWarning]
 
 
-def test_trtllm_legacy_facade_warns_and_preserves_output_identity():
+def test_trtllm_legacy_facade_warns_once_and_preserves_output_identity(monkeypatch):
+    monkeypatch.setattr(
+        mla_core,
+        "_trtllm_batch_decode_with_kv_cache_mla_warning_emitted",
+        False,
+        raising=False,
+    )
     case = MLATestCase(
         "sm100-trtllm-legacy", (10, 0), "trtllm-gen", qk_nope_head_dim=128
     )
@@ -285,14 +294,26 @@ def test_trtllm_legacy_facade_warns_and_preserves_output_identity():
     out = torch.empty((2, 1, 128, 512), dtype=case.output_dtype, device="cuda")
     kwargs["out"] = out
 
-    with pytest.warns(DeprecationWarning, match="batch_mla_paged_attention"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         result = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(**kwargs)
+        second_result = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(**kwargs)
 
+    deprecations = [item for item in caught if item.category is DeprecationWarning]
+    assert len(deprecations) == 1
+    assert "batch_mla_paged_attention" in str(deprecations[0].message)
     assert result.data_ptr() == out.data_ptr()
+    assert second_result.data_ptr() == out.data_ptr()
     assert_mla_close(result.reshape_as(expected_output), expected_output)
 
 
-def test_xqa_legacy_facade_warns_and_matches_reference():
+def test_xqa_legacy_facade_warns_once_and_matches_reference(monkeypatch):
+    monkeypatch.setattr(
+        mla_functional,
+        "_xqa_batch_decode_with_kv_cache_mla_warning_emitted",
+        False,
+        raising=False,
+    )
     case = MLATestCase("sm120-xqa-legacy", (12, 0), "xqa", qk_nope_head_dim=128)
     require_architecture(case.architecture)
     inputs = make_mla_inputs(case)
@@ -308,23 +329,43 @@ def test_xqa_legacy_facade_warns_and_matches_reference():
     ):
         kwargs.pop(name)
 
-    with pytest.warns(DeprecationWarning, match="batch_mla_paged_attention"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         result = flashinfer.mla.xqa_batch_decode_with_kv_cache_mla(**kwargs)
+        second_result = flashinfer.mla.xqa_batch_decode_with_kv_cache_mla(**kwargs)
 
+    deprecations = [item for item in caught if item.category is DeprecationWarning]
+    assert len(deprecations) == 1
+    assert "batch_mla_paged_attention" in str(deprecations[0].message)
     assert_mla_close(result.reshape_as(expected_output), expected_output)
+    assert_mla_close(second_result.reshape_as(expected_output), expected_output)
 
 
-def test_xqa_legacy_fi_trace_warns():
-    with pytest.warns(DeprecationWarning, match="batch_mla_paged_attention"):
+def test_xqa_legacy_fi_trace_warns_once(monkeypatch):
+    monkeypatch.setattr(
+        mla_functional,
+        "_xqa_batch_decode_with_kv_cache_mla_warning_emitted",
+        False,
+        raising=False,
+    )
+    kwargs = dict(
+        query=torch.empty(2, 1, 128, 576, dtype=torch.bfloat16),
+        kv_cache=torch.empty(4, 1, 64, 576, dtype=torch.bfloat16),
+        workspace_buffer=torch.empty(1024, dtype=torch.int8),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.zeros(2, 1, dtype=torch.int32),
+        seq_lens=torch.full((2,), 64, dtype=torch.int32),
+        max_seq_len=64,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         definition = flashinfer.mla.xqa_batch_decode_with_kv_cache_mla.fi_trace(
-            query=torch.empty(2, 1, 128, 576, dtype=torch.bfloat16),
-            kv_cache=torch.empty(4, 1, 64, 576, dtype=torch.bfloat16),
-            workspace_buffer=torch.empty(1024, dtype=torch.int8),
-            qk_nope_head_dim=128,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            block_tables=torch.zeros(2, 1, dtype=torch.int32),
-            seq_lens=torch.full((2,), 64, dtype=torch.int32),
-            max_seq_len=64,
+            **kwargs
         )
+        flashinfer.mla.xqa_batch_decode_with_kv_cache_mla.fi_trace(**kwargs)
+    deprecations = [item for item in caught if item.category is DeprecationWarning]
+    assert len(deprecations) == 1
+    assert "batch_mla_paged_attention" in str(deprecations[0].message)
     assert definition["name"].startswith("xqa_batch_decode_mla")

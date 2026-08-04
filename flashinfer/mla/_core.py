@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import functools
 import math
 import os
+import threading
 import warnings
 from typing import (
     List,
@@ -45,6 +46,26 @@ from ..utils import (
     log2e,
 )
 from ._sparse_mla_sm120 import _run_mla_decode_sparse_sm120
+
+
+_trtllm_batch_decode_with_kv_cache_mla_warning_emitted = False
+_trtllm_batch_decode_with_kv_cache_mla_warning_lock = threading.Lock()
+
+
+def _warn_trtllm_batch_decode_with_kv_cache_mla_once() -> None:
+    global _trtllm_batch_decode_with_kv_cache_mla_warning_emitted
+    if _trtllm_batch_decode_with_kv_cache_mla_warning_emitted:
+        return
+    with _trtllm_batch_decode_with_kv_cache_mla_warning_lock:
+        if _trtllm_batch_decode_with_kv_cache_mla_warning_emitted:
+            return
+        warnings.warn(
+            "trtllm_batch_decode_with_kv_cache_mla is deprecated; "
+            "use batch_mla_paged_attention instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        _trtllm_batch_decode_with_kv_cache_mla_warning_emitted = True
 
 
 __all__ = (
@@ -1707,12 +1728,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    warnings.warn(
-        "trtllm_batch_decode_with_kv_cache_mla is deprecated; "
-        "use batch_mla_paged_attention instead.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
+    _warn_trtllm_batch_decode_with_kv_cache_mla_once()
     return _batch_mla_paged_attention_impl(
         query=query,
         kv_cache=kv_cache,
@@ -1757,16 +1773,11 @@ _trtllm_batch_decode_with_kv_cache_mla_fi_trace = (
 
 
 @functools.wraps(_trtllm_batch_decode_with_kv_cache_mla_fi_trace)
-def _deprecated_trtllm_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs):
-    warnings.warn(
-        "trtllm_batch_decode_with_kv_cache_mla is deprecated; "
-        "use batch_mla_paged_attention instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
+def _warn_once_trtllm_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs):
+    _warn_trtllm_batch_decode_with_kv_cache_mla_once()
     return _trtllm_batch_decode_with_kv_cache_mla_fi_trace(*args, **kwargs)
 
 
 trtllm_batch_decode_with_kv_cache_mla.fi_trace = (  # type: ignore[attr-defined]
-    _deprecated_trtllm_batch_decode_with_kv_cache_mla_fi_trace
+    _warn_once_trtllm_batch_decode_with_kv_cache_mla_fi_trace
 )

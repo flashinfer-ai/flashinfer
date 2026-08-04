@@ -24,10 +24,7 @@ from ._capabilities import (
     MLAPlanCapabilities,
     validate_plan_capabilities,
 )
-from .._planning import (
-    _MLAPlanArguments,
-    _validate_dense_metadata,
-)
+from .._planning import _MLAPlanArguments
 from .._contracts import (
     MLAKVCache,
     MLAQuery,
@@ -583,7 +580,7 @@ class CutlassMlaRunner(TunableRunner):
                 dtype=request.query.dtype,
                 device=request.query.device,
             )
-        self._normalize_request(replace(request, out=initial_out))
+        self._prepared = self._normalize_request(replace(request, out=initial_out))
         self._inputs = [
             request.query,
             request.block_tables,
@@ -671,6 +668,8 @@ class CutlassMlaRunner(TunableRunner):
             )
         if request.seq_lens is None:
             raise ValueError("seq_lens is required for cutlass MLA.")
+        if not isinstance(request.block_tables, torch.Tensor):
+            raise ValueError("block_tables is required for cutlass MLA.")
         page_size = kv_cache.shape[1]
         if page_size <= 0:
             raise ValueError("kv_cache page_size must be positive.")
@@ -680,21 +679,9 @@ class CutlassMlaRunner(TunableRunner):
             raise ValueError("workspace_buffer must be a torch.Tensor.")
         if request.workspace_buffer.device != query.device:
             raise ValueError("workspace_buffer must be on the query device.")
-        cumulative_q = torch.arange(
-            query.shape[0] + 1, dtype=torch.int32, device=query.device
-        )
-        dense = _validate_dense_metadata(
-            cum_seq_lens_q=cumulative_q,
-            block_tables=request.block_tables,
-            seq_lens=request.seq_lens,
-            max_q_len=1,
-            page_size=page_size,
-            device=query.device,
-            table_width_alignment=128 // page_size,
-        )
         _validate_cutlass_metadata(
-            dense.seq_lens,
-            dense.block_tables,
+            request.seq_lens,
+            request.block_tables,
             batch_size=query.shape[0],
             page_size=page_size,
             device=query.device,
@@ -710,12 +697,14 @@ class CutlassMlaRunner(TunableRunner):
             raise ValueError(
                 "out must match the functional CUTLASS output shape, dtype, and device."
             )
-        _check_cutlass_shape(query[:, 0], kv_cache, dense.seq_lens, dense.block_tables)
+        _check_cutlass_shape(
+            query[:, 0], kv_cache, request.seq_lens, request.block_tables
+        )
         return (
             query[:, 0],
             kv_cache,
-            dense.seq_lens,
-            dense.block_tables,
+            request.seq_lens,
+            request.block_tables,
             float(request.bmm1_scale),
         )
 
@@ -740,20 +729,25 @@ class CutlassMlaRunner(TunableRunner):
         if len(inputs) != 4:
             raise ValueError("cutlass MLA runner expects four dynamic inputs.")
         query, block_tables, seq_lens, out = inputs
-        request = replace(
-            self.request,
-            query=query,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            out=out,
-        )
-        self._validate_functional_options(request)
-        packed_query, kv_cache, kv_len, page_table, sm_scale = self._normalize_request(
-            request
-        )
+        if all(
+            actual is prepared
+            for actual, prepared in zip(inputs, self._inputs, strict=True)
+        ):
+            packed_query, kv_cache, kv_len, page_table, sm_scale = self._prepared
+        else:
+            request = replace(
+                self.request,
+                query=query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                out=out,
+            )
+            self._validate_functional_options(request)
+            normalized = self._normalize_request(request)
+            packed_query, kv_cache, kv_len, page_table, sm_scale = normalized
         lse = torch.empty(0, dtype=torch.float32, device=query.device)
         get_mla_module().cutlass_mla_paged_attention(
-            request.workspace_buffer,
+            self.request.workspace_buffer,
             out[:, 0],
             lse,
             packed_query,

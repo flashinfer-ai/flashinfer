@@ -22,6 +22,7 @@ from ._core import (
     MLAQuery,
     batch_mla_paged_attention,
     deepseek_mla_dimensions,
+    nope_mla_dimensions,
     smaller_mla_dimensions,
     supported_mla_head_dimensions,
     supported_mla_layer_dimensions,
@@ -33,6 +34,7 @@ from ._core import (
 __all__ = (
     "MLAHeadDimensions",
     "deepseek_mla_dimensions",
+    "nope_mla_dimensions",
     "smaller_mla_dimensions",
     "supported_mla_head_dimensions",
     "MLALayerDimensions",

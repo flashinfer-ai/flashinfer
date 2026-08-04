@@ -398,6 +398,32 @@ class BatchMLAPagedAttentionWrapper:
         trace = self._auto_selection_trace
         return () if trace is None else trace.rejections
 
+    def _generated_fa_backend(self) -> Any:
+        """Return generated-FA state exposed by the legacy wrapper contract.
+
+        SGLang's CUDA-graph replay planner reaches this state through the
+        wrapper.  Keep those aliases while the backend redesign owns the
+        underlying objects, without copying state or adding run-path work.
+        """
+        if self._selected_backend not in ("fa2", "fa3") or self._backend_impl is None:
+            raise AttributeError(
+                "generated-FA planning state is available only after a successful "
+                "FA2 or FA3 plan"
+            )
+        return self._backend_impl
+
+    @property
+    def _cached_module(self) -> Any:
+        return self._generated_fa_backend()._cached_module
+
+    @property
+    def _int_workspace_buffer(self) -> torch.Tensor:
+        return self._generated_fa_backend()._int_workspace_buffer
+
+    @property
+    def _pin_memory_int_workspace_buffer(self) -> torch.Tensor:
+        return self._generated_fa_backend()._pin_memory_int_workspace_buffer
+
     def _reject_unsafe_cuda_graph_replan(self) -> None:
         if self._use_cuda_graph and self._selected_backend in (
             "cutlass",

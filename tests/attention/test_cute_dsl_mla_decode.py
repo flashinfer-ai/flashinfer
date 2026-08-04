@@ -1332,6 +1332,8 @@ def test_monolithic_workspace_cap_drops_empty_partitions():
         )
         == 8
     )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
 @pytest.mark.parametrize("page_size", [32, 128])
@@ -2478,6 +2480,8 @@ def test_mla_decode_variable_q_auto_uses_cute_dsl_for_head_gap():
         max_q_len=8,
         public_backend="auto",
     )
+
+
 def _batch_mla_wrapper_cute_dsl_case(metadata_form, wrapper_backend, cute_dsl_impl):
     skip_if_unsupported()
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
