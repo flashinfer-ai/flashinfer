@@ -42,7 +42,7 @@ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND, typename TileScheduler,
-          bool MULTIITEMSCORING = false>
+          bool MULTIITEMSCORING = false, bool USE_CUSTOM_MASK = false>
 __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
                              typename CollectiveMainloop::Params const mainloop_params,
@@ -285,7 +285,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
       }
       mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND,
-              MULTIITEMSCORING, CollectiveMainloop::WarpScheduler>(
+              MULTIITEMSCORING, USE_CUSTOM_MASK, CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND,
-          typename Params>
+          bool USE_CUSTOM_MASK, typename Params>
 cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
   using DTypeKV = typename KernelTraits::DTypeKV;
@@ -342,9 +342,9 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads)};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
-  auto kernel =
-      (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND, Scheduler>;
+  auto kernel = (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+                                                LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND, Scheduler,
+                                                /*MULTIITEMSCORING=*/false, USE_CUSTOM_MASK>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -541,11 +541,11 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
-  }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr bool BLOCK_EXTEND = MASK_MODE == MaskMode::kBlockExtend;
+  // Custom (packed-bitmask) mask: element-wise mask read inside the mainloop's
+  // masking loops. Treat it like the non-causal tile schedule (no diagonal).
+  constexpr bool USE_CUSTOM_MASK = MASK_MODE == MaskMode::kCustom;
   constexpr auto CTA_TILE_SIZE = getCTATileSize < HEAD_DIM_QK, HEAD_DIM_VO,
                  CAUSAL || BLOCK_EXTEND > ();
   SinglePrefillWithKVCacheKernelTraitsDispatched<
@@ -554,7 +554,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND>(params, stream);
+      LEFT_SLIDING_WINDOW, CAUSAL, BLOCK_EXTEND, USE_CUSTOM_MASK>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }

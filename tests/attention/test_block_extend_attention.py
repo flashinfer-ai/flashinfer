@@ -37,15 +37,21 @@ def block_extend_reference(
     q_offset: int = 0,
     kv_offset: int = 0,
     sm_scale: float,
+    backend: str = "fa2",
 ) -> torch.Tensor:
-    """Reference the block mask with the existing custom-mask path."""
+    """Reference the block mask with the existing custom-mask path.
+
+    The FA3 backend now supports ``custom_mask`` for the single-prefill path
+    (SM90+), so an FA3 reference can be produced for cross-checking by
+    passing ``backend="fa3"``.
+    """
     q_pos = torch.arange(q.shape[0], device=q.device) + q_offset
     kv_pos = torch.arange(k.shape[0], device=k.device) + kv_offset
     mask = ((q_pos[:, None] // block_size) >= (kv_pos[None, :] // block_size)).to(
         torch.uint8
     )
     return single_prefill_with_kv_cache(
-        q, k, v, custom_mask=mask, sm_scale=sm_scale, backend="fa2"
+        q, k, v, custom_mask=mask, sm_scale=sm_scale, backend=backend
     )
 
 
@@ -133,16 +139,17 @@ def test_block_extend_single_prefill_matches_reference(dtype: torch.dtype):
         q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
         k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-        ref = block_extend_reference(
-            q,
-            k,
-            v,
-            block_size,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
-            sm_scale=sm_scale,
-        )
         for backend in get_available_backends(device):
+            ref = block_extend_reference(
+                q,
+                k,
+                v,
+                block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                sm_scale=sm_scale,
+                backend=backend,
+            )
             out = single_prefill_with_kv_cache(
                 q,
                 k,
@@ -204,22 +211,23 @@ def test_block_extend_ragged_wrapper_matches_reference(dtype: torch.dtype):
         int(kv_indptr[-1]), num_kv_heads, head_dim, dtype=dtype, device=device
     )
 
-    refs = []
-    for i, (_, _, q_offset, kv_offset) in enumerate(requests):
-        refs.append(
-            block_extend_reference(
-                q[qo_indptr[i] : qo_indptr[i + 1]],
-                k[kv_indptr[i] : kv_indptr[i + 1]],
-                v[kv_indptr[i] : kv_indptr[i + 1]],
-                block_size,
-                q_offset=q_offset,
-                kv_offset=kv_offset,
-                sm_scale=sm_scale,
-            )
-        )
-    ref = torch.cat(refs)
-
     for backend in get_available_backends(device):
+        refs = []
+        for i, (_, _, q_offset, kv_offset) in enumerate(requests):
+            refs.append(
+                block_extend_reference(
+                    q[qo_indptr[i] : qo_indptr[i + 1]],
+                    k[kv_indptr[i] : kv_indptr[i + 1]],
+                    v[kv_indptr[i] : kv_indptr[i + 1]],
+                    block_size,
+                    q_offset=q_offset,
+                    kv_offset=kv_offset,
+                    sm_scale=sm_scale,
+                    backend=backend,
+                )
+            )
+        ref = torch.cat(refs)
+
         workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
         wrapper = BatchPrefillWithRaggedKVCacheWrapper(
             workspace,
@@ -284,15 +292,6 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
         )
         k = paged_kv[:, 0].reshape(-1, num_kv_heads, head_dim)[:kv_len]
         v = paged_kv[:, 1].reshape(-1, num_kv_heads, head_dim)[:kv_len]
-        ref = block_extend_reference(
-            q,
-            k,
-            v,
-            block_size,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
-            sm_scale=sm_scale,
-        )
         qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
         paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
         paged_kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
@@ -304,6 +303,16 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
         kv_offsets = torch.tensor([kv_offset], dtype=torch.int32, device=device)
 
         for backend in get_available_backends(device):
+            ref = block_extend_reference(
+                q,
+                k,
+                v,
+                block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                sm_scale=sm_scale,
+                backend=backend,
+            )
             workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 workspace,
@@ -343,9 +352,7 @@ def test_block_extend_paged_wrapper_matches_reference(dtype: torch.dtype):
             )
 
 
-@pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
     """Paged FA3 must advance past zero-visible data and preserve page bases."""
     device = torch.device("cuda:0")
@@ -382,9 +389,7 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
     kv_offset_values = [256, 0]
     q_offsets = torch.tensor(q_offset_values, dtype=torch.int32, device=device)
     kv_offsets = torch.tensor(kv_offset_values, dtype=torch.int32, device=device)
-    qo_indptr = torch.tensor(
-        [0, qo_len, 2 * qo_len], dtype=torch.int32, device=device
-    )
+    qo_indptr = torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=device)
     paged_kv_indptr = torch.tensor(
         [0, pages_per_request[0], num_pages], dtype=torch.int32, device=device
     )
@@ -395,26 +400,27 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
         device=device,
     )
 
-    refs = []
-    kv_starts = [0, pages_per_request[0] * page_size]
-    for i in range(batch_size):
-        start_q, end_q = i * qo_len, (i + 1) * qo_len
-        start_kv = kv_starts[i]
-        end_kv = start_kv + kv_lens[i]
-        refs.append(
-            block_extend_reference(
-                q[start_q:end_q],
-                k[start_kv:end_kv],
-                v[start_kv:end_kv],
-                block_size,
-                q_offset=q_offset_values[i],
-                kv_offset=kv_offset_values[i],
-                sm_scale=sm_scale,
-            )
-        )
-    ref = torch.cat(refs)
-
     for backend in get_available_backends(device):
+        refs = []
+        kv_starts = [0, pages_per_request[0] * page_size]
+        for i in range(batch_size):
+            start_q, end_q = i * qo_len, (i + 1) * qo_len
+            start_kv = kv_starts[i]
+            end_kv = start_kv + kv_lens[i]
+            refs.append(
+                block_extend_reference(
+                    q[start_q:end_q],
+                    k[start_kv:end_kv],
+                    v[start_kv:end_kv],
+                    block_size,
+                    q_offset=q_offset_values[i],
+                    kv_offset=kv_offset_values[i],
+                    sm_scale=sm_scale,
+                    backend=backend,
+                )
+            )
+        ref = torch.cat(refs)
+
         workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
         wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
@@ -470,16 +476,17 @@ def test_block_extend_non_power_of_two_single(dtype: torch.dtype):
         q = torch.randn(qo_len, num_heads, head_dim, dtype=dtype, device=device)
         k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-        ref = block_extend_reference(
-            q,
-            k,
-            v,
-            block_size,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
-            sm_scale=sm_scale,
-        )
         for backend in get_available_backends(device):
+            ref = block_extend_reference(
+                q,
+                k,
+                v,
+                block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                sm_scale=sm_scale,
+                backend=backend,
+            )
             out = single_prefill_with_kv_cache(
                 q,
                 k,
@@ -516,17 +523,18 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
         # --- Ragged path ---
         k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
         v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
-        ref = block_extend_reference(
-            q,
-            k,
-            v,
-            block_size,
-            q_offset=q_offset,
-            kv_offset=kv_offset,
-            sm_scale=sm_scale,
-        )
 
         for backend in get_available_backends(device):
+            ref = block_extend_reference(
+                q,
+                k,
+                v,
+                block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                sm_scale=sm_scale,
+                backend=backend,
+            )
             workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
             qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
             kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
@@ -553,9 +561,9 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
             )
             out = wrapper.run(q, k, v)
             diff = (out.float() - ref.float()).abs().max().item()
-            assert diff < tol, (
-                f"ragged backend={backend} block_size={block_size} diff={diff:.6f}"
-            )
+            assert (
+                diff < tol
+            ), f"ragged backend={backend} block_size={block_size} diff={diff:.6f}"
 
         # --- Paged path ---
         num_pages = (kv_len + page_size - 1) // page_size
@@ -584,6 +592,16 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
             ]
 
         for backend in get_available_backends(device):
+            ref = block_extend_reference(
+                q,
+                k,
+                v,
+                block_size,
+                q_offset=q_offset,
+                kv_offset=kv_offset,
+                sm_scale=sm_scale,
+                backend=backend,
+            )
             workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
             qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
             paged_kv_indptr = torch.tensor(
@@ -620,6 +638,6 @@ def test_block_extend_non_power_of_two_batch(dtype: torch.dtype):
             )
             out = wrapper.run(q, paged_kv)
             diff = (out.float() - ref.float()).abs().max().item()
-            assert diff < tol, (
-                f"paged backend={backend} block_size={block_size} diff={diff:.6f}"
-            )
+            assert (
+                diff < tol
+            ), f"paged backend={backend} block_size={block_size} diff={diff:.6f}"

@@ -451,6 +451,7 @@ def get_single_prefill_module(backend, *args):
                     mask_mode,
                     layout,
                     window_left,
+                    maybe_packed_custom_mask,
                     scale_v_tensor,
                     logits_soft_cap,
                     sm_scale,
@@ -2792,9 +2793,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_id = paged_kv_indptr_host[0]
                 for i in range(batch_size):
                     num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
-                    )
+                    assert (
+                        self._block_tables is not None
+                    ), "block_tables is not initialized"
                     self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
                         block_id : block_id + num_blocks_needed
                     ]
@@ -5235,19 +5236,19 @@ def trtllm_ragged_attention_deepseek(
         from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
         _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        assert query.dtype in _SUPPORTED_DTYPES, (
-            f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
-        )
+        assert (
+            query.dtype in _SUPPORTED_DTYPES
+        ), f"cute-dsl backend only supports {_SUPPORTED_DTYPES}, got {query.dtype}"
         # TODO: support device tensor scales to avoid D2H sync overhead
-        assert not isinstance(bmm1_scale, torch.Tensor), (
-            "cute-dsl backend does not support device tensor bmm1_scale"
-        )
-        assert not isinstance(bmm2_scale, torch.Tensor), (
-            "cute-dsl backend does not support device tensor bmm2_scale"
-        )
-        assert sum(num_elts_per_sage_attn_blk) == 0, (
-            "cute-dsl backend does not support sage attention scale factors"
-        )
+        assert not isinstance(
+            bmm1_scale, torch.Tensor
+        ), "cute-dsl backend does not support device tensor bmm1_scale"
+        assert not isinstance(
+            bmm2_scale, torch.Tensor
+        ), "cute-dsl backend does not support device tensor bmm2_scale"
+        assert (
+            sum(num_elts_per_sage_attn_blk) == 0
+        ), "cute-dsl backend does not support sage attention scale factors"
         _bmm1 = bmm1_scale
         _bmm2 = bmm2_scale
 
@@ -5327,9 +5328,9 @@ def trtllm_ragged_attention_deepseek(
         )
 
     if return_lse:
-        assert lse is not None, (
-            "lse assumed not None beyond this point when return_lse is True"
-        )
+        assert (
+            lse is not None
+        ), "lse assumed not None beyond this point when return_lse is True"
         return out, lse
     else:
         return out
@@ -5508,9 +5509,9 @@ def trtllm_batch_context_with_kv_cache(
         if kv_cache.shape[1] == 1:
             k_cache, v_cache = kv_cache, kv_cache
         else:
-            assert kv_cache.shape[1] == 2, (
-                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
-            )
+            assert (
+                kv_cache.shape[1] == 2
+            ), "When kv_cache is a single tensor, the second dimension must be 1 or 2"
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
@@ -5545,9 +5546,9 @@ def trtllm_batch_context_with_kv_cache(
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert query.dtype == torch.float8_e4m3fn, (
-            "query must be fp8 when out_dtype is nvfp4."
-        )
+        assert (
+            query.dtype == torch.float8_e4m3fn
+        ), "query must be fp8 when out_dtype is nvfp4."
         assert o_sf_scale is not None
         assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
         o_sf_vec_size = o_sf_vec_size or 16
@@ -5745,9 +5746,9 @@ def fmha_v2_prefill_deepseek(
     """
     if not is_sm12x_supported(query.device):
         raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
-    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
-        "currently only support deepseek r1 192 query and 128 value"
-    )
+    assert (
+        query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128
+    ), "currently only support deepseek r1 192 query and 128 value"
     module = get_trtllm_fmha_v2_sm120_module()
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16

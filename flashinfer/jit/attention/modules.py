@@ -538,8 +538,13 @@ def gen_single_prefill_module(
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
-            additional_tensor_names = ["maybe_scale_v"]
-            additional_tensor_dtypes = ["float"]
+            # NOTE: maybe_custom_mask is threaded into AdditionalParams and consumed
+            # by the FA3 mainloop's custom-mask branch (USE_CUSTOM_MASK). It is placed
+            # before maybe_scale_v so the launcher arg order is stable. FP8 FA3 does
+            # not add this tensor; the mainloop guards access via SFINAE
+            # (has_maybe_custom_mask_v) so FP8 still compiles.
+            additional_tensor_names = ["maybe_custom_mask", "maybe_scale_v"]
+            additional_tensor_dtypes = ["uint8_t", "float"]
             additional_scalar_names = ["logits_soft_cap", "sm_scale", "scale_v_scalar"]
             additional_scalar_dtypes = ["double", "double", "double"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
