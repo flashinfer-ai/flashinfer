@@ -431,6 +431,9 @@ def chunk_gated_delta_rule(
                 12: cp_delta_rule_dsl_sm120,
             }[_arch_major]
             assert cp_delta_rule_dsl is not None
+            state_indices_kwargs = (
+                {"state_indices": state_indices} if state_indices is not None else {}
+            )
             cp_delta_rule_dsl(
                 output,
                 output_state,
@@ -442,8 +445,8 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                state_indices=state_indices,
                 max_seqlen=total_seq_len,
+                **state_indices_kwargs,
             )
             if output_final_state:
                 return output, output_state
