@@ -214,6 +214,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
 
+    def supports_output_view(self) -> bool:
+        return True
+
     def compute(
         self,
         workspace: Any,
