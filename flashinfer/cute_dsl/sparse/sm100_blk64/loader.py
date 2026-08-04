@@ -41,10 +41,9 @@ def load_blk64_ext():
     build_dir = (
         Path(
             os.environ.get(
-                "FLASHINFER_WORKSPACE_BASE", Path.home() / ".cache" / "flashinfer"
+                "FLASHINFER_WORKSPACE_BASE", Path.home()
             )
-        )
-        / "sm100_blk64_ext"
+        ) / ".cache" / "flashinfer" / "sm100_blk64_ext"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
 

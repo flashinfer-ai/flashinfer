@@ -91,10 +91,10 @@ def _pytorch_ref(
     indices: torch.Tensor,
     R: int,
     C: int,
-    sm_scale: float = None,
+    sm_scale: float | None = None,
 ) -> torch.Tensor:
     """Dense PyTorch reference for block-sparse attention."""
-    M, H, D = q.shape
+    M, _H, D = q.shape
     N = k.shape[0]
     MB, NB = M // R, N // C
     if sm_scale is None:
@@ -120,7 +120,7 @@ def _pytorch_ref_gqa(
     indices: torch.Tensor,
     R: int,
     C: int,
-    sm_scale: float = None,
+    sm_scale: float | None = None,
 ) -> torch.Tensor:
     M, Hq, D = q.shape
     Hkv = k.shape[1]
@@ -451,7 +451,7 @@ def test_vsa_sm120_perf_sweep(workspace):
             times = bench_gpu_time(lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v))
             ms = statistics.median(times)
 
-            flops = 2 * 2 * num_blocks * active_blocks * R * C * num_heads * HEAD_DIM
+            flops = 2 * 2 * active_blocks * R * C * num_heads * HEAD_DIM
             tflops = flops / (ms * 1e-3) / 1e12
             actual_density = active_blocks / (num_blocks * num_blocks)
             print(f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}")

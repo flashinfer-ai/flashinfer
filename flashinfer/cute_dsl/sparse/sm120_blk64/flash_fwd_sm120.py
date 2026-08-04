@@ -105,7 +105,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
 
         cg = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        # TMA load barriers. K/V use a 2-stage ring buffer.
+        # TMA load barriers. Q/K/V each use a single-stage buffer.
         Q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=1,
             producer_group=cg,
@@ -425,10 +425,10 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (head_dim, seqlen, nheads, batch)
-        mK: cute.Tensor,  # (head_dim, seqlen, nheads, batch)
+        mQ: cute.Tensor,  # (seqlen, head_dim, nheads, batch)
+        mK: cute.Tensor,  # (seqlen, head_dim, nheads, batch)
         mV: cute.Tensor,  # (value_dim, seqlen, nheads, batch)
-        mO: cute.Tensor,  # (value_dim, seqlen, nheads, batch)
+        mO: cute.Tensor,  # (seqlen, value_dim, nheads, batch)
         mLSE: cute.Tensor,  # (seqlen, nheads, batch)
         blocksparse_indices_q2k: cute.Tensor,  # (k, q, nheads, batch)
         blocksparse_num_blocks_q2k: cute.Tensor,  # (q, nheads, batch)
@@ -609,7 +609,7 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             grid=grid_config,
             block=block_config,
             cluster=(1, 1, 1),
-            smem=self.shared_storage_t.size_in_bytes(),
+            smem=self.shared_storage_t.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
         )
