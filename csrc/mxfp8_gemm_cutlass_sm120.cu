@@ -125,9 +125,9 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
   }
 
   // SM120 MXFP8 kernel hardcodes the scale layout to the hardware-native swizzled format
-  // (Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB). Only 1D swizzled scale
-  // (layout_128x4 from mxfp8_quantize) is supported; 2D linear scale causes the kernel to
-  // misinterpret scale data and produce wrong results.
+  // (Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA/SFB). Scale tensors must be flattened
+  // 1D layout_128x4 buffers padded independently for each batch item; 2D linear scale
+  // causes the kernel to misinterpret scale data and produce wrong results.
   TVM_FFI_ICHECK_EQ(mat1Scale.ndim(), 1)
       << "SM120 MXFP8 only supports swizzled (1D) scale format. "
          "Use SfLayout.layout_128x4 when calling mxfp8_quantize.";
@@ -146,10 +146,8 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
   };
   {
     const int64_t k_scales = scale_len(k);
-    const int64_t rows_a = (mat1.ndim() == 2) ? m : b * m;
-    const int64_t rows_b = (mat1.ndim() == 2) ? n : b * n;
-    int64_t expected_a = swizzled_len(rows_a, k_scales);
-    int64_t expected_b = swizzled_len(rows_b, k_scales);
+    int64_t expected_a = b * swizzled_len(m, k_scales);
+    int64_t expected_b = b * swizzled_len(n, k_scales);
     TVM_FFI_ICHECK_EQ(mat1Scale.size(0), expected_a)
         << "mxfp8_gemm_sm120: mat1Scale size mismatch, expected " << expected_a << ", got "
         << mat1Scale.size(0);
