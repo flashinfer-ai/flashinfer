@@ -64,5 +64,5 @@ include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 
 # ── Autotuner ──
-‎flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx
-‎tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx
+flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx
+tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx
