@@ -5,7 +5,7 @@
 ``top_k_varlen`` is a **sparse-attention KV-index selection** primitive — it
 picks the top-K KV positions per request under variable per-request sequence
 lengths — NOT a vocabulary-sampling op. It therefore lives in its own routine
-module (mirroring ``flashinfer/topk_varlen.py``) rather than under
+module (mirroring ``flashinfer/top_k/topk_varlen.py``) rather than under
 ``routines/sampling.py``, and its backends are radix / gvr / radix_cutlass
 (there is no generic "cuda" backend here).
 
@@ -21,14 +21,20 @@ import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.utils import get_compute_capability
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
-    filter_backends_by_compute_capability,
     get_device,
     print_perf_metrics,
-    routine_cc_to_supported_backends,
 )
+
+# top_k_varlen's three runners. Per-CC support is NOT hard-coded here; it is
+# resolved at runtime from top_k_varlen's @backend_requirement decorator via
+# ``flashinfer.top_k_varlen.is_backend_supported(backend, cc)`` (the single
+# source of truth), mirroring how the GEMM routines rely on their support
+# checkers (e.g. mm_fp4 / bmm_fp8) instead of a compute-capability table.
+_TOP_K_VARLEN_BACKENDS = ("radix", "gvr", "radix_cutlass")
 
 
 def parse_topk_varlen_args(line, parser):
@@ -39,12 +45,12 @@ def parse_topk_varlen_args(line, parser):
         required=False,
         nargs="+",
         default=None,
-        choices=["radix", "radix_cutlass", "gvr"],
+        choices=list(_TOP_K_VARLEN_BACKENDS),
         help=(
             "Backends to benchmark. Default: every backend supported on the "
-            "current GPU (from the cc-registry). 'radix' = CuTe DSL multi-CTA "
-            "(Blackwell), 'gvr' = GVR LB (Blackwell), 'radix_cutlass' = masked "
-            "CUTLASS radix (any GPU)."
+            "current GPU (resolved via top_k_varlen's @backend_requirement "
+            "support checks). 'radix' = CuTe DSL multi-CTA (Blackwell), 'gvr' = "
+            "GVR LB (Blackwell), 'radix_cutlass' = masked CUTLASS radix (any GPU)."
         ),
     )
     parser.add_argument(
@@ -98,8 +104,9 @@ def testTopKVarlen(args):
                      ``pre_idx=None``. Filtered out on older hardware.
     radix_cutlass  — masked CUTLASS radix fallback; ``pre_idx=None``. Runs on any GPU.
     gvr            — GVR LB kernel; passes a pre-computed ``pre_idx``. Blackwell
-                     (sm_100+) only. Filtering is done by
-                     ``filter_backends_by_compute_capability``.
+                     (sm_100/103) only. Per-CC support is resolved via
+                     ``top_k_varlen.is_backend_supported`` (its
+                     ``@backend_requirement`` decorator).
 
     Reference check compares the *set* of selected indices against ``torch.topk``
     applied to logits masked to ``seq_lens``.
@@ -112,19 +119,10 @@ def testTopKVarlen(args):
     if args.generate_repro_command:
         print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
 
-    # Default (unset) --backends means "every backend this routine supports",
-    # sourced from the cc-registry (single source of truth). The per-CC filter
-    # below narrows to the current GPU (radix_cutlass everywhere, radix/gvr on
-    # Blackwell).
+    # Default (unset) --backends means "every backend this routine supports".
     backends = args.backends
     if backends is None:
-        backends = sorted(
-            {
-                b
-                for cc_map in routine_cc_to_supported_backends["top_k_varlen"].values()
-                for b in cc_map
-            }
-        )
+        backends = list(_TOP_K_VARLEN_BACKENDS)
     batch_size = args.batch_size
     max_seq_len = args.max_seq_len
     top_k = args.top_k
@@ -132,7 +130,19 @@ def testTopKVarlen(args):
     run_refcheck = args.refcheck
     res = []
 
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    # Narrow to backends supported on this GPU using top_k_varlen's
+    # @backend_requirement support checks (single source of truth) rather than a
+    # hard-coded compute-capability table -- mirrors the GEMM routines' reliance
+    # on mm_fp4 / bmm_fp8 support checkers.
+    major, minor = get_compute_capability(device)
+    cc = major * 10 + minor
+    for backend in list(backends):
+        if not flashinfer.top_k_varlen.is_backend_supported(backend, cc):
+            backends.remove(backend)
+            print(
+                f"[WARNING] {backend} for routine {args.routine} is not supported "
+                f"on compute capability {major}.{minor}. Skipping."
+            )
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res

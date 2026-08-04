@@ -505,7 +505,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -897,20 +897,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    "top_k_varlen": {
-        # radix = CuTe DSL multi-CTA radix (Blackwell sm_100+); gvr = GVR
-        # (sm_100/103 only — _GVR_CCS; kernel doesn't build on sm_120a);
-        # radix_cutlass = masked CUTLASS radix fallback (any GPU).
-        "7.5": ["radix_cutlass"],
-        "8.0": ["radix_cutlass"],
-        "8.6": ["radix_cutlass"],
-        "8.9": ["radix_cutlass"],
-        "9.0": ["radix_cutlass"],
-        "10.0": ["radix", "gvr", "radix_cutlass"],
-        "10.3": ["radix", "gvr", "radix_cutlass"],
-        "12.0": ["radix", "radix_cutlass"],
-        "12.1": ["radix", "radix_cutlass"],
-    },
+    # Note: top_k_varlen uses its @backend_requirement support checks
+    # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
     # ROPE
     "apply_rope": {
         "7.5": ["cuda"],
