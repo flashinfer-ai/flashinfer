@@ -512,6 +512,10 @@ def apply_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    if rotary_dim > q.size(-1):
+        raise ValueError(
+            f"head_dim ({q.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
     _apply_rope(
         q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -571,6 +575,10 @@ def apply_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    if rotary_dim > q.size(-1):
+        raise ValueError(
+            f"head_dim ({q.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
     _apply_rope_pos_ids(
         q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -668,6 +676,10 @@ def apply_llama31_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    if rotary_dim > q.size(-1):
+        raise ValueError(
+            f"head_dim ({q.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
     _apply_llama31_rope(
         q,
         k,
@@ -748,6 +760,10 @@ def apply_llama31_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    if rotary_dim > q.size(-1):
+        raise ValueError(
+            f"head_dim ({q.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
     _apply_llama31_rope_pos_ids(
         q,
         k,
