@@ -68,6 +68,7 @@ if not _USE_CUDA_NORM:
             fused_add_rmsnorm_cute,
             fused_add_rmsnorm_quant_cute,
             layernorm_cute,
+            layernorm_quant_cute,
         )
     except (ImportError, AttributeError):
         # nvidia-cutlass-dsl not installed or incompatible version
@@ -569,6 +570,7 @@ def layernorm_quant(
     beta: torch.Tensor,
     scale: Union[float, torch.Tensor],
     eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Layer normalization + fp8 quantization.
 
@@ -591,10 +593,28 @@ def layernorm_quant(
         divided by this scale before the fp8 cast.
     eps: float
         Epsilon for numerical stability.
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_.
+        Only honored by the CuTe-DSL backend; the CUDA fallback ignores it.
     """
     scale = _normalize_scale_tensor(scale, input)
-    # No CuTe-DSL layernorm quant kernel yet; always use the CUDA JIT module.
-    get_norm_module().layernorm_quant(out, input, gemma, beta, scale, eps)
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    if _use_cuda_norm(input.device):
+        get_norm_module().layernorm_quant(out, input, gemma, beta, scale, eps)
+    else:
+        if input.dtype != torch.bfloat16:
+            raise RuntimeError("input must be bfloat16")
+        if gemma.dtype != torch.float32:
+            raise RuntimeError("gamma must be float32")
+        if beta.dtype != torch.float32:
+            raise RuntimeError("beta must be float32")
+        if not input.is_contiguous():
+            raise RuntimeError("input must be contiguous")
+        if not out.is_contiguous():
+            raise RuntimeError("output must be contiguous")
+        layernorm_quant_cute(out, input, gemma, beta, scale, eps, enable_pdl=enable_pdl)
 
 
 @register_fake_op("flashinfer::layernorm_quant")
@@ -605,6 +625,7 @@ def _layernorm_quant_fake(
     beta: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     pass
 
