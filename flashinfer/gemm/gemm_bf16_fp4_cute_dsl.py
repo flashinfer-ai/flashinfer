@@ -102,13 +102,22 @@ def _select_bf16_fp4_k_splits(
 
 def _bf16_fp4_gemv_fill_split(n: int, k: int, sm_count: int) -> int:
     """K-split sizing the gemv grid to just under one full wave of the
-    kernel's 6 resident CTAs/SM (1536-thread SM limit / 256).  The 0.95
-    target leaves slack for stragglers and the PDL-overlapped tail of the
-    previous kernel; at ~1.0 waves the grid tips into a second wave
-    (+3% measured at 1.08 waves)."""
+    kernel's 6 resident CTAs/SM (1536-thread SM limit / 256).  A grid at
+    a full wave tips into a costly second wave, so the 0.95 target leaves
+    slack for stragglers and the PDL-overlapped tail of the previous
+    kernel."""
     ctas = -(-(n // 64) // 8)
     fill = int(0.95 * sm_count * 6 / ctas)
     return max(1, min(fill, (k // 16) // 4))
+
+
+def _bf16_fp4_gemv_knee_split(n: int, k: int, sm_count: int) -> int:
+    """Smallest K-split reaching ~20 warps/SM, capped at the fill split.
+    Throughput saturates around that residency, and splitting deeper only
+    adds partial traffic (a penalty that scales with n)."""
+    return min(
+        -(-20 * sm_count // (n // 64)), _bf16_fp4_gemv_fill_split(n, k, sm_count)
+    )
 
 
 def _select_bf16_fp4_gemv_split(
@@ -119,18 +128,12 @@ def _select_bf16_fp4_gemv_split(
 
     Serving stacks do not tune every shape (vLLM's warmup autotune never
     captures compute_logits, so lm_head always lands here), and the gemv
-    is the measured m=1 winner on every validated SM12x shape.  Picks the
-    smallest split reaching ~20 warps/SM: measured perf saturates there,
-    and splitting past it only buys partial traffic (at lm_head-scale n
-    an unneeded s2 costs ~2%).
+    is the measured m=1 winner on every validated SM12x shape.
     """
     if cc_major != 12 or n % 64 != 0 or k // 16 < 4:
         return None
-    warp_tiles = n // 64
-    split = min(
-        -(-20 * sm_count // warp_tiles), _bf16_fp4_gemv_fill_split(n, k, sm_count)
-    )
-    if warp_tiles * split < 12 * sm_count:
+    split = _bf16_fp4_gemv_knee_split(n, k, sm_count)
+    if (n // 64) * split < 12 * sm_count:
         # Even the deepest usable split leaves the GPU starved.
         return None
     return split
@@ -437,10 +440,9 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     use_fp16_mma, tile_swizzle, k_splits, occupancy, kind)`` tuples,
     where ``kind`` selects the kernel: ``"mma"`` (the dense GEMM, all
     fields live) or ``"gemv"`` (the m=1 streaming kernel, which only
-    reads ``k_splits``).  ``sm_count`` additionally enables the
-    fill-derived gemv split; callers must pass the same value to keep
-    tactic indices consistent (it only appends, and per-device tuning
-    always sees one device).
+    reads ``k_splits``).  ``sm_count`` additionally appends the
+    device-derived gemv splits, so every caller resolving a tactic index
+    must pass the same value.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -544,9 +546,12 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         k_tiles16 = k // 16
         gemv_splits = [s for s in (1, 2, 4, 8, 16, 32) if s * 4 <= k_tiles16]
         if sm_count is not None and gemv_splits:
-            fill = _bf16_fp4_gemv_fill_split(n, k, sm_count)
-            if fill not in gemv_splits:
-                gemv_splits.append(fill)
+            for s in (
+                _bf16_fp4_gemv_knee_split(n, k, sm_count),
+                _bf16_fp4_gemv_fill_split(n, k, sm_count),
+            ):
+                if s not in gemv_splits:
+                    gemv_splits.append(s)
         for splits in gemv_splits:
             configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
 
