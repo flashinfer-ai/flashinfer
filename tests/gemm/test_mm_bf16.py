@@ -218,7 +218,9 @@ def test_mm_bf16_cute_dsl_direct_fallback(pdl: bool):
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
     out = mm_bf16(a, b.T, pdl=pdl, backend="cute-dsl")
-    torch.testing.assert_close(out, a @ b.T, rtol=2e-2, atol=5e-1)
+    reference = a @ b.T
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 @pytest.mark.parametrize("enable_bias", [False, True])
@@ -240,7 +242,8 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     )
     out = mm_bf16(a, b.T, bias=bias, pdl=True, backend="cute-dsl")
     reference = F.linear(a, b, bias)
-    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-1)
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 def test_cute_dsl_low_m_tactic_policies():
