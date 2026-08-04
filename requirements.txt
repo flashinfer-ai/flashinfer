@@ -9,9 +9,8 @@ click
 # EXACTLY (e.g. ==2.29.7), so any floor here (>=2.30.7 for B200 EP) makes the
 # resolver evict torch — on aarch64 it backtracks all the way to the CPU-only
 # torch 2.10.0 wheel. torch supplies libnccl; the >=2.30.7 B200 floor is
-# enforced at runtime in flashinfer/moe_ep/core/validation/common.py, and the
-# build hook installs the newer wheel --no-deps on source installs
-# (build_backend.py).
+# enforced at runtime in flashinfer/moe_ep/core/validation/common.py. Source
+# environments that enable NCCL-EP must provide a compatible wheel.
 #
 # The same base-deps-must-not-force-a-CUDA-major rule applies to cuda-python:
 # a >=13.0 floor bulldozes CUDA-12 environments (pip reports e.g.

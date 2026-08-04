@@ -32,8 +32,8 @@ cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 # default (best-effort) on `pip install .` — see the moe_ep section at the top
 # of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
 # the >=2.30.7 B200 floor is enforced at runtime (moe_ep/core/validation/
-# common.py) and upgraded --no-deps by the build hook on source installs. Opt
-# out of the native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+# common.py). Opt out of the native build with BUILD_NVEP=0 (or
+# BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
 nvep = []
 
 [project.scripts]
