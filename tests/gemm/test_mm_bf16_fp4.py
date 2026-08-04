@@ -386,17 +386,15 @@ def test_cute_dsl_fallback_gemv_matches_reference():
     """tactic=-1 at m=1 routes through the gemv fallback; check its output."""
     _skip_if_backend_unavailable("cute-dsl")
     import flashinfer.gemm.gemm_bf16_fp4_cute_dsl as mod
-
-    if (
-        mod._select_bf16_fp4_gemv_split(
-            2048, 7168, *_device_cc_sm(torch.device("cuda"))
-        )
-        is None
-    ):
-        pytest.skip("gemv fallback not offered on this device")
+    from flashinfer.utils import get_device_sm_count
 
     device = torch.device("cuda")
     m, n, k = 1, 2048, 7168
+    cc_major = get_compute_capability(device)[0]
+    sm_count = get_device_sm_count(device)
+    if mod._select_bf16_fp4_gemv_split(n, k, cc_major, sm_count) is None:
+        pytest.skip("gemv fallback not offered on this device")
+
     torch.manual_seed(0)
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
@@ -413,12 +411,6 @@ def test_cute_dsl_fallback_gemv_matches_reference():
     runner.forward([a, b_p, sf_u8, alpha_l, torch.bfloat16, out, 16], tactic=-1)
     torch.cuda.synchronize()
     _assert_close_to_reference(out, ref, "cute-dsl gemv fallback")
-
-
-def _device_cc_sm(device):
-    from flashinfer.utils import get_compute_capability, get_device_sm_count
-
-    return get_compute_capability(device)[0], get_device_sm_count(device)
 
 
 def test_cute_dsl_fallback_k_splits_selector():

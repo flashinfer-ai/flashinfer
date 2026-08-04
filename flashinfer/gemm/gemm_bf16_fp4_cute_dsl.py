@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuTe-DSL backend for the bf16 x fp4 GEMM (weight repack / kernel launch)."""
 
+import functools
 from typing import List, Optional, Tuple, cast
 
 import torch
@@ -100,6 +101,14 @@ def _select_bf16_fp4_k_splits(
     return 1
 
 
+# Residency window for the stream GEMV, in warps per SM: below the floor
+# the grid cannot hide DRAM latency, far above the ceiling extra splits just
+# multiply partial-workspace traffic.  Shared by the tactic filter and the
+# no-autotune fallback so the two paths agree on when the gemv applies.
+_GEMV_MIN_WARPS_PER_SM = 12
+_GEMV_MAX_WARPS_PER_SM = 96
+
+
 def _bf16_fp4_gemv_fill_split(n: int, k: int, sm_count: int) -> int:
     """K-split sizing the gemv grid to just under one full wave of the
     kernel's 6 resident CTAs/SM (1536-thread SM limit / 256).  A grid at
@@ -133,8 +142,8 @@ def _select_bf16_fp4_gemv_split(
     if cc_major != 12 or n % 64 != 0 or k // 16 < 4:
         return None
     split = _bf16_fp4_gemv_knee_split(n, k, sm_count)
-    if (n // 64) * split < 12 * sm_count:
-        # Even the deepest usable split leaves the GPU starved.
+    warps_per_sm = (n // 64) * split / sm_count
+    if not _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM:
         return None
     return split
 
@@ -429,20 +438,22 @@ def _prepare_cute_dsl(
     return b_packed, sf_ksf_n, alpha
 
 
+@functools.cache
 def _bf16_fp4_cute_dsl_tactic_configs(
-    n: int, k: int, sm_count: Optional[int] = None
-) -> List[
-    Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int, str]
+    n: int, k: int, sm_count: int
+) -> Tuple[
+    Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int, int, int, str],
+    ...,
 ]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
-    Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
-    use_fp16_mma, tile_swizzle, k_splits, occupancy, kind)`` tuples,
+    Returns a tuple of ``(tile_shape_mnk, atom_layout, pipeline_depth,
+    use_fp16_mma, tile_swizzle, k_splits, occupancy, kind)`` entries,
     where ``kind`` selects the kernel: ``"mma"`` (the dense GEMM, all
     fields live) or ``"gemv"`` (the m=1 streaming kernel, which only
-    reads ``k_splits``).  ``sm_count`` additionally appends the
-    device-derived gemv splits, so every caller resolving a tactic index
-    must pass the same value.
+    reads ``k_splits``).  The gemv entries include device-derived splits,
+    so a tactic index is only meaningful for the ``(n, k, sm_count)`` it
+    was enumerated with.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
@@ -545,7 +556,7 @@ def _bf16_fp4_cute_dsl_tactic_configs(
     if n % 64 == 0:
         k_tiles16 = k // 16
         gemv_splits = [s for s in (1, 2, 4, 8, 16, 32) if s * 4 <= k_tiles16]
-        if sm_count is not None and gemv_splits:
+        if gemv_splits:
             for s in (
                 _bf16_fp4_gemv_knee_split(n, k, sm_count),
                 _bf16_fp4_gemv_fill_split(n, k, sm_count),
@@ -555,7 +566,7 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         for splits in gemv_splits:
             configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
 
-    return configs
+    return tuple(configs)
 
 
 _BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
@@ -585,7 +596,10 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             a, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            return (out_dtype, n, k)
+            # sm_count pins the tactic-index space: the config list holds
+            # device-derived gemv splits, so a tuned index must not be
+            # replayed on a device with a different SM count.
+            return (out_dtype, n, k, get_device_sm_count(a.device))
 
         def get_valid_tactics(
             self,
@@ -625,11 +639,10 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 # only runtime m == 1 lands in the m_opt == 1 bucket.
                 if m_opt != 1 or not gemv_ok:
                     return False
-                # Keep only splits that land in a sane residency window:
-                # under ~12 warps/SM can't hide DRAM latency, far above
-                # it just multiplies partial-workspace traffic.
                 warps_per_sm = (n // 64) * cfg[5] / sm_count
-                return 12 <= warps_per_sm <= 96
+                return (
+                    _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM
+                )
 
             return [
                 i
@@ -657,20 +670,22 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 if tactic >= 0
                 else None
             )
-            gemv_splits: Optional[int] = None
+            splits: Optional[int] = None
             if cfg is not None and cfg[7] == "gemv":
                 if m != 1:
                     raise ValueError(f"the gemv tactic requires m == 1, got m={m}")
-                gemv_splits = cfg[5]
-            elif cfg is None and m == 1:
-                gemv_splits = _select_bf16_fp4_gemv_split(
+                splits = cfg[5]
+            elif cfg is None and m == 1 and not do_preparation:
+                # do_preparation stays on the MMA heuristic: the autotuner
+                # issues it outside its per-tactic exception guard, so a
+                # gemv failure here would abort tuning for the whole op.
+                splits = _select_bf16_fp4_gemv_split(
                     n,
                     k,
                     get_compute_capability(a.device)[0],
                     get_device_sm_count(a.device),
                 )
-            if gemv_splits is not None:
-                splits = gemv_splits
+            if splits is not None:
                 compiled = _get_cute_dsl_bf16_fp4_gemv(
                     splits, a.dtype, out_dtype, enable_pdl=enable_pdl
                 )
