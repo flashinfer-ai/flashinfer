@@ -62,7 +62,6 @@ BF16_FC1_BASE = dict(
     use_max_tmem_overlap=0,
 )
 
-
 class TestBf16Fc1GatherValidation:
     def test_validate_gather_noswap_tile16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
@@ -97,7 +96,6 @@ class TestBf16Fc1GatherValidation:
             **uniform_pipeline_stage_overrides(4),
             **BF16_FC1_BASE,
         )
-
 
 class TestBf16Fc1TmaRoute:
     """FC1 with routeAct=tma: activations loaded via TMA gather4."""
@@ -136,16 +134,12 @@ class TestBf16Fc1TmaRoute:
             **cfg,
         )
         assert result
-
     def test_tma_route_noswap(self):
         self._run(swap_ab=False)
-
     def test_tma_route_swap(self):
         self._run(swap_ab=True)
-
     def test_tma_route_swiglu_noswap(self):
         self._run(swap_ab=False, act_kind=1)
-
     def test_tma_route_swiglu_noswap_returns_compact_output(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -166,18 +160,15 @@ class TestBf16Fc1TmaRoute:
 
         assert ok
         assert output.shape == (256, 8)
-
     def test_tma_route_swiglu_swap(self):
         self._run(swap_ab=True, act_kind=1)
-
     def test_tma_route_4experts(self):
         self._run(num_experts=4, num_tokens=512)
-
     def test_tma_route_nonrounded_topk(self):
         self._run(num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
 
-
 class TestBf16Fc1ActivationValidation:
+
     def _validate(self, *, act_kind: int, swap_ab: bool) -> None:
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
@@ -200,27 +191,21 @@ class TestBf16Fc1ActivationValidation:
             **uniform_pipeline_stage_overrides(4),
             **cfg,
         )
-
     def test_validate_geglu_noswap_tile16(self):
         self._validate(act_kind=2, swap_ab=False)
-
     def test_validate_geglu_swap_tile16(self):
         self._validate(act_kind=2, swap_ab=True)
-
     def test_validate_relu_eltwise_noswap_tile16(self):
         self._validate(act_kind=3, swap_ab=False)
-
     def test_validate_relu_eltwise_swap_tile16(self):
         self._validate(act_kind=3, swap_ab=True)
-
     def test_validate_none_eltwise_noswap_tile16(self):
         self._validate(act_kind=0, swap_ab=False)
-
     def test_validate_none_eltwise_swap_tile16(self):
         self._validate(act_kind=0, swap_ab=True)
 
-
 class TestBf16Fc1GatherGPU:
+
     def _run(
         self,
         *,
@@ -270,34 +255,24 @@ class TestBf16Fc1GatherGPU:
         assert result, (
             f"FC1 gather failed: tile_n={tile_n}, swap={swap_ab}, cluster={cluster_m}"
         )
-
     def test_gather_noswap_tile8(self):
         self._run(tile_n=8, swap_ab=False)
-
     def test_gather_noswap_tile16(self):
         self._run(tile_n=16, swap_ab=False)
-
     def test_gather_noswap_tile32(self):
         self._run(tile_n=32, swap_ab=False)
-
     def test_gather_swap_tile8(self):
         self._run(tile_n=8, swap_ab=True)
-
     def test_gather_swap_tile16(self):
         self._run(tile_n=16, swap_ab=True)
-
     def test_gather_noswap_4experts(self):
         self._run(tile_n=16, num_experts=4, num_tokens=512, swap_ab=False)
-
     def test_gather_swap_4experts(self):
         self._run(tile_n=16, num_experts=4, num_tokens=512, swap_ab=True)
-
     def test_gather_noswap_nonrounded_topk(self):
         self._run(tile_n=16, num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
-
     def test_gather_swap_nonrounded_topk(self):
         self._run(tile_n=16, num_experts=3, num_tokens=130, top_k=2, swap_ab=True)
-
     def test_gather_noswap_2cta_tile64(self):
         self._run(
             tile_n=64,
@@ -307,7 +282,6 @@ class TestBf16Fc1GatherGPU:
             num_tokens=256,
             pipeline_stages=4,
         )
-
     def test_gather_swap_2cta_tile64(self):
         self._run(
             tile_n=64,
@@ -330,7 +304,6 @@ class TestBf16Fc1GatherGPU:
             problem_k=1024,
             pipeline_stages=4,
         )
-
     @pytest.mark.parametrize("swap_ab", [False, True])
     @pytest.mark.parametrize("pipeline_stages_a,pipeline_stages_b", [(3, 4), (4, 3)])
     def test_gather_2cta_unequal_pipeline_stages(
@@ -349,8 +322,8 @@ class TestBf16Fc1GatherGPU:
             pipeline_stages_b=pipeline_stages_b,
         )
 
-
 class TestBf16Fc1SwiGLU:
+
     def _run_swiglu(
         self,
         *,
@@ -390,29 +363,22 @@ class TestBf16Fc1SwiGLU:
             **cfg,
         )
         assert result
-
     def test_swiglu_noswap_tile8(self):
         self._run_swiglu(tile_n=8, swap_ab=False)
-
     def test_swiglu_noswap_tile16(self):
         self._run_swiglu(tile_n=16, swap_ab=False)
-
     def test_swiglu_swap_tile8(self):
         self._run_swiglu(tile_n=8, swap_ab=True)
-
     def test_swiglu_swap_tile16(self):
         self._run_swiglu(tile_n=16, swap_ab=True)
-
     def test_swiglu_gather_noswap(self):
         self._run_swiglu(
             tile_n=16, swap_ab=False, has_gather=True, num_experts=2, num_tokens=256
         )
-
     def test_swiglu_gather_swap(self):
         self._run_swiglu(
             tile_n=16, swap_ab=True, has_gather=True, num_experts=2, num_tokens=256
         )
-
     def test_swiglu_clamp_bias_noswap(self):
         self._run_swiglu(
             tile_n=16,
@@ -420,7 +386,6 @@ class TestBf16Fc1SwiGLU:
             gemm1_clamp_limit_value=0.01,
             bias_type=1,
         )
-
 
 class TestBf16Fc1GeGLU:
     def _run_geglu(self, *, tile_n=16, swap_ab=False, has_gather=False):
@@ -448,16 +413,12 @@ class TestBf16Fc1GeGLU:
             **cfg,
         )
         assert result
-
     def test_geglu_noswap(self):
         self._run_geglu(swap_ab=False)
-
     def test_geglu_swap(self):
         self._run_geglu(swap_ab=True)
-
     def test_geglu_gather(self):
         self._run_geglu(swap_ab=False, has_gather=True)
-
 
 class TestBf16Fc1ReLU2:
     def _run_relu2(self, *, tile_n=16, swap_ab=False, has_gather=False):
@@ -485,16 +446,12 @@ class TestBf16Fc1ReLU2:
             **cfg,
         )
         assert result
-
     def test_relu2_noswap(self):
         self._run_relu2(swap_ab=False)
-
     def test_relu2_swap(self):
         self._run_relu2(swap_ab=True)
-
     def test_relu2_gather(self):
         self._run_relu2(swap_ab=False, has_gather=True)
-
 
 class TestBf16Fc1HighThroughput:
     HT_CFG = {

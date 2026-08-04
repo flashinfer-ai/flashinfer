@@ -452,7 +452,6 @@ class _DummyResource(MemoryResource):
     ):
         pass
 
-
 @dataclass(kw_only=True)
 class _DummyProxyResource(MemoryResource):
     """Proxy stub whose consumer publishes one pipeline-stage token."""
@@ -469,12 +468,10 @@ class _DummyProxyResource(MemoryResource):
     def consumer_work(self, stage_info):
         pass
 
-
 def _res(name: str, **kwargs) -> MemoryResource:
     if name == "Proxy":
         return _DummyProxyResource(name=name, **kwargs)
     return _DummyResource(name=name, **kwargs)
-
 
 def _work_queue() -> WorkQueue:
     scheduler_config = TileSchedulerConfig(

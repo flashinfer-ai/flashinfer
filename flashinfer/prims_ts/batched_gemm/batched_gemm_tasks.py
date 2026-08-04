@@ -1084,14 +1084,7 @@ def create_mma_task(
             tmem_sfab_res.wait()
         if has_cast_a:
             tmem_cast_a_addr = tmem_cast_a_res.publish_cast_a_addr()
-            if has_proxy:
-                desc_b_mma_base, smem_b_stage_ptr = (
-                    smem_b_res.build_mma_desc_b_at_stage(
-                        pipeline_stage_idx=proxy_stage_idx
-                    )
-                )
-            else:
-                desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
+            desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
             tmem_c_res.mma_cast_a(
                 desc_b_mma_base=desc_b_mma_base,
                 smem_b_stage_ptr=smem_b_stage_ptr,
