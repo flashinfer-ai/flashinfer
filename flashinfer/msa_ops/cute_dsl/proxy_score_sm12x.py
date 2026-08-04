@@ -849,9 +849,9 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
 
 class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
     """fp8-K packed-decode schedule. Same head-fused M rows as the packed
-    schedule, but warps split over keys instead of query rows (after Thien
-    Tran's indexer kernel), so the e4m3 -> f16/bf16 upconvert runs once per
-    K element instead of once per warp. K stays raw e4m3 through cp.async
+    schedule, but warps split over keys instead of query rows, so the
+    e4m3 -> f16/bf16 upconvert runs once per K element instead of once per
+    warp. K stays raw e4m3 through cp.async
     and smem, arriving as a 16-bit view with half the head dim (see
     msa_proxy_score), and upconverts in registers between the smem loads and
     the mma. Q is stored column-permuted to match the converted K fragments
@@ -1357,11 +1357,6 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
     two intra-CTA barriers per block. The low per-CTA fixed cost (no Q
     gather, no fill barriers, no per-step Q reloads) is what wins on the
     one-block-per-CTA grids that split-K produces at small batch.
-
-    Derived from vLLM's IndexDecodeScoreKernel (Apache-2.0) by Thien Tran
-    (gau-nernst), adapted to flat/paged K with a kv-head mode, per-request
-    variable q lengths, MSA q_offset causal semantics, and the
-    per-(head, kv_block, token) max-score output with -inf padding tiles.
     """
 
     _BLOCK_K = 128
