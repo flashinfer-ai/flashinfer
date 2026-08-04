@@ -656,7 +656,10 @@ def _reference_hca(
 
 
 @pytest.mark.arch_blackwell
-def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
+@pytest.mark.parametrize(
+    "compare_trtllm", (False, True), ids=("pytorch-reference", "trtllm-parity")
+)
+def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch, compare_trtllm):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
@@ -795,10 +798,48 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch):
             softmax_scale,
             output_scale,
         )
+        trtllm_output = None
+        if compare_trtllm:
+            try:
+                trtllm_output = trtllm_batch_decode_sparse_mla_dsv4(
+                    query=query,
+                    swa_kv_cache=window_cache,
+                    workspace_buffer=workspace,
+                    sparse_indices=compressed_page_aligned_sparse_indices,
+                    compressed_kv_cache=compressed_cache,
+                    sparse_topk_lens=sparse_topk_lens,
+                    seq_lens=raw_seq_lens,
+                    bmm1_scale=softmax_scale,
+                    bmm2_scale=output_scale,
+                    sinks=sinks,
+                    backend="trtllm-gen",
+                    enable_pdl=False,
+                )
+            except RuntimeError as error:
+                message = str(error)
+                if (
+                    "trtllm_paged_attention_decode_sparse_mla_dsv4 is not available"
+                    in message
+                    or "Missing TRTLLM-GEN kernel (decode)" in message
+                    or (
+                        "Ninja build failed" in message
+                        and "missing and no known rule" in message
+                    )
+                ):
+                    pytest.skip("TRTLLM-GEN sparse MLA artifacts are unavailable")
+                raise
         assert output.dtype == torch.bfloat16
         assert output.shape == query.shape
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output.float(), reference, atol=0.13, rtol=1e-5)
+        if trtllm_output is not None:
+            assert trtllm_output.dtype == torch.bfloat16
+            assert trtllm_output.shape == query.shape
+            assert torch.isfinite(trtllm_output).all()
+            torch.testing.assert_close(
+                trtllm_output.float(), reference, atol=0.13, rtol=1e-5
+            )
+            torch.testing.assert_close(output, trtllm_output, atol=0.13, rtol=1e-5)
         torch.testing.assert_close(tagged_output, output, atol=0.00390625, rtol=0)
 
     explicit_output = torch.empty_like(query, dtype=torch.bfloat16)
