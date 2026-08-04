@@ -284,9 +284,9 @@ class LayerNormQuantKernel:
     clamped to the finite range of the FP8 output dtype (E4M3 or E5M2).
 
     Derived from RMSNormQuantKernel (multi-row tiles, cluster reduction,
-    cp.async staging, vectorized FP8 stores). gamma/beta are float32 and are
-    loaded with per-element reads since their vector width differs from the
-    input tile.
+    cp.async staging, vectorized FP8 stores). gamma/beta are float32, so a
+    dedicated tiled copy loads them for full tiles; tail tiles fall back to
+    predicated per-element reads.
     """
 
     def __init__(
