@@ -88,6 +88,33 @@ def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
     assert all(work.unfinished_tasks == 0 for work in work_by_worker)
 
 
+def test_worker_steals_queued_long_unit_before_local_normal_unit() -> None:
+    long_work_by_worker = [queue.Queue() for _ in range(2)]
+    regular_work_by_worker = [queue.Queue() for _ in range(2)]
+    long_work_by_worker[0].put(_queue_test_unit("remote-long"))
+    regular_work_by_worker[1].put(_queue_test_unit("local-normal"))
+
+    long_queue, long_unit = runner._next_prioritized_worker_unit(
+        long_work_by_worker,
+        regular_work_by_worker,
+        1,
+    )
+
+    assert long_queue is long_work_by_worker[0]
+    assert long_unit.id == "remote-long"
+    long_queue.task_done()
+
+    normal_queue, normal_unit = runner._next_prioritized_worker_unit(
+        long_work_by_worker,
+        regular_work_by_worker,
+        1,
+    )
+
+    assert normal_queue is regular_work_by_worker[1]
+    assert normal_unit.id == "local-normal"
+    normal_queue.task_done()
+
+
 def test_compatibility_defaults_use_file_sized_units_without_time_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -931,7 +958,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.solo
+pytestmark = [pytest.mark.solo, pytest.mark.long_running]
 
 @pytest.fixture(scope="module", autouse=True)
 def exclusive_source():
@@ -996,6 +1023,86 @@ def test_regular():
     assert result.returncode == 0, result.stdout + result.stderr
     assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
+
+
+def test_long_running_sources_start_before_normal_work_and_solo_runs_last(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "schedule-state"
+    state.mkdir()
+    order = state / "order.txt"
+
+    for name, other in (("long-a", "long-b"), ("long-b", "long-a")):
+        (suite / f"test_{name.replace('-', '_')}.py").write_text(
+            f'''\
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.long_running
+
+def test_case():
+    state = Path(os.environ["SCHEDULE_STATE"])
+    with (state / "order.txt").open("a", encoding="utf-8") as stream:
+        stream.write("{name}\\n")
+    (state / "{name}.started").write_text("started", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not (state / "{other}.started").exists():
+        assert time.monotonic() < deadline, "other long-running unit did not start"
+        time.sleep(0.01)
+''',
+            encoding="utf-8",
+        )
+
+    (suite / "test_normal.py").write_text(
+        """\
+import os
+from pathlib import Path
+
+def test_case():
+    state = Path(os.environ["SCHEDULE_STATE"])
+    with (state / "order.txt").open("a", encoding="utf-8") as stream:
+        stream.write("normal\\n")
+""",
+        encoding="utf-8",
+    )
+    (suite / "test_solo.py").write_text(
+        """\
+import os
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.solo
+
+def test_case():
+    state = Path(os.environ["SCHEDULE_STATE"])
+    with (state / "order.txt").open("a", encoding="utf-8") as stream:
+        stream.write("solo\\n")
+""",
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--workers",
+        "2",
+        env_override={
+            "CUDA_VISIBLE_DEVICES": "0,1",
+            "SCHEDULE_STATE": str(state),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = order.read_text(encoding="utf-8").splitlines()
+    assert set(observed[:2]) == {"long-a", "long-b"}
+    assert observed[2:] == ["normal", "solo"]
 
 
 def test_run_records_the_shared_attempt_before_pytest_collection(

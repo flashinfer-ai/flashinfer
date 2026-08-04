@@ -44,6 +44,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "solo: run every node from this source without overlapping another local unit",
     )
+    config.addinivalue_line(
+        "markers",
+        "long_running: front-load every node from this source in the worker queues",
+    )
     config._flashinfer_sharding = {  # type: ignore[attr-defined]
         "session_start": time.time(),
         "collection_complete": None,
@@ -72,6 +76,11 @@ def pytest_collection_modifyitems(
         for item in items
         if item.get_closest_marker("solo") is not None
     }
+    long_running_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("long_running") is not None
+    }
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
@@ -88,13 +97,14 @@ def pytest_collection_modifyitems(
                 order=node.order,
                 shard_group=node.shard_group,
                 solo=item_path in solo_sources,
+                long_running=item_path in long_running_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")
     if collection_path:
         atomic_write_json(
             Path(collection_path),
-            {"schema_version": 1, "nodes": [node.to_dict() for node in collected]},
+            {"schema_version": 2, "nodes": [node.to_dict() for node in collected]},
         )
 
     selection_path = config.getoption("--flashinfer-node-file")

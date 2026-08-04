@@ -22,12 +22,14 @@ def _node(
     *,
     shard_group: str | None = None,
     solo: bool = False,
+    long_running: bool = False,
 ) -> CollectedNode:
     return CollectedNode.from_nodeid(
         nodeid,
         order=order,
         shard_group=shard_group,
         solo=solo,
+        long_running=long_running,
     )
 
 
@@ -576,8 +578,16 @@ def test_soft_target_search_does_not_retry_every_intermediate_bin_count(
 
 def test_plan_serialization_stores_each_nodeid_once() -> None:
     nodes = [
-        _node("tests/test_x.py::test_known[a-very-long-parameter]", 0),
-        _node("tests/test_x.py::test_new[another-very-long-parameter]", 1),
+        _node(
+            "tests/test_x.py::test_known[a-very-long-parameter]",
+            0,
+            long_running=True,
+        ),
+        _node(
+            "tests/test_x.py::test_new[another-very-long-parameter]",
+            1,
+            long_running=True,
+        ),
     ]
     book = EstimateBook([DurationEstimate("profile", nodes[0].nodeid, 1.0, 1)])
     plan = build_plan(
@@ -598,6 +608,7 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     assert Plan.from_dict(serialized) == plan
     assert serialized["schema_version"] == 3
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
+    assert serialized["long_running_sources"] == ["tests/test_x.py"]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded
     assert all(encoded.count(node.nodeid) == 1 for node in nodes)

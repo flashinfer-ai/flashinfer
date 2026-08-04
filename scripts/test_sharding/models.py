@@ -30,6 +30,7 @@ class CollectedNode:
     order: int
     shard_group: str | None = None
     solo: bool = False
+    long_running: bool = False
 
     @classmethod
     def from_nodeid(
@@ -39,6 +40,7 @@ class CollectedNode:
         shard_group: str | None = None,
         *,
         solo: bool = False,
+        long_running: bool = False,
     ) -> "CollectedNode":
         return cls(
             nodeid=nodeid,
@@ -47,6 +49,7 @@ class CollectedNode:
             order=order,
             shard_group=shard_group,
             solo=solo,
+            long_running=long_running,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,6 +60,7 @@ class CollectedNode:
             "order": self.order,
             "shard_group": self.shard_group,
             "solo": self.solo,
+            "long_running": self.long_running,
         }
 
 
@@ -185,6 +189,10 @@ class Plan:
             {node.source_file for node in self.nodes if node.solo},
             key=lambda value: value.encode("utf-8"),
         )
+        long_running_sources = sorted(
+            {node.source_file for node in self.nodes if node.long_running},
+            key=lambda value: value.encode("utf-8"),
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "algorithm_version": ALGORITHM_VERSION,
@@ -196,6 +204,7 @@ class Plan:
             ],
             "shard_groups": shard_groups,
             "solo_sources": solo_sources,
+            "long_running_sources": long_running_sources,
             "units": [
                 {
                     "id": unit.id,
@@ -248,6 +257,7 @@ class Plan:
                         order=int(node["order"]),
                         shard_group=node.get("shard_group"),
                         solo=bool(node.get("solo", False)),
+                        long_running=bool(node.get("long_running", False)),
                     )
                     for node in value["nodes"]
                 ),
@@ -272,14 +282,24 @@ class Plan:
             for index in group["node_indexes"]
         }
         solo_sources = {str(source) for source in value.get("solo_sources", [])}
+        long_running_sources = {
+            str(source) for source in value.get("long_running_sources", [])
+        }
         nodes = tuple(
             CollectedNode(
-                nodeid,
-                source_files.get(index, source_file_for_nodeid(nodeid)),
-                base_function_for_nodeid(nodeid),
-                index,
-                shard_groups.get(index),
-                source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
+                nodeid=nodeid,
+                source_file=source_files.get(index, source_file_for_nodeid(nodeid)),
+                base_function=base_function_for_nodeid(nodeid),
+                order=index,
+                shard_group=shard_groups.get(index),
+                solo=(
+                    source_files.get(index, source_file_for_nodeid(nodeid))
+                    in solo_sources
+                ),
+                long_running=(
+                    source_files.get(index, source_file_for_nodeid(nodeid))
+                    in long_running_sources
+                ),
             )
             for index, nodeid in enumerate(nodeids)
         )

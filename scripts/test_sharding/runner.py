@@ -345,6 +345,7 @@ def _selected_nodes(
             order=int(node["order"]),
             shard_group=node.get("shard_group"),
             solo=bool(node.get("solo", False)),
+            long_running=bool(node.get("long_running", False)),
         )
         for node in raw_nodes
     ]
@@ -793,39 +794,6 @@ class _UnitTimer:
         return self.prior_elapsed + (time.monotonic() - self.started_monotonic)
 
 
-@dataclass
-class _ExecutionGate:
-    condition: threading.Condition = field(default_factory=threading.Condition)
-    regular_active: int = 0
-    solo_active: bool = False
-    solo_waiting: int = 0
-
-    def acquire(self, *, solo: bool) -> None:
-        with self.condition:
-            if solo:
-                self.solo_waiting += 1
-                try:
-                    self.condition.wait_for(
-                        lambda: not self.solo_active and self.regular_active == 0
-                    )
-                    self.solo_active = True
-                finally:
-                    self.solo_waiting -= 1
-                return
-            self.condition.wait_for(
-                lambda: not self.solo_active and self.solo_waiting == 0
-            )
-            self.regular_active += 1
-
-    def release(self, *, solo: bool) -> None:
-        with self.condition:
-            if solo:
-                self.solo_active = False
-            else:
-                self.regular_active -= 1
-            self.condition.notify_all()
-
-
 def _next_worker_unit(
     work_by_worker: list[queue.Queue[Unit]],
     worker_index: int,
@@ -851,6 +819,17 @@ def _next_worker_unit(
     raise queue.Empty
 
 
+def _next_prioritized_worker_unit(
+    long_work_by_worker: list[queue.Queue[Unit]],
+    regular_work_by_worker: list[queue.Queue[Unit]],
+    worker_index: int,
+) -> tuple[queue.Queue[Unit], Unit]:
+    try:
+        return _next_worker_unit(long_work_by_worker, worker_index)
+    except queue.Empty:
+        return _next_worker_unit(regular_work_by_worker, worker_index)
+
+
 @dataclass
 class _ShardExecutor:
     repo_root: Path
@@ -862,12 +841,26 @@ class _ShardExecutor:
     devices: list[str | None]
     heartbeat: _LeaseHeartbeat
     solo_sources: frozenset[str]
-    work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
-    execution_gate: _ExecutionGate = field(default_factory=_ExecutionGate)
+    long_running_sources: frozenset[str]
+    long_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
+    regular_work_by_worker: list[queue.Queue[Unit]] = field(default_factory=list)
+    solo_units: list[Unit] = field(default_factory=list)
     infrastructure_errors: list[str] = field(default_factory=list)
     interruption_reasons: set[str] = field(default_factory=set)
     errors_lock: threading.Lock = field(default_factory=threading.Lock)
     stop_workers: threading.Event = field(default_factory=threading.Event)
+
+    def _worker_queues(self, units: list[Unit]) -> list[queue.Queue[Unit]]:
+        queues = []
+        for worker_units in source_affine_unit_bins(units, self.execution.workers):
+            work: queue.Queue[Unit] = queue.Queue()
+            for unit in sorted(
+                worker_units,
+                key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
+            ):
+                work.put(unit)
+            queues.append(work)
+        return queues
 
     def add_units(self, units: list[Unit]) -> None:
         pending = []
@@ -878,15 +871,19 @@ class _ShardExecutor:
                 for batch in unit.batches
             ):
                 pending.append(unit)
-        self.work_by_worker = []
-        for worker_units in source_affine_unit_bins(pending, self.execution.workers):
-            work: queue.Queue[Unit] = queue.Queue()
-            for unit in sorted(
-                worker_units,
-                key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
-            ):
-                work.put(unit)
-            self.work_by_worker.append(work)
+        self.solo_units = sorted(
+            (unit for unit in pending if self._unit_is_solo(unit)),
+            key=lambda item: (-item.estimated_ms, item.id.encode("utf-8")),
+        )
+        regular_units = [unit for unit in pending if not self._unit_is_solo(unit)]
+        long_units = [
+            unit for unit in regular_units if self._unit_is_long_running(unit)
+        ]
+        normal_units = [
+            unit for unit in regular_units if not self._unit_is_long_running(unit)
+        ]
+        self.long_work_by_worker = self._worker_queues(long_units)
+        self.regular_work_by_worker = self._worker_queues(normal_units)
 
     def run(self) -> None:
         with ThreadPoolExecutor(
@@ -906,6 +903,17 @@ class _ShardExecutor:
                     self._record_infrastructure_error(
                         f"worker-{index}: {type(error).__name__}: {error}"
                     )
+        if self.stop_workers.is_set():
+            return
+        for unit in self.solo_units:
+            try:
+                self._execute_unit(0, unit, solo=True)
+            except Exception as error:
+                self.stop_workers.set()
+                self._record_infrastructure_error(
+                    f"solo-worker: {type(error).__name__}: {error}"
+                )
+                return
 
     def _record_infrastructure_error(self, diagnostic: str) -> None:
         with self.errors_lock:
@@ -914,19 +922,25 @@ class _ShardExecutor:
     def _worker(self, index: int) -> None:
         while not self.stop_workers.is_set():
             try:
-                work, unit = _next_worker_unit(self.work_by_worker, index)
+                work, unit = _next_prioritized_worker_unit(
+                    self.long_work_by_worker,
+                    self.regular_work_by_worker,
+                    index,
+                )
             except queue.Empty:
                 return
-            solo = self._unit_is_solo(unit)
-            self.execution_gate.acquire(solo=solo)
             try:
-                self._execute_unit(index, unit, solo=solo)
+                self._execute_unit(index, unit, solo=False)
             finally:
-                self.execution_gate.release(solo=solo)
                 work.task_done()
 
     def _unit_is_solo(self, unit: Unit) -> bool:
         return any(batch.source_file in self.solo_sources for batch in unit.batches)
+
+    def _unit_is_long_running(self, unit: Unit) -> bool:
+        return any(
+            batch.source_file in self.long_running_sources for batch in unit.batches
+        )
 
     def _execute_unit(self, worker_index: int, unit: Unit, *, solo: bool) -> None:
         claim_path = claims_dir(self.junit_dir) / f"{unit.id}.json"
@@ -1290,6 +1304,9 @@ def execute_shard(
         devices=devices,
         heartbeat=leases.heartbeat,
         solo_sources=frozenset(node.source_file for node in plan.nodes if node.solo),
+        long_running_sources=frozenset(
+            node.source_file for node in plan.nodes if node.long_running
+        ),
     )
     shard_executor.add_units(shard_units)
     try:
