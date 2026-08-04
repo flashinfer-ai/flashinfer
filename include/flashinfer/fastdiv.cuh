@@ -47,18 +47,19 @@ struct uint_fastdiv {
 #else
 // CUDA 13+ path: cuda::fast_mod_div was removed. Fall back to plain division.
 struct uint_fastdiv {
-  __host__ __device__ uint_fastdiv() : d_(0) {}
+  __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
 
-  __host__ __device__ uint_fastdiv(uint32_t d) : d_(d ? d : 1) {}
+  __host__ __device__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
 
   __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
 
   __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t& q, uint32_t& r) const {
-    q = n / d_;
-    r = n % d_;
+    q = n / impl_;
+    r = n - q * d_;
   }
 
  private:
+  uint32_t impl_;
   uint32_t d_;
 };
 #endif
