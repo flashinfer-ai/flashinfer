@@ -50,7 +50,7 @@ void RunM64(TensorView q, TensorView k, TensorView v, TensorView g, TensorView b
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckExactSm100a(device_id);
+  CheckFlashKDATarget(device_id);
 
   const int64_t num_seqs =
       CheckCommonInputs(q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order,
