@@ -66,9 +66,8 @@ def block_extend_reference(
 
 
 def test_block_extend_batch_generator_routing(monkeypatch):
-    """Only a fixed Block Extend request takes the dedicated generator."""
+    """Block Extend uses the dedicated generator directly."""
     import flashinfer.prefill as prefill_module
-    from flashinfer.utils import MaskMode
 
     class DummySpec:
         def build_and_load(self):
@@ -77,19 +76,13 @@ def test_block_extend_batch_generator_routing(monkeypatch):
     def dedicated_generator(*args, **kwargs):
         return DummySpec()
 
-    def shared_generator(*args, **kwargs):
-        raise AssertionError("Block Extend mask must not use the shared generator")
-
     monkeypatch.setattr(
         prefill_module,
         "gen_customize_block_extend_batch_prefill_module",
         dedicated_generator,
     )
-    monkeypatch.setattr(
-        prefill_module, "gen_customize_batch_prefill_module", shared_generator
-    )
 
-    module = prefill_module.get_customize_batch_prefill_module(
+    module = prefill_module.get_block_extend_batch_prefill_module(
         backend="fa2",
         uri="test_block_extend_batch_generator_routing",
         dtype_q=torch.float16,
@@ -104,7 +97,6 @@ def test_block_extend_batch_generator_routing(monkeypatch):
         additional_scalar_dtypes=[],
         variant_name="TestBlockExtendAttention",
         variant_decl="",
-        mask_modes=[MaskMode.BLOCK_EXTEND.value],
     )
 
     assert module == "block-extend-module"
@@ -409,6 +401,8 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
         dtype=torch.int32,
         device=device,
     )
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    seq_lens_before_plan = seq_lens.clone()
 
     for backend in get_available_backends(device):
         refs = []
@@ -452,7 +446,9 @@ def test_block_extend_paged_zero_visible_then_normal(dtype: torch.dtype):
             sm_scale=sm_scale,
             q_offsets=q_offsets,
             kv_offsets=kv_offsets,
+            seq_lens=seq_lens,
         )
+        assert torch.equal(seq_lens, seq_lens_before_plan)
         out = wrapper.run(q, paged_kv)
         diff = (out.float() - ref.float()).abs().max().item()
         assert diff < tol, (backend, dtype, diff, tol)

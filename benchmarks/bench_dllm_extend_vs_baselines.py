@@ -1,12 +1,12 @@
-"""dLLM Extend: BBE/V2 vs Baselines Speedup
+"""Block Extend single/batch prefill vs baseline implementations.
 
 Key property: Q_end << KV_end → block_extend plan optimization takes effect.
 
 Compares 4 approaches:
   - [Baseline 1] SGLang Cascade: Ragged(current) + Paged(prefix) + merge_state
   - [Baseline 2] Custom Mask: single_prefill_with_kv_cache(custom_mask=...)
-  - [V2] block_extend: single_prefill_with_kv_cache(block_extend=True, ...)
-  - [BBE] BatchBlockExpanding Ragged: BatchPrefillWithRaggedKVCacheWrapper
+  - [Single BE] single_prefill_with_kv_cache(block_extend=True, ...)
+  - [Batch BE] BatchPrefillWithRaggedKVCacheWrapper(block_extend=True, ...)
 
 All approaches use CUDA Graph to eliminate launch overhead.
 """
@@ -25,7 +25,7 @@ def compute_block_extend_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    dllm_block_size: int,
+    block_size: int,
     q_offset: int = 0,
     sm_scale: float = None,
 ) -> torch.Tensor:
@@ -38,8 +38,8 @@ def compute_block_extend_reference(
         sm_scale = 1.0 / math.sqrt(head_dim)
     q_pos = torch.arange(qo_len, device=device) + q_offset
     k_pos = torch.arange(kv_len, device=device)
-    q_block = q_pos.unsqueeze(1) // dllm_block_size
-    k_block = k_pos.unsqueeze(0) // dllm_block_size
+    q_block = q_pos.unsqueeze(1) // block_size
+    k_block = k_pos.unsqueeze(0) // block_size
     mask_2d = (q_block >= k_block).to(torch.uint8)
     return single_prefill_with_kv_cache(
         q,
@@ -52,7 +52,7 @@ def compute_block_extend_reference(
 
 def run(
     tokens_per_request: int = 8192,
-    dllm_block_size: int = 32,
+    block_size: int = 32,
     chunk_sizes: list = None,
     num_heads: int = 32,
     num_kv_heads: int = 8,
@@ -68,18 +68,18 @@ def run(
     device = torch.device("cuda:0")
     dtype = torch.float16
     sm_scale = 1.0 / (head_dim**0.5)
-    B = dllm_block_size
+    B = block_size
     WS_MB = 256
 
     # Place Q in the middle of the sequence so Q_end << KV_end
     q_offset_base = tokens_per_request // 2
 
     print(f"\n{'=' * 90}")
-    print("dLLM Extend: BBE/V2 vs Baselines Speedup")
+    print("Block Extend single/batch prefill vs baselines")
     print(f"{'=' * 90}")
     print("Configuration:")
     print(f"  tokens_per_request  = {tokens_per_request}")
-    print(f"  dllm_block_size     = {dllm_block_size}")
+    print(f"  block_size          = {block_size}")
     print(f"  chunk_sizes         = {chunk_sizes}")
     print(f"  num_heads           = {num_heads}")
     print(f"  num_kv_heads        = {num_kv_heads}")
@@ -311,9 +311,9 @@ def run(
         torch.cuda.empty_cache()
 
         # ================================================================
-        # [V2] block_extend_attention
+        # Single Block Extend
         # ================================================================
-        print("  [V2    ] block_extend (single_prefill, block_extend=True)...")
+        print("  [Single BE] single prefill...")
         v2_out = torch.empty_like(q_extend)
 
         def run_v2_once():
@@ -323,7 +323,7 @@ def run(
                     k_full,
                     v_full,
                     block_extend=True,
-                    block_size=dllm_block_size,
+                    block_size=block_size,
                     q_offset=q_offset,
                     sm_scale=sm_scale,
                 )
@@ -357,15 +357,15 @@ def run(
         torch.cuda.empty_cache()
 
         # ================================================================
-        # [BBE] BatchBlockExpanding Ragged
+        # Batch Block Extend Ragged
         # ================================================================
-        print("  [BBE   ] BatchBlockExpanding Ragged...")
+        print("  [Batch BE ] ragged prefill...")
         ws_bbe = torch.empty(WS_MB * 1024 * 1024, dtype=torch.uint8, device=device)
         bbe_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
             ws_bbe,
             kv_layout="NHD",
             block_extend=True,
-            block_size=dllm_block_size,
+            block_size=block_size,
         )
         bbe_wrapper.plan(
             qo_indptr=qo_indptr,
@@ -432,12 +432,12 @@ def run(
         del bbe_graph, bbe_wrapper, ws_bbe
         torch.cuda.empty_cache()
 
-        # Correctness (BBE/V2 vs CustomMask reference)
+        # Correctness (batch/single Block Extend vs custom-mask reference)
         cm_ref = compute_block_extend_reference(
             q_extend,
             k_full,
             v_full,
-            dllm_block_size,
+            block_size,
             q_offset=q_offset,
             sm_scale=sm_scale,
         )
@@ -446,7 +446,8 @@ def run(
         tol = 1e-2
         if verbose or bbe_diff >= tol or v2_diff >= tol:
             print(
-                f"  Correctness vs CustomMask: BBE max_diff={bbe_diff:.6f}, V2 max_diff={v2_diff:.6f}"
+                f"  Correctness vs custom mask: batch_be max_diff={bbe_diff:.6f}, "
+                f"single_be max_diff={v2_diff:.6f}"
             )
 
         q_end = q_offset + chunk_size
@@ -477,8 +478,8 @@ def run(
 
     print(
         f"\n{'chunk':>6} {'eff_kv':>7} | "
-        f"{'Casc(us)':>8} {'CMsk(us)':>8} {'V2(us)':>8} {'BBE(us)':>8} | "
-        f"{'BBE/Cas':>8} {'BBE/CM':>8} {'V2/CM':>8} | "
+        f"{'Casc(us)':>8} {'CMsk(us)':>8} {'Single':>8} {'Batch':>8} | "
+        f"{'B/Cas':>8} {'B/CM':>8} {'S/CM':>8} | "
         f"{'plan':>12}"
     )
     print(
@@ -505,10 +506,10 @@ def run(
         f"  - Scenario: KV={tokens_per_request} fully populated, Q={chunk_sizes}@offset={q_offset_base}"
     )
     print("  - Q_end << KV_end → block_extend plan optimization active")
-    print("  - BBE/Cas: BBE speedup vs SGLang Cascade")
-    print("  - BBE/CM : BBE speedup vs Custom Mask")
-    print("  - V2/CM  : V2 block_extend speedup vs Custom Mask")
-    print("  - plan   : BBE scheduler decision (pad=padding, skv=split_kv)")
+    print("  - B/Cas: batch Block Extend speedup vs SGLang Cascade")
+    print("  - B/CM : batch Block Extend speedup vs custom mask")
+    print("  - S/CM : single Block Extend speedup vs custom mask")
+    print("  - plan : batch Block Extend scheduler decision (pad=padding, skv=split_kv)")
 
     return results
 
@@ -521,7 +522,12 @@ if __name__ == "__main__":
         "--tokens_per_request", type=int, default=8192, help="KV cache total length"
     )
     parser.add_argument(
-        "--dllm_block_size", type=int, default=32, help="DLLM block size"
+        "--block_size",
+        "--dllm_block_size",
+        dest="block_size",
+        type=int,
+        default=32,
+        help="Block Extend block size",
     )
     parser.add_argument(
         "--chunk_sizes", type=str, default="32,64,128,256", help="Q size list"
@@ -536,7 +542,7 @@ if __name__ == "__main__":
 
     run(
         tokens_per_request=args.tokens_per_request,
-        dllm_block_size=args.dllm_block_size,
+        block_size=args.block_size,
         chunk_sizes=[int(x) for x in args.chunk_sizes.split(",")],
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,

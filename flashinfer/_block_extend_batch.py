@@ -4,8 +4,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .utils import MaskMode
-
 
 _FA2_VARIANT_DECL = r"""
 struct BlockExtendBatchAttention : AttentionVariantBase {
@@ -138,6 +136,5 @@ def build_block_extend_jit_args(
         "use_sliding_window": False,
         "use_logits_soft_cap": False,
         "use_fp16_qk_reduction": False,
-        "mask_modes": [MaskMode.BLOCK_EXTEND.value],
     }
     return jit_args, jit_kwargs

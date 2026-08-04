@@ -934,40 +934,6 @@ inline cudaError_t PrefillPlanWorkspaceSize(
                                 num_colocated_ctas, uniform_q_len, stream);
 }
 
-/*!
- * \brief Compute the effective KV length for block_extend mask at request level.
- * \details Uses the last Q position to determine the maximum block-aligned visible
- * KV range. This is a conservative upper bound suitable for KV chunk sizing.
- */
-inline int64_t block_extend_effective_kv_len(int64_t qo_len, int64_t kv_len,
-                                             int64_t dllm_block_size, int64_t q_offset) {
-  if (dllm_block_size <= 0 || qo_len <= 0) return kv_len;
-  int64_t q_tile_end = qo_len;
-  int64_t q_global_end = q_offset + q_tile_end - 1;
-  int64_t q_block = q_global_end / dllm_block_size;
-  int64_t max_kv_global = (q_block + 1) * dllm_block_size;
-  return std::min(kv_len, max_kv_global);
-}
-
-/*!
- * \brief Compute the effective KV end for a specific Q tile under block_extend mask.
- * \details For a Q tile at qo_tile_idx, the last visible KV position is determined
- * by the last Q token's block boundary. Returns the visible KV end in [0, kv_len].
- * The last Q tile always sees the full kv_len.
- */
-inline int block_extend_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cta_tile_q,
-                               int num_qo_tiles, int64_t dllm_block_size, int64_t q_offset) {
-  if (qo_tile_idx + 1 == num_qo_tiles) {
-    return kv_len;
-  }
-  int64_t q_tile_end =
-      std::min<int64_t>(static_cast<int64_t>(qo_tile_idx + 1) * cta_tile_q, qo_len);
-  int64_t q_global_end = q_offset + q_tile_end - 1;
-  int64_t q_block = q_global_end / dllm_block_size;
-  int64_t max_kv_global = (q_block + 1) * dllm_block_size;
-  return std::max(std::min(static_cast<int>(max_kv_global), kv_len), 0);
-}
-
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
 
 template <typename T>

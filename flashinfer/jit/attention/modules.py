@@ -1370,10 +1370,11 @@ def gen_customize_single_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
-    """Public shared single-prefill gen. Compiles only the standard mask list
-    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. Block Extend uses the dedicated
-    gen_customize_block_extend_single_prefill_module dispatch path."""
+    """Build a shared single-prefill module for the standard mask modes.
+
+    Block Extend is kept out of this compilation product and uses its dedicated
+    generator below.
+    """
     return _gen_customize_single_prefill_module_impl(
         backend,
         uri,
@@ -1628,10 +1629,8 @@ def gen_customize_block_extend_single_prefill_module(
 ) -> "JitSpec":
     """Dedicated single-prefill front-end for Block Extend attention.
 
-    Compiles only ``MaskMode::kBlockExtend`` over the supported product
-    using a standalone congregate-config class that hard-codes the dispatch
-    — a separate small cartesian product, not a new value multiplied into the
-    big shared prefill one.
+    Compiles only ``MaskMode::kBlockExtend`` with dedicated configuration
+    templates, keeping it out of the shared prefill compilation product.
     """
     _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_single_prefill_module_impl(
@@ -1682,10 +1681,8 @@ def gen_customize_block_extend_batch_prefill_module(
 ) -> "JitSpec":
     """Dedicated batch-prefill front-end for Block Extend attention.
 
-    Compiles only ``MaskMode::kBlockExtend`` over the supported product
-    using a standalone congregate-config class that hard-codes the dispatch
-    — a separate small cartesian product, not a new value multiplied into the
-    big shared prefill one.
+    Compiles only ``MaskMode::kBlockExtend`` with dedicated configuration
+    templates, keeping it out of the shared prefill compilation product.
     """
     _check_block_extend_axes(dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo)
     return _gen_customize_batch_prefill_module_impl(
@@ -1819,10 +1816,11 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
-    """Public shared batch-prefill gen. Compiles only the standard mask list
-    [0,1,2,3] — kBlockExtend is NOT a value multiplied into this shared
-    product. Block Extend uses the dedicated
-    gen_customize_block_extend_batch_prefill_module dispatch path."""
+    """Build a shared batch-prefill module for the standard mask modes.
+
+    Block Extend is kept out of this compilation product and uses its dedicated
+    generator below.
+    """
     return _gen_customize_batch_prefill_module_impl(
         backend,
         uri,
