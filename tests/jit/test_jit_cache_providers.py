@@ -1,5 +1,7 @@
 import importlib.util
+import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,25 @@ def provider_package_config_module():
     )
     module_name = "_test_jit_cache_provider_package_config"
     spec = importlib.util.spec_from_file_location(module_name, config_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.fixture
+def wheelhouse_verifier_module():
+    verifier_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "verify_jit_cache_provider_wheelhouse.py"
+    )
+    module_name = "_test_jit_cache_wheelhouse_verifier"
+    spec = importlib.util.spec_from_file_location(module_name, verifier_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -152,6 +173,91 @@ def test_provider_build_config_uses_distinct_distribution_name(
     assert config.distribution == "flashinfer-jit-cache-sm90a"
     assert config.package == "flashinfer_jit_cache.providers.sm90a"
     assert config.version.endswith("+cu130")
+
+
+def test_native_provider_cuda_inspection_reports_no_ptx(
+    monkeypatch, tmp_path, wheelhouse_verifier_module
+):
+    wheel_path = tmp_path / "provider.whl"
+    archive_path = "provider/jit_cache/test_module/test_module.so"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(archive_path, b"test")
+    wheel = wheelhouse_verifier_module.Wheel(
+        path=wheel_path,
+        distribution="flashinfer-jit-cache-sm120f",
+        version="0.6.16+cu130",
+        requirements=(),
+        contents=(archive_path,),
+        metadata_path="provider.dist-info/METADATA",
+    )
+    cuobjdump = tmp_path / "cuobjdump"
+    cuobjdump.touch()
+
+    def mock_run(cmd, **_kwargs):
+        if cmd[1] == "--list-elf":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="ELF file 1: test.sm120f.cubin\n", stderr=""
+            )
+        assert cmd[1] == "--list-ptx"
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="",
+            stderr="cuobjdump info: No PTX file found to extract\n",
+        )
+
+    monkeypatch.setattr(wheelhouse_verifier_module.subprocess, "run", mock_run)
+
+    architectures, ptx_modules = wheelhouse_verifier_module.inspect_cuda_architectures(
+        wheel,
+        {"test_module": archive_path},
+        "sm120f",
+        cuobjdump,
+        strict=True,
+    )
+
+    assert architectures == {"test_module": ["sm120f"]}
+    assert ptx_modules == []
+
+
+def test_native_provider_cuda_inspection_rejects_ptx(
+    monkeypatch, tmp_path, wheelhouse_verifier_module
+):
+    wheel_path = tmp_path / "provider.whl"
+    archive_path = "provider/jit_cache/test_module/test_module.so"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(archive_path, b"test")
+    wheel = wheelhouse_verifier_module.Wheel(
+        path=wheel_path,
+        distribution="flashinfer-jit-cache-sm120f",
+        version="0.6.16+cu130",
+        requirements=(),
+        contents=(archive_path,),
+        metadata_path="provider.dist-info/METADATA",
+    )
+    cuobjdump = tmp_path / "cuobjdump"
+    cuobjdump.touch()
+
+    def mock_run(cmd, **_kwargs):
+        if cmd[1] == "--list-elf":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="ELF file 1: test.sm120f.cubin\n", stderr=""
+            )
+        assert cmd[1] == "--list-ptx"
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="PTX file 1: test.compute_80.ptx\n", stderr=""
+        )
+
+    monkeypatch.setattr(wheelhouse_verifier_module.subprocess, "run", mock_run)
+
+    with pytest.raises(ValueError, match="native-provider modules contain PTX"):
+        wheelhouse_verifier_module.inspect_cuda_architectures(
+            wheel,
+            {"test_module": archive_path},
+            "sm120f",
+            cuobjdump,
+            strict=True,
+        )
 
 
 def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):

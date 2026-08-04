@@ -594,7 +594,8 @@ def clear_cubin_cmd():
     show_default=True,
     help=(
         "Install all provider dependencies declared by the shim, or only the "
-        "providers selected by --sm or the visible GPUs."
+        "providers selected by --sm or the visible GPUs. Minimal mode does not "
+        "add a baseline provider."
     ),
 )
 @click.option(

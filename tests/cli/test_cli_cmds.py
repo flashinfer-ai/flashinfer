@@ -137,7 +137,7 @@ def test_install_cubin_wheel_cmd_mocked(monkeypatch):
     assert recorded["check"] is False
 
 
-def test_install_jit_cache_wheel_cmd_minimal_explicit_sm(monkeypatch):
+def test_install_jit_cache_wheel_cmd_minimal_does_not_add_sm80(monkeypatch):
     import flashinfer.__main__ as flashinfer_main
 
     recorded = {}
