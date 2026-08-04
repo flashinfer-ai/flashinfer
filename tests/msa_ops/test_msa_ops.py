@@ -1437,17 +1437,15 @@ def test_msa_proxy_score_paged_fp8():
     )
     torch.cuda.synchronize()
     assert torch.equal(out_paged, out_flat)
-    # Decode shapes dispatch fp8 K to the stream (q_len 1) and packed (q_len 4)
-    # schedules; both upconvert e4m3 exactly, so results stay bit-identical to
-    # the same call on dequantized K. Flat and paged (production shape) layouts;
-    # one fp16-q case covers the f16 convert target in the packed schedule.
+    # Decode shapes route fp8 K to the decode schedules; the e4m3 upconvert is
+    # exact, so results must stay bit-identical to the same call on
+    # dequantized K. The fp16-q case covers the f16 convert target.
     k8_pg = k_pg.to(torch.float8_e4m3fn).contiguous()
     for sq, qdt in ((1, torch.bfloat16), (4, torch.bfloat16), (4, torch.float16)):
         cu_qd = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=dev)
-        # e4m3-representable q, as deployment provides (M3 quantizes q
-        # upstream): the fp8 key-major schedule groups products into mma
-        # instructions differently from the bf16 path, and exactness under
-        # regrouping needs every dot term exact in f32.
+        # e4m3-representable q, as deployment provides: the fp8 key-major
+        # schedule regroups products across mma instructions, and exactness
+        # under regrouping needs every dot term exact in f32.
         qd = (
             (torch.randn(B * sq, Hq, 128, device=dev) / 3)
             .to(torch.float8_e4m3fn)
@@ -1465,8 +1463,8 @@ def test_msa_proxy_score_paged_fp8():
         assert torch.equal(out8, out_deq8)
         assert torch.equal(pg8, pg_deq8)
         if qdt is torch.bfloat16:
-            # Native fp8 q (the vLLM M3 fp8-cache contract): same exact math,
-            # so bit-identical to the bf16-q call on the same values.
+            # Native fp8 q: same exact math, so bit-identical to the bf16-q
+            # call on the same values.
             qd8 = qd.to(torch.float8_e4m3fn)
             out_q8 = msa_proxy_score(qd8, k8, cu_qd, cu_k, causal=True)
             pg_q8 = msa_proxy_score(

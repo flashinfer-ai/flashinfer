@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-MSA dense proxy-score kernels (bf16/fp16) for SM120/SM121: per (head, KV block,
-query) max of the unscaled post-mask QK^T logits; masked blocks yield -inf.
+MSA dense proxy-score kernels for SM120/SM121: per (head, KV block, query) max
+of the unscaled post-mask QK^T logits; masked blocks yield -inf.
 """
 
 from typing import Type
@@ -890,28 +890,18 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
 class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
     """fp8-K packed-decode schedule. Same head-fused M rows as the packed
     schedule, but warps split over keys instead of query rows (after Thien
-    Nguyen's indexer kernel): each warp owns its own key columns, so the
-    e4m3 -> f16/bf16 upconvert runs once per K element instead of once per
-    warp. K stays raw e4m3 through cp.async and smem (half the bytes and half
-    the smem of a converted tile) and upconverts in registers between the
-    smem loads and the mma. mK arrives as a 16-bit view of the e4m3 bytes with half the
-    head dim (see msa_proxy_score), which keeps the cp.async source alignment
-    provable. Q is stored column-permuted to match the converted K fragments
+    Tran's indexer kernel), so the e4m3 -> f16/bf16 upconvert runs once per
+    K element instead of once per warp. K stays raw e4m3 through cp.async
+    and smem, arriving as a 16-bit view with half the head dim (see
+    msa_proxy_score), and upconverts in registers between the smem loads and
+    the mma. Q is stored column-permuted to match the converted K fragments
     (see _gather_packed_q).
 
-    The score tile is 64 rows x 128 keys from a (16, 32)-tiled m16n8k16 mma
-    with the 4 warps side by side along N, so every warp computes all 64 rows
-    for its own 32 key columns and the epilogue joins the per-warp row maxes
-    through smem.
-
-    K staging is pipelined at two granularities, because split-K leaves the
-    small-batch grids with a single KV block per CTA (nothing to overlap
-    across blocks) while long-context CTAs iterate several: two smem K
-    buffers with a one-block prefetch overlap the next block's loads with
-    this block's mma, and each fill commits as two 64-key cp.async groups so
-    the mma starts on the first half while the second is still in flight.
-    Every iteration commits exactly two groups (empty ones once the tail is
-    reached), which keeps the wait_group counts static.
+    K staging is pipelined at two granularities because split-K often leaves
+    a CTA a single KV block: two smem buffers with a one-block prefetch
+    overlap across blocks, and each fill commits as two 64-key cp.async
+    groups so the mma starts on the first half while the second is still in
+    flight.
     """
 
     @cute.kernel
@@ -1040,13 +1030,9 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
 
         # B loads are plain 4B reads, not ldmatrix: a warp's slice per
         # (n-tile, k-step pair) is only 8 rows x 16B, which the ldmatrix tiled
-        # copies cannot partition here (the source collapses to one matrix).
-        # Each lane reads the two 16-bit pairs its own fragment needs; the
-        # swizzle keeps the reads bank-spread. kpair holds one such pair (four
-        # consecutive e4m3 key columns); the convert splits it into the
-        # even/odd mma k-steps, and the resulting K-axis column permutation is
-        # mirrored by the Q gather (a permutation shared by both operands
-        # leaves Q K^T unchanged).
+        # copies cannot partition. The convert splits each 4-byte pair into
+        # the even/odd mma k-steps; the resulting K-axis column permutation is
+        # mirrored by the Q gather, so Q K^T is unchanged.
         kpair = cute.make_rmem_tensor(cute.make_layout(2), self._dtype)
         kpair_u32 = cute.recast_tensor(kpair, cutlass.Uint32)
         tSrK_u32 = cute.recast_tensor(
@@ -1063,15 +1049,13 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
         n_rows = cute.size(acc_S_mn.shape[0])
 
         # Gather stores are synchronous; order them before the Q fragment
-        # reads. Q fragments are loaded per k-step inside the block loop (a
-        # full-tile preload would hold 4x the M-split fragment count and cost
-        # a CTA of occupancy).
+        # reads. Q fragments load per k-step inside the block loop, since a
+        # full-tile preload would cost a CTA of occupancy.
         self.cta_sync_barrier.arrive_and_wait()
 
-        # Buffer selection is a pointer pick, not an if/else over cloned fill
-        # and consume bodies: the small-batch grids run one CTA per SM with a
-        # cold instruction cache, where duplicated code costs more than the
-        # pipeline saves.
+        # Buffer selection is a pointer pick rather than cloned fill/consume
+        # bodies: small-batch grids run one cold-I-cache CTA per SM, where the
+        # duplicated code costs more than it saves.
         base0 = sK0.iterator.toint()
         buf_step = sK1.iterator.toint() - base0
 
@@ -1099,10 +1083,9 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                     sK_layout,
                 )
                 # Prefetch the next block into the idle buffer; its loads fly
-                # under this block's mma and epilogue. Exactly two commit
-                # groups go out either way (empty ones at the tail), so the
-                # current block's halves are always the 4th- and 3rd-newest
-                # groups and the wait_group counts below stay static.
+                # under this block's mma and epilogue. Two commit groups go
+                # out either way (empty ones at the tail), which keeps the
+                # wait_group counts below static.
                 nxt_block = kv_block + num_splits
                 if nxt_block < num_kv_blocks:
                     self._fill_k8_tile(
@@ -1123,8 +1106,7 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
 
                 # S = Q K^T (unscaled), consumed one 64-key half behind each
                 # fill group so the mma starts before the tile finishes
-                # landing (split-K often leaves one block per CTA, where this
-                # intra-block overlap is the only one available).
+                # landing.
                 acc_S.fill(0.0)
                 for h in cutlass.range_constexpr(2):
                     cute.arch.cp_async_wait_group(3 - h)
@@ -1250,10 +1232,8 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
         acc_S: cute.Tensor,
     ):
         """Convert-and-mma over one 64-key half (n-tiles ``2*half`` and
-        ``2*half + 1``). Per k-step pair: read the lane's raw 16-bit pairs,
-        packed-convert into the pair's fragments, then the two mma steps; Q
-        fragments load just in time so ptxas keeps the per-thread A footprint
-        at one k-step."""
+        ``2*half + 1``). Q fragments load just in time so ptxas keeps the
+        per-thread A footprint at one k-step."""
         tidx, _, _ = cute.arch.thread_idx()
         # Fragment geometry of the m16n8k16 B atom: lane covers key row
         # n = 32*nt + 8*warp + lane//4 and k16 pairs at 2*(lane%4) (+8).
@@ -1287,11 +1267,10 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                         lo, hi = _fp8x4_to_bf16x4(kpair_u32[0])
                     else:
                         lo, hi = _fp8x4_to_f16x4(kpair_u32[0])
-                    # All four e4m3 of this u32 belong to the same canonical
-                    # 16-column group g, so both converted pairs go into mma
-                    # step 2*kk8 + g: this keeps each product in the same
-                    # instruction as the reference schedules, and the chained
-                    # f32 accumulation stays bit-identical.
+                    # All four e4m3 of this u32 belong to canonical 16-column
+                    # group g, so both converted pairs go into mma step
+                    # 2*kk8 + g: each product lands in the same instruction as
+                    # the reference schedules, keeping the result bit-identical.
                     kk = 2 * kk8 + g
                     d0 = cute.crd2idx(((0, 0), nt, kk), tSrK.layout)
                     d1 = cute.crd2idx(((0, 1), nt, kk), tSrK.layout)
@@ -1327,13 +1306,10 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
     @cute.jit
     def _gather_packed_q(self, mQ, sQ, q_start, kv_head, seqlen_q, tidx):
         """Gather the packed Q tile into swizzled smem, column-permuted to
-        match the converted K fragments; rows past seqlen_q are zero-filled
-        (epilogue masks them).
-
-        The packed K convert places column ``16g + 4m + 2h + j`` of each
-        32-wide block in the mma slot that canonically holds
-        ``16g + 8h + 2m + j``, and Q must follow the same K-axis permutation
-        for ``Q K^T`` to be unchanged."""
+        match the converted K fragments (the K convert moves column
+        ``16g + 4m + 2h + j`` of each 32-wide block into the slot that
+        canonically holds ``16g + 8h + 2m + j``). Rows past seqlen_q are
+        zero-filled; the epilogue masks them."""
         elems = 128 // self._dtype.width
         chunks = self._head_dim // elems
         total = self._m_block_size * chunks
@@ -1420,10 +1396,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
     two-stage mbarrier pipeline (Q's smem aliases K stage 0), which leaves
     two intra-CTA barriers per block. The low per-CTA fixed cost (no Q
     gather, no fill barriers, no per-step Q reloads) is what wins on the
-    one-block-per-CTA grids that split-K produces at small batch, and
-    measured on SM120 the schedule also beats the row-major/key-split
-    packed schedules on machine-filling grids, so it takes every fused
-    tile of at most 32 rows.
+    one-block-per-CTA grids that split-K produces at small batch.
 
     Derived from vLLM's IndexDecodeScoreKernel (Apache-2.0) by Thien Tran
     (gau-nernst), adapted to flat/paged K with a kv-head mode, per-request
@@ -1458,14 +1431,10 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         self._is_causal = is_causal
         self._paged = paged
         self._kv_fp8 = kv_fp8
-        # fp8 q arrives as a 16-bit view like fp8 K (the vLLM M3 fp8 path
-        # emits e4m3 index-q). With both operands raw e4m3 the ldmatrix
-        # column order matches on both sides, so the Q fragments need only
-        # the same split converts as K -- no cross-lane permute.
         self._q_fp8 = q_fp8
         # Right-aligned decode (q_offset=None) computes the causal offset
-        # in-kernel from the seqlens, skipping the host-side offset-tensor
-        # build (two extra kernel launches that dominate at batch 1).
+        # in-kernel, skipping the host-side offset-tensor build kernels that
+        # dominate at batch 1.
         self._qoff_default = qoff_default
         self._block_q = group_size * pack_q_len
         self._q_tiles = (self._block_q + 7) // 8
@@ -1751,11 +1720,10 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 rK = cute.make_rmem_tensor((elems, 2, kw // mma_k), dtype)
                 if cutlass.const_expr(self._kv_fp8):
                     # ldmatrix on the 16-bit view hands each lane 4 consecutive
-                    # e4m3 per u32; splitting each converted u32 into its low
-                    # and high f16 pair yields two k16 A-fragments per
-                    # 32-fp8-column group as pure register renames (the Q
-                    # fragments are permuted once below to the same column
-                    # order).
+                    # e4m3 per u32, so splitting each converted u32 into its
+                    # low and high pair yields the two k16 A-fragments as pure
+                    # register renames. Q is permuted once below to the same
+                    # column order.
                     rK_u32 = cute.recast_tensor(rK, cutlass.Uint32)
                     rK_lo = cute.make_rmem_tensor((elems,), dtype)
                     rK_hi = cute.make_rmem_tensor((elems,), dtype)
@@ -1780,8 +1748,8 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 if cutlass.const_expr(self._kv_fp8):
                     rQ_u32 = cute.recast_tensor(rQ, cutlass.Uint32)
                     if cutlass.const_expr(self._q_fp8):
-                        # Raw e4m3 q: ldmatrix hands q the same fp8 column
-                        # order as K, so the split converts already are the
+                        # Raw e4m3 q gets the same fp8 column order as K from
+                        # ldmatrix, so the split converts already are the
                         # matching B-fragments.
                         for g in cutlass.range_constexpr(kw // mma_k):
                             for n in cutlass.range_constexpr(q_tiles):
@@ -1800,10 +1768,9 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                     rQp_u32[j, g, n, 1] = q_hi
                     else:
                         # One-time cross-lane permute of the bf16/f16 Q
-                        # B-fragments into the fp8 K column order: per
-                        # 32-column group, lane quad position q4 needs columns
-                        # 4*q4..4*q4+3, which sit as u32 pairs on quad lanes
-                        # 2*(q4%2) (lower half) and 2*(q4%2)+1 (upper half) of
+                        # B-fragments into the fp8 K column order: quad
+                        # position q4 needs columns 4*q4..4*q4+3, which sit as
+                        # u32 pairs on quad lanes 2*(q4%2) and 2*(q4%2)+1 of
                         # the canonical fragments.
                         q4 = lane_id % 4
                         src_lo = lane_id - q4 + 2 * (q4 % 2)
@@ -1859,9 +1826,8 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
 
                         if cutlass.const_expr(self._kv_fp8):
                             # The lower/upper regrouping puts different
-                            # products in each mma than the bf16 schedule;
-                            # with e4m3 K (and e4m3-representable q, the
-                            # deployment case) every f32 dot term is exact,
+                            # products in each mma than the bf16 schedule.
+                            # With e4m3 operands every f32 dot term is exact,
                             # so the result still matches dequantized K
                             # bit-for-bit.
                             for k in cutlass.range_constexpr(kw // mma_k):
@@ -2013,11 +1979,10 @@ class MsaProxyScoreDecodeStreamSm12x:
     GMEM to registers (no smem, no tensor cores) and dim-parallel lanes reduce
     each key's dot products with warp shuffles.
 
-    Deliberately q_len == 1 only: a pack_q > 1 (MTP) variant reusing the K
-    registers across tokens measured 0.67-0.99x of the packed-MMA schedule
-    (5080, Sq 2-8) -- the shuffle+FMA phase scales with Sq while the K loads
-    don't, and the rising arithmetic intensity at m = Sq * group_size rows is
-    exactly what starts paying for the tensor cores. MTP stays packed-MMA."""
+    Deliberately q_len == 1 only: the shuffle+FMA phase scales with q_len
+    while the K loads don't, and that rising arithmetic intensity is exactly
+    what starts paying for the tensor cores. MTP stays on the packed-MMA
+    schedules."""
 
     _NUM_WARPS = 8
     _KEYS_PER_ITER = 2  # 32 lanes = 2 keys x 16 dim-slice lanes

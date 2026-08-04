@@ -300,8 +300,8 @@ def msa_proxy_score(
     ----------
     q : torch.Tensor
         ``(total_q, num_qo_heads, 128)``, bf16 or fp16 (the cheap proxy Q).
-        May be fp8 E4M3 when ``k`` is fp8: decode shapes consume it natively
-        (the fastest path); other shapes upconvert it once internally.
+        May be fp8 E4M3 when ``k`` is fp8: decode shapes consume it natively,
+        other shapes upconvert it once internally.
     k : torch.Tensor
         Flat ``(total_k, num_kv_heads, 128)`` with ``cu_seqlens_k``, or
         paged ``(num_pages, num_kv_heads, 128, 128)`` with ``page_table`` +
@@ -437,8 +437,7 @@ def msa_proxy_score(
     # one q token per request, which its token == batch indexing relies on.
     # fp8 K skips it when the key-major schedule can take the shape instead:
     # the stream schedule pays a CUDA-core convert per K element, while
-    # key-major converts in-register nearly for free (measured ~10-18% faster
-    # at batch 1 on SM120).
+    # key-major converts in-register nearly for free.
     keymajor_fp8_sq1 = (
         kv_fp8 and 2 <= group_size <= 32 and _PACK_ROWS % group_size == 0
     )
@@ -462,17 +461,14 @@ def msa_proxy_score(
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
     if use_packed and kv_fp8:
         # The key-split fp8 kernel takes any 16-multiple row tile, so size it
-        # to the spec-decode length instead of always packing 64 rows: at the
-        # common 4-head sq<=4 shapes this quarters the mma work per CTA.
+        # to the spec-decode length instead of always packing 64 rows.
         p = 1
         while p < max_seqlen_q or group_size * p < 16:
             p *= 2
         pack_q_len = min(p, _PACK_ROWS // group_size)
-    # Small fused tiles (<= 32 rows) take the key-major TMA schedule at every
-    # grid size (see MsaProxyScoreDecodeKeyMajorSm12x): its per-CTA fixed cost
-    # matches the one-block-per-CTA grids split-K produces at small batch, and
-    # measured on SM120 it also beats the row-major/key-split schedules on
-    # machine-filling grids. Those remain only for > 32-row tiles.
+    # Small fused tiles (<= 32 rows) take the key-major TMA schedule (see
+    # MsaProxyScoreDecodeKeyMajorSm12x); the row-major/key-split schedules
+    # remain only for > 32-row tiles.
     use_keymajor = False
     if use_packed:
         p = 1
@@ -517,7 +513,7 @@ def msa_proxy_score(
     # the last dim): the kernel moves raw bytes and upconverts in registers,
     # and a typed view keeps the TMA/cp.async source alignment provable where
     # an in-kernel recast of a symbolic layout does not. fp8 q rides an f16
-    # carrier so both register converts hit the native e4m3 -> f16 path.
+    # carrier so its register convert hits the native e4m3 -> f16 path.
     kv16 = kv_fp8 and use_packed
     carrier = torch.float16 if q_fp8 else q.dtype
     q_call = q.contiguous().view(carrier) if q_fp8 else q
