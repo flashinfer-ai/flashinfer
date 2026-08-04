@@ -3,12 +3,12 @@
 Verifies the token-major translation of both LL dispatch layouts:
 
 * EXPERT_MAJOR: flatten ``[E_local, cap, hidden] → [E_local*cap, hidden]``,
-  synthesized ``selected_experts = row // cap + local_expert_offset``.
+  synthesized ``topk_ids = row // cap + local_expert_offset``.
 * RANK_MAJOR: flatten ``[world, per_rank, hidden] → [world*per_rank, hidden]``,
   driven by the received per-token ``topk_idx`` / ``topk_weights`` at the real
   model ``top_k`` with non-local picks masked to weight 0.
 
-EXPERT_MAJOR synthesizes ``final_scales == 1`` / ``top_k == 1``; both reshape back
+EXPERT_MAJOR synthesizes ``topk_weights == 1`` / ``top_k == 1``; both reshape back
 to the 3D combine layout.
 
 The bf16 path is host-checkable (no quant kernel); the NVFP4 path needs an
@@ -45,13 +45,13 @@ def test_bf16_pack_shapes_and_routing():
     m = num_local_experts * cap
     assert pack.hidden_states_q.shape == (m, hidden)
     assert pack.hidden_states_q.dtype == torch.bfloat16  # raw passthrough
-    assert pack.selected_experts.shape == (m, 1)  # top_k == 1
-    assert pack.final_scales.shape == (m, 1)
-    assert torch.all(pack.final_scales == 1.0)  # combine owns the reweight
+    assert pack.topk_ids.shape == (m, 1)  # top_k == 1
+    assert pack.topk_weights.shape == (m, 1)
+    assert torch.all(pack.topk_weights == 1.0)  # combine owns the reweight
 
     # Row r belongs to local expert r // cap, shifted by the global offset.
     expected = (torch.arange(m, device="cuda") // cap).to(torch.int32) + offset
-    assert torch.equal(pack.selected_experts.squeeze(-1), expected)
+    assert torch.equal(pack.topk_ids.squeeze(-1), expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -85,22 +85,22 @@ def test_rank_major_pack_faithful_routing_and_masking():
 
     assert pack.hidden_states_q.shape == (m, hidden)
     assert pack.hidden_states_q.dtype == torch.bfloat16  # raw passthrough
-    assert pack.selected_experts.shape == (m, top_k)  # real model top_k
-    assert pack.final_scales.shape == (m, top_k)
+    assert pack.topk_ids.shape == (m, top_k)  # real model top_k
+    assert pack.topk_weights.shape == (m, top_k)
 
     is_local = recv_idx >= 0
     # Local picks: local id -> global (id + offset), real weight kept. Non-local
     # picks (-1) are pinned to the first local expert (offset) with weight 0
     # (dropped by the weighted finalize).
     assert torch.equal(
-        pack.selected_experts[is_local], (recv_idx[is_local] + offset).to(torch.int32)
+        pack.topk_ids[is_local], (recv_idx[is_local] + offset).to(torch.int32)
     )
-    assert torch.all(pack.selected_experts[~is_local] == offset)
-    assert torch.allclose(pack.final_scales[is_local], recv_w[is_local])
-    assert torch.all(pack.final_scales[~is_local] == 0.0)
+    assert torch.all(pack.topk_ids[~is_local] == offset)
+    assert torch.allclose(pack.topk_weights[is_local], recv_w[is_local])
+    assert torch.all(pack.topk_weights[~is_local] == 0.0)
     # Every synthesized expert id lands inside this rank's local-expert range.
-    assert pack.selected_experts.min().item() >= offset
-    assert pack.selected_experts.max().item() < offset + num_local_experts
+    assert pack.topk_ids.min().item() >= offset
+    assert pack.topk_ids.max().item() < offset + num_local_experts
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -126,8 +126,8 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
         is_nvfp4=False,
     )
 
-    assert torch.all(pack.selected_experts == offset)
-    assert torch.all(pack.final_scales == 0.0)
+    assert torch.all(pack.topk_ids == offset)
+    assert torch.all(pack.topk_weights == 0.0)
 
 
 def test_build_activation_pack_rank_major_rejects_2d():
@@ -171,4 +171,4 @@ def test_nvfp4_pack_quantizes():
     assert pack.hidden_states_q.shape[0] == m
     assert pack.hidden_states_q.shape[1] == hidden // 2
     assert pack.hidden_states_scale.numel() > 0
-    assert pack.selected_experts.shape == (m, 1)
+    assert pack.topk_ids.shape == (m, 1)

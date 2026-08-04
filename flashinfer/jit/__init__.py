@@ -60,6 +60,8 @@ from .attention import (
     gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120_module,
 )
 from .core import JitSpec as JitSpec
+from .core import JitSpecNvcc as JitSpecNvcc
+from .cute_dsl_core import JitSpecCuteDsl as JitSpecCuteDsl
 from .core import JitSpecStatus as JitSpecStatus
 from .core import JitSpecRegistry as JitSpecRegistry
 from .core import jit_spec_registry as jit_spec_registry
@@ -71,6 +73,7 @@ from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
 from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
+from .core import sm107a_nvcc_flags as sm107a_nvcc_flags
 from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
 from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
 from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
@@ -97,6 +100,21 @@ from .fp4_kv_dequantization import (
 )
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m64_module as gen_flash_kda_m64_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_module as gen_flash_kda_m128_module,
+)
+from .flash_kda import (
+    get_flash_kda_prefill_module as get_flash_kda_prefill_module,
+)
+from .flash_kda import (
+    load_flash_kda_m64_module as load_flash_kda_m64_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_module as load_flash_kda_m128_module,
 )
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,

@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -23,7 +23,10 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
+# This test verifies the mega path only through the cutedsl_megamoe shim public
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# src/ kernel packages directly, so a new src/ drop can't silently break it.
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -95,11 +98,11 @@ def _make_bf16_weights(
     return w13, w2
 
 
-def _mega_problem(rank: int, world_size: int):
+def _mega_problem(
+    rank: int, world_size: int, *, num_tokens: int = 64, max_tokens: int = 64
+):
     hidden = 2048
     intermediate = 1024
-    num_tokens = 64
-    max_tokens = 64
     num_experts = 8
     topk = 4
     gate_up_clamp = 10.0
@@ -142,12 +145,14 @@ def _mega_problem(rank: int, world_size: int):
     )
 
 
-def _reference_mxfp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool = True):
+def _reference_mxfp8_mega_moe_staged(
+    problem: dict, *, destroy_buffer: bool = True, knobs: dict | None = None
+):
     """Reference with bf16 activations staged inside the symm buffer."""
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -171,6 +176,7 @@ def _reference_mxfp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
         world_size,
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
+        knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
     stage_mega_moe_inputs(
@@ -216,7 +222,7 @@ def _reference_mxfp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -269,7 +275,36 @@ def _reference_mxfp8_mega_moe_prestaged(
     return y
 
 
-def _megakernel_config(problem: dict):
+def _assert_ikr_close(y, y_ref, *, topk):
+    """Scale-aware compare for the in-flight (REDG) top-k reduce.
+
+    Mirrors the NVFP4 twin: the ikr path accumulates the K per-topk bf16
+    terms in nondeterministic order vs the reference's fp32 explicit reduce,
+    so where large terms nearly cancel the achievable agreement is bounded by
+    the bf16 round-off of the largest TERM, not of the final value.  Bound
+    per row: K terms x bf16 eps (2^-8) x safety 8.  A missing per-launch
+    output zero (2x accumulation) overshoots this band by ~64x.
+    """
+    import torch
+
+    a = y.float()
+    b = y_ref.float()
+    diff = (a - b).abs()
+    row_scale = torch.maximum(a.abs(), b.abs()).amax(dim=1, keepdim=True)
+    tol = 5e-2 + (topk * 2.0**-8 * 8.0) * row_scale
+    worst = (diff - tol).max().item()
+    assert worst <= 0.0, (
+        f"ikr output outside the bf16 K-term accumulation band "
+        f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+    )
+
+
+def _megakernel_config(
+    problem: dict,
+    knobs: dict | None = None,
+    *,
+    in_kernel_fc2_reduce: bool = False,
+):
     from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
 
     return Mxfp8CutedslMegaMoeConfig(
@@ -278,10 +313,21 @@ def _megakernel_config(problem: dict):
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        knobs=knobs,
     )
 
 
-def _run_mega_layer(rank, world_size, *, quantize_input: bool):
+def _run_mega_layer(
+    rank,
+    world_size,
+    *,
+    quantize_input: bool,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    knobs: dict | None = None,
+    in_kernel_fc2_reduce: bool = False,
+):
     import torch
     import torch.distributed as dist
 
@@ -305,8 +351,14 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
-    problem = _mega_problem(rank, world_size)
-    kernel = create_mega_kernel(_megakernel_config(problem))
+    problem = _mega_problem(
+        rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
+    )
+    kernel = create_mega_kernel(
+        _megakernel_config(
+            problem, knobs=knobs, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+        )
+    )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
@@ -317,7 +369,7 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mxfp8_mega_moe,
             )
 
@@ -360,7 +412,12 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             ),
             weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             backend=MegaConfig(
-                megakernel=_megakernel_config(problem),
+                # knobs= must reach the LAYER config (not just the throwaway
+                # runtime-requirements kernel above) for pinned-knob tests to
+                # actually exercise the pinned profile.
+                megakernel=_megakernel_config(
+                    problem, knobs=knobs, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+                ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
             ),
@@ -373,12 +430,19 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
             topk_weights=problem["topk_weights"],
             scales=t_scales,
         )
-        y_layer = mega.forward(t)
+        y_layer = mega.forward(t).clone()
+        # Repeated forward on the same session: with no per-launch host reset
+        # (run() default reset_counters=False) the second launch relies on the
+        # kernel's tail cleanup of its workspace counters/flags -- this is the
+        # regression guard for that contract.
+        y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
 
         if quantize_input:
-            y_ref = _reference_mxfp8_mega_moe_staged(problem, destroy_buffer=True)
+            y_ref = _reference_mxfp8_mega_moe_staged(
+                problem, destroy_buffer=True, knobs=knobs
+            )
         else:
             y_ref = _reference_mxfp8_mega_moe_prestaged(
                 problem, t_hidden, t_scales, destroy_buffer=True
@@ -388,7 +452,17 @@ def _run_mega_layer(rank, world_size, *, quantize_input: bool):
         assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
         assert y_layer.dtype == torch.bfloat16
         assert torch.isfinite(y_layer).all()
-        torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+        if in_kernel_fc2_reduce:
+            # Tolerance verdict vs the explicit-reduce (plain-sum) reference;
+            # see _assert_ikr_close.  The repeated forward doubles as the
+            # regression guard for the per-launch output_activation.zero_()
+            # (accumulate-from-zero contract): without it y_layer2 would be
+            # ~2x the reference and fail loudly.
+            _assert_ikr_close(y_layer, y_ref, topk=problem["topk"])
+            _assert_ikr_close(y_layer2, y_ref, topk=problem["topk"])
+        else:
+            torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
         mega.destroy()
         return rank
     finally:
@@ -417,6 +491,68 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference")
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
+    """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for MXFP8.
+
+    Regression guard for the sym-heap output fix: the MXFP8 symm buffer used
+    to allocate ``output_activation`` rank-locally even when the ikr param was
+    set, which would crash the cross-rank REDG path.  The output now always
+    lives on the symmetric heap and is zeroed before every launch
+    (accumulate-from-zero contract; the second forward inside
+    ``_run_mega_layer`` would come back ~2x without it).  MXFP8 ikr requires
+    epi-warp token-back, which is the measured MXFP8 default profile.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
+    )
+    print(
+        f"rank {rank}: mxfp8_cutedsl mega layer (in_kernel_fc2_reduce) "
+        "matches reference within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
+    """Large-token (>=2048) dispatch-warp token-back for MXFP8.
+
+    The MXFP8 default heuristic now uses flag_batch=4 + epi_warps at all sizes
+    (measured faster 2026-07-14), so the dispatch-warp combo is pinned here
+    explicitly via knobs: this stays the regression guard for whether MXFP8
+    large-token dispatch-warp token-back (token_back_by_dispatch=True, which
+    has no non_ubulk_fc2_store escape hatch) compiles + runs bit-exact.
+    MXFP8's mma_tiler stays kernel-fixed at (256,256).
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=2048,
+        max_tokens=2048,
+        # The full pre-2026-07-14 LARGE profile (explicit knobs skip the
+        # heuristic entirely, so pin every knob the old profile set).
+        knobs={
+            "cluster_shape_mnk": (2, 1, 1),
+            "group_hint": 512,
+            "flag_batch": 8,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": "reuse_dispatch_warps",
+            "load_balance_mode": "atomic_counter",
+        },
+    )
+    print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
 
 
 @pytest.mark.arch_blackwell

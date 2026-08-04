@@ -53,6 +53,7 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm107_module,
     gen_fp4_quantization_sm110_module,
     gen_fp4_quantization_sm120_module,
     gen_fp4_quantization_sm120f_module,
@@ -60,6 +61,15 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.flash_kda import (
+    FlashKDATarget,
+    gen_flash_kda_m64_module,
+    gen_flash_kda_m128_module,
+)
+from .jit.flash_kda_decode import (
+    FLASH_KDA_DECODE_VARIANTS,
+    gen_flash_kda_decode_module,
+)
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
@@ -78,6 +88,7 @@ from .jit.gemm import (
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
@@ -497,8 +508,16 @@ def gen_all_modules(
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm100a_exact = sm_capabilities.get("sm100a_exact", False)
+    has_flash_kda_prefill_sm100a = sm_capabilities.get(
+        "flash_kda_prefill_sm100a", False
+    )
+    has_flash_kda_prefill_sm100f = sm_capabilities.get(
+        "flash_kda_prefill_sm100f", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm107 = sm_capabilities.get("sm107", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
@@ -520,6 +539,27 @@ def gen_all_modules(
     )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # CUDA 12.8 predates the sm_100f target and therefore retains one exact
+    # B200 cubin per variant. CUDA 12.9+ registers only one family cubin per
+    # variant even when both CC 10.0 and CC 10.3 are requested.
+    flash_kda_targets: tuple[tuple[FlashKDATarget, bool], ...] = (
+        ("sm100a", has_flash_kda_prefill_sm100a),
+        ("sm100f", has_flash_kda_prefill_sm100f),
+    )
+    for flash_kda_target, enabled in flash_kda_targets:
+        if enabled:
+            jit_specs.extend(
+                [
+                    gen_flash_kda_m64_module(flash_kda_target),
+                    gen_flash_kda_m128_module(flash_kda_target),
+                ]
+            )
+    if has_sm100a_exact:
+        # The decode export is validated and packaged for exact SM100a.
+        jit_specs.extend(
+            gen_flash_kda_decode_module(variant)
+            for variant in FLASH_KDA_DECODE_VARIANTS
+        )
 
     if add_act:
         for act_name in act_func_def_str:
@@ -545,6 +585,7 @@ def gen_all_modules(
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
@@ -570,6 +611,11 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
+        if has_sm107:
+            jit_specs.append(gen_fp4_quantization_sm107_module())
+            jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
@@ -600,8 +646,17 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
@@ -695,9 +750,7 @@ def gen_all_modules(
         _ssu_ntokens = [1, 4, 6, 8]
         _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
-        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
-        # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
+        if has_sm80:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -713,7 +766,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )  # type: ignore[call-arg]
                 )
-        if has_sm90 or has_sm100:
+        if has_sm90:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -728,6 +781,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
+        if has_sm90 or has_sm100:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
@@ -948,12 +1002,32 @@ def detect_sm_capabilities():
     # `sm80` is true if any 8.x arch (sm_80/sm_86/sm_89) is in the build —
     # all support cp.async, which the SSU MTP-simple kernel requires.
     has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
+    cuda_version = get_cuda_version()
+    flash_kda_prefill_family_arches = {
+        (10, "0a"),
+        (10, "0f"),
+        (10, "3a"),
+        (10, "3f"),
+    }
     return {
-        "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
+        "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
+        "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+        and cuda_version >= Version("12.8"),
+        "flash_kda_prefill_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and Version("12.8") <= cuda_version < Version("12.9")
+        ),
+        "flash_kda_prefill_sm100f": (
+            bool(
+                flash_kda_prefill_family_arches & compilation_context.TARGET_CUDA_ARCHS
+            )
+            and cuda_version >= Version("12.9")
+        ),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
+        "sm107": has_sm("compute_107", "12.9"),
         "sm110": has_sm("compute_110", "13.0"),
         "sm120": has_sm("compute_120", "12.8"),
         "sm120f": has_sm("compute_120f", "12.9"),

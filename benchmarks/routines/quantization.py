@@ -168,7 +168,7 @@ def parse_quantization_args(line, parser):
         required=False,
         default="128x4",
         choices=["128x4", "8x4", "linear"],
-        help="Scale factor layout for NVFP4 quantization. Default: 128x4",
+        help="Scale factor layout for FP4 quantization. Default: 128x4",
     )
     parser.add_argument(
         "--do_shuffle",
@@ -423,10 +423,20 @@ def testMxfp4Quantize(args):
     backends = args.backends[:]  # Make a copy to avoid modifying the original
     m = args.m
     k = args.k
+    sf_layout_str = args.sf_layout
     enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
+
+    from flashinfer import SfLayout
+
+    sf_layout_map = {
+        "128x4": SfLayout.layout_128x4,
+        "8x4": SfLayout.layout_8x4,
+        "linear": SfLayout.layout_linear,
+    }
+    sf_layout = sf_layout_map[sf_layout_str]
 
     # mxfp4 uses sf_vec_size=32 (hardcoded in the API)
     sf_vec_size = 32
@@ -454,6 +464,7 @@ def testMxfp4Quantize(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
         print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {sf_layout_str = }")
         print(f"[VVERBOSE] {enable_pdl = }")
 
     def run_backend(backend, input_tensor):
@@ -461,6 +472,7 @@ def testMxfp4Quantize(args):
             input_tensor,
             backend=backend,
             enable_pdl=enable_pdl,
+            sfLayout=sf_layout,
         )
 
     # Reference check via dequantize round-trip
@@ -495,11 +507,13 @@ def testMxfp4Quantize(args):
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
-                # Dequantize and compare with original
+                # Dequantize and compare with original.
                 try:
-                    dequantized = flashinfer.mxfp4_dequantize(x_q, sf)
-                    # Move back to GPU for comparison
-                    dequantized = dequantized.to(input_tensor.device)
+                    dequantized = flashinfer.mxfp4_dequantize(
+                        x_q,
+                        sf,
+                        sfLayout=sf_layout,
+                    ).to(input_tensor.device)
                     # Compare with original input (allowing for quantization error)
                     (
                         num_different_elements,
@@ -564,6 +578,7 @@ def testMxfp4Quantize(args):
                 cur_res["m"] = m
                 cur_res["k"] = k
                 cur_res["input_dtype"] = str(input_dtype)
+                cur_res["sf_layout"] = sf_layout_str
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
