@@ -296,12 +296,8 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         combine with weights derived from s (without bias), normalised and
         scaled by routed_scaling_factor
 
-    With ``num_fused_shared_experts = S > 0`` the routing kernel appends S
-    slots per token carrying ids ``[E, E + S)`` at weight exactly ``1.0``
-    (``routed_scaling_factor`` applies to the routed weights only), and the
-    weight tensors carry ``E + S`` rows.  Serving both the S=0 and S>0 trace
-    templates from one function keeps the routing math single-sourced; S=0
-    callers simply omit the argument.
+    With ``S > 0``, append ids ``[E, E + S)`` at weight ``1.0``. Weight
+    tensors contain ``E + S`` rows.
     """
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
@@ -342,20 +338,15 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     # Gather per-row weights into [T, TOP_K] for the shared GEMM helper
     w_topk = weights.gather(1, topk_idx)
 
-    # Mirror the routing kernel's shared-expert append: ids [E, E + S) at
-    # weight 1.0, after the routed top-k slots. _fp8_moe_run_experts iterates
-    # the E + S weight rows and skips any id >= the expert count it is given,
-    # so the count passed below must be the fused total.
+    # Append shared ids [E, E + S) at weight 1.0.
     S = int(num_fused_shared_experts or 0)
     if S > 0:
         shared_ids = torch.arange(
             E_global, E_global + S, device=topk_idx.device, dtype=topk_idx.dtype
         ).expand(T, S)
         topk_idx = torch.cat((topk_idx, shared_ids), dim=1)
-        # Build the [T, S] weight block explicitly rather than slicing w_topk:
-        # a `w_topk[:, :S]` slice silently yields min(TOP_K, S) columns, which
-        # is wrong whenever S > TOP_K (reachable — only TOP_K + S <= 32 is
-        # enforced, so e.g. TOP_K=1, S=2 is valid).
+        # Allocate explicitly: a w_topk[:, :S] slice silently yields
+        # min(TOP_K, S) columns, which is wrong whenever S exceeds TOP_K.
         shared_w = torch.ones((T, S), device=w_topk.device, dtype=w_topk.dtype)
         w_topk = torch.cat((w_topk, shared_w), dim=1)
 
@@ -967,27 +958,11 @@ def _moe_fp8_block_scale_ds_shared_experts_init(
     num_local_experts: int = 0,
     **kwargs,
 ):
-    """Build inputs for ``trtllm_fp8_block_scale_moe`` with fused shared experts.
+    """Build shared-expert inputs with ``routed + S`` weight rows.
 
-    Same pipeline as :func:`_moe_fp8_block_scale_ds_init`, with two differences
-    that are easy to get backwards:
-
-    * the weight tensors carry ``routed + S`` rows (routed first, shared
-      appended), while
-    * ``local_num_experts`` stays *routed-only* — the kernel widens it itself.
-
-    The routed count is *derived*, not defaulted.  The shared-expert template
-    has no ``num_local_experts`` axis (every expert-major tensor is
-    ``routed + S`` rows, so the routed-only count is carried by no tensor), and
-    replay passes ``num_weight_rows`` instead.  Defaulting the routed count
-    here would rebuild an ``e33/s1`` definition with 257 rows.  Resolution
-    order: ``num_weight_rows - S``, then an explicit ``num_local_experts``,
-    then ``num_experts`` — the last being exact because fused shared experts
-    require the full routed set on this rank.
-
-    ``seq_len`` is spelled out rather than absorbed by ``**kwargs``: it is the
-    template's only ``Var`` axis, and the trace machinery discovers Var axes by
-    inspecting this signature.
+    The routed count is resolved from ``num_weight_rows``, then
+    ``num_local_experts``, then ``num_experts``. ``seq_len`` remains explicit
+    because trace axis discovery inspects this signature.
     """
     S = int(num_fused_shared_experts)
     if num_weight_rows:
@@ -1004,8 +979,7 @@ def _moe_fp8_block_scale_ds_shared_experts_init(
     out = _moe_fp8_block_scale_ds_init(
         seq_len=seq_len,
         num_experts=num_experts,
-        # Ask the routed builder for routed + S experts so the shared rows are
-        # materialized, then report the routed-only count below.
+        # Materialize shared rows, then restore the routed count below.
         num_local_experts=routed + S,
         **kwargs,
     )
@@ -1014,49 +988,21 @@ def _moe_fp8_block_scale_ds_shared_experts_init(
     return out
 
 
-# Inline the routed builder into the rendered init: the shared-expert builder
-# delegates to it, and the emitted source must run standalone. Set the
-# attribute directly rather than via _bind_init_dependency, which also copies
-# the dependency's __signature__ -- that would hide num_weight_rows and make
-# replay rebuild the routed expert count from a default instead of deriving it.
+# Render the delegated builder for standalone execution. Assign directly so
+# _bind_init_dependency does not replace the signature and hide num_weight_rows.
 cast(Any, _moe_fp8_block_scale_ds_shared_experts_init)._trace_init_dependencies = (
     _moe_fp8_block_scale_ds_init,
 )
 
 
 def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
-    """Build the DeepSeek-V3 block-FP8 trace, with or without shared experts.
+    """Build routed and shared-expert DeepSeek-V3 block-FP8 traces.
 
-    The two variants differ only in the expert-major row count and the extra
-    ``num_fused_shared_experts`` axis/input, so they are generated from one
-    body rather than copied: a divergence between them would silently produce
-    a benchmark definition that does not match what the kernel ran.
-
-    They must stay *separate templates* rather than one template with an S
-    axis defaulted to 0. Routing an S>0 call through the routed template
-    mislabels it: the expert-major axis is read from the weight rows, so the
-    definition records ``local_num_experts = E + S`` for a call that passed
-    ``E``, and drops ``S`` entirely — leaving a benchmark that cannot be
-    replayed as the kernel ran it. That is the load-bearing reason, and it bites
-    on every S>0 dump, because ``fi_trace`` *does* route through the dispatch
-    function below.
-
-    A second, currently-unreachable hazard: ``definition_name`` builds the
-    filename from the const axes alone and the dumper overwrites
-    unconditionally, so two configs whose physical row counts coincide (e.g.
-    ``E=32, S=0`` and ``E=31, S=1``) would land on one key. That matters for
-    Trace Apply, which resolves solutions by definition name at runtime — but
-    Trace Apply cannot reach any dispatched template today: ``apply.py`` builds
-    its wrapper from ``templates[0]``, which for this API is the *default*
-    routing template regardless of ``routing_method_type``. So the collision
-    only becomes reachable once that is fixed; it is listed here so the reason
-    for the separate name survives that fix.
-
-    ``num_fused_shared_experts`` therefore carries a non-empty abbrev, and the
-    routed template keeps its existing name untouched.
+    Shared experts need a separate template: using physical ``E + S`` rows as
+    ``local_num_experts`` loses the routed count and can collide with an S=0
+    definition. Both variants share this factory to keep their specs aligned.
     """
-    # Expert-major tensors (weights, scales, and the per-expert OA vectors)
-    # carry E_local + S physical rows; local_num_experts stays routed-only.
+    # Expert-major tensors use physical rows; local_num_experts is routed-only.
     rows = "num_weight_rows" if shared_experts else "num_local_experts"
     extra_axes = {}
     extra_inputs = {}
@@ -1065,13 +1011,8 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
             description="Number of fused shared experts (S), applied to every token.",
             abbrev="s",
         )
-        # Replaces num_local_experts as the expert-major dim rather than
-        # sitting alongside it: with S > 0 every expert-major tensor (weights,
-        # scales, and the per-expert OA vectors) has E_local + S rows, so no
-        # tensor carries the routed-only count and an axis for it would be
-        # unreachable. The routed count stays recoverable as rows - S.
-        # It inherits the "e" abbrev so the definition name still reports an
-        # expert-row count; the s<N> component disambiguates it from routed.
+        # No tensor carries routed-only E, so key expert-major tensors on E + S.
+        # Keep the "e" abbreviation and use s<N> to distinguish the template.
         extra_axes["num_weight_rows"] = Const(
             description=(
                 "Physical expert-major rows: local_num_experts + "
@@ -1310,10 +1251,7 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     Returns ``None`` for ``RoutingMethodType.Unspecified`` (6), which
     suppresses trace generation.
 
-    Fused shared experts select a separate DeepSeekV3 template: the two differ
-    in expert-major row count, so they must not share a definition name (the
-    dumper overwrites by name).  Only DeepSeekV3 supports them, so no other
-    routing type branches on ``num_fused_shared_experts``.
+    DeepSeekV3 calls with shared experts use a separate template.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
     if (
@@ -1324,10 +1262,7 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     return _MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
 
 
-# Expose all possible templates so _attach_fi_trace can auto-register them
-# in _TRACE_REGISTRY for consistency testing.  The shared-expert template is
-# not in the routing-type map (it is selected by the S branch above), so it is
-# appended explicitly.
+# Include the S-specific template, which is selected outside the routing map.
 trtllm_fp8_block_scale_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
     *_MOE_TRACE_BY_ROUTING_TYPE.values(),
     trtllm_fp8_block_scale_moe_ds_shared_experts_trace,

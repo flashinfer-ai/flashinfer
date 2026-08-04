@@ -38,14 +38,8 @@ from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 # ---------------------------------------------------------------------------
 # Kernel ceilings
 # ---------------------------------------------------------------------------
-# Mirrored from the trtllm-gen DeepSeek routing kernel
-# (``csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu``:
-# ``MaxSupportedTopExperts`` / ``NumNemotronExperts``).  Duplicated here so a
-# fused shared-expert geometry error is raised at config-construction time with
-# the offending numbers, instead of surfacing from a FLASHINFER_CHECK deep in
-# the launch path.  Both apply to the *fused* totals (``top_k + S`` and
-# ``num_experts + S``), because the routing kernel widens those counts before
-# running the permutation pipeline.
+# Mirrored from MaxSupportedTopExperts and NumNemotronExperts in the
+# trtllm-gen DeepSeek router. These limits apply after adding shared experts.
 MAX_SUPPORTED_TOP_EXPERTS = 32
 MAX_SUPPORTED_TOTAL_EXPERTS = 512
 
@@ -190,21 +184,10 @@ class ExpertConfig:
     local_num_experts : int or None
         Number of experts on this rank.  ``None`` → ``num_experts`` at runtime.
     num_fused_shared_experts : int
-        Number of shared experts (``S``) fused into the MoE launch.  Shared
-        experts run for *every* token in addition to the routed top-k.  ``0``
-        (default) disables the feature.
-
-        This is layer geometry, not per-call state: ``S`` is fixed for the
-        life of the layer and must never be derived from an activation pack.
-
-        When ``> 0`` the weight and scale tensors carry ``E + S`` rows —
-        routed experts first, shared experts appended — while
-        ``RoutingConfig.num_experts`` (``E``) and ``local_num_experts`` stay
-        *routed-only*, because ``E`` is also the routing-logits width.  The
-        routing kernel emits the shared ids ``[E, E + S)`` at weight ``1.0``,
-        so the effective per-token expert count is ``top_k + S``.
-
-        Cross-field constraints are checked by :class:`MoEConfig`.
+        Number of shared experts run for every token. Their rows follow the
+        routed experts, so weights have ``E + S`` rows while routing fields
+        remain routed-only. Cross-field constraints are checked by
+        :class:`MoEConfig`.
     """
 
     intermediate_size: int
@@ -371,15 +354,9 @@ class TrtllmFp8BlockConfig:
 
         .. warning::
            ``num_local_experts`` here is the **physical row count** of
-           ``w1_bf16`` / ``w2_bf16``, which with fused shared experts is
-           ``E_local + S`` — not
-           :attr:`ExpertConfig.local_num_experts`, which stays routed-only
-           (``E_local``).  The two deliberately disagree: the kernel takes the
-           routed count and widens it itself, while these tensors must already
-           carry the appended shared rows.  Passing ``E_local`` here with
-           ``S > 0`` produces a view the runner rejects as too small; passing
-           ``E_local + S`` to :class:`ExpertConfig` instead silently
-           double-counts the shared experts.
+           ``w1_bf16`` / ``w2_bf16``: ``E_local + S`` with shared experts.
+           :attr:`ExpertConfig.local_num_experts` remains routed-only
+           (``E_local``).
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
@@ -776,12 +753,8 @@ class MoEConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
     def __post_init__(self) -> None:
-        # Cross-field constraints only; single-field checks live on the
-        # sub-config.  These belong here rather than in a runner's
-        # ``check_support()`` because ``MoELayer.__init__`` *swallows* that
-        # method's exceptions to drop unsupported backends — a geometry error
-        # raised there would surface as "no backend available", not as the
-        # real cause.
+        # Not in check_support(): MoELayer swallows its exceptions to filter
+        # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
 
     def _validate_fused_shared_experts(self) -> None:
@@ -789,17 +762,14 @@ class MoEConfig:
         if s == 0:
             return
 
-        # Only the DeepSeekV3 routing kernel emits the appended shared slots;
-        # the Llama4/renormalize/custom kernels reject a non-zero count.
+        # Only DeepSeekV3 routing emits shared-expert slots.
         if self.routing.method is not RoutingMethodType.DeepSeekV3:
             raise ValueError(
                 "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
                 f"method={self.routing.method!r}."
             )
 
-        # The routing kernel widens top_k and the expert dimension by S before
-        # running the permutation pipeline, so both kernel ceilings apply to
-        # the *fused* totals rather than the routed-only values.
+        # Kernel limits apply to the fused totals.
         total_top_k = self.routing.top_k + s
         if total_top_k > MAX_SUPPORTED_TOP_EXPERTS:
             raise ValueError(
@@ -815,10 +785,8 @@ class MoEConfig:
                 f"+ {s} = {total_experts}."
             )
 
-        # EP is rejected outright: the routing kernel maps a shared expert's
-        # global id (num_experts + k) to a weight row as
-        # (global_id - local_expert_offset), which only lands on the intended
-        # local slot when this rank holds the full routed expert set.
+        # The kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), so all routed experts must be local.
         local_num_experts = (
             self.experts.local_num_experts
             if self.experts.local_num_experts is not None

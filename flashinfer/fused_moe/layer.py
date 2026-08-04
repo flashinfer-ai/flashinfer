@@ -121,10 +121,7 @@ class MoELayer:
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
-            # Fused shared experts are supported by only a subset of backends,
-            # and a non-supporting runner is filtered out above like any other
-            # unsupported configuration. Call that out explicitly: otherwise the
-            # generic message sends the reader looking at arch/quant support.
+            # Explain when shared-expert support filtered every candidate.
             hint = ""
             if config.experts.num_fused_shared_experts > 0:
                 supporting = ", ".join(
