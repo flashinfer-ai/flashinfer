@@ -41,11 +41,13 @@ __global__ void uint_fastdiv_kernel(uint32_t* output) {
     output[6] = static_cast<unsigned int>(default_divisor);
     output[7] = static_cast<unsigned int>(zero_divisor);
     output[8] = static_cast<unsigned int>(three_divisor);
+    output[9] = n / three_divisor;
+    output[10] = n % three_divisor;
   }
 }
 
 torch::Tensor test_uint_fastdiv() {
-  auto output = torch::empty({9}, torch::dtype(torch::kUInt32).device(torch::kCUDA));
+  auto output = torch::empty({11}, torch::dtype(torch::kUInt32).device(torch::kCUDA));
   uint_fastdiv_kernel<<<1, 1>>>(output.data_ptr<uint32_t>());
   return output;
 }
@@ -71,5 +73,7 @@ def fastdiv_module():
 
 def test_uint_fastdiv_zero_divisor_invariant(fastdiv_module):
     output = fastdiv_module.test_uint_fastdiv()
-    expected = torch.tensor([7, 7, 7, 7, 2, 1, 0, 0, 3], device="cuda", dtype=torch.uint32)
+    expected = torch.tensor(
+        [7, 7, 7, 7, 2, 1, 0, 0, 3, 2, 1], device="cuda", dtype=torch.uint32
+    )
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
