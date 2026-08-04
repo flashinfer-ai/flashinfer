@@ -5,7 +5,7 @@
 ``top_k_varlen`` is a **sparse-attention KV-index selection** primitive — it
 picks the top-K KV positions per request under variable per-request sequence
 lengths — NOT a vocabulary-sampling op. It therefore lives in its own routine
-module (mirroring ``flashinfer/top_k/topk_varlen.py``) rather than under
+module (mirroring ``flashinfer/topk_varlen/topk_varlen.py``) rather than under
 ``routines/sampling.py``, and its backends are radix / gvr / radix_cutlass
 (there is no generic "cuda" backend here).
 

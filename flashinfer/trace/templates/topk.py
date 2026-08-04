@@ -43,7 +43,7 @@ def _top_k_varlen_check(
     Exact set equality is not required because ties at the K-th boundary may be
     broken differently by the kernel vs the reference. Instead we verify that
     each selected index points to a value no smaller than the true K-th largest
-    (matching the check used in tests/top_k/test_topk_varlen.py::_check_correct).
+    (matching the check used in tests/topk_varlen/test_topk_varlen.py::_check_correct).
     This requires the original logits and seq_lens, which the template passes
     via **_unused from the check call in the test.
     """
