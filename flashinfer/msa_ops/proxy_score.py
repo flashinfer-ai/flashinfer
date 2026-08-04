@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 import functools
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -427,16 +426,28 @@ def msa_proxy_score(
         per_head = output
 
     group_size = num_qo_heads // num_kv_heads
-    # Single-token decode uses the dim-parallel stream schedule (see
+    _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
+    # Single-token bf16 decode uses the dim-parallel stream schedule (see
     # MsaProxyScoreDecodeStreamSm12x). total_q == batch_size guarantees exactly
     # one q token per request, which its token == batch indexing relies on.
-    use_stream = max_seqlen_q == 1 and total_q == batch_size and group_size <= 8
+    # fp8 K skips it when the key-major schedule can take the shape instead:
+    # the stream schedule pays a CUDA-core convert per K element, while
+    # key-major converts in-register nearly for free (measured ~10-18% faster
+    # at batch 1 on SM120).
+    keymajor_fp8_sq1 = (
+        kv_fp8 and 2 <= group_size <= 32 and _PACK_ROWS % group_size == 0
+    )
+    use_stream = (
+        max_seqlen_q == 1
+        and total_q == batch_size
+        and group_size <= 8
+        and not keymajor_fp8_sq1
+    )
     qoff_default = q_offset is None
 
     # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
     # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
     # (prefill, group_size not dividing 64) use the general schedule.
-    _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
     use_packed = (
         not use_stream
         and group_size >= 2
@@ -452,22 +463,17 @@ def msa_proxy_score(
         while p < max_seqlen_q or group_size * p < 16:
             p *= 2
         pack_q_len = min(p, _PACK_ROWS // group_size)
-    # Small fused tiles (<= 32 rows) on small base grids take the key-major
-    # TMA schedule, whose per-CTA fixed cost matches the one-block-per-CTA
-    # grids split-K produces at small batch (see
-    # MsaProxyScoreDecodeKeyMajorSm12x). Larger grids keep the row-major
-    # packed schedule: its smaller smem footprint co-resides 3 CTAs per SM,
-    # which wins once the grid can fill the machine.
+    # Small fused tiles (<= 32 rows) take the key-major TMA schedule at every
+    # grid size (see MsaProxyScoreDecodeKeyMajorSm12x): its per-CTA fixed cost
+    # matches the one-block-per-CTA grids split-K produces at small batch, and
+    # measured on SM120 it also beats the row-major/key-split schedules on
+    # machine-filling grids. Those remain only for > 32-row tiles.
     use_keymajor = False
     if use_packed:
         p = 1
         while p < max_seqlen_q:
             p *= 2
-        if group_size * p <= 32 and (
-            batch_size * num_kv_heads * 4 <= get_device_sm_count(dev)
-            # Diagnostic override to measure key-major on large grids.
-            or os.environ.get("FLASHINFER_MSA_FORCE_KEYMAJOR") == "1"
-        ):
+        if group_size * p <= 32:
             use_keymajor = True
             pack_q_len = p
 

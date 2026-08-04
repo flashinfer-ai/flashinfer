@@ -1418,10 +1418,12 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
     on both operands and the Q fragments load once per CTA and stay in
     registers across KV blocks. A fifth warp is a TMA producer feeding a
     two-stage mbarrier pipeline (Q's smem aliases K stage 0), which leaves
-    two intra-CTA barriers per block. This is what makes the schedule match
-    the single-block-per-CTA grids that split-K produces at small batch,
-    where the row-major packed schedule's per-CTA fixed phases (Q gather,
-    fill barriers, per-step Q reloads) dominate.
+    two intra-CTA barriers per block. The low per-CTA fixed cost (no Q
+    gather, no fill barriers, no per-step Q reloads) is what wins on the
+    one-block-per-CTA grids that split-K produces at small batch, and
+    measured on SM120 the schedule also beats the row-major/key-split
+    packed schedules on machine-filling grids, so it takes every fused
+    tile of at most 32 rows.
 
     Derived from vLLM's IndexDecodeScoreKernel (Apache-2.0) by Thien Tran
     (gau-nernst), adapted to flat/paged K with a kv-head mode, per-request
