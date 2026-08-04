@@ -91,15 +91,6 @@ static int select_fp8_fused_moe_tile_m(int total_rows, int shape_n, int num_expe
 
 static int select_plain_m64_or_m128(int m_per_expert, int shape_n, int num_experts, int num_sms) {
   constexpr int kPlainTileOverhead = 48;
-  // Real MoE routing gives non-uniform per-expert row counts, so the scheduler launches
-  // sum_e ceil(m_e / tile_m) tiles, not num_experts * ceil(mean / tile_m). Because ceil is
-  // convex, ceil-of-mean underestimates the tile count near tile boundaries and over-picks the
-  // smaller tile (measured 3-7% regression on non-uniform inputs). Per-expert counts are only
-  // available device-side, so instead of a D2H sync we use the *expected* per-expert tile count
-  // under Poisson(mean) routing noise, normal-approximated:
-  //   E[ceil(X / tile_m)] = sum_{j>=0} P(X > j*tile_m)
-  //                       ~ sum_{j>=0} 0.5 * (1 + erf((mean - j*tile_m) / sqrt(2*mean))).
-  // Only boundary-straddling terms contribute; away from a boundary this reduces to ceil-of-mean.
   auto expected_tiles_per_expert = [&](int tile_m) {
     double mean = double(m_per_expert);
     double denom = std::sqrt(2.0 * mean);
