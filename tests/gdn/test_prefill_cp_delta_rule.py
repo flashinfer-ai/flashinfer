@@ -39,7 +39,12 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
         cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
     )
-elif torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda")):
+elif (
+    torch.cuda.is_available()
+    and is_sm100a_supported(torch.device("cuda"))
+    and torch.version.cuda is not None
+    and int(torch.version.cuda.split(".")[0]) >= 13
+):
     from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
         cp_delta_rule_dsl_sm100 as cp_delta_rule_dsl,
         cp_delta_rule_fixup_dsl_sm100 as cp_delta_rule_fixup_dsl,
@@ -77,11 +82,14 @@ FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not (
-        is_sm90a_supported(device)
-        or is_sm100a_supported(device)
-        or is_sm12x_supported(device)
-    ):
+    if is_sm100a_supported(device):
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if cuda_major < 13:
+            pytest.skip(
+                f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+            )
+        return
+    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
 
 
@@ -996,6 +1004,7 @@ def test_sm100_cp_delta_rule_external_state_dtype(
     device = torch.device("cuda")
     if not is_sm100a_supported(device):
         pytest.skip("typed CP state requires SM100/SM103")
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     dtype = torch.bfloat16
     head_size = 128
