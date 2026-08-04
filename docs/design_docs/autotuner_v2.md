@@ -1,8 +1,13 @@
 # Autotuner v2 — Managed Persistence, Deployment-Matched Measurement, and the Runner Contract
 
-**Scope**: `flashinfer/autotune_cache.py` and `flashinfer/autotuner/` — the managed store, the
-measurement policy, the runner contract that tactic identities must satisfy, and the v1 → v2
-graduation plan (§5).
+**Scope**: `flashinfer/autotune_cache.py` (the whole module) and the `autotune_v2` state and hook
+sites in `flashinfer/autotuner/autotuner.py` — the managed store, the measurement policy, and the
+runner contract that tactic identities must satisfy.
+
+**Not** in scope: the v1 path — `autotune()`, `save_configs()`, `load_configs()`, and the
+profiling machinery they share. That code predates this document and has none of its own; changing
+it does not oblige you to update this doc. §5 is where the two are planned to converge, and the
+day v1 is folded into v2 this scope line should widen to match.
 
 **Status**: proposed. RFC [#3920](https://github.com/flashinfer-ai/flashinfer/issues/3920); this
 document ships with the v2 MVP in

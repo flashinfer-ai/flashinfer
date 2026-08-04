@@ -1370,7 +1370,14 @@ class _SkipOpsLocal(threading.local):
 
 class _V2Local(threading.local):
     """Per-thread record of the (single, non-nestable) active autotune_v2
-    context.  A single slot rather than a stack: autotune_v2 does not nest
+    context.
+
+    Design doc: ``docs/design_docs/autotuner_v2.md`` §2.1 (attach semantics,
+    why v2 does not nest).  It governs the ``autotune_v2`` state and hook
+    sites in this file only — the v1 ``autotune()`` / ``save_configs`` /
+    ``load_configs`` path predates it and is not covered.
+
+    A single slot rather than a stack: autotune_v2 does not nest
     (nesting raises), so a stack bought nothing; a per-thread slot keeps
     concurrent threads isolated (each in its own context targets its own
     store) without the stack machinery.
@@ -1447,8 +1454,11 @@ class AutoTuner:
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
-        # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache):
-        # serves context-free lookups for the remainder of the process, like
+        # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
+        # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
+        # attach is forced by both consumers serving OUTSIDE any context; a
+        # context-scoped store would silently regress serving to heuristics.
+        # Serves context-free lookups for the remainder of the process, like
         # load_configs.  Disjoint from _file_configs by design: v1
         # save_configs must never observe v2 entries.  Protected by _lock.
         # A persistent autotune_v2 context sets this last-wins so bare,
@@ -1848,6 +1858,9 @@ class AutoTuner:
             #     the ambient attached store outside any context); decoded
             #     hits are memoized per store identity so the hot path
             #     re-reads neither the filesystem nor JSON.
+            #     Design doc: docs/design_docs/autotuner_v2.md §2.4 -- a
+            #     missing/malformed/key-mismatched entry is a MISS, never an
+            #     error, and hits are memoized per store identity.
             managed_store = self._active_managed_store
             if managed_store is not None:
                 store_id = (str(managed_store.root), managed_store.env_hash)
@@ -2014,6 +2027,9 @@ class AutoTuner:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
             # Apply the autotune_v2 measurement policy (how tactics are
             # timed during profiling); inert when no policy is active.
+            # Design doc: docs/design_docs/autotuner_v2.md §2.5 -- the policy
+            # is part of the store's environment identity, so entries tuned
+            # under different policies never overwrite each other.
             measure_policy = self._effective_measure_policy
             if measure_policy is not None:
                 tuning_config = self._apply_measure_policy(
