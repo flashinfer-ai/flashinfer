@@ -528,7 +528,11 @@ def msa_proxy_score(
         kd = head_dim // 2 if kv16 else head_dim
         k_shape = (s_tk, s_hkv, _BLK_KV, kd) if paged else (s_tk, s_hkv, kd)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj: Union["MsaProxyScoreDecodeStreamSm12x", "MsaProxyScoreSm12x"]
+        kernel_obj: Union[
+            "MsaProxyScoreDecodeKeyMajorSm12x",
+            "MsaProxyScoreDecodeStreamSm12x",
+            "MsaProxyScoreSm12x",
+        ]
         if use_stream:
             kernel_obj = MsaProxyScoreDecodeStreamSm12x(
                 head_dim=head_dim,

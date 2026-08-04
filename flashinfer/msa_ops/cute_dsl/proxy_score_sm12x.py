@@ -702,9 +702,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
             pass  # per-block page lookup happens inside the loop
         else:
             mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
-            gK = cute.local_tile(
-                mK_h, (self._n_block_size, self._head_dim), (None, 0)
-            )
+            gK = cute.local_tile(mK_h, (self._n_block_size, self._head_dim), (None, 0))
             tKgK_flat = gmem_thr_copy.partition_S(gK)
         tKsK = gmem_thr_copy.partition_D(sK)
         cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
@@ -925,9 +923,7 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
         # Full-width layout on the same pointer: shapes the mma B fragment
         # only, no accesses go through it.
         sK_frag_ref = cute.make_tensor(sK0.iterator, self._make_sk_layout())
-        sMax = storage.sMax.get_tensor(
-            cute.make_layout(4 * self._m_block_size)
-        )
+        sMax = storage.sMax.get_tensor(cute.make_layout(4 * self._m_block_size))
 
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self._dtype.width
@@ -996,9 +992,7 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
         kpair = cute.make_rmem_tensor(cute.make_layout(2), self._dtype)
         kpair_u32 = cute.recast_tensor(kpair, cutlass.Uint32)
         tSrK_u32 = cute.recast_tensor(
-            cute.make_tensor(
-                tSrK.iterator, cute.make_layout(cute.cosize(tSrK.layout))
-            ),
+            cute.make_tensor(tSrK.iterator, cute.make_layout(cute.cosize(tSrK.layout))),
             cutlass.Uint32,
         )
         warp_idx = tidx // 32
@@ -1561,9 +1555,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
             cute.group_modes(sQ_tma, 0, 2),
             target_profile=(block_q, (q_tma_elems, qw // q_tma_elems)),
         )
-        epi_buffer = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((epi_q, 4))
-        )
+        epi_buffer = smem.allocate_tensor(cutlass.Float32, cute.make_layout((epi_q, 4)))
         tma_full_mbar = smem.allocate_array(cutlass.Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(cutlass.Int64, num_stages)
 
@@ -1603,9 +1595,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                 tma_parity = 1
 
                 gq_tile = cute.local_tile(
-                    cute.domain_offset(
-                        (q_start, kv_head * group, 0), q_tma.tma_tensor
-                    ),
+                    cute.domain_offset((q_start, kv_head * group, 0), q_tma.tma_tensor),
                     tiler=(pack, group, qw),
                     coord=(0, 0, 0),
                 )
@@ -1635,9 +1625,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                             )
                         k_mbar = tma_full_mbar + tma_stage
 
-                        cute.arch.mbarrier_wait(
-                            tma_empty_mbar + tma_stage, tma_parity
-                        )
+                        cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_parity)
                         with cute.arch.elect_one():
                             k_size = block_k * kw * (dtype.width // 8)
                             cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, k_size)
@@ -1655,12 +1643,8 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
 
             else:
                 # MMA warps: each owns 32 contiguous keys across all q rows.
-                sK_warp = cute.local_tile(
-                    sK, (32, kw, num_stages), (warp_id, 0, 0)
-                )
-                sQ_ldsm = cute.zipped_divide(
-                    sQ, (8, cute.make_layout((elems, 4)))
-                )
+                sK_warp = cute.local_tile(sK, (32, kw, num_stages), (warp_id, 0, 0))
+                sQ_ldsm = cute.zipped_divide(sQ, (8, cute.make_layout((elems, 4))))
                 sQ_ldsm = sQ_ldsm[(lane_id % 8, (None, lane_id // 8)), None]
 
                 ldsm_atom = cute.make_copy_atom(
@@ -1687,20 +1671,14 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                     rK_hi = cute.make_rmem_tensor((elems,), dtype)
                     rK_lo_u32 = cute.recast_tensor(rK_lo, cutlass.Uint32)
                     rK_hi_u32 = cute.recast_tensor(rK_hi, cutlass.Uint32)
-                    rQp = cute.make_rmem_tensor(
-                        (4, kw // mma_k, q_tiles, 2), dtype
-                    )
+                    rQp = cute.make_rmem_tensor((4, kw // mma_k, q_tiles, 2), dtype)
                     rQp_u32 = cute.recast_tensor(rQp, cutlass.Uint32)
 
                 if warp_id == 0:
                     cute.arch.mbarrier_wait(tma_full_mbar, 0)
-                cute.arch.barrier(
-                    barrier_id=self._BAR_MMA, number_of_threads=128
-                )
+                cute.arch.barrier(barrier_id=self._BAR_MMA, number_of_threads=128)
                 for q in cutlass.range_constexpr(q_tiles):
-                    cute.copy(
-                        ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q]
-                    )
+                    cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 if cutlass.const_expr(self._kv_fp8):
@@ -1712,9 +1690,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                         for g in cutlass.range_constexpr(kw // mma_k):
                             for n in cutlass.range_constexpr(q_tiles):
                                 for j in cutlass.range_constexpr(2):
-                                    if cutlass.const_expr(
-                                        dtype is cutlass.BFloat16
-                                    ):
+                                    if cutlass.const_expr(dtype is cutlass.BFloat16):
                                         q_lo, q_hi = _fp8x4_to_bf16x4(
                                             rQ_u32[(j, g % 2), g // 2, n]
                                         )
@@ -1749,12 +1725,8 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                     p3 = cute.arch.shuffle_sync(
                                         rQ_u32[(1, 1), g, n], src
                                     )
-                                    rQp_u32[0, g, n, h] = p0 ^ (
-                                        (p0 ^ p1) & sel_mask
-                                    )
-                                    rQp_u32[1, g, n, h] = p2 ^ (
-                                        (p2 ^ p3) & sel_mask
-                                    )
+                                    rQp_u32[0, g, n, h] = p0 ^ ((p0 ^ p1) & sel_mask)
+                                    rQp_u32[1, g, n, h] = p2 ^ ((p2 ^ p3) & sel_mask)
 
                 tma_stage = 1 % num_stages
                 tma_parity = 0
@@ -1795,19 +1767,13 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                     rK[None, None, k],
                                 )
                                 for m in cutlass.range_constexpr(2):
-                                    for i in cutlass.range_constexpr(
-                                        elems // 2
-                                    ):
+                                    for i in cutlass.range_constexpr(elems // 2):
                                         if cutlass.const_expr(
                                             dtype is cutlass.BFloat16
                                         ):
-                                            lo, hi = _fp8x4_to_bf16x4(
-                                                rK_u32[i, m, k]
-                                            )
+                                            lo, hi = _fp8x4_to_bf16x4(rK_u32[i, m, k])
                                         else:
-                                            lo, hi = _fp8x4_to_f16x4(
-                                                rK_u32[i, m, k]
-                                            )
+                                            lo, hi = _fp8x4_to_f16x4(rK_u32[i, m, k])
                                         rK_lo_u32[i] = lo
                                         rK_hi_u32[i] = hi
                                     for n in cutlass.range_constexpr(q_tiles):
@@ -1886,9 +1852,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                         if warp_id == 0:
                             head_local = lane_id // pack
                             token_f = lane_id - head_local * pack
-                            if lane_id < block_q and cute.elem_less(
-                                token_f, seqlen_q
-                            ):
+                            if lane_id < block_q and cute.elem_less(token_f, seqlen_q):
                                 score = epi_buffer[lane_id, 0]
                                 for i in cutlass.range_constexpr(1, 4):
                                     score = cute.arch.fmax(
@@ -1908,9 +1872,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                         if warp_id == 0:
                             head_p = lane_id // pack
                             token_p = lane_id - head_p * pack
-                            if lane_id < block_q and cute.elem_less(
-                                token_p, seqlen_q
-                            ):
+                            if lane_id < block_q and cute.elem_less(token_p, seqlen_q):
                                 mMaxScore[
                                     kv_head * group + head_p,
                                     kv_block,
@@ -1924,9 +1886,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                     if kv_block < max_k_tiles:
                         head_p2 = lane_id // pack
                         token_p2 = lane_id - head_p2 * pack
-                        if lane_id < block_q and cute.elem_less(
-                            token_p2, seqlen_q
-                        ):
+                        if lane_id < block_q and cute.elem_less(token_p2, seqlen_q):
                             mMaxScore[
                                 kv_head * group + head_p2,
                                 kv_block,
@@ -2088,12 +2048,8 @@ class MsaProxyScoreDecodeStreamSm12x:
             for it in cutlass.range_constexpr(self._num_iters):
                 if cutlass.const_expr(self._kv_fp8):
                     # f16 intermediate (exact for e4m3), packed cvt.
-                    k8 = cute.make_tensor(
-                        kfrag.iterator + it * 8, cute.make_layout(8)
-                    )
-                    kf16 = cute.make_rmem_tensor(
-                        cute.make_layout(8), cutlass.Float16
-                    )
+                    k8 = cute.make_tensor(kfrag.iterator + it * 8, cute.make_layout(8))
+                    kf16 = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Float16)
                     _cvt_fp8_frag(k8, kf16)
                     ks = [cutlass.Float32(kf16[i]) for i in range(8)]
                 else:
