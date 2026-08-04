@@ -215,8 +215,32 @@ index to maintain here; discovery is local, two ways:
    grep -H '^\*\*Scope\*\*:' docs/design_docs/*.md
    ```
 
-Then: **if the code diverges from the doc, update the doc in the same PR**, with the rationale.
-Silently contradicting a design doc is a defect, not a style nit.
+### The workflow, when a design doc covers what you are changing
+
+1. **Read the doc before writing code.** It states invariants, constraints, and rejected
+   alternatives that the implementation alone does not express.
+2. **Propose your change as a delta from the documented design** — what the doc says today, what
+   you are changing, and why — rather than as a standalone edit judged only against the code.
+3. **Flag design ambiguities as you hit them, and explore the options.** If the doc is silent,
+   internally inconsistent, or the code has already drifted from it, say so and lay out the
+   candidate resolutions with their tradeoffs instead of silently picking one. An ambiguity
+   surfaced during the change is cheap; the same ambiguity rediscovered by the next contributor
+   is not.
+4. **Reconcile doc and code before you finish, in the same PR.** The doc must describe what the
+   code now does. If the change invalidates an invariant or revives a rejected alternative,
+   rewrite that section rather than appending to it. Silently contradicting a design doc is a
+   defect, not a style nit.
+
+**Why this workflow.** A design doc exists to prevent **design drift**. Without one, every change
+is made by inferring intent from the current implementation — and inference compounds: a few
+changes later the subsystem embodies a design nobody actually chose. The doc also carries what
+code cannot. An implementation shows *what* happens; it does not show why, which constraints are
+load-bearing, or which alternatives were already tried and rejected. Those are far better inputs
+for the next change than anything reverse-engineered from the code, and they are exactly what is
+lost when a doc goes stale. This matters most for AI agents, which are fluent at pattern-matching
+existing code and therefore especially prone to confidently extending a design they inferred
+rather than the one that was chosen — following this loop improves generated-code quality and
+keeps the product coherent across many contributors.
 
 Adding a design doc? Two obligations, and they are what keep it discoverable with no central list:
 give it a `**Scope**:` line listing the paths it governs, and cite it from at least one of them.
