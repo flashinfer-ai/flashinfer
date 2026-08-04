@@ -451,6 +451,7 @@ def get_single_prefill_module(backend, *args):
                     mask_mode,
                     layout,
                     window_left,
+                    maybe_packed_custom_mask,
                     scale_v_tensor,
                     logits_soft_cap,
                     sm_scale,

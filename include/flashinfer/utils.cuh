@@ -567,6 +567,7 @@ DEFINE_HAS_MEMBER(q_block_extend_offset)
 DEFINE_HAS_MEMBER(maybe_q_block_extend_offset)   // per-batch q_offset pointer for FA3 BatchPrefill
 DEFINE_HAS_MEMBER(kv_block_extend_offset)        // kv_offset for Cascade Current Chunk
 DEFINE_HAS_MEMBER(maybe_kv_block_extend_offset)  // per-batch kv_offset pointer for FA3 BatchPrefill
+DEFINE_HAS_MEMBER(maybe_custom_mask)  // packed custom (bitmask) mask ptr for FA3 SinglePrefill
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_

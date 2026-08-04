@@ -18,9 +18,10 @@
 namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool BLOCK_EXTEND,
-          bool MULTIITEMSCORING, typename WarpScheduler, typename AttentionVariant, typename Params,
-          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+          bool MULTIITEMSCORING, bool USE_CUSTOM_MASK, typename WarpScheduler,
+          typename AttentionVariant, typename Params, typename MainloopPipeline,
+          typename PipelineState, typename SharedStorage, typename FrgTensorO,
+          typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
     const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
     MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -184,6 +185,22 @@ CUTLASS_DEVICE void mma_f16(
                     : (AttentionUpdater::fill_value);
     }
   };
+  // Apply the element-wise packed-bitmask custom mask to a single logits reg.
+  // The packed mask is a flat little-endian bit array of shape [qo_len, kv_len]
+  // (one request) read at offset = qo_idx * kv_len + kv_idx, mirroring FA2's
+  // DefaultAttention::LogitsMask. SFINAE-guarded so FP8 (no maybe_custom_mask)
+  // still compiles. Returns true if the element is masked out.
+  auto apply_custom_mask = [&](int qo_idx, int kv_idx) -> bool {
+    if constexpr (USE_CUSTOM_MASK &&
+                  has_maybe_custom_mask_v<decltype(mainloop_params.additional_params)>) {
+      const bool valid = (qo_idx < qo_len) && (kv_idx < kv_len);
+      const uint64_t off = static_cast<uint64_t>(qo_idx) * kv_len + kv_idx;
+      return !valid ||
+             !((mainloop_params.additional_params.maybe_custom_mask[off >> 3] >> (off & 7)) & 1);
+    } else {
+      return false;
+    }
+  };
   auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
     int result = kv_tile_idx - 1;
     if constexpr (MULTIITEMSCORING) {
@@ -223,6 +240,10 @@ CUTLASS_DEVICE void mma_f16(
         if (kv_idx < col_limit_left(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
+      }
+      // Element-wise custom (packed-bitmask) mask (see apply_custom_mask).
+      if (apply_custom_mask(qo_idx, kv_idx)) {
+        tSrS(i) = AttentionUpdater::fill_value;
       }
     }
   }
@@ -268,6 +289,9 @@ CUTLASS_DEVICE void mma_f16(
         if (kv_idx >= std::min(kv_len, block_extend_col_limit(qo_idx))) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
+      } else if constexpr (USE_CUSTOM_MASK) {
+        // Custom (packed-bitmask) mask is applied fully below; only out-of-range
+        // masking needs to happen here (handled by the custom-mask block).
       } else {
         if (kv_idx >= col_limit_right(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
@@ -277,6 +301,10 @@ CUTLASS_DEVICE void mma_f16(
         if (kv_idx < col_limit_left(qo_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
+      }
+      // Element-wise custom (packed-bitmask) mask (see apply_custom_mask).
+      if (apply_custom_mask(qo_idx, kv_idx)) {
+        tSrS(i) = AttentionUpdater::fill_value;
       }
     }
     attention_updater.update</*init=*/false>(tSrS);
@@ -312,6 +340,12 @@ CUTLASS_DEVICE void mma_f16(
       int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
+      // Element-wise custom (packed-bitmask) mask (see apply_custom_mask). This
+      // middle loop covers fully-in-bound tiles that are otherwise unmasked for
+      // non-causal/non-block modes, so the custom mask must be applied here.
+      if (apply_custom_mask(qo_idx, kv_idx)) {
+        tSrS(i) = AttentionUpdater::fill_value;
+      }
     }
     if constexpr (MULTIITEMSCORING) {
       // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q,
@@ -359,6 +393,9 @@ CUTLASS_DEVICE void mma_f16(
         tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), batch_idx, qo_idx, kv_idx,
                                           qo_head_idx, kv_head_idx);
         if (kv_idx < col_limit_left(qo_idx)) {
+          tSrS(i) = AttentionUpdater::fill_value;
+        }
+        if (apply_custom_mask(qo_idx, kv_idx)) {
           tSrS(i) = AttentionUpdater::fill_value;
         }
       }
