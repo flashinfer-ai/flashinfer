@@ -352,6 +352,7 @@ def msa_proxy_score(
     import cutlass.cute as cute
 
     from .cute_dsl.proxy_score_sm12x import (
+        MsaProxyScoreDecodeKeyMajorSm12x,
         MsaProxyScoreDecodePackedFp8Sm12x,
         MsaProxyScoreDecodePackedSm12x,
         MsaProxyScoreDecodeStreamSm12x,
@@ -458,6 +459,23 @@ def msa_proxy_score(
         while p < max_seqlen_q or group_size * p < 16:
             p *= 2
         pack_q_len = min(p, _PACK_ROWS // group_size)
+    # Small fused tiles (<= 32 rows) on small base grids take the key-major
+    # TMA schedule, whose per-CTA fixed cost matches the one-block-per-CTA
+    # grids split-K produces at small batch (see
+    # MsaProxyScoreDecodeKeyMajorSm12x). Larger grids keep the row-major
+    # packed schedule: its smaller smem footprint co-resides 3 CTAs per SM,
+    # which wins once the grid can fill the machine.
+    use_keymajor = False
+    if use_packed and not kv_fp8:
+        p = 1
+        while p < max_seqlen_q:
+            p *= 2
+        if (
+            group_size * p <= 32
+            and batch_size * num_kv_heads * 4 <= get_device_sm_count(dev)
+        ):
+            use_keymajor = True
+            pack_q_len = p
 
     # group_size keys the packed/stream schedules: it is constexpr-baked into
     # the gather/epilogue, so each factorization is its own kernel.
@@ -469,6 +487,7 @@ def msa_proxy_score(
         kv_fp8,
         use_stream,
         use_packed,
+        use_keymajor,
         group_size if use_stream else pack_q_len,
         qoff_default if use_stream else None,
     )
@@ -502,6 +521,15 @@ def msa_proxy_score(
                 paged=paged,
                 kv_fp8=kv_fp8,
                 qoff_default=qoff_default,
+            )
+        elif use_keymajor:
+            kernel_obj = MsaProxyScoreDecodeKeyMajorSm12x(
+                head_dim=head_dim,
+                group_size=group_size,
+                pack_q_len=pack_q_len,
+                is_causal=causal,
+                paged=paged,
+                kv_fp8=kv_fp8,
             )
         elif use_packed:
             # fp8 K gets the key-split warp layout so the e4m3 upconvert

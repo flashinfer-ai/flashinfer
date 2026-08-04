@@ -1368,6 +1368,511 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                 sQ_chunk0.fill(0)
 
 
+_TMA_EVICT_FIRST = cutlass.Int64(0x12F0000000000000)
+
+
+@dsl_user_op
+def _mma_m16n8k16(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, *, loc=None, ip=None):
+    """One m16n8k16 f16/bf16 mma.sync with f32 accumulate; a is 4 u32, b is
+    2 u32, c is 4 f32 (read-modify-write)."""
+    ab_ty = "bf16" if a.element_type is cutlass.BFloat16 else "f16"
+    a_u32 = cute.recast_tensor(a, cutlass.Uint32)
+    b_u32 = cute.recast_tensor(b, cutlass.Uint32)
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 4),
+        [a_u32[i].ir_value(loc=loc, ip=ip) for i in range(4)]
+        + [b_u32[i].ir_value(loc=loc, ip=ip) for i in range(2)]
+        + [c[i].ir_value(loc=loc, ip=ip) for i in range(4)],
+        f"mma.sync.aligned.m16n8k16.row.col.f32.{ab_ty}.{ab_ty}.f32 "
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    for i in range(4):
+        c[i] = cutlass.Float32(
+            llvm.extractvalue(cutlass.Float32.mlir_type, out, [i], loc=loc, ip=ip)
+        )
+
+
+@cute.jit
+def _tma_copy_g2s(atom, gmem, smem, mbar, cache_policy=None):
+    """One bulk-tensor TMA G2S copy (call without elect_one; the atom elects)."""
+    s_part, g_part = cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem, 0),
+        cute.group_modes(gmem, 0),
+    )
+    cute.copy(atom, g_part, s_part, tma_bar_ptr=mbar, cache_policy=cache_policy)
+
+
+class MsaProxyScoreDecodeKeyMajorSm12x:
+    """Key-major packed-decode schedule for small fused-row tiles
+    (group_size * pack_q_len <= 32): the score GEMM runs as K Q^T with the
+    128 keys as the MMA M dimension and the fused (head, token) query rows as
+    N. Each of the 4 MMA warps owns 32 contiguous keys, so ldmatrix is legal
+    on both operands and the Q fragments load once per CTA and stay in
+    registers across KV blocks. A fifth warp is a TMA producer feeding a
+    two-stage mbarrier pipeline (Q's smem aliases K stage 0), which leaves
+    two intra-CTA barriers per block. This is what makes the schedule match
+    the single-block-per-CTA grids that split-K produces at small batch,
+    where the row-major packed schedule's per-CTA fixed phases (Q gather,
+    fill barriers, per-step Q reloads) dominate.
+
+    Derived from vLLM's IndexDecodeScoreKernel (Apache-2.0) by Thien Tran
+    (gau-nernst), adapted to flat/paged K with a kv-head mode, per-request
+    variable q lengths, MSA q_offset causal semantics, and the
+    per-(head, kv_block, token) max-score output with -inf padding tiles.
+    """
+
+    _BLOCK_K = 128
+    _BAR_MMA = 1
+    _NUM_STAGES = 2
+
+    def __init__(
+        self,
+        head_dim: int = 128,
+        group_size: int = 4,
+        pack_q_len: int = 4,
+        is_causal: bool = True,
+        paged: bool = False,
+        kv_fp8: bool = False,
+    ):
+        if head_dim != 128:
+            raise ValueError("only head_dim == 128 is supported")
+        if group_size * pack_q_len > 32:
+            raise ValueError("group_size * pack_q_len must be <= 32")
+        if kv_fp8:
+            raise NotImplementedError("fp8 K key-major schedule not yet wired")
+        self._head_dim = head_dim
+        self._group = group_size
+        self._pack_q_len = pack_q_len
+        self._is_causal = is_causal
+        self._paged = paged
+        self._kv_fp8 = kv_fp8
+        self._block_q = group_size * pack_q_len
+        self._q_tiles = (self._block_q + 7) // 8
+        self._num_threads = 32 * 5
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuQ: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
+        max_seqlen_q: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        num_qo_heads: cutlass.Int32,
+        max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(
+            not (
+                mQ.element_type == cutlass.Float16
+                or mQ.element_type == cutlass.BFloat16
+            )
+        ):
+            raise TypeError("Only Float16 or BFloat16 q is supported")
+        self._dtype: Type[cutlass.Numeric] = mQ.element_type
+
+        dtype = self._dtype
+        hd = self._head_dim
+        pack = self._pack_q_len
+        group = self._group
+        block_q = self._block_q
+        elems = 128 * 8 // dtype.width
+        tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
+        swizzle_128b = cute.make_swizzle(3, 4, 3)
+
+        sQ_layout = cute.make_composed_layout(
+            swizzle_128b,
+            0,
+            cute.make_layout(
+                (pack, group, (elems, hd // elems)),
+                stride=(elems, pack * elems, (1, block_q * elems)),
+            ),
+        )
+        q_tma = cpasync.make_tiled_tma_atom(
+            tma_g2s,
+            cute.logical_divide(mQ, (None, None, elems)),
+            sQ_layout,
+            cta_tiler=(pack, group, hd),
+        )
+
+        if cutlass.const_expr(self._paged):
+            sK_layout = cute.make_composed_layout(
+                swizzle_128b,
+                0,
+                cute.make_layout(
+                    (1, 1, self._BLOCK_K, (elems, hd // elems), self._NUM_STAGES),
+                    stride=(
+                        0,
+                        0,
+                        elems,
+                        (1, self._BLOCK_K * elems),
+                        self._BLOCK_K * hd,
+                    ),
+                ),
+            )
+            k_tma = cpasync.make_tiled_tma_atom(
+                tma_g2s,
+                cute.logical_divide(mK, (None, None, None, elems)),
+                sK_layout,
+                cta_tiler=(1, 1, self._BLOCK_K, hd),
+            )
+        else:
+            sK_layout = cute.make_composed_layout(
+                swizzle_128b,
+                0,
+                cute.make_layout(
+                    (self._BLOCK_K, 1, (elems, hd // elems), self._NUM_STAGES),
+                    stride=(
+                        elems,
+                        0,
+                        (1, self._BLOCK_K * elems),
+                        self._BLOCK_K * hd,
+                    ),
+                ),
+            )
+            k_tma = cpasync.make_tiled_tma_atom(
+                tma_g2s,
+                cute.logical_divide(mK, (None, None, elems)),
+                sK_layout,
+                cta_tiler=(self._BLOCK_K, 1, hd),
+            )
+
+        self.kernel(
+            q_tma,
+            k_tma,
+            mPageTable,
+            mMaxScore,
+            mCuQ,
+            mCuK,
+            mQOffset,
+            max_k_tiles,
+            num_splits,
+        ).launch(
+            grid=(num_splits, batch_size, num_qo_heads // group),
+            block=[self._num_threads, 1, 1],
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        q_tma: cpasync.TmaInfo,
+        k_tma: cpasync.TmaInfo,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuQ: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
+        max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,
+    ):
+        split_idx, batch_idx, kv_head = cute.arch.block_idx()
+        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_id = cute.arch.lane_idx()
+
+        dtype = self._dtype
+        hd = self._head_dim
+        pack = self._pack_q_len
+        group = self._group
+        block_q = self._block_q
+        block_k = self._BLOCK_K
+        num_stages = self._NUM_STAGES
+        q_tiles = self._q_tiles
+        epi_q = q_tiles * 8
+        elems = 128 // dtype.width
+        mma_k = 32 * 8 // dtype.width
+
+        q_start = mCuQ[batch_idx]
+        seqlen_q = mCuQ[batch_idx + 1] - q_start
+        if cutlass.const_expr(self._paged):
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
+        num_kv_blocks = cute.ceil_div(seqlen_k, block_k)
+
+        smem = cutlass.utils.SmemAllocator()
+        sK_full = smem.allocate_tensor(
+            dtype,
+            k_tma.smem_layout.outer,
+            byte_alignment=128,
+            swizzle=k_tma.smem_layout.inner,
+        )
+        if cutlass.const_expr(self._paged):
+            sK = sK_full[0, 0, None, None, None]
+        else:
+            sK = sK_full[None, 0, None, None]
+        # Q's smem aliases K stage 0: the Q fragments are register-resident
+        # before the first K tile is allowed in (empty-mbarrier order).
+        sQ_tma = cute.make_tensor(
+            sK[None, None, 0].iterator, layout=q_tma.smem_layout.outer
+        )
+        q_tma_elems = 128 * 8 // dtype.width
+        sQ = cute.coalesce(
+            cute.group_modes(sQ_tma, 0, 2),
+            target_profile=(block_q, (q_tma_elems, hd // q_tma_elems)),
+        )
+        epi_buffer = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((epi_q, 4))
+        )
+        tma_full_mbar = smem.allocate_array(cutlass.Int64, num_stages)
+        tma_empty_mbar = smem.allocate_array(cutlass.Int64, num_stages)
+
+        n_iter = cute.ceil_div(max_k_tiles, num_splits)
+
+        if split_idx < num_kv_blocks:
+            if warp_id == 0:
+                with cute.arch.elect_one():
+                    for i in cutlass.range_constexpr(num_stages):
+                        cute.arch.mbarrier_init(tma_full_mbar + i, 1)
+                        cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
+                    cute.arch.mbarrier_init_fence()
+            elif warp_id == 1:
+                cpasync.prefetch_descriptor(q_tma.atom)
+                cpasync.prefetch_descriptor(k_tma.atom)
+            cute.arch.sync_threads()
+
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+
+            if warp_id == 4:
+                # TMA producer warp: Q once, then one K tile per valid block.
+                tma_stage = 0
+                tma_parity = 1
+
+                gq_tile = cute.local_tile(
+                    cute.domain_offset(
+                        (q_start, kv_head * group, 0), q_tma.tma_tensor
+                    ),
+                    tiler=(pack, group, hd),
+                    coord=(0, 0, 0),
+                )
+                cute.arch.mbarrier_wait(tma_empty_mbar, tma_parity)
+                with cute.arch.elect_one():
+                    q_size = block_q * hd * (dtype.width // 8)
+                    cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar, q_size)
+                _tma_copy_g2s(q_tma.atom, gq_tile, sQ_tma, tma_full_mbar)
+
+                tma_stage = (tma_stage + 1) % num_stages
+                if tma_stage == 0:
+                    tma_parity ^= 1
+
+                for it in cutlass.range(n_iter):
+                    kv_block = split_idx + it * num_splits
+                    if kv_block < num_kv_blocks:
+                        if cutlass.const_expr(self._paged):
+                            page = mPageTable[batch_idx, kv_block]
+                            gk_tile = k_tma.tma_tensor[page, kv_head, None, None]
+                        else:
+                            gk_tile = cute.local_tile(
+                                cute.domain_offset(
+                                    (k_start, kv_head, 0), k_tma.tma_tensor
+                                ),
+                                tiler=(block_k, 1, hd),
+                                coord=(kv_block, 0, 0),
+                            )
+                        k_mbar = tma_full_mbar + tma_stage
+
+                        cute.arch.mbarrier_wait(
+                            tma_empty_mbar + tma_stage, tma_parity
+                        )
+                        with cute.arch.elect_one():
+                            k_size = block_k * hd * (dtype.width // 8)
+                            cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, k_size)
+                        _tma_copy_g2s(
+                            k_tma.atom,
+                            gk_tile,
+                            sK[None, None, tma_stage],
+                            k_mbar,
+                            cache_policy=_TMA_EVICT_FIRST,
+                        )
+
+                        tma_stage = (tma_stage + 1) % num_stages
+                        if tma_stage == 0:
+                            tma_parity ^= 1
+
+            else:
+                # MMA warps: each owns 32 contiguous keys across all q rows.
+                sK_warp = cute.local_tile(
+                    sK, (32, hd, num_stages), (warp_id, 0, 0)
+                )
+                sK_ldsm = cute.zipped_divide(
+                    sK_warp, (16, cute.make_layout((elems, 2)), 1)
+                )
+                sQ_ldsm = cute.zipped_divide(
+                    sQ, (8, cute.make_layout((elems, 4)))
+                )
+                sK_ldsm = sK_ldsm[(lane_id % 16, (None, lane_id // 16), 0), None]
+                sQ_ldsm = sQ_ldsm[(lane_id % 8, (None, lane_id // 8)), None]
+
+                ldsm_atom = cute.make_copy_atom(
+                    warp.LdMatrix8x8x16bOp(num_matrices=4), dtype
+                )
+
+                rQ = cute.make_rmem_tensor(
+                    ((elems // 2, 2), hd // (mma_k * 2), q_tiles), dtype
+                )
+                rK = cute.make_rmem_tensor((elems, 2, hd // mma_k), dtype)
+                rC = cute.make_rmem_tensor((4, 2, q_tiles), cutlass.Float32)
+
+                if warp_id == 0:
+                    cute.arch.mbarrier_wait(tma_full_mbar, 0)
+                cute.arch.barrier(
+                    barrier_id=self._BAR_MMA, number_of_threads=128
+                )
+                for q in cutlass.range_constexpr(q_tiles):
+                    cute.copy(
+                        ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q]
+                    )
+                cute.arch.mbarrier_arrive(tma_empty_mbar)
+
+                tma_stage = 1 % num_stages
+                tma_parity = 0
+                if tma_stage == 0:
+                    tma_parity ^= 1
+
+                if cutlass.const_expr(self._is_causal):
+                    q_off = mQOffset[batch_idx]
+                else:
+                    q_off = cutlass.Int32(0)
+
+                for it in cutlass.range(n_iter):
+                    kv_block = split_idx + it * num_splits
+                    if kv_block < num_kv_blocks:
+                        rC.fill(0.0)
+
+                        if warp_id == 0:
+                            cute.arch.mbarrier_wait(
+                                tma_full_mbar + tma_stage, tma_parity
+                            )
+                        cute.arch.barrier(
+                            barrier_id=self._BAR_MMA, number_of_threads=128
+                        )
+
+                        for k in cutlass.range_constexpr(hd // mma_k):
+                            cute.copy(
+                                ldsm_atom,
+                                sK_ldsm[None, (None, k, tma_stage)],
+                                rK[None, None, k],
+                            )
+                            for m in cutlass.range_constexpr(2):
+                                for n in cutlass.range_constexpr(q_tiles):
+                                    _mma_m16n8k16(
+                                        rK[None, m, k],
+                                        rQ[(None, k % 2), k // 2, n],
+                                        rC[None, m, n],
+                                    )
+
+                        cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
+
+                        # Mask keys past the causal limit and the sequence
+                        # tail (TMA zero-fills out-of-bounds rows).
+                        k_base = kv_block * block_k + warp_id * 32
+                        for q in cutlass.range_constexpr(q_tiles):
+                            for i in cutlass.range_constexpr(4):
+                                for j in cutlass.range_constexpr(2):
+                                    col = q * 8 + (lane_id % 4) * 2 + j
+                                    token = col % pack
+                                    if cutlass.const_expr(self._is_causal):
+                                        col_limit = cutlass.min(
+                                            token + q_off + 1, seqlen_k
+                                        )
+                                    else:
+                                        col_limit = seqlen_k
+                                    k_pos = k_base + i * 8 + lane_id // 4
+                                    if cute.elem_less(col_limit, k_pos + 1):
+                                        rC[q * 8 + i * 2 + j] = -cutlass.Float32.inf
+
+                        for q in cutlass.range_constexpr(q_tiles):
+                            r0 = rC[q * 8 + 0]
+                            r1 = rC[q * 8 + 1]
+                            for i in cutlass.range_constexpr(1, 4):
+                                r0 = cute.arch.fmax(r0, rC[q * 8 + i * 2 + 0])
+                                r1 = cute.arch.fmax(r1, rC[q * 8 + i * 2 + 1])
+                            for i in cutlass.range_constexpr(3):
+                                off = 4 << i
+                                r0 = cute.arch.fmax(
+                                    r0,
+                                    cute.arch.shuffle_sync_bfly(
+                                        r0, offset=off, mask=-1, mask_and_clamp=31
+                                    ),
+                                )
+                                r1 = cute.arch.fmax(
+                                    r1,
+                                    cute.arch.shuffle_sync_bfly(
+                                        r1, offset=off, mask=-1, mask_and_clamp=31
+                                    ),
+                                )
+                            if lane_id * 2 < 8:
+                                epi_buffer[q * 8 + lane_id * 2 + 0, warp_id] = r0
+                                epi_buffer[q * 8 + lane_id * 2 + 1, warp_id] = r1
+                        cute.arch.barrier(
+                            barrier_id=self._BAR_MMA, number_of_threads=128
+                        )
+
+                        head_local = lane_id // pack
+                        token_f = lane_id - head_local * pack
+                        if lane_id < block_q and cute.elem_less(token_f, seqlen_q):
+                            score = epi_buffer[lane_id, 0]
+                            for i in cutlass.range_constexpr(1, 4):
+                                score = cute.arch.fmax(score, epi_buffer[lane_id, i])
+                            mMaxScore[
+                                kv_head * group + head_local,
+                                kv_block,
+                                q_start + token_f,
+                            ] = score
+
+                        tma_stage = (tma_stage + 1) % num_stages
+                        if tma_stage == 0:
+                            tma_parity ^= 1
+                    elif kv_block < max_k_tiles:
+                        # Padding tile in [num_kv_blocks, max_k_tiles) -> -inf.
+                        if warp_id == 0:
+                            head_p = lane_id // pack
+                            token_p = lane_id - head_p * pack
+                            if lane_id < block_q and cute.elem_less(
+                                token_p, seqlen_q
+                            ):
+                                mMaxScore[
+                                    kv_head * group + head_p,
+                                    kv_block,
+                                    q_start + token_p,
+                                ] = -cutlass.Float32.inf
+        elif split_idx < max_k_tiles:
+            # CTA with no valid block: only padding stores remain.
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+            if warp_id == 0:
+                for it in cutlass.range(n_iter):
+                    kv_block = split_idx + it * num_splits
+                    if kv_block < max_k_tiles:
+                        head_p2 = lane_id // pack
+                        token_p2 = lane_id - head_p2 * pack
+                        if lane_id < block_q and cute.elem_less(
+                            token_p2, seqlen_q
+                        ):
+                            mMaxScore[
+                                kv_head * group + head_p2,
+                                kv_block,
+                                q_start + token_p2,
+                            ] = -cutlass.Float32.inf
+
+
 class MsaProxyScoreDecodeStreamSm12x:
     """Single-token decode schedule: at one query token the score tile is only
     group_size rows, too skinny for the MMA atom, so K streams straight from
