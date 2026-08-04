@@ -6,14 +6,14 @@ runner contract that tactic identities must satisfy.
 
 **Not** in scope: the v1 path — `autotune()`, `save_configs()`, `load_configs()`, and the
 profiling machinery they share. That code predates this document and has none of its own; changing
-it does not oblige you to update this doc. §5 is where the two are planned to converge, and the
+it does not oblige you to update this doc. §4 is where the two are planned to converge, and the
 day v1 is folded into v2 this scope line should widen to match.
 
 **Status**: proposed. RFC [#3920](https://github.com/flashinfer-ai/flashinfer/issues/3920); this
 document ships with the v2 MVP in
 [#3861](https://github.com/flashinfer-ai/flashinfer/pull/3861) (opt-in; `autotune()` and the v1
-cache path are untouched). Sections 1–4 describe the design as implemented in this branch;
-section 5 (graduation) is the part that is **not** yet agreed and is the reason this document
+cache path are untouched). Sections 1–3 describe the design as implemented in this branch;
+section 4 (graduation) is the part that is **not** yet agreed and is the reason this document
 exists.
 
 ## 1. Motivation
@@ -128,8 +128,11 @@ maintaining a migration path for data that is, by construction, an optimization.
   read/merge/write cycle and no exit-time save, so a crashed or killed tuning run keeps every
   winner it had already measured.
 - **No locks.** Concurrent writers do redundant work and the last valid write wins. This is what
-  makes SGLang's all-ranks-tune-simultaneously pattern safe with zero framework code — and it is
-  a deliberate divergence from the JIT kernel cache (§4), where single-flight is correct.
+  makes SGLang's all-ranks-tune-simultaneously pattern safe with zero framework code. It is a
+  deliberate divergence from FlashInfer's JIT kernel cache, which takes a cross-process
+  `FileLock` for single-flight: that is correct there and wrong here. Compiling the same kernel
+  twice wastes minutes of CPU, whereas ranks tune *inside collectives*, so a cross-rank lock
+  would either serialize warmup or deadlock it. Redundant measurement is the cheaper failure.
 - **Invalid is a miss, never an error.** A missing file, malformed JSON, or an embedded-key
   mismatch logs a warning and returns "not found". A corrupt entry costs one retune, not a dead
   server, and cannot take the other entries with it.
@@ -208,42 +211,7 @@ Persistence and orchestration stay separate responsibilities.
   broadcasts without parsing, `install()` verifies the environment fingerprint and publishes
   locally. Not yet implemented.
 
-## 3. Relationship to the CuTe-DSL kernel cache
-
-[`cute_dsl_kernel_cache.md`](cute_dsl_kernel_cache.md) describes a disk cache with a strikingly
-similar shape — environment record file, one artifact per specialization, atomic publish,
-invalid-is-a-miss. The convergence is evidence the primitives are right. The two caches are
-nonetheless **not** unifiable at the payload level, because they store different classes of
-artifact:
-
-| | CuTe-DSL kernel cache | autotune v2 store |
-|---|---|---|
-| payload | compiled `.o` (opaque binary) | chosen tactic (small JSON) |
-| key origin | author-written specialization name, known statically | derived per call at runtime from live tensors |
-| reproducible from key? | yes — recompile, seconds | no — requires GPU profiling; depends on silicon, clocks, library versions, measurement policy |
-| validity axes | *compile* env: arch, `nvidia-cutlass-dsl` stack, source SHA | *performance* env: GPU, cuBLAS/cuDNN versions, measurement policy |
-| concurrency | `FileLock` single-flight — double-compiling wastes minutes | no lock, last-valid-write-wins — a cross-rank lock would serialize or deadlock collective warmup |
-| portability | must never leave its arch | the thing you specifically want to broadcast to peers |
-
-The locking contracts are outright opposite, so a shared implementation is not available. What
-*should* be shared is the mechanics layer, and today it is duplicated:
-
-- **One word for the environment record.** `meta.json` (kernel cache) vs `manifest.json`
-  (autotune store) name the same concept.
-- **One helper for atomic-write + invalid-is-a-miss.** Both implement roughly the same 40 lines;
-  those crash-safety semantics deserve to be tested once, in `flashinfer/jit/`.
-- **One cache-clearing story.** Both live under `FLASHINFER_CACHE_DIR`, so `rm -rf
-  ~/.cache/flashinfer/` covers both, but `clear_cache_dir()` semantics and the env-var surface
-  (`FLASHINFER_AUTOTUNE_CACHE_DIR`, and the unrelated MLA-specific `FLASHINFER_AUTOTUNE_DIR`)
-  should be documented as one story.
-
-One lesson runs the other way: the kernel cache selects artifacts by a hand-written name string
-(`_nvfp4_kernel_name`), with `meta.json` guarding arch/DSL-version/source-SHA but not per-kernel
-codegen parameters. That is structurally the vllm#43119 failure class. It is currently mitigated
-by a test; contract rule 5 above (synthesis-invariant keys backed by a debug-mode completeness
-check) is the stronger form.
-
-## 4. Why v2 is a separate entry point
+## 3. Why v2 is a separate entry point
 
 The reason commonly given — "the on-disk format may be different" — is **not** load-bearing.
 Autotune caches are already per-version disposable (§2.3): `_collect_metadata()` stamps
@@ -262,7 +230,7 @@ Two things do argue for a separate name, and both are migration-window problems:
 
 Neither justifies permanent coexistence, which is what section 5 exists to prevent.
 
-## 5. Graduation plan
+## 4. Graduation plan
 
 **The problem this section addresses**: `autotune_v2` is a version number in a public symbol
 name. If graduation is left implicit, the number becomes permanent API surface and the next
@@ -270,7 +238,7 @@ iteration is structurally forced to be `autotune_v3`. That outcome arrives by in
 end state is written down *before* downstream code adopts the name — and
 `framework_patches/vllm_autotune_v2.patch` in #3861 asks vLLM to adopt it by name now.
 
-### 5.1 End state
+### 4.1 End state
 
 **`autotune_v2` is a transitional name.** At graduation:
 
@@ -278,13 +246,13 @@ end state is written down *before* downstream code adopts the name — and
 2. `autotune_v2` becomes a deprecated alias of `autotune()`, emitting a `DeprecationWarning`.
 3. `autotune(cache=<path>)`, `save_configs(path)`, and `load_configs(path)` are retained as thin
    shims forwarding to the managed store, with `cache=<path>` honored as *placement only*.
-4. The alias and the v1 shims are removed no earlier than the next major version (§5.3).
+4. The alias and the v1 shims are removed no earlier than the next major version (§4.3).
 
 The version number never survives into the stable API. Step 3 is what makes this cheap: it
 collapses the two-autotuner surface immediately, without waiting on a removal window, and no
 framework call site breaks at the moment of graduation.
 
-### 5.2 Gates
+### 4.2 Gates
 
 "Deprecate v1 afterwards" currently hides at least four preconditions. Graduation requires all
 of:
@@ -299,32 +267,32 @@ of:
 Gates 2 and 3 are the substantive ones: both would otherwise land as behavior changes *after*
 users have migrated, which is exactly the cost the separate entry point was meant to avoid.
 
-### 5.3 Version policy
+### 4.3 Version policy
 
 Under the right-shifted scheme in `CLAUDE.md`, **removing** `autotune(cache=<path>)` /
 `save_configs` / `load_configs` is an incompatible API change and requires a **major** bump — as
 does eventually dropping the `autotune_v2` alias. So:
 
-- Graduation itself (steps 1–3 of §5.1) is backwards-compatible and can land in a **minor**.
+- Graduation itself (steps 1–3 of §4.1) is backwards-compatible and can land in a **minor**.
 - Removal (step 4) is deferred to the next major, whether or not that is stated. Given that the
   shims are a few lines, keeping them indefinitely is a legitimate end state.
 
 Nothing about graduation deletes user cache files: old environment directories are left on disk
 and simply stop being consulted.
 
-### 5.4 Documentation debt
+### 4.4 Documentation debt
 
 `docs/autotuning.rst` (419 lines) currently documents `autotune(cache=path)` / `save_configs` /
 `load_configs` as *the* public API and does not mention v2. #3861 does not touch it. Until it
 does, the shipped documentation describes v1 only and nothing in-tree forces the reckoning.
 Graduation must update that file in the same change that swaps the implementation.
 
-## 6. Alternatives considered
+## 5. Alternatives considered
 
-**New parameters on `autotune()` instead of a new symbol.** Rejected for the two reasons in §4:
+**New parameters on `autotune()` instead of a new symbol.** Rejected for the two reasons in §3:
 the `cache=` argument would change meaning under existing callers, and attach-vs-scope would
 change behavior after the `with` block exits. A distinct symbol makes the eventual convergence a
-rename rather than a silent semantic drift — provided §5 is committed to.
+rename rather than a silent semantic drift — provided §4 is committed to.
 
 **Context-scoped store instead of process attach.** Rejected: both consumers serve outside any
 context, so the store would detach at the end of warmup and serving would silently fall back to
@@ -342,7 +310,7 @@ failure mode.
 (small M) land in disjoint shape buckets, so each bucket is served in one consistent mode; a
 single ambient policy matching the mode-sensitive path is sufficient.
 
-## 7. Limitations and future work
+## 6. Limitations and future work
 
 - **Opaque `export()` / `install()`** for multi-node distribution without a shared filesystem —
   designed, not implemented.
