@@ -17,7 +17,7 @@
 // Frozen Loom schedule plus its TVM-FFI binding in one translation unit.
 //
 // Frozen device-source provenance: loom/examples/weave/alpha_moe_fused_router.py
-// at Cake commit e2aa03274. The latest source-validation head, 6548b26ff,
+// at Cake commit e2aa03274. The latest source-validation head, def2a9dcb,
 // retains the same device body while strengthening route-plan coverage checks.
 // generate_kernel(..., arch="sm_100a") and sm_103a both produce the same
 // 17,780-byte raw source with SHA256

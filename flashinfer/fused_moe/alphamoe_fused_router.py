@@ -315,11 +315,11 @@ def alphamoe_fused_router(
 ) -> AlphaMoERoutePlan:
     r"""Route FP32 logits and build an AlphaMoE aligned plan (SM100/SM103).
 
-    One cooperative generated kernel performs deterministic top-k selection,
-    selected-logit softmax, per-expert counting, block padding, and grouped
-    route scatter. With ``has_shared_expert=True``, the last expert is forced
-    into the final route slot and the remaining ``top_k - 1`` experts are
-    selected from ``[0, num_experts - 1)``.
+    One cooperative generated kernel performs top-k selection, selected-logit
+    softmax, per-expert counting, block padding, and grouped route scatter.
+    With ``has_shared_expert=True``, the last expert is forced into the final
+    route slot and the remaining ``top_k - 1`` experts are selected from
+    ``[0, num_experts - 1)``.
 
     Parameters
     ----------
@@ -352,10 +352,12 @@ def alphamoe_fused_router(
 
     Notes
     -----
+    When routed logits are exactly equal, the selected expert set and its order
+    are unspecified; no lower-expert-ID tie break is guaranteed.
     The frozen CUDA device source was generated from Cake/Loom commit
     ``e2aa03274`` and compiled with ``--use_fast_math``; its SHA256 is
     ``ec5bc689e68264a11a56a17fb10f699bc3733a521dea916b71ecda51d4227801``.
-    Source-validation head ``6548b26ff`` retains that exact device source while
+    Source-validation head ``def2a9dcb`` retains that exact device source while
     strengthening route-plan coverage checks.
     The operation has no dependency on an AlphaMoE compute kernel and its plan
     can feed either the W8A8 or NVFP4 fused up/down path.

@@ -49,10 +49,11 @@ from `Humming <https://github.com/inclusionAI/humming>`_.
 AlphaMoE Router (SM100/SM103)
 -----------------------------
 
-The standalone AlphaMoE frontend converts FP32 logits into deterministic
-top-k weights and an expert-grouped, block-aligned route plan. The resulting
-plan can feed either the AlphaMoE W8A8 or NVFP4 compute path and can be reused
-across launches to avoid steady-state allocation.
+The standalone AlphaMoE frontend converts FP32 logits into top-k weights and an
+expert-grouped, block-aligned route plan. Selection and ordering among exactly
+equal routed logits are unspecified. The resulting plan can feed either the
+AlphaMoE W8A8 or NVFP4 compute path and can be reused across launches to avoid
+steady-state allocation.
 
 .. autosummary::
     :toctree: ../generated

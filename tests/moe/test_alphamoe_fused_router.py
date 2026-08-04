@@ -48,7 +48,8 @@ def _reference_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     routed_experts = logits.shape[1] - int(has_shared_expert)
     routed_top_k = top_k - int(has_shared_expert)
-    # Stable descending argsort implements the kernel's lower-expert tie break.
+    # Random reference inputs have no exact ties. Tie selection/order is outside
+    # the public contract and is covered separately below.
     topk_ids = torch.argsort(
         logits[:, :routed_experts], dim=-1, descending=True, stable=True
     )[:, :routed_top_k]
@@ -65,23 +66,18 @@ def _reference_topk(
     return torch.softmax(selected_logits, dim=-1), topk_ids.to(torch.int32)
 
 
-def _assert_plan(
-    logits: torch.Tensor,
+def _assert_aligned_plan(
     plan: AlphaMoERoutePlan,
+    selected_ids: torch.Tensor,
     *,
-    top_k: int,
+    num_experts: int,
     block_m: int,
-    has_shared_expert: bool,
 ) -> None:
-    ref_weights, ref_ids = _reference_topk(logits, top_k, has_shared_expert)
-    torch.testing.assert_close(plan.topk_ids, ref_ids, rtol=0, atol=0)
-    torch.testing.assert_close(plan.topk_weights, ref_weights, rtol=3e-4, atol=3e-4)
-
-    num_tokens, num_experts = logits.shape
+    num_tokens, top_k = selected_ids.shape
     sentinel = num_tokens * top_k
-    ref_ids_cpu = ref_ids.cpu().reshape(-1)
+    selected_ids_cpu = selected_ids.cpu().reshape(-1)
     expected_counts = torch.bincount(
-        ref_ids_cpu.to(torch.int64), minlength=num_experts
+        selected_ids_cpu.to(torch.int64), minlength=num_experts
     ).to(torch.int32)
     padded_counts = ((expected_counts + block_m - 1) // block_m) * block_m
     expected_offsets = torch.empty(num_experts + 1, dtype=torch.int32)
@@ -103,7 +99,9 @@ def _assert_plan(
         padded_count = int(padded_counts[expert])
         if count == 0:
             continue
-        expected_pairs = torch.nonzero(ref_ids_cpu == expert).flatten().to(torch.int32)
+        expected_pairs = (
+            torch.nonzero(selected_ids_cpu == expert).flatten().to(torch.int32)
+        )
         actual_pairs = sorted_ids[start : start + count]
         torch.testing.assert_close(
             torch.sort(actual_pairs).values,
@@ -117,6 +115,21 @@ def _assert_plan(
         num_blocks = padded_count // block_m
         assert torch.all(expert_ids[first_block : first_block + num_blocks] == expert)
     assert sorted(covered_pairs) == list(range(sentinel))
+
+
+def _assert_plan(
+    logits: torch.Tensor,
+    plan: AlphaMoERoutePlan,
+    *,
+    top_k: int,
+    block_m: int,
+    has_shared_expert: bool,
+) -> None:
+    ref_weights, ref_ids = _reference_topk(logits, top_k, has_shared_expert)
+    torch.testing.assert_close(plan.topk_ids, ref_ids, rtol=0, atol=0)
+    torch.testing.assert_close(plan.topk_weights, ref_weights, rtol=3e-4, atol=3e-4)
+
+    _assert_aligned_plan(plan, ref_ids, num_experts=logits.shape[1], block_m=block_m)
 
 
 @requires_router_gpu
@@ -154,7 +167,7 @@ def test_alphamoe_fused_router_matches_reference(
 
 @requires_router_gpu
 @pytest.mark.parametrize("has_shared_expert", [False, True])
-def test_alphamoe_fused_router_ties_choose_lower_expert(has_shared_expert):
+def test_alphamoe_fused_router_ties_form_valid_plan(has_shared_expert):
     logits = torch.zeros(3, 512, device="cuda", dtype=torch.float32)
     plan = alphamoe_fused_router(
         logits,
@@ -162,22 +175,25 @@ def test_alphamoe_fused_router_ties_choose_lower_expert(has_shared_expert):
         block_m=16,
         has_shared_expert=has_shared_expert,
     )
-    expected = torch.arange(8, device="cuda", dtype=torch.int32).expand(3, -1)
+    routed_experts = 512 - int(has_shared_expert)
+    routed_top_k = 8 - int(has_shared_expert)
+    routed_ids = plan.topk_ids[:, :routed_top_k]
+    assert torch.all((routed_ids >= 0) & (routed_ids < routed_experts))
+    assert torch.all(torch.sort(routed_ids, dim=1).values.diff(dim=1) > 0)
     if has_shared_expert:
-        expected = torch.cat(
-            (
-                torch.arange(7, device="cuda", dtype=torch.int32).expand(3, -1),
-                torch.full((3, 1), 511, device="cuda", dtype=torch.int32),
-            ),
-            dim=1,
-        )
-    torch.testing.assert_close(plan.topk_ids, expected, rtol=0, atol=0)
-    _assert_plan(
-        logits,
+        assert torch.all(plan.topk_ids[:, -1] == 511)
+    selected_logits = torch.gather(logits, 1, plan.topk_ids.to(torch.int64))
+    torch.testing.assert_close(
+        plan.topk_weights,
+        torch.softmax(selected_logits, dim=-1),
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    _assert_aligned_plan(
         plan,
-        top_k=8,
+        plan.topk_ids,
+        num_experts=512,
         block_m=16,
-        has_shared_expert=has_shared_expert,
     )
 
 
@@ -431,7 +447,7 @@ def test_alphamoe_fused_router_frozen_provenance_is_recorded():
         Path(__file__).resolve().parents[2] / "csrc" / "alphamoe_fused_router.cu"
     ).read_text()
     assert "e2aa03274" in source
-    assert "6548b26ff" in source
+    assert "def2a9dcb" in source
     assert "ec5bc689e68264a11a56a17fb10f699bc3733a521dea916b71ecda51d4227801" in source
     assert "cudaLaunchCooperativeKernel" in source
     assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor" in source

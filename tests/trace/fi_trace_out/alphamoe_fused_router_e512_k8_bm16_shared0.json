@@ -1,6 +1,6 @@
 {
   "name": "alphamoe_fused_router_e512_k8_bm16_shared0",
-  "description": "AlphaMoE logits-to-plan frontend: deterministic top-k, selected-logit softmax, per-expert block padding, and expert-grouped route scatter in one cooperative SM100/SM103 kernel.",
+  "description": "AlphaMoE logits-to-plan frontend: top-k (exact-tie order unspecified), selected-logit softmax, per-expert block padding, and expert-grouped route scatter in one cooperative SM100/SM103 kernel.",
   "op_type": "moe_routing",
   "tags": [
     "fi_api:flashinfer.fused_moe.alphamoe_fused_router.alphamoe_fused_router",

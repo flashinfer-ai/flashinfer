@@ -4007,9 +4007,9 @@ alphamoe_fused_router_trace = TraceTemplate(
     op_type="moe_routing",
     name_prefix="alphamoe_fused_router",
     description=(
-        "AlphaMoE logits-to-plan frontend: deterministic top-k, selected-logit "
-        "softmax, per-expert block padding, and expert-grouped route scatter in "
-        "one cooperative SM100/SM103 kernel."
+        "AlphaMoE logits-to-plan frontend: top-k (exact-tie order unspecified), "
+        "selected-logit softmax, per-expert block padding, and expert-grouped "
+        "route scatter in one cooperative SM100/SM103 kernel."
     ),
     axes={
         "num_tokens": Var(description="Number of routed tokens."),
