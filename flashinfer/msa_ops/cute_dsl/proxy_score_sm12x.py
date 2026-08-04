@@ -516,9 +516,9 @@ class MsaProxyScoreSm12x:
 
 
 class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
-    """Head-fused packed-decode schedule (bf16/fp16 or fp8 K): packs qhead_per_kv
-    heads x pack_q_len tokens into the M rows so the shared index-K is read once
-    per kv_head. fp8 K loads e4m3 bytes and packed-converts into smem."""
+    """Head-fused packed-decode bf16/fp16 schedule: packs qhead_per_kv heads x
+    pack_q_len tokens into the M rows so the shared index-K is read once per
+    kv_head. fp8 K takes the key-split subclass instead."""
 
     def __init__(
         self,
@@ -698,18 +698,17 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         n_rows = cute.size(acc_S_mn.shape[0])
 
         # K gmem views, as in the general kernel.
-        if cutlass.const_expr(not self._kv_fp8):
-            if cutlass.const_expr(self._paged):
-                pass  # per-block page lookup happens inside the loop
-            else:
-                mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
-                gK = cute.local_tile(
-                    mK_h, (self._n_block_size, self._head_dim), (None, 0)
-                )
-                tKgK_flat = gmem_thr_copy.partition_S(gK)
-            tKsK = gmem_thr_copy.partition_D(sK)
-            cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
-            tKVcKV = gmem_thr_copy.partition_S(cKV)
+        if cutlass.const_expr(self._paged):
+            pass  # per-block page lookup happens inside the loop
+        else:
+            mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
+            gK = cute.local_tile(
+                mK_h, (self._n_block_size, self._head_dim), (None, 0)
+            )
+            tKgK_flat = gmem_thr_copy.partition_S(gK)
+        tKsK = gmem_thr_copy.partition_D(sK)
+        cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
+        tKVcKV = gmem_thr_copy.partition_S(cKV)
 
         # Gather stores are synchronous; order them before the Q fragment reads,
         # then preload the Q fragments once (sQ reused across all kv-blocks).
@@ -729,78 +728,39 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
             kv_block = split_idx + it * num_splits
             if kv_block < num_kv_blocks:
                 self.cta_sync_barrier.arrive_and_wait()
-                if cutlass.const_expr(self._kv_fp8):
-                    if cutlass.const_expr(self._paged):
-                        page8 = mPageTable[batch_idx, kv_block]
-                        mK_h8 = mK[page8, kv_head, None, None]
-                        row_off8 = cutlass.Int32(0)
-                    else:
-                        mK_h8 = cute.domain_offset(
-                            (k_start, 0), mK[None, kv_head, None]
-                        )
-                        row_off8 = kv_block * self._n_block_size
-                    chunks_per_row = self._head_dim // 16
-                    n_chunks = (
-                        self._n_block_size * chunks_per_row // self._num_threads
+                if cutlass.const_expr(self._paged):
+                    page = mPageTable[batch_idx, kv_block]
+                    gK_pg = cute.local_tile(
+                        mK[page, kv_head, None, None],
+                        (self._n_block_size, self._head_dim),
+                        (None, 0),
                     )
-                    # Issue every 16B K load before the convert+store loop so the
-                    # gmem latencies overlap (the loads have no cp.async here).
-                    k_frag = cute.make_rmem_tensor(
-                        cute.make_layout((16, n_chunks)), mK.element_type
-                    )
-                    cvt_frag = cute.make_rmem_tensor(cute.make_layout(16), self._dtype)
-                    for kv_it in cutlass.range_constexpr(n_chunks):
-                        kv_chunk = tidx + kv_it * self._num_threads
-                        kv_m = kv_chunk // chunks_per_row
-                        kv_c16 = kv_chunk % chunks_per_row
-                        if (kv_block * self._n_block_size + kv_m) < seqlen_k:
-                            gKc = cute.local_tile(
-                                mK_h8[row_off8 + kv_m, None], (16,), (kv_c16,)
+                    tKgK_pg = gmem_thr_copy.partition_S(gK_pg)
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if (
+                            kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
+                        ) < seqlen_k:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK_pg[None, n, None, 0],
+                                tKsK[None, n, None],
                             )
-                            cute.autovec_copy(gKc, k_frag[None, kv_it])
                         else:
-                            k_frag[None, kv_it].fill(0)
-                    for kv_it in cutlass.range_constexpr(n_chunks):
-                        kv_chunk = tidx + kv_it * self._num_threads
-                        kv_m = kv_chunk // chunks_per_row
-                        kv_c16 = kv_chunk % chunks_per_row
-                        sK_chunk = cute.local_tile(sK[kv_m, None], (16,), (kv_c16,))
-                        _cvt_fp8_frag(k_frag[None, kv_it], cvt_frag)
-                        cute.autovec_copy(cvt_frag, sK_chunk)
+                            tKsK[None, n, None].fill(0)
                 else:
-                    if cutlass.const_expr(self._paged):
-                        page = mPageTable[batch_idx, kv_block]
-                        gK_pg = cute.local_tile(
-                            mK[page, kv_head, None, None],
-                            (self._n_block_size, self._head_dim),
-                            (None, 0),
-                        )
-                        tKgK_pg = gmem_thr_copy.partition_S(gK_pg)
-                        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            if (
-                                kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
-                            ) < seqlen_k:
-                                cute.copy(
-                                    gmem_tiled_copy,
-                                    tKgK_pg[None, n, None, 0],
-                                    tKsK[None, n, None],
-                                )
-                            else:
-                                tKsK[None, n, None].fill(0)
-                    else:
-                        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            if (
-                                kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
-                            ) < seqlen_k:
-                                cute.copy(
-                                    gmem_tiled_copy,
-                                    tKgK_flat[None, n, None, kv_block],
-                                    tKsK[None, n, None],
-                                )
-                            else:
-                                tKsK[None, n, None].fill(0)
-                    cute.arch.cp_async_commit_group()
-                    cute.arch.cp_async_wait_group(0)
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if (
+                            kv_block * self._n_block_size + tKVcKV[0, n, 0][0]
+                        ) < seqlen_k:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK_flat[None, n, None, kv_block],
+                                tKsK[None, n, None],
+                            )
+                        else:
+                            tKsK[None, n, None].fill(0)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
                 self.cta_sync_barrier.arrive_and_wait()
 
                 # S = Q K^T (unscaled)
@@ -1585,16 +1545,6 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         kw = hd // 2 if self._kv_fp8 else hd
         qw = hd // 2 if self._q_fp8 else hd
 
-        q_start = mCuQ[batch_idx]
-        seqlen_q = mCuQ[batch_idx + 1] - q_start
-        if cutlass.const_expr(self._paged):
-            k_start = cutlass.Int32(0)
-            seqlen_k = mCuK[batch_idx]
-        else:
-            k_start = mCuK[batch_idx]
-            seqlen_k = mCuK[batch_idx + 1] - k_start
-        num_kv_blocks = cute.ceil_div(seqlen_k, block_k)
-
         smem = cutlass.utils.SmemAllocator()
         sK_full = smem.allocate_tensor(
             dtype,
@@ -1624,21 +1574,34 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
 
         n_iter = cute.ceil_div(max_k_tiles, num_splits)
 
+        if warp_id == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(num_stages):
+                    cute.arch.mbarrier_init(tma_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
+                cute.arch.mbarrier_init_fence()
+        elif warp_id == 1:
+            cpasync.prefetch_descriptor(q_tma.atom)
+            cpasync.prefetch_descriptor(k_tma.atom)
+        cute.arch.sync_threads()
+
+        # PDL: the preceding kernel may still be writing the seqlen tensors,
+        # so they are read only after the dependency wait (the setup above is
+        # independent of global data and can overlap).
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
+
+        q_start = mCuQ[batch_idx]
+        seqlen_q = mCuQ[batch_idx + 1] - q_start
+        if cutlass.const_expr(self._paged):
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
+        num_kv_blocks = cute.ceil_div(seqlen_k, block_k)
+
         if split_idx < num_kv_blocks:
-            if warp_id == 0:
-                with cute.arch.elect_one():
-                    for i in cutlass.range_constexpr(num_stages):
-                        cute.arch.mbarrier_init(tma_full_mbar + i, 1)
-                        cute.arch.mbarrier_init(tma_empty_mbar + i, 128)
-                    cute.arch.mbarrier_init_fence()
-            elif warp_id == 1:
-                cpasync.prefetch_descriptor(q_tma.atom)
-                cpasync.prefetch_descriptor(k_tma.atom)
-            cute.arch.sync_threads()
-
-            cute.arch.griddepcontrol_wait()
-            cute.arch.griddepcontrol_launch_dependents()
-
             if warp_id == 4:
                 # TMA producer warp: Q once, then one K tile per valid block.
                 tma_stage = 0
@@ -1925,17 +1888,22 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                             barrier_id=self._BAR_MMA, number_of_threads=128
                         )
 
-                        head_local = lane_id // pack
-                        token_f = lane_id - head_local * pack
-                        if lane_id < block_q and cute.elem_less(token_f, seqlen_q):
-                            score = epi_buffer[lane_id, 0]
-                            for i in cutlass.range_constexpr(1, 4):
-                                score = cute.arch.fmax(score, epi_buffer[lane_id, i])
-                            mMaxScore[
-                                kv_head * group + head_local,
-                                kv_block,
-                                q_start + token_f,
-                            ] = score
+                        if warp_id == 0:
+                            head_local = lane_id // pack
+                            token_f = lane_id - head_local * pack
+                            if lane_id < block_q and cute.elem_less(
+                                token_f, seqlen_q
+                            ):
+                                score = epi_buffer[lane_id, 0]
+                                for i in cutlass.range_constexpr(1, 4):
+                                    score = cute.arch.fmax(
+                                        score, epi_buffer[lane_id, i]
+                                    )
+                                mMaxScore[
+                                    kv_head * group + head_local,
+                                    kv_block,
+                                    q_start + token_f,
+                                ] = score
 
                         tma_stage = (tma_stage + 1) % num_stages
                         if tma_stage == 0:
@@ -1955,8 +1923,6 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
                                 ] = -cutlass.Float32.inf
         elif split_idx < max_k_tiles:
             # CTA with no valid block: only padding stores remain.
-            cute.arch.griddepcontrol_wait()
-            cute.arch.griddepcontrol_launch_dependents()
             if warp_id == 0:
                 for it in cutlass.range(n_iter):
                     kv_block = split_idx + it * num_splits
