@@ -14,7 +14,11 @@
 
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+    DType,
     RouteImpl,
     TileScheduler,
 )
@@ -28,6 +32,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     valid_prims_ts_nvfp4_moe_tactics,
 )
 from flashinfer.tllm_enums import ActivationType
+from flashinfer.utils import is_sm100a_supported
 
 
 def _find_bs1_ldgsts_persistent_pair(*, enable_pdl=False):
@@ -77,6 +82,66 @@ def _find_bs1_ldgsts_persistent_pair(*, enable_pdl=False):
 
 def test_nvfp4_search_contains_bs1_ldgsts_persistent_pair():
     assert _find_bs1_ldgsts_persistent_pair() is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_sm100a_supported(torch.device("cuda")),
+    reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
+)
+@pytest.mark.parametrize(
+    (
+        "stage",
+        "problem_n",
+        "problem_k",
+        "num_experts",
+        "top_k",
+        "early_exit_max_token_ctas",
+        "dtype_c_override",
+        "seed",
+    ),
+    (
+        pytest.param(
+            "fc1", 4096, 7168, 16, 8, 16, int(DType.BF16), 42, id="fc1-mainloop"
+        ),
+        pytest.param("fc1", 256, 512, 2, 1, 4, None, 123, id="fc1-quantized-output"),
+        pytest.param("fc2", 7168, 2048, 16, 8, 16, None, 42, id="fc2"),
+    ),
+)
+def test_bs1_deepseek_persistent_pair_gpu_correctness(
+    stage,
+    problem_n,
+    problem_k,
+    num_experts,
+    top_k,
+    early_exit_max_token_ctas,
+    dtype_c_override,
+    seed,
+):
+    """Exercise the BS=1 tactic, including skipped persistent work tiles."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = _find_bs1_ldgsts_persistent_pair()
+    assert pair is not None
+    cfg = dict(pair.fc1.cfg.kwargs if stage == "fc1" else pair.fc2.cfg.kwargs)
+    if dtype_c_override is not None:
+        # The standalone random-input reference overstates E2M1 quantization
+        # error for DeepSeek's large K. Use BF16 here to isolate the exact FC1
+        # LDGSTS/persistent mainloop; the second FC1 row covers its real E2M1
+        # output epilogue with the same tile and pipeline schedule.
+        cfg["dtype_c"] = dtype_c_override
+
+    assert reference_check(
+        num_experts=num_experts,
+        num_tokens=1,
+        top_k=top_k,
+        problem_n=problem_n,
+        problem_k=problem_k,
+        seed=seed,
+        early_exit_max_token_ctas=early_exit_max_token_ctas,
+        **cfg,
+    )
 
 
 def test_bs1_persistent_early_exit_pdl_wait_completes_before_task_graph():

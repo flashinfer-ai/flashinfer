@@ -27,8 +27,6 @@ from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
     TaskLocalVariable,
-    WorkAttr,
-    WorkTileInfo,
     WorkQueue,
     consumer_work,
 )
@@ -138,25 +136,6 @@ class BatchedGemmWorkQueue(WorkQueue):
             context.smem_base.data_ptr() + self._alloc_fast_drain_mbar.offset,
             mem_space=cutlass.AddressSpace.smem,
         )
-
-    @consumer_work(
-        work_attrs=WorkAttr.AUXILIARY, returns=("work_tile", "skip_work_tile")
-    )
-    @cute.jit
-    def init_work_tile(
-        self,
-        stage_info: StageInfo,
-    ) -> tuple[Any, cutlass.Boolean]:
-        self._init_fast_drain_smem_state(stage_info)
-        tile_scheduler = object.__getattribute__(self, "tile_scheduler")
-        if cutlass.const_expr(tile_scheduler is not None):
-            initial_work_tile = self.initial_work_tile_info()
-        else:
-            initial_work_tile = WorkTileInfo(
-                (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
-                cutlass.Boolean(False),
-            )
-        return initial_work_tile, cutlass.Boolean(False)
 
     @cute.jit
     def should_skip_work_tile(self, work_tile) -> bool:

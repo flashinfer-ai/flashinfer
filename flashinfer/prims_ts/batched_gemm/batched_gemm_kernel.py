@@ -1349,10 +1349,6 @@ def _batched_gemm_kernel_bf16_body(
         num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
             idx=Int32(0), vector_size=1
         )[0]
-        if cutlass.const_expr(cfg.metadata_compute_tile_ratio > 1):
-            num_non_exiting_ctas_value *= cutlass.Int32(
-                cfg.metadata_compute_tile_ratio
-            )
 
     tma_a_ptr = tma_a_desc.get_ptr()
     tma_b_ptr = tma_b_desc.get_ptr()

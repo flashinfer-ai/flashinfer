@@ -165,7 +165,7 @@
             "fused_act,act,eltwise_act_type": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],
-                [false, "swiglu", "relu2"]
+                [false, "none", "relu2"]
             ],
             "sf_layout_b": "linear",
             "dtype_c": "e2m1",
