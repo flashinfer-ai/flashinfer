@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -eo pipefail
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="${SCRIPT_DIR}/unit_test_runner.py"
@@ -28,13 +28,17 @@ export SAMPLE_OFFSET
 export PARALLEL_TESTS=true
 
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/test_utils.sh"
+source "${SCRIPT_DIR}/test_utils.sh" || exit $?
 
 main() {
     local runner_settings_output
     local -a runner_settings
     runner_settings_output=$(python "${RUNNER}" __shell-settings "$@")
-    mapfile -t runner_settings <<< "${runner_settings_output}"
+    local runner_settings_exit_code=$?
+    if [ "${runner_settings_exit_code}" -ne 0 ]; then
+        return "${runner_settings_exit_code}"
+    fi
+    mapfile -t runner_settings <<< "${runner_settings_output}" || return $?
     local operation="${runner_settings[0]}"
     TEST_PATH="${runner_settings[1]}"
 
@@ -48,14 +52,16 @@ main() {
         # nvshmem4py-cu12 pins cuda-python<=12.9. The CI image already carries
         # compatible cuda-python and NVIDIA NVSHMEM libraries, so avoid allowing
         # pip to replace the CUDA flavor while filling this one missing module.
-        python -c "import nvshmem.core" 2>/dev/null || pip install --no-deps nvshmem4py-cu12
+        if ! python -c "import nvshmem.core" 2>/dev/null; then
+            pip install --no-deps nvshmem4py-cu12 || return $?
+        fi
 
-        install_and_verify
+        install_and_verify || return $?
 
         # Apply dependency overrides after installation since pip may overwrite
         # the versions established by the CI image.
         # shellcheck disable=SC1091
-        source "${SCRIPT_DIR}/setup_test_env.sh"
+        source "${SCRIPT_DIR}/setup_test_env.sh" || return $?
 
         # tests/moe_ep needs its additional runtime stack only on CUDA 13 images.
         local cuda_major
@@ -63,7 +69,7 @@ main() {
             'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
             2>/dev/null || echo 0)
         if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
-            FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
+            FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh || return $?
         fi
     fi
 
@@ -73,6 +79,7 @@ main() {
 
     local runner_exit_code
     local runner_status
+    local wrapper_exit_code
     if python "${RUNNER}" "${operation}" "$@"; then
         runner_exit_code=0
     else
@@ -82,15 +89,19 @@ main() {
     case "${runner_exit_code}" in
         0)
             runner_status="complete-without-failures"
+            wrapper_exit_code=0
             ;;
         1)
             runner_status="complete-with-failures"
+            wrapper_exit_code=1
             ;;
         2)
             runner_status="incomplete-and-resumable"
+            wrapper_exit_code=0
             ;;
         3)
             runner_status="configuration-collection-or-infrastructure-error"
+            wrapper_exit_code=3
             ;;
         *)
             echo "UNIT TEST RUNNER ABNORMAL EXIT: exit_code=${runner_exit_code} wrapper_exit_code=unchanged" >&2
@@ -98,8 +109,8 @@ main() {
             ;;
     esac
 
-    echo "UNIT TEST RUNNER RESULT: exit_code=${runner_exit_code} status=${runner_status} wrapper_exit_code=0"
-    return 0
+    echo "UNIT TEST RUNNER RESULT: exit_code=${runner_exit_code} status=${runner_status} wrapper_exit_code=${wrapper_exit_code}"
+    return "${wrapper_exit_code}"
 }
 
 main "$@"

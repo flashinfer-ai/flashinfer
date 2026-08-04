@@ -37,11 +37,16 @@ export MAX_JOBS
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
     _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
     if [ -n "${_torch_pin}" ]; then
-        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt) || return $?
         echo "${_torch_pin}" > "${_constraint_file}"
+        _constraint_write_status=$?
+        if [ "${_constraint_write_status}" -ne 0 ]; then
+            rm -f "${_constraint_file}"
+            return "${_constraint_write_status}"
+        fi
         export PIP_CONSTRAINT="${_constraint_file}"
         echo "Pinning for all pip installs in this job: ${_torch_pin}"
-        unset _constraint_file
+        unset _constraint_file _constraint_write_status
     fi
     unset _torch_pin
 fi
@@ -231,14 +236,14 @@ install_precompiled_kernels() {
 
         if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
             echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
-            pip install -q "${DIST_CUBIN_DIR}"/*.whl
+            pip install -q "${DIST_CUBIN_DIR}"/*.whl || return $?
         else
             echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
         fi
 
         if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
             echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
-            pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
+            pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl || return $?
         else
             echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
         fi
@@ -253,24 +258,24 @@ install_and_verify() {
         echo ""
 
         # Install precompiled kernels if enabled
-        install_precompiled_kernels
+        install_precompiled_kernels || return $?
 
         # Sync dependencies from the branch's requirements.txt
-        pip install -r requirements.txt
+        pip install -r requirements.txt || return $?
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
         # version skew between libs-base and libs-cu13.
         if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0" || return $?
         fi
 
         # Install local python sources
-        pip install -e . -v --no-deps
+        pip install -e . -v --no-deps || return $?
         echo ""
 
         # Verify installation
         echo "Verifying installation..."
-        (cd /tmp && python -m flashinfer show-config)
+        (cd /tmp && python -m flashinfer show-config) || return $?
         echo ""
     fi
 }

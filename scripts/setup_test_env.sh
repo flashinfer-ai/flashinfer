@@ -22,18 +22,23 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
   _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
   if [ -n "${_torch_pin}" ]; then
-    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt) || return $?
     echo "${_torch_pin}" > "${_constraint_file}"
+    _constraint_write_status=$?
+    if [ "${_constraint_write_status}" -ne 0 ]; then
+      rm -f "${_constraint_file}"
+      return "${_constraint_write_status}"
+    fi
     export PIP_CONSTRAINT="${_constraint_file}"
     echo "Pinning for all pip installs in this job: ${_torch_pin}"
-    unset _constraint_file
+    unset _constraint_file _constraint_write_status
   fi
   unset _torch_pin
 fi
 
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
-  source "${REPO_ROOT}/ci/setup_python.env"
+  source "${REPO_ROOT}/ci/setup_python.env" || return $?
 fi
 
 # Override TVM-FFI if specified
@@ -41,7 +46,7 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "========================================"
   echo "Overriding TVM-FFI with ref: ${TVM_FFI_REF}"
   echo "========================================"
-  pip install --force-reinstall "git+https://github.com/apache/tvm-ffi.git@${TVM_FFI_REF}"
+  pip install --force-reinstall "git+https://github.com/apache/tvm-ffi.git@${TVM_FFI_REF}" || return $?
   echo "TVM-FFI override complete."
   echo ""
 fi
@@ -60,7 +65,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "========================================"
   # Clean uninstall old packages first (recommended by NVIDIA docs)
   pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
-  pip install "${CUTLASS_DSL_PKG}"
+  pip install "${CUTLASS_DSL_PKG}" || return $?
   echo "nvidia-cutlass-dsl override complete."
   echo ""
 fi
