@@ -208,7 +208,9 @@ def test_cache_key_extras_are_str_stable(runner_cls, backend_cfg, variant, alt_v
         f"object address and will not match across processes: {rendered}"
     )
     for element in extras:
-        assert isinstance(element, (int, float, str, bool, tuple)), (
+        # None is permitted: str(None) == "None" is stable across processes,
+        # and optional config fields (n_group, per_token_scale, ...) are keyed.
+        assert isinstance(element, (int, float, str, bool, tuple, type(None))), (
             f"{runner_cls.__name__}: cache-key element {element!r} of type "
             f"{type(element).__name__} has no guaranteed stable repr."
         )
@@ -298,4 +300,59 @@ def test_fused_shared_experts_change_both_cache_keys():
     )
     assert len({e for _, e in keys.values()}) == 3, (
         f"S values share cache-key extras: {keys}"
+    )
+
+
+# Routing shape and declared-but-unconsumed quant flags. Neither changes which
+# tactics are *legal*, so they are not in _DIMENSIONS above; they are keyed
+# because they change how a tactic ranks (routing shape alters the expert-token
+# distribution) or will feed tactic enumeration once honored (quant flags).
+_SOFT_DIMENSIONS = [
+    ("routing_method", dict(method=RoutingMethodType.Renormalize)),
+    ("n_group", dict(n_group=4)),
+    ("topk_group", dict(topk_group=2)),
+    ("per_token_scale", dict(per_token_scale=True)),
+    ("swizzled_scale_factors", dict(swizzled_scale_factors=True)),
+]
+
+
+def _config_with(backend_cfg, variant, **overrides):
+    quant_kwargs = {
+        k: overrides.pop(k)
+        for k in ("per_token_scale", "swizzled_scale_factors")
+        if k in overrides
+    }
+    routing_kwargs = {
+        k: overrides.pop(k)
+        for k in ("method", "n_group", "topk_group")
+        if k in overrides
+    }
+    cfg = _config(backend_cfg, variant, **overrides)
+    if routing_kwargs:
+        cfg = dataclasses.replace(
+            cfg, routing=dataclasses.replace(cfg.routing, **routing_kwargs)
+        )
+    if quant_kwargs:
+        cfg = dataclasses.replace(
+            cfg, quant=dataclasses.replace(cfg.quant, **quant_kwargs)
+        )
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "dimension,override", _SOFT_DIMENSIONS, ids=[d[0] for d in _SOFT_DIMENSIONS]
+)
+def test_ranking_relevant_dimension_changes_both_cache_keys(dimension, override):
+    _skip_unless_sm100()
+    device = torch.device("cuda")
+    base = TrtllmFp8BlockRunner(
+        _config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8), device=device
+    )
+    other = TrtllmFp8BlockRunner(
+        _config_with(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, **override),
+        device=device,
+    )
+    assert hash(base) != hash(other), f"{dimension} does not change runner_hash"
+    assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
+        f"{dimension} does not change get_cache_key_extras()"
     )

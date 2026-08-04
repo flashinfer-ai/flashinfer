@@ -260,6 +260,22 @@ class MoERunner(TunableRunner):
             int(experts.num_fused_shared_experts),
             int(self.config.activation.type),
             bool(self.config.execution.do_finalize),
+            # Routing shape. These do not change which tactics are *legal*, but
+            # they change the expert-token distribution, and therefore the
+            # per-expert GEMM shapes and padding a tactic is ranked on. Two
+            # configs differing only here can genuinely want different winners.
+            # routed_scaling_factor is deliberately absent: it is a pure output
+            # scale with no bearing on ranking.
+            int(routing.method),
+            routing.n_group,
+            routing.topk_group,
+            # Declared but not yet consumed by any TRTLLM runner (they all pass
+            # per_token_scale=None today). Keyed anyway: both feed the upstream
+            # tactic enumeration once a runner honors them, and re-deriving that
+            # at the point of use is exactly the omission this method exists to
+            # prevent.
+            self.config.quant.per_token_scale,
+            self.config.quant.swizzled_scale_factors,
         ) + tuple(self._backend_cache_key_parts())
 
     def _backend_cache_key_parts(self) -> tuple:
