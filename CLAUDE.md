@@ -242,6 +242,35 @@ existing code and therefore especially prone to confidently extending a design t
 rather than the one that was chosen — following this loop improves generated-code quality and
 keeps the product coherent across many contributors.
 
+### What a design doc contains
+
+[`flashinfer_moe_api.md`](docs/design_docs/flashinfer_moe_api.md) is the worked example of the
+full shape — treat it as the template. Not every doc needs every section, but the order is
+deliberate: intent before mechanism, mechanism before follow-ups.
+
+| Section | Required | Purpose |
+|---|---|---|
+| `**Scope**:` line | yes | the paths this doc governs (see above) |
+| Objectives / motivation | yes | what the subsystem is for and what it must guarantee — stated **before** any mechanism, so a reader can judge the design against its goals |
+| Design | yes | the mechanisms, with the **options considered** and why the chosen one won; prefer short code sketches and worked examples over prose |
+| Alternatives considered | recommended | what was proposed or tried and rejected, with the reason — this is what stops the next change from re-litigating a settled question |
+| Tracked items | as needed | status tables for follow-ups, release gates, and carryover: `\| Status \| Task \| Notes \|` with `[ ]` / `[x]` |
+| Review comments | as needed | transcribed review threads with stable ids (`C0`, `C1`, …) plus the anchor text, so code and later sections can cite a specific objection — `flashinfer/fused_moe/api.py` cites `C4-C5/C39` |
+| Decision log | as needed | dated entries recording what was decided, and why, during a work session |
+| Non-goals | recommended | scope boundaries stated positively, so "why doesn't it do X" has a written answer |
+
+**Record decisions as they are made — including during autonomous agent sessions.** When an agent
+resolves a design question mid-session (chose between options, discovered a binding constraint,
+abandoned an approach), that belongs in the decision log with its reasoning and a date. Otherwise
+the reasoning survives only in a session transcript nobody will reread, and the next session
+re-derives it — usually differently.
+
+**Why this belongs in the doc and not only in the PR description.** A design change written into
+the doc arrives at review **verbalized**: the diff states, in words, what the design now is and
+why it changed. Reviewers can argue with the decision itself instead of reverse-engineering it
+from an implementation diff, and the outcome is recorded where the next contributor will look —
+not in a review thread that scrolls out of sight.
+
 Adding a design doc? Two obligations, and they are what keep it discoverable with no central list:
 give it a `**Scope**:` line listing the paths it governs, and cite it from at least one of them.
 A doc that is reachable only by browsing `docs/` will not be read.
