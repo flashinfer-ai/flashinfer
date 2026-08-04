@@ -81,4 +81,4 @@ if __name__ == "__main__":
     for seq_len in [1024, 2048, 8192]:
         for batch_size in [64, 128, 768]:
             for num_heads in [64, 128]:
-                bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "auto")
+                bench_deepseek_mla_decode(batch_size, seq_len, num_heads, "fa3")
