@@ -29,7 +29,7 @@ import torch
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 from .api import (
-    _CUTLASS_SM90_ARCHS,
+    _CUTLASS_SUPPORTED_ARCHS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -196,12 +196,12 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# SM90 CUTLASS runners — dense BF16 and mixed-input W4A16
+# CUTLASS runners — dense BF16 and mixed-input W4A16
 # ---------------------------------------------------------------------------
 
 
-class _CutlassSm90Runner(MoERunner):
-    """Shared launch, tuning, and workspace mechanics for SM90 CUTLASS MoE."""
+class _CutlassRunnerBase(MoERunner):
+    """Shared launch, tuning, and workspace mechanics for CUTLASS MoE."""
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     _weight_dtype: ClassVar[torch.dtype]
@@ -240,11 +240,13 @@ class _CutlassSm90Runner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
-        if self._device_arch not in _CUTLASS_SM90_ARCHS:
+        # Keep this runtime guard aligned with each config's supported() check.
+        # Extend both only after this runner contract is validated on a new arch.
+        if self._device_arch not in _CUTLASS_SUPPORTED_ARCHS:
             raise RuntimeError(
                 f"{type(self).__name__} does not support "
                 f"SM{self._device_arch}; supported architectures are "
-                f"{_CUTLASS_SM90_ARCHS}."
+                f"{_CUTLASS_SUPPORTED_ARCHS}."
             )
 
         enable_pdl = config.execution.enable_pdl
@@ -525,8 +527,8 @@ class _CutlassSm90Runner(MoERunner):
         return (self._device_arch,)
 
 
-class CutlassBf16Runner(_CutlassSm90Runner):
-    """SM90 unified adapter for dense BF16 CUTLASS fused MoE."""
+class CutlassBf16Runner(_CutlassRunnerBase):
+    """Unified adapter for dense BF16 CUTLASS fused MoE."""
 
     backend_key = "cutlass_bf16"
     supported_quant_variants = (QuantVariant.BF16,)
@@ -554,8 +556,8 @@ class CutlassBf16Runner(_CutlassSm90Runner):
         return [w1, w2]
 
 
-class CutlassW4A16Runner(_CutlassSm90Runner):
-    """SM90 unified adapter for MXFP4-weight x BF16-activation fused MoE."""
+class CutlassW4A16Runner(_CutlassRunnerBase):
+    """Unified adapter for MXFP4-weight x BF16-activation fused MoE."""
 
     backend_key = "cutlass_w4a16"
     supported_quant_variants = (QuantVariant.W4A16,)

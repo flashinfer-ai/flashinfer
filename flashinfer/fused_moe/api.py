@@ -234,10 +234,10 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
-# This PR intentionally validates the concrete unified CUTLASS runners only on
-# Hopper. Other architectures remain available through the legacy flat API and
-# can be enabled here by follow-up runners with architecture-specific coverage.
-_CUTLASS_SM90_ARCHS = (90,)
+# The unified CUTLASS path is initially validated only on Hopper. Keep the
+# configs architecture-neutral and extend this allowlist as the same runner
+# contracts are validated on architectures already served by the flat API.
+_CUTLASS_SUPPORTED_ARCHS = (90,)
 
 
 @dataclass(frozen=True)
@@ -503,7 +503,7 @@ class CutlassConfig:
 
 @dataclass(frozen=True)
 class CutlassBf16Config:
-    """SM90 CUTLASS BF16 backend for the unified MoE API.
+    """CUTLASS BF16 backend for the unified MoE API.
 
     Other architectures remain available through the legacy flat API until
     their unified runner coverage is validated separately.
@@ -511,7 +511,7 @@ class CutlassBf16Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _CUTLASS_SM90_ARCHS
+        return arch in _CUTLASS_SUPPORTED_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -546,11 +546,11 @@ class CutlassBf16Config:
 
 @dataclass(frozen=True)
 class CutlassW4A16Config:
-    """SM90 CUTLASS MXFP4-weight x BF16-activation backend."""
+    """CUTLASS MXFP4-weight x BF16-activation backend."""
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in _CUTLASS_SM90_ARCHS
+        return arch in _CUTLASS_SUPPORTED_ARCHS
 
     @staticmethod
     def prepare_weights(
