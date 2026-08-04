@@ -179,8 +179,15 @@ class MsaProxyScoreFp4MmaSm12x:
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._N)
         group_size = mQ.shape[1] // mK.shape[1]
         kv_head = qo_head // group_size
@@ -724,8 +731,15 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._N)
         num_qo_heads = mQ.shape[1]
 
