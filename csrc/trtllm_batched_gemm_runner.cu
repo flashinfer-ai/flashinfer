@@ -365,7 +365,6 @@ void TrtllmGenBatchedGemmRunner::run(
   checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
   bool const transposeMmaOutput = config.mOptions.mTransposeMmaOutput;
-  printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -403,8 +402,6 @@ void TrtllmGenBatchedGemmRunner::run(
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
-
-  printf("multiProcessorCount: %d\n", multiProcessorCount);
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
