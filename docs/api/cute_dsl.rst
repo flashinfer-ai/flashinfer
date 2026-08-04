@@ -108,6 +108,10 @@ cache is flattened into token rows and selected by an ``[B * Q, 128]`` INT32
 are supported. The compressed cache remains paged and uses an ``[B * Q,
 max_pages]`` INT32 block table. Masked window padding must still contain a
 legal row index because gather4 reads every coordinate before masking.
+``hca_seq_lens`` describes the backing HCA footprint scheduled by TMA, not the
+effective top-k. Each compressed block-table row must therefore contain legal
+page IDs for that footprint rounded up to 128-slot tiles, including slots later
+masked by a shorter ``sparse_topk_lens``.
 
 Callers whose existing ``sparse_indices`` are a canonical page-aligned HCA
 expansion may set ``hca_sparse_indices_format="page-aligned"`` to generate SWA

@@ -1193,6 +1193,8 @@ class DSV4HCAMetadata:
     ``hca_swa_indices`` contains absolute rows into the flattened SWA cache;
     ``hca_compressed_block_tables`` contains physical compressed-cache page
     IDs. Both are ordered by flattened query row (``B * Q``).
+    ``hca_seq_lens`` describes the backing HCA footprint scheduled by TMA and
+    may exceed the effective per-row ``sparse_topk_lens``.
     """
 
     hca_swa_indices: torch.Tensor
@@ -1608,9 +1610,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         padding, must name a legal row of the flattened SWA cache.
     hca_compressed_block_tables : Optional[torch.Tensor]
         HCA compressed-pool page IDs, shape ``[B * Q, max_pages]`` INT32.
+        For each query row, the valid page-ID prefix must cover the compressed
+        footprint implied by ``hca_seq_lens``, rounded up to 128-slot tiles.
+        Those page IDs must be legal even when ``sparse_topk_lens`` masks the
+        corresponding slots.
     hca_seq_lens : Optional[torch.Tensor]
-        Per-request total HCA slot counts ``[B]`` INT32. Each value counts the
-        128 window slots plus compressed slots, not original raw KV tokens.
+        Per-request backing HCA slot counts ``[B]`` INT32 used to schedule TMA
+        loads. Each value counts the 128 window slots plus compressed slots,
+        not original raw KV tokens, and may exceed an effective per-row
+        ``sparse_topk_lens``.
     hca_is_causal : bool
         Must currently be ``True``. HCA index/page-table rows and valid-length
         tensors are per query token (``B * Q`` rows).
