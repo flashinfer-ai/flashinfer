@@ -21,8 +21,9 @@ import pathlib
 import random
 from urllib.parse import urljoin
 import shutil
+import threading
 import time
-from typing import Union
+from typing import Optional, Union
 import uuid
 
 import filelock
@@ -45,6 +46,19 @@ def safe_urljoin(base, path):
     return urljoin(base, path)
 
 
+_thread_local = threading.local()
+
+
+def _get_thread_session():
+    import requests  # type: ignore[import-untyped]
+
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.session = session
+    return session
+
+
 def download_file(
     source: str,
     destination: str,
@@ -53,6 +67,7 @@ def download_file(
     timeout: int = 10,
     lock_timeout: int = 30,
     session=None,
+    expected_sha256: Optional[str] = None,
 ):
     """
     Downloads a file from a URL or copies from a local path to a destination.
@@ -66,6 +81,8 @@ def download_file(
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
     - lock_timeout (int): Timeout in seconds for the file lock (default: 30).
+    - session: When None, a per-thread session is used
+    - expected_sha256 (Optional[str]): bytes verified against this hash if provided.
 
     Returns:
     - bool: True if download or copy is successful, False otherwise.
@@ -74,7 +91,7 @@ def download_file(
     import requests  # type: ignore[import-untyped]
 
     if session is None:
-        session = requests.Session()
+        session = _get_thread_session()
 
     lock_path = f"{destination}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)
@@ -101,42 +118,54 @@ def download_file(
 
             # Handle URL downloads with exponential backoff
             for attempt in range(retries):
+                failure = None
                 try:
-                    response = session.get(source, timeout=timeout)
-                    response.raise_for_status()
-
-                    with open(temp_path, "wb") as file:
-                        file.write(response.content)
-
-                    # Atomic rename to prevent readers from seeing partial writes
-                    os.replace(temp_path, destination)
-
-                    logger.info(
-                        f"File downloaded successfully: {source} -> {destination}"
-                    )
-                    return True
-
-                except requests.exceptions.RequestException as e:
-                    logger.warning(
-                        f"Downloading {source}: attempt {attempt + 1} failed: {e}"
-                    )
-
-                    if attempt < retries - 1:
-                        # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.
-                        # Preserves an exponentially-growing lower bound on the delay
-                        # so retries adapt to sustained congestion, while still
-                        # decorrelating the 4 parallel download threads (and many CI
-                        # runners) hitting the same CDN edge.
-                        backoff_cap = delay * (2**attempt)
-                        backoff_delay = backoff_cap + random.uniform(0, backoff_cap)  # noqa: S311
-                        logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
-                        time.sleep(backoff_delay)
+                    try:
+                        response = session.get(source, timeout=timeout)
+                        response.raise_for_status()
+                        content = response.content
+                    except requests.exceptions.RequestException as e:
+                        failure = f"request failed: {e}"
                     else:
-                        logger.error("Max retries reached. Download failed.")
-                        return False
+                        if expected_sha256 is not None:
+                            actual_sha256 = hashlib.sha256(content).hexdigest()
+                            if actual_sha256 != expected_sha256:
+                                failure = (
+                                    f"checksum mismatch (expected {expected_sha256} "
+                                    f"actual {actual_sha256})"
+                                )
+                        if failure is None:
+                            with open(temp_path, "wb") as file:
+                                file.write(content)
+
+                            # Atomic rename to prevent readers from seeing partial writes
+                            os.replace(temp_path, destination)
+
+                            logger.info(
+                                f"File downloaded successfully: {source} -> {destination}"
+                            )
+                            return True
                 finally:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
+
+                logger.warning(
+                    f"Downloading {source}: attempt {attempt + 1} failed: {failure}"
+                )
+
+                if attempt < retries - 1:
+                    # Equal jitter: uniform[cap, 2*cap] with cap=base*2^attempt.
+                    # Preserves an exponentially-growing lower bound on the delay
+                    # so retries adapt to sustained congestion, while still
+                    # decorrelating the 4 parallel download threads (and many CI
+                    # runners) hitting the same CDN edge.
+                    backoff_cap = delay * (2**attempt)
+                    backoff_delay = backoff_cap + random.uniform(0, backoff_cap)  # noqa: S311
+                    logger.info(f"Retrying in {backoff_delay:.2f} seconds...")
+                    time.sleep(backoff_delay)
+                else:
+                    logger.error("Max retries reached. Download failed.")
+                    return False
 
     except filelock.Timeout:
         logger.error(
