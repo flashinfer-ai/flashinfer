@@ -50,6 +50,19 @@ def _atomic_add_i32(a, ptr: cute.Pointer) -> cutlass.Int32:
     return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=av)
 
 
+@cute.jit
+def _radix_key(bits):
+    """Order-preserving transform: ascending key == descending float score.
+
+    Shared by every top-k kernel; the cross-kernel identical-selection
+    invariant depends on all of them ranking on this exact key.
+    """
+    key = (~bits) & cutlass.Uint32(0x7FFFFFFF)
+    if (bits & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0):
+        key = bits
+    return key
+
+
 class TopKSelectRadixSm12x:
     """Multi-stage MSD radix top-K selection over per-block proxy scores."""
 
@@ -76,14 +89,6 @@ class TopKSelectRadixSm12x:
             block=(_KTHREADS, 1, 1),
             stream=stream,
         )
-
-    @cute.jit
-    def _radix_key(self, bits):
-        """Order-preserving transform: ascending key == descending float score."""
-        key = (~bits) & cutlass.Uint32(0x7FFFFFFF)
-        if (bits & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0):
-            key = bits
-        return key
 
     @cute.kernel
     def kernel(
@@ -191,7 +196,7 @@ class TopKSelectRadixSm12x:
             if dn == cutlass.Int32(0):
                 b = mid_lo + tid
                 while b < mid_hi:
-                    okey = self._radix_key(mBits[h, b, q])
+                    okey = _radix_key(mBits[h, b, q])
                     binv = cutlass.Int32((okey >> shift) & cutlass.Uint32(0x3FF))
                     if cutlass.const_expr(step == 1):
                         _atomic_add_i32(1, hist.iterator + binv)
@@ -280,7 +285,7 @@ class TopKSelectRadixSm12x:
                 fits = fbs <= cutlass.Int32(_STAGE_CAP)
                 b = mid_lo + tid
                 while b < mid_hi:
-                    okey = self._radix_key(mBits[h, b, q])
+                    okey = _radix_key(mBits[h, b, q])
                     # `proceed` is always a dynamic (uniform-true for stage 1)
                     # bool so the body below traces once, not per static branch.
                     if cutlass.const_expr(step == 1):

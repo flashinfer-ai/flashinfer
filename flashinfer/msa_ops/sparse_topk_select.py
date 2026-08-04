@@ -25,12 +25,31 @@ from ..utils import is_sm12x_supported
 _topk_compile_cache: dict = {}
 
 
-def _get_compiled_topk(topk: int, small: bool):
-    """``small`` picks the O(N^2) count-rank kernel, else the radix kernel; the
-    two give identical selections only on distinct-score inputs (ties may differ)."""
+def _compile_topk(kernel_obj, num_score_tensors: int, num_scalars: int):
+    """Shared compile plumbing so every top-k variant builds with identical
+    fake-tensor setup and options. All tensor arguments are 3D and the scalar
+    values are placeholders (the compiled kernels take them dynamically)."""
     import cutlass
     import cutlass.cute as cute
 
+    def fk(dtype):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            tuple(cute.sym_int() for _ in range(3)),
+            stride_order=(2, 1, 0),
+            assumed_align=4,
+        )
+
+    args = [fk(cutlass.Float32)]  # max_score (H, P, S)
+    args += [fk(cutlass.Int32) for _ in range(num_score_tensors - 1)]
+    args += [cutlass.Int32(1)] * num_scalars
+    args.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True))
+    return cute.compile(kernel_obj, *args, options="--enable-tvm-ffi")
+
+
+def _get_compiled_topk(topk: int, small: bool):
+    """``small`` picks the O(N^2) count-rank kernel, else the radix kernel; the
+    two give identical selections only on distinct-score inputs (ties may differ)."""
     key = (topk, small)
     compiled = _topk_compile_cache.get(key)
     if compiled is not None:
@@ -44,29 +63,24 @@ def _get_compiled_topk(topk: int, small: bool):
         from .cute_dsl.topk_select_radix_sm12x import (  # type: ignore[assignment,no-redef]
             TopKSelectRadixSm12x as _TopKKernel,
         )
-    kernel_obj = _TopKKernel(topk=topk)
+    compiled = _compile_topk(_TopKKernel(topk=topk), 2, 5)
+    _topk_compile_cache[key] = compiled
+    return compiled
 
-    def fk(dtype, ndim, align):
-        return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            tuple(cute.sym_int() for _ in range(ndim)),
-            stride_order=tuple(reversed(range(ndim))),
-            assumed_align=align,
-        )
 
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        kernel_obj,
-        fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
-        fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
-        cutlass.Int32(1),  # num_valid_pages
-        cutlass.Int32(0),  # force_begin
-        cutlass.Int32(0),  # force_end
-        cutlass.Int32(1),  # total_qo_len
-        cutlass.Int32(1),  # num_qo_heads
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
+def _get_compiled_topk_chunked(topk: int, tiled: bool):
+    """Two-kernel (per-chunk rank + merge) variant; selections match the
+    count-rank kernel exactly (same bit-key and tie order). ``tiled`` picks
+    the full-grid partial kernel (coalesced q-tile staging) over the
+    row-per-CTA one."""
+    key = (topk, "chunked", tiled)
+    compiled = _topk_compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    from .cute_dsl.topk_select_chunked_sm12x import TopKSelectChunkedSm12x
+
+    compiled = _compile_topk(TopKSelectChunkedSm12x(topk=topk, tiled=tiled), 4, 7)
     _topk_compile_cache[key] = compiled
     return compiled
 
@@ -115,6 +129,12 @@ def msa_topk_select(
         Shape ``(total_qo_len, num_qo_heads, topk)``, dtype int32.
         Ascending KV-block indices; ``-1`` entries are tail-padded invalid
         slots.
+
+    Notes
+    -----
+    When near-tied scores compete for the last slots, either block may be
+    selected; exact indices may vary across problem sizes and releases, but
+    the selected score values always match.
     """
     if not is_sm12x_supported(max_score.device):
         raise RuntimeError(
@@ -173,12 +193,59 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
+    from .cute_dsl.topk_select_chunked_sm12x import (
+        _CHUNK_BLOCKS,
+        _MAX_CHUNK_BLOCKS,
+        _TILED_MIN_QUERIES,
+        _MAX_CHUNKED_SCRATCH_BYTES,
+        _MAX_CHUNKS,
+        _MIN_BLOCKS,
+        _MIN_CHUNKS,
+    )
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
-    # Dispatch on the runtime valid-page count: the count-rank kernel only ever
-    # touches blocks below num_valid_pages, regardless of the allocated score
-    # dimension.
+    # Dispatch on num_valid_pages (the kernels never touch blocks above it);
+    # topk_select_chunked_sm12x explains why chunked wins on both small and
+    # full grids. Everything here is shape-constant, so CUDA-graph safe.
     small = int(num_valid_pages) <= _MAX_BLOCKS
+    rows = total_qo_len * num_qo_heads
+    n_mid = int(num_valid_pages) - force_begin_blocks - force_end_blocks
+    chunked = _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
+    # Keyed on queries, not rows: the tiled kernel's lanes parallelize over
+    # queries only, so a head-heavy grid with few queries would run it with
+    # mostly idle lanes even though rows is large.
+    tiled = total_qo_len > _TILED_MIN_QUERIES
+    if chunked:
+        num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
+        if rows * num_chunks * topk * 8 > _MAX_CHUNKED_SCRATCH_BYTES:
+            chunked = False
+    if chunked:
+        chunk_len = -(-n_mid // num_chunks)
+        # The partial kernels' SMEM staging has no in-kernel clamp.
+        assert chunk_len <= _MAX_CHUNK_BLOCKS
+        # One allocation for both candidate buffers keeps this hot path at a
+        # single allocator call.
+        cand = torch.empty(
+            (2, total_qo_len, num_qo_heads, num_chunks * topk),
+            dtype=torch.int32,
+            device=max_score.device,
+        )
+        cand_key, cand_idx = cand[0], cand[1]
+        _get_compiled_topk_chunked(topk, tiled)(
+            max_score,
+            cand_key,
+            cand_idx,
+            output,
+            int(num_valid_pages),
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            num_chunks,
+            chunk_len,
+            int(total_qo_len),
+            int(num_qo_heads),
+        )
+        return output
+
     _get_compiled_topk(topk, small)(
         max_score,
         output,

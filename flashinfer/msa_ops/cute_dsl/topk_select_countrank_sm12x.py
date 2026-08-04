@@ -21,7 +21,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from .topk_select_radix_sm12x import _atomic_add_i32
+from .topk_select_radix_sm12x import _atomic_add_i32, _radix_key
 
 # SMEM-resident score cap and dispatch threshold. Below this many candidate blocks
 # (128 blocks = 16k context) the O(N^2) rank count beats the radix kernel's fixed
@@ -59,14 +59,6 @@ class TopKSelectCountRankSm12x:
             stream=stream,
         )
 
-    @cute.jit
-    def _radix_key(self, bits):
-        """Order-preserving transform: ascending key == descending float score."""
-        key = (~bits) & cutlass.Uint32(0x7FFFFFFF)
-        if (bits & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0):
-            key = bits
-        return key
-
     @cute.kernel
     def kernel(
         self,
@@ -102,7 +94,7 @@ class TopKSelectCountRankSm12x:
         # with deterministic NaN placement.
         b = mid_lo + tid
         while b < mid_hi:
-            score[b] = self._radix_key(mScore[h, b, q])
+            score[b] = _radix_key(mScore[h, b, q])
             b += _NTHREADS
 
         # Forced sink/window blocks bypass ranking; emit slots start after them
