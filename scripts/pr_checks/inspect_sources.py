@@ -241,6 +241,28 @@ def collect_module_alias_exports(
 
     pkg_dotted = pkg_root.name
     raw_imports: list[tuple[str, str, list[ast.alias]]] = []
+
+    class ModuleScopeImportFromVisitor(ast.NodeVisitor):
+        """Visit imports reachable without entering a nested scope."""
+
+        def __init__(self) -> None:
+            self.imports: list[ast.ImportFrom] = []
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            self.imports.append(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
     for py_file in sorted(pkg_root.rglob("*.py")):
         try:
             tree = ast.parse(
@@ -251,9 +273,9 @@ def collect_module_alias_exports(
         importer_mod = module_name(py_file, pkg_root)
         importer_parts = importer_mod.split(".")
         is_package = py_file.name == "__init__.py"
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
-                continue
+        visitor = ModuleScopeImportFromVisitor()
+        visitor.visit(tree)
+        for node in visitor.imports:
             level = node.level or 0
             target_mod: str
             if level > 0:

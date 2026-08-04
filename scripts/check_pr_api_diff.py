@@ -86,6 +86,108 @@ def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]
     return result
 
 
+class ModuleScopeImportFromVisitor(ast.NodeVisitor):
+    """Collect imports visible at module scope, including guarded imports."""
+
+    def __init__(self) -> None:
+        self.imports: list[ast.ImportFrom] = []
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.imports.append(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+def module_scope_imports(tree: ast.AST) -> list[ast.ImportFrom]:
+    visitor = ModuleScopeImportFromVisitor()
+    visitor.visit(tree)
+    return visitor.imports
+
+
+def module_name_from_path(path: str) -> str:
+    parts = list(PurePosixPath(path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def resolve_import_module(node: ast.ImportFrom, path: str) -> str | None:
+    """Resolve a relative or absolute import to a FlashInfer module."""
+    if node.level == 0:
+        if not node.module or not (
+            node.module == "flashinfer" or node.module.startswith("flashinfer.")
+        ):
+            return None
+        return node.module
+
+    current_module = module_name_from_path(path)
+    current_package = (
+        current_module
+        if path.endswith("/__init__.py")
+        else current_module.rpartition(".")[0]
+    )
+    package_parts = current_package.split(".") if current_package else []
+    ascend = node.level - 1
+    if ascend > len(package_parts):
+        return None
+    base_parts = package_parts[: len(package_parts) - ascend]
+    if node.module:
+        base_parts.extend(node.module.split("."))
+    module = ".".join(base_parts)
+    if not (module == "flashinfer" or module.startswith("flashinfer.")):
+        return None
+    return module
+
+
+def module_reexports(path: str, source: str | None) -> dict[str, tuple[str, str]]:
+    """Return public aliases as exported name -> (target module, target name)."""
+    if source is None:
+        return {}
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError:
+        return {}
+
+    result: dict[str, tuple[str, str]] = {}
+    for node in module_scope_imports(tree):
+        module = resolve_import_module(node, path)
+        if not module or not node.module:
+            continue
+        for alias in node.names:
+            exported_name = alias.asname or alias.name
+            if exported_name != "*":
+                result[exported_name] = (module, alias.name)
+    return result
+
+
+def module_apis(
+    revision: str,
+    module: str,
+    cache: dict[str, dict[str, ApiFunction]],
+) -> dict[str, ApiFunction]:
+    if module in cache:
+        return cache[module]
+
+    module_path = module.replace(".", "/")
+    for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+        source = git_file(revision, candidate)
+        if source is not None:
+            cache[module] = extract_public_apis(candidate, source)
+            return cache[module]
+    cache[module] = {}
+    return cache[module]
+
+
 def exported_names(source: str | None) -> dict[str, str]:
     if source is None:
         return {}
@@ -94,9 +196,7 @@ def exported_names(source: str | None) -> dict[str, str]:
     except SyntaxError:
         return {}
     exports: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom):
-            continue
+    for node in module_scope_imports(tree):
         if node.level > 0:
             module = ".".join(
                 part for part in ("flashinfer", node.module or "") if part
@@ -135,6 +235,7 @@ def changed_docs_contain(
 def check(base: str, head: str) -> list[PrFinding]:
     paths = changed_paths(base, head)
     findings: list[PrFinding] = []
+    target_cache: dict[str, dict[str, ApiFunction]] = {}
 
     for path in sorted(
         p for p in paths if p.startswith("flashinfer/") and p.endswith(".py")
@@ -142,8 +243,17 @@ def check(base: str, head: str) -> list[PrFinding]:
         old = extract_public_apis(path, git_file(base, path))
         new = extract_public_apis(path, git_file(head, path))
 
+        reexports = module_reexports(path, git_file(head, path))
         for name in sorted(set(old) - set(new)):
             api = old[name]
+            target = reexports.get(name)
+            if target:
+                target_module, target_name = target
+                target_api = module_apis(head, target_module, target_cache).get(
+                    target_name
+                )
+                if target_api and target_api.signature == api.signature:
+                    continue
             findings.append(
                 PrFinding(
                     "public_api_removed",

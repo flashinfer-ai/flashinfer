@@ -13,9 +13,11 @@ permissions:
 jobs:
   comment:
     if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0]
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - name: Download untrusted report data
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: pr-documentation-report
@@ -40,24 +42,87 @@ jobs:
               .replace(/>/g, '&gt;')
               .replace(/\r?\n/g, ' ')
               .slice(0, 500);
-            const findings = [];
-            for (const file of ['reports/public-api.json', 'reports/static-documentation.json']) {
-              if (!fs.existsSync(file)) continue;
+            const publicApiFindings = [];
+            const documentationFindings = [];
+            const reportErrors = [];
+            const reportTargets = [
+              ['reports/public-api.json', publicApiFindings],
+              ['reports/static-documentation.json', documentationFindings],
+            ];
+            for (const [file, target] of reportTargets) {
+              if (!fs.existsSync(file)) {
+                reportErrors.push(`${file} is missing`);
+                continue;
+              }
               try {
                 const report = JSON.parse(fs.readFileSync(file, 'utf8'));
-                for (const finding of report.findings || []) findings.push(finding);
+                for (const finding of report.findings || []) target.push(finding);
               } catch (error) {
                 core.warning(`Ignoring malformed report ${file}: ${error.message}`);
+                reportErrors.push(`${file} is malformed`);
               }
             }
-            const unique = new Map();
-            for (const finding of findings) {
-              unique.set([finding.check, finding.path, finding.line, finding.message].join(':'), finding);
+            let executionStatus = {};
+            if (fs.existsSync('reports/execution-status.json')) {
+              try {
+                executionStatus = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+              } catch (error) {
+                reportErrors.push('execution-status.json is malformed');
+              }
+            } else {
+              reportErrors.push('execution-status.json is missing');
             }
-            const rows = [...unique.values()].slice(0, 20);
-            const body = rows.length
-              ? `${marker}\n## Documentation checks ⚠️ ${rows.length} new finding(s)\n\n${rows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n')}\n\n[View the full check run](${runUrl})`
-              : `${marker}\n## Documentation checks ✅\n\nNo new API or documentation drift was introduced by this PR. [View the check run](${runUrl})`;
+            const failedChecks = Object.entries(executionStatus)
+              .filter(([, outcome]) => outcome !== 'success')
+              .map(([name]) => name);
+            const findings = [...publicApiFindings, ...documentationFindings];
+            const publicRows = publicApiFindings.slice(0, 20);
+            const documentationRows = documentationFindings.slice(0, 20);
+            const sections = [marker];
+            if (publicApiFindings.length) {
+              sections.push(
+                '# 🚨 POTENTIAL BREAKING PUBLIC API CHANGE DETECTED 🚨',
+                '',
+                '> [!CAUTION]',
+                '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
+                '>',
+                '> This is an advisory warning and does not gate merging. Confirm compatibility and provide a deprecation or migration path, or track the fix in a follow-up PR.',
+                '',
+                `${publicApiFindings.length} public API finding(s):`,
+                '',
+                publicRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
+              );
+            }
+            if (documentationFindings.length) {
+              sections.push(
+                '## Documentation checks ⚠️',
+                '',
+                `${documentationFindings.length} new documentation finding(s):`,
+                '',
+                documentationRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
+              );
+            }
+            if (failedChecks.length || reportErrors.length) {
+              const problems = [
+                ...failedChecks.map((name) => `${name} did not complete`),
+                ...reportErrors,
+              ];
+              sections.push(
+                '# 🚨 ADVISORY CHECKER REPORT IS INCOMPLETE 🚨',
+                '',
+                '> [!WARNING]',
+                `> ${escape(problems.join('; '))}. The checker remains non-blocking, but this run must not be treated as a clean result.`,
+              );
+            }
+            if (!findings.length && !failedChecks.length && !reportErrors.length) {
+              sections.push(
+                '## Documentation checks ✅',
+                '',
+                'No new API or documentation drift was introduced by this PR.',
+              );
+            }
+            sections.push('', `[View the full check run](${runUrl})`);
+            const body = sections.join('\n');
             const { owner, repo } = context.repo;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: prNumber, per_page: 100,
@@ -85,11 +150,17 @@ jobs:
               .replace(/\r?\n/g, ' ')
               .slice(0, 500);
             const findings = [];
-            for (const file of ['reports/public-api.json', 'reports/static-documentation.json']) {
+            for (const [file, category] of [
+              ['reports/public-api.json', 'public_api'],
+              ['reports/static-documentation.json', 'documentation'],
+            ]) {
               if (!fs.existsSync(file)) continue;
               try {
                 const report = JSON.parse(fs.readFileSync(file, 'utf8'));
-                findings.push(...(report.findings || []));
+                findings.push(...(report.findings || []).map((finding) => ({
+                  ...finding,
+                  category,
+                })));
               } catch (error) {
                 core.warning(`Ignoring malformed report ${file}: ${error.message}`);
               }
@@ -128,7 +199,9 @@ jobs:
                     path,
                     line,
                     side: 'RIGHT',
-                    body: `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}`,
+                    body: finding.category === 'public_api'
+                      ? `<!-- ${marker} --><!-- key:${key} -->\n🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
+                      : `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}`,
                   }],
                 });
               } catch (error) {

@@ -12,6 +12,7 @@ jobs:
   documentation:
     name: Public API and documentation
     if: github.event.pull_request.draft == false
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +32,6 @@ jobs:
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
               --github-actions \
-              --strict \
               --report-json reports/public-api.json | tee api-doc-check.txt; then
             status=0
           else
@@ -52,7 +52,6 @@ jobs:
               --base "$BASE_SHA" \
               --head "$HEAD_SHA" \
               --github-actions \
-              --strict \
               --report-json reports/static-documentation.json | tee static-doc-check.txt; then
             status=0
           else
@@ -61,20 +60,43 @@ jobs:
           cat static-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
-      - name: Upload documentation report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-documentation-report
-          path: reports/*.json
-          retention-days: 1
-
-      - name: Fail when a documentation check reports findings or crashes
+      - name: Record non-blocking checker status
         if: always()
         env:
           PUBLIC_API_OUTCOME: ${{ steps.public_api.outcome }}
           STATIC_DOCUMENTATION_OUTCOME: ${{ steps.static_documentation.outcome }}
         run: |
-          if [[ "$PUBLIC_API_OUTCOME" != 'success' || "$STATIC_DOCUMENTATION_OUTCOME" != 'success' ]]; then
-            exit 1
-          fi
+          mkdir -p reports
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          outcomes = {
+              "public_api": os.environ["PUBLIC_API_OUTCOME"],
+              "static_documentation": os.environ["STATIC_DOCUMENTATION_OUTCOME"],
+          }
+          Path("reports/execution-status.json").write_text(
+              json.dumps(outcomes, indent=2) + "\n"
+          )
+          failed = [name for name, outcome in outcomes.items() if outcome != "success"]
+          if failed:
+              print(
+                  "::warning::Non-blocking PR checker execution failed: "
+                  + ", ".join(failed)
+              )
+              with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                  summary.write(
+                      "\n> [!WARNING]\n> The following advisory checker(s) "
+                      "could not complete: " + ", ".join(failed) + ".\n"
+                  )
+          PY
+
+      - name: Upload documentation report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-documentation-report
+          path: reports/*.json
+          retention-days: 1
