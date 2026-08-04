@@ -111,6 +111,7 @@ def test_wrapper_does_not_enable_bash_errexit() -> None:
 
     assert "set -e" not in source
     assert "set -eo" not in source
+    assert "set -o errexit" not in source
 
 
 @pytest.mark.parametrize(

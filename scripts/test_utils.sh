@@ -239,6 +239,7 @@ install_precompiled_kernels() {
             pip install -q "${DIST_CUBIN_DIR}"/*.whl || return $?
         else
             echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            return 1
         fi
 
         if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
@@ -246,6 +247,7 @@ install_precompiled_kernels() {
             pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl || return $?
         else
             echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            return 1
         fi
         echo ""
     fi
