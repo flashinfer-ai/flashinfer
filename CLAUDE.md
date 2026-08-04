@@ -202,6 +202,10 @@ kernel logic and report bugs, labeling findings by confidence.
 the rationale behind them, and the alternatives already tried and rejected. A doc that has drifted
 from the code is worse than no doc, because the next contributor will trust it.
 
+Only normative designs belong there. How-tos live in `docs/runbooks/`, and integration reports or
+validation records live at `docs/` top level; neither is a contract, so neither carries a
+`**Scope**:` line and neither is covered by the rules below.
+
 **Before changing a subsystem, find out whether it has a design doc.** There is deliberately no
 index to maintain here; discovery is local, two ways:
 

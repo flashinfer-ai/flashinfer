@@ -1,8 +1,9 @@
 # vLLM ⇄ `flashinfer.moe_ep` all2all integration — changes, correctness, benchmarks
 
-**Scope**: none — this is an integration report (cross-repo changes, validation runs, measured
-numbers), not a normative design. The normative designs are
-[`moe_ep_architecture.md`](./moe_ep_architecture.md) and [`MoE_EP_impl.md`](./MoE_EP_impl.md).
+> An **integration report** (cross-repo changes, validation runs, measured numbers), not a design
+> doc — the numbers below are a record of one validation run, not a contract. The normative
+> designs are [`moe_ep_architecture.md`](design_docs/moe_ep_architecture.md) and
+> [`MoE_EP_impl.md`](design_docs/MoE_EP_impl.md).
 
 This document summarizes the integration of FlashInfer's MoE expert-parallel transport
 (`flashinfer.moe_ep`, NCCL-EP backend) as two vLLM all2all backends
@@ -351,7 +352,7 @@ the competitive datapoint. For a per-stage breakdown, add an nsys capture
 ## 8. Fault tolerance — future vLLM wiring (design note)
 
 **No vLLM code ships with this change.** FlashInfer now exposes the FT rank-mask
-API (see `moe_ep_runbook.md`); this section records the target shape so a later
+API (see `runbooks/moe_ep_runbook.md`); this section records the target shape so a later
 vLLM commit is mechanical.
 
 vLLM already owns the contract — `All2AllManagerBase.support_fault_tolerance`,

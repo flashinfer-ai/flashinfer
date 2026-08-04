@@ -71,7 +71,7 @@ class FleetAlgoKnobFaultTolerance(AlgoKnob):
     The runtime API lives on the Fleet: :meth:`~flashinfer.moe_ep.core.comm.
     fleet.Fleet.query_fault`, ``query_active_mask``, ``set_active_mask``,
     ``reconcile_active_mask`` and ``clear_faults``. See
-    ``docs/design_docs/moe_ep_runbook.md`` for the recovery state machine.
+    ``docs/runbooks/moe_ep_runbook.md`` for the recovery state machine.
 
     Note: a masked rank's experts are dropped from combine with **no** topk
     re-normalization, so affected tokens come out scaled by the surviving
