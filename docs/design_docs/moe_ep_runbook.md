@@ -51,6 +51,32 @@ NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
 error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
 with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
+### CUTLASS DSL version pin (PIN — do not `-U`)
+
+After the editable install, pin the DSL exactly:
+
+```bash
+pip install "nvidia-cutlass-dsl[cu13]==4.6.1"
+```
+
+The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
+kernels need ≥ 4.6.x. Do **not** use `pip install -U` (the older recipe):
+as of 2026-08-05 that resolves to **4.7.0**, whose bundled CUDA libs
+(`nvidia-cutlass-dsl-libs-cu13`) break the **deep_gemm** mega path — every
+4-rank `deep_gemm.fp8_fp4_mega_moe` launch dies with
+`CUDA_ERROR_MISALIGNED_ADDRESS` and the poisoned context cascades through the
+rest of the `mega` pytest session (bisected 2026-08-05 on prenyx B200: fails
+on dsl 4.7.0 at two commits / three nodes, passes on 4.6.1 with the identical
+deep_gemm 2.5.0+891d57b). The vLLM e2e sections below keep their own separate
+**4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for the vLLM engine
+env, not for running the moe_ep test suite.
+
+Known tolerance note (dsl-version-independent): on B200 nodes,
+`test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` fails by one
+bf16 cell (rank 3, |d|=16.0 vs atol=8.0, rel_l2≈0.0017) — the fixed atol was
+calibrated on GB200 (last-passed 2026-07-31); the scale-aware ikr variant of
+the same test passes. Treat as tolerance marginality, not a regression.
+
 ### Run tests
 
 `tests/moe_ep/run_tests.sh <target>` — targets and requirements:
