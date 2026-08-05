@@ -64,23 +64,23 @@ _SOURCE_SHA256 = {
     "cake_msa_decode_m16_bf16_flat_binding.cu": "7cce6013f914c642e5f3243d9ed94c2f28773bdd28f7df775aea46438924436e",
     "cake_msa_decode_m16_bf16_paged.cu": "87ac97c531e8a7822e805eccfb6a65fbaf97b42ef0d0dc3715bc747646317fcb",
     "cake_msa_decode_m16_bf16_paged_binding.cu": "3a05f2bfb8550b692eae38921931d90f604e3ecefc7c2f246a24683bf7fd352a",
-    "cake_msa_prefill_m128_bf16_flat.cu": "b369e18f44ab9d5a2746f7d61ed46becda5a3ffd20998937efe88623c545201b",
+    "cake_msa_prefill_m128_bf16_flat.cu": "4e1fc08163989f181ef0f2de316eccb9c6a7037bdd233ad2c5e6ed74b1b0f600",
     "cake_msa_prefill_m128_bf16_flat_binding.cu": "d8654b6215ce53f4315281c5dd74ecd7d45848fc26475b3036249e885a7276f0",
-    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "1480dd90326d0013c8b341cb8f3cf23401bd777f2801850680835a60440f69a1",
+    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "d3dce4aa9b30d5350d7be6f2e01ababc4475116bf8cd5419c46c8473aaa33459",
     "cake_msa_prefill_m128_bf16_gqa16_flat_binding.cu": "bc9cf4c038a87738c8e583fdc17450bd5982ea6190373f8c065f9ee6446c16a5",
-    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "40d521b397dc95a0d6c7361800a70c3dd2856a0b74da1b727f386d6e242e0d69",
+    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "3e6c60518c6666050ed8cb9792f6eab8a0265e0311b76b4235255df3e5477f34",
     "cake_msa_prefill_m128_bf16_gqa16_paged_binding.cu": "b0cd93d959adb957fecea0eb3744cc98c5838cc642ff088ec6c7a19bab5d157b",
-    "cake_msa_prefill_m128_bf16_paged.cu": "e6abfda8ebaeff9dec13568136e46a7281975463b1b03ad883674338aa1239c8",
+    "cake_msa_prefill_m128_bf16_paged.cu": "11656c45d4e0ae5108486a199a11cb2bf005b2a792543e1503e5798252490ddb",
     "cake_msa_prefill_m128_bf16_paged_binding.cu": "f6c2ce95b6e78f94b7133ec8d9f2b3a0e2d7939a61be8c79e03e2bd2a4502df6",
-    "cake_msa_prefill_m128_fp16_flat.cu": "b5164dbdfd82aa8d2b4270ad6b7e6644ef1574f368624f80af0b3e4d6bb0e272",
+    "cake_msa_prefill_m128_fp16_flat.cu": "c3d7c21398fba913bd84f2654f6b96cb27052f78c41976fb2d602e894b3f0fb2",
     "cake_msa_prefill_m128_fp16_flat_binding.cu": "c671e8d1e0fb3e7fb0b9ed768fff8e13c0ee262dafa15d3bb60f62ab6b7ead66",
-    "cake_msa_prefill_m128_fp16_paged.cu": "32506262f63fddc97976bbe572fab19815f77c50991b93c9f59b47fffb87b5d7",
+    "cake_msa_prefill_m128_fp16_paged.cu": "7e7c507b0262cacfc598f99a47fa67a7ac8375ddd2ede7b1961e3047de254f66",
     "cake_msa_prefill_m128_fp16_paged_binding.cu": "e18556e08eba86c4442e49dbbe7f847ae1c82508e2318df531115698621c678a",
-    "cake_msa_prefill_m128_fp8_flat.cu": "ccccf1aca0906c872553a6d11d009daa59effeb74621bef4e25334ca1be6b64d",
+    "cake_msa_prefill_m128_fp8_flat.cu": "eb1c08bbf9e2f20d6579ea4397e79ede7d3e405bdff2df30114329d9cb20b4d0",
     "cake_msa_prefill_m128_fp8_flat_binding.cu": "b17fc25aeef6194c1a7b29cdd9538db619b8a04fc6f576fdc37722c977dd9c35",
-    "cake_msa_prefill_m128_fp8_paged.cu": "a46e4c1c1dfd395be1656d4fabef451e0959914dda2574c0c2f2ca412fc95e22",
+    "cake_msa_prefill_m128_fp8_paged.cu": "26a8dd6df860cd18abee547fee51f1ebe97a0b5a55971615b1ddf805f3b087e6",
     "cake_msa_prefill_m128_fp8_paged_binding.cu": "3907d184e87291524f1765024e8af62bb65cd56fa59bbcbbfbc4c6342fc23907",
-    "cake_msa_prefill_m64_bf16_flat.cu": "958874d056d9c0105b48fb84cf28dceca7fe1bba6b7ca61457b372a29d47bafc",
+    "cake_msa_prefill_m64_bf16_flat.cu": "f8804ebddc44c7580e253abb29d05f7a4393bd90a8ecd13100476b6d34c432d2",
     "cake_msa_prefill_m64_bf16_flat_binding.cu": "f582a554274dd4e0ad03636eae98f31d955f68a740a5bfcd4033615dfecafada",
     "cake_msa_topk.cu": "4b4c6a2d6134980e7f6568ea1eaf07521eafddd9ed65f641097660a89f115043",
     "cake_msa_topk_binding.cu": "55e62a2f97c7645a08203814d8d283005677f1501acc451930aa4f063afbf640",
@@ -238,7 +238,14 @@ def test_cake_msa_m128_prefill_masks_empty_register_halves():
         device_source = (_CAKE_MSA_CSRC_DIR / _device_name(variant)).read_text(
             encoding="utf-8"
         )
-        assert device_source.count("if (body_valid < 64)") == 2
-        assert device_source.count("if (tail_valid < 64)") == 2
-        assert "body_valid > 0 && body_valid < 64" not in device_source
+        assert device_source.count("body_valid > 0 && body_valid < 64") == 2
+        assert device_source.count("valid_cols > 0 && tail_valid < 64") == 2
         assert "tail_valid > 0 && tail_valid < 64" not in device_source
+
+
+def test_cake_msa_m64_prefill_masks_empty_register_halves():
+    device_source = (
+        _CAKE_MSA_CSRC_DIR / _device_name("prefill_m64_bf16_flat")
+    ).read_text(encoding="utf-8")
+    assert device_source.count("if (valid_cols > 0 && half_valid < 64)") == 2
+    assert "half_valid > 0 && half_valid < 64" not in device_source
