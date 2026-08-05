@@ -1388,7 +1388,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
     """_make_tuning_config must return configs whose topk_ids initializer is the
     same object across calls and matches the launcher's routing representation.
     """
-    fn = core_mod.get_trtllm_moe_sm100_module
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
         mock_module = MagicMock()
@@ -1401,7 +1401,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             ),
             patch.object(core_mod, "setup_cubin_loader"),
         ):
-            MoERunner = core_mod.get_trtllm_moe_sm100_module().MoERunner
+            MoERunner = fn(enable_rubin=False).MoERunner
 
         runner = MoERunner(
             top_k=8,
@@ -1502,7 +1502,9 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
     assert eq_calls == 0
 
 
-def _call_build_mla_decode_tuning_config(enable_dcp: bool = False):
+def _call_build_mla_decode_tuning_config(
+    enable_dcp: bool = False, has_sparse_mla_top_k_lens: bool = False
+):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
     runner_names is restricted to trtllm-gen so bucket computation stays
@@ -1519,6 +1521,7 @@ def _call_build_mla_decode_tuning_config(enable_dcp: bool = False):
         kv_lora_rank=512,
         max_seq_len=1024,
         device=torch.device("cpu"),
+        has_sparse_mla_top_k_lens=has_sparse_mla_top_k_lens,
         enable_dcp=enable_dcp,
         cp_world=4,
         cp_rank=1,
@@ -1526,14 +1529,26 @@ def _call_build_mla_decode_tuning_config(enable_dcp: bool = False):
 
 
 @pytest.mark.parametrize(
-    ("enable_dcp", "expected_input_idx", "expected_initializer_indices"),
+    (
+        "enable_dcp",
+        "has_sparse_mla_top_k_lens",
+        "expected_input_idx",
+        "expected_initializer_indices",
+        "expected_fifth_value",
+    ),
     [
-        (False, (0, 1, 2, 3), {1, 2}),
-        (True, (0, 1, 2, 3, 4), {1, 2, 4}),
+        (False, False, (0, 1, 2, 3), {1, 2}, None),
+        (True, False, (0, 1, 2, 3, 4), {1, 2, 4}, 4097),
+        (False, True, (0, 1, 2, 3, 4), {1, 2, 4}, 64),
     ],
+    ids=("default", "dcp", "sparse-top-k"),
 )
 def test_mla_decode_tuning_config_is_memoized(
-    enable_dcp, expected_input_idx, expected_initializer_indices
+    enable_dcp,
+    has_sparse_mla_top_k_lens,
+    expected_input_idx,
+    expected_initializer_indices,
+    expected_fifth_value,
 ):
     """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
 
@@ -1543,8 +1558,12 @@ def test_mla_decode_tuning_config_is_memoized(
     """
     _mla_decode_tuning_config.cache_clear()
     try:
-        config_a = _call_build_mla_decode_tuning_config(enable_dcp)
-        config_b = _call_build_mla_decode_tuning_config(enable_dcp)
+        config_a = _call_build_mla_decode_tuning_config(
+            enable_dcp, has_sparse_mla_top_k_lens
+        )
+        config_b = _call_build_mla_decode_tuning_config(
+            enable_dcp, has_sparse_mla_top_k_lens
+        )
 
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "
@@ -1552,7 +1571,14 @@ def test_mla_decode_tuning_config_is_memoized(
             "reuse one config object instead of rebuilding it each call."
         )
         assert config_a.dynamic_tensor_specs[0].input_idx == expected_input_idx
-        assert set(dict(config_a.tensor_initializers)) == expected_initializer_indices
+        initializers = dict(config_a.tensor_initializers)
+        assert set(initializers) == expected_initializer_indices
+        if expected_fifth_value is not None:
+            fifth_tensor = initializers[4]((8,), torch.int32, torch.device("cpu"))
+            torch.testing.assert_close(
+                fifth_tensor,
+                torch.full((8,), expected_fifth_value, dtype=torch.int32),
+            )
     finally:
         _mla_decode_tuning_config.cache_clear()
 

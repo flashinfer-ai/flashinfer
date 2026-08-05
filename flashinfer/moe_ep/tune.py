@@ -198,6 +198,7 @@ def _tune_one(
                 args.hidden,
                 2 * args.intermediate,
                 gate_up_clamp=args.gate_up_clamp,
+                combine_dtype=args.combine_dtype,
                 seed=args.seed,
             )
             candidates = nvfp4_candidates(
@@ -243,6 +244,7 @@ def _tune_one(
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
+                    combine_dtype=args.combine_dtype,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")

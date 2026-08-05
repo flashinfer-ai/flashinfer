@@ -14,37 +14,41 @@ single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
 recipe (hardware, container, versions, harness invocation) is in the
 "Sweep methodology" and "Runbook" sections below.
 
-## Microbenchmark results (2026-07-21, e2e_pipelined p50 µs)
+## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
-Measured at the branch tip (`29e2d2f8`; includes the fused quant-stage,
-launch-thunk cache, and the %64 cutedsl alignment relaxation). Default
-geometry (7168 hidden / 2048 inter / 256 experts / top-8), 4x GB200,
-heuristic knobs, speedup vs `deep_gemm_mega` in parens; CSV
-`moe_ep_benchmark/model_shapes/results/model_shapes_20260721_111314_deepseek_v3.csv`:
+Measured at the `4_5_2-perf-fix` branch tip (`7d538173`) on
+**nvidia-cutlass-dsl 4.5.2** — the new default runtime (see "CuTe-DSL
+runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
+Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
+CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
+every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
+top-8), 4x GB200, heuristic knobs, speedup vs `deep_gemm_mega` in parens;
+CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
-| 8        | 212.5  | 219.5 (0.97x)  | 233.1 (0.91x)  | 226.3 (0.94x)      | 227.2 (0.94x)  |
-| 64       | 284.7  | 283.6 (1.00x)  | 312.1 (0.91x)  | 301.5 (0.94x)      | 302.1 (0.94x)  |
-| 512      | 340.0  | 351.8 (0.97x)  | 355.3 (0.96x)  | 321.1 (1.06x)      | 326.7 (1.04x)  |
-| 1024     | 468.0  | 422.9 (1.11x)  | 422.9 (1.11x)  | **363.5 (1.29x)**  | 377.8 (1.24x)  |
-| 2048     | 817.2  | 604.9 (1.35x)  | 602.9 (1.36x)  | **529.4 (1.54x)**  | 560.1 (1.46x)  |
-| 4096     | 1473.5 | 981.5 (1.50x)  | 990.2 (1.49x)  | **862.7 (1.71x)**  | 912.4 (1.61x)  |
-| 8192     | 2993.7 | 1896.8 (1.58x) | 1887.4 (1.59x) | **1677.3 (1.78x)** | 1672.2 (1.79x) |
+| 8        | 215.0  | 222.2 (0.97x)  | 234.0 (0.92x)  | 228.3 (0.94x)      | 228.8 (0.94x)  |
+| 64       | 288.8  | 287.7 (1.00x)  | 314.8 (0.92x)  | 304.2 (0.95x)      | 308.2 (0.94x)  |
+| 512      | 346.1  | 359.3 (0.96x)  | 362.5 (0.95x)  | 328.7 (1.05x)      | 334.8 (1.03x)  |
+| 1024     | 474.1  | 428.6 (1.11x)  | 431.8 (1.10x)  | **375.8 (1.26x)**  | 384.0 (1.23x)  |
+| 2048     | 822.3  | 621.5 (1.32x)  | 615.4 (1.34x)  | **545.8 (1.51x)**  | 573.4 (1.43x)  |
+| 4096     | 1501.7 | 1001.5 (1.50x) | 989.2 (1.52x)  | **931.3 (1.61x)**  | 947.5 (1.58x)  |
+| 8192     | 3072.9 | 1896.4 (1.62x) | 1878.3 (1.64x) | **1655.3 (1.86x)** | 1752.0 (1.75x) |
 
 [ikr = in_kernel_fc2_reduce; +combine_nvfp4 / +combine_mxfp8 = the fc2
 epilogue quantizes each partial in registers to fp4 (e2m1 + bf16 scale per
 16) or fp8 (e4m3 + e8m0 scale per 32) just for the wire]
 
 Shape of the curve: **parity with dg through ~512 tok/rank, crossover
-between 512 and 1024, win growing to 1.58x at 8192** (1.78x with the fp4
+between 512 and 1024, win growing to 1.62x at 8192** (1.86x with the fp4
 combine wire).  The small-batch regime is weight-load bound and fp4-vs-fp4
 there is a wash.
 
-The `mxfp8_cutedsl` backend (latest sweep 2026-07-15; its >=2048 rows use
-the re-derived dispatch-warp default profile) runs 0.63x / 0.84x / 0.86x /
-0.99x vs dg at 1024 / 2048 / 4096 / 8192 tok/rank — dg parity at 8192 at a
-3x better accuracy point (6.4% vs 20.6% rel-L2).
+The `mxfp8_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
+`sweep_20260722_114210_fi_mega.csv`; its >=2048 rows use the re-derived
+dispatch-warp default profile) runs 0.63x / 0.82x / 0.88x / 0.96x vs dg at
+1024 / 2048 / 4096 / 8192 tok/rank — near dg parity at 8192 at a 3x better
+accuracy point (6.4% vs 20.6% rel-L2).
 
 ### Real-model geometry sweep (2026-07-21)
 
@@ -164,6 +168,14 @@ path) and `fi_dg` run the mxfp4 checkpoint.
   as spin, and decode reads ~4% BELOW native — a config artifact, not a
   kernel property.
 - The headline decode cell reproduces at this branch tip within 0.6%.
+- **2026-07-22 revalidation on nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own
+  pin, no force-upgrade — the MR!27 WAR makes 4.5.2 the perf floor): the
+  prefill-8k cell reproduces on the same metric (native 45,582 / fi_nvfp4
+  53,623 tok/s = 1.176x); the decode-1k check was recorded as **total tok/s**
+  (prompt + output: native 32,086 / fi_nvfp4 34,263 = 1.068x), a different
+  metric from the headline's output tok/s — it corroborates the 1.07x speedup
+  ratio rather than the absolute cells (vllm_e2e RUNS.md runs 41-42,
+  `requick452_*.json`).
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
@@ -181,7 +193,12 @@ Caught by the torch-oracle tests
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.
 
-## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15)
+## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15) — OBSOLETE
+
+> **OBSOLETE (2026-07-22):** the regression below is fixed by the MR!27
+> mainloop WAR (see the follow-up subsection) — 4.5.2 now runs at full
+> parity for both nvfp4 and mxfp8, and the perf floor is 4.5.2, not 4.6.1.
+> Kept for the record of what unpatched 4.5.2 codegen did.
 
 Same recipe, geometry and runbook as the microbenchmark table above, with
 the only change being the CuTe-DSL runtime pinned to 4.5.2 instead of
@@ -210,9 +227,72 @@ Takeaways:
   ~512-1024 tok/rank out past 2048 (nvfp4 *loses* at 1024, 0.80-0.83x),
   and the 8192 win shrinks from ~1.6-1.8x to 1.19-1.24x.
 
-Conclusion: treat **4.6.1 as a performance floor**, not just a
+Conclusion (2026-07-15): treat **4.6.1 as a performance floor**, not just a
 compile-compatibility floor — 4.5.2 is functional but leaves ~1.3-1.5x of
 nvfp4 kernel performance on the table.
+**Superseded for nvfp4 on 2026-07-22 by the MR!27 mainloop WAR — see the
+follow-up below.**
+
+### Follow-up 2026-07-22: MR!27 mainloop WAR recovers nvfp4 on 4.5.2
+
+`cutedsl_megamoe` MR!27 (ported in the `4_5_2-perf-fix` branch, single file
+`src/moe_nvfp4_swapab/kernel_fc12.py`) peels the last k-tile out of the
+MMA-consumer mainloop when `cutlass.__version__ == 4.5.2` exactly
+(`cutlass.const_expr`-gated, so 4.6.1+ traces are unchanged). Rerun of the
+same sweep recipe with 4.5.2 pinned (CSVs
+`moe_ep_benchmark/results/sweep_20260722_1125*/1126*/1129*_fi_mega.csv`;
+e2e_pipelined p50 µs, ratio vs same-run dg):
+
+| tok/rank | dg     | nvfp4 bf16     | +combine_nvfp4     |
+|---------:|-------:|---------------:|-------------------:|
+| 8        | 214.0  | 222.5 (0.96x)  | 227.3 (0.94x)      |
+| 512      | 341.4  | 359.3 (0.95x)  | **327.7 (1.04x)**  |
+| 1024     | 469.0  | 428.0 (1.10x)  | **371.7 (1.26x)**  |
+| 2048     | 834.0  | 609.3 (1.37x)  | **533.0 (1.56x)**  |
+| 4096     | 1576.3 | 996.9 (1.58x)  | **885.8 (1.78x)**  |
+| 8192     | 3018.2 | 1859.7 (1.62x) | **1738.7 (1.74x)** |
+
+This matches the 4.6.1 reference table above within run noise at every
+point (e.g. nvfp4 bf16 428.0 vs 428.5 @1024, 609.3 vs 625.6 @2048, 1859.7
+vs 1923.5 @8192), i.e. the 34-54% regression is fully recovered and the
+dg-crossover / large-token win shape is restored. Correctness: the full
+`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all 8
+sections, 2026-07-22, job 2427254).
+
+mxfp8 needs no WAR: a same-day 4.5.2 sweep
+(`sweep_20260722_114210_fi_mega.csv`) matches the 4.6.1 mxfp8 reference
+within noise at every point (373.7/604.1/750.4/1007.2/1714.7/3215.3 µs at
+8..8192 vs 385.8/634.9/749.6/1006.6/1742.8/3122.2) — the 4.5.2 codegen
+regression was specific to the nvfp4 swap-AB fc12 mainloop. With both
+dtypes at parity and the suite green, 4.5.2 is a fully acceptable runtime
+for this drop; 4.5.0 still fails at `cute.compile`, so <4.5.2 remains
+unsupported in practice.
+
+Later the same day the full 5-variant reference sweep and the vLLM e2e
+headline pair were re-measured on 4.5.2 and adopted as the current
+reference numbers — see "Microbenchmark results (2026-07-22)" and the
+end-to-end section above.
+
+The two published versions between 4.5.2 and 4.6.1 were also measured
+(dg + nvfp4 @1024/2048/8192, `sweep_20260722_132849/133055_fi_mega.csv`):
+**4.5.3 (424.4/613.3/1933.3 µs) and 4.6.0 (427.0/614.1/1922.0 µs) both
+match the fast reference** — the codegen regression existed only in
+4.5.2 and was fixed upstream in 4.5.3, so the WAR's exact `== 4.5.2` gate
+is correct and every published version >= 4.5.2 runs at full performance.
+
+Support statement: **>= 4.5.2 at full performance** (4.5.2 via the MR!27
+WAR; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
+(4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
+
+The 4.7.0.dev internal drop (`nvidia-cutlass-dsl-internal`
+`0.3.0+20260721052439.f58f4a5`) also measures fast: nvfp4
+427.0/614.2/1907.7 µs @1024/2048/8192 (`sweep_20260722_142421_fi_mega.csv`)
+— compiles and runs cleanly. Note internal wheels report their own version
+scheme (`cutlass.__version__ == "0.3.0"`, dist name
+`nvidia-cutlass-dsl-internal`), so on internal drops the ==4.5.2 WAR gate
+is always OFF and the shim's <4.5.2 warning silently skips (dist lookup
+misses) — both are the right behavior as long as internal drops carry the
+4.5.3+ codegen fix, which this one does.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
@@ -508,7 +588,9 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
 torch `2.12.0a0+5aff3928d8.nv26.05`, CUDA 13.2, `cuda-bindings 13.2.0`,
 `triton 3.7.0+nv26.5`, `deep_gemm 2.5.0+891d57b`,
 `nvshmem4py-cu13 0.3.1`; `nvidia-cutlass-dsl` upgraded in-container to
-**4.6.1** (the mega kernels require it).  FlashInfer = this branch,
+**4.6.1** (>=4.5.2 suffices since the 2026-07-22 MR!27 WAR; the reference
+numbers were measured on 4.6.1 and 4.5.2 reproduces them within noise).
+FlashInfer = this branch,
 editable-installed inside the container
 (`PIP_CONSTRAINT="" BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`).
 
@@ -558,7 +640,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.6.1
+    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.5.2
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do

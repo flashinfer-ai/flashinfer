@@ -314,6 +314,10 @@ def trtllm_batch_decode_mla(
     if backend == "cute-dsl":
         if compute_capability[0] not in (10, 11):
             pytest.skip("cute-dsl MLA requires SM100-SM110 (tcgen05)")
+        from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+        if not is_cute_dsl_arch_supported(*compute_capability):
+            pytest.skip("installed CuTe DSL cannot target this device architecture")
         if dynamic_scale:
             pytest.skip("cute-dsl does not support dynamic_scale")
         if enable_pdl is not None:

@@ -19,12 +19,17 @@ bootstrap_paths()
 
 
 def _check_dsl_perf_floor() -> None:
-    """Warn once if the installed CuTe-DSL predates the 4.6.1 perf floor.
+    """Warn once if the installed CuTe-DSL predates the 4.5.2 perf floor.
 
-    The MegaMoE kernels compile 34-54% slower on nvidia-cutlass-dsl 4.5.x
-    (measured 2026-07-15, TUNING.md "CuTe-DSL runtime sensitivity"; vllm_e2e
-    RUNS.md run 14). Results are CORRECT on 4.5.x — only slower — so this
-    warns instead of raising. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
+    Every published version >=4.5.2 measures at full parity (TUNING.md
+    "CuTe-DSL runtime sensitivity" + 2026-07-22 follow-up): 4.5.2 via the
+    MR!27 mainloop WAR in kernel_fc12.py (const_expr-gated on ==4.5.2 —
+    the codegen regression existed only in 4.5.2, fixed upstream in
+    4.5.3), 4.5.3/4.6.0/4.6.1 verified natively fast; mxfp8 never
+    regressed. Below 4.5.2: 4.5.0 fails outright at cute.compile, 4.5.1
+    unmeasured/presumed slow. Results are CORRECT wherever compilation
+    succeeds — only slower — so this warns instead of raising. Silence
+    with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.
     """
     import os as _os
 
@@ -39,13 +44,14 @@ def _check_dsl_perf_floor() -> None:
     import re as _re
 
     parts = tuple(int(p) for p in _re.findall(r"\d+", ver)[:3])
-    if parts and parts < (4, 6, 1):
+    if parts and parts < (4, 5, 2):
         import warnings as _warnings
 
         _warnings.warn(
             f"nvidia-cutlass-dsl {ver} detected: the CuTeDSL MegaMoE kernels "
-            "compile 34-54% slower on <4.6.1 (perf floor; results stay "
-            "correct). Install nvidia-cutlass-dsl[cu13]>=4.6.1 — see "
+            "compile 34-54% slower on <4.5.2 (perf floor; results stay "
+            "correct where compilation succeeds; 4.5.0 fails to compile). "
+            "Install nvidia-cutlass-dsl[cu13]>=4.5.2 — see "
             "kernel_src/cutedsl_megamoe/TUNING.md 'CuTe-DSL runtime "
             "sensitivity'. Silence with FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1.",
             UserWarning,
