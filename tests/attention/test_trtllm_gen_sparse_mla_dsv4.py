@@ -698,6 +698,8 @@ def run_flashinfer_decode(
     swa_page_stride_padding_elements: int = 0,
     compressed_page_stride_padding_elements: int = 0,
     sparse_indices_are_storage_offsets: bool | None = None,
+    remapped_sparse_indices_buffer: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert t.decode is not None
     swa_indices = testcase.kv_scope.indices_in_kvcache[testcase.valid_q].contiguous()
@@ -773,6 +775,9 @@ def run_flashinfer_decode(
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
             enable_pdl=False,
+            backend="trtllm-gen",
+            out=out,
+            remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
             sparse_indices_are_storage_offsets=sparse_indices_are_storage_offsets,
         )
     except RuntimeError as err:
@@ -882,10 +887,15 @@ def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
 
 
 @pytest.mark.parametrize("kv_layout", ("HND", "NHD"))
+@pytest.mark.parametrize(
+    "dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
+)
 @pytest.mark.parametrize("sparse_indices_are_storage_offsets", (False, True))
 @torch.inference_mode()
 def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
-    kv_layout: KVLayout, sparse_indices_are_storage_offsets: bool
+    kv_layout: KVLayout,
+    dtype: torch.dtype,
+    sparse_indices_are_storage_offsets: bool,
 ) -> None:
     _skip_unless_sm100_or_sm103()
     p = RawTestParamForDecode(
@@ -901,14 +911,23 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
         block_size=SWA_PAGE_SIZE,
         extra_block_size=C4_PAGE_SIZE,
         seed=TEST_SEED_BASE + len(TESTCASES),
-        dtype=torch.bfloat16,
+        dtype=dtype,
         kv_layout=kv_layout,
         sparse_case="swa128+topk4x",
     ).to_test_param()
     testcase = generate_testcase_for_decode(p)
-    testcase.kv_scope.indices_in_kvcache[0, 0] = -1
+    testcase.kv_scope.indices_in_kvcache[0, 0, 0] = -1
     assert testcase.extra_kv_scope is not None
-    testcase.extra_kv_scope.indices_in_kvcache[0, 0] = -1
+    testcase.extra_kv_scope.indices_in_kvcache[0, 0, 0] = -1
+    assert testcase.extra_kv_scope.topk_length is not None
+    for batch_idx, topk_len in enumerate(
+        testcase.extra_kv_scope.topk_length[:, 0].tolist()
+    ):
+        testcase.extra_kv_scope.indices_in_kvcache[batch_idx, 0, topk_len:] = -1
+    assert torch.any(testcase.kv_scope.indices_in_kvcache >= p.decode.block_size)
+    assert torch.any(
+        testcase.extra_kv_scope.indices_in_kvcache >= p.decode.extra_block_size
+    )
     out_ans = run_flashinfer_decode(
         p,
         testcase,
@@ -917,4 +936,100 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
         sparse_indices_are_storage_offsets=sparse_indices_are_storage_offsets,
     )
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    _assert_close(out_ans, out_ref, p.dtype)
+
+
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph() -> None:
+    _skip_unless_sm100_or_sm103()
+    p = RawTestParamForDecode(
+        b=2,
+        h_q=64,
+        s_q=3,
+        h_kv=1,
+        s_kv=512,
+        is_varlen=True,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=1024,
+        extra_topk=_c4_topk(64),
+        block_size=SWA_PAGE_SIZE,
+        extra_block_size=C4_PAGE_SIZE,
+        seed=TEST_SEED_BASE + len(TESTCASES) + 1,
+        dtype=torch.bfloat16,
+        kv_layout="HND",
+        sparse_case="swa128+topk4x",
+    ).to_test_param()
+    testcase = generate_testcase_for_decode(p)
+    assert p.decode is not None
+    assert p.decode.extra_topk is not None
+    num_queries = int(testcase.valid_q.sum().item())
+    remapped_sparse_indices_buffer = torch.empty(
+        (num_queries, DSV4_SWA_TOPK + p.decode.extra_topk),
+        dtype=torch.int32,
+        device="cuda:0",
+    )
+    out = torch.empty(
+        (num_queries, p.h_q, p.d_v),
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="sparse_indices_are_storage_offsets must be set for strided KV pools",
+    ):
+        run_flashinfer_decode(
+            p,
+            testcase,
+            swa_page_stride_padding_elements=512,
+            compressed_page_stride_padding_elements=1024,
+        )
+
+    run_flashinfer_decode(
+        p,
+        testcase,
+        swa_page_stride_padding_elements=512,
+        compressed_page_stride_padding_elements=1024,
+        sparse_indices_are_storage_offsets=False,
+        remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
+        out=out,
+    )
+    assert testcase.extra_kv_scope is not None
+    expected_indices = torch.cat(
+        (
+            testcase.kv_scope.indices_in_kvcache[testcase.valid_q],
+            testcase.extra_kv_scope.indices_in_kvcache[testcase.valid_q],
+        ),
+        dim=-1,
+    ).contiguous()
+    for indices, page_size, padding in (
+        (expected_indices[:, :DSV4_SWA_TOPK], SWA_PAGE_SIZE, 512),
+        (expected_indices[:, DSV4_SWA_TOPK:], C4_PAGE_SIZE, 1024),
+    ):
+        valid = indices >= 0
+        page_span = page_size + padding // DSV4_HEAD_DIM
+        indices[valid] = (
+            torch.div(indices[valid], page_size, rounding_mode="floor") * page_span
+            + indices[valid] % page_size
+        )
+    torch.testing.assert_close(remapped_sparse_indices_buffer, expected_indices)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_ans = run_flashinfer_decode(
+            p,
+            testcase,
+            swa_page_stride_padding_elements=512,
+            compressed_page_stride_padding_elements=1024,
+            sparse_indices_are_storage_offsets=False,
+            remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
+            out=out,
+        )
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert out_ans.data_ptr() == out.data_ptr()
+    out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    out_ref = out_ref[testcase.valid_q]
     _assert_close(out_ans, out_ref, p.dtype)
