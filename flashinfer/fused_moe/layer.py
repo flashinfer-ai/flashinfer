@@ -122,17 +122,22 @@ class MoELayer:
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
             # Explain when shared-expert support filtered every candidate.
+            # Deliberately a *global* capability list, not one filtered by the
+            # configured backends or this arch: the common case is that the
+            # caller configured a backend that does not implement S at all, so
+            # filtering would leave the list empty and say nothing useful.
             hint = ""
             if config.experts.num_fused_shared_experts > 0:
                 supporting = ", ".join(
                     r.__name__
                     for r in _BACKEND_RUNNERS.values()
-                    if getattr(r, "supports_fused_shared_experts", False)
+                    if r.supports_fused_shared_experts
                 )
                 hint = (
                     f" Note num_fused_shared_experts="
-                    f"{config.experts.num_fused_shared_experts}, which only "
-                    f"[{supporting}] support."
+                    f"{config.experts.num_fused_shared_experts}: fused shared "
+                    f"experts are implemented only by [{supporting}], which must "
+                    f"also be configured and supported on this arch."
                 )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
