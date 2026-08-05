@@ -152,8 +152,17 @@ jobs:
             const hasProblems = Boolean(
               findings.length || failedChecks.length || reportErrors.length
             );
-            if (!hasProblems && !previous) {
-              core.info('Clean PR with no existing documentation summary; no comment needed.');
+            if (!hasProblems) {
+              if (previous) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: previous.id,
+                });
+                core.info('Documentation findings resolved; removed the existing summary.');
+              } else {
+                core.info('Clean PR with no existing documentation summary; no comment needed.');
+              }
               return;
             }
             const publicRows = publicApiFindings.slice(0, 20);
@@ -192,13 +201,6 @@ jobs:
                 '',
                 '> [!WARNING]',
                 `> ${escape(problems.join('; '))}. The checker remains non-blocking, but this run must not be treated as a clean result.`,
-              );
-            }
-            if (!findings.length && !failedChecks.length && !reportErrors.length) {
-              sections.push(
-                '## Documentation checks ✅',
-                '',
-                'No new API or documentation drift was introduced by this PR.',
               );
             }
             sections.push('', `[View the full check run](${runUrl})`);
