@@ -48,5 +48,6 @@ def write_report(
             },
             indent=2,
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
