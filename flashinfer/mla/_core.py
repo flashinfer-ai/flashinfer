@@ -2389,17 +2389,12 @@ def _mla_decode_tuning_config(
         return tensor
 
     input_idx = (0, 1, 2, 3, 4) if enable_dcp else (0, 1, 2, 3)
-    tensor_initializers = (
-        (
-            None,
-            init_block_tables,
-            init_seq_lens,
-            None,
-            init_causal_seqlens_kv_global,
-        )
-        if enable_dcp
-        else (None, init_block_tables, init_seq_lens, None)
-    )
+    tensor_initializers = [
+        (1, init_block_tables),
+        (2, init_seq_lens),
+    ]
+    if enable_dcp:
+        tensor_initializers.append((4, init_causal_seqlens_kv_global))
 
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -2408,10 +2403,9 @@ def _mla_decode_tuning_config(
                 dim_idx=(0,) * len(input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=tensor_initializers,
             ),
         ),
-        tensor_initializers=((1, init_block_tables), (2, init_seq_lens)),
+        tensor_initializers=tuple(tensor_initializers),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

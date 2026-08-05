@@ -1502,7 +1502,7 @@ def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatc
     assert eq_calls == 0
 
 
-def _call_build_mla_decode_tuning_config():
+def _call_build_mla_decode_tuning_config(enable_dcp: bool = False):
     """Call _build_mla_decode_tuning_config with fresh (equivalent) tensors.
 
     runner_names is restricted to trtllm-gen so bucket computation stays
@@ -1519,28 +1519,40 @@ def _call_build_mla_decode_tuning_config():
         kv_lora_rank=512,
         max_seq_len=1024,
         device=torch.device("cpu"),
+        enable_dcp=enable_dcp,
+        cp_world=4,
+        cp_rank=1,
     )
 
 
-def test_mla_decode_tuning_config_is_memoized():
+@pytest.mark.parametrize(
+    ("enable_dcp", "expected_input_idx", "expected_initializer_indices"),
+    [
+        (False, (0, 1, 2, 3), {1, 2}),
+        (True, (0, 1, 2, 3, 4), {1, 2, 4}),
+    ],
+)
+def test_mla_decode_tuning_config_is_memoized(
+    enable_dcp, expected_input_idx, expected_initializer_indices
+):
     """Equivalent MLA-decode dispatcher calls must reuse one TuningConfig object.
 
-    Memoizing on (buckets, num_pages, profile_seq_len) keeps a single config
-    object and its initializer closures alive across dispatcher calls, avoiding
-    a per-call rebuild on the decode hot path.
+    Memoizing equivalent arguments keeps a single config object and its
+    initializer closures alive across dispatcher calls, avoiding a per-call
+    rebuild on the decode hot path.
     """
     _mla_decode_tuning_config.cache_clear()
     try:
-        config_a = _call_build_mla_decode_tuning_config()
-        config_b = _call_build_mla_decode_tuning_config()
+        config_a = _call_build_mla_decode_tuning_config(enable_dcp)
+        config_b = _call_build_mla_decode_tuning_config(enable_dcp)
 
         assert config_a is config_b, (
             "_build_mla_decode_tuning_config returned a different TuningConfig "
-            "object for equivalent arguments. It must memoize on "
-            "(buckets, num_pages, profile_seq_len) so equivalent dispatcher calls "
+            "object for equivalent arguments. Equivalent dispatcher calls must "
             "reuse one config object instead of rebuilding it each call."
         )
-        assert set(dict(config_a.tensor_initializers)) == {1, 2}
+        assert config_a.dynamic_tensor_specs[0].input_idx == expected_input_idx
+        assert set(dict(config_a.tensor_initializers)) == expected_initializer_indices
     finally:
         _mla_decode_tuning_config.cache_clear()
 
