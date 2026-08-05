@@ -965,6 +965,29 @@ def _route_key(
     )
 
 
+def _is_long_paged_gqa16_direct_decode(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    group_size: int,
+    seqlen_q: int,
+    paged: bool,
+    force_fused: Optional[bool],
+) -> bool:
+    """Match the long Q8 paged geometry where selected-block decode is cheaper."""
+
+    return (
+        paged
+        and seqlen_q == 8
+        and force_fused is True
+        and group_size == 16
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and tuple(q.shape) == (512, 64, _HEAD_DIM)
+        and tuple(k.shape) == (32768, 4, _BLOCK_SIZE, _HEAD_DIM)
+    )
+
+
 def _select_decode_route(
     *,
     q: torch.Tensor,
@@ -986,6 +1009,19 @@ def _select_decode_route(
                 "decode tensors and options"
             )
         return workspace._routes[route_key]  # type: ignore[return-value]
+
+    if _is_long_paged_gqa16_direct_decode(
+        q=q,
+        k=k,
+        group_size=group_size,
+        seqlen_q=seqlen_q,
+        paged=paged,
+        force_fused=force_fused,
+    ):
+        # The folded-M128 route scans the 512-block visible range.  At this
+        # exact long-context geometry, visiting the 32 selected blocks with
+        # the direct swap-AB body removes that union-scan overcompute.
+        return "decode", False, True
 
     if seqlen_q > 1 and force_fused is not False:
         folded_gqa16 = (
