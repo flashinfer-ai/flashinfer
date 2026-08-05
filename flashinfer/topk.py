@@ -711,7 +711,9 @@ def top_k_page_table_transform(
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     src_page_table : torch.Tensor
         Source page table of shape ``(batch_size, max_page_table_length)`` with
-        dtype ``int32``.
+        dtype ``int32``. Entries used by selected indices must be nonnegative,
+        and each resulting ``physical_page * page_size + offset`` must fit in
+        signed ``int32``. These value constraints are not checked at runtime.
     lengths : torch.Tensor
         Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
     k : int

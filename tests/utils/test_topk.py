@@ -2665,7 +2665,7 @@ def test_top_k_tie_break_explicit_deterministic_transform_order(
     physical_pages = torch.gather(
         src_page_table[row_to_batch],
         1,
-        page_table_row_starts.unsqueeze(1) + local_indices // page_size,
+        (page_table_row_starts.unsqueeze(1) + local_indices // page_size).long(),
     )
     expected_page = physical_pages * page_size + local_indices % page_size
     assert torch.equal(page_output, expected_page)
@@ -2679,7 +2679,7 @@ def test_top_k_tie_break_explicit_deterministic_transform_order(
         translated_raw = torch.gather(
             src_page_table[row_to_batch],
             1,
-            page_table_row_starts.unsqueeze(1) + raw_indices // page_size,
+            (page_table_row_starts.unsqueeze(1) + raw_indices // page_size).long(),
         )
         translated_raw = translated_raw * page_size + raw_indices % page_size
         assert torch.equal(page_output, translated_raw)
