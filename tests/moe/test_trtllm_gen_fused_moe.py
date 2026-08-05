@@ -31,6 +31,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     BF16Moe,
     FP4Moe,
     FP8BlockScaleMoe,
+    FP8PerChannelMoe,
     FP8PerTensorMoe,
     Fp8QuantizationType,
     MxInt4BlockScaleMoe,

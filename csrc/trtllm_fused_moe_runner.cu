@@ -435,9 +435,12 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
-        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
-                                                                              : btg::Dtype::Fp32)
-                                              : btg::Dtype::Void,
+        .perTokenSfDtype =
+            usePerChannelScaling
+                ? btg::Dtype::Fp32
+                : (usePerTokenScaling
+                       ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
+                       : btg::Dtype::Void),
         .usePerChannelScaling = usePerChannelScaling,
     };
     return options;
@@ -462,9 +465,12 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .fusedBiasShuffleMode = fusedBiasShuffleMode,
         .biasDtype = biasDtype,
         .usePerTokenScaling = usePerTokenScaling,
-        .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
-                                                                              : btg::Dtype::Fp32)
-                                              : btg::Dtype::Void,
+        .perTokenSfDtype =
+            usePerChannelScaling
+                ? btg::Dtype::Fp32
+                : (usePerTokenScaling
+                       ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
+                       : btg::Dtype::Void),
         .usePerChannelScaling = usePerChannelScaling};
     return options;
   }
@@ -576,9 +582,12 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
-      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16
-                                                                            : btg::Dtype::Fp32)
-                                            : btg::Dtype::Void,
+      .perTokenSfDtype =
+          usePerChannelScaling
+              ? btg::Dtype::Fp32
+              : (usePerTokenScaling
+                     ? (dtypeAct == btg::Dtype::E4m3 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32)
+                     : btg::Dtype::Void),
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }
@@ -924,11 +933,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              args.gemm2_per_channel_weight_scale == nullptr ? workspace.token_scales_fc2
                                                             : gemm2_input_scale,
-             args.gemm2_per_channel_weight_scale,
-             args.output2_scales_scalar,
-             args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale,
-             totalExpertsPerToken, args.hidden_size, args.intermediate_size, totalLocalExperts,
-             args.num_tokens, workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+             args.gemm2_per_channel_weight_scale, args.output2_scales_scalar, args.gemm2_bias,
+             workspace.gemm2_output, workspace.gemm2_output_scale, totalExpertsPerToken,
+             args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens,
+             workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
              workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl);
 
