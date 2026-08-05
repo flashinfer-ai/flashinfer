@@ -388,7 +388,7 @@ def _tgv_gemm_requirement(
 
 
 @supported_compute_capability([100, 103])
-def _cute_dsl_splitk_mm_bf16_requirement(
+def _cute_dsl_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -400,19 +400,19 @@ def _cute_dsl_splitk_mm_bf16_requirement(
     ] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL split-K backend requires bfloat16 output.")
+        raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
     if out is not None and out.dtype != torch.bfloat16:
-        raise ValueError("The CuTeDSL split-K backend requires a bfloat16 out tensor.")
-    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError("The CuTeDSL low-M backend requires a bfloat16 out tensor.")
+    if not is_sm100a_supported(a.device):
         raise ValueError(
-            "The CuTeDSL split-K backend requires SM100/SM103 with CUDA 12.8+."
+            "The CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+."
         )
     if a.ndim != 2 or b.ndim != 2:
-        raise ValueError("The CuTeDSL split-K backend requires 2D inputs.")
+        raise ValueError("The CuTeDSL low-M backend requires 2D inputs.")
     if not a.is_contiguous():
-        raise ValueError("The CuTeDSL split-K backend requires row-major A.")
+        raise ValueError("The CuTeDSL low-M backend requires row-major A.")
     if not b.T.is_contiguous():
-        raise ValueError("The CuTeDSL split-K backend requires column-major B.")
+        raise ValueError("The CuTeDSL low-M backend requires column-major B.")
     if b.shape[0] != a.shape[1]:
         raise ValueError(
             f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
@@ -420,7 +420,7 @@ def _cute_dsl_splitk_mm_bf16_requirement(
     if b.device != a.device:
         raise ValueError("A and B must be on the same CUDA device.")
     if out is not None and not out.is_contiguous():
-        raise ValueError("The CuTeDSL split-K backend requires row-major output.")
+        raise ValueError("The CuTeDSL low-M backend requires row-major output.")
     if bias is not None and (
         bias.device != a.device
         or bias.shape != (b.shape[1],)
@@ -433,7 +433,7 @@ def _cute_dsl_splitk_mm_bf16_requirement(
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
     if not is_cute_dsl_available():
-        raise LibraryError("The CuTeDSL split-K backend requires nvidia-cutlass-dsl.")
+        raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
 
     from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
 
@@ -588,7 +588,7 @@ def _heuristic_func_mm_bf16(
         "cublaslt": _cublaslt_mm_bf16_requirement,
         "tinygemm": _tinygemm_mm_bf16_requirement,
         "cutile": _cutile_mm_bf16_requirement,
-        "cute-dsl": _cute_dsl_splitk_mm_bf16_requirement,
+        "cute-dsl": _cute_dsl_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -737,6 +737,8 @@ def mm_bf16(
         backends = _heuristic_func_mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
+    elif backend == "cute-dsl":
+        backends = ["cute-dsl"]
     else:
         backends = [backend]
 
@@ -1499,11 +1501,12 @@ def _cute_dsl_splitk_bf16_gemm_runner(
 
     class CuteDSLSplitKBf16Runner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, bias, pdl, out, *_ = inputs
             return (
-                str(inputs[0].dtype),
-                str(inputs[4].dtype),
-                inputs[2] is not None,
-                bool(inputs[3]),
+                str(a.dtype),
+                str(out.dtype),
+                bias is not None,
+                bool(pdl),
                 compute_capability,
             )
 
@@ -1512,8 +1515,9 @@ def _cute_dsl_splitk_bf16_gemm_runner(
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list[tuple[int, int, int, int]]:
-            m, k = inputs[0].shape
-            n = inputs[1].shape[1]
+            a, b, *_ = inputs
+            m, k = a.shape
+            n = b.shape[1]
             try:
                 default = default_tactic(m, n, k)
             except ValueError:
@@ -1535,7 +1539,7 @@ def _cute_dsl_splitk_bf16_gemm_runner(
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, *_ = inputs
+            a, b, bias, pdl, out, *_ = inputs
             if tactic == -1:
                 tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
             else:
@@ -1546,14 +1550,7 @@ def _cute_dsl_splitk_bf16_gemm_runner(
                         "CuTeDSL split-K tactics must be "
                         "(mma_m, mma_n, split_k, ab_stages)."
                     ) from error
-            return run_splitk_dense(
-                a,
-                b,
-                inputs[2],
-                inputs[4],
-                bool(inputs[3]),
-                tactic,
-            )
+            return run_splitk_dense(a, b, bias, out, bool(pdl), tactic)
 
     return CuteDSLSplitKBf16Runner()
 
@@ -1571,10 +1568,11 @@ def _cute_dsl_direct_bf16_gemm_runner(
 
     class CuteDSLDirectBf16Runner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, _, pdl, out, *_ = inputs
             return (
-                str(inputs[0].dtype),
-                str(inputs[4].dtype),
-                bool(inputs[3]),
+                str(a.dtype),
+                str(out.dtype),
+                bool(pdl),
                 compute_capability,
             )
 
@@ -1583,10 +1581,11 @@ def _cute_dsl_direct_bf16_gemm_runner(
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> list[tuple[int, int, int]]:
-            if inputs[2] is not None:
+            a, b, bias, *_ = inputs
+            if bias is not None:
                 return []
-            m, k = inputs[0].shape
-            n = inputs[1].shape[1]
+            m, k = a.shape
+            n = b.shape[1]
             return [astuple(config) for config in autotune_tactics(m, n, k)]
 
         def forward(

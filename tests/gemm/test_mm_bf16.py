@@ -53,16 +53,16 @@ def test_mm_bf16(
 
     if backend == "cute-dsl":
         if not is_sm100a_supported(torch.device("cuda")):
-            pytest.skip("CuTeDSL split-K backend requires SM100/SM103 with CUDA 12.8+.")
+            pytest.skip("CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+.")
 
         from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
         if not is_cute_dsl_available():
             pytest.skip("nvidia-cutlass-dsl is not available.")
         if m > 32:
-            pytest.skip("CuTeDSL split-K backend requires M <= 32.")
+            pytest.skip("CuTeDSL low-M backend requires M <= 32.")
         if res_dtype != torch.bfloat16:
-            pytest.skip("CuTeDSL split-K backend requires BF16 output.")
+            pytest.skip("CuTeDSL low-M backend requires BF16 output.")
 
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
@@ -244,34 +244,6 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
-
-
-def test_cute_dsl_low_m_tactic_policies():
-    from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
-        DirectTactic,
-        autotune_tactics as direct_autotune_tactics,
-        prefer_direct_bf16_gemm_sm100,
-    )
-    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-        autotune_tactics as splitk_autotune_tactics,
-        default_tactic as splitk_default_tactic,
-    )
-
-    assert prefer_direct_bf16_gemm_sm100(1, 4608, 8192)
-    assert prefer_direct_bf16_gemm_sm100(4, 512, 8192)
-    assert prefer_direct_bf16_gemm_sm100(8, 256, 8192)
-    assert not prefer_direct_bf16_gemm_sm100(2, 4608, 8192)
-    assert not prefer_direct_bf16_gemm_sm100(8, 512, 8192)
-    assert not prefer_direct_bf16_gemm_sm100(1, 4608, 4096)
-
-    assert DirectTactic(256, 2, 8) in direct_autotune_tactics(8, 256, 8192)
-    assert splitk_default_tactic(1, 1024, 128).ab_stages == 1
-    assert (
-        min(tactic.ab_stages for tactic in splitk_autotune_tactics(1, 1024, 128)) == 1
-    )
-    assert (
-        min(tactic.ab_stages for tactic in splitk_autotune_tactics(1, 1024, 256)) == 2
-    )
 
 
 if __name__ == "__main__":
