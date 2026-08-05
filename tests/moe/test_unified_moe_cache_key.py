@@ -38,6 +38,7 @@ from flashinfer.fused_moe import (
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import (
@@ -45,6 +46,7 @@ from flashinfer.fused_moe.runners import (
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
@@ -87,6 +89,13 @@ _RUNNERS = [
         QuantVariant.NVFP4,
         QuantVariant.MXFP4,
         id="fp4",
+    ),
+    pytest.param(
+        TrtllmMxInt4RoutedRunner,
+        TrtllmMxInt4Config(),
+        QuantVariant.MxInt4,
+        None,
+        id="mxint4",
     ),
 ]
 
