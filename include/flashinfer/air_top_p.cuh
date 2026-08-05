@@ -27,6 +27,8 @@
 #include <cuda/std/limits>
 #include <type_traits>
 
+#include "sampling_tie_break.cuh"
+
 namespace flashinfer {
 namespace sampling {
 namespace air_top_p {
@@ -436,22 +438,44 @@ __global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs, Count
   int const batchId = blockIdx.x;
   int const tid = threadIdx.x;
   T const threshold = twiddleOut<T>(counters[batchId].kthValueBits, false);
+  const uint32_t equal_count = counters[batchId].len;
+  uint32_t tie_index_limit = UINT32_MAX;
+  double retained_mass = -1;
+  if (equal_count > 1) {
+    const auto mass =
+        GetSamplingBoundaryMass<1024>(probs + batchId * vocabSize, vocabSize, float(threshold));
+    const uint32_t take = SamplingBoundaryQuota(double(counters[batchId].p) * mass.total,
+                                                mass.above, double(threshold), mass.equal_count);
+    if (take < mass.equal_count) {
+      tie_index_limit = FindSamplingTieIndexLimit<1024>(
+          vocabSize, take, [probs, batchId, vocabSize, threshold](uint32_t i) {
+            return probs[batchId * vocabSize + i] == threshold;
+          });
+    }
+    retained_mass = mass.above + double(take) * double(threshold);
+  }
   float threadSum = 0.0f;
   for (int i = tid; i < vocabSize; i += blockDim.x) {
     T val = probs[batchId * vocabSize + i];
-    if (val >= threshold) threadSum += static_cast<float>(val);
+    if (val > threshold || (val == threshold && uint32_t(i) < tie_index_limit))
+      threadSum += static_cast<float>(val);
   }
   typedef cub::BlockReduce<float, 1024> BlockReduce;
   __shared__ typename BlockReduce::TempStorage temp;
   float totalSum = BlockReduce(temp).Sum(threadSum);
   __shared__ float sharedNorm;
-  if (tid == 0) sharedNorm = (totalSum > 1e-8f) ? (1.0f / totalSum) : 1.0f;
+  if (tid == 0) {
+    const float selected_sum = retained_mass >= 0 ? float(retained_mass) : totalSum;
+    sharedNorm = (selected_sum > 1e-8f) ? (1.0f / selected_sum) : 1.0f;
+  }
   __syncthreads();
   float norm = sharedNorm;
   for (int i = tid; i < vocabSize; i += blockDim.x) {
     T val = probs[batchId * vocabSize + i];
     renormedProbs[batchId * vocabSize + i] =
-        (val >= threshold) ? static_cast<T>(static_cast<float>(val) * norm) : static_cast<T>(0);
+        (val > threshold || (val == threshold && uint32_t(i) < tie_index_limit))
+            ? static_cast<T>(static_cast<float>(val) * norm)
+            : static_cast<T>(0);
   }
 }
 
