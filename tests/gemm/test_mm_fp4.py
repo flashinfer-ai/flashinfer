@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -115,18 +120,35 @@ def _test_mm_fp4(
             pytest.fail(str(e))
 
 
-# TODO: Consdier splitting this function up for the various backends
+# Curated smoke set. Randomized breadth over m x {n,k} x fp4-type x backend (nvfp4 +
+# mxfp4, 128x4 layout, tight elementwise oracle, determinism, autotune-winner
+# validation) lives in tests/gemm/test_unified_gemm_fuzz.py's mm_nvfp4/mm_mxfp4
+# adapters. This file keeps, per backend: one odd-M + one large-M case, the 8x4
+# scale-factor layout (NOT fuzzed yet -- fuzzer TODO C1/#2861), the trtllm
+# weight-shuffle path, and each fp4_type at least once.
+_SMOKE_CASES = [
+    # m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+    # (every case must actually run on its target arch: trtllm is the only 8x4-layout
+    #  backend and is bf16-out only; b12x is nvfp4+128x4 only; mxfp4 runs on
+    #  cudnn/cute-dsl/auto only -- see the skip matrix in _test_mm_fp4)
+    (7, 128, 256, torch.bfloat16, "trtllm", True, False, "nvfp4"),
+    (512, 512, 512, torch.bfloat16, "trtllm", False, True, "nvfp4"),
+    (48, 256, 512, torch.bfloat16, "trtllm", False, False, "nvfp4"),
+    (13, 256, 128, torch.bfloat16, "cudnn", True, True, "nvfp4"),
+    (256, 512, 256, torch.float16, "cudnn", True, False, "mxfp4"),
+    (9, 512, 256, torch.bfloat16, "cudnn", True, True, "mxfp4_alpha"),
+    (1, 128, 512, torch.bfloat16, "cutlass", True, False, "nvfp4"),
+    (31, 256, 256, torch.float16, "cutlass", True, True, "nvfp4"),
+    (48, 512, 128, torch.float16, "cute-dsl", True, True, "nvfp4"),
+    (3, 256, 512, torch.bfloat16, "cute-dsl", True, False, "mxfp4"),
+    (17, 128, 128, torch.bfloat16, "b12x", True, False, "nvfp4"),
+    (128, 512, 512, torch.bfloat16, "b12x", True, True, "nvfp4"),
+]
+
+
 @pytest.mark.parametrize(
-    "m",
-    [1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 15, 16, 17, 20, 24, 31, 32, 48, 64, 128, 256, 512],
+    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type", _SMOKE_CASES
 )
-@pytest.mark.parametrize("n", [128, 256, 512])
-@pytest.mark.parametrize("k", [128, 256, 512])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass", "cute-dsl", "b12x"])
-@pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
@@ -136,19 +158,20 @@ def test_mm_fp4(
     )
 
 
-# Split tests for checking auto functionality
-@pytest.mark.parametrize("m", [1, 48, 256, 512])
-@pytest.mark.parametrize("n", [256, 512])
-@pytest.mark.parametrize("k", [256, 512])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("use_128x4_sf_layout", [True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
-def test_mm_fp4_backend_auto(
-    m, n, k, res_dtype, use_128x4_sf_layout, auto_tuning, fp4_type
-):
+# Auto backend: one case per fp4_type, autotune on/off and boundary M covered.
+_AUTO_SMOKE_CASES = [
+    # m, n, k, res_dtype, auto_tuning, fp4_type
+    (1, 256, 512, torch.bfloat16, False, "nvfp4"),
+    (512, 512, 256, torch.float16, True, "nvfp4"),
+    (48, 512, 512, torch.bfloat16, True, "mxfp4"),
+    (256, 256, 256, torch.bfloat16, False, "mxfp4_alpha"),
+]
+
+
+@pytest.mark.parametrize("m,n,k,res_dtype,auto_tuning,fp4_type", _AUTO_SMOKE_CASES)
+def test_mm_fp4_backend_auto(m, n, k, res_dtype, auto_tuning, fp4_type):
     # Some test cases for auto backend.
-    _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
+    _test_mm_fp4(m, n, k, res_dtype, "auto", True, auto_tuning, fp4_type)
 
 
 # Regression (#3560): b12x must accept ragged K (real floor K%32==0, not tile_k=128).
