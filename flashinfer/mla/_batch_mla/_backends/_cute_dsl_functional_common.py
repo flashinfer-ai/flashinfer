@@ -402,6 +402,9 @@ class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
         sinks_key = (
             None if self.sinks is None else (tuple(self.sinks.shape), self.sinks.dtype)
         )
+        workspace_bytes = (
+            self.workspace_buffer.numel() * self.workspace_buffer.element_size()
+        )
         return (
             query.dtype,
             self.kv_cache.dtype,
@@ -411,6 +414,8 @@ class CuteDslMlaDecodeRunner(_FunctionalMLARunner):
             self.qk_rope_head_dim,
             self.page_size,
             next_positive_power_of_2(self.max_seq_len),
+            self.max_seq_len,
+            workspace_bytes,
             self.is_var_seq,
             self.uses_shared_paged_kv_idx,
             self.enable_pdl,

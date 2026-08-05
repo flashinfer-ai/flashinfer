@@ -127,6 +127,10 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAGeneratedFaMechanics):
         kv_data_type: torch.dtype,
         use_profiler: bool,
     ) -> None:
+        if use_profiler:
+            raise _BackendPlanUnsupportedError(
+                "use_profiler is not supported by the fa2 backend."
+            )
         if kv_data_type not in (torch.float16, torch.bfloat16):
             raise _BackendPlanUnsupportedError(
                 f"MLA kv_data_type {kv_data_type} is not supported by the fa2 "

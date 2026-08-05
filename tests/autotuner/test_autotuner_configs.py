@@ -977,6 +977,44 @@ class TestThreadSafety:
         assert tuner._active_tuning_contexts == 0, "reference count leak"
         assert len(errors) == 0, f"Errors in threads: {errors}"
 
+    def test_is_tuning_mode_uses_innermost_nested_context(self):
+        tuner = AutoTuner.get()
+
+        assert tuner.is_tuning_mode is False
+        with autotune(True):
+            assert tuner.is_tuning_mode is True
+            with autotune(False):
+                assert tuner.is_tuning_mode is False
+            assert tuner.is_tuning_mode is True
+        assert tuner.is_tuning_mode is False
+
+    def test_is_tuning_mode_explicit_false_overrides_other_thread(self):
+        import threading
+
+        tuner = AutoTuner.get()
+        tuning_entered = threading.Event()
+        release_tuning = threading.Event()
+
+        def tune_elsewhere():
+            with autotune(True):
+                tuning_entered.set()
+                assert release_tuning.wait(timeout=5)
+
+        thread = threading.Thread(target=tune_elsewhere)
+        thread.start()
+        assert tuning_entered.wait(timeout=5)
+        try:
+            assert tuner.is_tuning_mode is True
+            with autotune(False):
+                assert tuner.is_tuning_mode is False
+            assert tuner.is_tuning_mode is True
+        finally:
+            release_tuning.set()
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert tuner.is_tuning_mode is False
+
 
 # ---------------------------------------------------------------------------
 # Metadata compatibility: hard vs soft mismatch, cache healing
