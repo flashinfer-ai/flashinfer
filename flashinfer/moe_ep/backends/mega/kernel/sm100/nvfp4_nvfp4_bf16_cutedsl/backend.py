@@ -46,6 +46,8 @@ def _resolve_gate_up_clamp(
     "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
 )
 class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
@@ -213,9 +215,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.fc2_alpha.copy_(t.fc2_alpha)
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
-
-    def supports_output_view(self) -> bool:
-        return True
 
     def compute(
         self,
