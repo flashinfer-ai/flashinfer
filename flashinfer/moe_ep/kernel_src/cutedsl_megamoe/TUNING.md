@@ -188,7 +188,7 @@ runs used a faster-but-wrong load pattern and produced incorrect results
 (the old "uniform 1.5-1.7x at every token count" claim was this artifact).
 Caught by the torch-oracle tests
 (`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`); fixed in
-`backends/mega/kernel/nvfp4_cutedsl/weights.py` (K-major transpose views).
+`backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/weights.py` (K-major transpose views).
 `deep_gemm_mega` / `mxfp8_cutedsl` numbers were unaffected.  The corrected
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.

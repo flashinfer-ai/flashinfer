@@ -6,15 +6,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .....config import BootstrapConfig, FleetParams
-from .....core.kernel.base import MegaKernelBackend
-from .....core.kernel.registry import register_mega_kernel
-from .....core.validation.common import (
+from ......config import BootstrapConfig, FleetParams
+from ......core.kernel.base import MegaKernelBackend
+from ......core.kernel.registry import register_mega_kernel
+from ......core.validation.common import (
     validate_mega_arch,
     validate_mega_fleet_params,
     validate_mega_forward_inputs,
 )
-from .....weights import MoEWeightPack
+from ......weights import MoEWeightPack
 from .config import DeepGemmMegaMoeConfig
 from .staging import stage_mega_moe_inputs
 from .weights import (
@@ -24,7 +24,7 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
-    from .....tensors import MoEEpTensors
+    from ......tensors import MoEEpTensors
 
 
 @register_mega_kernel("deep_gemm_mega")

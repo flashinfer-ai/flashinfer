@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, Tuple
 
-from .....weights import MoEWeightPack, PrequantizedMoEWeights
+from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     import torch
@@ -43,7 +43,7 @@ def _fp8_data_dtype(kind: Sm90Fp8Kind) -> "torch.dtype":
     # Backend talks only to the pull_style_cutedsl_megakernel shim (never src/
     # directly); the package import also bootstraps sys.path for the kernel
     # packages.
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import kind_data_dtype
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -58,7 +58,7 @@ def _interleave_gate_up_8(
     axis must carry gate/up interleaved in blocks of 8 rows.
     """
     # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import Fp8GateUpInterleave
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import Fp8GateUpInterleave
 
     block = Fp8GateUpInterleave
     if intermediate_size % (2 * block) != 0:
@@ -116,7 +116,7 @@ def _swizzle_unit_e8m0_sf(
     """
     import torch
 
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
         _stack_byte_reinterpretable_tensors,
         to_blocked,
     )
@@ -148,7 +148,7 @@ def preprocess_mega_weights(
     import torch
 
     # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-    from .....core.validation.common import MoEEpConfigError
+    from ......core.validation.common import MoEEpConfigError
 
     if isinstance(weights, PrequantizedMoEWeights):
         # PORT NOTE: pre-quantized FP8 packs (per-expert or blockwise scales)
@@ -194,7 +194,7 @@ def preprocess_mega_weights(
     fc2_sf_parts: list["torch.Tensor"] = []
     for expert in range(num_experts):
         if blockwise:
-            from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
                 quantize_fp8_weight_block_nk,
             )
 
@@ -234,7 +234,7 @@ def preprocess_mega_weights(
 
     # Per-tensor: (E,) fp32 weight scales + (1,) fp32 static activation scales
     # (real dequant inputs), plus swizzled unit E8M0 placeholder SF planes.
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import ceil_div
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import ceil_div
 
     fc1_weight_dequant_scale = torch.cat(fc1_sf_parts).to(device)
     fc2_weight_dequant_scale = torch.cat(fc2_sf_parts).to(device)
@@ -260,7 +260,7 @@ def preprocess_mega_weights(
 
 def _check_leg_structure(transformed: object) -> None:
     """4-tuple-per-leg layout (this kernel carries the fp8 dequant scales)."""
-    from .....core.validation.common import MoEEpConfigError
+    from ......core.validation.common import MoEEpConfigError
 
     if not isinstance(transformed, tuple) or len(transformed) != 2:
         raise MoEEpConfigError(
@@ -295,8 +295,8 @@ def validate_transformed_mega_weights(
     """
     import torch
 
-    from .....core.validation.common import MoEEpConfigError
-    from ..weight_validation import check_transformed_weight_pair
+    from ......core.validation.common import MoEEpConfigError
+    from ...weight_validation import check_transformed_weight_pair
 
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
@@ -319,7 +319,7 @@ def validate_transformed_mega_weights(
         fc2_sf_shape = (local_experts, hidden_size // 128, intermediate_size // 128)
         sf_dtype = torch.float32
     else:
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import ceil_div
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import ceil_div
 
         fc1_sf_shape = (
             local_experts,
@@ -385,7 +385,7 @@ def _swizzled_flat_e8m0_size(rows: int, cols: int) -> int:
     import torch
 
     # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import to_blocked
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import to_blocked
 
     plain = torch.zeros(rows, cols, dtype=torch.float8_e8m0fnu)
     return to_blocked(plain).numel()

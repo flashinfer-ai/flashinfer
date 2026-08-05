@@ -200,7 +200,7 @@ def _mega_problem(
 
 def _preprocess_weights(problem: dict):
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -240,7 +240,7 @@ def _reference_sm90_fp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool =
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
@@ -387,7 +387,7 @@ def _run_mega_layer(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -622,7 +622,7 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel

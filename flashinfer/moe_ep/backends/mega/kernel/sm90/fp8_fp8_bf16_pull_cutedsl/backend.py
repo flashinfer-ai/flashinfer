@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .....config import BootstrapConfig, FleetParams
-from .....core.kernel.base import MegaKernelBackend
-from .....core.kernel.registry import register_mega_kernel
-from .....core.runtime import sm90_pull_fp8_runtime_requirements
-from .....core.validation.common import (
+from ......config import BootstrapConfig, FleetParams
+from ......core.kernel.base import MegaKernelBackend
+from ......core.kernel.registry import register_mega_kernel
+from ......core.runtime import sm90_pull_fp8_runtime_requirements
+from ......core.validation.common import (
     validate_mega_arch_sm90,
     validate_mega_fleet_params,
 )
-from .....weights import MoEWeightPack
+from ......weights import MoEWeightPack
 from .config import Sm90PullFp8MegaMoeConfig
 from .staging import (
     stage_mega_moe_inputs,
@@ -35,7 +35,7 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
-    from .....tensors import MoEEpTensors
+    from ......tensors import MoEEpTensors
 
 
 def _resolve_gate_up_clamp(config: Sm90PullFp8MegaMoeConfig) -> float | None:
@@ -113,7 +113,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the pull_style_cutedsl_megakernel shim (never
         # src/ directly).
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             get_symm_buffer_for_hopper_fp8_mega_moe,
         )
 
@@ -184,7 +184,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             # Pre-staged fp8 + scales: byte-copy into the symmetric buffers.
             # Backend talks only to the pull_style_cutedsl_megakernel shim.
             if k.fp8_scale_mode == "blockwise":
-                from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
                     Fp8BlockScaleK,
                 )
 
@@ -195,7 +195,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
                     t.scales[:num_tokens, :sf_cols].to(torch.float32)
                 )
             else:
-                from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
                     Fp8E8M0SfVecSize,
                     ceil_div,
                 )
@@ -229,7 +229,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         output: torch.Tensor | None,
     ) -> torch.Tensor:
         # Backend talks only to the pull_style_cutedsl_megakernel shim.
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             hopper_fp8_mega_moe,
         )
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .....core.validation.common import MoEEpConfigError
+from ......core.validation.common import MoEEpConfigError
 
 # E8M0 encodes 2^(byte - 127): byte 127 == 1.0.  The per-tensor SF wire plane
 # is dispatched but unused by GEMM dequantization; unit values match the drop
@@ -16,7 +16,7 @@ def _fp8_data_dtype(kind: str) -> torch.dtype:
     # Backend talks only to the pull_style_cutedsl_megakernel shim (never src/
     # directly); the package import also bootstraps sys.path for the kernel
     # packages.
-    from .....kernel_src.sm90.pull_style_cutedsl_megakernel import kind_data_dtype
+    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -77,7 +77,7 @@ def stage_mega_moe_inputs(
 
     if fp8_scale_mode == "blockwise":
         # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             Fp8BlockScaleK,
             quantize_fp8_per_token_block,
         )
@@ -135,7 +135,7 @@ def validate_sm90_fp8_forward_inputs(
     scales: torch.Tensor | None = None,
 ) -> None:
     """SM90 FP8 mega-path validation (bf16 staging or pre-staged fp8)."""
-    from .....core.validation.common import validate_mega_forward_inputs
+    from ......core.validation.common import validate_mega_forward_inputs
 
     if quantize_input:
         validate_mega_forward_inputs(
@@ -185,7 +185,7 @@ def validate_sm90_fp8_forward_inputs(
         )
     if blockwise:
         # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import Fp8BlockScaleK
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import Fp8BlockScaleK
 
         sf_cols = hidden // Fp8BlockScaleK
         if scales.dtype != torch.float32:
@@ -193,7 +193,7 @@ def validate_sm90_fp8_forward_inputs(
                 f"blockwise scales must have dtype torch.float32, got {scales.dtype}"
             )
     else:
-        from .....kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
             Fp8E8M0SfVecSize,
             ceil_div,
         )

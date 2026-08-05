@@ -195,10 +195,10 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     import torch
 
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig, preprocess_mega_weights
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 
@@ -498,10 +498,10 @@ def _run_mega_torch_oracle(rank, world_size):
         ensure_moe_ep_cuda_device,
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 

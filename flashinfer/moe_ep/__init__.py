@@ -38,19 +38,19 @@ from .algo_knobs import (
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
 )
-from .backends.mega.kernel.deep_gemm_mega import (
+from .backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm import (
     DeepGemmMegaMoeConfig,
     preprocess_mega_weights,
 )
-from .backends.mega.kernel.mxfp8_cutedsl import (
+from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Mxfp8CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
-from .backends.mega.kernel.nvfp4_cutedsl import (
+from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
-from .backends.mega.kernel.sm90_pull_fp8 import (
+from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90PullFp8MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )

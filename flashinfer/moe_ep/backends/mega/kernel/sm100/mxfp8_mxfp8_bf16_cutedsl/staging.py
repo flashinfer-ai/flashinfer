@@ -1,4 +1,4 @@
-"""Stage bf16 activations + routing into NVFP4 mega-MoE symmetric buffers."""
+"""Stage bf16 activations + routing into MXFP8 mega-MoE symmetric buffers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 
 import torch
 
-from .....core.validation.common import MoEEpConfigError
+from ......core.validation.common import MoEEpConfigError
 
 
 def _use_fused_stage() -> bool:
@@ -14,32 +14,39 @@ def _use_fused_stage() -> bool:
     return os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
 
 
+def _mxfp8_data_dtype(kind: str) -> torch.dtype:
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
+    # package import also bootstraps sys.path for the kernel packages.
+    from ......kernel_src.cutedsl_megamoe import kind_data_dtype
+
+    return kind_data_dtype(kind)
+
+
 def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    x_nvfp4: torch.Tensor,
+    x_fp8: torch.Tensor,
     x_sf: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
     *,
-    norm_const: float = 1.0,
+    kind: str = "mxfp8_e4m3",
 ) -> None:
-    """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
+    """bf16 ``hidden_states`` → MXFP8 activation + E8M0 block scales.
 
     Default path is the fused single-launch ``DataPreprocess`` staging kernel
     (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
     falls back to the original torch-composed staging below.
     """
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.sm100.cutedsl_megamoe import (
-        Nvfp4BlockSize,
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from ......kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
         fused_quant_stage_supported,
         note_staged_tokens,
-        nvfp4_quantize_per_block_16,
+        mxfp8_quantize_per_block_32,
         round_up,
     )
 
@@ -57,25 +64,25 @@ def stage_mega_moe_inputs(
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
     if _use_fused_stage() and fused_quant_stage_supported(
-        hidden_states, quant_type="nvfp4"
+        hidden_states, quant_type="mxfp8"
     ):
         fused_quant_stage(
             hidden_states,
             topk_ids,
             topk_weights,
-            x_nvfp4,
+            x_fp8,
             x_sf,
             topk_idx_out,
             topk_weights_out,
-            quant_type="nvfp4",
-            norm_const=norm_const,
+            quant_type=kind,
         )
         return
 
+    data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
-    q, sf = nvfp4_quantize_per_block_16(activation_fp32, norm_const)
+    q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
 
-    hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
+    hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
     if x_sf.shape[1] < hidden_sf_cols_padded:
         raise ValueError(
@@ -83,19 +90,19 @@ def stage_mega_moe_inputs(
             f"{hidden_sf_cols_padded}."
         )
 
-    x_nvfp4[:num_tokens].copy_(q)
+    x_fp8[:num_tokens].view(torch.uint8).copy_(q.view(torch.uint8))
     x_sf[:num_tokens].zero_()
-    x_sf[:num_tokens, :hidden_sf_cols].copy_(sf)
+    x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
 
-    capacity = x_nvfp4.shape[0]
+    capacity = x_fp8.shape[0]
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
     note_staged_tokens(topk_idx_out, num_tokens)
 
 
-def validate_nvfp4_forward_inputs(
+def validate_mxfp8_forward_inputs(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -103,10 +110,11 @@ def validate_nvfp4_forward_inputs(
     *,
     top_k: int,
     quantize_input: bool,
+    kind: str = "mxfp8_e4m3",
     scales: torch.Tensor | None = None,
 ) -> None:
-    """NVFP4 mega-path validation (bf16 staging or pre-staged NVFP4)."""
-    from .....core.validation.common import validate_mega_forward_inputs
+    """MXFP8 mega-path validation (bf16 staging or pre-staged fp8)."""
+    from ......core.validation.common import validate_mega_forward_inputs
 
     if quantize_input:
         validate_mega_forward_inputs(
@@ -119,8 +127,16 @@ def validate_nvfp4_forward_inputs(
         )
         return
 
+    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
+    from ......kernel_src.cutedsl_megamoe import (
+        Mxfp8BlockSize,
+        Mxfp8ScaleDtype,
+        ceil_div,
+    )
+
     num_tokens = hidden_states.shape[0]
     hidden = fleet_params.token_hidden_size
+    data_dtype = _mxfp8_data_dtype(kind)
     if scales is None:
         raise MoEEpConfigError(
             "MoEEpTensors.scales is required when MegaConfig.quantize_input=False"
@@ -130,15 +146,15 @@ def validate_nvfp4_forward_inputs(
             f"token count {num_tokens} exceeds "
             f"max_tokens_per_rank={fleet_params.max_tokens_per_rank}"
         )
-    if hidden % 2 != 0:
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != hidden:
         raise MoEEpConfigError(
-            f"token_hidden_size ({hidden}) must be even for NVFP4 packing"
+            f"pre-staged MXFP8 hidden_states must be 2D with shape "
+            f"[num_tokens, {hidden}], got {tuple(hidden_states.shape)}"
         )
-    packed_hidden = hidden // 2
-    if hidden_states.ndim != 2 or hidden_states.shape[1] != packed_hidden:
+    if hidden_states.dtype != data_dtype:
         raise MoEEpConfigError(
-            f"pre-staged NVFP4 hidden_states must be 2D with shape "
-            f"[num_tokens, {packed_hidden}], got {tuple(hidden_states.shape)}"
+            f"pre-staged MXFP8 hidden_states must have dtype {data_dtype}, "
+            f"got {hidden_states.dtype}"
         )
     if topk_ids.shape != (num_tokens, top_k):
         raise MoEEpConfigError(
@@ -148,13 +164,14 @@ def validate_nvfp4_forward_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
-
-    hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
+    hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     if scales.ndim != 2 or scales.shape[0] != num_tokens:
         raise MoEEpConfigError(
             f"scales must be 2D with leading dim {num_tokens}, got {tuple(scales.shape)}"
+        )
+    if scales.dtype != Mxfp8ScaleDtype:
+        raise MoEEpConfigError(
+            f"scales must have dtype {Mxfp8ScaleDtype}, got {scales.dtype}"
         )
     if scales.shape[1] < hidden_sf_cols:
         raise MoEEpConfigError(

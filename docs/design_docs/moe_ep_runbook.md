@@ -622,10 +622,10 @@ prefill chunks), per-role offline knob caches.
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. Kernel-team drops are
+under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
 vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
-- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo; a push-style tree will be added later)
 
@@ -692,7 +692,7 @@ caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
 Add both functions under the owning tree's `shim/` — e.g.
-`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`kernel_src/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
 `nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
 for Hopper — and re-export them from that package's `__init__.py` (or point at
 your own kernel module). Raw kernel sources live under the tree's `src/` — see

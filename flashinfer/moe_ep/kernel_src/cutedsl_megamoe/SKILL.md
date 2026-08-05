@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-kernel_src/sm100/cutedsl_megamoe/
+kernel_src/cutedsl_megamoe/
 ├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
@@ -42,7 +42,7 @@ from `src/` via sys.path (`shim/_paths.bootstrap_paths`).
 Layer isolation (enforce on every drop — grep before/after):
 - `shim/` is the **only** layer that imports `src/` packages (`common`,
   `moe_nvfp4_swapab`, `moe_mxfp8_glu`, `src`).
-- FI backends (`backends/mega/kernel/{nvfp4,mxfp8}_cutedsl/`) import kernel
+- FI backends (`backends/mega/kernel/sm100/{nvfp4_nvfp4,mxfp8_mxfp8}_bf16_cutedsl/`) import kernel
   helpers/constants/launch entry points **only** from the package `__init__`,
   never from `src/` directly.
 - `modes/` talk to backends only; `core/` never imports the kernel drop (its
@@ -62,9 +62,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 1. **Replace `src/` verbatim** with the drop's four kernel packages — no injected
    files, no edits (the drop is a full repo; copy only these four dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
+   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_mxfp8_glu,moe_nvfp4_swapab} \
-       flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/
+       flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).
@@ -124,7 +124,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 - `__init__.py` / `shim/` — our adapter layer. The public surface moe_ep depends on
   is `__init__.py`; keep it stable across kernel drops.
-- `backends/mega/kernel/nvfp4_cutedsl/` and `mxfp8_cutedsl/` — those are the FI backend
+- `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/` and `mxfp8_mxfp8_bf16_cutedsl/` — those are the FI backend
   wrappers; they import from the package (`__init__.py`) but are not part of this drop.
 - `core/runtime/bootstrap.py` — initializes NVSHMEM without touching this
   package (each tree's shim bootstraps its own `src/` paths at import; core

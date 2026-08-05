@@ -6,7 +6,7 @@ from typing import Tuple
 
 import torch
 
-from .....weights import MoEWeightPack, PrequantizedMoEWeights
+from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
 TransformedMegaWeights = Tuple[
     Tuple[torch.Tensor, torch.Tensor],
@@ -98,7 +98,7 @@ def validate_transformed_mega_weights(
     """One-time check for kernel-ready DeepGEMM fp4 weights (``preprocess_weights=False``)."""
     import torch
 
-    from .....core.validation.common import MoEEpConfigError
+    from ......core.validation.common import MoEEpConfigError
 
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")

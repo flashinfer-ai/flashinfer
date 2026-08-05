@@ -17,7 +17,7 @@ import dataclasses
 import pytest
 
 from flashinfer.moe_ep import Sm90PullFp8MegaMoeConfig
-from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8 import (
+from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90PullFp8MegaKernelBackend,
 )
 from flashinfer.moe_ep.core.kernel.registry import (

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_blackwell():
@@ -57,7 +57,7 @@ def _make_buffers(quant_type: str, capacity: int, hidden: int, topk: int):
     # reset the tail-fill memo for this (possibly reused) address so the
     # fused path treats the dirty buffer as fully live.
     topk_idx = torch.full((capacity, topk), 7, dtype=torch.int64, device="cuda")
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import note_staged_tokens
 
     note_staged_tokens(topk_idx, capacity)
     topk_weights = torch.zeros(capacity, topk, dtype=torch.float32, device="cuda")
@@ -83,7 +83,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
     hidden_states, topk_ids, topk_weights = batch
     x, sf, idx_out, w_out = buffers
     if quant_type == "nvfp4":
-        from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -98,7 +98,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
             norm_const=norm_const,
         )
     else:
-        from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -180,7 +180,7 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     _require_blackwell()
     pytest.importorskip("deep_gemm")
 
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 
@@ -222,7 +222,7 @@ def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
     """
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         fused_quant_stage,
         staged_tokens,
     )

@@ -154,7 +154,7 @@ def test_factory_returns_mega_for_mega_config(dist_not_initialized):
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpMegaLayer
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -177,7 +177,7 @@ def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
 
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         pytest.warns(UserWarning, match="fleet_knobs are ignored"),
     ):

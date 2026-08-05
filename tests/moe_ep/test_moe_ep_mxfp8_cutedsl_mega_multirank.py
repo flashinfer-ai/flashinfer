@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -33,9 +33,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -161,15 +161,15 @@ def _reference_mxfp8_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -231,12 +231,12 @@ def _reference_mxfp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -352,7 +352,7 @@ def _run_mega_layer(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -378,7 +378,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mxfp8_mega_moe,
             )
 
@@ -614,14 +614,14 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
@@ -784,7 +784,7 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 

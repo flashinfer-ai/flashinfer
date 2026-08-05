@@ -4,7 +4,7 @@
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -23,10 +23,11 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
-  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
+  backends/mega/kernel/sm100/{nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_nvfp4_bf16_deepgemm}
+  backends/mega/kernel/sm90/fp8_fp8_bf16_pull_cutedsl
+  kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
-    __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
+    __init__.py                ← public API consumed by the sm100 cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
@@ -36,6 +37,19 @@ moe_ep/
     shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
   modes/{split_layer,mega_layer,config}.py
 ```
+
+Layout rule — taxonomy vs provenance:
+
+- `backends/mega/kernel/` is organized by **taxonomy** (the user view):
+  `sm<arch>/<act_dtype>_<weight_dtype>_<out_dtype>_<kernel_style>/`. Backends are
+  thin adapters; several may wrap kernels from the same vendored repo.
+- `kernel_src/` is organized by **provenance** (the kernel-dev view): one
+  directory per upstream kernel repo snapshot, mirroring the vendor repo, with
+  `src/` verbatim, all adaptation in `shim/`, and a `VENDOR.md` recording the
+  upstream repo, pinned commit, sync date, and any pending local diffs. Never
+  hand-merge two upstream states into one directory. (`kernel_src/sm90/…` is a
+  separate snapshot of a fork and keeps its current path for now; fold it into
+  `cutedsl_megamoe/` if upstream merges the SM90 kernel.)
 
 Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; comm fleets register when their `fleet.py` is imported from `__init__.py`.
 
@@ -168,7 +182,7 @@ Raw megakernel or split-kernel configs cannot be passed as `backend=`; wrap in `
 See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-mega-kernel-backend) for a step-by-step example (frontend contract, config, registration).
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
-2. **Mega kernel** — `backends/mega/kernel/<name>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
+2. **Mega kernel** — `backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
 3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py`, `fleet.py`, `handle.py`; import fleet from `moe_ep.__init__.py`.
 
 ## Tests
