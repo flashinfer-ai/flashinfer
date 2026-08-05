@@ -137,14 +137,6 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
     CHECK_DEVICE(maybe_output_raw_indices.value(), input);
     CHECK_DIM(2, maybe_output_raw_indices.value());
     CHECK_SHAPE(maybe_output_raw_indices.value(), output_page_table);
-    const auto output_begin = reinterpret_cast<std::uintptr_t>(output_page_table.data_ptr());
-    const auto output_raw_begin =
-        reinterpret_cast<std::uintptr_t>(maybe_output_raw_indices.value().data_ptr());
-    const auto output_nbytes =
-        static_cast<std::uintptr_t>(output_page_table.numel()) * sizeof(int32_t);
-    TVM_FFI_ICHECK(output_begin + output_nbytes <= output_raw_begin ||
-                   output_raw_begin + output_nbytes <= output_begin)
-        << "output_page_table and output_raw_indices must not overlap";
   }
   if (maybe_row_states_buffer.has_value()) {
     CHECK_DEVICE(maybe_row_states_buffer.value(), input);

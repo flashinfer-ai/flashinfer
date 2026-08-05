@@ -820,15 +820,6 @@ def top_k_page_table_transform(
         )
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
-        if out is not None:
-            out_start = out.data_ptr()
-            out_raw_indices_start = out_raw_indices.data_ptr()
-            output_nbytes = out.numel() * out.element_size()
-            if max(out_start, out_raw_indices_start) < min(
-                out_start + output_nbytes,
-                out_raw_indices_start + output_nbytes,
-            ):
-                raise ValueError("out and out_raw_indices must not overlap")
 
     if (
         can_use_clusters_topk(

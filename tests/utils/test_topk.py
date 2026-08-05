@@ -21,7 +21,7 @@ import torch
 
 import flashinfer
 import flashinfer.utils as flashinfer_utils
-from flashinfer.topk import can_implement_filtered_topk, get_topk_module
+from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 
 
@@ -619,53 +619,6 @@ def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
         torch.sort(out_raw_indices, dim=-1).values,
         torch.sort(ref_raw_indices, dim=-1).values,
     )
-
-
-@pytest.mark.parametrize("page_size", [64])
-def test_top_k_page_table_transform_rejects_overlapping_buffers(page_size):
-    """Translated and raw output buffers must not alias each other."""
-    device = "cuda"
-    num_rows = 2
-    k = 16
-    max_len = k * page_size
-    scores = torch.zeros((num_rows, max_len), device=device, dtype=torch.float32)
-    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
-
-    overlapping_storage = torch.empty(
-        num_rows * k + 1, device=device, dtype=torch.int32
-    )
-    overlapping_out = overlapping_storage[:-1].view(num_rows, k)
-    overlapping_raw_indices = overlapping_storage[1:].view(num_rows, k)
-    src_page_table = torch.zeros((num_rows, k), device=device, dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="must not overlap"):
-        flashinfer.top_k_page_table_transform(
-            scores,
-            src_page_table,
-            lengths,
-            k,
-            page_size=page_size,
-            out=overlapping_out,
-            out_raw_indices=overlapping_raw_indices,
-        )
-
-    with pytest.raises(RuntimeError, match="must not overlap"):
-        get_topk_module().radix_topk_page_table_transform(
-            scores,
-            overlapping_out,
-            src_page_table,
-            None,
-            lengths,
-            None,
-            k,
-            False,
-            0,
-            page_size,
-            False,
-            row_starts=None,
-            page_table_row_starts=None,
-            output_raw_indices=overlapping_raw_indices,
-        )
 
 
 @pytest.mark.parametrize("page_size", [64])
