@@ -24,8 +24,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
+cu12 = ["nvidia-cutlass-dsl==4.7.0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.7.0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -102,6 +102,8 @@ strict_optional = false
 exclude = [
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
+  # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
+  "flashinfer/attention/prims_ts/kernels/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
@@ -111,7 +113,6 @@ exclude = [
   "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
   "build/",
 ]
-
 
 # CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
 # cutedsl_megamoe/src kernels are maintained upstream and re-dropped
