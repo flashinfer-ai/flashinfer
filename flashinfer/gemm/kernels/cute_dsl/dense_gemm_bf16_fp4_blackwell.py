@@ -216,10 +216,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                 f"(got tile_K={self.tile_shape_mnk[2]})"
             )
 
-        # occupancy > 1 splits the SMEM budget across that many co-resident
-        # CTAs per SM: ab_stage shrinks (less per-CTA latency hiding) but the
-        # resident-warp count multiplies, which is what large weight-bound
-        # grids need to cover DRAM latency (see _compute_stages).
+        # occupancy > 1 splits the SMEM budget across co-resident CTAs:
+        # ab_stage shrinks but resident warps multiply, which is what
+        # weight-bound grids need to cover DRAM latency (_compute_stages).
         self.occupancy = int(occupancy)
         if self.occupancy < 1:
             raise ValueError(f"occupancy must be >= 1 (got {occupancy})")
@@ -469,11 +468,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
             self.epi_smem_layout_staged,
             tile_sched_params,
         ).launch(
-            # No cluster dims: an explicit cluster launch (even 1x1x1) is
-            # scheduled by the cluster work distributor, whose co-residency
-            # cap sits below the block-occupancy limit on SM12x (measured:
-            # 2 clusters/SM where 3 CTAs fit) and would silently defeat
-            # occupancy > 2 tactics.
+            # No cluster dims: even a 1x1x1 cluster launch goes through the
+            # cluster work distributor, whose co-residency cap (2/SM where 3
+            # CTAs fit on SM12x) silently defeats occupancy > 2 tactics.
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             stream=stream,
@@ -768,9 +765,7 @@ class BlackwellDenseGemmBf16Fp4Kernel:
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                # Host enforces k_splits <= k_tiles, so every split owns
-                # >= 1 K-tile and the pipeline never waits on a stage the
-                # producer won't fill.
+                # k_splits <= k_tiles is checked at launch, so no split is empty.
                 if cutlass.const_expr(self.k_splits > 1):
                     tile_l, split_idx, k_start, k_len = self._split_work_krange(
                         tile_coord_mnl[2], k_tile_cnt
@@ -988,9 +983,8 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         )
 
                 if cutlass.const_expr(self.k_splits > 1):
-                    # Store alpha * acc as fp32 partials straight from
-                    # registers; staging through the output-dtype smem
-                    # buffer would round each split early.
+                    # Store fp32 partials straight from registers; staging through
+                    # the output-dtype smem buffer would round each split early.
                     m_actual = cute.size(mC_mnl, mode=[0])
                     n_actual = cute.size(mC_mnl, mode=[1])
                     cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
@@ -1048,16 +1042,15 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                         tcgc_for_tma_partition,
                     )
 
-                    # Iterate (epi_m, epi_n) explicitly, indexing tRS_rAcc
-                    # by (mma_m, mma_n) modes, so the loop works for any
-                    # epi_tile shape.
+                    # Index tRS_rAcc by (mma_m, mma_n) modes so the loop
+                    # works for any epi_tile shape.
                     epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
                     epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
                     epi_tile_m = self.epi_tile[0]
                     epi_tile_n = self.epi_tile[1]
-                    # tRS_rAcc holds one fragment per MMA-atom tile, so
-                    # dividing the CTA tile by its (mma_m, mma_n) mode
-                    # extents gives the per-atom tile size.
+                    # tRS_rAcc holds one fragment per MMA-atom tile, so dividing
+                    # the CTA tile by the (mma_m, mma_n) mode extents gives the
+                    # per-atom tile size.
                     mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
                     mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
                     MmaMPerEpiM = epi_tile_m // mma_tile_m
@@ -1075,9 +1068,9 @@ class BlackwellDenseGemmBf16Fp4Kernel:
                     m_actual = cute.size(mC_mnl, mode=[0])
                     cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
 
-                    # Skipped iterations must not advance the TMA-store
-                    # pipeline, so the stage index comes from kept_count,
-                    # not the loop indices.
+                    # Skipped iterations must not advance the TMA-store pipeline,
+                    # so the stage index comes from kept_count rather than the
+                    # loop indices.
                     kept_count = 0
                     for epi_n in cutlass.range_constexpr(epi_rest_n):
                         for epi_m in cutlass.range_constexpr(epi_rest_m):

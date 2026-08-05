@@ -82,11 +82,8 @@ def _select_bf16_fp4_tile_shape(
 def _select_bf16_fp4_k_splits(
     m: int, n: int, k: int, tile_shape_mnk: Tuple[int, int, int], sm_count: int
 ) -> int:
-    """Static split-K pick for the no-autotune fallback.
-
-    Conservative by design: only clear-win underfill grids get a split;
-    closer calls are left to the autotuner.
-    """
+    """Static split-K pick for the no-autotune fallback: only clear-win
+    underfill grids get a split, closer calls are left to the autotuner."""
     tile_m, tile_n, tile_k = tile_shape_mnk
     if tile_m != (16 if tile_k == 128 else 32):
         # Split only the tile shapes that the tactic space pairs with splits.
@@ -101,18 +98,16 @@ def _select_bf16_fp4_k_splits(
     return 1
 
 
-# Residency window for the stream GEMV, in warps per SM: below the floor
-# the grid cannot hide DRAM latency, far above the ceiling extra splits just
-# multiply partial-workspace traffic.
+# Stream-GEMV residency window (warps/SM): below the floor DRAM latency is
+# uncovered, far above the ceiling splits just multiply partial traffic.
 _GEMV_MIN_WARPS_PER_SM = 12
 _GEMV_MAX_WARPS_PER_SM = 96
 
 
 def _bf16_fp4_gemv_knee_split(n: int, k: int, sm_count: int) -> int:
-    """Smallest K-split reaching ~20 warps/SM: throughput saturates around
-    that residency, and splitting deeper only adds partial traffic.  Capped
-    just under one full wave of the kernel's 6 resident CTAs/SM
-    (1536-thread SM limit / 256) and at >= 4 K-tiles per split."""
+    """Smallest K-split reaching ~20 warps/SM, where throughput saturates
+    and deeper splits only add partial traffic; capped under one full wave
+    (6 CTAs/SM = 1536-thread limit / 256) and at >= 4 K-tiles per split."""
     ctas = -(-(n // 64) // 8)
     cap = max(1, min(int(0.95 * sm_count * 6 / ctas), (k // 16) // 4))
     return min(-(-20 * sm_count // (n // 64)), cap)
@@ -122,12 +117,8 @@ def _select_bf16_fp4_gemv_split(
     n: int, k: int, cc_major: int, sm_count: int
 ) -> Optional[int]:
     """m=1 no-autotune fallback pick: the stream GEMV where it applies,
-    ``None`` where the MMA heuristic should run instead.
-
-    Serving stacks do not tune every shape (vLLM's warmup autotune never
-    captures compute_logits, so lm_head always lands here), and the gemv
-    is the measured m=1 winner on every validated SM12x shape.
-    """
+    ``None`` for the MMA heuristic.  Serving stacks do not tune every
+    shape (vLLM never tunes the logits GEMM), so untuned m=1 matters."""
     if cc_major != 12 or n % 64 != 0 or k // 16 < 4:
         return None
     split = _bf16_fp4_gemv_knee_split(n, k, sm_count)
@@ -511,30 +502,24 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=8)
         add(64, (2, 2, 1), 1, 1, tile_n=128, swz=1)
 
-    # occupancy=2: two co-resident CTAs per SM (6 resident warps instead of
-    # 3) at half the ab_stage depth.  Large weight-bound grids are latency
-    # bound on resident warps (1 CTA x 3 warps cannot cover DRAM latency at
-    # production bandwidth), so trading pipeline depth for warps wins there;
-    # only offered when the m=1 grid has enough tiles to fill two CTAs on
-    # every SM of the largest deployment targets (~188 SMs needs n >= 24k;
-    # gate at 128 tiles so 5080-class parts qualify too).
+    # occupancy=2: two co-resident CTAs per SM at half the ab_stage depth
+    # (the kernel's occupancy note explains the trade).  The 128-tile gate
+    # fills two CTAs per SM on ~188-SM parts; 5080-class still qualifies.
     if tile_k == 128 and n // 64 >= 128:
         add(base_tile_m, base_atom, 1, 1, occ=2)
         add(base_tile_m, base_atom, 0, 1, occ=2)
 
-    # occupancy=2 x split-K: grids too small to fill two CTAs per SM on their
-    # own (the down-proj class, ~1 tile per SM) get there by splitting K, so
-    # both halves of a tile's K loop co-reside on one SM.  get_valid_tactics'
-    # makespan gate decides per device whether the pieces actually fit.
+    # occupancy=2 x split-K: grids too small to fill two CTAs per SM (the
+    # down-proj class) get there by splitting K; the makespan gate decides
+    # per device whether the pieces fit.
     if tile_k == 128 and n // 64 <= 256:
         k_tiles = k // tile_k
         for splits in (2, 4, 8):
             if splits <= k_tiles:
                 add(base_tile_m, base_atom, 1, 1, splits=splits, occ=2)
 
-    # occupancy=3: 9 resident warps per SM, matching Marlin's warp-level load
-    # parallelism.  Needs a 2-stage epilogue to keep 3 ab stages in the SMEM
-    # budget (paired in _get_cute_dsl_bf16_fp4_gemm).
+    # occupancy=3: 9 resident warps per SM; needs the 2-stage epilogue to
+    # keep 3 ab stages in SMEM (paired in _get_cute_dsl_bf16_fp4_gemm).
     if tile_k == 128 and n // 64 >= 128:
         add(base_tile_m, base_atom, 1, 1, occ=3)
 
@@ -580,9 +565,8 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             a, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            # sm_count pins the tactic-index space: the config list holds
-            # device-derived gemv splits, so a tuned index must not be
-            # replayed on a device with a different SM count.
+            # The config list holds device-derived gemv splits, so a tuned
+            # index must not replay on a different SM count.
             return (out_dtype, n, k, get_device_sm_count(a.device))
 
         def get_valid_tactics(
@@ -595,16 +579,15 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             k = int(b.shape[0]) * int(block_size)
             m_opt = int(profile.get_opt_shapes()[0][0])
             sm_count = get_device_sm_count(a.device)
-            # GEMV is validated only on SM12x; elsewhere keep the MMA path,
-            # since the autotuner ranks by time and would not catch a
-            # wrong-but-fast kernel on an unvalidated arch.
+            # GEMV is validated only on SM12x; the autotuner ranks by time
+            # and would not catch a wrong-but-fast kernel elsewhere.
             gemv_ok = get_compute_capability(a.device)[0] == 12
             configs = _bf16_fp4_cute_dsl_tactic_configs(n, k, sm_count)
 
             def split_reduces_makespan(cfg) -> bool:
-                # Offer a split only if it shrinks the last wave >= 25%:
-                # the autotuner's warm-cache timing hides the partials
-                # cost, so it cannot reject bad splits itself.
+                # Offer a split only if it shrinks the last wave >= 25%: the
+                # autotuner's warm-cache timing hides the partials cost, so it
+                # cannot reject bad splits itself.
                 splits = cfg[5]
                 if splits == 1:
                     return True
@@ -618,9 +601,8 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 return split_waves <= 0.75 * base_waves
 
             def gemv_valid(cfg) -> bool:
-                # m=1 only (the kernel computes one activation row; at
-                # m >= 2 the MMA path wins).  The m buckets round up, so
-                # only runtime m == 1 lands in the m_opt == 1 bucket.
+                # The m buckets round up, so only runtime m == 1 lands in
+                # the m_opt == 1 bucket.
                 if m_opt != 1 or not gemv_ok:
                     return False
                 warps_per_sm = (n // 64) * cfg[5] / sm_count
@@ -660,9 +642,8 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     raise ValueError(f"the gemv tactic requires m == 1, got m={m}")
                 splits = cfg[5]
             elif cfg is None and m == 1 and not do_preparation:
-                # do_preparation stays on the MMA heuristic: the autotuner
-                # issues it outside its per-tactic exception guard, so a
-                # gemv failure here would abort tuning for the whole op.
+                # Prep calls run outside the autotuner's per-tactic exception
+                # guard; a gemv failure there would abort the whole op.
                 splits = _select_bf16_fp4_gemv_split(
                     n,
                     k,

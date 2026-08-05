@@ -15,13 +15,11 @@ limitations under the License.
 
 Streaming W4A16 GEMV for SM12x: bf16 activation row x NVFP4 weights at m=1.
 
-The MMA kernel's design point (SMEM pipeline feeding tensor cores) is wrong
-for m=1: the problem is DRAM-bound and the tensor-core math is nearly free,
-so pipeline depth buys nothing while its SMEM cost caps resident warps.
-This kernel inverts the trade. Weights stream GMEM -> registers with no
-SMEM and no tensor cores, and latency is hidden by warp count alone
-(~48 resident warps/SM), which holds the DRAM-bandwidth ceiling at m=1
-where the MMA path falls short.
+The MMA kernel's design point (SMEM pipeline feeding tensor cores) is
+wrong for m=1: the problem is DRAM-bound and the math nearly free, so
+pipeline depth buys nothing while its SMEM cost caps resident warps.
+Here weights stream GMEM -> registers, no SMEM, no tensor cores, and
+latency is hidden by warp count alone (~48 resident warps/SM).
 """
 
 import cuda.bindings.driver as cuda
@@ -62,26 +60,21 @@ def _s0e5m3_to_f32(byte: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 class GemvBf16Fp4Sm12x:
-    """Streaming bf16 x nvfp4 GEMV over the cute-DSL backend's prepared
-    tensors: the tile-packed ``(K/16, N*2)`` int32 weight and the S0E5M3
-    ``(K/16, N)`` scales, the same operands the MMA kernel takes, so the
-    two dispatch freely per call.
+    """Streaming bf16 x nvfp4 GEMV over the same prepared operands as the
+    MMA kernel (tile-packed ``(K/16, N*2)`` int32 weight, S0E5M3 ``(K/16,
+    N)`` scales), so the two dispatch freely per call.
 
     Each warp owns one 64-wide N tile and streams its (16K x 64N) packed
-    tiles along K: 4 int32 per lane per tile is one contiguous 16B load,
-    so the warp consumes each 512B tile fully coalesced.  The pack's MMA
-    thread mapping then pins per lane which (k, n) each byte holds: lane
-    ``l`` covers n = base + {0,16,32,48} (base drawn from l) over half the
-    tile's K, and its xor-1 partner lane covers the other half, so four
-    f32 partials per lane plus one butterfly step complete each dot
-    product.  fp4 codes and scales decode with single hardware ops
-    (``cvt.f16x2.e2m1x2``, f16 bit-place) and accumulate in f32.
+    tiles along K, 4 int32 per lane as one coalesced 16B load.  The pack's
+    MMA thread mapping pins per lane which (k, n) each byte holds: lane
+    ``l`` covers n = base + {0,16,32,48} over half the tile's K, its xor-1
+    partner the other half, so four f32 partials per lane plus one
+    butterfly complete each dot product.
 
-    ``splits`` shards K across grid.y for grid fill (a 64-wide-tile grid
-    alone underfills large GPUs); split partials reuse the MMA kernel's
-    fp32-workspace + fixed-order reduce scheme, so results stay
-    deterministic.  m == 1 only: at m >= 2 the serial FMA chain scales
-    with m while the loads do not, and the MMA path wins.
+    ``splits`` shards K across grid.y for grid fill; partials reuse the
+    MMA kernel's fp32-workspace + fixed-order reduce, so results stay
+    deterministic.  m == 1 only: at m >= 2 the serial FMA chain grows with
+    m while the loads do not, and the MMA path wins.
     """
 
     _NUM_WARPS = 8  # one 64-wide N tile per warp
@@ -108,9 +101,8 @@ class GemvBf16Fp4Sm12x:
         mAlpha: cute.Tensor,  # (1,) f32
         stream: cuda.CUstream,
     ):
-        # M == 1 only: partials write at stride N but the reduce indexes at
-        # stride M*N, so they agree only at M == 1. Enforced host-side by the
-        # runner (the m != 1 guard in forward); M is symbolic here.
+        # M == 1 only: partials write at stride N but the reduce indexes
+        # at stride M*N.
         n_tiles = cute.size(mSF, mode=[1]) // self._TILE_N
         self.kernel(mA, mB, mSF, mC, mPartial, mAlpha).launch(
             grid=(
@@ -164,9 +156,8 @@ class GemvBf16Fp4Sm12x:
             kt0 = split * kt_per_split
             kt1 = cutlass.min(kt0 + kt_per_split, k_tiles)
 
-            # Lane-fixed slice of the pack mapping (see the class docstring):
-            # this lane's 16B load holds codes for n = base_n + {0,16,32,48}
-            # at k_half in 2*(lane%2) + {0,1,4,5}.
+            # This lane's 16B load holds codes for n = base_n + {0,16,32,48}
+            # at k_half in 2*(lane%2) + {0,1,4,5} (the pack's thread mapping).
             base_n = (lane // 16) * 8 + (lane % 16) // 2
 
             acc = cute.make_rmem_tensor((4,), Float32)
@@ -182,10 +173,8 @@ class GemvBf16Fp4Sm12x:
                     mB[kt, None], (self._I32_PER_LANE,), (nt * 32 + lane,)
                 )
                 cute.autovec_copy(w_chunk, wfrag)
-                # Each lane loads only its own 8 A values: k in
-                # 2*trh0 + {0..3} and 2*trh0 + {8..11} of the tile.  The
-                # lane parity lives in the address so the fragment indices
-                # below stay compile-time.
+                # Lane parity lives in the address so the fragment
+                # indices below stay compile-time.
                 for h in cutlass.range_constexpr(2):
                     a_chunk = cute.local_tile(
                         mA[0, None], (4,), (kt * 4 + 2 * h + (lane % 2),)
@@ -231,8 +220,7 @@ class GemvBf16Fp4Sm12x:
         mPartial: cute.Tensor,
         mC_mn: cute.Tensor,
     ):
-        """Sum the fp32 partials into C, one element per thread, in fixed
-        split order for determinism (same scheme as the MMA kernel)."""
+        """Sum the fp32 partials into C, one element per thread."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 

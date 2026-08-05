@@ -274,12 +274,8 @@ def test_backend_out_dtype_override(backend):
 @pytest.mark.parametrize("m,n,k", [(1, 2048, 7168), (16, 10304, 2688)])
 def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     """Every enumerated cute-dsl tactic matches the reference and is
-    run-to-run deterministic.
-
-    The autotuner only exercises the winning tactic, so non-default configs
-    need direct coverage.  Shapes cover even and uneven K splits plus
-    padded M rows.
-    """
+    run-to-run deterministic (the autotuner only exercises the winner).
+    Shapes cover even and uneven K splits plus padded M rows."""
     _skip_if_backend_unavailable("cute-dsl")
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
         _bf16_fp4_cute_dsl_tactic_configs,
@@ -368,9 +364,8 @@ def test_cute_dsl_gemv_fp16_out():
 
 
 def test_cute_dsl_fallback_gemv_selector():
-    """Pin the m=1 no-autotune gemv fallback (smallest split reaching
-    ~20 warps/SM).  Expected picks match the measured-best splits on
-    84/188-SM parts for the Qwen decode shapes."""
+    """Pin the m=1 gemv fallback: expected picks are the measured-best
+    splits on 84/188-SM parts for the Qwen decode shapes."""
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _select_bf16_fp4_gemv_split
 
     assert _select_bf16_fp4_gemv_split(34816, 5120, 12, 84) == 4
