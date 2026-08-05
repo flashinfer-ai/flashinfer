@@ -167,9 +167,10 @@ def iter_decorated_functions(
       pulls in every decorated method, so reporting class methods as MISSING
       against the module-level .rst would be a false positive.
     - ``"all"`` — every decorated FunctionDef anywhere in the AST, including
-      class methods. Used by the docstring / args checks which need to look at
-      method docstrings too. Class methods are reported under a synthetic
-      module path ``mod.ClassName`` so they don't collide with module-level
+      functions under module-level control flow and methods of nested classes.
+      Used by the docstring / args checks which need to look at method
+      docstrings too. Class methods are reported under a synthetic module path
+      ``mod.OuterClass.InnerClass`` so they don't collide with module-level
       functions sharing the same name.
 
     Skips files with syntax errors silently — matches existing checker behavior.
@@ -193,17 +194,21 @@ def iter_decorated_functions(
                 if is_decorated_with(node, decorator):
                     yield py_file, mod, node
         else:
-            for top in tree.body:
-                if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if is_decorated_with(top, decorator):
-                        yield py_file, mod, top
-                elif isinstance(top, ast.ClassDef):
-                    cls_mod = f"{mod}.{top.name}"
-                    for sub in top.body:
-                        if isinstance(
-                            sub, (ast.FunctionDef, ast.AsyncFunctionDef)
-                        ) and is_decorated_with(sub, decorator):
-                            yield py_file, cls_mod, sub
+
+            def visit(
+                parent: ast.AST, class_path: tuple[str, ...] = ()
+            ) -> Iterator[tuple[Path, str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+                for child in ast.iter_child_nodes(parent):
+                    if isinstance(child, ast.ClassDef):
+                        yield from visit(child, (*class_path, child.name))
+                        continue
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if is_decorated_with(child, decorator):
+                            owner = ".".join((mod, *class_path))
+                            yield py_file, owner, child
+                    yield from visit(child, class_path)
+
+            yield from visit(tree)
 
 
 def collect_module_alias_exports(

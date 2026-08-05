@@ -108,6 +108,7 @@ _ENV_VAR_EXCLUSIONS = {
 #   os.environ.get("X")            os.environ["X"]
 #   os.getenv("X")                 "X" in os.environ
 #   std::getenv("X")               getenv("X")
+#   ENV_NAME = "X"; os.environ.get(ENV_NAME)
 _ENV_VAR_READ_RE = re.compile(
     r"""(?xs)
     (?:
@@ -118,7 +119,33 @@ _ENV_VAR_READ_RE = re.compile(
     )
     """
 )
+_ENV_VAR_NAME_ASSIGNMENT_RE = re.compile(
+    r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*"
+    r"['\"](FLASHINFER_[A-Z][A-Z_0-9]*)['\"]"
+)
 _ENV_VAR_DOCREF_RE = re.compile(r"FLASHINFER_[A-Z][A-Z_0-9]*")
+
+
+def _env_var_reads(text: str) -> list[tuple[int, str]]:
+    """Return source offsets and names for direct and constant-aliased reads."""
+    reads = [
+        (match.start(), match.group(1) or match.group(2) or match.group(3))
+        for match in _ENV_VAR_READ_RE.finditer(text)
+    ]
+    assignments = {
+        match.group(1): match.group(2)
+        for match in _ENV_VAR_NAME_ASSIGNMENT_RE.finditer(text)
+    }
+    for variable, name in assignments.items():
+        variable_re = re.escape(variable)
+        indirect_read_re = re.compile(
+            rf"(?:os\.environ\.get|os\.getenv|std::getenv|getenv)"
+            rf"\(\s*{variable_re}\b"
+            rf"|os\.environ\[\s*{variable_re}\b"
+            rf"|\b{variable_re}\b\s+in\s+os\.environ"
+        )
+        reads.extend((match.start(), name) for match in indirect_read_re.finditer(text))
+    return sorted(set(reads))
 
 
 def collect_env_var_reads_in_code() -> dict[str, tuple[str, int]]:
@@ -136,12 +163,10 @@ def collect_env_var_reads_in_code() -> dict[str, tuple[str, int]]:
                 text = fp.read_text("utf-8", "replace")
             except Exception:
                 continue
-            for m in _ENV_VAR_READ_RE.finditer(text):
-                # Any of the alternation groups may have matched.
-                name = m.group(1) or m.group(2) or m.group(3)
+            for offset, name in _env_var_reads(text):
                 if name and name not in _ENV_VAR_EXCLUSIONS and name not in found:
                     path = str(fp.relative_to(FLASHINFER_ROOT))
-                    line = text.count("\n", 0, m.start()) + 1
+                    line = text.count("\n", 0, offset) + 1
                     found[name] = (path, line)
     return found
 
@@ -281,10 +306,47 @@ def check_supported_arch() -> list[Finding]:
 # quickref_paths_exist
 # ---------------------------------------------------------------------------
 
-# File-like tokens inside backticks: e.g. `flashinfer/aot.py`, `tests/foo`.
-_FILELIKE_RE = re.compile(
-    r"`([a-zA-Z_][a-zA-Z0-9_./-]*(?:/[a-zA-Z0-9_.][a-zA-Z0-9_./-]*)+)`"
+# Repo-relative path tokens. Directory paths must contain a slash; root files
+# must have a common source/config/document extension or a well-known basename.
+_PATH_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_./~-])"
+    r"("
+    r"(?:\.?[A-Za-z0-9_-][A-Za-z0-9_.-]*/)+(?:[A-Za-z0-9_.-]+)?"
+    r"|\.?(?:[A-Za-z0-9_-]+\.)+"
+    r"(?:py|md|rst|toml|ya?ml|json|txt|sh|cu|cuh|cc|cpp|h|hpp)"
+    r"|(?:Makefile|Dockerfile|LICENSE|NOTICE|CMakeLists\.txt|\.gitmodules)"
+    r")"
+    r"(?![A-Za-z0-9_./-])"
 )
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_REPO_PATH_PREFIXES = {
+    ".claude",
+    ".github",
+    "3rdparty",
+    "benchmarks",
+    "csrc",
+    "docker",
+    "docs",
+    "examples",
+    "flashinfer",
+    "include",
+    "scripts",
+    "tests",
+}
+_ROOT_FILE_NAMES = {
+    ".gitmodules",
+    ".pre-commit-config.yaml",
+    "CMakeLists.txt",
+    "Dockerfile",
+    "LICENSE",
+    "Makefile",
+    "NOTICE",
+    "README.md",
+    "build_backend.py",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+}
 
 # Path basenames that are obvious tutorial placeholders (e.g. "create
 # flashinfer/new_op.py" demonstrates the PATTERN, not a real file).
@@ -297,6 +359,7 @@ _PLACEHOLDER_PATH_TOKENS = (
     "scale.py",
     "bench_scale.py",
     "test_scale.py",
+    "tests/path/",
     "my_script.py",
     "mylog.txt",
 )
@@ -319,14 +382,44 @@ def _is_placeholder_path(path: str) -> bool:
     return False
 
 
+def _paths_in_fragment(fragment: str) -> list[str]:
+    """Extract plausible repo-relative paths from one Markdown fragment."""
+    paths: list[str] = []
+    for match in _PATH_TOKEN_RE.finditer(fragment):
+        path = match.group(1).rstrip("/.,;:")
+        prefix = fragment[max(0, match.start() - 3) : match.start()]
+        if prefix.endswith("://"):
+            continue
+        first_component = path.split("/", 1)[0]
+        if path not in _ROOT_FILE_NAMES and first_component not in _REPO_PATH_PREFIXES:
+            continue
+        paths.append(path)
+    return paths
+
+
+def iter_markdown_paths(text: str) -> list[str]:
+    """Extract paths from code spans, fenced code blocks, and table rows."""
+    paths: list[str] = []
+    for match in _INLINE_CODE_RE.finditer(text):
+        paths.extend(_paths_in_fragment(match.group(1)))
+
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or "|" in line:
+            paths.extend(_paths_in_fragment(_INLINE_CODE_RE.sub("", line)))
+    return list(dict.fromkeys(paths))
+
+
 def check_quickref_paths_exist() -> list[Finding]:
     if not CLAUDE_MD.exists():
         return []
     text = CLAUDE_MD.read_text("utf-8", "replace")
     out: list[Finding] = []
     seen: set[str] = set()
-    for m in _FILELIKE_RE.finditer(text):
-        path = m.group(1)
+    for path in iter_markdown_paths(text):
         # Skip URLs, glob-like patterns, env var demo strings
         if path.startswith(("http", "/")):
             continue
@@ -362,8 +455,6 @@ def check_quickref_paths_exist() -> list[Finding]:
 # skill_refs_exist
 # ---------------------------------------------------------------------------
 
-_SKILL_FILELIKE_RE = _FILELIKE_RE
-
 
 def check_skill_refs_exist() -> list[Finding]:
     out: list[Finding] = []
@@ -377,8 +468,7 @@ def check_skill_refs_exist() -> list[Finding]:
         except Exception:
             continue
 
-        for m in _SKILL_FILELIKE_RE.finditer(text):
-            path = m.group(1)
+        for path in iter_markdown_paths(text):
             if path.startswith(("http", "/")):
                 continue
             if any(ch in path for ch in ("*", "?")):
@@ -569,7 +659,8 @@ def main(argv: list[str]) -> int:
                 "findings": [asdict(f) for f in findings],
             },
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
     print(f"\nWrote: {out_json}")
 
@@ -595,7 +686,7 @@ def main(argv: list[str]) -> int:
         lines += ["", f"## {get_check(c).title} ({len(grp)} findings)", ""]
         for f in grp:
             lines.append(f"- **FAIL** `{f.location}` — {f.message}")
-    out_md.write_text("\n".join(lines))
+    out_md.write_text("\n".join(lines), encoding="utf-8")
     print(f"Wrote: {out_md}")
 
     return 0 if not findings else 1
