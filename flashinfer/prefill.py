@@ -1492,6 +1492,10 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
+    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+    _check_head_dim(q.shape[-1], out_head_dim)
+
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1544,8 +1548,6 @@ def single_prefill_with_kv_cache(
         else v.shape[-1]
     )
 
-    _check_head_dim(q.shape[-1], out_head_dim)
-
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -1557,6 +1559,8 @@ def single_prefill_with_kv_cache(
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
         )
+
+    _check_head_dim(q.shape[-1], out_head_dim, backend)
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -2519,6 +2523,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
