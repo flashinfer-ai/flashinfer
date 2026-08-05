@@ -120,9 +120,9 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            # Some runner constructors load or JIT-build their backend module.
-            # Reject incompatible quantization contracts before construction so
-            # an unrelated candidate cannot trigger that expensive side effect.
+            # Runners that have not migrated module loading to build() may
+            # still perform it in __init__. Keep this cheap common filter
+            # before construction during the incremental migration.
             if config.quant.variant not in runner_cls.supported_quant_variants:
                 continue
             runner = runner_cls(config, device=self.device)
@@ -130,6 +130,7 @@ class MoELayer:
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
+            runner.build()
             self.runners.append(runner)
 
         if not self.runners:

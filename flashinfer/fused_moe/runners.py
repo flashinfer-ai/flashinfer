@@ -195,6 +195,14 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
 
+    def build(self) -> None:
+        """Prepare backend resources after support has been validated.
+
+        Existing runners that finish initialization in ``__init__`` inherit
+        this no-op. Backends can migrate expensive module loading here
+        incrementally.
+        """
+
 
 # ---------------------------------------------------------------------------
 # CUTLASS runners — dense BF16 and mixed-input W4A16
@@ -229,10 +237,15 @@ class _CutlassRunnerBase(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not yet support expert parallelism."
             )
+        if self._device_arch not in self._supported_archs:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support "
+                f"SM{self._device_arch}; supported architectures are "
+                f"{self._supported_archs}."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         from ..utils import device_support_pdl, get_compute_capability
-        from .core import get_cutlass_fused_moe_module
 
         self.config = config
         self.device = torch.device(device)
@@ -242,20 +255,26 @@ class _CutlassRunnerBase(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
-        # Keep this runtime guard aligned with the concrete config's supported()
-        # check; quantization contracts need not share architecture coverage.
-        if self._device_arch not in self._supported_archs:
-            raise RuntimeError(
-                f"{type(self).__name__} does not support "
-                f"SM{self._device_arch}; supported architectures are "
-                f"{self._supported_archs}."
-            )
 
         enable_pdl = config.execution.enable_pdl
         if enable_pdl is None:
             enable_pdl = device_support_pdl(self.device)
         self._enable_pdl = enable_pdl
         self._use_fused_finalize = True
+        self._inner: Any = None
+
+        # pack_inputs replaces this with the current MoELayer token bucket.
+        self.tuning_config = TuningConfig()
+        self._workspace: torch.Tensor | None = None
+        self._workspace_num_tokens = 0
+        self._workspace_hidden_size: int | None = None
+
+    def build(self) -> None:
+        """Load the CUTLASS module and create the inner runner once."""
+        if self._inner is not None:
+            return
+
+        from .core import get_cutlass_fused_moe_module
 
         with torch.cuda.device(self.device):
             module = get_cutlass_fused_moe_module(str(self._device_arch))
@@ -263,7 +282,7 @@ class _CutlassRunnerBase(MoERunner):
                 x_dtype=torch.bfloat16,
                 weight_dtype=self._weight_dtype,
                 output_dtype=torch.bfloat16,
-                top_k=config.routing.top_k,
+                top_k=self.config.routing.top_k,
                 tp_size=1,
                 tp_rank=0,
                 ep_size=1,
@@ -276,18 +295,17 @@ class _CutlassRunnerBase(MoERunner):
                 use_mxfp8_act_scaling=False,
                 min_latency_mode=False,
                 enable_pdl=self._enable_pdl,
-                activation_type=config.activation.type,
+                activation_type=self.config.activation.type,
                 use_packed_weights=False,
                 use_fused_finalize=self._use_fused_finalize,
                 use_wfp4afp8_humming=False,
             )
 
-        # pack_inputs replaces this with the current MoELayer token bucket.
-        self.tuning_config = TuningConfig()
-        self._workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
-        self._workspace: torch.Tensor | None = None
-        self._workspace_num_tokens = 0
-        self._workspace_hidden_size: int | None = None
+    def _ensure_built(self) -> None:
+        """Preserve direct-runner use while enforcing check-before-build."""
+        if self._inner is None:
+            self.check_support()
+            self.build()
 
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
@@ -307,6 +325,7 @@ class _CutlassRunnerBase(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._validate_input_count(inputs)
+        self._ensure_built()
         # The two GEMMs have independent tactic spaces. Preserve the legacy
         # O(n1+n2) tuning flow, then let the outer unified tuner profile only
         # the selected pair as one full-MoE candidate.
@@ -337,17 +356,23 @@ class _CutlassRunnerBase(MoERunner):
         return [(int(gemm1), int(gemm2))]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
-        key = (num_tokens, hidden_size)
-        workspace = self._workspace_cache.get(key)
-        if workspace is not None:
-            self._workspace = workspace
-            self._workspace_num_tokens = num_tokens
-            self._workspace_hidden_size = hidden_size
+        if num_tokens > self.config.execution.tune_max_num_tokens:
+            raise ValueError(
+                f"workspace num_tokens={num_tokens} exceeds tune_max_num_tokens="
+                f"{self.config.execution.tune_max_num_tokens}."
+            )
+        if self._workspace is not None:
+            if hidden_size != self._workspace_hidden_size:
+                raise ValueError(
+                    "CUTLASS runner hidden_size changed after workspace allocation: "
+                    f"{self._workspace_hidden_size} -> {hidden_size}."
+                )
             return
         from .core import cutlass_fused_moe_workspace_size
 
+        max_num_tokens = self.config.execution.tune_max_num_tokens
         size = cutlass_fused_moe_workspace_size(
-            num_tokens,
+            max_num_tokens,
             hidden_size,
             self.config.experts.intermediate_size,
             self.config.routing.num_experts,
@@ -360,12 +385,8 @@ class _CutlassRunnerBase(MoERunner):
             use_fused_finalize=self._use_fused_finalize,
             device=self.device,
         )
-        workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
-        # Keep every allocation alive: a captured CUDA graph retains the raw
-        # pointer even after a later call activates a different token bucket.
-        self._workspace_cache[key] = workspace
-        self._workspace = workspace
-        self._workspace_num_tokens = num_tokens
+        self._workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._workspace_num_tokens = max_num_tokens
         self._workspace_hidden_size = hidden_size
 
     def pack_inputs(
@@ -472,6 +493,7 @@ class _CutlassRunnerBase(MoERunner):
         self._validate_input_count(inputs)
         if self._workspace is None:
             raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
+        self._ensure_built()
         if tactic == -1:
             profile_ids = [-1, -1]
         elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
@@ -501,9 +523,7 @@ class _CutlassRunnerBase(MoERunner):
             )
             return inputs[0]
 
-        # A tuning override may leave a different profile bucket active. Select
-        # the workspace for the actual launch shape before passing its pointer
-        # to C++; cached allocations remain stable for captured CUDA graphs.
+        # Validate the launch shape against the stable maximum-sized workspace.
         num_tokens, hidden_size = inputs[1].shape
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
