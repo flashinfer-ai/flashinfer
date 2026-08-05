@@ -14,6 +14,7 @@
 
 import hashlib
 import re
+from types import SimpleNamespace
 
 import pytest
 from packaging.version import Version
@@ -124,6 +125,42 @@ _FROZEN_BODY_BEGIN = "// BEGIN FROZEN GENERATED BODY\n"
 _FROZEN_BODY_END = "// END FROZEN GENERATED BODY\n"
 _VOLATILE_TEMP = re.compile(r"\b_(bval|bits|addr)_([0-9]{6,})\b")
 
+_PHYSICAL_TARGET_CASES = [
+    *(
+        (
+            variant,
+            "sm100a",
+            (10, "0a"),
+            "-gencode=arch=compute_100a,code=sm_100a",
+            1000,
+        )
+        for variant in FROZEN_GENERATED_BODY_SHA256
+    ),
+    *(
+        (
+            variant,
+            "sm100f",
+            (10, "0f"),
+            "-gencode=arch=compute_100f,code=sm_100f",
+            100,
+        )
+        for variant in FROZEN_GENERATED_BODY_SHA256
+    ),
+    *(
+        (
+            variant,
+            "sm103a",
+            (10, "3a"),
+            "-gencode=arch=compute_103a,code=sm_103a",
+            1003,
+        )
+        for variant in (
+            "d128_t1_precomputed_direct_split16",
+            "d128_t1_precomputed_direct_split8",
+        )
+    ),
+]
+
 
 def _normalize_generated_body(source):
     source = source.replace("\r\n", "\n").replace("\r", "\n")
@@ -140,17 +177,23 @@ def _normalize_generated_body(source):
 
 
 @pytest.mark.parametrize(
-    ("variant", "body_hashes"),
-    FROZEN_GENERATED_BODY_SHA256.items(),
+    ("variant", "target", "target_arch", "expected_flag", "target_kind"),
+    _PHYSICAL_TARGET_CASES,
 )
 def test_flash_kda_decode_jit_spec_and_frozen_body(
-    monkeypatch, tmp_path, variant, body_hashes
+    monkeypatch,
+    tmp_path,
+    variant,
+    target,
+    target_arch,
+    expected_flag,
+    target_kind,
 ):
-    raw_sha256, normalized_sha256 = body_hashes
+    raw_sha256, normalized_sha256 = FROZEN_GENERATED_BODY_SHA256[variant]
     monkeypatch.setattr(
         jit_core.current_compilation_context,
         "TARGET_CUDA_ARCHS",
-        {(10, "0a")},
+        {target_arch},
     )
     monkeypatch.setattr(
         flash_kda_decode.jit_env,
@@ -159,21 +202,27 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     )
     flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
 
-    uri = flash_kda_decode.get_flash_kda_decode_uri(variant)
-    spec = flash_kda_decode.gen_flash_kda_decode_module(variant)
+    uri = flash_kda_decode.get_flash_kda_decode_uri(variant, target)
+    spec = flash_kda_decode.gen_flash_kda_decode_module(variant, target)
 
-    assert uri == f"flash_kda_decode_{variant}_sm100a"
+    assert uri == f"flash_kda_decode_{variant}_{target}"
     assert spec.name == uri
     assert len(spec.sources) == 1
     assert spec.sources[0] == tmp_path / uri / "flashkda_decode_binding.cu"
     assert spec.sources[0].is_file()
-    assert "-gencode=arch=compute_100a,code=sm_100a" in spec.extra_cuda_cflags
+    assert expected_flag in spec.extra_cuda_cflags
+    target_defines = [
+        flag
+        for flag in spec.extra_cuda_cflags
+        if flag.startswith("-DFLASHINFER_FLASH_KDA_DECODE_TARGET_KIND=")
+    ]
+    assert target_defines == [
+        f"-DFLASHINFER_FLASH_KDA_DECODE_TARGET_KIND={target_kind}"
+    ]
     assert "-use_fast_math" in spec.extra_cuda_cflags
     assert "--maxrregcount=128" in spec.extra_cuda_cflags
-    assert not any(
-        "compute_103" in flag or "compute_120" in flag
-        for flag in spec.extra_cuda_cflags
-    )
+    assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
+    assert not any("compute_120" in flag for flag in spec.extra_cuda_cflags)
 
     frozen_source = flash_kda_decode._get_csrc_dir() / f"flashkda_decode_{variant}.cu"
     frozen_text = frozen_source.read_text()
@@ -236,6 +285,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
         "#define FLASHKDA_DECODE_DIRECT_IMPL 1" in binding_text
     ) is metadata.direct_impl
     assert '#include "flashkda_decode_binding.cuh"' in binding_text
+    flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
 
 
 def test_flash_kda_decode_binding_contract():
@@ -249,7 +299,13 @@ def test_flash_kda_decode_binding_contract():
     assert "#include FLASHKDA_DECODE_BODY_FILE" in binding
     assert "#ifdef FLASHKDA_DECODE_DIRECT_IMPL" in binding
     assert '#include "flashkda_decode_binding_direct_impl.cuh"' in binding
-    assert "CheckExactSm100a" in common
+    assert "#ifndef FLASHINFER_FLASH_KDA_DECODE_TARGET_KIND" in common
+    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeFamilyTarget" in common
+    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM100aTarget" in common
+    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM103aTarget" in common
+    assert "major == 10 && (minor == 0 || minor == 3)" in common
+    assert "major == 10 && minor == expected_minor" in common
+    assert "CheckFlashKDADecodeTarget(device_id)" in common
     assert "struct VariantTraits" in common
     assert "static_assert(Tokens >= 1)" in common
     assert "ValueSplit == 16" in common
@@ -331,16 +387,18 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "d128_t6_precomputed_gram_split4": 192,
         "d128_t6_precomputed_gram_split8": 192,
     }
-    assert {
+    direct_variants = {
         variant
         for variant, metadata in (
             flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA.items()
         )
         if metadata.direct_impl
-    } == {
+    }
+    assert direct_variants == {
         "d128_t1_precomputed_direct_split16",
         "d128_t1_precomputed_direct_split8",
     }
+    assert set(flash_kda_decode.FLASH_KDA_DECODE_DIRECT_VARIANTS) == direct_variants
     for removed_variant in (
         "d128_t4_precomputed",
         "d128_t5_precomputed",
@@ -348,31 +406,81 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
         "d128_t5_precomputed_gram_split3",
     ):
         with pytest.raises(ValueError, match="unsupported FlashKDA decode variant"):
-            flash_kda_decode.get_flash_kda_decode_uri(removed_variant)
-
+            flash_kda_decode.get_flash_kda_decode_uri(removed_variant, "sm100f")
+    with pytest.raises(ValueError, match="unsupported FlashKDA decode target"):
+        flash_kda_decode.get_flash_kda_decode_uri(expected_variants[0], "sm120a")
+    with pytest.raises(ValueError, match="only retained for direct T=1"):
+        flash_kda_decode.get_flash_kda_decode_uri(expected_variants[0], "sm103a")
     sentinel = object()
     monkeypatch.setattr(
         flash_kda_decode,
         "load_flash_kda_decode_module",
-        lambda variant: (sentinel, variant),
+        lambda variant, target: (sentinel, variant, target),
     )
     for variant in expected_variants:
-        assert flash_kda_decode.get_flash_kda_decode_module(variant) == (
+        assert flash_kda_decode.get_flash_kda_decode_module(variant, "sm100f") == (
             sentinel,
             variant,
+            "sm100f",
         )
 
 
+def test_flash_kda_decode_physical_targets_have_deliberate_cache_keys(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(10, "0a"), (10, "3a")},
+    )
+    monkeypatch.setattr(
+        flash_kda_decode.jit_env,
+        "FLASHINFER_GEN_SRC_DIR",
+        tmp_path,
+    )
+    flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
+
+    variant = flash_kda_decode.FLASH_KDA_DECODE_DIRECT_VARIANTS[0]
+    family = flash_kda_decode.gen_flash_kda_decode_module(variant, "sm100f")
+    cached_family = flash_kda_decode.gen_flash_kda_decode_module(variant, "sm100f")
+    legacy = flash_kda_decode.gen_flash_kda_decode_module(variant, "sm100a")
+    gb300_direct = flash_kda_decode.gen_flash_kda_decode_module(variant, "sm103a")
+
+    assert family is cached_family
+    assert len({family.name, legacy.name, gb300_direct.name}) == 3
+    assert family.name == f"flash_kda_decode_{variant}_sm100f"
+    assert legacy.name == f"flash_kda_decode_{variant}_sm100a"
+    assert gb300_direct.name == f"flash_kda_decode_{variant}_sm103a"
+    flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
+
+
 @pytest.mark.parametrize(
-    ("target_archs", "expected_exact"),
+    (
+        "target_archs",
+        "cuda_version",
+        "expected_legacy",
+        "expected_family",
+        "expected_sm103_direct",
+    ),
     [
-        ({(10, "0a")}, True),
-        ({(10, "0f")}, False),
-        ({(10, "3a")}, False),
-        ({(12, "0f")}, False),
+        ({(10, "0a")}, "12.8", True, False, False),
+        ({(10, "0a")}, "12.9", False, True, False),
+        ({(10, "0f")}, "13.0", False, True, False),
+        ({(10, "3a")}, "12.8", False, False, False),
+        ({(10, "3a")}, "12.9", False, True, True),
+        ({(10, "3f")}, "13.0", False, True, True),
+        ({(10, "0a"), (10, "3a")}, "13.0", False, True, True),
+        ({(12, "0f")}, "13.0", False, False, False),
     ],
 )
-def test_aot_detects_only_exact_sm100a(monkeypatch, target_archs, expected_exact):
+def test_aot_detects_flash_kda_decode_physical_targets(
+    monkeypatch,
+    target_archs,
+    cuda_version,
+    expected_legacy,
+    expected_family,
+    expected_sm103_direct,
+):
     from flashinfer import aot
 
     class FakeCompilationContext:
@@ -386,5 +494,95 @@ def test_aot_detects_only_exact_sm100a(monkeypatch, target_archs, expected_exact
             ]
 
     monkeypatch.setattr(aot, "CompilationContext", FakeCompilationContext)
-    monkeypatch.setattr(aot, "get_cuda_version", lambda: Version("13.0"))
-    assert aot.detect_sm_capabilities()["sm100a_exact"] is expected_exact
+    monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda_version))
+    capabilities = aot.detect_sm_capabilities()
+    assert capabilities["flash_kda_decode_sm100a_legacy"] is expected_legacy
+    assert capabilities["flash_kda_decode_sm100f"] is expected_family
+    assert capabilities["flash_kda_decode_sm103a_direct"] is expected_sm103_direct
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected_targets"),
+    [
+        (
+            {"flash_kda_decode_sm100a_legacy": True},
+            [
+                (variant, "sm100a")
+                for variant in flash_kda_decode.FLASH_KDA_DECODE_VARIANTS
+            ],
+        ),
+        (
+            {"flash_kda_decode_sm100f": True},
+            [
+                (variant, "sm100f")
+                for variant in flash_kda_decode.FLASH_KDA_DECODE_VARIANTS
+            ],
+        ),
+        (
+            {
+                "flash_kda_decode_sm100f": True,
+                "flash_kda_decode_sm103a_direct": True,
+            },
+            [
+                *[
+                    (variant, "sm100f")
+                    for variant in flash_kda_decode.FLASH_KDA_DECODE_VARIANTS
+                ],
+                *[
+                    (variant, "sm103a")
+                    for variant in flash_kda_decode.FLASH_KDA_DECODE_DIRECT_VARIANTS
+                ],
+            ],
+        ),
+    ],
+)
+def test_aot_registers_flash_kda_decode_physical_portfolio(
+    monkeypatch, capabilities, expected_targets
+):
+    from flashinfer import aot
+
+    calls = []
+
+    def fake_flash_kda_decode(variant, target):
+        calls.append((variant, target))
+        return SimpleNamespace(name=f"flash_kda_decode_{variant}_{target}")
+
+    monkeypatch.setattr(
+        aot,
+        "gen_flash_kda_decode_module",
+        fake_flash_kda_decode,
+    )
+    monkeypatch.setattr(
+        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
+    )
+    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
+    monkeypatch.setattr(
+        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
+    )
+
+    specs = aot.gen_all_modules(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        capabilities,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
+
+    assert calls == expected_targets
+    assert [spec.name for spec in specs] == [
+        "spdlog",
+        *(
+            f"flash_kda_decode_{variant}_{target}"
+            for variant, target in expected_targets
+        ),
+        "cudnn",
+    ]
