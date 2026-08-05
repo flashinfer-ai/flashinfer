@@ -25,7 +25,7 @@ import torch
 import flashinfer
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 # ---------------------------------------------------------------------------
 # Hardware / dependency gates
@@ -35,8 +35,12 @@ _HAS_QUACK = importlib.util.find_spec("quack") is not None
 
 pytestmark = [
     pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-        reason="VSA SM100 backend requires sm100a (Blackwell GPU)",
+        not torch.cuda.is_available()
+        or not (
+            is_sm100a_supported(torch.device("cuda"))
+            or is_sm110a_supported(torch.device("cuda"))
+        ),
+        reason="VSA SM100 backend requires SM100 or SM110 (Blackwell GPU)",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,
@@ -666,6 +670,29 @@ HEAD_DIM_BLK64 = 128  # blk64 kernel requires head_dim=128
 
 def _make_wrapper_blk64(workspace):
     return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
+
+
+def test_vsa_blk64_rejects_empty_rows(workspace):
+    """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    MB = NB = 4
+    M = N = MB * R64
+    num_heads = 8
+
+    # BSR path: first Q-block has no KV blocks (indptr[1] == indptr[0])
+    indptr = torch.tensor([0, 0, 2, 3, 4], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    wrapper = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper.plan(indptr, indices, M, N, R64, C64, num_heads, num_heads, HEAD_DIM_BLK64, q_data_type=dtype)
+
+    # block_mask path: second Q-block is all False
+    block_mask = torch.ones(num_heads, MB, NB, dtype=torch.bool, device=device)
+    block_mask[:, 1, :] = False
+    wrapper2 = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper2.plan(None, None, M, N, R64, C64, num_heads, num_heads, HEAD_DIM_BLK64, q_data_type=dtype, block_mask=block_mask)
 
 
 @pytest.mark.parametrize(

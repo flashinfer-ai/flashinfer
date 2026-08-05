@@ -49,14 +49,13 @@ fi
 # Install quack for the VSA SM100 (blk128) backend tests.
 # quack is NOT a runtime requirement of flashinfer — only users of the blk128
 # VSA backend need it, so it is intentionally kept out of requirements.txt and
-# installed here for CI only. The blk128 backend (and its tests, which are
-# gated on is_sm100a_supported) only run on Blackwell (SM 10.x), so we install
-# quack only when such a GPU is present to avoid slowing unrelated CI jobs.
-# Note: the quack package on PyPI is unrelated — install from source.
+# installed here for CI only. The blk128 backend supports SM100/SM110, so we
+# install quack only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The quack package on PyPI is unrelated — install from source.
 SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
-if [ "${SM_MAJOR}" = "10" ]; then
+if [ "${SM_MAJOR}" = "10" ] || [ "${SM_MAJOR}" = "11" ]; then
   echo "========================================"
-  echo "Detected Blackwell (SM 10.x); installing quack for VSA blk128 tests"
+  echo "Detected SM${SM_MAJOR} (SM100/SM110 Blackwell); installing quack for VSA blk128 tests"
   echo "========================================"
   pip install "git+https://github.com/Dao-AILab/quack.git"
   echo "quack install complete."

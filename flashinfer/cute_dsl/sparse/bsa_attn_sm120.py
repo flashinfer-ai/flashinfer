@@ -171,6 +171,11 @@ def bsa_attn_sm120_blk64_fwd(
     k = k.contiguous()
     v = v.contiguous()
 
+    if out is not None:
+        assert out.dtype == q.dtype, (
+            f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}): "
+            "the kernel reuses Q shared memory for the O epilogue and requires identical dtypes"
+        )
     if out is None:
         out = torch.empty(
             (batch, seqlen_q, num_heads, head_dim_v), dtype=q.dtype, device=q.device

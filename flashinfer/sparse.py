@@ -677,6 +677,13 @@ class BlockSparseAttentionWrapper:
                     indptr, indices, MB, NB, H, self.device, non_blocking
                 )
 
+            if self._vsa_q2k_num.min().item() == 0:
+                raise ValueError(
+                    "vsa_sm100_blk64 backend does not support empty sparse rows "
+                    "(Q-blocks with zero KV blocks). All Q-blocks must attend to "
+                    "at least one KV block."
+                )
+
             self.M = M
             self.N = N
             self.R = R

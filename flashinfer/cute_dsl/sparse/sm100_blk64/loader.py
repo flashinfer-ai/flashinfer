@@ -18,26 +18,14 @@ from pathlib import Path
 
 from torch.utils.cpp_extension import load
 
+import flashinfer.jit.env as jit_env
 
 _THIS_DIR = Path(__file__).resolve().parent
-
-
-def _get_cutlass_root() -> Path:
-    # Walk up from this file to find the flashinfer repo root, then 3rdparty/cutlass
-    root = _THIS_DIR
-    for _ in range(10):
-        candidate = root / "3rdparty" / "cutlass"
-        if candidate.is_dir():
-            return candidate
-        root = root.parent
-    raise RuntimeError("Could not locate 3rdparty/cutlass from sm100_blk64 loader")
 
 
 @lru_cache(maxsize=1)
 def load_blk64_ext():
     """JIT-compile and load the blk64 BSA forward kernel extension."""
-    cutlass_root = _get_cutlass_root()
-
     build_dir = (
         Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home()))
         / ".cache"
@@ -67,8 +55,7 @@ def load_blk64_ext():
         "-DCUDA_CTA_RECONFIG_ACTIVATED=1",
         "-gencode=arch=compute_100a,code=sm_100a",
         f"-I{_THIS_DIR}",
-        f"-I{cutlass_root / 'include'}",
-        f"-I{cutlass_root / 'tools' / 'util' / 'include'}",
+        *(f"-I{p}" for p in jit_env.CUTLASS_INCLUDE_DIRS),
     ]
 
     ext = load(

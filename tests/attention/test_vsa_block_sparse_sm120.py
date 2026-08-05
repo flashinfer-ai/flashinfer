@@ -404,6 +404,46 @@ def test_vsa_sm120_return_lse(dtype, num_blocks, num_heads, workspace):
     )
 
 
+def test_vsa_sm120_empty_row(workspace):
+    """Empty sparse rows (no KV blocks) must produce zero output and LSE=-inf."""
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    MB = NB = 4
+    M = N = MB * R
+    num_heads = 8
+
+    # BSR path: first Q-block has no KV blocks
+    indptr = torch.tensor([0, 0, 2, 3, 4], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    wrapper = _make_wrapper(workspace)
+    wrapper.plan(indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+
+    # Empty Q-block 0: output must be zero, LSE must be -inf
+    assert torch.all(out[:R] == 0), "empty row output should be zero"
+    assert torch.all(lse[:R].isinf() & (lse[:R] < 0)), "empty row LSE should be -inf"
+    # Non-empty rows must produce finite LSE
+    assert torch.all(lse[R:].isfinite()), "non-empty rows should have finite LSE"
+
+    # block_mask path: second Q-block is all False
+    block_mask = torch.ones(num_heads, MB, NB, dtype=torch.bool, device=device)
+    block_mask[:, 1, :] = False
+
+    wrapper2 = _make_wrapper(workspace)
+    wrapper2.plan(None, None, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype, block_mask=block_mask)
+    out2, lse2 = wrapper2.run(q, k, v, return_lse=True)
+
+    empty_slice = slice(R, 2 * R)
+    assert torch.all(out2[empty_slice] == 0), "empty row output should be zero (block_mask path)"
+    assert torch.all(lse2[empty_slice].isinf() & (lse2[empty_slice] < 0)), "empty row LSE should be -inf (block_mask path)"
+
+
 # ---------------------------------------------------------------------------
 # Variable KV-block count via block_mask
 # ---------------------------------------------------------------------------

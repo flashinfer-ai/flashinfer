@@ -476,6 +476,11 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tOrO_cvt.store(tOrO.load().to(self.O_dtype))
 
         # R2S, reusing Q smem for the TMA-store epilogue.
+        # Safe because: Q is fully in registers before the KV loop; O_dtype == Q_dtype
+        # so O_smem_layout is identical to Q_smem_layout (same tile, dtype, majorness,
+        # single stage); each warp writes exactly the M partition it previously read.
+        # sync_threads() below ensures R2S is complete before TMA store reads sO.
+        # Re-verify if O tile shape, O dtype, or PV warp layout ever changes.
         sO = shared_storage.Q_smem.get_tensor(
             O_smem_layout.outer, swizzle=O_smem_layout.inner
         )
