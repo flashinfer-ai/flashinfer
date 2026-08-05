@@ -22,12 +22,17 @@ from typing import Tuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.grouped_mm import moe_gemm_fp8_nt_groupwise
 from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import is_sm120a_supported
 
 CALC_DIFF_THRESHOLD = 1e-3
+# Gated (fused SwiGLU) uses a looser tolerance: the fp8 GEMM output is 2N (gate+up),
+# whose e4m3 quantization diff (~1.5e-3) dominates and is independent of the SwiGLU
+# fusion (verified: non-gated GEMM + torch SiLU gives the same diff).
+GATED_CALC_DIFF_THRESHOLD = 2e-3
 
 
 def skip_if_not_sm120():
@@ -79,7 +84,7 @@ def per_token_cast_to_fp8_for_moe_gemm(
     return x_fp8, padded
 
 
-def make_inputs(m_per_expert_list, n, k):
+def make_inputs(m_per_expert_list, n, k, is_gated=False):
     torch.random.manual_seed(0)
     num_experts = len(m_per_expert_list)
     offsets = [0]
@@ -87,9 +92,12 @@ def make_inputs(m_per_expert_list, n, k):
         offsets.append(offsets[-1] + m_pe)
     total_rows = offsets[-1]
 
+    # Gated (fused SwiGLU): b packs up (first n) + gate (second n) along N (2*n);
+    # output N stays n after up * SiLU(gate).
+    weight_n = 2 * n if is_gated else n
     a = torch.randn((total_rows, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn(
-        (num_experts, n, k), dtype=torch.bfloat16, device="cuda"
+        (num_experts, weight_n, k), dtype=torch.bfloat16, device="cuda"
     ) / math.sqrt(k)
     m_indptr = torch.tensor(offsets, dtype=torch.int32, device="cuda")
 
@@ -97,7 +105,11 @@ def make_inputs(m_per_expert_list, n, k):
     for i in range(num_experts):
         start, end = offsets[i], offsets[i + 1]
         if start < end:
-            ref[start:end] = a[start:end] @ b[i].t()
+            if is_gated:
+                gate_up = a[start:end] @ b[i].t()  # [rows, 2*n]
+                ref[start:end] = gate_up[:, :n] * F.silu(gate_up[:, n:])
+            else:
+                ref[start:end] = a[start:end] @ b[i].t()
 
     a_fp8, a_scale = per_token_cast_to_fp8_for_moe_gemm(a, m_indptr)
     b_fp8_list, b_sf_list = [], []
@@ -121,6 +133,20 @@ def test_moe_gemm_fp8_nt_groupwise(num_experts, rows_per_expert, n, k):
     out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr)
     diff = calc_diff(out.float(), ref.float())
     assert diff < CALC_DIFF_THRESHOLD, f"calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize("num_experts", [4, 8])
+@pytest.mark.parametrize("rows_per_expert", [1, 8, 192, 1024])
+@pytest.mark.parametrize("n,k", [(4096, 7168), (7168, 4096)])
+def test_moe_gemm_fp8_nt_groupwise_gated(num_experts, rows_per_expert, n, k):
+    skip_if_not_sm120()
+    a, b, a_scale, b_scale, m_indptr, ref = make_inputs(
+        [rows_per_expert] * num_experts, n, k, is_gated=True
+    )
+    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr, is_gated=True)
+    assert out.shape == (ref.shape[0], n)
+    diff = calc_diff(out.float(), ref.float())
+    assert diff < GATED_CALC_DIFF_THRESHOLD, f"gated calc_diff={diff:.6e}"
 
 
 @pytest.mark.parametrize(

@@ -16,9 +16,9 @@ include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
 
 # ── GEMM ──
-flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
-include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
-tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
+flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
+include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
+tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc
 
 # ── Grouped GEMM ──
 flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
@@ -32,8 +32,8 @@ include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv
 tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka
 
 # ── MOE_EP ──
-flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @agopal @Anerudhan @mhoqueanik @feih-nv @Aneureka
-tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @agopal @Anerudhan @mhoqueanik @feih-nv @Aneureka
+flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
+tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
 
 # ── Communication ──
 flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
@@ -55,14 +55,14 @@ flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jia
 tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
 
 # ── MAMBA ──
-csrc/checkpointing_ssu*         @kahyunnam @yzh119 @jimmyzho @ishovkun
-csrc/selective_state_update*    @kahyunnam @yzh119 @jimmyzho @ishovkun
-csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @jimmyzho @ishovkun
-flashinfer/jit/mamba/           @kahyunnam @yzh119 @jimmyzho @ishovkun
-flashinfer/mamba/               @kahyunnam @yzh119 @jimmyzho @ishovkun
-include/flashinfer/mamba/       @kahyunnam @yzh119 @jimmyzho @ishovkun
-tests/mamba/                    @kahyunnam @yzh119 @jimmyzho @ishovkun
+csrc/checkpointing_ssu*         @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+csrc/selective_state_update*    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+flashinfer/mamba/               @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
 
 # ── Autotuner ──
-‎flashinfer/autotuner.py                  @qiching
-‎tests/autotuner/test_autotuner_core.py   @qiching
+flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx
+tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx
