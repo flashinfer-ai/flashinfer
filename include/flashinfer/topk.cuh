@@ -1337,17 +1337,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
 
     // Stage 2: Collect indices with mode-specific epilogue (single pass)
     if constexpr (MODE == RadixTopKMode::Basic) {
-      if (output_values != nullptr) {
-        DType* row_output_values = output_values + row_idx * top_k_val;
-        collect_indices([&](uint32_t original_idx, OrderedType ordered_val, int pos) {
-          row_output[pos] = static_cast<IdType>(original_idx);
+      // Use a single collect_indices instantiation (one lambda type) with a runtime
+      // null-check on the value pointer. Instantiating collect_indices twice (a values
+      // and a no-values lambda) would give each its own __shared__ scan temp storage,
+      // doubling the deterministic collect's static shared memory and overflowing the
+      // per-block opt-in cap on GPUs with a smaller limit (Ada/sm_89: ~99KB), which
+      // fails the launch with cudaErrorInvalidValue.
+      DType* row_output_values =
+          (output_values != nullptr) ? output_values + row_idx * top_k_val : nullptr;
+      collect_indices([&](uint32_t original_idx, OrderedType ordered_val, int pos) {
+        row_output[pos] = static_cast<IdType>(original_idx);
+        if (row_output_values != nullptr) {
           row_output_values[pos] = Traits::FromOrdered(ordered_val);
-        });
-      } else {
-        collect_indices([&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
-          row_output[pos] = static_cast<IdType>(original_idx);
-        });
-      }
+        }
+      });
     } else if constexpr (MODE == RadixTopKMode::PageTableTransform) {
       uint32_t batch_idx = (row_to_batch != nullptr) ? row_to_batch[row_idx] : row_idx;
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
