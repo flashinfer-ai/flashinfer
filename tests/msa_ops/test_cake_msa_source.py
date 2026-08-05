@@ -64,21 +64,21 @@ _SOURCE_SHA256 = {
     "cake_msa_decode_m16_bf16_flat_binding.cu": "7cce6013f914c642e5f3243d9ed94c2f28773bdd28f7df775aea46438924436e",
     "cake_msa_decode_m16_bf16_paged.cu": "87ac97c531e8a7822e805eccfb6a65fbaf97b42ef0d0dc3715bc747646317fcb",
     "cake_msa_decode_m16_bf16_paged_binding.cu": "3a05f2bfb8550b692eae38921931d90f604e3ecefc7c2f246a24683bf7fd352a",
-    "cake_msa_prefill_m128_bf16_flat.cu": "93862a578172467b9de3003d355ca3a3edcab2624c001a8f80683a8aac412ac2",
+    "cake_msa_prefill_m128_bf16_flat.cu": "b369e18f44ab9d5a2746f7d61ed46becda5a3ffd20998937efe88623c545201b",
     "cake_msa_prefill_m128_bf16_flat_binding.cu": "d8654b6215ce53f4315281c5dd74ecd7d45848fc26475b3036249e885a7276f0",
-    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "e70a8c8ab606b42e82bd53fae5e9d2ebe14dd2b182a129100a53929b91ee7c38",
+    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "1480dd90326d0013c8b341cb8f3cf23401bd777f2801850680835a60440f69a1",
     "cake_msa_prefill_m128_bf16_gqa16_flat_binding.cu": "bc9cf4c038a87738c8e583fdc17450bd5982ea6190373f8c065f9ee6446c16a5",
-    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "30e1e1dab7dd2d3e3ebe35973bd5927e53f0b175cba027fef3179ad8b8c635b1",
+    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "40d521b397dc95a0d6c7361800a70c3dd2856a0b74da1b727f386d6e242e0d69",
     "cake_msa_prefill_m128_bf16_gqa16_paged_binding.cu": "b0cd93d959adb957fecea0eb3744cc98c5838cc642ff088ec6c7a19bab5d157b",
-    "cake_msa_prefill_m128_bf16_paged.cu": "413ed2585f1261372483060fad2bd97f236eb35b407489679d87398e75f007fa",
+    "cake_msa_prefill_m128_bf16_paged.cu": "e6abfda8ebaeff9dec13568136e46a7281975463b1b03ad883674338aa1239c8",
     "cake_msa_prefill_m128_bf16_paged_binding.cu": "f6c2ce95b6e78f94b7133ec8d9f2b3a0e2d7939a61be8c79e03e2bd2a4502df6",
-    "cake_msa_prefill_m128_fp16_flat.cu": "40b3d90f4d1516daef14872ef81bc5bf28ff8c6b92656339bcfece8a9de81724",
+    "cake_msa_prefill_m128_fp16_flat.cu": "b5164dbdfd82aa8d2b4270ad6b7e6644ef1574f368624f80af0b3e4d6bb0e272",
     "cake_msa_prefill_m128_fp16_flat_binding.cu": "c671e8d1e0fb3e7fb0b9ed768fff8e13c0ee262dafa15d3bb60f62ab6b7ead66",
-    "cake_msa_prefill_m128_fp16_paged.cu": "ae55ad52a12361d9f918912cbd36908ef87ff03df487d89e011ddb282cd5f364",
+    "cake_msa_prefill_m128_fp16_paged.cu": "32506262f63fddc97976bbe572fab19815f77c50991b93c9f59b47fffb87b5d7",
     "cake_msa_prefill_m128_fp16_paged_binding.cu": "e18556e08eba86c4442e49dbbe7f847ae1c82508e2318df531115698621c678a",
-    "cake_msa_prefill_m128_fp8_flat.cu": "4f5dfe55ef0919fb5ffbef9f55a5b75e19e1b4185d5b452eebca4b9aff966771",
+    "cake_msa_prefill_m128_fp8_flat.cu": "ccccf1aca0906c872553a6d11d009daa59effeb74621bef4e25334ca1be6b64d",
     "cake_msa_prefill_m128_fp8_flat_binding.cu": "b17fc25aeef6194c1a7b29cdd9538db619b8a04fc6f576fdc37722c977dd9c35",
-    "cake_msa_prefill_m128_fp8_paged.cu": "fdfd25d63ffc27c5498eedb620ce375a22badcc467cb53ca20ff4fecf83f10e7",
+    "cake_msa_prefill_m128_fp8_paged.cu": "a46e4c1c1dfd395be1656d4fabef451e0959914dda2574c0c2f2ca412fc95e22",
     "cake_msa_prefill_m128_fp8_paged_binding.cu": "3907d184e87291524f1765024e8af62bb65cd56fa59bbcbbfbc4c6342fc23907",
     "cake_msa_prefill_m64_bf16_flat.cu": "958874d056d9c0105b48fb84cf28dceca7fe1bba6b7ca61457b372a29d47bafc",
     "cake_msa_prefill_m64_bf16_flat_binding.cu": "f582a554274dd4e0ad03636eae98f31d955f68a740a5bfcd4033615dfecafada",
@@ -228,3 +228,17 @@ def test_cake_msa_tma_variants_use_grid_constant_tensor_map_parameters():
         assert not forbidden_storage, (
             f"{variant} uses forbidden tensor-map storage: {forbidden_storage}"
         )
+
+
+def test_cake_msa_m128_prefill_masks_empty_register_halves():
+    for variant in _VARIANTS:
+        if not variant.startswith("prefill_m128_"):
+            continue
+
+        device_source = (_CAKE_MSA_CSRC_DIR / _device_name(variant)).read_text(
+            encoding="utf-8"
+        )
+        assert device_source.count("if (body_valid < 64)") == 2
+        assert device_source.count("if (tail_valid < 64)") == 2
+        assert "body_valid > 0 && body_valid < 64" not in device_source
+        assert "tail_valid > 0 && tail_valid < 64" not in device_source
