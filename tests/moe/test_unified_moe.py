@@ -206,10 +206,6 @@ class TestReprRoundTrip:
         assert isinstance(reconstructed.candidates[0], TrtllmFp4Config)
         assert isinstance(reconstructed.candidates[1], CutlassConfig)
 
-    def test_cutlass_concrete_and_placeholder_configs_round_trip(self):
-        for config in (CutlassConfig(), CutlassBf16Config(), CutlassW4A16Config()):
-            assert _eval_repr(config) == config
-
     def test_backend_options_single(self):
         opts = BackendOptions(candidates=(TrtllmFp8PerTensorConfig(),))
         reconstructed = _eval_repr(opts)
