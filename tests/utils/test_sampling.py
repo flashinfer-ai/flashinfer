@@ -96,9 +96,7 @@ def test_validate_softmax_temperature_accepts_scalar(
         (torch.ones(3, dtype=torch.bool), "must have dtype"),
     ],
 )
-def test_validate_softmax_temperature_rejects_invalid_tensor(
-    temperature, error_match
-):
+def test_validate_softmax_temperature_rejects_invalid_tensor(temperature, error_match):
     logits = torch.empty((3, 5), dtype=torch.float32)
 
     with pytest.raises(ValueError, match=error_match):

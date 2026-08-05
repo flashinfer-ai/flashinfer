@@ -69,8 +69,7 @@ bool use_mr515_none_row(uint32_t rows) {
 }
 
 bool use_mr515_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
-                      float temperature_val, bool enable_pdl, int device_major,
-                      int device_minor) {
+                      float temperature_val, bool enable_pdl, int device_major, int device_minor) {
   if (device_major != 10 || device_minor != 3 || vocab_size != 32000) {
     return false;
   }
@@ -102,16 +101,16 @@ bool use_rowwise_kernel(uint32_t rows, uint32_t vocab_size, ParameterKind parame
          dense_aligned_high_row_wide || measured_large_odd;
 }
 
-SoftmaxRoute select_softmax_route(uint32_t rows, uint32_t vocab_size,
-                                  ParameterKind parameter_kind, float temperature_val,
-                                  bool enable_pdl, int device_major, int device_minor) {
+SoftmaxRoute select_softmax_route(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
+                                  float temperature_val, bool enable_pdl, int device_major,
+                                  int device_minor) {
   if (rows == 0 || vocab_size == 0 ||
       static_cast<uint64_t>(rows) * vocab_size >
           static_cast<uint64_t>(std::numeric_limits<int>::max())) {
     return SoftmaxRoute::kFallback;
   }
-  if (use_mr515_kernel(rows, vocab_size, parameter_kind, temperature_val, enable_pdl,
-                       device_major, device_minor)) {
+  if (use_mr515_kernel(rows, vocab_size, parameter_kind, temperature_val, enable_pdl, device_major,
+                       device_minor)) {
     return SoftmaxRoute::kMr515V32000T512;
   }
   if (use_warp_kernel(rows, vocab_size, parameter_kind)) {
@@ -209,8 +208,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
                     &vocab_size_i, &parameter_kind_i, &temperature_val};
     return launch_noncooperative_kernel(
         reinterpret_cast<const void*>(kernel_flashinfer_blackwell_softmax_followup_rowwise),
-        dim3(rows), dim3(kRowwiseThreads), args, kRowwiseDynamicSmemBytes,
-        launch_with_pdl, stream);
+        dim3(rows), dim3(kRowwiseThreads), args, kRowwiseDynamicSmemBytes, launch_with_pdl, stream);
   }
 
   int active_blocks_per_sm = 0;
@@ -228,7 +226,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   int device = 0;
   if ((status = cudaGetDevice(&device)) != cudaSuccess ||
       (status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device)) !=
-      cudaSuccess) {
+          cudaSuccess) {
     return status;
   }
 
@@ -311,17 +309,16 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
   int device_major = 0;
   int device_minor = 0;
   cudaError_t status = cudaDeviceGetAttribute(&device_major, cudaDevAttrComputeCapabilityMajor,
-                                               logits.device().device_id);
+                                              logits.device().device_id);
   if (status == cudaSuccess) {
     status = cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor,
                                     logits.device().device_id);
   }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Blackwell Softmax route query failed with error code " << cudaGetErrorString(status);
-  return select_softmax_route(static_cast<uint32_t>(logits.size(0)),
-                              static_cast<uint32_t>(logits.size(1)), parameter_kind,
-                              static_cast<float>(temperature_val), enable_pdl, device_major,
-                              device_minor);
+  return select_softmax_route(
+      static_cast<uint32_t>(logits.size(0)), static_cast<uint32_t>(logits.size(1)), parameter_kind,
+      static_cast<float>(temperature_val), enable_pdl, device_major, device_minor);
 }
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,
@@ -371,8 +368,7 @@ void blackwell_softmax(TensorView workspace_buffer, TensorView logits, TensorVie
 }
 
 int64_t blackwell_softmax_route(TensorView logits, Optional<TensorView> maybe_temperature_arr,
-                                double temperature_val, bool enable_pdl,
-                                bool temperature_is_none) {
+                                double temperature_val, bool enable_pdl, bool temperature_is_none) {
   return static_cast<int64_t>(query_softmax_route(logits, maybe_temperature_arr, temperature_val,
                                                   enable_pdl, temperature_is_none));
 }
