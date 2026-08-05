@@ -34,6 +34,11 @@ def test_manifest_preserves_production_prefix_and_freezes_coverage_rows():
 
 
 def test_manifest_records_complete_provenance_and_baseline_support():
+    assert set(benchmark.CORRECTNESS_TOLERANCES) == {
+        "bfloat16",
+        "float16",
+        "float8_e4m3fn",
+    }
     for shape in benchmark.SHAPE_MANIFEST:
         assert shape.stable_id
         assert shape.source

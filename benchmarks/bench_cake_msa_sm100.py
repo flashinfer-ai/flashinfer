@@ -66,6 +66,7 @@ SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 ACTIVITY_SCOPE = "first_to_last_correlated_gpu_activity_for_one_public_api_call"
 CORRECTNESS_TOLERANCES = {
     "bfloat16": {"atol": 1e-2, "rtol": 1e-2},
+    "float16": {"atol": 1e-2, "rtol": 1e-2},
     "float8_e4m3fn": {"atol": 0.1, "rtol": 0.1},
 }
 
