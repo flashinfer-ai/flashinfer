@@ -50,6 +50,7 @@ from flashinfer.utils import get_compute_capability
 FLASH_KDA_PEER_COMMIT = "d2ff19a6a0c82f39f796f637ebd1c36090b1268f"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
 DEFAULT_STATE_ROTATIONS = 512
+SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,24 @@ def _require_cupti() -> None:
     cupti_version = version("cupti-python")
     if int(cupti_version.split(".", 1)[0]) < 13:
         raise RuntimeError(f"cupti-python >= 13 is required, found {cupti_version}")
+
+
+def _hardware_metadata(device: torch.device) -> dict:
+    compute_capability = get_compute_capability(device)
+    properties = torch.cuda.get_device_properties(device)
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    return {
+        "device_name": properties.name,
+        "device_index": device_index,
+        "compute_capability": list(compute_capability),
+        "cuda_arch": SUPPORTED_FLASH_KDA_ARCHS[compute_capability],
+        "multiprocessor_count": properties.multi_processor_count,
+        "total_memory_bytes": properties.total_memory,
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -490,9 +509,23 @@ def main() -> None:
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
-        raise RuntimeError("frozen recurrent-KDA prefill requires B200 (cc 10.0)")
+    device = torch.device("cuda")
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in SUPPORTED_FLASH_KDA_ARCHS:
+        raise RuntimeError(
+            "frozen recurrent-KDA prefill requires exact CC 10.0 "
+            "(SM100a; B200/GB200) or CC 10.3 (SM103a; B300/GB300), "
+            f"got CC {compute_capability[0]}."
+            f"{compute_capability[1]}"
+        )
     _require_cupti()
+    hardware = _hardware_metadata(device)
+    print(
+        "Hardware: "
+        f"{hardware['device_name']} cc "
+        f"{hardware['compute_capability'][0]}."
+        f"{hardware['compute_capability'][1]} ({hardware['cuda_arch']})"
+    )
 
     flash_kda = None
     peer_provenance = None
@@ -518,7 +551,7 @@ def main() -> None:
             state_rotations=args.state_rotations,
             flash_kda=flash_kda,
         )
-        result = dict(prepared.metadata)
+        result = {**prepared.metadata, "hardware": hardware}
         if prepared.peer_raw_run is None:
             prepared.reset_state_pools()
             prepared.candidate_run()
