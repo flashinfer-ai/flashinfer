@@ -816,26 +816,50 @@ class TestB12xFunctional:
         )
 
     @pytest.mark.parametrize(
-        ("num_tokens", "expected_backend"),
-        [(4, "static"), (321, "dynamic")],
+        ("num_tokens", "num_experts", "expected_backend", "expected_tile_m"),
+        [
+            (4, 8, "static", None),
+            (321, 64, "dynamic", 16),
+            (321, 32, "dynamic", 32),
+            (321, 8, "dynamic", 64),
+            (321, 4, "dynamic", 128),
+        ],
     )
     def test_mxfp4_micro_and_dynamic_accuracy(
-        self, num_tokens: int, expected_backend: str
+        self,
+        num_tokens: int,
+        num_experts: int,
+        expected_backend: str,
+        expected_tile_m: int | None,
+        monkeypatch,
     ):
-        """MXFP4 must cover the micro subpath and queue-driven dynamic path."""
+        """MXFP4 covers MMA micro and every dynamic tile-M variant."""
         from flashinfer import b12x_fused_moe
-        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
-            select_sm120_moe_backend,
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        def reject_direct_micro(*args, **kwargs):
+            raise AssertionError("MXFP4 must not enter the NVFP4 direct-micro path")
+
+        monkeypatch.setattr(
+            moe_dispatch, "_get_direct_micro_kernel", reject_direct_micro
         )
+        select_sm120_moe_backend = moe_dispatch.select_sm120_moe_backend
 
         hidden_size = intermediate_size = 256
-        num_experts, top_k = 8, 2
+        top_k = 2
         assert (
             select_sm120_moe_backend(
                 num_tokens=num_tokens, num_topk=top_k, quant_mode="mxfp4"
             )
             == expected_backend
         )
+        if expected_tile_m is not None:
+            assert (
+                moe_dispatch._select_dynamic_tile_m(
+                    num_tokens * top_k, num_experts
+                )
+                == expected_tile_m
+            )
         tensors = create_b12x_mxfp4_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
