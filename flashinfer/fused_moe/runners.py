@@ -115,6 +115,14 @@ def _validate_prerouted_inputs(
         )
 
 
+def _pack_prerouted_topk_ids(act: MoEActivationPack) -> torch.Tensor:
+    """Pack global expert IDs and BF16 weight bits for TRTLLM routed APIs."""
+    if act.topk_ids is None or act.topk_weights is None:
+        raise ValueError("Packed routing requires topk_ids + topk_weights.")
+    weight_bits = act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    return ((act.topk_ids << 16) | (weight_bits & 0xFFFF)).contiguous()
+
+
 def _validate_logits_inputs(
     act: MoEActivationPack, num_tokens: int, num_experts: int, runner: str
 ) -> None:
@@ -147,6 +155,8 @@ def _validate_logits_inputs(
             f"({num_tokens}, {num_experts}) (num_tokens, num_experts) — "
             "routing scores are over the GLOBAL expert set."
         )
+    if not logits.is_contiguous():
+        raise ValueError(f"{runner}: routing_logits must be contiguous.")
     if act.routing_bias is not None:
         if act.routing_bias.dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(
@@ -158,6 +168,8 @@ def _validate_logits_inputs(
                 f"{runner}: routing_bias shape {tuple(act.routing_bias.shape)} "
                 f"!= ({num_experts},) (num_experts,)."
             )
+        if not act.routing_bias.is_contiguous():
+            raise ValueError(f"{runner}: routing_bias must be contiguous.")
 
 
 class MoERunner(TunableRunner):
@@ -344,14 +356,14 @@ class TrtllmFp4RoutedRunner(MoERunner):
         if variant in self.supported_quant_variants:
             from ..utils import get_compute_capability
 
-            # Direct-runner guard: NVFP4/MXFP4 support SM100/SM103. W4A16
-            # remains SM100-only, matching the upstream SM103 xfail in #1754.
+            # Direct-runner guard: #4280 relanded the SM107 cubins removed by
+            # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
+            # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
-            supported = (
-                compute_capability in ((10, 0), (10, 3))
-                if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
-                else compute_capability == (10, 0)
-            )
+            if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+                supported = compute_capability in ((10, 0), (10, 3), (10, 7))
+            else:
+                supported = compute_capability in ((10, 0), (10, 7))
             if not supported:
                 raise NotImplementedError(
                     f"TRTLLM {variant.name} is unsupported on "
@@ -639,11 +651,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            ids = act.topk_ids
-            weight_bf16_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
+            topk_ids = _pack_prerouted_topk_ids(act)
             # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
             # the raw op declares it non-Optional.  The high-level wrapper allocates
             # an empty bf16 placeholder here; we mirror that since we bypass it.
@@ -766,6 +774,16 @@ class TrtllmFp8BlockRunner(MoERunner):
         if not self.config.execution.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only do_finalize=True."
+            )
+        from ..utils import get_compute_capability
+        from .api import TrtllmFp8BlockConfig
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmFp8BlockConfig.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on validated "
+                f"SM100/SM103 targets, got sm{arch}."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -968,10 +986,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             )
             routing_logits = None
             routing_bias = None
-            weight_bits = (
-                act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-            )
-            topk_ids = (act.topk_ids << 16) | (weight_bits & 0xFFFF)
+            topk_ids = _pack_prerouted_topk_ids(act)
             expert_weights = act.topk_weights.new_empty(
                 (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
@@ -1032,7 +1047,7 @@ class TrtllmFp8BlockRunner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM per-tensor FP8 runner — E4M3 activations/weights, FromLogits only
+# TRTLLM per-tensor FP8 runner — E4M3 activations/weights
 # ---------------------------------------------------------------------------
 
 
@@ -1042,15 +1057,22 @@ class TrtllmFp8PerTensorRunner(MoERunner):
     The kernel consumes prequantized E4M3 activations and weights. Its calibrated
     activation/weight multipliers are folded into three per-expert FP32 epilogue
     scale vectors, so ``MoEActivationPack.hidden_states_scale`` remains ``None``.
+    Routing can be computed from logits or supplied as packed precomputed
+    ``(global_expert_id << 16) | bf16(weight)`` values.
     """
 
     backend_key = "trtllm_fp8_per_tensor"
-    supported_routing_modes = (RoutingInputMode.FromLogits,)
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
 
     def check_support(self) -> None:
         super().check_support()
         from ..tllm_enums import RoutingMethodType
+        from ..utils import get_compute_capability
+        from .api import TrtllmFp8PerTensorConfig
 
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
@@ -1066,6 +1088,13 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         ):
             raise ValueError(
                 f"{type(self).__name__} requires top_k=1 for Llama4 routing."
+            )
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmFp8PerTensorConfig.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on validated "
+                f"SM100/SM103 targets, got sm{arch}."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -1201,21 +1230,42 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         view = weights.get_view(self.backend_key)
         routing = self.config.routing
         num_tokens, hidden_size = act.hidden_states_q.shape
-        _validate_logits_inputs(
-            act, num_tokens, routing.num_experts, type(self).__name__
-        )
         self._validate_tensors(act, view, hidden_size)
 
-        routing_logits = act.routing_logits
         output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
         )
-        # These buffers are autotuner inputs and routing-kernel outputs. The
-        # per-tensor FFI itself selects FromLogits from its non-optional logits.
-        topk_ids = act.hidden_states_q.new_empty(
-            (num_tokens, routing.top_k), dtype=torch.int32
-        )
-        expert_weights = routing_logits.new_empty((num_tokens, routing.top_k))
+        routing_input_mode = act.routing_input_mode
+        if routing_input_mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, type(self).__name__
+            )
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            # The routing kernel writes BF16 expert weights regardless of
+            # whether routing_logits is BF16 or FP32.
+            topk_ids = act.hidden_states_q.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.int32
+            )
+            expert_weights = act.hidden_states_q.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, type(self).__name__
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = _pack_prerouted_topk_ids(act)
+            # The routed per-tensor op allocates its own expert-weight buffer
+            # and consumes only the packed topk_ids from this generic schema.
+            expert_weights = None
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only FromLogits and "
+                "PackedPrecomputed routing."
+            )
+
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -1227,7 +1277,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
             per_token_scale=None,
         )
         self._static_kwargs = dict(
-            routing_bias=act.routing_bias,
+            routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             output1_scales_scalar=view["output1_scales_scalar"],
             output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
@@ -1250,6 +1300,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         self.tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -1260,19 +1311,20 @@ class TrtllmFp8PerTensorRunner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM BF16 routed runner — canonical trtllm-gen MoERunner, bf16 dtypes
+# TRTLLM BF16 runner — canonical trtllm-gen MoERunner, bf16 dtypes
 # ---------------------------------------------------------------------------
 
 
 class TrtllmBf16RoutedRunner(MoERunner):
-    """Pre-routed BF16 adapter over the canonical trtllm-gen ``MoERunner``.
+    """BF16 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Mirrors :class:`TrtllmFp4RoutedRunner` but with ``Bfloat16`` activation +
     weight dtypes and no scale-factor tensors, wrapping the same inner
     ``MoERunner`` (whose ``forward`` dispatches to ``moe_op.trtllm_bf16_moe`` when
     ``dtype_weights == Bfloat16``).  Used for the EP grouped-GEMM bf16 path: the
     packed pre-routed ids carry ``(GLOBAL expert_id << 16) | bf16(weight)`` (with
-    ``local_expert_offset`` passed separately);
+    ``local_expert_offset`` passed separately), while ``FromLogits`` lets the
+    kernel compute routing from BF16 or FP32 logits;
     with the EP bridge's synthesized ``top_k=1`` + ``weight=1`` and
     ``do_finalize=True``, the output comes back in input row order.
 
@@ -1280,8 +1332,10 @@ class TrtllmBf16RoutedRunner(MoERunner):
     """
 
     backend_key = "trtllm_bf16_routed"
-    # The bf16 kernel supports FromLogits too; wiring it here is a follow-up.
-    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
     supported_quant_variants = (QuantVariant.BF16,)
 
     def check_support(self) -> None:
@@ -1289,6 +1343,19 @@ class TrtllmBf16RoutedRunner(MoERunner):
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only do_finalize=True."
+            )
+        from ..utils import get_compute_capability
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if arch not in (100, 103, 107):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on routed-MoE cubin "
+                f"targets SM100/SM103/SM107, got sm{arch}."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -1380,34 +1447,44 @@ class TrtllmBf16RoutedRunner(MoERunner):
         hidden_states = act.hidden_states_q  # raw bf16 on this path
         num_tokens, hidden_size = hidden_states.shape
 
-        if act.routing_input_mode != RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"TrtllmBf16RoutedRunner does not support "
-                f"routing_input_mode={act.routing_input_mode!r} "
-                "(only PackedPrecomputed is wired)."
+        routing_input_mode = act.routing_input_mode
+        if routing_input_mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, type(self).__name__
             )
-        # Packed pre-routed top-k ids: (GLOBAL expert_id << 16) | bf16(weight).
-        # The kernel expects GLOBAL ids and filters/maps them via the separately
-        # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
-        # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
-        # offset: on ranks with local_expert_offset>0 that yields a local id below
-        # the offset, which the kernel treats as non-local and skips → zero output.
-        _validate_prerouted_inputs(
-            act, num_tokens, routing.top_k, "TrtllmBf16RoutedRunner"
-        )
-        ids = act.topk_ids
-        weight_bf16_bits = (
-            act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-        )
-        topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            topk_ids = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.int32
+            )
+            # The BF16 routing kernel writes BF16 expert weights even for FP32
+            # routing logits.
+            expert_weights = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, type(self).__name__
+            )
+            routing_logits = None
+            routing_bias = None
+            # Keep global IDs intact. The kernel applies local_expert_offset;
+            # pre-subtracting it here would apply the offset twice and silently
+            # drop experts on nonzero-offset ranks.
+            topk_ids = _pack_prerouted_topk_ids(act)
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only FromLogits and "
+                "PackedPrecomputed routing."
+            )
 
         output = hidden_states.new_empty((num_tokens, hidden_size))
-        expert_weights = act.topk_weights.new_empty(
-            (num_tokens, routing.top_k), dtype=torch.bfloat16
-        )
         moe_inputs = MoeRunnerInputs(
             output=output,
-            routing_logits=None,
+            routing_logits=routing_logits,
             topk_ids=topk_ids,
             expert_weights=expert_weights,
             hidden_states=hidden_states,
@@ -1419,8 +1496,8 @@ class TrtllmBf16RoutedRunner(MoERunner):
         from ..tllm_enums import WeightLayout
 
         self._static_kwargs = dict(
-            routing_input_mode=RoutingInputMode.PackedPrecomputed,
-            routing_bias=None,
+            routing_input_mode=routing_input_mode,
+            routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
             gemm2_weights=v["gemm2_weights"],
             gemm1_alpha=v.get("gemm1_alpha"),
@@ -1436,13 +1513,16 @@ class TrtllmBf16RoutedRunner(MoERunner):
             weight_layout=int(WeightLayout.BlockMajorK),
             do_finalize=self.config.execution.do_finalize,
             enable_pdl=self._enable_pdl,
-            norm_topk_prob=False,
+            # Matches the canonical BF16 FromLogits wrapper. Precomputed
+            # routing ignores this flag because weights are already final.
+            norm_topk_prob=True,
         )
 
         self._ensure_inner(hidden_size)
         self.tuning_config = self._inner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -1450,6 +1530,300 @@ class TrtllmBf16RoutedRunner(MoERunner):
 
     def __hash__(self):
         return hash(("trtllm_bf16_routed",))
+
+
+# ---------------------------------------------------------------------------
+# TRTLLM MxInt4 runner — BF16 activations, packed INT4 BlockMajorK weights
+# ---------------------------------------------------------------------------
+
+
+class TrtllmMxInt4RoutedRunner(MoERunner):
+    """MxInt4 adapter over the canonical TRTLLM MoE runner."""
+
+    backend_key = "trtllm_mxint4_routed"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
+    supported_quant_variants = (QuantVariant.MxInt4,)
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only do_finalize=True."
+            )
+        from ..utils import get_compute_capability
+        from .api import TrtllmMxInt4Config
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmMxInt4Config.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on supported "
+                f"SM100/SM103/SM107 targets, got sm{arch}."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
+        from .core import get_trtllm_moe_sm100_module
+
+        self.config = config
+        self.device = device
+        self._module = get_trtllm_moe_sm100_module()
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        self._dtype_act = DtypeTrtllmGen.Bfloat16
+        self._dtype_weights = DtypeTrtllmGen.MxInt4
+        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        self._inner: Any = None
+        self._static_kwargs: dict = {}
+        self.tuning_config: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.BlockMajorK),
+            use_per_token_scaling=False,
+            num_experts=self.config.routing.num_experts,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
+        )
+        return inputs[0]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        from .core import MoeRunnerInputs
+
+        view = weights.get_view(self.backend_key)
+        routing = self.config.routing
+        hidden_states = act.hidden_states_q
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"{type(self).__name__}: hidden_states_q must be 2D BF16.")
+        if not hidden_states.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__}: hidden_states_q must be contiguous."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__}: hidden_states_scale must be None."
+            )
+        num_tokens, hidden_size = hidden_states.shape
+        if hidden_size % 256 != 0 or self._intermediate_size % 256 != 0:
+            raise ValueError(
+                f"{type(self).__name__}: hidden_size and intermediate_size "
+                "must be divisible by 256."
+            )
+        routing_input_mode = act.routing_input_mode
+        if routing_input_mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, type(self).__name__
+            )
+            if act.routing_logits.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"{type(self).__name__}: FromLogits currently requires "
+                    f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
+                )
+            if act.routing_bias is not None:
+                if act.routing_bias.dtype != torch.bfloat16:
+                    raise TypeError(
+                        f"{type(self).__name__}: routing_bias must be bfloat16, "
+                        f"got {act.routing_bias.dtype}."
+                    )
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            topk_ids = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.int32
+            )
+            expert_weights = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, type(self).__name__
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = _pack_prerouted_topk_ids(act)
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only FromLogits and "
+                "PackedPrecomputed routing."
+            )
+
+        required = (
+            "gemm1_weights",
+            "gemm1_weights_scale",
+            "gemm2_weights",
+            "gemm2_weights_scale",
+        )
+        missing = [key for key in required if key not in view]
+        if missing:
+            raise KeyError(f"{self.backend_key} weight view is missing {missing}.")
+        for key in required:
+            tensor = view[key]
+            if tensor.device != hidden_states.device:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} is on {tensor.device}, "
+                    f"expected {hidden_states.device}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+        if (
+            view["gemm1_weights"].dtype != torch.uint8
+            or view["gemm2_weights"].dtype != torch.uint8
+        ):
+            raise TypeError("MxInt4 packed weights must be uint8.")
+        if (
+            view["gemm1_weights_scale"].dtype != torch.bfloat16
+            or view["gemm2_weights_scale"].dtype != torch.bfloat16
+        ):
+            raise TypeError("MxInt4 weight scales must be bfloat16.")
+        expected_shapes = {
+            "gemm1_weights": (
+                self._num_local_experts,
+                hidden_size // 256,
+                2 * self._intermediate_size,
+                128,
+            ),
+            "gemm1_weights_scale": (
+                self._num_local_experts,
+                2 * self._intermediate_size * hidden_size // 32,
+            ),
+            "gemm2_weights": (
+                self._num_local_experts,
+                self._intermediate_size // 256,
+                hidden_size,
+                128,
+            ),
+            "gemm2_weights_scale": (
+                self._num_local_experts,
+                hidden_size * self._intermediate_size // 32,
+            ),
+        }
+        for key, expected in expected_shapes.items():
+            if tuple(view[key].shape) != expected:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} shape "
+                    f"{tuple(view[key].shape)} != expected {expected}."
+                )
+        for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            tensor = view.get(key)
+            if tensor is None:
+                continue
+            if tensor.device != hidden_states.device:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} is on {tensor.device}, "
+                    f"expected {hidden_states.device}."
+                )
+            if tensor.dtype != torch.float32:
+                raise TypeError(
+                    f"{type(self).__name__}: {key} must be float32, got {tensor.dtype}."
+                )
+            if tuple(tensor.shape) != (self._num_local_experts,):
+                raise ValueError(
+                    f"{type(self).__name__}: {key} shape {tuple(tensor.shape)} "
+                    f"!= expected ({self._num_local_experts},)."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+
+        output = hidden_states.new_empty((num_tokens, hidden_size))
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        self._static_kwargs = dict(
+            routing_bias=routing_bias,
+            gemm1_weights=view["gemm1_weights"],
+            gemm1_weights_scale=view["gemm1_weights_scale"],
+            gemm1_alpha=view.get("gemm1_alpha"),
+            gemm1_beta=view.get("gemm1_beta"),
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
+            gemm2_weights=view["gemm2_weights"],
+            gemm2_weights_scale=view["gemm2_weights_scale"],
+            num_experts=routing.num_experts,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method),
+            do_finalize=self.config.execution.do_finalize,
+            enable_pdl=self._enable_pdl,
+            norm_topk_prob=True,
+        )
+
+        self._ensure_inner(hidden_size)
+        self.tuning_config = self._inner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        return moe_inputs.to_list()
+
+    def __hash__(self):
+        return hash(("trtllm_mxint4_routed",))
 
 
 # ---------------------------------------------------------------------------

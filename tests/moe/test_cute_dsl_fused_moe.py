@@ -60,12 +60,12 @@ from .utils import (
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
+    CuteDSL MoE NVFP4 does not target Rubin SM107.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10
+    return (props.major, props.minor) in ((10, 0), (10, 3))
 
 
 # Skip decorators
@@ -74,7 +74,7 @@ cute_dsl_available = pytest.mark.skipif(
 )
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
-    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
+    reason="Requires CuteDSL MoE target SM100 or SM103",
 )
 
 

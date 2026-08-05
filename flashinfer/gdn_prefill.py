@@ -16,17 +16,18 @@ limitations under the License.
 
 import math
 import warnings
-from typing import Literal, Optional, Union, Tuple
+from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
-from .utils import get_compute_capability, get_device_sm_count
+from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
     cp_delta_rule_dsl_sm90,
+    cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
 )
 from .gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
@@ -48,6 +49,7 @@ def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
+    cuda_major: int,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -58,15 +60,21 @@ def _cp_delta_rule_rejection_reason(
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
 ) -> Optional[str]:
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
+    elif arch_major == 10:
+        if cuda_major < 13:
+            return "CP delta rule SM100 requires CUDA 13 or newer"
+        if cp_delta_rule_dsl_sm100 is None:
+            return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
-        return "CP delta rule is currently implemented only for SM90 and SM120"
+        return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -90,12 +98,20 @@ def _cp_delta_rule_rejection_reason(
         ("k", k),
         ("v", v),
         ("output", output),
-        ("initial_state", initial_state),
     ):
         if tensor is None:
             continue
         if not tensor.is_contiguous():
             return f"CP delta rule requires {name} to be contiguous"
+    if initial_state is not None:
+        if state_indices is None and not initial_state.is_contiguous():
+            return "CP delta rule requires initial_state to be contiguous"
+        if state_indices is not None and initial_state.stride()[1:] != (
+            initial_state.shape[2] * initial_state.shape[3],
+            initial_state.shape[3],
+            1,
+        ):
+            return "CP delta rule requires initial_state to be contiguous in [H, V, K]"
     return None
 
 
@@ -337,10 +353,14 @@ def chunk_gated_delta_rule(
 
     _sm_count = get_device_sm_count(device)
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _arch_major = get_compute_capability(device)[0]
-    _device_name = torch.cuda.get_device_properties(device).name
-    cp_heuristic_matches = _arch_major in (9, 12) and should_use_cp_host(
-        num_seqs * num_sab_heads, _sm_count, _device_name
+    _device_capability = get_compute_capability(device)
+    _arch_major = _device_capability[0]
+    _device_name = get_device_name(device)
+    cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
+        num_seqs * num_sab_heads,
+        _sm_count,
+        _device_name,
+        device_capability=_device_capability,
     )
     will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
     if state_indices is not None:
@@ -348,7 +368,7 @@ def chunk_gated_delta_rule(
         # CuTe-DSL kernel. Reject it on every other dispatch path (SM90, SM120,
         # or CP) rather than silently ignoring it and reading/writing the state
         # in packed, sequence-ordered layout.
-        if _arch_major != 10 or will_use_cp:
+        if _arch_major != 10:
             raise NotImplementedError(
                 "state_indices is only supported on the SM100/SM103 GDN prefill "
                 f"kernel (non-CP); got compute-capability major {_arch_major}, "
@@ -366,6 +386,7 @@ def chunk_gated_delta_rule(
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
+            cuda_major=_cuda_major,
             q=q,
             k=k,
             v=v,
@@ -376,6 +397,7 @@ def chunk_gated_delta_rule(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            state_indices=state_indices,
         )
         if cp_rejection_reason is not None:
             if use_cp is True:
@@ -387,7 +409,7 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
-            if output_state is None:
+            if output_final_state and output_state is None:
                 output_state = torch.empty(
                     (num_seqs, num_sab_heads, head_size, head_size),
                     dtype=torch.float32,
@@ -407,10 +429,17 @@ def chunk_gated_delta_rule(
                     total_seq_len, num_sab_heads, dtype=torch.float32, device=device
                 )
             )
-            cp_delta_rule_dsl = (
-                cp_delta_rule_dsl_sm90 if _arch_major == 9 else cp_delta_rule_dsl_sm120
+            cp_delta_rule_dsl = cast(
+                Callable[..., None],
+                {
+                    9: cp_delta_rule_dsl_sm90,
+                    10: cp_delta_rule_dsl_sm100,
+                    12: cp_delta_rule_dsl_sm120,
+                }[_arch_major],
             )
-            assert cp_delta_rule_dsl is not None
+            state_indices_kwargs = (
+                {"state_indices": state_indices} if state_indices is not None else {}
+            )
             cp_delta_rule_dsl(
                 output,
                 output_state,
@@ -419,10 +448,11 @@ def chunk_gated_delta_rule(
                 v,
                 _g,
                 _beta,
-                cu_seqlens.to(torch.int64),
+                cu_seqlens,
                 _scale,
                 initial_state=initial_state,
                 max_seqlen=total_seq_len,
+                **state_indices_kwargs,
             )
             if output_final_state:
                 return output, output_state

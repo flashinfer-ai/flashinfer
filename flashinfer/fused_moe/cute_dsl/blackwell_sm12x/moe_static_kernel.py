@@ -113,12 +113,13 @@ from flashinfer.cute_dsl.fp4_common import (
     quantize_block_fp4,
     quantize_block_fp4_fast,
     get_ptr_as_int64,
+    ld_shared_i32_relaxed,
     st_global_f32,
     st_global_i32,
     shared_ptr_to_u32,
     st_shared_u8,
     st_global_u64,
-    scatter_add_bf16x2,
+    scatter_add_v4_bf16x2,
 )
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
@@ -357,9 +358,10 @@ class MoEStaticKernel:
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
-        self.fast_math = fast_math
         self.activation = activation
         self.is_gated = is_gated_activation(activation)
+        # relu2's squared outputs need the exact quantizer and scale math.
+        self.fast_math = bool(fast_math) and self.is_gated
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
@@ -741,6 +743,9 @@ class MoEStaticKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
+            # A regular launch beside other stream work can admit only part
+            # of the grid, deadlocking the software grid barriers below.
+            cooperative=True,
             stream=stream,
         )
 
@@ -794,7 +799,7 @@ class MoEStaticKernel:
         _, _, gdim_z = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_cta_leader = Int32(1) if Int32(tidx) == Int32(0) else Int32(0)
+        is_cta_leader = Int32(Int32(tidx) == Int32(0))
 
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_a)
@@ -2032,15 +2037,14 @@ class MoEStaticKernel:
                             tRS_sD[(None, None, None, epi_buffer)],
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        # No cross-warp barrier needed before scatter:
-                        # StMatrix is warp-local, and each warp only reads
-                        # its own 64×64 quadrant of sC below.
+                        # The 8-wide reads from sC can cross another warp's
+                        # stores, so wait for all MMA warps.
+                        self.epilog_sync_barrier.arrive_and_wait()
 
                         rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
                         # Per-warp scatter: each warp scatters its own quadrant
-                        # of sC (64 M-rows × 64 N-cols). No cross-warp read
-                        # dependencies, so no pre-scatter barrier is needed.
+                        # of sC (64 M-rows × 64 N-cols).
                         warp_epi_rows = (
                             valid_rows - tile_m_base - rows_offset - warp_m_base
                         )
@@ -2049,50 +2053,90 @@ class MoEStaticKernel:
                         if warp_epi_rows < Int32(0):
                             warp_epi_rows = Int32(0)
 
-                        pair_idx = lane_id
-                        while pair_idx < warp_epi_rows * Int32(32):
-                            local_row = pair_idx >> Int32(5)  # / 32
-                            local_pair_col = pair_idx & Int32(31)  # % 32
-                            global_col = (
-                                tile_n_base_cur
-                                + warp_n_base
-                                + local_pair_col * Int32(2)
-                            )
+                        tile_vec_cols = Int32(64) // Int32(8)
+                        vec_idx = lane_id
+                        while vec_idx < warp_epi_rows * tile_vec_cols:
+                            local_row = vec_idx // tile_vec_cols
+                            local_vec_col = vec_idx - local_row * tile_vec_cols
+                            local_col = warp_n_base + local_vec_col * Int32(8)
+                            global_col = tile_n_base_cur + local_col
                             cached_row = rows_offset + warp_m_base + local_row
-                            # Only lane 0 loads tok/wv from gmem; broadcast via shuffle.
-                            tok = Int32(0)
-                            wv = cutlass.Float32(0.0)
-                            if lane_id == Int32(0):
-                                tok = _ld_shared_i32(
-                                    scatter_tok_base_addr + cached_row * Int32(4)
-                                )
-                                wv = _ld_shared_f32(
-                                    scatter_weight_base_addr + cached_row * Int32(4)
-                                )
-                            tok = cute.arch.shuffle_sync(tok, Int32(0))
-                            wv = cute.arch.shuffle_sync(wv, Int32(0))
+                            tok = ld_shared_i32_relaxed(
+                                scatter_tok_base_addr + cached_row * Int32(4)
+                            )
+                            wv = _ld_shared_f32(
+                                scatter_weight_base_addr + cached_row * Int32(4)
+                            )
                             sc_v0 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2),
+                                    local_col,
                                     epi_buffer,
                                 ]
                             )
                             sc_v1 = cutlass.Float32(
                                 sC[
                                     warp_m_base + local_row,
-                                    warp_n_base + local_pair_col * Int32(2) + Int32(1),
+                                    local_col + Int32(1),
                                     epi_buffer,
                                 ]
                             )
-                            scatter_add_bf16x2(
+                            sc_v2 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(2),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v3 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(3),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v4 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(4),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v5 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(5),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v6 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(6),
+                                    epi_buffer,
+                                ]
+                            )
+                            sc_v7 = cutlass.Float32(
+                                sC[
+                                    warp_m_base + local_row,
+                                    local_col + Int32(7),
+                                    epi_buffer,
+                                ]
+                            )
+                            scatter_add_v4_bf16x2(
                                 get_ptr_as_int64(
                                     scatter_output, tok * scatter_N + global_col
                                 ),
                                 wv * sc_v0,
                                 wv * sc_v1,
+                                wv * sc_v2,
+                                wv * sc_v3,
+                                wv * sc_v4,
+                                wv * sc_v5,
+                                wv * sc_v6,
+                                wv * sc_v7,
                             )
-                            pair_idx += Int32(self.num_threads_per_warp)
+                            vec_idx += Int32(self.num_threads_per_warp)
 
                         # Post-scatter barrier: needed to ensure all warps
                         # finish scatter before next output tile's pipeline ops

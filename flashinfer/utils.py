@@ -278,10 +278,16 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
 
 
 @functools.cache
+def get_device_properties(device: torch.device):
+    return torch.cuda.get_device_properties(device)
+
+
+@functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
-    return torch.cuda.get_device_capability(device.index)
+    properties = get_device_properties(device)
+    return properties.major, properties.minor
 
 
 @functools.cache
@@ -326,7 +332,7 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
 
 @functools.cache
 def get_shared_bytes_per_block_optin(device: torch.device) -> int:
-    cap = torch.cuda.get_device_properties(device.index)
+    cap = get_device_properties(device)
     return cap.shared_memory_per_block_optin
 
 
@@ -830,7 +836,12 @@ def round_up(x: int, y: int) -> int:
 
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return get_device_properties(device).multi_processor_count
+
+
+@functools.cache
+def get_device_name(device: torch.device) -> str:
+    return get_device_properties(device).name
 
 
 def get_device_index(device: torch.device) -> int:
