@@ -685,14 +685,37 @@ def test_vsa_blk64_rejects_empty_rows(workspace):
     indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
     wrapper = _make_wrapper_blk64(workspace)
     with pytest.raises(ValueError, match="empty sparse rows"):
-        wrapper.plan(indptr, indices, M, N, R64, C64, num_heads, num_heads, HEAD_DIM_BLK64, q_data_type=dtype)
+        wrapper.plan(
+            indptr,
+            indices,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+        )
 
     # block_mask path: second Q-block is all False
     block_mask = torch.ones(num_heads, MB, NB, dtype=torch.bool, device=device)
     block_mask[:, 1, :] = False
     wrapper2 = _make_wrapper_blk64(workspace)
     with pytest.raises(ValueError, match="empty sparse rows"):
-        wrapper2.plan(None, None, M, N, R64, C64, num_heads, num_heads, HEAD_DIM_BLK64, q_data_type=dtype, block_mask=block_mask)
+        wrapper2.plan(
+            None,
+            None,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+            block_mask=block_mask,
+        )
 
 
 @pytest.mark.parametrize(

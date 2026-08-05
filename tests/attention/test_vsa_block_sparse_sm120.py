@@ -422,7 +422,9 @@ def test_vsa_sm120_empty_row(workspace):
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+    wrapper.plan(
+        indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype
+    )
     out, lse = wrapper.run(q, k, v, return_lse=True)
 
     # Empty Q-block 0: output must be zero, LSE must be -inf
@@ -436,12 +438,28 @@ def test_vsa_sm120_empty_row(workspace):
     block_mask[:, 1, :] = False
 
     wrapper2 = _make_wrapper(workspace)
-    wrapper2.plan(None, None, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype, block_mask=block_mask)
+    wrapper2.plan(
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
     out2, lse2 = wrapper2.run(q, k, v, return_lse=True)
 
     empty_slice = slice(R, 2 * R)
-    assert torch.all(out2[empty_slice] == 0), "empty row output should be zero (block_mask path)"
-    assert torch.all(lse2[empty_slice].isinf() & (lse2[empty_slice] < 0)), "empty row LSE should be -inf (block_mask path)"
+    assert torch.all(out2[empty_slice] == 0), (
+        "empty row output should be zero (block_mask path)"
+    )
+    assert torch.all(lse2[empty_slice].isinf() & (lse2[empty_slice] < 0)), (
+        "empty row LSE should be -inf (block_mask path)"
+    )
 
 
 # ---------------------------------------------------------------------------
