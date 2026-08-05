@@ -594,6 +594,21 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def precompile_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        tactics: List[Any],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> bool:
+        """Optionally perform compile-only work for all tactics before profiling.
+
+        Returns ``True`` when the runner handled all needed preparation itself.
+        Returning ``False`` keeps the legacy autotuner behavior of calling
+        ``forward(..., tactic=-1, do_preparation=True)`` once before profiling.
+        """
+        return False
+
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
 
@@ -1617,7 +1632,16 @@ class AutoTuner:
                                 "do_preparation" in runner_arg_names
                                 and len(valid_tactics) > 0
                             ):
-                                r(tensors, tactic=-1, do_preparation=True, **kwargs)
+                                handled = r.precompile_tactics(
+                                    tensors, valid_tactics, p, **kwargs
+                                )
+                                if not handled:
+                                    r(
+                                        tensors,
+                                        tactic=-1,
+                                        do_preparation=True,
+                                        **kwargs,
+                                    )
                             for tac in valid_tactics:
                                 try:
                                     time_measured = self._profile_single_kernel(

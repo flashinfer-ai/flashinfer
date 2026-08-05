@@ -802,6 +802,7 @@ def get_fp4_quantization_module(backend: str = "100"):
 
     # Register the module
     return SimpleNamespace(
+        raw_module=module,
         fp4_quantize_sm100=fp4_quantize_sm100,
         block_scale_interleave_sm100=block_scale_interleave_sm100,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,

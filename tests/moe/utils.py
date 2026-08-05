@@ -121,14 +121,21 @@ def skip_checks(
     intermediate_size,
     logits_dtype,
     zero_hidden_states=False,
+    gemm1_lora_delta=None,
+    moe_gemm_backend=None,
 ):
     """Common skip logic for all tests."""
+    from tests.moe.trtllm_gen_fused_moe_utils import MoeGemmBackend
+
+    if moe_gemm_backend is None:
+        moe_gemm_backend = MoeGemmBackend.TRTLLM
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
     # Check moe_impl class by name to avoid circular imports
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
+    is_fp8_per_tensor_moe = type(moe_impl).__name__ == "FP8PerTensorMoe"
     is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
 
     # Skip zero hidden states tests for non-FP8 Block Scale MoE implementations
@@ -182,6 +189,75 @@ def skip_checks(
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
         )
+    compatible_gemm_backends = weight_processing.get(
+        "compatible_gemm_backends", [MoeGemmBackend.TRTLLM]
+    )
+    if moe_gemm_backend not in compatible_gemm_backends:
+        pytest.skip(
+            f"Incompatible: {moe_gemm_backend.value} backend with "
+            f"{weight_processing['layout']} weight layout"
+        )
+    if moe_gemm_backend == MoeGemmBackend.PRIMS_TS:
+        is_supported_prims_impl = type(moe_impl).__name__ == "BF16Moe" or (
+            is_fp4_moe
+            and moe_impl.quant_mode
+            in (
+                QuantMode.FP4_NVFP4_NVFP4,
+                QuantMode.FP4_MXFP4_MXFP8,
+                QuantMode.FP4_MXFP4_Bf16,
+            )
+        ) or (
+            type(moe_impl).__name__ == "FP8PerTensorMoe"
+        ) or (
+            is_fp8_block_scale_moe
+        )
+        if not is_supported_prims_impl:
+            pytest.skip(
+                "Prims-TS MoE backend currently supports BF16, NVFP4xNVFP4, "
+                "MXFP4xMXFP8, MXFP4xBF16, FP8 per-tensor, and FP8 block-scale"
+            )
+        try:
+            from flashinfer.prims_ts.utils import is_prims_ts_available
+        except ModuleNotFoundError:
+            pytest.skip("Prims-TS dependencies are unavailable")
+        if not is_prims_ts_available():
+            pytest.skip("Prims-TS dependencies are unavailable")
+        if gemm1_lora_delta is not None:
+            pytest.skip("Prims-TS MoE GEMM1 LoRA delta is not supported yet")
+        routing_method_type = routing_config["routing_method_type"]
+        if (
+            type(moe_impl).__name__ == "BF16Moe"
+            and routing_method_type
+            in (RoutingMethodType.Sigmoid, RoutingMethodType.DeepSeekV3)
+        ):
+            pytest.skip(
+                "Prims-TS BF16 MoE Sigmoid and DeepSeekV3 routing are not supported yet"
+            )
+        if is_fp8_per_tensor_moe and routing_method_type == RoutingMethodType.Sigmoid:
+            pytest.skip("Prims-TS FP8 per-tensor Sigmoid routing is not supported yet")
+        if (
+            is_fp8_per_tensor_moe
+            and routing_method_type == RoutingMethodType.DeepSeekV3
+            and not is_gated_activation(activation_type)
+        ):
+            pytest.skip(
+                "Prims-TS FP8 per-tensor DeepSeekV3 routing requires a gated activation"
+            )
+        if (
+            is_fp8_block_scale_moe
+            and routing_config.get("num_fused_shared_experts", 0)
+        ):
+            pytest.skip(
+                "Prims-TS FP8 block-scale fused shared experts are not supported yet"
+            )
+        if (
+            is_fp4_moe
+            and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
+            and activation_type == ActivationType.Relu2
+        ):
+            pytest.skip(
+                "Prims-TS NVFP4xNVFP4 Relu2 output quantization is not supported yet"
+            )
     if (
         is_fp8_block_scale_moe
         and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
@@ -192,8 +268,9 @@ def skip_checks(
         is_fp8_block_scale_moe
         and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
         and weight_processing["layout"] != WeightLayout.MajorK
+        and moe_gemm_backend != MoeGemmBackend.PRIMS_TS
     ):
-        pytest.skip("weight_layout must be MajorK for MxFp8.")
+        pytest.skip("TRT-LLM MxFp8 weight_layout must be MajorK.")
 
     if intermediate_size not in routing_config["compatible_intermediate_size"]:
         pytest.skip(
@@ -211,6 +288,7 @@ def skip_checks(
     if (
         is_fp4_moe
         and moe_impl.quant_mode == QuantMode.FP4_MXFP4_Bf16
+        and moe_gemm_backend != MoeGemmBackend.PRIMS_TS
         and compute_capability[0] == 10
         and compute_capability[1] == 3
     ):

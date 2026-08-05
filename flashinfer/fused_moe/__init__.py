@@ -48,6 +48,16 @@ from .runners import (  # noqa: F401
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
+from .backends.prims_ts.bf16_op import prims_ts_bf16_moe, prims_ts_bf16_routed_moe
+from .backends.prims_ts.fp8_op import (
+    prims_ts_fp8_block_scale_moe,
+    prims_ts_fp8_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
+)
+from .backends.prims_ts.fp4_op import (
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
+)
 from .core import (
     RoutingInputMode,
     convert_to_block_layout,
@@ -172,6 +182,13 @@ __all__ = [
     "gen_trtllm_gen_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
+    "prims_ts_bf16_moe",
+    "prims_ts_bf16_routed_moe",
+    "prims_ts_fp4_block_scale_moe",
+    "prims_ts_fp4_block_scale_routed_moe",
+    "prims_ts_fp8_block_scale_moe",
+    "prims_ts_fp8_block_scale_routed_moe",
+    "prims_ts_fp8_per_tensor_scale_moe",
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",

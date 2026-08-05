@@ -1,5 +1,6 @@
 import argparse
-from typing import Optional, Literal
+from dataclasses import dataclass
+from typing import Callable, Literal, Optional
 import torch
 import numpy as np
 from functools import partial
@@ -9,8 +10,14 @@ from flashinfer import (
     fp4_quantize,
     mxfp8_quantize,
 )
+from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     Fp8QuantizationType,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
+    prims_ts_fp8_block_scale_moe,
+    prims_ts_fp8_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -19,7 +26,12 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
+from flashinfer.fused_moe.core import (
+    _maybe_get_cached_w3_w1_permute_indices,
+    get_w2_permute_indices_with_cache,
+)
 from flashinfer.autotuner import autotune, AutoTuner
+from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import device_support_pdl
 from routines.flashinfer_benchmark_utils import enum_type
@@ -27,6 +39,23 @@ from flashinfer.fused_moe.utils import make_random_topk_ids
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
+BACKENDS = ("trtllm", "prims_ts")
+
+
+@dataclass(frozen=True)
+class BenchmarkSetup:
+    batch_size: int
+    backend: str
+    fn: Callable
+    input_kwargs: dict
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    batch_size: int
+    backend: str
+    no_autotune_ms: float
+    tuned_ms: float
 
 
 def _pack_topk(
@@ -64,17 +93,37 @@ def mxint4_quantize(
     ), scales.reshape(-1, sf_vec_size)
 
 
-def _print_table(results: list[tuple[int, float, float]], config_str: str):
+def _print_table(results: list[BenchmarkResult], config_str: str):
     print(f"\n{config_str}")
-    col0, col1, col2, col3 = 12, 18, 16, 9
-    header = f"  {'num_tokens':>{col0}}  {'no_autotune (ms)':>{col1}}  {'autotuned (ms)':>{col2}}  {'speedup':>{col3}}"
-    sep = f"  {'-' * col0}  {'-' * col1}  {'-' * col2}  {'-' * col3}"
+    col0, col1, col2, col3, col4, col5 = 12, 10, 18, 16, 9, 15
+    header = (
+        f"  {'num_tokens':>{col0}}  {'backend':>{col1}}"
+        f"  {'no_autotune (ms)':>{col2}}  {'autotuned (ms)':>{col3}}"
+        f"  {'speedup':>{col4}}  {'vs trtllm':>{col5}}"
+    )
+    sep = (
+        f"  {'-' * col0}  {'-' * col1}  {'-' * col2}  {'-' * col3}"
+        f"  {'-' * col4}  {'-' * col5}"
+    )
     print(header)
     print(sep)
-    for num_tokens, ms, ms_tuned in results:
-        speedup = ms / ms_tuned
+    trtllm_tuned = {
+        result.batch_size: result.tuned_ms
+        for result in results
+        if result.backend == "trtllm"
+    }
+    for result in sorted(results, key=lambda item: (item.batch_size, item.backend)):
+        speedup = result.no_autotune_ms / result.tuned_ms
+        baseline = trtllm_tuned.get(result.batch_size)
+        backend_ratio = baseline / result.tuned_ms if baseline is not None else None
+        backend_ratio_str = (
+            f"{backend_ratio:.2f}x" if backend_ratio is not None else "n/a"
+        )
         print(
-            f"  {num_tokens:>{col0}}  {ms:>{col1}.3f}  {ms_tuned:>{col2}.3f}  {speedup:>{col3}.2f}x"
+            f"  {result.batch_size:>{col0}}  {result.backend:>{col1}}"
+            f"  {result.no_autotune_ms:>{col2}.3f}"
+            f"  {result.tuned_ms:>{col3}.3f}  {speedup:>{col4}.2f}x"
+            f"  {backend_ratio_str:>{col5}}"
         )
 
 
@@ -92,30 +141,240 @@ def _measure(fn, input_kwargs, warmups, iterations):
 
 
 def _run_benchmark(
-    setups: list[tuple[int, callable, dict]],
+    setups: list[BenchmarkSetup],
     warmups: int,
     iterations: int,
     config_str: str,
+    tuning_buckets: Optional[list[int]] = None,
 ):
     AutoTuner.get().clear_cache()
 
     measure = partial(_measure, warmups=warmups, iterations=iterations)
 
     # measure untuned
-    ms_no_autotune = [measure(fn, kw) for _, fn, kw in setups]
+    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
 
-    # tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw = setups[0]
-    with autotune(True):
-        first_fn(**first_kw)
+    # Tune each backend once.  The tuning config controls whether this covers
+    # all buckets up to tune_max or only the explicit user-requested buckets.
+    tuned_backends = set()
+    tuning_buckets_tuple = None if tuning_buckets is None else tuple(tuning_buckets)
+    for setup in setups:
+        if setup.backend in tuned_backends:
+            continue
+        with autotune(True, tuning_buckets=tuning_buckets_tuple):
+            setup.fn(**setup.input_kwargs)
+        tuned_backends.add(setup.backend)
 
     # measure tuned
     results = [
-        (batch_size, ms, measure(fn, kw))
-        for (batch_size, fn, kw), ms in zip(setups, ms_no_autotune, strict=True)
+        BenchmarkResult(
+            setup.batch_size,
+            setup.backend,
+            ms,
+            measure(setup.fn, setup.input_kwargs),
+        )
+        for setup, ms in zip(setups, ms_no_autotune, strict=True)
     ]
 
     _print_table(results, config_str)
+
+
+def _normalize_backends(backends: list[str], quant_mode: str) -> list[str]:
+    if "both" in backends:
+        resolved = list(BACKENDS)
+    else:
+        resolved = []
+        for backend in backends:
+            if backend not in resolved:
+                resolved.append(backend)
+
+    if "prims_ts" in resolved:
+        if quant_mode == "MxInt4xBf16":
+            raise ValueError(
+                "Prims-TS is not wired for MxInt4xBf16 in this benchmark"
+            )
+        if not is_prims_ts_available():
+            raise RuntimeError(
+                "Prims-TS backend requested but dependencies are unavailable"
+            )
+    return resolved
+
+
+def _fp4_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return (
+            trtllm_fp4_block_scale_routed_moe
+            if routed
+            else trtllm_fp4_block_scale_moe
+        )
+    if backend == "prims_ts":
+        return (
+            prims_ts_fp4_block_scale_routed_moe
+            if routed
+            else prims_ts_fp4_block_scale_moe
+        )
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _fp8_per_tensor_op(backend: str) -> Callable:
+    if backend == "trtllm":
+        return trtllm_fp8_per_tensor_scale_moe
+    if backend == "prims_ts":
+        return prims_ts_fp8_per_tensor_scale_moe
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _fp8_block_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return (
+            trtllm_fp8_block_scale_routed_moe
+            if routed
+            else trtllm_fp8_block_scale_moe
+        )
+    if backend == "prims_ts":
+        return (
+            prims_ts_fp8_block_scale_routed_moe
+            if routed
+            else prims_ts_fp8_block_scale_moe
+        )
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _shuffle_fp4_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm1_scales: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_scales: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_local_experts: int,
+    sf_vec_size: int,
+    gemm1_bias: Optional[torch.Tensor] = None,
+    gemm2_bias: Optional[torch.Tensor] = None,
+) -> dict[str, Optional[torch.Tensor]]:
+    """Convert canonical FP4 expert tensors to the shuffled MajorK layout.
+
+    The FP4 MoE kernels benchmarked here consume the TRT-LLM/Prims-TS native
+    layout: gated FC1 rows and FC2 rows are epilogue-tile permuted, and their
+    block-scale tensors are interleaved to match the packed weight layout.
+    """
+    epilogue_tile_m = 128
+    gemm1_weights = gemm1_weights.view(torch.uint8).reshape(
+        num_local_experts, 2 * intermediate_size, hidden_size // 2
+    )
+    gemm1_scales = gemm1_scales.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+    )
+    gemm2_weights = gemm2_weights.view(torch.uint8).reshape(
+        num_local_experts, hidden_size, intermediate_size // 2
+    )
+    gemm2_scales = gemm2_scales.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+
+    gemm1_weights_shuffled = []
+    gemm1_scales_shuffled = []
+    gemm2_weights_shuffled = []
+    gemm2_scales_shuffled = []
+    gemm1_bias_shuffled = [] if gemm1_bias is not None else None
+    gemm2_bias_shuffled = [] if gemm2_bias is not None else None
+    permute_cache = {}
+    for expert_idx in range(num_local_experts):
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_weights[expert_idx],
+            epilogue_tile_m,
+            is_gated_act_gemm=True,
+        )
+        gemm1_weights_shuffled.append(
+            gemm1_weights[expert_idx][permute_indices.to(gemm1_weights.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_scales[expert_idx].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=True,
+        )
+        gemm1_scales_shuffled.append(
+            block_scale_interleave(
+                gemm1_scales[expert_idx]
+                .view(torch.uint8)[permute_sf_indices.to(gemm1_scales.device)]
+                .contiguous()
+            )
+        )
+
+        if gemm1_bias_shuffled is not None:
+            permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
+                permute_cache,
+                gemm1_bias[expert_idx].reshape(-1, 1),
+                epilogue_tile_m,
+                is_gated_act_gemm=True,
+            )
+            gemm1_bias_shuffled.append(
+                gemm1_bias[expert_idx]
+                .reshape(-1, 1)[permute_bias_indices.to(gemm1_bias.device)]
+                .contiguous()
+            )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            permute_cache, gemm2_weights[expert_idx], epilogue_tile_m
+        )
+        gemm2_weights_shuffled.append(
+            gemm2_weights[expert_idx][permute_indices.to(gemm2_weights.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            permute_cache,
+            gemm2_scales[expert_idx].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm2_scales_shuffled.append(
+            block_scale_interleave(
+                gemm2_scales[expert_idx]
+                .view(torch.uint8)[permute_sf_indices.to(gemm2_scales.device)]
+                .contiguous()
+            )
+        )
+
+        if gemm2_bias_shuffled is not None:
+            permute_bias_indices = get_w2_permute_indices_with_cache(
+                permute_cache,
+                gemm2_bias[expert_idx].reshape(-1, 1),
+                epilogue_tile_m,
+            )
+            gemm2_bias_shuffled.append(
+                gemm2_bias[expert_idx]
+                .reshape(-1, 1)[permute_bias_indices.to(gemm2_bias.device)]
+                .contiguous()
+            )
+
+    result = {
+        "gemm1_weights": torch.stack(gemm1_weights_shuffled),
+        "gemm1_weights_scale": torch.stack(gemm1_scales_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size),
+        "gemm2_weights": torch.stack(gemm2_weights_shuffled),
+        "gemm2_weights_scale": torch.stack(gemm2_scales_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
+        "gemm1_bias": None,
+        "gemm2_bias": None,
+    }
+    if gemm1_bias_shuffled is not None:
+        result["gemm1_bias"] = torch.stack(gemm1_bias_shuffled).reshape(
+            num_local_experts, 2 * intermediate_size
+        )
+    if gemm2_bias_shuffled is not None:
+        result["gemm2_bias"] = torch.stack(gemm2_bias_shuffled).reshape(
+            num_local_experts, hidden_size
+        )
+    return result
 
 
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
@@ -129,6 +388,8 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     warmups: int,
     iterations: int,
     activation_type: int,
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
     routed: bool = False,
 ):
     device = torch.device("cuda:0")
@@ -206,8 +467,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
 
         if quant_mode == "Fp8-Per-Tensor":
             hidden_states, hs_scale = fp8_quantize(hidden_states_bf16)
-            fn = partial(
-                trtllm_fp8_per_tensor_scale_moe,
+            common_fn_kwargs = dict(
                 routing_logits=torch.rand(batch_size, num_experts, device=device).to(
                     torch.bfloat16
                 ),
@@ -234,6 +494,15 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 "gemm1_weights": w13,
                 "gemm2_weights": w2,
             }
+            for backend in backends:
+                setups.append(
+                    BenchmarkSetup(
+                        batch_size,
+                        backend,
+                        partial(_fp8_per_tensor_op(backend), **common_fn_kwargs),
+                        input_kwargs,
+                    )
+                )
         else:
             if quant_mode == "Fp8-Block":
                 hidden_states, hs_scalar = fp8_quantize(hidden_states_bf16)
@@ -265,15 +534,13 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 else Fp8QuantizationType.MxFp8,
             )
             if routed:
-                fn = partial(
-                    trtllm_fp8_block_scale_routed_moe,
+                common_fn_kwargs = dict(
                     topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
                     routing_method_type=RoutingMethodType.Renormalize.value,
                     **block_scale_kwargs,
                 )
             else:
-                fn = partial(
-                    trtllm_fp8_block_scale_moe,
+                common_fn_kwargs = dict(
                     routing_logits=torch.rand(
                         batch_size, num_experts, device=device
                     ).to(torch.float32),
@@ -288,7 +555,15 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 "gemm2_weights": w2,
                 "gemm2_weights_scale": w2_scale,
             }
-        setups.append((batch_size, fn, input_kwargs))
+            for backend in backends:
+                setups.append(
+                    BenchmarkSetup(
+                        batch_size,
+                        backend,
+                        partial(_fp8_block_ops(backend, routed), **common_fn_kwargs),
+                        input_kwargs,
+                    )
+                )
 
     mode_str = "routed" if routed else "non_routed"
     _run_benchmark(
@@ -297,6 +572,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        tuning_buckets=tuning_buckets,
     )
 
 
@@ -305,12 +581,17 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
     num_tokens_list: list[int],
     num_experts: int,
+    local_num_experts: int,
+    local_expert_offset: int,
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
     warmups: int,
     iterations: int,
     activation_type: int,
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
+    use_bias: bool = True,
     routed: bool = False,
 ):
     device = torch.device("cuda:0")
@@ -318,16 +599,34 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     tune_max = (
         max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
     )
+    if local_expert_offset < 0 or local_num_experts <= 0:
+        raise ValueError(
+            "local_expert_offset must be non-negative and local_num_experts positive"
+        )
+    if local_expert_offset + local_num_experts > num_experts:
+        raise ValueError(
+            "local_expert_offset + local_num_experts must be <= num_experts"
+        )
 
     # --- num_tokens-independent setup ---
     w13 = torch.randn(
-        num_experts, intermediate_size * 2, hidden_size, device=device
+        local_num_experts, intermediate_size * 2, hidden_size, device=device
     ).to(torch.bfloat16)
-    w2 = torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+    w2 = torch.randn(
+        local_num_experts, hidden_size, intermediate_size, device=device
+    ).to(
         torch.bfloat16
     )
-    bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
-    bias2 = torch.randn(num_experts, hidden_size, device=device) * 10
+    bias13 = (
+        torch.randn(local_num_experts, intermediate_size * 2, device=device) * 10
+        if use_bias
+        else None
+    )
+    bias2 = (
+        torch.randn(local_num_experts, hidden_size, device=device) * 10
+        if use_bias
+        else None
+    )
 
     if quant_mode == "NvFP4xNvFP4":
         w13, w13_scale = fp4_quantize(
@@ -335,48 +634,76 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
         )
         w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, intermediate_size * 2, -1
+            local_num_experts, intermediate_size * 2, -1
         )
         w2, w2_scale = fp4_quantize(
             w2,
             torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, -1
+            local_num_experts, hidden_size, -1
         )
         w13_global_scale = w2_global_scale = 1.0 / 448.0 / 6.0
         hidden_states_global_scale = 1.0 / 448.0 / 6.0
+        sf_vec_size = 16
     else:
         assert activation_type != ActivationType.Relu2.value, (
             "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
         )
         w13, w13_scale = fp4_quantize(
-            w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
+            w13,
+            torch.tensor([1.0], device=device),
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
         )
         w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, intermediate_size * 2, -1
+            local_num_experts, intermediate_size * 2, -1
         )
         w2, w2_scale = fp4_quantize(
-            w2, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
+            w2,
+            torch.tensor([1.0], device=device),
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, -1
+            local_num_experts, hidden_size, -1
         )
         w13_global_scale = w2_global_scale = 1.0
         hidden_states_global_scale = 1.0
+        sf_vec_size = 32
 
     output1_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w13_global_scale] * local_num_experts,
+        device=device,
     )
     output1_scale_gate_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w13_global_scale] * local_num_experts,
+        device=device,
     )
     output2_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w2_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w2_global_scale] * local_num_experts,
+        device=device,
+    )
+
+    shuffled = _shuffle_fp4_major_k(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=local_num_experts,
+        sf_vec_size=sf_vec_size,
+        gemm1_bias=bias13,
+        gemm2_bias=bias2,
     )
 
     fp4_kwargs = dict(
@@ -392,8 +719,8 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         n_group=None,
         topk_group=None,
         intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
         routed_scaling_factor=None,
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
@@ -429,14 +756,12 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             hidden_states_scale = None
 
         if routed:
-            fn = partial(
-                trtllm_fp4_block_scale_routed_moe,
+            common_fn_kwargs = dict(
                 topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
                 **fp4_kwargs,
             )
         else:
-            fn = partial(
-                trtllm_fp4_block_scale_moe,
+            common_fn_kwargs = dict(
                 routing_logits=torch.rand(batch_size, num_experts, device=device).to(
                     torch.bfloat16
                 ),
@@ -446,14 +771,22 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         input_kwargs = {
             "hidden_states": hidden_states,
             "hidden_states_scale": hidden_states_scale,
-            "gemm1_weights": w13,
-            "gemm1_weights_scale": w13_scale,
-            "gemm2_weights": w2,
-            "gemm2_weights_scale": w2_scale,
-            "gemm1_bias": bias13,
-            "gemm2_bias": bias2,
+            "gemm1_weights": shuffled["gemm1_weights"],
+            "gemm1_weights_scale": shuffled["gemm1_weights_scale"],
+            "gemm2_weights": shuffled["gemm2_weights"],
+            "gemm2_weights_scale": shuffled["gemm2_weights_scale"],
+            "gemm1_bias": shuffled["gemm1_bias"],
+            "gemm2_bias": shuffled["gemm2_bias"],
         }
-        setups.append((batch_size, fn, input_kwargs))
+        for backend in backends:
+            setups.append(
+                BenchmarkSetup(
+                    batch_size,
+                    backend,
+                    partial(_fp4_ops(backend, routed), **common_fn_kwargs),
+                    input_kwargs,
+                )
+            )
 
     mode_str = "routed" if routed else "non_routed"
     _run_benchmark(
@@ -461,7 +794,10 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         warmups,
         iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
-        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        f"  local_experts={local_num_experts}  local_offset={local_expert_offset}"
+        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
+        f"  bias={use_bias}",
+        tuning_buckets=tuning_buckets,
     )
 
 
@@ -536,7 +872,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
             "gemm2_weights": w2,
             "gemm2_weights_scale": w2_scale,
         }
-        setups.append((batch_size, fn, input_kwargs))
+        setups.append(BenchmarkSetup(batch_size, "trtllm", fn, input_kwargs))
 
     _run_benchmark(
         setups,
@@ -568,8 +904,18 @@ if __name__ == "__main__":
         "--num-tokens",
         type=int,
         nargs="+",
-        default=[512],
+        default=None,
         help="Number of tokens (one or more)",
+    )
+    parser.add_argument(
+        "--tuning-buckets",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit autotune measurement buckets. Defaults to the API bucket "
+            "generation when omitted."
+        ),
     )
     parser.add_argument(
         "--tune-max-num-tokens",
@@ -578,11 +924,23 @@ if __name__ == "__main__":
         help="Maximum number of tokens for tuning (defaults to max of --num-tokens)",
     )
     parser.add_argument(
-        "--num-experts", type=int, default=128, help="Number of experts"
+        "--num-experts", type=int, default=None, help="Number of global experts"
     )
-    parser.add_argument("--hidden-size", type=int, default=3072, help="Hidden size")
     parser.add_argument(
-        "--intermediate-size", type=int, default=3072, help="Intermediate size"
+        "--local-num-experts",
+        type=int,
+        default=None,
+        help="Number of resident local experts",
+    )
+    parser.add_argument(
+        "--local-expert-offset",
+        type=int,
+        default=0,
+        help="Global expert id offset for the first local expert",
+    )
+    parser.add_argument("--hidden-size", type=int, default=None, help="Hidden size")
+    parser.add_argument(
+        "--intermediate-size", type=int, default=None, help="Intermediate size"
     )
     parser.add_argument(
         "--tp",
@@ -590,7 +948,23 @@ if __name__ == "__main__":
         default=1,
         help="Tensor parallelism degree; divides intermediate-size",
     )
-    parser.add_argument("--top-k", type=int, default=4, help="Top-k experts per token")
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k experts per token"
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        nargs="+",
+        default=["both"],
+        choices=["trtllm", "prims_ts", "both"],
+        help="Backends to benchmark. Use 'both' to compare TRT-LLM Gen and Prims-TS.",
+    )
+    parser.add_argument(
+        "--use-bias",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include FC1/FC2 bias tensors in FP4 benchmarks.",
+    )
     parser.add_argument(
         "--warmups", type=int, default=100, help="Number of warmup iterations"
     )
@@ -613,6 +987,24 @@ if __name__ == "__main__":
         "Not supported for Fp8-Per-Tensor or MxInt4xBf16.",
     )
     args = parser.parse_args()
+
+    if args.num_tokens is None:
+        args.num_tokens = [512]
+    if args.num_experts is None:
+        args.num_experts = 128
+    if args.hidden_size is None:
+        args.hidden_size = 3072
+    if args.intermediate_size is None:
+        args.intermediate_size = 3072
+    if args.top_k is None:
+        args.top_k = 4
+    if args.use_bias is None:
+        args.use_bias = True
+
+    if args.local_num_experts is None:
+        args.local_num_experts = args.num_experts
+
+    backends = _normalize_backends(args.backends, args.quant_mode)
     args.intermediate_size //= args.tp
 
     is_fp8 = args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"]
@@ -635,6 +1027,8 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            backends,
+            tuning_buckets=args.tuning_buckets,
             routed=args.routed,
         )
     elif is_mxint4:
@@ -656,11 +1050,16 @@ if __name__ == "__main__":
             args.quant_mode,
             args.num_tokens,
             args.num_experts,
+            args.local_num_experts,
+            args.local_expert_offset,
             args.hidden_size,
             args.intermediate_size,
             args.top_k,
             args.warmups,
             args.iterations,
             args.activation_type,
+            backends,
+            tuning_buckets=args.tuning_buckets,
+            use_bias=args.use_bias,
             routed=args.routed,
         )
