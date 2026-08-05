@@ -3095,12 +3095,12 @@ def trtllm_batch_decode_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
-    bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     bmm1_scale_log2: Optional[torch.Tensor] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     enable_block_sparse_attention: bool = False,
+    bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -3242,12 +3242,6 @@ def trtllm_batch_decode_with_kv_cache(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
-    bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
-        Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
-        default separate transformed-K/V cubins and is ignored by other paths.
-        ``"k_only"`` selects the optimized K-only transform cubins, and
-        ``"separate_kv"`` selects the separate transformed-K/V cubins.
-
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
         by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
@@ -3277,6 +3271,12 @@ def trtllm_batch_decode_with_kv_cache(
         (kv head, sequence) pairs (the dense maximum is a safe upper bound).
         Not compatible with sliding window (``window_left != -1``),
         ``skip_softmax_threshold_scale_factor``, or ``uses_shared_paged_kv_idx=False``.
+
+    bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
+        Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
+        default separate transformed-K/V cubins and is ignored by other paths.
+        ``"k_only"`` selects the optimized K-only transform cubins, and
+        ``"separate_kv"`` selects the separate transformed-K/V cubins.
 
     Returns
     -------
