@@ -3427,7 +3427,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_run_from_routing_metadata_impl(
       output1_scales_gate_scalar, output2_scales_scalar, per_token_scales);
   launcher.init(std::move(args), tile_N, static_cast<int64_t>(RoutingMethodType::Unspecified),
                 /*use_shuffled_weight=*/true, /*weight_layout=*/0,
-                static_cast<ActivationType>(act_type), mDtypeAct, mDtypeWeights);
+                static_cast<ActivationType>(act_type), mDtypeAct, mDtypeWeights,
+                static_cast<int64_t>(batchedGemm::gemm::BiasType::None));
 
   return launcher.run_from_routing_metadata(config, routing_metadata, enable_pdl);
 }
