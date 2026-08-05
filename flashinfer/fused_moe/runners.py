@@ -2186,11 +2186,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         (the EP bridge does not quantize on the bf16 path);
         ``act.hidden_states_scale`` is unused.
         """
-<<<<<<< HEAD
         self._require_built()
-=======
-        self._assert_shared_experts_supported()
->>>>>>> 5b5ee633a (feat(moe): fused shared experts for unified block-FP8)
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -2680,11 +2676,7 @@ class _B12xRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-<<<<<<< HEAD
         self._require_built()
-=======
-        self._assert_shared_experts_supported()
->>>>>>> 5b5ee633a (feat(moe): fused shared experts for unified block-FP8)
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
         first_weight = v[self.required_weight_keys[0]]
