@@ -71,6 +71,11 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert _BACKEND_RUNNERS[CutlassW4A16Config] is CutlassW4A16Runner
 
 
+def test_legacy_cutlass_config_is_deprecated():
+    with pytest.warns(DeprecationWarning, match="CutlassConfig is deprecated"):
+        CutlassConfig()
+
+
 def test_prepare_cutlass_bf16_weights_preserves_canonical_layout():
     w1 = torch.randn(2, 64, 64, dtype=torch.bfloat16)[..., ::2]
     w2 = torch.randn(2, 32, 64, dtype=torch.bfloat16)[..., ::2]

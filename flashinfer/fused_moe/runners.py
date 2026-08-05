@@ -547,7 +547,8 @@ class _CutlassRunnerBase(MoERunner):
             )
             return inputs[0]
 
-        # Validate the launch shape against the stable maximum-sized workspace.
+        # Select the deterministic geometric-capacity workspace for this
+        # launch; older cached buffers remain alive for captured graphs.
         num_tokens, hidden_size = inputs[1].shape
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens

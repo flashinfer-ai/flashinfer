@@ -32,6 +32,7 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from typing_extensions import deprecated
 
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
@@ -485,9 +486,16 @@ class TrtllmMxInt4Config:
         return "TrtllmMxInt4Config()"
 
 
+@deprecated(
+    "CutlassConfig is deprecated and non-runnable; use CutlassBf16Config or "
+    "CutlassW4A16Config instead."
+)
 @dataclass(frozen=True)
 class CutlassConfig:
     """Legacy quantization-neutral CUTLASS configuration placeholder.
+
+    .. deprecated::
+        Use :class:`CutlassBf16Config` or :class:`CutlassW4A16Config` instead.
 
     This type is preserved for source compatibility, but it is intentionally
     not registered with :class:`MoELayer` and therefore is not runnable. Select
