@@ -906,6 +906,178 @@ def _verify_public_outputs(
     }
 
 
+def _logical_dense_kv(torch, shape: MSAShape, inputs: dict[str, Any]):
+    """Recover logical per-sequence K/V without relying on the candidate."""
+
+    if shape.kv_layout == "flat_varlen":
+        logical_shape = (
+            shape.batch_size,
+            shape.seqlen_kv,
+            shape.num_kv_heads,
+            shape.head_dim,
+        )
+        return inputs["k"].view(logical_shape), inputs["v"].view(logical_shape)
+
+    page_ids = inputs["page_table"].long()
+
+    def unpack(cache):
+        # Physical pages are deliberately shuffled by _make_paged_cache.
+        # Resolve the page table before flattening page-local token rows.
+        pages = cache[page_ids]
+        dense = pages.permute(0, 1, 3, 2, 4).reshape(
+            shape.batch_size,
+            -1,
+            shape.num_kv_heads,
+            shape.head_dim,
+        )
+        return dense[:, : shape.seqlen_kv]
+
+    return unpack(inputs["k"]), unpack(inputs["v"])
+
+
+def _candidate_reference_output(torch, shape: MSAShape, inputs: dict[str, Any]):
+    """Independent FP32 sparse-attention reference for baseline-unsupported rows."""
+
+    q = (
+        inputs["q"]
+        .view(
+            shape.batch_size,
+            shape.seqlen_q,
+            shape.num_q_heads,
+            shape.head_dim,
+        )
+        .float()
+    )
+    k, v = _logical_dense_kv(torch, shape, inputs)
+    k = k.float()
+    v = v.float()
+    selections = (
+        inputs["q2k"]
+        .view(shape.num_kv_heads, shape.batch_size, shape.seqlen_q, shape.topk)
+        .permute(1, 2, 0, 3)
+    )
+
+    token_ids = torch.arange(shape.seqlen_kv, device=q.device)
+    block_ids = token_ids // shape.block_size
+    allowed = (
+        block_ids.view(1, 1, 1, shape.seqlen_kv, 1) == selections.unsqueeze(-2)
+    ).any(-1)
+    if shape.causal:
+        q_positions = (
+            shape.seqlen_kv
+            - shape.seqlen_q
+            + torch.arange(shape.seqlen_q, device=q.device)
+        )
+        allowed &= token_ids.view(1, 1, 1, shape.seqlen_kv) <= q_positions.view(
+            1, shape.seqlen_q, 1, 1
+        )
+
+    group_size = shape.num_q_heads // shape.num_kv_heads
+    output = torch.zeros_like(q)
+    scale = shape.head_dim**-0.5
+    for kv_head in range(shape.num_kv_heads):
+        head_start = kv_head * group_size
+        head_end = head_start + group_size
+        logits = (
+            torch.einsum(
+                "bqgd,bkd->bqgk",
+                q[:, :, head_start:head_end],
+                k[:, :, kv_head],
+            )
+            * scale
+        )
+        mask = allowed[:, :, kv_head].unsqueeze(2)
+        probabilities = torch.softmax(logits.masked_fill(~mask, float("-inf")), dim=-1)
+        probabilities = torch.where(
+            mask.any(-1).unsqueeze(-1),
+            probabilities,
+            torch.zeros_like(probabilities),
+        )
+        output[:, :, head_start:head_end] = torch.einsum(
+            "bqgk,bkd->bqgd", probabilities, v[:, :, kv_head]
+        )
+    return output.reshape(-1, shape.num_q_heads, shape.head_dim).to(inputs["q"].dtype)
+
+
+def _verify_candidate_reference(
+    torch,
+    shape: MSAShape,
+    inputs: dict[str, Any],
+    candidate_call: Callable[[], Any],
+    *,
+    candidate_api: str,
+) -> dict[str, Any]:
+    candidate_output = _primary_output(candidate_call())
+    reference_output = _candidate_reference_output(torch, shape, inputs)
+    torch.cuda.synchronize()
+    expected_shape = (
+        shape.batch_size * shape.seqlen_q,
+        shape.num_q_heads,
+        shape.head_dim,
+    )
+    tolerance = CORRECTNESS_TOLERANCES[shape.q_dtype]
+    shape_matches = (
+        tuple(candidate_output.shape) == expected_shape
+        and tuple(reference_output.shape) == expected_shape
+    )
+    dtype_matches = candidate_output.dtype == reference_output.dtype
+    if not shape_matches or not dtype_matches:
+        return {
+            "status": "failed",
+            "passed": False,
+            "reference": "independent_torch_fp32_masked_attention",
+            "candidate_public_api": candidate_api,
+            "expected_shape": list(expected_shape),
+            "candidate_shape": list(candidate_output.shape),
+            "reference_shape": list(reference_output.shape),
+            "candidate_dtype": str(candidate_output.dtype),
+            "reference_dtype": str(reference_output.dtype),
+            **tolerance,
+            "max_abs_error": None,
+            "mismatch_count": None,
+        }
+
+    candidate_float = candidate_output.float()
+    reference_float = reference_output.float()
+    close = torch.isclose(
+        candidate_float,
+        reference_float,
+        atol=float(tolerance["atol"]),
+        rtol=float(tolerance["rtol"]),
+        equal_nan=False,
+    )
+    candidate_nonfinite_count = int((~torch.isfinite(candidate_float)).sum().item())
+    reference_nonfinite_count = int((~torch.isfinite(reference_float)).sum().item())
+    passed = (
+        bool(close.all().item())
+        and candidate_nonfinite_count == 0
+        and reference_nonfinite_count == 0
+    )
+    finite = torch.isfinite(candidate_float) & torch.isfinite(reference_float)
+    max_abs_error = None
+    if bool(finite.any().item()):
+        max_abs_error = float(
+            (candidate_float[finite] - reference_float[finite]).abs().max().item()
+        )
+    return {
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "reference": "independent_torch_fp32_masked_attention",
+        "candidate_public_api": candidate_api,
+        "same_q_k_v_tensor_objects": True,
+        "same_sequence_metadata_tensor_objects": True,
+        "same_page_table_argument": True,
+        "expected_shape": list(expected_shape),
+        "candidate_dtype": str(candidate_output.dtype),
+        "reference_dtype": str(reference_output.dtype),
+        **tolerance,
+        "max_abs_error": max_abs_error,
+        "mismatch_count": int((~close).sum().item()),
+        "candidate_nonfinite_count": candidate_nonfinite_count,
+        "reference_nonfinite_count": reference_nonfinite_count,
+    }
+
+
 def _hardware(torch) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1014,23 +1186,34 @@ def _run_worker(args: argparse.Namespace) -> None:
         "cupti_python_version": cupti_python_version,
     }
     if args.worker_backend == "verify":
-        imported_baseline = importlib.import_module("fmha_sm100")
-        imported_baseline_root = Path(imported_baseline.__file__).resolve().parents[2]
-        if imported_baseline_root != baseline_root:
-            raise RuntimeError(
-                f"expected fmha_sm100 from {baseline_root}, "
-                f"imported {imported_baseline_root}"
-            )
         candidate_call, candidate_api, _ = _candidate_call(shape, inputs)
-        baseline_call, baseline_api, _ = _baseline_call(torch, shape, inputs)
-        correctness = _verify_public_outputs(
-            torch,
-            shape,
-            candidate_call,
-            baseline_call,
-            candidate_api=candidate_api,
-            baseline_api=baseline_api,
-        )
+        if shape.baseline_comparable:
+            imported_baseline = importlib.import_module("fmha_sm100")
+            imported_baseline_root = (
+                Path(imported_baseline.__file__).resolve().parents[2]
+            )
+            if imported_baseline_root != baseline_root:
+                raise RuntimeError(
+                    f"expected fmha_sm100 from {baseline_root}, "
+                    f"imported {imported_baseline_root}"
+                )
+            baseline_call, baseline_api, _ = _baseline_call(torch, shape, inputs)
+            correctness = _verify_public_outputs(
+                torch,
+                shape,
+                candidate_call,
+                baseline_call,
+                candidate_api=candidate_api,
+                baseline_api=baseline_api,
+            )
+        else:
+            correctness = _verify_candidate_reference(
+                torch,
+                shape,
+                inputs,
+                candidate_call,
+                candidate_api=candidate_api,
+            )
         result = {
             "status": "verified" if correctness["passed"] else "failed",
             "backend": "verify",
@@ -1246,29 +1429,25 @@ def _run_parent(args: argparse.Namespace) -> None:
         temp_root = Path(temp_dir)
         for index, shape in enumerate(selected_shapes):
             comparable = shape.baseline_comparable
-            if comparable:
-                print(
-                    f"Verifying public output parity for {shape.stable_id}", flush=True
+            reference_kind = (
+                "pinned MiniMax public output"
+                if comparable
+                else "independent FP32 masked-attention reference"
+            )
+            print(f"Verifying {shape.stable_id} against {reference_kind}", flush=True)
+            correctness_worker = _run_isolated(
+                args,
+                backend="verify",
+                shape=shape,
+                output=temp_root / f"{index}-verify.json",
+            )
+            correctness_results.append(correctness_worker)
+            if not correctness_worker["correctness"]["passed"]:
+                raise RuntimeError(
+                    f"correctness failed for {shape.stable_id}: "
+                    f"{correctness_worker['correctness']}"
                 )
-                correctness_worker = _run_isolated(
-                    args,
-                    backend="verify",
-                    shape=shape,
-                    output=temp_root / f"{index}-verify.json",
-                )
-                correctness_results.append(correctness_worker)
-                if not correctness_worker["correctness"]["passed"]:
-                    raise RuntimeError(
-                        f"public output parity failed for {shape.stable_id}: "
-                        f"{correctness_worker['correctness']}"
-                    )
-                correctness = correctness_worker["correctness"]
-            else:
-                correctness = {
-                    "status": "not_run",
-                    "passed": None,
-                    "reason": "official_baseline_unsupported",
-                }
+            correctness = correctness_worker["correctness"]
             if comparable and index % 2 == 0:
                 process_order = ("minimax", "flashinfer")
             elif comparable:
@@ -1309,9 +1488,7 @@ def _run_parent(args: argparse.Namespace) -> None:
                 "shape": _public_shape(shape),
                 "comparison_status": comparison_status,
                 "correctness": correctness,
-                "correctness_process": (
-                    "separate_untimed_public_api_parity_worker" if comparable else None
-                ),
+                "correctness_process": "separate_untimed_correctness_worker",
                 "process_order": list(process_order),
                 "baseline": baseline,
                 "candidate": candidate,
@@ -1325,9 +1502,10 @@ def _run_parent(args: argparse.Namespace) -> None:
     _validate_checkout(source_root, source_sha, "FlashInfer source")
     _validate_checkout(baseline_root, baseline_sha, "MiniMax baseline")
     _validate_common_metadata(measured_results, expected_measurements)
-    expected_correctness_ids = [
+    expected_comparison_ids = [
         shape.stable_id for shape in selected_shapes if shape.baseline_comparable
     ]
+    expected_correctness_ids = [shape.stable_id for shape in selected_shapes]
     _validate_correctness_metadata(
         correctness_results,
         measured_results[0],
@@ -1338,9 +1516,9 @@ def _run_parent(args: argparse.Namespace) -> None:
         for row in rows
         if row["speedup_baseline_over_candidate"] is not None
     ]
-    if len(comparable_speedups) != len(expected_correctness_ids):
+    if len(comparable_speedups) != len(expected_comparison_ids):
         raise RuntimeError(
-            f"expected {len(expected_correctness_ids)} comparable rows, "
+            f"expected {len(expected_comparison_ids)} comparable rows, "
             f"got {len(comparable_speedups)}"
         )
     geometric_mean = (
@@ -1380,9 +1558,12 @@ def _run_parent(args: argparse.Namespace) -> None:
             "one_public_api_call_per_sample": True,
             "worker_isolation": "one_process_per_measured_backend_shape_pair",
             "correctness_worker_isolation": (
-                "one_separate_untimed_process_per_comparable_shape"
+                "one_separate_untimed_process_per_selected_shape"
             ),
-            "correctness_reference": "pinned_public_fmha_sm100_sparse_atten_func",
+            "correctness_reference": (
+                "pinned_public_fmha_sm100_sparse_atten_func for MiniMax-supported "
+                "rows; independent torch FP32 masked attention for FP16 rows"
+            ),
             "baseline_api_selection": (
                 "sparse_atten_func supports the required flat/paged BF16 and "
                 "mixed BF16-query/FP8-KV inputs. FP16 rows are candidate-only; "
@@ -1402,11 +1583,14 @@ def _run_parent(args: argparse.Namespace) -> None:
             "manifest_shape_count": len(SHAPE_MANIFEST),
             "selected_shape_count": len(selected_shapes),
             "selected_shape_ids": [shape.stable_id for shape in selected_shapes],
-            "comparable_shape_count": len(expected_correctness_ids),
+            "comparable_shape_count": len(expected_comparison_ids),
             "official_baseline_unsupported_shape_count": sum(
                 not shape.baseline_comparable for shape in selected_shapes
             ),
-            "output_parity_checked_shape_count": len(correctness_results),
+            "correctness_checked_shape_count": len(correctness_results),
+            "minimax_output_parity_checked_shape_count": len(expected_comparison_ids),
+            "independent_reference_checked_shape_count": len(expected_correctness_ids)
+            - len(expected_comparison_ids),
             "num_q_heads_values": sorted(
                 {shape.num_q_heads for shape in selected_shapes}
             ),
@@ -1423,6 +1607,7 @@ def _run_parent(args: argparse.Namespace) -> None:
         "summary": {
             "all_required_measurements_valid": True,
             "all_comparable_outputs_match": True,
+            "all_frozen_shape_correctness_passed": True,
             "measured_comparisons": len(comparable_speedups),
             "geometric_mean_speedup": geometric_mean,
             "minimum_speedup": min(comparable_speedups)

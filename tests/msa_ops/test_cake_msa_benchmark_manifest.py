@@ -1,7 +1,7 @@
 """CPU-only contract tests for the frozen SM100/SM103 MSA benchmark matrix."""
 
 from argparse import Namespace
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
@@ -134,3 +134,24 @@ def test_paged_cache_builder_pads_partial_final_page_without_changing_tokens():
     reconstructed = logical_pages.reshape(-1, num_kv_heads, head_dim)
     torch.testing.assert_close(reconstructed[:seqlen_kv], logical)
     assert torch.count_nonzero(reconstructed[seqlen_kv:]).item() == 0
+
+
+def test_independent_reference_is_layout_invariant_for_partial_fp16_page():
+    base = benchmark.SHAPE_MANIFEST[4]
+    common = {
+        "batch_size": 1,
+        "seqlen_q": 2,
+        "seqlen_kv": 129,
+        "num_q_heads": 2,
+        "num_kv_heads": 1,
+        "topk": 4,
+    }
+    flat = replace(base, kv_layout="flat_varlen", **common)
+    paged = replace(base, kv_layout="paged", **common)
+    flat_inputs = benchmark._make_inputs(torch, flat, torch.device("cpu"))
+    paged_inputs = benchmark._make_inputs(torch, paged, torch.device("cpu"))
+
+    flat_output = benchmark._candidate_reference_output(torch, flat, flat_inputs)
+    paged_output = benchmark._candidate_reference_output(torch, paged, paged_inputs)
+
+    torch.testing.assert_close(flat_output, paged_output, atol=0, rtol=0)
