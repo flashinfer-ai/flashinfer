@@ -1711,6 +1711,7 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._assert_shared_experts_supported()
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
