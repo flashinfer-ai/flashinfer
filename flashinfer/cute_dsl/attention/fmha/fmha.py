@@ -118,6 +118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
         use_tma_store: bool = True,
+        skip_rescale_threshold: float = 8.0,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -142,6 +143,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             - window_size_left/right: Sliding window size for attention masking
             - enable_ex2_emulation: Whether to enable exp2 emulation
             - enable_skip_correction: Whether to skip the correction when rowmax is not updated larger than a threshold
+            - skip_rescale_threshold: Skip-correction threshold: >0 enables skip-correction when row_max is not updated
+                                      ; it allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
 
         :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
         :type qk_acc_dtype: Type[cutlass.Numeric]
@@ -190,6 +193,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_persistent = is_persistent
         self.mask_type = mask_type
         self.enable_skip_correction = enable_skip_correction
+        self.rescale_threshold = skip_rescale_threshold if enable_skip_correction else 0.0
         self.enable_ex2_emulation = enable_ex2_emulation
         self.use_tma_store = use_tma_store
 
@@ -333,14 +337,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mma_softmax_stage = 1
         self.epi_stage = 2
 
-        # Tunable parameters
-        self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
         # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.
         self.p_fp8_prescale_log2 = max(0.0, math.floor(math.log2(448) - self.rescale_threshold))
         # ln(2) * offset correction for LSE when pre-scale is active
         self.p_fp8_prescale_lse_correction = self.p_fp8_prescale_log2 * math.log(2)
+
+        # Tunable parameters
         # For most cases, seq barrier is needed to help keep the pipeline stable
         # But sometimes, compiler will schedule the barrier at an unexpected place
         # if it hurts perf a lot, try to quickly fix it by disabling seq barrier

@@ -3493,8 +3493,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             _sm_scale = (
                 sm_scale if sm_scale is not None else 1.0 / math.sqrt(head_dim_qk)
             )
-            # Variant-less head-128 dense/causal plans route to the trtllm
-            # CuTe DSL FMHA kernel (prebuilt artifacts).  Sliding-window
+            # Variant-less head-128 dense/causal plans route to the standalone
+            # CuTe DSL FMHA runner (prebuilt artifacts or JIT). Sliding-window
             # plans use the modular cute-dsl path, which measures faster on
             # windows (banded masks skip dead work) for every V dtype —
             # mixed V (e.g. fp8 V with bf16 Q/K) forces the FMHA path onto
@@ -3508,8 +3508,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cute_dsl_fmha_plan = {
                     "qo_indptr": qo_indptr,
                     "kv_indptr": kv_indptr,
-                    "seq_lens": k_lens.to(torch.int32),
-                    "batch_size": qo_indptr.shape[0] - 1,
                     "max_q_len": int(q_lens.max().item()),
                     "max_kv_len": int(k_lens.max().item()),
                     "sm_scale": _sm_scale,
@@ -3690,6 +3688,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        skip_rescale_threshold: float = 8.0,
     ) -> torch.Tensor:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
@@ -3700,7 +3699,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, k, v)
+        return self.run(q, k, v, skip_rescale_threshold=skip_rescale_threshold)
 
     @overload
     def run(
@@ -3713,6 +3712,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        skip_rescale_threshold: float = 8.0,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -3729,6 +3729,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        skip_rescale_threshold: float = 8.0,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -3749,6 +3750,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        skip_rescale_threshold: float = 8.0,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
@@ -3783,6 +3785,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        skip_rescale_threshold : float
+            Cute DSL Skip-correction threshold: >0 enables skip-correction when row_max is not updated;
+            it allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -3933,33 +3938,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # enable_pdl is a launch-latency hint: forwarded on the FMHA
             # route below; the modular kernel has no PDL support.
             if self._cute_dsl_use_fmha:
-                # Delegate dense/causal plans to the trtllm CuTe DSL FMHA
-                # kernel (mixed V dtype included: it JIT-compiles
-                # separate-V-dtype variants).  Windowed plans stay on the
-                # modular path for every V dtype.
+                # Dense/causal plans invoke the shared CuTe DSL FMHA runner
+                # directly, keeping this FlashInfer wrapper independent from
+                # the TRT-LLM attention entry point. Mixed V dtypes and
+                # non-default rescale thresholds JIT-compile distinct kernels.
+                from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
+
                 p = self._cute_dsl_fmha_plan
-                return trtllm_ragged_attention_deepseek(
-                    query=q,
-                    key=k,
-                    value=v,
-                    workspace_buffer=self._float_workspace_buffer,
-                    seq_lens=p["seq_lens"],
-                    max_q_len=p["max_q_len"],
-                    max_kv_len=p["max_kv_len"],
-                    bmm1_scale=p["sm_scale"],
-                    bmm2_scale=1.0,
-                    o_sf_scale=1.0,
-                    batch_size=p["batch_size"],
-                    window_left=p["window_left"],
-                    cum_seq_lens_q=p["qo_indptr"],
-                    cum_seq_lens_kv=p["kv_indptr"],
-                    enable_pdl=enable_pdl,
+                cute_dsl_fmha_ragged_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    o=out,
+                    qo_indptr=p["qo_indptr"],
+                    kv_indptr=p["kv_indptr"],
                     is_causal=p["causal"],
-                    return_lse=return_lse,
-                    out=out,
-                    lse=lse,
-                    backend="cute-dsl",
+                    sm_scale=p["sm_scale"],
+                    window_left=p["window_left"],
+                    lse=lse if return_lse else None,
+                    max_qo_len=p["max_q_len"],
+                    max_kv_len=p["max_kv_len"],
+                    skip_rescale_threshold=skip_rescale_threshold,
+                    enable_pdl=enable_pdl,
                 )
+                if return_lse:
+                    assert lse is not None
+                    return out, lse
+                return out
             if return_lse:
                 # Standard-path modular kernel computes LSE natively; the
                 # wrapper raises NotImplementedError for attention variants.
@@ -4454,6 +4459,7 @@ def trtllm_ragged_attention_deepseek(
     return_lse: bool,
     attention_sinks: Optional[torch.Tensor] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    skip_rescale_threshold: float = 8.0,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     sage_attn_sfs: Tuple[
@@ -4514,6 +4520,9 @@ def trtllm_ragged_attention_deepseek(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    skip_rescale_threshold : float
+        Cute DSL Skip-correction threshold: >0 enables skip-correction when row_max is not updated;
+        it allows skipping at (new_row_max - row_max) * scale_sm * log2e < X.
     out : Optional[torch.Tensor]
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
@@ -4632,6 +4641,7 @@ def trtllm_ragged_attention_deepseek(
             max_qo_len=max_q_len,
             max_kv_len=max_kv_len,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            skip_rescale_threshold=skip_rescale_threshold,
             enable_pdl=enable_pdl,
         )
     else:

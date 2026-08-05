@@ -55,6 +55,7 @@ def cute_dsl_fmha_blockscaled_prefill(
     scale_v: float | torch.Tensor = 1.0,
     scale_o: float | torch.Tensor = 1.0,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
+    skip_rescale_threshold: float = 8.0,
     enable_pdl: bool = False,
 ) -> None:
     """Batched (non-varlen) block-scaled prefill via the JIT-compiled trtllm kernel.
@@ -91,6 +92,7 @@ def cute_dsl_fmha_blockscaled_prefill(
         use_skip,
         enable_pdl,
         q.device,
+        skip_rescale_threshold=skip_rescale_threshold,
     )
 
     if sm_scale is None:

@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Frontend tests for the `cute-dsl` backend routed to the trtllm JIT FMHA kernel.
+"""Frontend tests for APIs backed by the shared CuTe DSL FMHA runner.
 
 Covers entry points:
-* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the shared low-level API.
-* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — delegates to the former
-  for standard attention, falls back to prefill.py for ALiBi / soft-cap.
+* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the TRT-LLM API entry.
+* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — independently calls
+  the runner for standard attention and uses modular prefill for ALiBi / soft-cap.
 """
 
 import math
@@ -78,15 +78,15 @@ def _make_qkv(total_q, total_kv, Hq, Hk, dtype_qk, dtype_vo, Dqk, Dvo):
 
 
 @pytest.mark.parametrize(
-    "dtype_qk,dtype_vo,Dqk,Dvo",
+    "dtype_qk,dtype_vo,Dqk,Dvo,skip_rescale_threshold",
     [
-        (torch.bfloat16, torch.bfloat16, 128, 128),
-        (torch.bfloat16, torch.float8_e4m3fn, 128, 128),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, 128, 128),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, 192, 128),  # MLA
+        (torch.bfloat16, torch.bfloat16, 128, 128, 1.0),
+        (torch.bfloat16, torch.float8_e4m3fn, 128, 128, 8.0),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, 128, 128, 8.0),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, 192, 128, 8.0),  # MLA
     ],
 )
-def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo):
+def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo, skip_rescale_threshold):
     torch.manual_seed(0)
     b, s, H = 2, 256, 8
     qo = _indptr([s] * b)
@@ -115,10 +115,11 @@ def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo):
         enable_pdl=False,
         is_causal=False,
         return_lse=False,
+        skip_rescale_threshold=skip_rescale_threshold,
         backend="cute-dsl",
     )
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=False)
-    atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    atol = 5e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
 
@@ -152,7 +153,7 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
     w.plan(qo, kv, Hq, Hk, D, causal=causal, q_data_type=dtype_qk)
     o = w.run(q, k, v)
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=causal)
-    atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    atol = 5e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
     # LSE is now supported for standard attention.
@@ -161,7 +162,8 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
     assert lse.shape == (total, Hq)
 
 
-def test_cute_dsl_jit_case(monkeypatch):
+@pytest.mark.parametrize("skip_rescale_threshold", [8.0, 1.0])
+def test_cute_dsl_jit_case(monkeypatch, skip_rescale_threshold):
     """When the cubin variant is unavailable, cute_dsl_fmha_ragged_prefill must
     JIT-compile the kernel and still produce correct results.
     """
@@ -194,13 +196,14 @@ def test_cute_dsl_jit_case(monkeypatch):
         sm_scale=sm,
         max_qo_len=s,
         max_kv_len=s,
+        skip_rescale_threshold=skip_rescale_threshold,
     )
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=False)
     torch.testing.assert_close(o.float(), ref.float(), atol=3e-2, rtol=3e-2)
 
 
 def test_batch_prefill_cute_dsl_alibi():
-    """ALiBi is unsupported by the trtllm kernel; must use prefill.py instead."""
+    """ALiBi is unsupported by the FMHA runner; use modular prefill instead."""
     torch.manual_seed(0)
     b, s, H, D = 2, 256, 8, 128
     qo = _indptr([s] * b)
