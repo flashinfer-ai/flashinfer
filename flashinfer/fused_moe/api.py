@@ -512,6 +512,10 @@ class CutlassBf16Config:
 
     Architecture coverage follows the dense-BF16 legacy flat API. The unified
     GPU tests currently exercise SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported.
     """
 
     @classmethod
@@ -551,7 +555,13 @@ class CutlassBf16Config:
 
 @dataclass(frozen=True)
 class CutlassW4A16Config:
-    """CUTLASS MXFP4-weight x BF16-activation backend for SM90."""
+    """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported. Both ``hidden_size`` and ``intermediate_size`` must be divisible
+    by 128.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:

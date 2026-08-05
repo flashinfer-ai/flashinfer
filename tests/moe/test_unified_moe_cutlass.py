@@ -1,4 +1,4 @@
-"""Unified CUTLASS BF16 MoE adapter tests."""
+"""Unified CUTLASS BF16 and W4A16/MXFP4 MoE adapter tests."""
 
 from __future__ import annotations
 
@@ -403,7 +403,7 @@ def _make_case(num_tokens: int = 16):
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
     hidden_size, intermediate_size = 128, 256
-    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 5
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
     w1 = (
         torch.randn(
             num_experts,
@@ -412,7 +412,7 @@ def _make_case(num_tokens: int = 16):
             device=device,
             dtype=torch.bfloat16,
         )
-        / 20
+        / 10
     )
     w2 = (
         torch.randn(
@@ -422,7 +422,7 @@ def _make_case(num_tokens: int = 16):
             device=device,
             dtype=torch.bfloat16,
         )
-        / 20
+        / 10
     )
     topk_ids = torch.stack(
         [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
@@ -458,7 +458,7 @@ def _make_w4a16_case(num_tokens: int = 16):
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
     hidden_size, intermediate_size = 128, 256
-    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 5
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
     w1 = (
         torch.randn(
             num_experts,
@@ -467,7 +467,7 @@ def _make_w4a16_case(num_tokens: int = 16):
             device=device,
             dtype=torch.bfloat16,
         )
-        / 20
+        / 10
     )
     w2 = (
         torch.randn(
@@ -477,7 +477,7 @@ def _make_w4a16_case(num_tokens: int = 16):
             device=device,
             dtype=torch.bfloat16,
         )
-        / 20
+        / 10
     )
     topk_ids = torch.stack(
         [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
@@ -528,6 +528,23 @@ def _reference(act: MoEActivationPack, w1: torch.Tensor, w2: torch.Tensor):
     return result.to(torch.bfloat16)
 
 
+def _assert_numerically_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(
+            torch.zeros_like(expected),
+            expected,
+            rtol=rtol,
+            atol=atol,
+        )
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
 def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
     runner = layer.runners[0]
     bucket = map_to_hybrid_bucket(
@@ -548,7 +565,7 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference():
 
     assert layer.winner_backend == "cutlass_bf16"
     assert runner._workspace is not None
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    _assert_numerically_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @cutlass_sm90_required
@@ -565,7 +582,7 @@ def test_cutlass_w4a16_moe_layer_matches_quantized_reference():
     assert layer.winner_backend == "cutlass_w4a16"
     assert runner._workspace is not None
     assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
-    torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
+    _assert_numerically_close(actual, expected, rtol=5e-2, atol=2e-2)
 
 
 @cutlass_sm90_required
@@ -623,7 +640,7 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     actual = runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
     expected = _reference(act, w1, w2)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    _assert_numerically_close(actual, expected, rtol=2e-2, atol=2e-2)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -636,7 +653,7 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
+    _assert_numerically_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
 @cutlass_sm90_required
@@ -681,7 +698,7 @@ def test_cutlass_forward_reactivates_runtime_workspace_after_smaller_override():
 
     assert runner._workspace_num_tokens == 64
     assert runner._workspace is workspace_64
-    torch.testing.assert_close(actual, _reference(act, w1, w2), rtol=2e-2, atol=2e-2)
+    _assert_numerically_close(actual, _reference(act, w1, w2), rtol=2e-2, atol=2e-2)
 
 
 @cutlass_sm90_required
@@ -704,7 +721,7 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     torch.cuda.synchronize()
     expected = _reference(act, w1, w2)
     assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
-    torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
+    _assert_numerically_close(actual, expected, rtol=5e-2, atol=2e-2)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -716,4 +733,4 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(captured, expected, rtol=1e-1, atol=1e-1)
+    _assert_numerically_close(captured, expected, rtol=5e-2, atol=2e-2)
