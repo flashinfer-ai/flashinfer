@@ -22,6 +22,13 @@ IDs, and routing weights. Scale tensors use their native UE8M0/block-32 and
 E4M3/block-16 layouts. This avoids a large temporary BF16 weight allocation
 while keeping the performance comparison data-identical.
 
+This script measures one rank and does not simulate expert-parallel dispatch.
+For EP comparisons, pass the number of experts resident on that rank and choose
+--tokens/--top-k so that tokens * top_k matches the routed pairs
+actually processed by that rank. Under balanced routing this is approximately
+the model top-k divided by the EP size, but it can be fractional or imbalanced;
+the default --top-k 8 is a single-rank workload and is not EP-aware.
+
 Usage:
     python benchmarks/bench_b12x_mxfp4_moe.py
     python benchmarks/bench_b12x_mxfp4_moe.py --tokens 1 8 32

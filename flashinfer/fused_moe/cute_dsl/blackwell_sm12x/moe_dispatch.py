@@ -461,7 +461,11 @@ def allocate_sm120_static_workspace(
 
     # Direct micro reads weights by global expert id, so its planes are only
     # useful without EP remapping.
-    if state_E == weight_E and _direct_micro_candidate(k, n, num_topk, weight_E):
+    if (
+        quant_mode == "nvfp4"
+        and state_E == weight_E
+        and _direct_micro_candidate(k, n, num_topk, weight_E)
+    ):
         dm_rows = min(max_rows, _MICRO_MAX_TOKENS * num_topk)
         # The epoch-based barriers restore their slots after each launch, so
         # the zeroed allocation is the only reset needed (graph-replay safe).
@@ -1506,7 +1510,7 @@ def launch_sm120_static_moe(
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
     use_direct_micro = (
-        activation_precision == "fp4"
+        quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
@@ -1517,6 +1521,10 @@ def launch_sm120_static_moe(
     )
     if _FORCED_BACKEND is not None:
         if _FORCED_BACKEND == "direct_micro":
+            if quant_mode != "nvfp4":
+                raise ValueError(
+                    "forced direct_micro backend only supports quant_mode=nvfp4"
+                )
             if workspace.dm_barrier_count is None or not (
                 MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
             ):
