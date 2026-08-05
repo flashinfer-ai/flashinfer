@@ -28,6 +28,7 @@ from typing import Any, ClassVar, List
 import torch
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
+from ..utils import next_positive_power_of_2
 from .api import (
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_W4A16_ARCHS,
@@ -210,7 +211,11 @@ class MoERunner(TunableRunner):
 
 
 class _CutlassRunnerBase(MoERunner):
-    """Shared launch, tuning, and workspace mechanics for CUTLASS MoE."""
+    """Shared launch, tuning, and workspace mechanics for CUTLASS MoE.
+
+    A runner is a single-stream resource. Concurrent use or CUDA-graph replay
+    on multiple streams requires one runner (or ``MoELayer``) per stream.
+    """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     _supported_archs: ClassVar[tuple[int, ...]]
@@ -265,6 +270,10 @@ class _CutlassRunnerBase(MoERunner):
 
         # pack_inputs replaces this with the current MoELayer token bucket.
         self.tuning_config = TuningConfig()
+        # Retain geometrically sized buffers because captured CUDA graphs keep
+        # their raw pointers. Deterministic capacities make a request shape
+        # select the same pointer regardless of allocation history.
+        self._workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._workspace: torch.Tensor | None = None
         self._workspace_num_tokens = 0
         self._workspace_hidden_size: int | None = None
@@ -356,23 +365,32 @@ class _CutlassRunnerBase(MoERunner):
         return [(int(gemm1), int(gemm2))]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
-        if num_tokens > self.config.execution.tune_max_num_tokens:
+        max_num_tokens = self.config.execution.tune_max_num_tokens
+        if num_tokens > max_num_tokens:
             raise ValueError(
                 f"workspace num_tokens={num_tokens} exceeds tune_max_num_tokens="
-                f"{self.config.execution.tune_max_num_tokens}."
+                f"{max_num_tokens}."
             )
-        if self._workspace is not None:
-            if hidden_size != self._workspace_hidden_size:
-                raise ValueError(
-                    "CUTLASS runner hidden_size changed after workspace allocation: "
-                    f"{self._workspace_hidden_size} -> {hidden_size}."
-                )
+        if (
+            self._workspace_hidden_size is not None
+            and hidden_size != self._workspace_hidden_size
+        ):
+            raise ValueError(
+                "CUTLASS runner hidden_size changed after workspace allocation: "
+                f"{self._workspace_hidden_size} -> {hidden_size}."
+            )
+
+        capacity = min(next_positive_power_of_2(num_tokens), max_num_tokens)
+        key = (capacity, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is not None:
+            self._workspace = workspace
+            self._workspace_num_tokens = capacity
             return
         from .core import cutlass_fused_moe_workspace_size
 
-        max_num_tokens = self.config.execution.tune_max_num_tokens
         size = cutlass_fused_moe_workspace_size(
-            max_num_tokens,
+            capacity,
             hidden_size,
             self.config.experts.intermediate_size,
             self.config.routing.num_experts,
@@ -385,8 +403,10 @@ class _CutlassRunnerBase(MoERunner):
             use_fused_finalize=self._use_fused_finalize,
             device=self.device,
         )
-        self._workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
-        self._workspace_num_tokens = max_num_tokens
+        workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._workspace_cache[key] = workspace
+        self._workspace = workspace
+        self._workspace_num_tokens = capacity
         self._workspace_hidden_size = hidden_size
 
     def pack_inputs(
@@ -434,6 +454,10 @@ class _CutlassRunnerBase(MoERunner):
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
+
+        # Workspace-size querying loads the CUTLASS module. Validate backend
+        # support and finish the lazy build before that first JIT entry point.
+        self._ensure_built()
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens

@@ -59,7 +59,6 @@ from flashinfer.fused_moe.api import (
     CuteDslConfig,
     CutlassConfig,
     CutlassBf16Config,
-    CutlassW4A16Config,
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,

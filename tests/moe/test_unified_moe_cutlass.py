@@ -30,7 +30,15 @@ from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
 from flashinfer.tllm_enums import ActivationType
-from flashinfer.utils import is_sm90a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+    is_sm100f_supported,
+    is_sm110a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+    is_sm90a_supported,
+)
 
 
 def _config(**overrides) -> MoEConfig:
@@ -437,6 +445,51 @@ def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
         runner.pack_inputs(act, MoEWeightPack())
 
 
+def test_cutlass_direct_pack_checks_support_before_workspace_query():
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config()
+    runner.device = torch.device("cpu")
+    runner._inner = None
+    events = []
+
+    def check_support():
+        events.append("check_support")
+
+    def build():
+        events.append("build")
+        runner._inner = object()
+
+    def ensure_workspace(num_tokens, hidden_size):
+        events.append("workspace")
+
+    runner.check_support = check_support
+    runner.build = build
+    runner._ensure_workspace = ensure_workspace
+    runner._pack_weight_inputs = lambda view, hidden_size: [
+        torch.empty(1),
+        torch.empty(1),
+    ]
+
+    act = MoEActivationPack(
+        torch.empty(1, 128, dtype=torch.bfloat16),
+        None,
+        torch.zeros(1, 2, dtype=torch.int32),
+        torch.full((1, 2), 0.5, dtype=torch.float32),
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        runner.backend_key,
+        {
+            "fc1_expert_weights": torch.empty(1),
+            "fc2_expert_weights": torch.empty(1),
+        },
+    )
+
+    runner.pack_inputs(act, weights)
+
+    assert events == ["check_support", "build", "workspace"]
+
+
 def test_cutlass_tuning_pre_hook_activates_synthesized_bucket_workspace():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner.config = _config()
@@ -456,7 +509,7 @@ def test_cutlass_tuning_pre_hook_activates_synthesized_bucket_workspace():
     assert activated == [(64, 128)]
 
 
-def test_cutlass_reuses_max_sized_workspace_across_buckets(monkeypatch):
+def test_cutlass_reuses_geometric_workspace_capacities(monkeypatch):
     from flashinfer.fused_moe import core
 
     requested_tokens = []
@@ -470,20 +523,53 @@ def test_cutlass_reuses_max_sized_workspace_across_buckets(monkeypatch):
     runner.config = _config()
     runner.device = torch.device("cpu")
     runner._use_fused_finalize = True
+    runner._workspace_cache = {}
     runner._workspace = None
     runner._workspace_num_tokens = 0
     runner._workspace_hidden_size = None
 
-    runner._ensure_workspace(32, 128)
-    workspace = runner._workspace
-    runner._ensure_workspace(64, 128)
-    runner._ensure_workspace(32, 128)
+    runner._ensure_workspace(17, 128)
+    workspace_32 = runner._workspace
+    runner._ensure_workspace(33, 128)
+    workspace_64 = runner._workspace
+    runner._ensure_workspace(17, 128)
 
-    assert runner._workspace is workspace
-    assert runner._workspace_num_tokens == 64
-    assert requested_tokens == [64]
+    assert runner._workspace is workspace_32
+    assert runner._workspace_num_tokens == 32
+    assert requested_tokens == [32, 64]
+    assert runner._workspace_cache[(32, 128)] is workspace_32
+    assert runner._workspace_cache[(64, 128)] is workspace_64
     with pytest.raises(ValueError, match="hidden_size changed"):
         runner._ensure_workspace(32, 256)
+
+
+def _is_cutlass_bf16_runtime_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda")
+    major, minor = get_compute_capability(device)
+    arch = major * 10 + minor
+    if not CutlassBf16Config.supported(arch):
+        return False
+    if arch == 90:
+        return is_sm90a_supported(device)
+    if arch in (100, 103):
+        return is_sm100a_supported(device)
+    if arch == 107:
+        return is_sm100f_supported(device)
+    if arch == 110:
+        return is_sm110a_supported(device)
+    if arch == 120:
+        return is_sm120a_supported(device)
+    if arch == 121:
+        return is_sm121a_supported(device)
+    return arch == 89
+
+
+cutlass_bf16_required = pytest.mark.skipif(
+    not _is_cutlass_bf16_runtime_supported(),
+    reason="requires a supported CUTLASS BF16 GPU and CUDA toolkit",
+)
 
 
 cutlass_w4a16_required = pytest.mark.skipif(
@@ -648,6 +734,7 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
     return runner
 
 
+@cutlass_bf16_required
 def test_cutlass_bf16_moe_layer_matches_independent_reference():
     config, act, weights, w1, w2 = _make_case()
     layer = MoELayer(config)
@@ -678,6 +765,7 @@ def test_cutlass_w4a16_moe_layer_matches_quantized_reference():
     _assert_numerically_close(actual, expected, rtol=5e-2, atol=2e-2)
 
 
+@cutlass_bf16_required
 def test_cutlass_stage_file_cache_key_includes_top_k():
     config, act, weights, _, _ = _make_case()
     runner = MoELayer(config).runners[0]
@@ -709,6 +797,7 @@ def test_cutlass_stage_file_cache_key_includes_top_k():
     assert original_key.file_key != other_key.file_key
 
 
+@cutlass_bf16_required
 def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     config, act, weights, w1, w2 = _make_case(num_tokens=17)
     runner = MoELayer(config).runners[0]
@@ -716,7 +805,7 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     spec = runner.tuning_config.dynamic_tensor_specs[0]
     assert spec.input_idx == (0, 1, 2, 3)
     assert spec.gen_tuning_buckets == (32,)
-    assert runner._workspace_num_tokens == 64
+    assert runner._workspace_num_tokens == 32
 
     with autotune(True):
         _, tactic = AutoTuner.get().choose_one(
@@ -738,7 +827,8 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
         captured = runner.forward(inputs, tactic=tactic)
     captured_workspace = runner._workspace
     runner._ensure_workspace(64, inputs[1].shape[1])
-    assert runner._workspace is captured_workspace
+    assert runner._workspace is not captured_workspace
+    assert runner._workspace_cache[(32, inputs[1].shape[1])] is captured_workspace
     captured.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -746,11 +836,12 @@ def test_cutlass_autotuned_compound_tactic_numerics_and_cuda_graph():
     _assert_numerically_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_cutlass_autotune_override_reuses_max_workspace():
+@cutlass_bf16_required
+def test_cutlass_autotune_override_uses_geometric_workspace():
     config, act, weights, _, _ = _make_case(num_tokens=17)
     runner = MoELayer(config).runners[0]
     inputs = runner.pack_inputs(act, weights)
-    workspace = runner._workspace
+    workspace_32 = runner._workspace
 
     with autotune(True, tuning_buckets=(64,)):
         AutoTuner.get().choose_one(
@@ -761,14 +852,16 @@ def test_cutlass_autotune_override_reuses_max_workspace():
         )
 
     assert runner._workspace_num_tokens == 64
-    assert runner._workspace is workspace
+    assert runner._workspace is runner._workspace_cache[(64, 128)]
+    assert runner._workspace_cache[(32, 128)] is workspace_32
 
 
-def test_cutlass_forward_reuses_max_workspace_after_smaller_override():
+@cutlass_bf16_required
+def test_cutlass_forward_reselects_runtime_workspace_after_smaller_override():
     config, act, weights, w1, w2 = _make_case(num_tokens=50)
     runner = MoELayer(config).runners[0]
     inputs = runner.pack_inputs(act, weights)
-    workspace = runner._workspace
+    workspace_64 = runner._workspace
 
     with autotune(True, tuning_buckets=(32,)):
         _, tactic = AutoTuner.get().choose_one(
@@ -778,13 +871,13 @@ def test_cutlass_forward_reuses_max_workspace_after_smaller_override():
             inputs,
         )
 
-    assert runner._workspace_num_tokens == 64
-    assert runner._workspace is workspace
+    assert runner._workspace_num_tokens == 32
+    assert runner._workspace is runner._workspace_cache[(32, 128)]
     actual = runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
 
     assert runner._workspace_num_tokens == 64
-    assert runner._workspace is workspace
+    assert runner._workspace is workspace_64
     _assert_numerically_close(actual, _reference(act, w1, w2), rtol=2e-2, atol=2e-2)
 
 
@@ -815,7 +908,8 @@ def test_cutlass_w4a16_autotuned_compound_tactic_and_cuda_graph():
         captured = runner.forward(inputs, tactic=tactic)
     captured_workspace = runner._workspace
     runner._ensure_workspace(64, inputs[1].shape[1])
-    assert runner._workspace is captured_workspace
+    assert runner._workspace is not captured_workspace
+    assert runner._workspace_cache[(32, inputs[1].shape[1])] is captured_workspace
     captured.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
