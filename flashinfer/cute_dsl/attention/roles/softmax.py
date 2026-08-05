@@ -141,6 +141,13 @@ class SoftmaxRole:
         4. Transforming scores using exp2(x*scale - max*scale)
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
+
+        CONTRACT: step() advances the four pipeline participants internally
+        and returns them; every call site MUST tuple-unpack them back into
+        the same variables.  That rebinding assignment is what marks the
+        participants as loop-carried in run()'s dynamic loops — dropping it
+        silently freezes their state across iterations (see the
+        helper-method rules in loader_tma.py).
         """
         assert self.q_dtype is not None
         assert self.o_dtype is not None
