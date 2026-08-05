@@ -22,7 +22,7 @@ runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
 Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
 CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
 every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
-top-8), 4x GB200, heuristic knobs, speedup vs `deep_gemm_mega` in parens;
+top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens;
 CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
@@ -44,7 +44,7 @@ between 512 and 1024, win growing to 1.62x at 8192** (1.86x with the fp4
 combine wire).  The small-batch regime is weight-load bound and fp4-vs-fp4
 there is a wash.
 
-The `mxfp8_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
+The `sm100_mxfp8_mxfp8_bf16_cutedsl` backend (latest sweep 2026-07-22 on dsl 4.5.2, CSV
 `sweep_20260722_114210_fi_mega.csv`; its >=2048 rows use the re-derived
 dispatch-warp default profile) runs 0.63x / 0.82x / 0.88x / 0.96x vs dg at
 1024 / 2048 / 4096 / 8192 tok/rank — near dg parity at 8192 at a 3x better
@@ -58,7 +58,7 @@ session, and node as the table above; CSVs
 generated tables in that repo's `model_shapes/RESULTS.md`).  Pattern holds
 everywhere: dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens (1.6-1.9x on 7168-hidden shapes).  `e2e_pipelined` p50 µs, speedup
-vs `deep_gemm_mega` in parens.
+vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens.
 
 **deepseek_v3** — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the table above; matches within run noise):
@@ -131,12 +131,12 @@ distributions fare better — see the e2e GSM8K numbers below):
 
 | variant                | acc loss |
 |------------------------|---------:|
-| deep_gemm_mega         | 20.6%    |
+| sm100_fp8_nvfp4_bf16_deepgemm         | 20.6%    |
 | nvfp4 (bf16 wire)      | 23.2%    |
 | nvfp4 `+ikr`           | 23.2%    |
 | nvfp4 `+combine_mxfp8` | 23.3%    |
 | nvfp4 `+combine_nvfp4` | 25.0%    |
-| mxfp8_cutedsl          | 6.4%     |
+| sm100_mxfp8_mxfp8_bf16_cutedsl          | 6.4%     |
 
 Note mxfp8's 6.4% vs the fp4-weight backends' ~21-25%: the perf ranking is
 not the whole story.
@@ -179,7 +179,7 @@ path) and `fi_dg` run the mxfp4 checkpoint.
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
-All `nvfp4_cutedsl` measurements taken before 2026-07-15 used a broken
+All `sm100_nvfp4_nvfp4_bf16_cutedsl` measurements taken before 2026-07-15 used a broken
 weight layout and have been removed (raw CSVs archived under
 `moe_ep_benchmark/results/archive_pre20260715_broken_nvfp4_layout/`): the
 FI preprocess materialized fc1/fc2 weights N-stride-1 while the frontend
@@ -189,7 +189,7 @@ runs used a faster-but-wrong load pattern and produced incorrect results
 Caught by the torch-oracle tests
 (`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`); fixed in
 `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/weights.py` (K-major transpose views).
-`deep_gemm_mega` / `mxfp8_cutedsl` numbers were unaffected.  The corrected
+`sm100_fp8_nvfp4_bf16_deepgemm` / `sm100_mxfp8_mxfp8_bf16_cutedsl` numbers were unaffected.  The corrected
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.
 
@@ -316,7 +316,7 @@ misses) — both are the right behavior as long as internal drops carry the
   2048 tokens, fb4 + reuse_dispatch_warps at >=2048 (-14.5% at 2048:
   1010.6 vs 1181.6 us kernel-mode; supersedes the 07-14 "dispatch-warp is
   ~5% slower for MXFP8" reading, which conflated it with fb8).
-- Backend configs (`Nvfp4/Mxfp8CutedslMegaMoeConfig.knobs`): explicit dict
+- Backend configs (`Nvfp4/Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the
@@ -383,7 +383,7 @@ a shape comes in:
 sequenceDiagram
     autonumber
     participant L as MoEEpMegaLayer<br/>(modes/mega_layer)
-    participant B as Backend<br/>(nvfp4_cutedsl)
+    participant B as Backend<br/>(sm100_nvfp4_nvfp4_bf16_cutedsl)
     participant S as get_symm_buffer_for_mega_moe<br/>(shim)
     participant T as tuner.py
     participant F as Frontend<br/>(shim nvfp4/mxfp8)
@@ -511,7 +511,7 @@ before comparing MoE backends.
 
 Imported from TRT-LLM PR #16190, both idea families are
 plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
-(`Nvfp4CutedslMegaMoeConfig`):
+(`Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig`):
 
 - `in_kernel_fc2_reduce` — in-flight top-k combine via cross-rank REDG
   atomic-add; its main win is that the multi-GB per-topk combine staging
@@ -600,7 +600,7 @@ editable-installed inside the container
 ranks per (variant, token-count) point — every point pays a fresh
 `cute.compile` (amortized by cute's on-disk cache).  Variants selected
 with the bench env knobs `MEGA_IKR=1` / `MEGA_COMBINE_DTYPE=nvfp4|mxfp8`
-(mapped onto `Nvfp4CutedslMegaMoeConfig`); knobs left at the default
+(mapped onto `Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig`); knobs left at the default
 per-size heuristic profiles (`tuner.default_knobs`), which the quantized
 wires auto-adjust to dispatch-warp token-back.
 
@@ -621,7 +621,7 @@ activations quantized at staging; random (uneven) routing from
   prestaged once outside the loop, so per-forward activation
   quantize/staging is NOT included (for any backend).
 Reported number = rank-0 median of the 50 iters (p50); min/max in the
-CSVs.  `deep_gemm_mega` has no thunk API, so its "kernel" number loops
+CSVs.  `sm100_fp8_nvfp4_bf16_deepgemm` has no thunk API, so its "kernel" number loops
 `compute()` (includes its thin FI wrapper).
 
 ### Runbook (rerun the sweep)
@@ -645,13 +645,13 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
       export MEGA_TIMING=$MODE
-      MEGA_LIST="deep_gemm_mega nvfp4_cutedsl" \
+      MEGA_LIST="sm100_fp8_nvfp4_bf16_deepgemm sm100_nvfp4_nvfp4_bf16_cutedsl" \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # baseline
-      MEGA_LIST=nvfp4_cutedsl MEGA_IKR=1 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_IKR=1 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +ikr
-      MEGA_LIST=nvfp4_cutedsl MEGA_COMBINE_DTYPE=nvfp4 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=nvfp4 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_nvfp4
-      MEGA_LIST=nvfp4_cutedsl MEGA_COMBINE_DTYPE=mxfp8 \
+      MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_COMBINE_DTYPE=mxfp8 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +combine_mxfp8
     done
   '

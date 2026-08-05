@@ -1,7 +1,7 @@
 """Single-GPU checks: NVFP4 ``nvfp4_mega_moe`` vs a pure-torch oracle.
 
 NVFP4 counterpart of ``test_mxfp8_cutedsl_preprocess_vs_reference.py``: validates
-that ``nvfp4_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
+that ``sm100_nvfp4_nvfp4_bf16_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
 with an independent plain quant, and that a single-rank ``nvfp4_mega_moe``
 launch matches a pure-torch dequant reference (fp32 GEMMs + SwiGLU + fc1-out
 NVFP4 round-trip) after the in-kernel top-k reduction.

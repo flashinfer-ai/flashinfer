@@ -22,7 +22,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from .config import Sm90PullFp8MegaMoeConfig
+from .config import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
 from .staging import (
     stage_mega_moe_inputs,
     staged_tokens,
@@ -38,21 +38,21 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Sm90PullFp8MegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
 
 
-@register_mega_kernel("sm90_pull_fp8")
+@register_mega_kernel("sm90_fp8_fp8_bf16_pull_cutedsl")
 class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Sm90PullFp8MegaMoeConfig) -> None:
+    def __init__(self, config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig) -> None:
         super().__init__(config)
-        self._kernel_config: Sm90PullFp8MegaMoeConfig = config
+        self._kernel_config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig = config
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm90_pull_fp8"
+        return "sm90_fp8_fp8_bf16_pull_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return sm90_pull_fp8_runtime_requirements(bootstrap)
@@ -266,7 +266,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         fp = fleet_params
         return (
-            "sm90_pull_fp8",
+            "sm90_fp8_fp8_bf16_pull_cutedsl",
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

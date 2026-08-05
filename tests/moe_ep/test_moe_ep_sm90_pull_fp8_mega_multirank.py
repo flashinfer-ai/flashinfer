@@ -1,4 +1,4 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm90_pull_fp8).
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm90_fp8_fp8_bf16_pull_cutedsl).
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py -v -m "gpu_4 and arch_hopper"
@@ -10,7 +10,7 @@ Requires Hopper (exactly sm_90), >=4 GPUs, and CuTeDSL runtime deps
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
 
-Parity methodology (mirrors the mxfp8_cutedsl twin): each layer test drives
+Parity methodology (mirrors the sm100_mxfp8_mxfp8_bf16_cutedsl twin): each layer test drives
 the SAME fused kernel twice — once through the full ``MoEEpLayer`` EP plumbing
 and once directly through the shim API (``hopper_fp8_mega_moe`` on a fresh
 symm buffer) with identical staged inputs, quantization, and preprocessed
@@ -345,9 +345,9 @@ def _assert_ikr_close(y, y_ref, *, topk):
 
 
 def _megakernel_config(problem: dict, *, in_kernel_fc2_reduce: bool = False):
-    from flashinfer.moe_ep import Sm90PullFp8MegaMoeConfig
+    from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
 
-    return Sm90PullFp8MegaMoeConfig(
+    return Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         kind=problem["kind"],
@@ -506,7 +506,7 @@ def _run_mega_layer(
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
 def test_moe_ep_sm90_pull_fp8_mega_layer_matches_reference(fp8_scale_mode):
-    """MoEEpMegaLayer (sm90_pull_fp8) with on-the-fly bf16→FP8 staging."""
+    """MoEEpMegaLayer (sm90_fp8_fp8_bf16_pull_cutedsl) with on-the-fly bf16→FP8 staging."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
@@ -515,7 +515,7 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_matches_reference(fp8_scale_mode):
         rank, world_size, quantize_input=True, fp8_scale_mode=fp8_scale_mode
     )
     print(
-        f"rank {rank}: sm90_pull_fp8 mega layer ({fp8_scale_mode}, staged inputs) "
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer ({fp8_scale_mode}, staged inputs) "
         "matches reference"
     )
 
@@ -535,7 +535,7 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_swap_ab_matches_reference():
         fp8_scale_mode="per_tensor",
         swap_ab=True,
     )
-    print(f"rank {rank}: sm90_pull_fp8 mega layer (swap_ab) matches reference")
+    print(f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference")
 
 
 @pytest.mark.gpu_4
@@ -550,7 +550,7 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_prestaged_inputs_matches_reference():
         rank, world_size, quantize_input=False, fp8_scale_mode="blockwise"
     )
     print(
-        f"rank {rank}: sm90_pull_fp8 mega layer (prestaged blockwise inputs) "
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (prestaged blockwise inputs) "
         "matches reference"
     )
 
@@ -577,7 +577,7 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_in_kernel_fc2_reduce():
         in_kernel_fc2_reduce=True,
     )
     print(
-        f"rank {rank}: sm90_pull_fp8 mega layer (in_kernel_fc2_reduce) "
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
     )
 
@@ -774,7 +774,7 @@ def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(fp8_scale_mode, swap_a
         rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
     )
     print(
-        f"rank {rank}: sm90_pull_fp8 mega kernel ({fp8_scale_mode}, "
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel ({fp8_scale_mode}, "
         f"swap_ab={swap_ab}) matches the multi-rank torch oracle"
     )
 
@@ -817,10 +817,10 @@ def test_sm90_pull_fp8_preprocess_mega_weights_from_bf16():
 
 
 def test_sm90_pull_fp8_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Sm90PullFp8MegaMoeConfig
+    from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Sm90PullFp8MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(intermediate_size=128, top_k=2)
     )
-    assert kernel.kernel_name() == "sm90_pull_fp8"
+    assert kernel.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"

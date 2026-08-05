@@ -22,7 +22,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from .config import Mxfp8CutedslMegaMoeConfig
+from .config import Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_mxfp8_forward_inputs
 from .weights import (
     TransformedMegaWeights,
@@ -34,17 +34,17 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Mxfp8CutedslMegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(config: Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
 
 
-@register_mega_kernel("mxfp8_cutedsl")
+@register_mega_kernel("sm100_mxfp8_mxfp8_bf16_cutedsl")
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Mxfp8CutedslMegaMoeConfig) -> None:
+    def __init__(self, config: Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig) -> None:
         super().__init__(config)
-        self._kernel_config: Mxfp8CutedslMegaMoeConfig = config
+        self._kernel_config: Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig = config
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -63,7 +63,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "mxfp8_cutedsl"
+        return "sm100_mxfp8_mxfp8_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return mxfp8_cutedsl_runtime_requirements(bootstrap)
@@ -276,7 +276,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
         fp = fleet_params
         return (
-            "mxfp8_cutedsl",
+            "sm100_mxfp8_mxfp8_bf16_cutedsl",
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

@@ -1,4 +1,4 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (nvfp4_cutedsl).
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl).
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
@@ -20,7 +20,7 @@ Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
 self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
 ownership, cross-rank combine), because both sides run the same CUDA kernel.
 ``test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle`` closes that gap with
-the sm90_pull_fp8 twin's methodology: each rank all-gathers the actual plain
+the sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: each rank all-gathers the actual plain
 quantized weight legs and checks its real-EP kernel output slice against the
 single-GPU pure-torch oracle run on its staged tokens + the global expert set.
 """
@@ -373,7 +373,7 @@ def _assert_ikr_close(y, y_ref, *, topk):
 
 
 def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_extra):
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
 
     kwargs = dict(
         intermediate_size=problem["intermediate"],
@@ -388,7 +388,7 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
             fc1_norm_const=problem["fc1_norm_const"],
         )
     kwargs.update(config_extra)
-    return Nvfp4CutedslMegaMoeConfig(**kwargs)
+    return Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(**kwargs)
 
 
 def _run_mega_layer(
@@ -570,23 +570,23 @@ def _run_mega_layer(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with on-the-fly bf16→NVFP4 staging.
+    """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with on-the-fly bf16→NVFP4 staging.
 
     Per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are supplied
-    via :class:`Nvfp4CutedslMegaMoeConfig` (workspace allocation).
+    via :class:`Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig` (workspace allocation).
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (staged inputs) matches reference")
+    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference")
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with pre-staged NVFP4 activations.
+    """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with pre-staged NVFP4 activations.
 
     Per-expert epilogue scalars are supplied via :class:`MoEEpTensors` and copied
     into the symm workspace when ``quantize_input=False``.
@@ -596,7 +596,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference")
+    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (prestaged inputs) matches reference")
 
 
 @pytest.mark.gpu_4
@@ -616,7 +616,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     rank = _run_mega_layer(
         rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
     )
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (large tokens) matches reference")
+    print(f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (large tokens) matches reference")
 
 
 @pytest.mark.gpu_4
@@ -644,7 +644,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens
         max_tokens=num_tokens,
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (mid tokens={num_tokens}) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (mid tokens={num_tokens}) "
         "matches reference"
     )
 
@@ -669,7 +669,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
         rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (in_kernel_fc2_reduce) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
     )
 
@@ -694,7 +694,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_quantized_combine(combine_dtype):
         rank, world_size, quantize_input=True, combine_dtype=combine_dtype
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (combine_dtype={combine_dtype}) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (combine_dtype={combine_dtype}) "
         "matches reference"
     )
 
@@ -744,7 +744,7 @@ def _run_mega_torch_oracle(
     Parity tests alone cannot catch a kernel that is wrong but self-consistent
     at ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
     peer-token dequant, cross-rank combine), because both sides run the same
-    CUDA kernel; this closes that gap (sm90_pull_fp8 twin methodology).
+    CUDA kernel; this closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
     cross-rank NVSHMEM traffic, then all-gathers the ACTUAL plain (pre-swizzle)
@@ -980,7 +980,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
         combine_dtype=combine_dtype,
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
         f"combine={combine_dtype}) matches the multi-rank torch oracle"
     )
 
@@ -1086,34 +1086,34 @@ def test_nvfp4_cutedsl_staging_uses_input_norm_const():
 
 
 def test_nvfp4_cutedsl_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Nvfp4CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
     )
-    assert kernel.kernel_name() == "nvfp4_cutedsl"
+    assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
 def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Nvfp4CutedslMegaMoeConfig(
+    cfg = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         in_kernel_fc2_reduce=True,
     )
     assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "nvfp4_cutedsl"
+    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
-    cfg_q = Nvfp4CutedslMegaMoeConfig(
+    cfg_q = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         combine_dtype="nvfp4",
     )
-    assert create_mega_kernel(cfg_q).kernel_name() == "nvfp4_cutedsl"
+    assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():

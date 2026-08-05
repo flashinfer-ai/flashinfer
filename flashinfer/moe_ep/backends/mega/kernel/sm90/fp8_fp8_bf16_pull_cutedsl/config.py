@@ -7,7 +7,7 @@ from typing import Literal
 
 
 @dataclass
-class Sm90PullFp8MegaMoeConfig:
+class Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig:
     """Kernel params for ``kernel_src.sm90.pull_style_cutedsl_megakernel.hopper_fp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching the SM100 configs
@@ -41,7 +41,7 @@ class Sm90PullFp8MegaMoeConfig:
 
     intermediate_size: int
     top_k: int
-    kernel_name: str = "sm90_pull_fp8"
+    kernel_name: str = "sm90_fp8_fp8_bf16_pull_cutedsl"
     kind: Literal["fp8_e4m3", "fp8_e5m2"] = "fp8_e4m3"
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"

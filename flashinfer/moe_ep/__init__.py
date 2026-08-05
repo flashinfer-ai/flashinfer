@@ -39,21 +39,28 @@ from .algo_knobs import (
     HandleAlgoKnobUserStream,
 )
 from .backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm import (
-    DeepGemmMegaMoeConfig,
+    Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
     preprocess_mega_weights,
 )
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
-    Mxfp8CutedslMegaMoeConfig,
+    Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
-    Nvfp4CutedslMegaMoeConfig,
+    Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
-    Sm90PullFp8MegaMoeConfig,
+    Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )
+# Deprecated aliases (pre-taxonomy names, kept for external callers such as
+# the vLLM integration patch). New code should use the Sm<arch>... names.
+DeepGemmMegaMoeConfig = Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig
+Mxfp8CutedslMegaMoeConfig = Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
+Nvfp4CutedslMegaMoeConfig = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
+Sm90PullFp8MegaMoeConfig = Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -120,7 +127,11 @@ __all__ = [
     "BootstrapConfig",
     "CombineInputParams",
     "CombineOutput",
+    "Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig",
     "DeepGemmMegaMoeConfig",
+    "Mxfp8CutedslMegaMoeConfig",
+    "Nvfp4CutedslMegaMoeConfig",
+    "Sm90PullFp8MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
@@ -156,13 +167,13 @@ __all__ = [
     "MoEWeightPack",
     "PrequantizedMoEWeights",
     "UnquantizedMoEWeights",
-    "Mxfp8CutedslMegaMoeConfig",
+    "Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
-    "Nvfp4CutedslMegaMoeConfig",
+    "Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig",
     "NvepConfig",
     "QuantType",
-    "Sm90PullFp8MegaMoeConfig",
+    "Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",

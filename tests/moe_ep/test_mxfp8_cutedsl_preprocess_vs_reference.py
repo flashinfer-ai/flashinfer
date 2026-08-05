@@ -1,6 +1,6 @@
 """Single-GPU checks: FlashInfer MXFP8 preprocess vs ``compute_megamoe_reference_mxfp8``.
 
-Validates that ``mxfp8_cutedsl.preprocess_mega_weights`` produces fp8 weights and
+Validates that ``sm100_mxfp8_mxfp8_bf16_cutedsl.preprocess_mega_weights`` produces fp8 weights and
 plain E8M0 scale layouts consistent with the CuTeDSL torch reference, and that a
 single-rank ``mxfp8_mega_moe`` launch matches the reference after weighted top-k
 reduction.

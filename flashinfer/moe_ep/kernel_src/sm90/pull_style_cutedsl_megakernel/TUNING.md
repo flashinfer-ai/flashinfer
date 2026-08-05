@@ -1,6 +1,6 @@
 # SM90 pull-style FP8 MegaMoE tuning + performance notes
 
-This document collects the performance work on the `sm90_pull_fp8` mega
+This document collects the performance work on the `sm90_fp8_fp8_bf16_pull_cutedsl` mega
 backend: the measured microbenchmark results against the kernel team's
 reference sweep, the benchmark methodology behind those numbers, the knob
 surface as it exists today, and the open perf levers.  It is the companion
@@ -129,7 +129,7 @@ this is the top e2e lever (see "Next levers").
 ## The knob surface (no tuner yet)
 
 The SM90 tree has **no `tuner.py` / `autotune.py` / knob-cache** — geometry
-and behavior knobs are explicit `Sm90PullFp8MegaMoeConfig` fields, resolved
+and behavior knobs are explicit `Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig` fields, resolved
 once per session at workspace allocation:
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
@@ -232,5 +232,5 @@ mega+topk.
    stabilizes (today: two tiles per layout, `flag_batch`/`epi_flag_batch`
    defaults from the drop driver).
 6. **CUDA-graph capture** — the SM100 mega layer's warmup+capture path is
-   kernel-agnostic; validate it on sm90_pull_fp8 (`test_mega_cuda_graph`
+   kernel-agnostic; validate it on sm90_fp8_fp8_bf16_pull_cutedsl (`test_mega_cuda_graph`
    analog) for decode serving.

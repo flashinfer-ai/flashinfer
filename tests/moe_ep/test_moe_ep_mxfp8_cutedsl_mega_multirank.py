@@ -1,4 +1,4 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (mxfp8_cutedsl).
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
@@ -20,7 +20,7 @@ Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
 self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
 ownership, cross-rank combine), because both sides run the same CUDA kernel.
 ``test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle`` closes that gap with
-the sm90_pull_fp8 twin's methodology: every rank all-gathers the actual staged
+the sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: every rank all-gathers the actual staged
 MXFP8 payloads, routing, and plain weight legs, runs the multi-rank-native
 ``compute_megamoe_reference_mxfp8`` on the global problem, and checks its own
 rank's slice against the real-EP kernel output.
@@ -314,9 +314,9 @@ def _megakernel_config(
     *,
     in_kernel_fc2_reduce: bool = False,
 ):
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
 
-    return Mxfp8CutedslMegaMoeConfig(
+    return Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig(
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         kind=problem["kind"],
@@ -481,25 +481,25 @@ def _run_mega_layer(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
-    """MoEEpMegaLayer (mxfp8_cutedsl) with on-the-fly bf16→MXFP8 staging."""
+    """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with on-the-fly bf16→MXFP8 staging."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (staged inputs) matches reference")
+    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (staged inputs) matches reference")
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer (mxfp8_cutedsl) with pre-staged MXFP8 activations."""
+    """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with pre-staged MXFP8 activations."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference")
+    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (prestaged inputs) matches reference")
 
 
 @pytest.mark.gpu_4
@@ -523,7 +523,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
         rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
     )
     print(
-        f"rank {rank}: mxfp8_cutedsl mega layer (in_kernel_fc2_reduce) "
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
     )
 
@@ -561,7 +561,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
             "load_balance_mode": "atomic_counter",
         },
     )
-    print(f"rank {rank}: mxfp8_cutedsl mega layer (large tokens) matches reference")
+    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (large tokens) matches reference")
 
 
 def _all_gather_stack(t):
@@ -589,7 +589,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     Parity alone cannot catch a kernel that is wrong but self-consistent at
     ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
     cross-rank combine), because both sides run the same CUDA kernel; this
-    closes that gap (sm90_pull_fp8 twin methodology).
+    closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
     cross-rank NVSHMEM traffic, then all-gathers the ACTUAL staged MXFP8
@@ -772,7 +772,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
         rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
     )
     print(
-        f"rank {rank}: mxfp8_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}) "
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}) "
         "matches the multi-rank torch oracle"
     )
 
@@ -819,10 +819,10 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Mxfp8CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
     )
-    assert kernel.kernel_name() == "mxfp8_cutedsl"
+    assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"

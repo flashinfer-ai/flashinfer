@@ -168,12 +168,12 @@ def test_corrupt_cache_file_warns_and_misses(monkeypatch, tmp_path):
 
 
 def test_backend_warns_on_auto_knobs():
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     with pytest.warns(UserWarning, match="offline"):
         create_mega_kernel(
-            Nvfp4CutedslMegaMoeConfig(intermediate_size=128, top_k=2, knobs="auto")
+            Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(intermediate_size=128, top_k=2, knobs="auto")
         )
 
 

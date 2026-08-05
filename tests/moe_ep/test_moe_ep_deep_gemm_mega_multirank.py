@@ -14,7 +14,7 @@ Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
 self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
 ownership, cross-rank combine), because both sides run the same CUDA kernel.
 ``test_moe_ep_deep_gemm_mega_multirank_torch_oracle`` closes that gap with the
-sm90_pull_fp8 twin's methodology: each rank all-gathers the actual loaded fp4
+sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: each rank all-gathers the actual loaded fp4
 weight legs and checks its real-EP kernel output slice against the pure-torch
 oracle run on its tokens + the global expert set.
 """
@@ -194,7 +194,7 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     import deep_gemm
     import torch
 
-    from flashinfer.moe_ep import DeepGemmMegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep import Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig, preprocess_mega_weights
     from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
@@ -229,7 +229,7 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
 
     y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     kernel = DeepGemmMegaKernelBackend(
-        DeepGemmMegaMoeConfig(
+        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
             intermediate_size=problem["intermediate"],
             top_k=problem["topk"],
             activation_clamp=problem["activation_clamp"],
@@ -253,7 +253,7 @@ def _run_mega_layer(rank, world_size):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpLayer,
@@ -278,7 +278,7 @@ def _run_mega_layer(rank, world_size):
         ),
         weights=weights,
         backend=MegaConfig(
-            megakernel=DeepGemmMegaMoeConfig(
+            megakernel=Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],
@@ -482,7 +482,7 @@ def _run_mega_torch_oracle(rank, world_size):
     Parity alone cannot catch a kernel that is wrong but self-consistent at
     ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
     cross-rank combine), because both sides run the same CUDA kernel; this
-    closes that gap (sm90_pull_fp8 twin methodology).  Every rank stages its
+    closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).  Every rank stages its
     own shard, runs the fused kernel with real cross-rank traffic, all-gathers
     the ACTUAL loaded fp4 weight legs of all ranks (no reliance on cross-rank
     RNG determinism), and checks its own output slice against the pure-torch
@@ -494,7 +494,7 @@ def _run_mega_torch_oracle(rank, world_size):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
         ensure_moe_ep_cuda_device,
         preprocess_mega_weights,
     )
@@ -543,7 +543,7 @@ def _run_mega_torch_oracle(rank, world_size):
             n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
         )
         kernel = DeepGemmMegaKernelBackend(
-            DeepGemmMegaMoeConfig(
+            Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],

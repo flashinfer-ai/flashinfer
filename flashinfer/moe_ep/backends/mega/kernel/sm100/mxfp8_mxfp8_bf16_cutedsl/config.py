@@ -7,7 +7,7 @@ from typing import Literal
 
 
 @dataclass
-class Mxfp8CutedslMegaMoeConfig:
+class Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig:
     """Kernel params for ``kernel_src.cutedsl_megamoe.mxfp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.
@@ -21,7 +21,7 @@ class Mxfp8CutedslMegaMoeConfig:
 
     intermediate_size: int
     top_k: int
-    kernel_name: str = "mxfp8_cutedsl"
+    kernel_name: str = "sm100_mxfp8_mxfp8_bf16_cutedsl"
     kind: Literal["mxfp8_e4m3", "mxfp8_e5m2"] = "mxfp8_e4m3"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None

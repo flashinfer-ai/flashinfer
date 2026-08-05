@@ -169,7 +169,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
         MoEEpMegaLayer,
         MoEEpTensors,
         MoEWeightPack,
-        Nvfp4CutedslMegaMoeConfig,
+        Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig,
     )
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
@@ -202,7 +202,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
             ),
             weights=MoEWeightPack(w13=w13, w2=w2),
             backend=MegaConfig(
-                megakernel=Nvfp4CutedslMegaMoeConfig(
+                megakernel=Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
                     intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
                 ),
                 quantize_input=True,

@@ -146,7 +146,7 @@ Notes:
 
 ### SM90 mega token sweep
 
-Hopper-only (`sm90_pull_fp8`) correctness targets run in their own pytest
+Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
 `bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
@@ -202,11 +202,11 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `deep_gemm_mega` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `nvfp4_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `nvfp4_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
-| `+combine_nvfp4`| `fi_combine_fp4` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
-| `+combine_mxfp8`| `fi_combine_fp8` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+| `dg`            | `fi_dg`          | `sm100_fp8_nvfp4_bf16_deepgemm` | — |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
 
 Inside the flashinfer-EP container (editable install per "Build & test
 environment" above), pin the DSL and run the sweep:
@@ -236,7 +236,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `deep_gemm_mega` in parens:
+knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -255,7 +255,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`deep_gemm_mega` in parens.
+`sm100_fp8_nvfp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -330,8 +330,8 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=deep_gemm_mega` |
-| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_nvfp4_bf16_deepgemm` |
+| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
@@ -348,7 +348,7 @@ JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
 JOBID=$JOBID bash $W/in_container.sh \
   'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
 JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
+  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
 ```
 
 Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
@@ -424,11 +424,11 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `deep_gemm_mega` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `nvfp4_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `nvfp4_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
-| `+combine_nvfp4`| `fi_combine_fp4` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
-| `+combine_mxfp8`| `fi_combine_fp8` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+| `dg`            | `fi_dg`          | `sm100_fp8_nvfp4_bf16_deepgemm` | — |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
 
 Inside the flashinfer-EP container (editable install per "Build & test
 environment" above), pin the DSL and run the sweep:
@@ -458,7 +458,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `deep_gemm_mega` in parens:
+knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -477,7 +477,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`deep_gemm_mega` in parens.
+`sm100_fp8_nvfp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -552,8 +552,8 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=deep_gemm_mega` |
-| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_nvfp4_bf16_deepgemm` |
+| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
@@ -570,7 +570,7 @@ JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
 JOBID=$JOBID bash $W/in_container.sh \
   'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
 JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
+  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
 ```
 
 Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
@@ -635,7 +635,7 @@ trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
 own drop revision and are **process-exclusive** — the top-level kernel module
 names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
 sibling tree's modules are already imported (a process runs on one
-architecture anyway). Use the existing `mxfp8_cutedsl` backend as the
+architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
 reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)

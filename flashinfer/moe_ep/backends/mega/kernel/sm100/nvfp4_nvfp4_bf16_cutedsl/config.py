@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class Nvfp4CutedslMegaMoeConfig:
+class Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig:
     """Kernel params for ``kernel_src.cutedsl_megamoe.nvfp4_mega_moe``.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
@@ -20,7 +20,7 @@ class Nvfp4CutedslMegaMoeConfig:
 
     intermediate_size: int
     top_k: int
-    kernel_name: str = "nvfp4_cutedsl"
+    kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True

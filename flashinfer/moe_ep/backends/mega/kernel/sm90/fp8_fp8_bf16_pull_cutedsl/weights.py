@@ -152,11 +152,11 @@ def preprocess_mega_weights(
 
     if isinstance(weights, PrequantizedMoEWeights):
         # PORT NOTE: pre-quantized FP8 packs (per-expert or blockwise scales)
-        # are not wired yet for sm90_pull_fp8; kernel-ready weights can still
+        # are not wired yet for sm90_fp8_fp8_bf16_pull_cutedsl; kernel-ready weights can still
         # bypass preprocessing entirely via MegaConfig.preprocess_weights=False
         # + transformed_weights (validated by validate_transformed_mega_weights).
         raise MoEEpConfigError(
-            "sm90_pull_fp8 does not support PrequantizedMoEWeights yet; pass "
+            "sm90_fp8_fp8_bf16_pull_cutedsl does not support PrequantizedMoEWeights yet; pass "
             "canonical bf16 w13/w2, or supply kernel-ready transformed "
             "weights with MegaConfig.preprocess_weights=False"
         )
