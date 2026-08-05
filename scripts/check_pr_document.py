@@ -135,6 +135,22 @@ def load_findings(output: Path) -> set[PrFinding]:
     return findings
 
 
+def introduced_findings(
+    base_findings: set[PrFinding], head_findings: set[PrFinding]
+) -> list[PrFinding]:
+    """Return head-only findings while treating source lines as display data."""
+    base_keys = {
+        (finding.check, finding.path, finding.message, finding.level)
+        for finding in base_findings
+    }
+    return sorted(
+        finding
+        for finding in head_findings
+        if (finding.check, finding.path, finding.message, finding.level)
+        not in base_keys
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, help="Base commit SHA")
@@ -156,7 +172,9 @@ def main() -> int:
         base_out, head_out = temp_root / "base-out", temp_root / "head-out"
         run_checker(base_src, base_out, "pr-base")
         run_checker(head_src, head_out, "pr-head")
-        new_findings = sorted(load_findings(head_out) - load_findings(base_out))
+        new_findings = introduced_findings(
+            load_findings(base_out), load_findings(head_out)
+        )
 
     print(f"Static documentation checks: {len(new_findings)} new finding(s)")
     for finding in new_findings:
