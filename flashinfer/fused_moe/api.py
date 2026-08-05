@@ -235,8 +235,7 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
-# CUTLASS API. The unified adapter is architecture-neutral; SM90 is the
-# currently exercised GPU test target.
+# CUTLASS API.
 _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
