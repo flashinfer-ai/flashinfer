@@ -19,15 +19,26 @@ Kimi Delta Attention Decode - API Layer
 =======================================
 
 This file provides the public API for recurrent KDA decode operations.
-Kernel implementations are in flashinfer/kda_kernels/.
+Kernel implementations are in ``flashinfer.kda_kernels``; callers may
+explicitly select the exported Cake backend.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
-from .trace.templates.kda import recurrent_kda_trace
+from .trace.templates.kda import fused_kda_decode_trace, recurrent_kda_trace
+
+try:
+    from .kda_kernels.fused_kda_decode import (
+        run_fused_kda_decode as _run_fused_kda_decode,
+    )
+
+    _FUSED_KDA_DECODE_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _run_fused_kda_decode = None
+    _FUSED_KDA_DECODE_AVAILABLE = False
 
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 
@@ -59,13 +70,16 @@ def recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    *,
+    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
-    This is the public API layer for the CuTe DSL implementation in
+    This public API supports the existing CuTe DSL implementation and an
+    explicit exported Cake backend in
     ``flashinfer.kda_kernels.recurrent_kda``. It supports single-token decode,
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
-    gate modes as the backend implementation.
+    gate modes as the selected backend implementation.
 
     Args:
         q (torch.Tensor):
@@ -132,6 +146,11 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        backend (Literal["cute-dsl", "cake"]):
+            Implementation backend. ``"cute-dsl"`` preserves the existing
+            FlashInfer implementation. ``"cake"`` strictly selects an
+            exported Cake kernel and raises when the call does not match one
+            of its supported contracts. Default: ``"cute-dsl"``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -139,6 +158,8 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
+    if backend not in ("cute-dsl", "cake"):
+        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
 
@@ -164,4 +185,103 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        backend=backend,
+    )
+
+
+@flashinfer_api(trace=fused_kda_decode_trace)
+def fused_kda_decode(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    lower_bound: Optional[float] = -5.0,
+    norm_eps: float = 1e-5,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run the fused Kimi KDA decode pipeline.
+
+    This operator fuses a width-four depthwise causal convolution with SiLU,
+    one recurrent KDA update, and gated RMSNorm. It is specialized for
+    head dimension 128 and 12, 24, 32, 48, or 96 heads. ``conv_state`` and
+    ``state`` are updated in-place.
+
+    Slot zero is reserved as a null slot. Rows whose ``state_indices`` value
+    is non-positive produce zeros and do not update either cache.
+
+    Args:
+        x:
+            Packed QKV projection with shape ``[num_rows, 3 * H * 128]`` and
+            dtype bfloat16. The channel dimension must be contiguous.
+        weight:
+            Depthwise convolution weights with shape ``[3, 4, H * 128]`` and
+            dtype float32.
+        conv_state:
+            Paged convolution cache with shape
+            ``[num_slots, 3 * H * 128, 3]`` and dtype bfloat16. Each slot must
+            use the sequence-dimension cache layout with strides
+            ``[slot_stride, 1, 3 * H * 128]``.
+        raw_gate:
+            Raw per-channel recurrence gate with shape
+            ``[1, num_rows, H, 128]`` and dtype bfloat16.
+        raw_beta:
+            Raw delta-rule learning-rate logits with shape
+            ``[1, num_rows, H]`` and dtype bfloat16.
+        A_log:
+            Log decay parameter with ``H`` elements and dtype float32.
+        dt_bias:
+            Per-channel decay bias with ``H * 128`` elements and dtype float32.
+        state_indices:
+            Cache slot selected by each decode row. Must be a contiguous int32
+            tensor with ``num_rows`` elements. Live indices must be in
+            ``[1, num_slots)``; non-positive indices select the null path.
+        state:
+            Paged recurrent state with shape
+            ``[num_slots, H, 128, 128]`` and dtype float32 or bfloat16. The
+            recurrence is evaluated in float32; a bfloat16 state is rounded
+            when written back. Each slot's ``[H, 128, 128]`` contents must be
+            contiguous. ``state`` and ``conv_state`` must have the same
+            ``num_slots``.
+        output_gate:
+            Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
+            ``[1, num_rows, H, 128]`` and dtype bfloat16.
+        norm_weight:
+            RMSNorm weight with 128 elements and dtype float32.
+        lower_bound:
+            Negative lower bound used by the recurrence gate. Defaults to
+            ``-5.0`` for Kimi K3. Pass ``None`` to use the original
+            Kimi-Linear softplus gate.
+        norm_eps:
+            Non-negative RMSNorm epsilon. Defaults to ``1e-5``.
+        output:
+            Optional preallocated contiguous bfloat16 output with shape
+            ``[1, num_rows, H, 128]``.
+
+    Returns:
+        The bfloat16 output tensor with shape ``[1, num_rows, H, 128]``.
+    """
+    if _run_fused_kda_decode is None:
+        raise NotImplementedError("fused KDA decode backend is unavailable")
+    return _run_fused_kda_decode(
+        x=x,
+        weight=weight,
+        conv_state=conv_state,
+        raw_gate=raw_gate,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_indices=state_indices,
+        state=state,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+        output=output,
     )

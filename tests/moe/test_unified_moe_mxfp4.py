@@ -50,12 +50,12 @@ from tests.moe.test_cute_dsl_fused_moe import (
 def _sm100_family() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
-    ) in ((10, 0), (10, 3))
+    ) in ((10, 0), (10, 3), (10, 7))
 
 
 pytestmark = pytest.mark.skipif(
     not _sm100_family(),
-    reason="TRTLLM MXFP4 unified tests require SM100 or SM103",
+    reason="TRTLLM MXFP4 unified tests require SM100, SM103, or SM107",
 )
 
 
@@ -452,15 +452,15 @@ def test_trtllm_mxfp4_rejects_unaligned_weights(
     [
         (QuantVariant.NVFP4, (10, 0), True),
         (QuantVariant.NVFP4, (10, 3), True),
-        (QuantVariant.NVFP4, (10, 7), False),
+        (QuantVariant.NVFP4, (10, 7), True),
         (QuantVariant.NVFP4, (12, 0), False),
         (QuantVariant.MXFP4, (10, 0), True),
         (QuantVariant.MXFP4, (10, 3), True),
-        (QuantVariant.MXFP4, (10, 7), False),
+        (QuantVariant.MXFP4, (10, 7), True),
         (QuantVariant.MXFP4, (12, 0), False),
         (QuantVariant.W4A16, (10, 0), True),
         (QuantVariant.W4A16, (10, 3), False),
-        (QuantVariant.W4A16, (10, 7), False),
+        (QuantVariant.W4A16, (10, 7), True),
         (QuantVariant.W4A16, (12, 0), False),
     ],
 )
