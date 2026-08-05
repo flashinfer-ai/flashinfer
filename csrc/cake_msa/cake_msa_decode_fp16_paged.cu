@@ -625,8 +625,15 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_msa_decode_fp16_paged(CakeMsaTensorMap const* Q, CakeMsaTensorMap const* Q_prefill, __half* __restrict__ Q_prefill_raw, CakeMsaTensorMap const* K, CakeMsaTensorMap const* K_prefill_pair, CakeMsaTensorMap const* V, CakeMsaTensorMap const* V_prefill_pair, CakeMsaTensorMap const* KV, __half* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
+kernel_cake_msa_decode_fp16_paged(const __grid_constant__ CakeMsaTensorMap Q_value, const __grid_constant__ CakeMsaTensorMap Q_prefill_value, __half* __restrict__ Q_prefill_raw, const __grid_constant__ CakeMsaTensorMap K_value, const __grid_constant__ CakeMsaTensorMap K_prefill_pair_value, const __grid_constant__ CakeMsaTensorMap V_value, const __grid_constant__ CakeMsaTensorMap V_prefill_pair_value, const __grid_constant__ CakeMsaTensorMap KV_value, __half* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
 {
+    CakeMsaTensorMap const* Q = &Q_value;
+    CakeMsaTensorMap const* Q_prefill = &Q_prefill_value;
+    CakeMsaTensorMap const* K = &K_value;
+    CakeMsaTensorMap const* K_prefill_pair = &K_prefill_pair_value;
+    CakeMsaTensorMap const* V = &V_value;
+    CakeMsaTensorMap const* V_prefill_pair = &V_prefill_pair_value;
+    CakeMsaTensorMap const* KV = &KV_value;
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
@@ -637,15 +644,6 @@ kernel_cake_msa_decode_fp16_paged(CakeMsaTensorMap const* Q, CakeMsaTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(Q)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(Q_prefill)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(K_prefill_pair)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(V_prefill_pair)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(KV)) : "memory");
-    }
     __syncthreads();
 
 

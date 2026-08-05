@@ -18,11 +18,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "tvm_ffi_utils.h"
 
@@ -39,6 +34,9 @@
 #undef uint64_t
 #undef int32_t
 #undef int16_t
+
+static_assert(sizeof(CUtensorMap) == 128);
+static_assert(sizeof(CakeMsaTensorMap) == sizeof(CUtensorMap));
 
 namespace flashinfer::cake_msa {
 
@@ -118,112 +116,6 @@ inline void CheckCakeMsaTarget(int32_t device_id) {
       << "this CAKE MSA module supports compute capability 10.0 or 10.3, got " << major << "."
       << minor;
 #endif
-}
-
-struct TmaDeviceArena {
-  static constexpr size_t kSlotsPerChunk = 256;
-  static constexpr size_t kMaxSlots = 4096;
-  std::vector<CUdeviceptr> chunks;
-  size_t used = 0;
-};
-
-// Immutable, process-lifetime device tensor-map slots for the pointer ABI.
-// A slot is never rewritten: different descriptor bytes always get a new
-// address, so concurrent streams cannot observe a partially updated map. The
-// chunked arena caps storage at 512 KiB per CUDA context in this host module.
-static inline void* TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStream_t stream) {
-  static std::mutex mu;
-  static auto* slots = new std::unordered_map<std::string, void*>();
-  static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
-
-  // Device allocations are context-owned. Resolve and validate the active
-  // context before cache lookup so a warm entry can never bypass the same
-  // checks as a cold entry or leak a pointer across contexts on one device.
-  CUcontext current_context = nullptr;
-  CUresult result = cuCtxGetCurrent(&current_context);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS && current_context != nullptr, RuntimeError)
-      << "pointer TMA ABI requires an active CUDA context: CUresult=" << static_cast<int>(result);
-  CUdevice current_device = -1;
-  result = cuCtxGetDevice(&current_device);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS && current_device == device_id, RuntimeError)
-      << "TMA descriptor device mismatch: current=" << current_device << ", tensor=" << device_id;
-
-  std::string key = std::to_string(reinterpret_cast<uintptr_t>(current_context));
-  key.push_back(':');
-  key.append(reinterpret_cast<const char*>(&tm), sizeof(CUtensorMap));
-  std::lock_guard<std::mutex> lock(mu);
-  auto it = slots->find(key);
-  if (it != slots->end()) return it->second;
-
-  CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
-  result = cuStreamIsCapturing(reinterpret_cast<CUstream>(stream), &capture_status);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuStreamIsCapturing for TMA descriptor slot failed: CUresult="
-      << static_cast<int>(result);
-  TVM_FFI_CHECK(capture_status == CU_STREAM_CAPTURE_STATUS_NONE, RuntimeError)
-      << "pointer TMA ABI cannot create a new device descriptor slot inside "
-         "CUDA Graph capture; prewarm this exact tensor/layout binding or "
-         "compile with tma_abi='grid_constant'";
-
-  TmaDeviceArena& arena = (*arenas)[current_context];
-  TVM_FFI_CHECK(arena.used < TmaDeviceArena::kMaxSlots, RuntimeError)
-      << "pointer TMA ABI exhausted its immutable descriptor arena in CUDA "
-         "context "
-      << current_context << " on device " << device_id << " (capacity=" << TmaDeviceArena::kMaxSlots
-      << "); reuse tensor/layout bindings or compile with tma_abi='grid_constant'";
-  if (arena.used % TmaDeviceArena::kSlotsPerChunk == 0) {
-    CUdeviceptr chunk = 0;
-    result = cuMemAlloc(&chunk, TmaDeviceArena::kSlotsPerChunk * sizeof(CUtensorMap));
-    TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-        << "cuMemAlloc for TMA descriptor arena failed: CUresult=" << static_cast<int>(result);
-    arena.chunks.push_back(chunk);
-  }
-  size_t chunk_index = arena.used / TmaDeviceArena::kSlotsPerChunk;
-  size_t slot_index = arena.used % TmaDeviceArena::kSlotsPerChunk;
-  CUdeviceptr dev = arena.chunks[chunk_index] + slot_index * sizeof(CUtensorMap);
-  result = cuMemcpyHtoD(dev, &tm, sizeof(CUtensorMap));
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuMemcpyHtoD for TMA descriptor slot failed: CUresult=" << static_cast<int>(result);
-  ++arena.used;
-  void* pointer = reinterpret_cast<void*>(static_cast<uintptr_t>(dev));
-  (*slots)[key] = pointer;
-  return pointer;
-}
-
-// 3D TMA descriptor for buffer 'Q' — compiled from the
-// descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_Q(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'Q' must have at least 2 dimensions, got ndim=" << t.ndim();
-  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
-      << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
-  int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'Q' trailing dims must be positive";
-  int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "Q");
-  int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'Q' physical strides must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'Q' extent " << d1 << " must divide exactly by " << 64;
-  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
-      << "TMA descriptor for 'Q' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 16u <= global_dim[1] && 2u <= global_dim[2], ValueError)
-      << "TMA box (64, 16, 2) exceeds resolved global dims for 'Q'";
-  uint64_t global_strides[2] = {
-      (uint64_t)((s2 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
-  };
-  uint32_t box_dim[3] = {64u, 16u, 2u};
-  uint32_t elem_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tm;
-  CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim,
-      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
-  return tm;
 }
 
 // 4D TMA descriptor for buffer 'Q_prefill' — compiled from the
@@ -629,22 +521,13 @@ void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_ra
       << grid_z << ")";
 
   CUtensorMap h_Q = EncodeTma_Q(arg_Q);
-  void* p_Q = TmaDeviceSlot(h_Q, arg_Q.device().device_id, stream);
   CUtensorMap h_Q_prefill = EncodeTma_Q_prefill(arg_Q_prefill);
-  void* p_Q_prefill = TmaDeviceSlot(h_Q_prefill, arg_Q_prefill.device().device_id, stream);
   void* p_Q_prefill_raw = arg_Q_prefill_raw.data_ptr();
   CUtensorMap h_K = EncodeTma_K(arg_K);
-  void* p_K = TmaDeviceSlot(h_K, arg_K.device().device_id, stream);
   CUtensorMap h_K_prefill_pair = EncodeTma_K_prefill_pair(arg_K_prefill_pair);
-  void* p_K_prefill_pair =
-      TmaDeviceSlot(h_K_prefill_pair, arg_K_prefill_pair.device().device_id, stream);
   CUtensorMap h_V = EncodeTma_V(arg_V);
-  void* p_V = TmaDeviceSlot(h_V, arg_V.device().device_id, stream);
   CUtensorMap h_V_prefill_pair = EncodeTma_V_prefill_pair(arg_V_prefill_pair);
-  void* p_V_prefill_pair =
-      TmaDeviceSlot(h_V_prefill_pair, arg_V_prefill_pair.device().device_id, stream);
   CUtensorMap h_KV = EncodeTma_KV(arg_KV);
-  void* p_KV = TmaDeviceSlot(h_KV, arg_KV.device().device_id, stream);
   void* p_O = arg_O.data_ptr();
   void* p_partial_O = arg_partial_O.data_ptr();
   void* p_partial_M = arg_partial_M.data_ptr();
@@ -680,14 +563,14 @@ void Run(TensorView arg_Q, TensorView arg_Q_prefill, TensorView arg_Q_prefill_ra
   int32_t v_record_tasks = (int32_t)arg_record_tasks;
   int32_t v_msa_max_pages = (int32_t)arg_msa_max_pages;
   int32_t v_msa_split_policy = (int32_t)arg_msa_split_policy;
-  void* kargs[] = {&p_Q,
-                   &p_Q_prefill,
+  void* kargs[] = {&h_Q,
+                   &h_Q_prefill,
                    &p_Q_prefill_raw,
-                   &p_K,
-                   &p_K_prefill_pair,
-                   &p_V,
-                   &p_V_prefill_pair,
-                   &p_KV,
+                   &h_K,
+                   &h_K_prefill_pair,
+                   &h_V,
+                   &h_V_prefill_pair,
+                   &h_KV,
                    &p_O,
                    &p_partial_O,
                    &p_partial_M,

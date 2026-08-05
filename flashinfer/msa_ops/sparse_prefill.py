@@ -103,7 +103,7 @@ def msa_sparse_attention(
         ``(batch_size, max_pages)`` and maps batch-local KV block indices to
         pages. Requires ``seqused_k``. ``k``/``v`` may also be views split
         from a cache that packs K and V in one ``2 * head_dim`` content dim
-        per token on SM120/SM121 (see ``SUPPORTS_PACKED_KV``). Compute
+        per token on SM120/SM121 (see ``supports_packed_kv``). Compute
         capability 10.0/10.3 requires separate contiguous K and V tensors and
         never copies packed views implicitly.
     seqused_k : Optional[torch.Tensor], default=None

@@ -212,7 +212,7 @@ def msa_sparse_decode_attention(
         with ``cu_seqlens_k``. May be fp8 E4M3 (upconverted in-kernel).
         On the paged path, ``k``/``v`` may also be views split from a cache
         that packs K and V in one ``2 * head_dim`` content dim per token
-        on SM120/SM121 (see ``SUPPORTS_PACKED_KV``). Compute capability
+        on SM120/SM121 (see ``supports_packed_kv``). Compute capability
         10.0/10.3 requires separate contiguous K and V tensors and never
         copies packed views implicitly.
     q2k_indices : torch.Tensor

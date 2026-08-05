@@ -48,45 +48,60 @@ _VARIANTS = (
 # its host binding for every variant.  Keep these digests out of the
 # public CUDA files so they do not expose generator provenance.
 _SOURCE_SHA256 = {
-    "cake_msa_decode_bf16_flat.cu": "f9e22803e3ab8e30c6001b92e8b7b7fedbbe78f2286f1c029285d4ae3a6f39d3",
-    "cake_msa_decode_bf16_flat_binding.cu": "66ff0761fd9c54e34ef5d2fcb88e0428f1395441a4c0b88a57f9555183a0980d",
-    "cake_msa_decode_bf16_paged.cu": "066ee8a226a87da2ea9cb274c84fc577b62d1ff339a8fc0ec299fbbb44e58cce",
-    "cake_msa_decode_bf16_paged_binding.cu": "ebfab54b367e5d7d2430d254c6c9b4f225680fad6f7379472b1b31d067710228",
-    "cake_msa_decode_fp16_flat.cu": "230adad70c29a7732584d77c4a79b1e5503e5fe34edd58573a6afcfc7e48dea7",
-    "cake_msa_decode_fp16_flat_binding.cu": "b26fcf5c289e3088ad2c2488f9b89cff64860bd7d3f6ddeec7a21cb582579b94",
-    "cake_msa_decode_fp16_paged.cu": "0379f8c4f868aeb5a2f13ed5d60b2a17e375109e292845aabaeb5bd55902c5c6",
-    "cake_msa_decode_fp16_paged_binding.cu": "3c7056eaed79f61575bb5c936f1711f8ff41c8ac0dfe4586533ef9602a9a0105",
-    "cake_msa_decode_fp8_flat.cu": "62befbfce102eafc3a3083927885f3f17d1b29ffa6f73c337f59f0725ecfd39c",
-    "cake_msa_decode_fp8_flat_binding.cu": "65050ee6c1fa930ca356e7f4bf0221045c0d9adc2070a1cbdf14069de8f2fae2",
-    "cake_msa_decode_fp8_paged.cu": "4cffc3198ee296d6921afee56914062bff42ec15f74386962d26367b84b9362b",
-    "cake_msa_decode_fp8_paged_binding.cu": "422f65caa6415a18cebcb2e8882600b4b04ffdac9603eec745e9113ed4d37f5b",
-    "cake_msa_decode_m16_bf16_flat.cu": "52591e583b89051bdfaa3add386d94a44051359846a8299713beb59bf7f450af",
-    "cake_msa_decode_m16_bf16_flat_binding.cu": "8b83f001560ce21801efa4679423bdaa86aa0af0b2105c87a8cb34fb2c916c67",
-    "cake_msa_decode_m16_bf16_paged.cu": "9b0a1d2a68e1747c68dffbc20e88ab1ef0be1146334d54ba23cc6fd286e94000",
-    "cake_msa_decode_m16_bf16_paged_binding.cu": "58540beab6bce0f4957775152b169e013cb9636d3114666baa1734620ae493e6",
-    "cake_msa_prefill_m128_bf16_flat.cu": "78a27286684792d3795ce268516cb53d91d24c2b9f4a0dc569436922d0b6d77c",
-    "cake_msa_prefill_m128_bf16_flat_binding.cu": "87009e7f6219d732434d20e11166638b86df1dea505ccb0cae6941c9ae021777",
-    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "5c26070b6f45699ccdae322c9c8937d7fc924741c039a15a1554c48bfec90cd5",
-    "cake_msa_prefill_m128_bf16_gqa16_flat_binding.cu": "8a622e4ec003111077e21dffff82de77a272b617f05e4430c9135c53100a4987",
-    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "6c45de021c993f6658a4d3241e8e9dd91a52f9b227fa88825acf7a0ab862c453",
-    "cake_msa_prefill_m128_bf16_gqa16_paged_binding.cu": "78516fba73cacff8a1e528c5bf5fb481dbc3524f21077422b122a8b54c3d3d5f",
-    "cake_msa_prefill_m128_bf16_paged.cu": "eb980b7428872f67b90497a12b2b680591b1d9ac83870c705162c658b90473b0",
-    "cake_msa_prefill_m128_bf16_paged_binding.cu": "b3041e30fc992ff6a335e724ece8a1d5185bc2b085c03dd1660cbabe53536c8f",
-    "cake_msa_prefill_m128_fp16_flat.cu": "f27c95b260c88a40a803704aa205965337ed91e1fb917653353d2268122e024b",
-    "cake_msa_prefill_m128_fp16_flat_binding.cu": "d8817ad9ebe03bf28afe8ddc508ba07ce0f74cb1fbcb80bae1d3a76e8f8c34b1",
-    "cake_msa_prefill_m128_fp16_paged.cu": "b627f2696ae310b9c7e39b543c02807fc1ca3f747aae42809a2b8f90fb048669",
-    "cake_msa_prefill_m128_fp16_paged_binding.cu": "516777081d61538f4bca42d258bdeebe98b07f34731fae49dd58695333c7bf51",
-    "cake_msa_prefill_m128_fp8_flat.cu": "9c3496faaf123ddf1a317a08e9dbdebb5a00d29574d31bf0bef27fb7c4b6d97a",
-    "cake_msa_prefill_m128_fp8_flat_binding.cu": "47454f5a8f8a00c6d0b12e730297b39d86fa7e722624292e3967d816ec2223f4",
-    "cake_msa_prefill_m128_fp8_paged.cu": "96d6d70973fb90fe33bc6babe464d0fc10ba257504b2bff584b5048929ec5917",
-    "cake_msa_prefill_m128_fp8_paged_binding.cu": "c82066a290e3a070d519f2ced75ffea541b22130d579bae377d07ff5162ca32d",
-    "cake_msa_prefill_m64_bf16_flat.cu": "f818ec3a96eaa96e3483b3aa3369e57fafc9f2a267635e61c06ef1b4cd7d4bc7",
-    "cake_msa_prefill_m64_bf16_flat_binding.cu": "72e56d4eb4411c871da6ca86ae860ad1f97e6785ecbea6b036f861288ebc3f87",
+    "cake_msa_decode_bf16_flat.cu": "fab06f6bd7d0febbb9949f07ffafe29ef6d7ac52fd6f8a1bc14616aefd13cf59",
+    "cake_msa_decode_bf16_flat_binding.cu": "f4a571d272ffdf86e15fde03efd6e93ab8c647b7dfb3233e5ff2701d2d9c9c72",
+    "cake_msa_decode_bf16_paged.cu": "d209ef72eaf2fe6912fbbda5cd3272f60615a594307254706c2a89aedf1aa12a",
+    "cake_msa_decode_bf16_paged_binding.cu": "8e592b19235991605abeda9f85845a4986be07346f1c2563eb3c1964c923c09f",
+    "cake_msa_decode_fp16_flat.cu": "717e3b26f6c879cf9c99cd4f619502f9f690be2f89385d2b8d696302a1fcf6d7",
+    "cake_msa_decode_fp16_flat_binding.cu": "44c1ebf4a7b99ae742274174f45c27edcd032556a7f009c714d12505a6518e4c",
+    "cake_msa_decode_fp16_paged.cu": "c6d7d79a6a626d4861ba97a352e2a8057b82f53ccec9f60d2c4a71d65575ca16",
+    "cake_msa_decode_fp16_paged_binding.cu": "d340771abcb8f46f3c7e0eb101112429f2f85a67c5d9438d4e8ff27536d7f0eb",
+    "cake_msa_decode_fp8_flat.cu": "f62fb8ee4474ef842be2664a8f7c69bd92ab6ebf3ee5b81c193d3b4413fbb979",
+    "cake_msa_decode_fp8_flat_binding.cu": "9d78c1662f68e8293bf9efdf6724b62865a71406ee736debfc0bb14df047a0b8",
+    "cake_msa_decode_fp8_paged.cu": "e394e0ad905f2c759f5e8e8efb7d61ca16c5b358f563e0e8d1b2e359f211542d",
+    "cake_msa_decode_fp8_paged_binding.cu": "6691058a919ce2608c6473fa09c86f4944c4aecb752067eeb37ab79b9c5ab17e",
+    "cake_msa_decode_m16_bf16_flat.cu": "edcc630818d1cfd1b9de03a4ff16ea0a1726e5c8d4990e0b2f372274dfacd1a3",
+    "cake_msa_decode_m16_bf16_flat_binding.cu": "8eea81aed8b4fd692077a6ff2c2977b04cc13aadd2e70b49e7293d204eda1edf",
+    "cake_msa_decode_m16_bf16_paged.cu": "87ac97c531e8a7822e805eccfb6a65fbaf97b42ef0d0dc3715bc747646317fcb",
+    "cake_msa_decode_m16_bf16_paged_binding.cu": "93bce3b701dc04adb82a7ab00d948e99fa90664df60eae0fdf3eb03d7da44beb",
+    "cake_msa_prefill_m128_bf16_flat.cu": "93862a578172467b9de3003d355ca3a3edcab2624c001a8f80683a8aac412ac2",
+    "cake_msa_prefill_m128_bf16_flat_binding.cu": "d8654b6215ce53f4315281c5dd74ecd7d45848fc26475b3036249e885a7276f0",
+    "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "e70a8c8ab606b42e82bd53fae5e9d2ebe14dd2b182a129100a53929b91ee7c38",
+    "cake_msa_prefill_m128_bf16_gqa16_flat_binding.cu": "bc9cf4c038a87738c8e583fdc17450bd5982ea6190373f8c065f9ee6446c16a5",
+    "cake_msa_prefill_m128_bf16_gqa16_paged.cu": "30e1e1dab7dd2d3e3ebe35973bd5927e53f0b175cba027fef3179ad8b8c635b1",
+    "cake_msa_prefill_m128_bf16_gqa16_paged_binding.cu": "b0cd93d959adb957fecea0eb3744cc98c5838cc642ff088ec6c7a19bab5d157b",
+    "cake_msa_prefill_m128_bf16_paged.cu": "413ed2585f1261372483060fad2bd97f236eb35b407489679d87398e75f007fa",
+    "cake_msa_prefill_m128_bf16_paged_binding.cu": "f6c2ce95b6e78f94b7133ec8d9f2b3a0e2d7939a61be8c79e03e2bd2a4502df6",
+    "cake_msa_prefill_m128_fp16_flat.cu": "40b3d90f4d1516daef14872ef81bc5bf28ff8c6b92656339bcfece8a9de81724",
+    "cake_msa_prefill_m128_fp16_flat_binding.cu": "c671e8d1e0fb3e7fb0b9ed768fff8e13c0ee262dafa15d3bb60f62ab6b7ead66",
+    "cake_msa_prefill_m128_fp16_paged.cu": "ae55ad52a12361d9f918912cbd36908ef87ff03df487d89e011ddb282cd5f364",
+    "cake_msa_prefill_m128_fp16_paged_binding.cu": "e18556e08eba86c4442e49dbbe7f847ae1c82508e2318df531115698621c678a",
+    "cake_msa_prefill_m128_fp8_flat.cu": "4f5dfe55ef0919fb5ffbef9f55a5b75e19e1b4185d5b452eebca4b9aff966771",
+    "cake_msa_prefill_m128_fp8_flat_binding.cu": "b17fc25aeef6194c1a7b29cdd9538db619b8a04fc6f576fdc37722c977dd9c35",
+    "cake_msa_prefill_m128_fp8_paged.cu": "fdfd25d63ffc27c5498eedb620ce375a22badcc467cb53ca20ff4fecf83f10e7",
+    "cake_msa_prefill_m128_fp8_paged_binding.cu": "3907d184e87291524f1765024e8af62bb65cd56fa59bbcbbfbc4c6342fc23907",
+    "cake_msa_prefill_m64_bf16_flat.cu": "958874d056d9c0105b48fb84cf28dceca7fe1bba6b7ca61457b372a29d47bafc",
+    "cake_msa_prefill_m64_bf16_flat_binding.cu": "f582a554274dd4e0ad03636eae98f31d955f68a740a5bfcd4033615dfecafada",
     "cake_msa_topk.cu": "4b4c6a2d6134980e7f6568ea1eaf07521eafddd9ed65f641097660a89f115043",
     "cake_msa_topk_binding.cu": "55e62a2f97c7645a08203814d8d283005677f1501acc451930aa4f063afbf640",
 }
 
 _FORBIDDEN_BINDING_APIS = ("EmbedCubin", "kernel.Launch", "GetKernel")
+_FORBIDDEN_TMA_STORAGE_TOKENS = (
+    "TmaDeviceArena",
+    "TmaDeviceSlot",
+    "CUdeviceptr",
+    "cuCtxGetCurrent",
+    "cuCtxGetDevice",
+    "cuMemAlloc",
+    "cudaMalloc",
+    "cuMemcpyHtoD",
+    "cudaMemcpy(",
+    "cuStreamIsCapturing",
+    "__device__ CUtensorMap",
+    "__constant__ CUtensorMap",
+    "fence.proxy.tensormap::generic.acquire",
+)
 
 _NEUTRAL_KERNEL_SYMBOL = re.compile(r"\bkernel_cake_msa_[a-z0-9_]+\b")
 _DEVICE_KERNEL_DEFINITION = re.compile(
@@ -98,6 +113,13 @@ _CUDA_LAUNCH_SYMBOL = re.compile(
     r"cudaLaunchKernel\s*\(\s*reinterpret_cast<const void\*>\("
     r"(kernel_cake_msa_[a-z0-9_]+)\)"
 )
+_GRID_CONSTANT_TENSOR_MAP = re.compile(
+    r"\bconst __grid_constant__ CakeMsaTensorMap ([A-Za-z0-9_]+)\b"
+)
+_ENCODED_HOST_TENSOR_MAP = re.compile(
+    r"\bCUtensorMap h_([A-Za-z0-9_]+) = EncodeTma_[A-Za-z0-9_]+\("
+)
+_DIRECT_TENSOR_MAP_LAUNCH_ARG = re.compile(r"&h_([A-Za-z0-9_]+)(?=,|})")
 
 
 def _device_name(variant):
@@ -151,4 +173,52 @@ def test_cake_msa_device_binding_pairs_use_neutral_kernel_symbols():
         ]
         assert not forbidden_apis, (
             f"{binding_name} uses forbidden generated-host APIs: {forbidden_apis}"
+        )
+
+
+def test_cake_msa_tma_variants_use_grid_constant_tensor_map_parameters():
+    for variant in _VARIANTS:
+        if variant == "topk":
+            continue
+
+        device_name = _device_name(variant)
+        binding_name = _binding_name(variant)
+        device_source = (_CAKE_MSA_CSRC_DIR / device_name).read_text(encoding="utf-8")
+        binding_source = (_CAKE_MSA_CSRC_DIR / binding_name).read_text(encoding="utf-8")
+
+        if variant.startswith("decode_"):
+            expected_maps = {
+                "Q",
+                "Q_prefill",
+                "K",
+                "K_prefill_pair",
+                "V",
+                "V_prefill_pair",
+                "KV",
+            }
+        else:
+            expected_maps = {"q", "k", "v"}
+
+        grid_constant_params = _GRID_CONSTANT_TENSOR_MAP.findall(device_source)
+        assert set(grid_constant_params) == {f"{name}_value" for name in expected_maps}
+        assert len(grid_constant_params) == len(expected_maps)
+
+        encoded_host_maps = _ENCODED_HOST_TENSOR_MAP.findall(binding_source)
+        direct_launch_maps = _DIRECT_TENSOR_MAP_LAUNCH_ARG.findall(binding_source)
+        assert set(encoded_host_maps) == expected_maps
+        assert len(encoded_host_maps) == len(expected_maps)
+        assert direct_launch_maps == encoded_host_maps
+
+        assert "static_assert(sizeof(CUtensorMap) == 128);" in binding_source
+        assert (
+            "static_assert(sizeof(CakeMsaTensorMap) == sizeof(CUtensorMap));"
+            in binding_source
+        )
+
+        combined_source = device_source + binding_source
+        forbidden_storage = [
+            token for token in _FORBIDDEN_TMA_STORAGE_TOKENS if token in combined_source
+        ]
+        assert not forbidden_storage, (
+            f"{variant} uses forbidden tensor-map storage: {forbidden_storage}"
         )

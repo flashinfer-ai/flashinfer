@@ -323,14 +323,14 @@ CASES = [
             kv_layout="flat_varlen",
             batch_size=4,
             seqlen_q=1,
-            kv_lens=[1024, 1152, 1280, 1408],
+            kv_lens=[129, 257, 385, 513],
             num_q_heads=8,
             num_kv_heads=2,
             topk=16,
             causal=True,
             seed=35,
         ),
-        id="decode-flat-fp16-ragged-batch4",
+        id="decode-flat-fp16-ragged-nonmultiple64",
     ),
     pytest.param(
         _attention_case(
