@@ -297,9 +297,9 @@ void da_upload_knn_exemplars(tvm::ffi::Tensor exemplar_norm_flat,
 // CUDA graph with SWITCH conditional node for N-way tile dispatch.
 // ---------------------------------------------------------------------------
 
-// Decision kernel arguments — stable storage required because
-// cudaGraphAddKernelNode captures pointers to each parameter, and those
-// pointers must remain valid for the lifetime of the graph.
+// Decision kernel arguments. cudaGraphAddKernelNode copies the argument values
+// while adding the node; the device allocations referenced by those copied
+// pointer values must remain live for the graph's lifetime.
 struct DecisionKernelArgs {
   const int32_t* topk_ids_ptr;
   int num_elements;
@@ -397,12 +397,9 @@ static int split_knn_min_elements() {
 // histogram + select two-node graph path. Uses atomicInc last-block pattern
 // for intra-kernel synchronization. Off by default until benchmarked.
 static bool fused_knn_enabled() {
-  static const bool enabled = []() {
-    const char* v = std::getenv("FLASHINFER_DA_FUSED");
-    return v && v[0] != '\0' && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
-           std::strcmp(v, "False") != 0;
-  }();
-  return enabled;
+  const char* v = std::getenv("FLASHINFER_DA_FUSED");
+  return v && v[0] != '\0' && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+         std::strcmp(v, "False") != 0;
 }
 
 // Real inline-switch API.
@@ -418,13 +415,16 @@ static bool fused_knn_enabled() {
 //       <Python launches real MoE kernels on side_stream with tactic for tile i>
 //       da_inline_body_end_capture(ctx_id)          # side_stream ends capturing
 //   da_inline_switch_end(ctx_id)                     # adds SWITCH to outer capture
+//   <finish capture, instantiate/replay/destroy the owning outer graph>
 //   da_inline_destroy(ctx_id)
 //
 // Allocator routing must be set up on the Python side via
 // torch._C._cuda_beginAllocateToPool so that MoE internal workspace
 // allocations (workspace_fc1/fc2 etc.) go to a pool that outlives the
 // outer graph. The pool handle is managed on the Python side; C++ here
-// only handles graph bookkeeping.
+// only handles graph bookkeeping. DAInlineContext must outlive the owning
+// outer graph because its captured routing-event handles are referenced by
+// that graph.
 // ---------------------------------------------------------------------------
 struct DAInlineContext {
   int device_id = -1;

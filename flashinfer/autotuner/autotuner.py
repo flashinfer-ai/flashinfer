@@ -1398,6 +1398,11 @@ class _ValueAwareInputArena:
         for input_idx, tensor in enumerate(inputs):
             if not isinstance(tensor, torch.Tensor):
                 continue
+            if tensor.numel() == 0:
+                # Empty CUDA storages commonly report data_ptr()==0 even when
+                # they are unrelated allocations. They have no addressable
+                # elements, so there is no alias relationship to preserve.
+                continue
             storage_key = (
                 tensor.device.type,
                 tensor.device.index,
@@ -1415,7 +1420,8 @@ class _ValueAwareInputArena:
             if previous[0] != view_key:
                 raise ValueError(
                     "value-aware input arena does not support partially "
-                    "aliased input tensor views"
+                    "aliased input tensor views at input indices "
+                    f"{previous[1]} and {input_idx}"
                 )
             if previous[1] != input_idx and (
                 previous[1] in dynamic_input_indices
@@ -1459,9 +1465,11 @@ class _ValueAwareInputArena:
         for shapes in profile_shapes:
             profile_bytes = 0
             seen_views = set()
-            storage_views: Dict[Tuple[Any, ...], Tuple[Any, ...]] = {}
+            storage_views: Dict[Tuple[Any, ...], Tuple[Tuple[Any, ...], int]] = {}
             for input_idx, tensor in enumerate(max_inputs):
                 if not isinstance(tensor, torch.Tensor):
+                    continue
+                if tensor.numel() == 0:
                     continue
                 storage_key = (
                     tensor.device.type,
@@ -1475,11 +1483,14 @@ class _ValueAwareInputArena:
                     tuple(tensor.stride()),
                     tensor.dtype,
                 )
-                previous_view = storage_views.setdefault(storage_key, active_view_key)
+                previous_view, previous_idx = storage_views.setdefault(
+                    storage_key, (active_view_key, input_idx)
+                )
                 if previous_view != active_view_key:
                     raise ValueError(
                         "value-aware input arena does not support partially "
-                        "aliased input tensor views"
+                        "aliased input tensor views at input indices "
+                        f"{previous_idx} and {input_idx}"
                     )
                 if active_view_key not in seen_views:
                     seen_views.add(active_view_key)
@@ -1844,6 +1855,32 @@ class _GraphProfileSession:
         self.cold_l2_flush_count = 0
         self.cold_l2_flush_source: Optional[torch.Tensor] = None
         self.cold_l2_flush_destination: Optional[torch.Tensor] = None
+        self._closed = False
+
+    def close(self) -> None:
+        """Destroy the graph before releasing its stable input storage."""
+        if self._closed:
+            return
+        graph = self.graph
+        try:
+            self.stream.synchronize()
+        finally:
+            try:
+                graph.reset()
+            finally:
+                # Drop the CUDAGraph and its private-pool token explicitly
+                # while input_batches is still retained by this session (and
+                # by the surrounding optimization profile). Do not delegate
+                # their relative destruction order to Python frame cleanup.
+                self.graph = None
+                self.graph_pool = None
+                self._closed = True
+
+    def __del__(self) -> None:
+        # Exception-path backstop only. Normal profiling calls close()
+        # explicitly before the session and its tensors leave scope.
+        with contextlib.suppress(Exception):
+            self.close()
 
     @classmethod
     def capture(
@@ -1924,25 +1961,34 @@ class _GraphProfileSession:
                 session.cold_l2_flush_source
             )
 
-        with _profile_measurement_scope(), torch.cuda.stream(stream):
-            with _autotune_nvtx_range("graph-session:stage-initial"):
-                session._stage_values(initial_value_inputs)
-            with _autotune_nvtx_range(f"graph-session:warmup, calls={tuner.warmup}"):
-                for _ in range(tuner.warmup):
-                    runner(input_batches[-1], tactic=tactic, **kwargs)
-            stream.synchronize()
-            with (
-                _autotune_nvtx_range(
-                    f"graph-session:capture, calls-per-graph={len(input_batches)}"
-                ),
-                torch.cuda.graph(graph, pool=graph_pool),
-            ):
-                session._run_kernels()
-            stream.synchronize()
-            with _autotune_nvtx_range("graph-session:replay-warmup, calls=1"):
-                graph.replay()
-            stream.synchronize()
-            session.graph_warmup_replays += 1
+        try:
+            with _profile_measurement_scope(), torch.cuda.stream(stream):
+                with _autotune_nvtx_range("graph-session:stage-initial"):
+                    session._stage_values(initial_value_inputs)
+                with _autotune_nvtx_range(
+                    f"graph-session:warmup, calls={tuner.warmup}"
+                ):
+                    for _ in range(tuner.warmup):
+                        runner(input_batches[-1], tactic=tactic, **kwargs)
+                stream.synchronize()
+                with (
+                    _autotune_nvtx_range(
+                        f"graph-session:capture, calls-per-graph={len(input_batches)}"
+                    ),
+                    torch.cuda.graph(graph, pool=graph_pool),
+                ):
+                    session._run_kernels()
+                stream.synchronize()
+                with _autotune_nvtx_range("graph-session:replay-warmup, calls=1"):
+                    graph.replay()
+                stream.synchronize()
+                session.graph_warmup_replays += 1
+        except BaseException:
+            # The caller cannot close a session that capture never returned.
+            # Reset it here while its stable input arena is still alive.
+            with contextlib.suppress(Exception):
+                session.close()
+            raise
 
         session.setup_host_time_s = time.perf_counter() - setup_start
         return session
@@ -3042,6 +3088,7 @@ class AutoTuner:
                                 value_time_max_ms = None
                                 value_times_ms = None
                                 graph_time_needs_reduction = False
+                                session = None
                                 try:
                                     if value_input_sets is not None:
                                         if tuning_config.use_cuda_graph:
@@ -3171,6 +3218,9 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                finally:
+                                    if session is not None:
+                                        session.close()
                                 if graph_time_needs_reduction:
                                     # Graph-profile measurements bypass
                                     # _profile_single_kernel, so apply the
@@ -3529,32 +3579,39 @@ class AutoTuner:
                         **kwargs,
                     )
 
-            with torch.cuda.stream(stream):
-                if tuning_config.use_cuda_graph:
-                    with torch.cuda.graph(graph):
+            try:
+                with torch.cuda.stream(stream):
+                    if tuning_config.use_cuda_graph:
+                        with torch.cuda.graph(graph):
+                            _run_kernels()
+
+                    stream.synchronize()
+
+                    # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
+                    delay_kernel_time_usec = (
+                        self._CUDA_GRAPH_DELAY_MICRO_SECS
+                        if tuning_config.use_cuda_graph
+                        else self.stream_delay_micro_secs
+                    )
+                    delay_kernel(delay_kernel_time_usec)
+
+                    record_start()
+
+                    if tuning_config.use_cuda_graph:
+                        graph.replay()
+                    else:
                         _run_kernels()
 
-                stream.synchronize()
+                    record_end()
+                    stream.synchronize()
 
-                # Delay the profiled kernel launch to eliminate affects of host time overhead in profiling.
-                delay_kernel_time_usec = (
-                    self._CUDA_GRAPH_DELAY_MICRO_SECS
-                    if tuning_config.use_cuda_graph
-                    else self.stream_delay_micro_secs
-                )
-                delay_kernel(delay_kernel_time_usec)
-
-                record_start()
-
+                    return elapsed_time() / repeat
+            finally:
+                # Keep the stable profiling inputs alive until the graph
+                # executable no longer owns their raw device pointers. This
+                # also covers failed tactic capture/replay and timing errors.
                 if tuning_config.use_cuda_graph:
-                    graph.replay()
-                else:
-                    _run_kernels()
-
-                record_end()
-                stream.synchronize()
-
-                return elapsed_time() / repeat
+                    graph.reset()
 
         # Run the timing under ``_profile_measurement_scope`` (so runners
         # can consult ``is_in_profile_measurement()``), then — if a

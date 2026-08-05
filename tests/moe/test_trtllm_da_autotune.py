@@ -20,8 +20,6 @@ import csv
 import importlib
 import math
 import os
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -179,27 +177,19 @@ class _FakeCUDAStream:
     cuda_stream: int
 
 
-def _clear_da_stream_caches() -> None:
-    da_single_graph._DA_INLINE_POOL_HANDLES.clear()
-    da_single_graph._DA_INLINE_SIDE_STREAMS.clear()
-    da_single_graph._DA_INLINE_ROUTING_STREAMS.clear()
-
-
 @pytest.fixture
-def isolated_da_stream_caches():
+def isolated_da_stream_caches(monkeypatch):
     """Keep mocked CUDA streams from escaping into public-wrapper tests."""
-    _clear_da_stream_caches()
-    moe_utils._EFF_EXPERTS_STREAMS.clear()
-    yield
-    _clear_da_stream_caches()
-    moe_utils._EFF_EXPERTS_STREAMS.clear()
+    monkeypatch.setattr(da_single_graph, "_DA_INLINE_POOL_HANDLES", {})
+    monkeypatch.setattr(da_single_graph, "_DA_INLINE_SIDE_STREAMS", {})
+    monkeypatch.setattr(da_single_graph, "_DA_INLINE_ROUTING_STREAMS", {})
+    monkeypatch.setattr(moe_utils, "_EFF_EXPERTS_STREAMS", {})
 
 
 def test_da_capture_primitives_resolve_unindexed_current_device(
     monkeypatch, isolated_da_stream_caches
 ):
     """An unindexed CUDA device is cached under the concrete current device."""
-    _clear_da_stream_caches()
     created_devices = []
 
     def make_stream(*, device):
@@ -223,7 +213,6 @@ def test_da_capture_stream_pool_wrap_is_repaired(
     monkeypatch, isolated_da_stream_caches
 ):
     """A pooled handle that wraps onto the outer stream is reacquired."""
-    _clear_da_stream_caches()
     replacements = iter((_FakeCUDAStream(101),))
     monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: next(replacements))
 
@@ -241,7 +230,6 @@ def test_da_capture_stream_reacquires_internal_counterpart(
     monkeypatch, isolated_da_stream_caches
 ):
     """A supplied stream is preserved while its internal alias is repaired."""
-    _clear_da_stream_caches()
     supplied_side = _FakeCUDAStream(41)
     monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: _FakeCUDAStream(99))
 
@@ -261,7 +249,6 @@ def test_da_capture_stream_replacement_is_cached(
     monkeypatch, isolated_da_stream_caches
 ):
     """A repaired internal stream becomes the stable per-device primitive."""
-    _clear_da_stream_caches()
     replacement = _FakeCUDAStream(83)
     monkeypatch.setattr(torch.cuda, "Stream", lambda **_kwargs: replacement)
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: "pool")
@@ -693,28 +680,6 @@ def test_da_knn_capture_rejects_unsupported_cuda_architecture(monkeypatch):
 
 def test_da_captured_selector_survives_conflicting_context_upload():
     """Captured selectors retain their own context after a conflicting upload."""
-    if os.getenv("_FLASHINFER_DA_SELECTOR_LIFETIME_CHILD") != "1":
-        # This low-level test creates CUDA conditional body graphs directly.
-        # Keep that process-global capture state out of the public-wrapper
-        # matrix, which intentionally creates dozens of unrelated graphs.
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_SELECTOR_LIFETIME_CHILD"] = "1"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::test_da_captured_selector_survives_conflicting_context_upload",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
     _require_sm100()
     ffi = _load_moe_ffi_op()
     injector = object.__new__(da_single_graph.DAInlineGraphInjector)
@@ -778,7 +743,7 @@ def test_da_captured_selector_survives_conflicting_context_upload():
 
     topk_ids = torch.zeros((num_tokens, 1), device=device, dtype=torch.int32)
 
-    def capture_selector(selector_handle):
+    def capture_selector(selector_handle, owner):
         output = torch.zeros((), device=device, dtype=torch.int32)
         side_stream = torch.cuda.Stream(device=device)
         routing_stream = torch.cuda.Stream(device=device)
@@ -798,6 +763,7 @@ def test_da_captured_selector_survives_conflicting_context_upload():
                 side_stream=side_stream,
                 routing_stream=routing_stream,
                 pool_handle=pool_handle,
+                resource_owner=owner,
             ) as switch,
         ):
             assert switch.num_bodies == 2
@@ -808,15 +774,17 @@ def test_da_captured_selector_survives_conflicting_context_upload():
         return graph, output, side_stream, routing_stream
 
     graph_a = graph_b = None
+    side_a = routing_a = side_b = routing_b = None
+    handle_a_destroyed = False
     try:
         upload(context_a, [0, 1])
-        graph_a, output_a, side_a, routing_a = capture_selector(handle_a)
+        graph_a, output_a, side_a, routing_a = capture_selector(handle_a, context_a)
         graph_a.replay()
         torch.cuda.synchronize()
         assert output_a.item() == 1
 
         upload(context_b, [1, 0])
-        graph_b, output_b, side_b, routing_b = capture_selector(handle_b)
+        graph_b, output_b, side_b, routing_b = capture_selector(handle_b, context_b)
         graph_b.replay()
         torch.cuda.synchronize()
         assert output_b.item() == 2
@@ -826,42 +794,60 @@ def test_da_captured_selector_survives_conflicting_context_upload():
             graph_a.replay()
             torch.cuda.synchronize()
             assert output_a.item() == 1
+        assert len(da_single_graph._DA_INLINE_GRAPH_RESOURCES) == 2
+
+        # Tear down one graph and its C++ mutation state while the other graph
+        # remains live. Context-scoped release must not disturb the survivor.
+        side_a.synchronize()
+        routing_a.synchronize()
+        graph_a.reset()
+        del graph_a
+        graph_a = None
+        da_capture.release_capture_resources(context_a)
+        da_state.destroy_selector_handle(ffi, context_a, handle_a)
+        assert context_a not in da_state.SELECTOR_HANDLES
+        handle_a_destroyed = True
+
+        output_b.zero_()
+        graph_b.replay()
+        torch.cuda.synchronize()
+        assert output_b.item() == 2
+        assert len(da_single_graph._DA_INLINE_GRAPH_RESOURCES) == 1
     finally:
         torch.cuda.synchronize()
+        for stream in (side_a, routing_a, side_b, routing_b):
+            if stream is not None:
+                stream.synchronize()
         # Explicitly release graph executables before selector device state and
         # their capture streams.  CUDA graph nodes retain the selector pointers.
         for graph in (graph_a, graph_b):
             if graph is not None:
                 graph.reset()
-        del graph_a, graph_b
-        ffi.da_destroy_knn_selector(handle_a)
-        ffi.da_destroy_knn_selector(handle_b)
+        del graph, graph_a, graph_b
+        da_capture.release_capture_resources()
+        assert not da_single_graph._DA_INLINE_GRAPH_RESOURCES
+        if not handle_a_destroyed:
+            da_state.destroy_selector_handle(ffi, context_a, handle_a)
+        da_state.destroy_selector_handle(ffi, context_b, handle_b)
+
+    # Reuse the same process and CUDA context immediately after releasing all
+    # graph-owned DA mutation state. This catches delayed event/argument
+    # use-after-free without relying on a later, unrelated allocation.
+    reuse_output = torch.zeros((), device=device, dtype=torch.int32)
+    reuse_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(reuse_graph):
+        reuse_output.fill_(7)
+    reuse_graph.replay()
+    torch.cuda.synchronize()
+    assert reuse_output.item() == 7
+    reuse_graph.reset()
+    del reuse_graph
+    torch.cuda.synchronize()
 
 
-def test_da_sparse_register_sort_preserves_zero_tail():
+def test_da_sparse_register_sort_preserves_zero_tail(monkeypatch):
     """Fused multi-block selection preserves sparse counts across replays."""
-    if os.getenv("_FLASHINFER_DA_SPARSE_REGISTER_SORT_CHILD") != "1":
-        # Direct conditional-graph construction leaves process-global CUDA
-        # capture state. Isolate it from the public-wrapper numerical matrix.
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_SPARSE_REGISTER_SORT_CHILD"] = "1"
-        env["FLASHINFER_DA_FUSED"] = "1"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::test_da_sparse_register_sort_preserves_zero_tail",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
+    monkeypatch.setenv("FLASHINFER_DA_FUSED", "1")
     _require_sm100()
     ffi = _load_moe_ffi_op()
     injector = object.__new__(da_single_graph.DAInlineGraphInjector)
@@ -969,33 +955,17 @@ def test_da_sparse_register_sort_preserves_zero_tail():
             assert output.item() == 1
     finally:
         torch.cuda.synchronize()
+        side_stream.synchronize()
+        routing_stream.synchronize()
         graph.reset()
         del graph
-        ffi.da_destroy_knn_selector(selector_handle)
+        da_capture.release_capture_resources()
+        da_state.destroy_selector_handle(ffi, context, selector_handle)
 
 
-def test_da_non_power_of_two_expert_count_preserves_zero_sort_tail():
+def test_da_non_power_of_two_expert_count_preserves_zero_sort_tail(monkeypatch):
     """A 17-expert selector ignores the synthetic 32-lane bitonic-sort tail."""
-    if os.getenv("_FLASHINFER_DA_NON_POWER_OF_TWO_SORT_CHILD") != "1":
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_NON_POWER_OF_TWO_SORT_CHILD"] = "1"
-        env["FLASHINFER_DA_FUSED"] = "1"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::test_da_non_power_of_two_expert_count_preserves_zero_sort_tail",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
+    monkeypatch.setenv("FLASHINFER_DA_FUSED", "1")
     _require_sm100()
     ffi = _load_moe_ffi_op()
     injector = object.__new__(da_single_graph.DAInlineGraphInjector)
@@ -1084,32 +1054,16 @@ def test_da_non_power_of_two_expert_count_preserves_zero_sort_tail():
             assert output.item() == 1
     finally:
         torch.cuda.synchronize()
+        side_stream.synchronize()
+        routing_stream.synchronize()
         graph.reset()
         del graph
-        ffi.da_destroy_knn_selector(selector_handle)
+        da_capture.release_capture_resources()
+        da_state.destroy_selector_handle(ffi, context, selector_handle)
 
 
 def test_da_selector_consumes_counts_published_by_multi_tile_routing():
     """The optional count selector waits for live multi-tile routing counts."""
-    if os.getenv("_FLASHINFER_DA_ROUTING_COUNTS_CHILD") != "1":
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_ROUTING_COUNTS_CHILD"] = "1"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::test_da_selector_consumes_counts_published_by_multi_tile_routing",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
     _require_sm100()
     ffi = _load_moe_ffi_op()
     injector = object.__new__(da_single_graph.DAInlineGraphInjector)
@@ -1175,11 +1129,12 @@ def test_da_selector_consumes_counts_published_by_multi_tile_routing():
         expert_weights,
     )
     flat_metadata = [tensor for metadata in metadata_by_tile for tensor in metadata]
-    output = torch.zeros((), device=device, dtype=torch.int32)
-    side_stream = torch.cuda.Stream(device=device)
-    routing_stream = torch.cuda.Stream(device=device)
-    graph = torch.cuda.CUDAGraph()
-    try:
+
+    def capture_routing_graph():
+        output = torch.zeros((), device=device, dtype=torch.int32)
+        side_stream = torch.cuda.Stream(device=device)
+        routing_stream = torch.cuda.Stream(device=device)
+        graph = torch.cuda.CUDAGraph()
         with (
             torch.cuda.graph(graph),
             injector.inject(
@@ -1195,6 +1150,7 @@ def test_da_selector_consumes_counts_published_by_multi_tile_routing():
                 side_stream=side_stream,
                 routing_stream=routing_stream,
                 pool_handle=torch.cuda.graph_pool_handle(),
+                resource_owner=context,
             ) as switch,
         ):
             with switch.routing_branch():
@@ -1219,7 +1175,19 @@ def test_da_selector_consumes_counts_published_by_multi_tile_routing():
                 output.fill_(1)
             with switch.body(1):
                 output.fill_(2)
+        return graph, output, side_stream, routing_stream
 
+    def release_routing_graph(graph, side_stream, routing_stream):
+        torch.cuda.synchronize()
+        side_stream.synchronize()
+        routing_stream.synchronize()
+        graph.reset()
+        da_capture.release_capture_resources(context)
+
+    graph = None
+    second_graph = None
+    try:
+        graph, output, side_stream, routing_stream = capture_routing_graph()
         expert_ids.copy_(
             torch.arange(num_tokens, dtype=torch.int32, device=device)
             .remainder(num_experts)
@@ -1240,11 +1208,29 @@ def test_da_selector_consumes_counts_published_by_multi_tile_routing():
             ),
         )
         assert output.item() == 2
-    finally:
-        torch.cuda.synchronize()
-        graph.reset()
+
+        release_routing_graph(graph, side_stream, routing_stream)
         del graph
-        ffi.da_destroy_knn_selector(selector_handle)
+        graph = None
+        assert not da_single_graph._DA_INLINE_GRAPH_RESOURCES
+
+        # Recreate the full routing branch in the same CUDA context after its
+        # graph, events, streams, and pool generation have been released.
+        # This catches delayed event-handle use-after-free at the producer.
+        second_graph, second_output, second_side, second_routing = (
+            capture_routing_graph()
+        )
+        second_output.zero_()
+        second_graph.replay()
+        torch.cuda.synchronize()
+        assert second_output.item() == 2
+    finally:
+        if graph is not None:
+            release_routing_graph(graph, side_stream, routing_stream)
+        if second_graph is not None:
+            release_routing_graph(second_graph, second_side, second_routing)
+        da_capture.release_capture_resources()
+        da_state.destroy_selector_handle(ffi, context, selector_handle)
 
 
 def test_effective_expert_streams_are_scoped_per_cuda_device():
@@ -1973,19 +1959,20 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
 
     if replay:
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run_split()
-        for _ in range(2):
-            split.zero_()
-            graph.replay()
+        try:
+            with torch.cuda.graph(graph):
+                run_split()
+            for _ in range(2):
+                split.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+                _assert_bit_exact(monolithic, split)
+        finally:
+            # This helper runs dozens of graph cases before the public DA
+            # capture tests. Reset even when a numerical assertion fails.
+            graph.reset()
+            del graph
             torch.cuda.synchronize()
-            _assert_bit_exact(monolithic, split)
-        # This helper runs dozens of graph cases before the public DA capture
-        # tests.  Explicit reset prevents completed graph executables from
-        # retaining capture-stream state until cyclic Python GC runs.
-        graph.reset()
-        del graph
-        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(
@@ -2350,7 +2337,7 @@ def test_fp4_logits_da_graph_replays_packed_metadata(monkeypatch, precision):
             per_tile_tactics={int(tactic[0]): tactic for tactic in body_tactics},
             per_body_tactics=body_tactics,
         )
-        da_capture.CAPTURE_RESOURCES.clear()
+        da_capture.release_capture_resources(da_context)
 
         output = torch.empty_like(monolithic_reference)
         _run_matrix_fp4_logits(execution[0], output)
@@ -3056,13 +3043,9 @@ def _reset_tuner_and_da(monkeypatch: pytest.MonkeyPatch) -> AutoTuner:
     monkeypatch.setattr(da_profile, "_bundle_loaded", False)
     monkeypatch.setattr(da_profile, "_bundle_has_tactics", False)
 
+    da_capture.release_capture_resources()
     da_state.PER_TILE_TACTICS.clear()
     da_state.PER_BODY_TACTICS.clear()
-    da_capture.CAPTURE_RESOURCES.clear()
-    da_state.CAPTURE_KEEPALIVE.clear()
-    da_single_graph._DA_INLINE_POOL_HANDLES.clear()
-    da_single_graph._DA_INLINE_SIDE_STREAMS.clear()
-    da_single_graph._DA_INLINE_ROUTING_STREAMS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
     da_state.BUNDLE_EAGER_TACTICS.clear()
     da_state.BASELINE_GUARD_DECISIONS.clear()
@@ -3082,16 +3065,9 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
     # Capture resources own tensors referenced by graph and side-stream work.
     # Ensure that work is complete before dropping the keepalive references.
     torch.cuda.synchronize()
+    da_capture.release_capture_resources()
     da_state.PER_TILE_TACTICS.clear()
     da_state.PER_BODY_TACTICS.clear()
-    da_capture.CAPTURE_RESOURCES.clear()
-    da_state.CAPTURE_KEEPALIVE.clear()
-    # Tests destroy every graph executable before reaching this point. Drop
-    # its per-device pool and stream caches as well so the next test cannot
-    # inherit CUDA capture state or allocations from an unrelated graph.
-    da_single_graph._DA_INLINE_POOL_HANDLES.clear()
-    da_single_graph._DA_INLINE_SIDE_STREAMS.clear()
-    da_single_graph._DA_INLINE_ROUTING_STREAMS.clear()
     da_state.STATIC_FALLBACK_TACTICS.clear()
     da_state.BUNDLE_EAGER_TACTICS.clear()
     da_state.BASELINE_GUARD_DECISIONS.clear()
@@ -3100,6 +3076,9 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
     tuner.reset_statistics()
     tuner.is_tuning_mode = False
     tuner._post_autotune_callbacks.clear()
+    assert not da_capture.CAPTURE_RESOURCES
+    assert not da_state.CAPTURE_KEEPALIVE
+    assert not da_single_graph._DA_INLINE_GRAPH_RESOURCES
 
 
 def _collect_profile_latencies(tuner: AutoTuner) -> dict[int, dict[int, float]]:
@@ -3795,42 +3774,6 @@ def test_da_baseline_lookup_retries_after_profiles_are_published():
     ) == ((32, 9), 0.75)
 
 
-def test_da_capture_resources_require_explicit_lifecycle_release():
-    """Context-scoped release preserves unrelated graph storage generations."""
-    first = _da_test_context(
-        "flashinfer::trtllm_fp4_block_scale_moe",
-        moe_core.DtypeTrtllmGen.E2m1,
-        moe_core.DtypeTrtllmGen.E2m1,
-        device="cuda:0",
-    )
-    second = _da_test_context(
-        "flashinfer::trtllm_fp4_block_scale_moe",
-        moe_core.DtypeTrtllmGen.E2m1,
-        moe_core.DtypeTrtllmGen.E2m1,
-        device="cuda:0",
-        hidden_size=2048,
-    )
-    first_key = (first, 64, 2, (16,), 2)
-    second_key = (second, 64, 2, (16,), 2)
-    da_capture.CAPTURE_RESOURCES[first_key] = object()
-    da_capture.CAPTURE_RESOURCES[second_key] = object()
-    da_state.CAPTURE_KEEPALIVE[first] = [torch.empty(1)]
-    da_state.CAPTURE_KEEPALIVE[second] = [torch.empty(1)]
-    try:
-        da_capture.release_capture_resources(first)
-        assert first_key not in da_capture.CAPTURE_RESOURCES
-        assert first not in da_state.CAPTURE_KEEPALIVE
-        assert second_key in da_capture.CAPTURE_RESOURCES
-        assert second in da_state.CAPTURE_KEEPALIVE
-
-        da_capture.release_capture_resources()
-        assert not da_capture.CAPTURE_RESOURCES
-        assert not da_state.CAPTURE_KEEPALIVE
-    finally:
-        da_capture.CAPTURE_RESOURCES.clear()
-        da_state.CAPTURE_KEEPALIVE.clear()
-
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -3988,6 +3931,7 @@ def _capture_and_replay_da_graph(
     graph.reset()
     del graph
     torch.cuda.synchronize()
+    da_capture.release_capture_resources()
     return result
 
 
@@ -4292,30 +4236,6 @@ def test_factorized_da_public_wrapper_graph_matches_independent_reference(
     monkeypatch, tmp_path, precision
 ):
     """The real public CUDA graph must dispatch DA and match the dequant reference."""
-    child_precision = os.getenv("_FLASHINFER_DA_FACTOR_GRAPH_CHILD")
-    if child_precision != precision.name:
-        # Earlier conditional-graph tests can leave CUDA state that is only
-        # reported by a later allocation.  Keep every precision contract real,
-        # but give it an independent CUDA context so failures are attributable
-        # to that public-wrapper capture rather than inherited graph lifetime.
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_FACTOR_GRAPH_CHILD"] = precision.name
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::{test_factorized_da_public_wrapper_graph_matches_independent_reference.__name__}[{precision.name}]",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:
@@ -4359,30 +4279,6 @@ def test_optional_gemm1_activation_parameters_bypass_da_without_changing_results
     monkeypatch, tmp_path, precision
 ):
     """Unsupported activation tensors use the public monolithic graph path."""
-    child_precision = os.getenv("_FLASHINFER_DA_OPTIONAL_ACTIVATION_CHILD")
-    if child_precision != precision.name:
-        # Conditional graph tests intentionally retain process-global CUDA
-        # state. Run this independent public-wrapper contract in a fresh CUDA
-        # context so a prior graph cannot turn its first allocation into a
-        # delayed illegal-access report.
-        env = os.environ.copy()
-        env["_FLASHINFER_DA_OPTIONAL_ACTIVATION_CHILD"] = precision.name
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                f"{__file__}::{test_optional_gemm1_activation_parameters_bypass_da_without_changing_results.__name__}[{precision.name}]",
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return
-
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:

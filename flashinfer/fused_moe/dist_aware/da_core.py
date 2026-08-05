@@ -717,9 +717,7 @@ def tune_and_publish_tactic(
         runner_inputs,
         tune_max_num_tokens=tune_max_num_tokens,
         routing_input_mode=execution.invocation.routing_input_mode,
-        # This selects only the tactic-measurement discipline. User-facing DA
-        # CUDA-graph capture and replay remain controlled by the wrapper.
-        use_cuda_graph=execution.invocation.use_cuda_graph_profiling,
+        use_cuda_graph=True,
         use_cold_l2_cache=True,
         **tuning_kwargs,
     )

@@ -15,6 +15,7 @@ import torch
 
 __all__ = [
     "DAInlineGraphInjector",
+    "release_graph_resources",
 ]
 
 
@@ -28,6 +29,73 @@ __all__ = [
 _DA_INLINE_POOL_HANDLES: Dict[int, Any] = {}
 _DA_INLINE_SIDE_STREAMS: Dict[int, "torch.cuda.Stream"] = {}
 _DA_INLINE_ROUTING_STREAMS: Dict[int, "torch.cuda.Stream"] = {}
+
+
+@dataclass(frozen=True)
+class _DAGraphMutationResources:
+    """C++ mutation state whose lifetime must cover the owning graph."""
+
+    ffi: Any
+    ctx_id: int
+    device_idx: int
+    side_stream: "torch.cuda.Stream"
+    routing_stream: "torch.cuda.Stream"
+    pool_handle: Any
+    owner: Any
+
+
+_DA_INLINE_GRAPH_RESOURCES: list[_DAGraphMutationResources] = []
+
+
+def release_graph_resources(owner: Any = None) -> None:
+    """Release inline graph state after the owning graph executables are reset.
+
+    ``DAInlineContext`` owns CUDA event handles referenced by nodes inserted
+    into the outer graph. Destroying that context when ``inject()`` exits is
+    too early: the outer capture has not even finished, and later replay can
+    dereference stale graph-mutation state. The Python
+    lifecycle registry therefore retains each C++ context until the framework
+    resets its graph and calls this function (normally through
+    ``release_capture_resources``).
+
+    Selector buffers are separately owned by the C++ selector registry. A
+    caller that explicitly destroys a selector must do so only after releasing
+    every graph resource that was captured with that selector.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("cannot release DA graph resources during capture")
+
+    selected = [
+        resource
+        for resource in _DA_INLINE_GRAPH_RESOURCES
+        if owner is None or resource.owner == owner
+    ]
+    affected_devices = {resource.device_idx for resource in selected}
+    if owner is None:
+        affected_devices.update(_DA_INLINE_SIDE_STREAMS)
+        affected_devices.update(_DA_INLINE_ROUTING_STREAMS)
+    elif getattr(owner, "device_type", None) == "cuda":
+        affected_devices.add(int(owner.device_index))
+
+    for resource in selected:
+        with torch.cuda.device(resource.device_idx):
+            resource.side_stream.synchronize()
+            resource.routing_stream.synchronize()
+            torch.cuda.synchronize()
+            resource.ffi.da_inline_destroy(resource.ctx_id)
+        _DA_INLINE_GRAPH_RESOURCES.remove(resource)
+
+    # Streams and graph-pool handles are shared per device. Drop them only
+    # after the final retained graph on that device is gone.
+    live_devices = {resource.device_idx for resource in _DA_INLINE_GRAPH_RESOURCES}
+    for device_idx in affected_devices - live_devices:
+        side_stream = _DA_INLINE_SIDE_STREAMS.pop(device_idx, None)
+        routing_stream = _DA_INLINE_ROUTING_STREAMS.pop(device_idx, None)
+        if side_stream is not None:
+            side_stream.synchronize()
+        if routing_stream is not None:
+            routing_stream.synchronize()
+        _DA_INLINE_POOL_HANDLES.pop(device_idx, None)
 
 
 def _concrete_cuda_device(device: torch.device) -> torch.device:
@@ -183,8 +251,9 @@ class DAInlineGraphInjector:
         pool_handle: Optional[Any] = None,
         side_stream_supplied: Optional[bool] = None,
         routing_stream_supplied: Optional[bool] = None,
+        resource_owner: Any = None,
     ):
-        """Context manager that sets up the inline switch and tears it down."""
+        """Set up the inline switch and retain its state for graph teardown."""
         if side_stream_supplied is None:
             side_stream_supplied = side_stream is not None
         if routing_stream_supplied is None:
@@ -287,6 +356,7 @@ class DAInlineGraphInjector:
             pool_handle=pool_handle,
             direct_mode=direct_mode,
         )
+        completed = False
         try:
             # Route allocations device-wide to our graph-private pool for
             # the duration of the body captures. This is how MoE internal
@@ -298,8 +368,22 @@ class DAInlineGraphInjector:
             finally:
                 torch._C._cuda_endAllocateToPool(device_idx, pool_handle)
             self._ffi.da_inline_switch_end(ctx_id)
+            completed = True
         finally:
-            self._ffi.da_inline_destroy(ctx_id)
+            if completed and not direct_mode:
+                _DA_INLINE_GRAPH_RESOURCES.append(
+                    _DAGraphMutationResources(
+                        ffi=self._ffi,
+                        ctx_id=ctx_id,
+                        device_idx=int(device_idx),
+                        side_stream=side_stream,
+                        routing_stream=routing_stream,
+                        pool_handle=pool_handle,
+                        owner=resource_owner,
+                    )
+                )
+            else:
+                self._ffi.da_inline_destroy(ctx_id)
 
 
 @dataclass

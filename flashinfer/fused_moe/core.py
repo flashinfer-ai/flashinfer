@@ -3996,7 +3996,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             use_routing_scales_on_input,
             packed_topk_ids,
         )
-        return [torch.from_dlpack(tensor) for tensor in metadata]
+        # DLPack conversion requires the exported tensor's CUDA device to be
+        # current, even though the C++ allocation already selected it.
+        with torch.cuda.device(routing_logits.device):
+            return [torch.from_dlpack(tensor) for tensor in metadata]
 
     @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata_from_logits")
     def _fake_trtllm_moe_allocate_routing_metadata_from_logits(
@@ -4121,7 +4124,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_input_mode,
             topk_weights,
         )
-        return [torch.from_dlpack(tensor) for tensor in metadata]
+        # Preserve the caller's ambient CUDA device while converting metadata
+        # allocated on the input tensor's device.
+        with torch.cuda.device(topk_ids.device):
+            return [torch.from_dlpack(tensor) for tensor in metadata]
 
     @register_fake_op("flashinfer::trtllm_moe_allocate_routing_metadata")
     def _fake_trtllm_moe_allocate_routing_metadata(
@@ -4207,7 +4213,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_input_mode,
             topk_weights,
         )
-        flat = [torch.from_dlpack(tensor) for tensor in metadata]
+        # Preserve the caller's ambient CUDA device while converting metadata
+        # allocated on the input tensor's device.
+        with torch.cuda.device(topk_ids.device):
+            flat = [torch.from_dlpack(tensor) for tensor in metadata]
         if (
             int(routing_input_mode) == int(RoutingInputMode.UnpackedPrecomputed)
             and topk_weights is not None

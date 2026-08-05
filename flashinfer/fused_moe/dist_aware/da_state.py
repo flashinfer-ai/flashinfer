@@ -168,6 +168,31 @@ def selector_handle(context: DAMoeContext) -> int:
     return handle
 
 
+def destroy_selector_handle(
+    ffi: Any,
+    context: DAMoeContext,
+    expected_handle: Optional[int] = None,
+) -> None:
+    """Destroy a context's C++ selector and invalidate its Python handle.
+
+    Graph executables and their capture resources must be released before this
+    function is called.  The cache entry is removed only after C++ destruction
+    succeeds, so a failed teardown cannot silently publish a replacement ID.
+    """
+
+    handle = SELECTOR_HANDLES.get(context)
+    if handle is None:
+        return
+    if expected_handle is not None and handle != int(expected_handle):
+        raise RuntimeError(
+            "selector handle ownership mismatch: "
+            f"context owns {handle}, caller expected {int(expected_handle)}"
+        )
+    ffi.da_destroy_knn_selector(handle)
+    if SELECTOR_HANDLES.get(context) == handle:
+        SELECTOR_HANDLES.pop(context, None)
+
+
 PER_TILE_TACTICS: Dict[Tuple[int, DAMoeContext], Dict[int, Tuple[int, int]]] = {}
 PER_BODY_TACTICS: Dict[Tuple[int, DAMoeContext], list[Tuple[int, int]]] = {}
 CAPTURE_KEEPALIVE: Dict[DAMoeContext, Dict[int, torch.Tensor]] = {}

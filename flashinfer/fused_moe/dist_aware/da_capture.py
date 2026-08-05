@@ -132,6 +132,7 @@ def release_capture_resources(
         if context.device_type == "cuda":
             with torch.cuda.device(context.device_index):
                 torch.cuda.synchronize()
+    da_single_graph.release_graph_resources(da_context)
     for key in tuple(CAPTURE_RESOURCES):
         if da_context is None or key[0] == da_context:
             CAPTURE_RESOURCES.pop(key, None)
@@ -1183,6 +1184,7 @@ def try_trtllm_capture_aware_da(
         pool_handle=capture_resources.pool_handle,
         side_stream_supplied=False,
         routing_stream_supplied=False,
+        resource_owner=da_context,
     ) as ctx:
         if populate_candidate_routing_metadata is not None:
             with ctx.routing_branch():

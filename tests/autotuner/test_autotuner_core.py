@@ -175,6 +175,9 @@ def test_value_aware_tuning_reuses_arena_lanes_for_each_profile(monkeypatch):
         def diagnostics(self):
             return self._diagnostics
 
+        def close(self):
+            return None
+
     def _capture(
         _cls,
         _tuner,
@@ -251,6 +254,43 @@ def test_value_aware_input_arena_preserves_exact_static_aliases():
     assert batches[0][1].data_ptr() == batches[0][2].data_ptr()
     assert batches[1][1].data_ptr() == batches[1][2].data_ptr()
     assert batches[0][1].data_ptr() != batches[1][1].data_ptr()
+
+
+def test_value_aware_input_arena_does_not_alias_unrelated_empty_tensors():
+    """Zero-sized inputs sharing CUDA's null pointer need no alias contract."""
+    tuner = reset_autotuner()
+    dynamic = torch.empty((4, 8))
+    empty_ids = torch.empty((4, 0), dtype=torch.int32)
+    empty_weights = torch.empty((4, 0), dtype=torch.bfloat16)
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1, 2),
+                dim_idx=(0, 0, 0),
+                gen_tuning_buckets=(4,),
+                map_to_tuning_buckets=lambda size: size,
+            ),
+        ),
+        use_cold_l2_cache=True,
+    )
+    profile = tuner._generate_optimization_profiles(
+        config, [dynamic, empty_ids, empty_weights]
+    )[0]
+
+    arena = _ValueAwareInputArena.create(
+        tuner,
+        [profile],
+        [dynamic, empty_ids, empty_weights],
+        config,
+        lane_count=2,
+    )
+
+    assert arena.diagnostics()["input_arena_reused"] is True
+    assert arena.diagnostics()["arena_fallback_reason"] == ""
+    assert all(
+        batch[1].numel() == batch[2].numel() == 0
+        for batch in arena.batches_for(profile)
+    )
 
 
 def test_value_aware_input_arena_bounds_zero_and_tiny_profiles(monkeypatch):
@@ -345,6 +385,27 @@ def test_value_aware_graph_session_rounds_to_actual_measured_calls(
     )
     assert session.measurement_graph_replays == expected_replays
     assert session.measured_calls_per_sample == expected_calls
+
+
+def test_value_aware_graph_session_resets_graph_when_sync_fails():
+    """A failed tactic cannot strand a graph that owns profiling inputs."""
+    session = object.__new__(autotuner_module._GraphProfileSession)
+    session.stream = MagicMock()
+    session.stream.synchronize.side_effect = RuntimeError("asynchronous tactic failure")
+    graph = MagicMock()
+    session.graph = graph
+    session.graph_pool = object()
+    session._closed = False
+
+    with pytest.raises(RuntimeError, match="asynchronous tactic failure"):
+        session.close()
+
+    graph.reset.assert_called_once_with()
+    assert session.graph is None
+    assert session.graph_pool is None
+    assert session._closed is True
+    session.close()
+    graph.reset.assert_called_once_with()
 
 
 def test_value_aware_graph_session_uses_globaltimer(monkeypatch):
