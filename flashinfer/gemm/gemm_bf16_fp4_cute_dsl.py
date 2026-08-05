@@ -103,30 +103,19 @@ def _select_bf16_fp4_k_splits(
 
 # Residency window for the stream GEMV, in warps per SM: below the floor
 # the grid cannot hide DRAM latency, far above the ceiling extra splits just
-# multiply partial-workspace traffic.  Shared by the tactic filter and the
-# no-autotune fallback so the two paths agree on when the gemv applies.
+# multiply partial-workspace traffic.
 _GEMV_MIN_WARPS_PER_SM = 12
 _GEMV_MAX_WARPS_PER_SM = 96
 
 
-def _bf16_fp4_gemv_fill_split(n: int, k: int, sm_count: int) -> int:
-    """K-split sizing the gemv grid to just under one full wave of the
-    kernel's 6 resident CTAs/SM (1536-thread SM limit / 256).  A grid at
-    a full wave tips into a costly second wave, so the 0.95 target leaves
-    slack for stragglers and the PDL-overlapped tail of the previous
-    kernel."""
-    ctas = -(-(n // 64) // 8)
-    fill = int(0.95 * sm_count * 6 / ctas)
-    return max(1, min(fill, (k // 16) // 4))
-
-
 def _bf16_fp4_gemv_knee_split(n: int, k: int, sm_count: int) -> int:
-    """Smallest K-split reaching ~20 warps/SM, capped at the fill split.
-    Throughput saturates around that residency, and splitting deeper only
-    adds partial traffic (a penalty that scales with n)."""
-    return min(
-        -(-20 * sm_count // (n // 64)), _bf16_fp4_gemv_fill_split(n, k, sm_count)
-    )
+    """Smallest K-split reaching ~20 warps/SM: throughput saturates around
+    that residency, and splitting deeper only adds partial traffic.  Capped
+    just under one full wave of the kernel's 6 resident CTAs/SM
+    (1536-thread SM limit / 256) and at >= 4 K-tiles per split."""
+    ctas = -(-(n // 64) // 8)
+    cap = max(1, min(int(0.95 * sm_count * 6 / ctas), (k // 16) // 4))
+    return min(-(-20 * sm_count // (n // 64)), cap)
 
 
 def _select_bf16_fp4_gemv_split(
@@ -550,19 +539,14 @@ def _bf16_fp4_cute_dsl_tactic_configs(
         add(base_tile_m, base_atom, 1, 1, occ=3)
 
     # Streaming GEMV for m=1 decode (SMEM-free, no tensor cores; see
-    # GemvBf16Fp4Sm12x).  splits shards K across grid.y for grid fill;
-    # get_valid_tactics gates each split to a sane warps-per-SM window
-    # and to the m=1 bucket.
+    # GemvBf16Fp4Sm12x).  splits shards K across grid.y for grid fill.
     if n % 64 == 0:
         k_tiles16 = k // 16
         gemv_splits = [s for s in (1, 2, 4, 8, 16, 32) if s * 4 <= k_tiles16]
         if gemv_splits:
-            for s in (
-                _bf16_fp4_gemv_knee_split(n, k, sm_count),
-                _bf16_fp4_gemv_fill_split(n, k, sm_count),
-            ):
-                if s not in gemv_splits:
-                    gemv_splits.append(s)
+            knee = _bf16_fp4_gemv_knee_split(n, k, sm_count)
+            if knee not in gemv_splits:
+                gemv_splits.append(knee)
         for splits in gemv_splits:
             configs.append(((1, 64, 16), (0, 0, 0), 0, 0, 1, splits, 1, "gemv"))
 
