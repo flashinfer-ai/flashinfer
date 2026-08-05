@@ -117,6 +117,11 @@ from .flash_kda import (
 from .flash_kda import (
     load_flash_kda_m128_module as load_flash_kda_m128_module,
 )
+from .cake_msa import CAKE_MSA_VARIANTS as CAKE_MSA_VARIANTS
+from .cake_msa import gen_cake_msa_module as gen_cake_msa_module
+from .cake_msa import get_cake_msa_module as get_cake_msa_module
+from .cake_msa import get_cake_msa_uri as get_cake_msa_uri
+from .cake_msa import load_cake_msa_module as load_cake_msa_module
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )

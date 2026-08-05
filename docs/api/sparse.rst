@@ -29,7 +29,17 @@ Kernels for block sparse flashattention.
 flashinfer.msa_ops
 ==================
 
-Minimax Sparse Attention (MSA) APIs for SM120/SM121 (Blackwell).
+Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
+selection dispatch on compute capability 10.0/10.3 (SM100/SM103) and
+SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
+only. NVFP4 K/V and views split from a packed paged K/V cache are also
+SM120/SM121-only; the compute capability 10.0/10.3 attention backend requires
+separate contiguous K and V tensors and does not make implicit copies.
+
+CUDA graph capture of sparse prefill or decode on compute capability 10.0/10.3
+requires a caller-owned
+:class:`flashinfer.msa_ops.MSASparseAttentionWorkspace`. Warm the workspace
+eagerly with the exact tensors, options, and capture stream before capture.
 
 .. currentmodule:: flashinfer.msa_ops
 
@@ -38,6 +48,7 @@ Minimax Sparse Attention (MSA) APIs for SM120/SM121 (Blackwell).
 
     msa_proxy_score
     msa_proxy_score_fp4
+    MSASparseAttentionWorkspace
     msa_sparse_attention
     msa_sparse_decode_attention
     msa_topk_select

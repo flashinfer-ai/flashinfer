@@ -20,6 +20,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
+from ._cake_sm100 import cake_msa_topk_select, is_cake_msa_device
 
 
 _topk_compile_cache: dict = {}
@@ -85,7 +86,8 @@ def msa_topk_select(
     Implements the block-scoring pass of Minimax Sparse Attention: given the
     per-block maximum attention scores from a cheap proxy prefill, selects the
     ``topk`` most important KV blocks for each (query token, head) pair and
-    returns their sorted indices.
+    returns their sorted indices. Dispatch supports compute capability
+    10.0/10.3 and SM120/SM121.
 
     Parameters
     ----------
@@ -116,6 +118,15 @@ def msa_topk_select(
         Ascending KV-block indices; ``-1`` entries are tail-padded invalid
         slots.
     """
+    if is_cake_msa_device(max_score.device):
+        return cake_msa_topk_select(
+            max_score,
+            topk,
+            num_valid_pages=num_valid_pages,
+            output=output,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+        )
     if not is_sm12x_supported(max_score.device):
         raise RuntimeError(
             "msa_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"

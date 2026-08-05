@@ -1,5 +1,10 @@
-"""Minimax Sparse Attention (MSA) operations. SM120/SM121 (Blackwell) only."""
+"""Minimax Sparse Attention operations.
 
+Sparse prefill, sparse decode, and top-k selection support CC10 and SM12x
+Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
+"""
+
+from ._cake_sm100 import MSASparseAttentionWorkspace
 from .proxy_score import (
     msa_proxy_score,
     msa_proxy_score_fp4,
@@ -8,13 +13,16 @@ from .sparse_prefill import msa_sparse_attention
 from .sparse_decode import msa_sparse_decode_attention
 from .sparse_topk_select import msa_topk_select
 
-# Capability flag for callers (e.g. vLLM): the sparse attention ops accept K/V
-# views split from a paged cache that packs K and V in one 2*head_dim content
-# dim per token.
+# Capability flags for callers (e.g. vLLM). SM120/SM121 accept K/V views split
+# from a paged cache that packs K and V in one 2*head_dim content dim per token.
+# Compute capability 10.0/10.3 requires separate contiguous K/V tensors.
 SUPPORTS_PACKED_KV = True
+SUPPORTS_PACKED_KV_CC10 = False
 
 __all__ = [
+    "MSASparseAttentionWorkspace",
     "SUPPORTS_PACKED_KV",
+    "SUPPORTS_PACKED_KV_CC10",
     "msa_proxy_score",
     "msa_proxy_score_fp4",
     "msa_sparse_attention",
