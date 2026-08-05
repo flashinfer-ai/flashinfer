@@ -2147,12 +2147,16 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
                         Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
                         TensorView const& hidden_states_scale, TensorView const& gemm1_weights,
                         TensorView const& gemm1_per_channel_weight_scale,
+                        TensorView const& output1_scales_scalar,
+                        TensorView const& output1_scales_gate_scalar,
                         TensorView const& gemm2_weights,
                         TensorView const& gemm2_per_channel_weight_scale,
-                        TensorView const& expert_indices, TensorView const& expert_weights)
+                        TensorView const& output2_scales_scalar, TensorView const& expert_indices,
+                        TensorView const& expert_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
-                         Optional<TensorView>(), Optional<TensorView>(), Optional<TensorView>(),
-                         gemm2_weights, Optional<TensorView>(),
+                         Optional<TensorView>(), Optional<TensorView>(output1_scales_scalar),
+                         Optional<TensorView>(output1_scales_gate_scalar), gemm2_weights,
+                         Optional<TensorView>(output2_scales_scalar),
                          Optional<TensorView>(hidden_states_scale)),
         use_routing_scales_on_input(false),
         hidden_states_scale_(hidden_states_scale),
@@ -2282,6 +2286,30 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
         << "gemm1_per_channel_weight_scale dim 1 must be " << intermediate_size_factor
         << "*intermediate_size=" << gemm1_scale_dim1 << ".";
 
+    TVM_FFI_ICHECK(output1_scales_scalar.has_value());
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().dtype(), dl_float32)
+        << "output1_scales_scalar must be float32.";
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().ndim(), 1)
+        << "output1_scales_scalar must be 1D [local_num_experts].";
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().size(0), args->local_num_experts)
+        << "output1_scales_scalar dim 0 must match local_num_experts.";
+
+    TVM_FFI_ICHECK(output1_scales_gate_scalar.has_value());
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().dtype(), dl_float32)
+        << "output1_scales_gate_scalar must be float32.";
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().ndim(), 1)
+        << "output1_scales_gate_scalar must be 1D [local_num_experts].";
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().size(0), args->local_num_experts)
+        << "output1_scales_gate_scalar dim 0 must match local_num_experts.";
+
+    TVM_FFI_ICHECK(output2_scales_scalar.has_value());
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().dtype(), dl_float32)
+        << "output2_scales_scalar must be float32.";
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().ndim(), 1)
+        << "output2_scales_scalar must be 1D [local_num_experts].";
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().size(0), args->local_num_experts)
+        << "output2_scales_scalar dim 0 must match local_num_experts.";
+
     TVM_FFI_ICHECK_EQ(gemm2_per_channel_weight_scale_.dtype(), dl_float32)
         << "gemm2_per_channel_weight_scale must be float32.";
     TVM_FFI_ICHECK_EQ(gemm2_per_channel_weight_scale_.ndim(), 2)
@@ -2337,9 +2365,10 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     }
     args->output_scale = nullptr;
 
-    args->output1_scales_scalar = nullptr;
-    args->output1_scales_gate_scalar = nullptr;
-    args->output2_scales_scalar = nullptr;
+    args->output1_scales_scalar = static_cast<float*>(output1_scales_scalar.value().data_ptr());
+    args->output1_scales_gate_scalar =
+        static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
+    args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
 
     args->hidden_states_scale = const_cast<void*>(hidden_states_scale_.data_ptr());
     args->gemm1_per_channel_weight_scale =
@@ -3968,13 +3997,14 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
 Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView hidden_states_scale,
-    TensorView gemm1_weights, TensorView gemm1_per_channel_weight_scale, TensorView gemm2_weights,
-    TensorView gemm2_per_channel_weight_scale, TensorView output, int64_t num_experts,
-    int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
-    Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
-    int64_t activation_type, bool norm_topk_prob) {
+    TensorView gemm1_weights, TensorView gemm1_per_channel_weight_scale,
+    TensorView output1_scales_scalar, TensorView output1_scales_gate_scalar,
+    TensorView gemm2_weights, TensorView gemm2_per_channel_weight_scale,
+    TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
+    bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -4004,8 +4034,14 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
       << "FP8 per-channel MoE: gemm2_weights must be float8_e4m3fn.";
   TVM_FFI_ICHECK_EQ(gemm1_per_channel_weight_scale.dtype(), dl_float32)
       << "FP8 per-channel MoE: gemm1_per_channel_weight_scale must be float32.";
+  TVM_FFI_ICHECK_EQ(output1_scales_scalar.dtype(), dl_float32)
+      << "FP8 per-channel MoE: output1_scales_scalar must be float32.";
+  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.dtype(), dl_float32)
+      << "FP8 per-channel MoE: output1_scales_gate_scalar must be float32.";
   TVM_FFI_ICHECK_EQ(gemm2_per_channel_weight_scale.dtype(), dl_float32)
       << "FP8 per-channel MoE: gemm2_per_channel_weight_scale must be float32.";
+  TVM_FFI_ICHECK_EQ(output2_scales_scalar.dtype(), dl_float32)
+      << "FP8 per-channel MoE: output2_scales_scalar must be float32.";
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
@@ -4040,8 +4076,9 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
 
     auto launcher = std::make_unique<Fp8PerChannelLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_per_channel_weight_scale, gemm2_weights, gemm2_per_channel_weight_scale,
-        expert_indices, expert_weights);
+        gemm1_per_channel_weight_scale, output1_scales_scalar, output1_scales_gate_scalar,
+        gemm2_weights, gemm2_per_channel_weight_scale, output2_scales_scalar, expert_indices,
+        expert_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, use_routing_scales_on_input, activation, norm_topk_prob);
 

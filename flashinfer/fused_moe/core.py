@@ -421,23 +421,27 @@ _GATED_ACTIVATION_TYPES = (
 )
 
 
-def _combine_gemm1_per_channel_scales(
+def _prepare_gemm1_per_channel_scales(
     weight_scale: torch.Tensor,
     gate_weight_scale: torch.Tensor,
     activation_type: int,
-) -> torch.Tensor:
-    """Combine activation and gate per-channel scales into one interleaved tensor.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split row-wise dequantization from the scalar FC1 output scale.
 
-    After reorder_rows_for_gated_act_gemm the weight matrix interleaves activation rows at even
-    indices and gate rows at odd indices.  The kernel's single per-channel scale array must
-    therefore carry the activation-channel scale (which folds in c_global_sf) at even positions
-    and the gate-channel scale (dequant-only) at odd positions.
+    The MetaFP8 cubins apply the two FP32 row-scale operands before the activation, while
+    ``ScaleC`` applies the output quantization factor and ``ScaleGate``/``ScaleAct`` supplies any
+    remaining pre-activation factor.  The public API keeps the same scale tensors as the
+    per-tensor path: ``weight_scale`` carries ``c_global_sf`` and ``gate_weight_scale`` carries
+    weight dequantization.  Recover the scalar output factor here and pass neutral gate/activation
+    scales so the row-wise factors are applied exactly once.
     """
-    if ActivationType(activation_type) not in _GATED_ACTIVATION_TYPES:
-        return weight_scale
-    combined = weight_scale.clone()
-    combined[:, 1::2] = gate_weight_scale[:, 1::2]
-    return combined
+    if ActivationType(activation_type) in _GATED_ACTIVATION_TYPES:
+        output_scale = weight_scale[:, 0] / gate_weight_scale[:, 0]
+    else:
+        output_scale = weight_scale[:, 0]
+    output_scale = output_scale.contiguous()
+    gate_scale = torch.ones_like(output_scale)
+    return gate_weight_scale, output_scale, gate_scale
 
 
 def _maybe_get_cached_w3_w1_permute_indices(
@@ -2220,10 +2224,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     )
                 elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                     # FP8 per-token activation and per-channel weight scales.
-                    gemm1_scale = _combine_gemm1_per_channel_scales(
-                        kwargs["gemm1_per_channel_weight_scale"],
-                        kwargs["gemm1_per_channel_gate_weight_scale"],
-                        self.activation_type,
+                    gemm1_scale, output1_scale, output1_gate_scale = (
+                        _prepare_gemm1_per_channel_scales(
+                            kwargs["gemm1_per_channel_weight_scale"],
+                            kwargs["gemm1_per_channel_gate_weight_scale"],
+                            self.activation_type,
+                        )
                     )
                     moe_op.trtllm_fp8_per_channel_scale_moe(
                         routing_logits,
@@ -2234,8 +2240,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         hidden_states_scale,
                         kwargs["gemm1_weights"],
                         gemm1_scale,
+                        output1_scale,
+                        output1_gate_scale,
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_per_channel_weight_scale"],
+                        output1_gate_scale,
                         output,
                         kwargs["num_experts"],
                         self.top_k,
@@ -3549,10 +3558,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
-        gemm1_scale = _combine_gemm1_per_channel_scales(
-            gemm1_per_channel_weight_scale,
-            gemm1_per_channel_gate_weight_scale,
-            activation_type,
+        gemm1_scale, output1_scale, output1_gate_scale = (
+            _prepare_gemm1_per_channel_scales(
+                gemm1_per_channel_weight_scale,
+                gemm1_per_channel_gate_weight_scale,
+                activation_type,
+            )
         )
         intermediate_output = moe_op.trtllm_fp8_per_channel_scale_moe(
             routing_logits,
@@ -3563,8 +3574,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             hidden_states_scale,
             gemm1_weights,
             gemm1_scale,
+            output1_scale,
+            output1_gate_scale,
             gemm2_weights,
             gemm2_per_channel_weight_scale,
+            output1_gate_scale,
             output,
             num_experts,
             top_k,
@@ -5931,12 +5945,19 @@ def trtllm_fp8_per_channel_scale_moe(
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
-        hidden_states_scale: [seq_len, 1] FP32 per-token activation scales
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] FP8 first layer weights
-        gemm1_per_channel_weight_scale: [local_num_experts, 2*intermediate_size] per-channel scales for gemm1
-        gemm1_per_channel_gate_weight_scale: [local_num_experts, 2*intermediate_size] per-channel gate scales for gemm1
+        hidden_states_scale: [seq_len, 1] FP32 per-token dequantization multipliers
+        gemm1_weights: [num_experts, M, hidden_size] FP8 first layer weights,
+            where M is 2*intermediate_size for gated activations and
+            intermediate_size otherwise
+        gemm1_per_channel_weight_scale: [local_num_experts, M] per-channel
+            output scales for gemm1, in the same shuffled row order as gemm1_weights
+        gemm1_per_channel_gate_weight_scale: [local_num_experts, M] per-channel
+            weight dequantization multipliers for gemm1, in the same shuffled row
+            order as gemm1_weights
         gemm2_weights: [num_experts, hidden_size, intermediate_size] FP8 second layer weights
-        gemm2_per_channel_weight_scale: [local_num_experts, hidden_size] per-channel scales for gemm2
+        gemm2_per_channel_weight_scale: [local_num_experts, hidden_size]
+            per-channel dequantization multipliers for gemm2, in the same shuffled
+            row order as gemm2_weights
         num_experts: Total number of experts
         top_k: Number of experts to route to per token
         n_group: Number of expert groups
