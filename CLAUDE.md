@@ -1091,6 +1091,15 @@ users should normally leave the batch-size policy at its defaults.
 | `FLASHINFER_PACKED_KDA_L2POL` | `0` | Override the experimental L2 cache-policy selector. |
 | `FLASHINFER_PACKED_KDA_MINBLOCKS` | `0` | Override the generated kernel's minimum-blocks-per-SM launch-bound hint. |
 
+## Sampling boundary order
+
+Sampling, top-k renormalization/masking, and top-p renormalization use descending
+value and ascending original token index. Keep exactly k positions for top-k and
+the shortest prefix reaching top-p. See `docs/api/sampling.rst` and
+`tests/utils/test_sampling_tie_break.py`. Preserve this order through top-k-first
+selection, including ties created by normalization inside the gathered top-p boundary. The rejection loop
+may terminate only after accepting a token or resolving the final boundary set.
+
 ## Development Workflow
 
 ### Typical Development Loop

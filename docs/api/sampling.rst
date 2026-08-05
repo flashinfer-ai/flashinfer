@@ -16,6 +16,15 @@ Kernels for LLM sampling.
    The output row index still feeds the Philox subsequence. Per-row seeds do not
    make sampling invariant to batch position, even with the same seed and offset.
 
+Top-k and top-p rank tokens by probability (or logit) descending, then by
+original token index ascending. Top-k keeps exactly ``min(k, vocab_size)``
+positions. Top-p keeps the shortest prefix whose mass reaches its threshold,
+including the token that crosses it. Boundary ties keep only the required
+prefix, so they can change results previously produced by tie-inclusive filters.
+The convention applies to sampling, renormalization, masking, and both
+``filter_apply_order`` paths, independently of ``deterministic``. The two filter
+orders retain their existing intermediate normalization semantics.
+
 .. seealso::
 
   For efficient Top-K selection (without sampling), see :ref:`apitopk` which provides
