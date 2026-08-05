@@ -4,12 +4,18 @@ from ..trace.templates.gemm import (
     mm_M1_16_K7168_N256_trace,
     tinygemm_bf16_trace,
 )
-from flashinfer.jit import gen_dsv3_router_gemm_module, gen_tinygemm2_module
+from flashinfer.jit import (
+    gen_dsv3_router_gemm_module,
+    gen_tinygemm2_module,
+    gen_tinygemm2_sm100_module,
+)
 import functools
+import os
 from types import SimpleNamespace
 from typing import Optional
 import torch
 from flashinfer.utils import (
+    is_sm100a_supported,
     register_custom_op,
     supported_compute_capability,
     backend_requirement,
@@ -400,6 +406,68 @@ def get_tinygemm2_module():
     )
 
 
+# tinygemm2_sm100: generated SM100/SM103 variants of the same kernel. Loom
+# schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
+# selected automatically for the bias path on B200/B300-class devices.
+_TINYGEMM2_SM100_TILE_M = 16
+_TINYGEMM2_SM100_TILE_N = 8
+_TINYGEMM2_SM100_K_PER_LOOP = 1024
+
+
+@functools.cache
+def _tinygemm2_sm100_num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _tinygemm2_sm100_use_stage4(
+    batch_size: int, output_features: int, input_features: int, num_sms: int
+) -> bool:
+    """Select the shallow pipeline ring from measured B200 crossover axes."""
+    tiles_m = (output_features + _TINYGEMM2_SM100_TILE_M - 1) // _TINYGEMM2_SM100_TILE_M
+    tiles_n = (batch_size + _TINYGEMM2_SM100_TILE_N - 1) // _TINYGEMM2_SM100_TILE_N
+    total_ctas = tiles_m * tiles_n
+    return input_features <= _TINYGEMM2_SM100_K_PER_LOOP or total_ctas > 2 * num_sms
+
+
+@functools.cache
+def get_tinygemm2_sm100_module():
+    module = gen_tinygemm2_sm100_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::tinygemm2_sm100_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_sm100_op_impl(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        use_pdl: bool = False,
+    ) -> None:
+        device_index = input.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        stage4 = _tinygemm2_sm100_use_stage4(
+            input.shape[0],
+            weight.shape[0],
+            input.shape[1],
+            _tinygemm2_sm100_num_sms(device_index),
+        )
+        if use_pdl:
+            op = module.stage4_pdl_op if stage4 else module.stage8_pdl_op
+        else:
+            op = module.stage4_op if stage4 else module.stage8_op
+        op(input, weight, bias, out)
+
+    return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
+
+
+def _use_tinygemm2_sm100(device: torch.device) -> bool:
+    if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
+        return False
+    return is_sm100a_supported(device)
+
+
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
 @flashinfer_api(trace=tinygemm_bf16_trace)
 def tinygemm_bf16(
@@ -446,8 +514,18 @@ def tinygemm_bf16(
     -----
     Requires SM90+ (Hopper or newer).  Raises ``ValueError`` if tensor
     dimensions, dtypes, or alignment constraints are violated.
+
+    On SM100/SM103 (B200/B300 class) devices the bias path dispatches to
+    ``tinygemm2_sm100`` — generated variants of the same kernel with
+    bit-identical outputs and lower latency (see
+    ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
+    to force the reference implementation everywhere.
     """
     if bias is None:
         get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)
+    elif _use_tinygemm2_sm100(input.device):
+        get_tinygemm2_sm100_module().tinygemm2_sm100_op(
+            input, weight, bias, out, use_pdl
+        )
     else:
         get_tinygemm2_module().tinygemm2_op(input, weight, bias, out, use_pdl)

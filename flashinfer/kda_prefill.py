@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
-_FLASH_KDA_BETA_TMA_MIN_HEADS = 8
+_FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
@@ -381,7 +381,11 @@ def _beta_tma_source(
     total_tokens = batch_size * seq_len
     beta_flat = beta.reshape(total_tokens, num_heads)
     padded_tokens = max(total_tokens, 32)
-    padded_heads = max(num_heads, _FLASH_KDA_BETA_TMA_MIN_HEADS)
+    padded_heads = (
+        (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
+        // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+    )
     if padded_tokens == total_tokens and padded_heads == num_heads:
         return beta_flat
     shape = (padded_tokens, padded_heads)
