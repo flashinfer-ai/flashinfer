@@ -1263,7 +1263,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     remapped_sparse_indices_buffer : Optional[torch.Tensor]
         Optional INT32 output buffer matching ``sparse_indices``. TRTLLM-GEN
         uses it when either KV pool has a strided page layout. Passing a stable
-        buffer avoids an allocation in serving and CUDA graph paths.
+        buffer avoids an allocation in serving and CUDA graph paths. Concurrent
+        calls must use distinct buffers.
     sparse_indices_are_storage_offsets : Optional[bool]
         Encoding of ``sparse_indices`` for strided TRTLLM-GEN KV pools. Set to
         ``False`` for logical flattened token indices or ``True`` for indices
