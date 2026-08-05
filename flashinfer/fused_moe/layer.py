@@ -120,11 +120,6 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            # Runners that have not migrated module loading to build() may
-            # still perform it in __init__. Keep this cheap common filter
-            # before construction during the incremental migration.
-            if config.quant.variant not in runner_cls.supported_quant_variants:
-                continue
             runner = runner_cls(config, device=self.device)
             try:
                 runner.check_support()

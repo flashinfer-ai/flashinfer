@@ -256,25 +256,6 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
         runner.check_support()
 
 
-def test_moe_layer_rejects_quant_before_runner_construction(monkeypatch):
-    from flashinfer.fused_moe import layer as layer_module
-
-    class MustNotConstructRunner:
-        supported_quant_variants = (QuantVariant.BF16,)
-
-        def __init__(self, config, device):
-            raise AssertionError("incompatible runner was constructed")
-
-    monkeypatch.setattr(layer_module, "get_compute_capability", lambda device: (9, 0))
-    monkeypatch.setitem(
-        layer_module._BACKEND_RUNNERS, CutlassBf16Config, MustNotConstructRunner
-    )
-    config = _config(quant=QuantConfig(variant=QuantVariant.NVFP4))
-
-    with pytest.raises(RuntimeError, match="none of the configured backends"):
-        MoELayer(config, device=torch.device("cuda"))
-
-
 def test_moe_layer_checks_support_before_build(monkeypatch):
     from flashinfer.fused_moe import layer as layer_module
 
@@ -306,6 +287,7 @@ def test_moe_layer_checks_support_before_build(monkeypatch):
 @pytest.mark.parametrize(
     "config",
     (
+        _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
         _config(activation=ActivationConfig(ActivationType.Relu2)),
         _config(execution=ExecutionConfig(do_finalize=False)),
         _config(
