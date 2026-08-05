@@ -1982,6 +1982,22 @@ class FP8PerChannelMoe(Moe):
                 gemm1_per_channel_scales_reordered.append(reordered)
             gemm1_per_channel_scales = torch.stack(gemm1_per_channel_scales_reordered)
 
+        # The MetaFP8 row scales index the physically shuffled weight rows.
+        # Apply the same permutation used by shuffle_matrix_a so each scale
+        # remains paired with its output channel.
+        gemm1_per_channel_scales = torch.stack(
+            [
+                shuffle_matrix_a(scale.unsqueeze(-1), epilogue_tile_m).squeeze(-1)
+                for scale in gemm1_per_channel_scales
+            ]
+        )
+        gemm2_per_channel_scales = torch.stack(
+            [
+                shuffle_matrix_a(scale.unsqueeze(-1), epilogue_tile_m).squeeze(-1)
+                for scale in gemm2_per_channel_scales
+            ]
+        )
+
         if is_gated_activation(args.activation_type):
             scale_c_fc1 = args_dequant.c_global_sf / gemm1_per_channel_scales
         else:
@@ -2834,10 +2850,10 @@ def quant_fp8_per_tensor(a, a_global_sf):
 
 
 def quant_fp8_per_token(a):
-    """FP8 dynamic per-token quantization."""
+    """FP8 dynamic per-token quantization returning the dequant multiplier."""
     max_abs = a.float().abs().nan_to_num().amax(dim=-1, keepdim=True)
-    per_token_scales = 448.0 / max_abs.clamp(min=1e-12)
-    a_fp8 = (a.float() * per_token_scales).to(torch.float8_e4m3fn)
+    per_token_scales = max_abs.clamp(min=1e-12) / 448.0
+    a_fp8 = (a.float() / per_token_scales).to(torch.float8_e4m3fn)
     return a_fp8, per_token_scales
 
 
@@ -3411,7 +3427,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
 def run_moe_reference_per_channel_scale_fp8(args):
     """Reference for FP8 per-token activations and per-channel weights."""
     hidden_states_dequant = (
-        args.hidden_states.to(torch.float) / args.hidden_states_scale
+        args.hidden_states.to(torch.float) * args.hidden_states_scale
     )
 
     gemm1_weights_dequant = {}
