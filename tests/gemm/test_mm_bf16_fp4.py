@@ -305,7 +305,9 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     for tactic, cfg in enumerate(
         _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
     ):
-        if cfg[7] == "gemv" and m != 1:
+        if cfg[7] == "gemv" and (
+            m != 1 or get_compute_capability(device)[0] != 12
+        ):
             continue
         outs = []
         for _ in range(2):
@@ -344,6 +346,8 @@ def test_cute_dsl_gemv_fp16_out():
         torch.float16
     )
 
+    if get_compute_capability(device)[0] != 12:
+        pytest.skip("the stream GEMV is offered on SM12x only")
     runner = _cute_dsl_bf16_fp4_runner(enable_pdl=True)
     sf_u8 = sf_p.view(torch.uint8).contiguous()
     alpha_l = _prepare_bf16_fp4_alpha(alpha_p, device)
