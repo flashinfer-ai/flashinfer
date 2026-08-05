@@ -238,8 +238,6 @@ class SmemAResource(MemoryResource):
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
         """Build the A descriptor at the stage reported ready by the proxy."""
-        if cutlass.const_expr(self.cfg.num_stages_a != self.cfg.num_stages_b):
-            pipeline_stage_idx = pipeline_stage_idx % self.cfg.num_stages_a
         return self._build_mma_desc_a_impl(pipeline_stage_idx)
 
     @cute.jit
@@ -452,8 +450,6 @@ class SmemBResource(MemoryResource):
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
         """Build the B descriptor at the stage reported ready by the proxy."""
-        if cutlass.const_expr(self.cfg.num_stages_a != self.cfg.num_stages_b):
-            pipeline_stage_idx = pipeline_stage_idx % self.cfg.num_stages_b
         return self._build_mma_desc_b_impl(pipeline_stage_idx)
 
     @cute.jit
@@ -721,8 +717,6 @@ class SmemGatherResource(MemoryResource):
     def build_mma_desc_a_at_stage(
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
-        if cutlass.const_expr(self.cfg.num_stages_a != self.cfg.num_stages_b):
-            pipeline_stage_idx = pipeline_stage_idx % self.cfg.num_stages_a
         desc, stage_ptr = self._build_mma_desc_impl(pipeline_stage_idx)
         return desc, stage_ptr
 
@@ -737,8 +731,6 @@ class SmemGatherResource(MemoryResource):
     def build_mma_desc_b_at_stage(
         self, stage_info: StageInfo, *, pipeline_stage_idx
     ) -> tuple[Int64, Int64]:
-        if cutlass.const_expr(self.cfg.num_stages_a != self.cfg.num_stages_b):
-            pipeline_stage_idx = pipeline_stage_idx % self.cfg.num_stages_b
         desc, stage_ptr = self._build_mma_desc_impl(pipeline_stage_idx)
         return desc, stage_ptr
 

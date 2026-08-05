@@ -20,7 +20,6 @@ Entry points:
   - gemm()                            — host-side launcher (creates TMA descs, compiles, launches)
 """
 
-import math
 import os
 
 import cutlass
@@ -427,13 +426,9 @@ def _make_pipeline_configs(cfg):
 
     # 2-CTA + gather: proxy barrier for cross-CTA sync
     if cfg.has_gather and cfg.has_cluster:
-        # The proxy stage is later projected onto both independent operand
-        # rings.  Keep enough phase information to recover either operand's
-        # stage even when their pipeline depths differ.  ``max(a, b)`` loses
-        # that information after the smaller ring wraps; ``lcm(a, b)`` is the
-        # smallest ring whose stage can be reduced modulo both depths.
         proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
-            num_stages=math.lcm(cfg.num_stages_a, cfg.num_stages_b),
+            # validate_config() requires equal A/B depths for this path.
+            num_stages=cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * cfg.cluster_m,  # SyncTask warp × CTAs
