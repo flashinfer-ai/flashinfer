@@ -71,11 +71,18 @@ deep_gemm 2.5.0+891d57b). The vLLM e2e sections below keep their own separate
 **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for the vLLM engine
 env, not for running the moe_ep test suite.
 
-Known tolerance note (dsl-version-independent): on B200 nodes,
-`test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` fails by one
-bf16 cell (rank 3, |d|=16.0 vs atol=8.0, rel_l2≈0.0017) — the fixed atol was
-calibrated on GB200 (last-passed 2026-07-31); the scale-aware ikr variant of
-the same test passes. Treat as tolerance marginality, not a regression.
+Tolerance note (dsl-version-independent, resolved 2026-08-05): on B200 nodes
+`test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` used to fail by
+one bf16 cell (rank 3, |d|=16.0 vs atol=8.0, rel_l2≈0.0017) — the flat atol
+was really "1 bf16 ULP at |term|≈2048" calibrated on GB200's rounding, and
+where large per-topk terms nearly cancel the achievable agreement is bounded
+by the bf16 round-off of the TERMS, not of the final value. The mxfp8 oracle
+compares (multirank + single-GPU) now use a per-cell term-magnitude band
+derived from the oracle's own pre-reduce terms
+(`_assert_mega_oracle_term_band_close` in
+`tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py`), which is
+arch-independent. GB200 verified 2026-08-05; if a B200 run still trips the
+band, that is a real signal, not marginality.
 
 ### Run tests
 

@@ -487,7 +487,9 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (staged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -499,7 +501,9 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (prestaged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (prestaged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -561,7 +565,9 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
             "load_balance_mode": "atomic_counter",
         },
     )
-    print(f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (large tokens) matches reference")
+    print(
+        f"rank {rank}: sm100_mxfp8_mxfp8_bf16_cutedsl mega layer (large tokens) matches reference"
+    )
 
 
 def _all_gather_stack(t):
@@ -627,7 +633,10 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         mxfp8_mega_moe,
     )
 
-    from .test_mxfp8_cutedsl_preprocess_vs_reference import _plain_mxfp8_from_bf16
+    from .test_mxfp8_cutedsl_preprocess_vs_reference import (
+        _assert_mega_oracle_term_band_close,
+        _plain_mxfp8_from_bf16,
+    )
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
@@ -732,28 +741,17 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             f"max|d|={(yk - y_ref).abs().max().item():.4g} "
             f"amax(ref)={y_ref.abs().max().item():.4g}"
         )
-        # Single-GPU oracle tolerances: random unscaled bf16 weights yield
-        # |y|~1e2–1e3; kernel vs torch ref can differ by ~1 bf16 ULP (|d|≈8)
-        # on a handful of cells.
-        if in_kernel_fc2_reduce:
-            # The REDG reduce accumulates the K per-topk bf16 terms in
-            # nondeterministic order vs the reference's fp32 sum; widen the
-            # band by the bf16 K-term accumulation band per row (same bound
-            # as _assert_ikr_close).
-            diff = (yk - y_ref).abs()
-            row_scale = torch.maximum(yk.abs(), y_ref.abs()).amax(dim=1, keepdim=True)
-            tol = (
-                8.0 + 0.05 * y_ref.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
-            )
-            worst = (diff - tol).max().item()
-            assert worst <= 0.0, (
-                f"ikr oracle output outside the widened band "
-                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
-            )
-            assert rel_l2.item() < 0.03
-        else:
-            torch.testing.assert_close(yk, y_ref, atol=8.0, rtol=0.05)
-            assert rel_l2.item() < 0.02
+        # Per-cell bf16 term-magnitude band (see
+        # _assert_mega_oracle_term_band_close): the old flat atol=8.0 was
+        # "1 bf16 ULP at |term|~2048" calibrated on GB200's rounding and
+        # tripped by one cell on B200; the band derives the bound from the
+        # oracle's own per-topk terms instead. The ikr coefficient absorbs
+        # the REDG nondeterministic reduce order (same bound as
+        # _assert_ikr_close).
+        _assert_mega_oracle_term_band_close(
+            yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
+        )
+        assert rel_l2.item() < (0.03 if in_kernel_fc2_reduce else 0.02)
         return rank
     finally:
         finalize_moe_ep_runtime(runtime)
