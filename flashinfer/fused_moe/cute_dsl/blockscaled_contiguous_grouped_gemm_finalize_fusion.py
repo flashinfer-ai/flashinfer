@@ -190,6 +190,9 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    direct_output: bool = False,
+    output_rows_per_owner: int = 1,
+    output_physical_rows_per_owner: int = 1,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -212,6 +215,9 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        direct_output,
+        output_rows_per_owner,
+        output_physical_rows_per_owner,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -224,6 +230,9 @@ def _get_compiled_finalize_kernel(
             enable_pdl=enable_pdl,
             use_a_per_token_scale=use_a_per_token_scale,
             use_fused_finalize=use_fused_finalize,
+            direct_output=direct_output,
+            output_rows_per_owner=output_rows_per_owner,
+            output_physical_rows_per_owner=output_physical_rows_per_owner,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -289,6 +298,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    direct_output: bool = False,
+    output_rows_per_owner: int = 1,
+    output_physical_rows_per_owner: int = 1,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -438,10 +450,23 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             f"mma_tiler_mn={mma_tiler_mn}, cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
+    if direct_output and not use_fused_finalize:
+        raise ValueError("Direct output requires fused routing-weight finalization")
+    if direct_output and (
+        output_rows_per_owner <= 0
+        or output_physical_rows_per_owner < output_rows_per_owner
+    ):
+        raise ValueError(
+            "Direct output requires a positive logical owner extent and a "
+            "physical owner stride at least as large as that extent"
+        )
+
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
+        if direct_output:
+            raise ValueError("Direct output requires a pre-allocated output buffer")
         allocator = torch.zeros if use_fused_finalize else torch.empty
         out = allocator(
             (output_rows, n),
@@ -452,6 +477,23 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         raise ValueError(
             f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
         )
+    if direct_output:
+        last_expanded_row = seq_len * topk - 1
+        required_rows = 0
+        if last_expanded_row >= 0:
+            last_owner = last_expanded_row // output_rows_per_owner
+            last_owner_row = last_expanded_row % output_rows_per_owner
+            required_rows = (
+                last_owner * output_physical_rows_per_owner + last_owner_row + 1
+            )
+        available_elements = (
+            out.untyped_storage().nbytes() // out.element_size() - out.storage_offset()
+        )
+        if required_rows * n > available_elements:
+            raise ValueError(
+                "Direct output backing storage is smaller than its physical "
+                "owner-row extent"
+            )
 
     # Get SM count
     if sm_count is None:
@@ -549,6 +591,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        direct_output=direct_output,
+        output_rows_per_owner=output_rows_per_owner,
+        output_physical_rows_per_owner=output_physical_rows_per_owner,
     )
 
     # Execute kernel with runtime parameters

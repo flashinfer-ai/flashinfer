@@ -1152,6 +1152,128 @@ class TestCuteDslFusedMoeFunctional:
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
 
+    def test_direct_owner_output(self):
+        """Direct output preserves expanded rows and physical owner gaps."""
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            CuteDslFusedMoENvfp4Runner,
+        )
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+        num_owners = 2
+        output_rows_per_owner = num_tokens * top_k // num_owners
+        output_physical_rows_per_owner = output_rows_per_owner + 32
+
+        runner = CuteDslFusedMoENvfp4Runner(
+            forward_impl=lambda **_: None,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            direct_output=True,
+            output_rows_per_owner=output_rows_per_owner,
+            output_physical_rows_per_owner=output_physical_rows_per_owner,
+        )
+        tensor_initializers = runner.tuning_config.dynamic_tensor_specs[
+            0
+        ].tensor_initializers
+        assert tensor_initializers is not None
+        output_initializer = tensor_initializers[-1]
+        tuning_output = output_initializer(
+            (num_tokens, hidden_size),
+            torch.bfloat16,
+            torch.device("cuda"),
+        )
+        required_tuning_rows = output_physical_rows_per_owner + output_rows_per_owner
+        assert tuning_output.shape == (num_tokens, hidden_size)
+        assert (
+            tuning_output.untyped_storage().nbytes()
+            == required_tuning_rows * hidden_size * tuning_output.element_size()
+        )
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        kwargs = {
+            "x": tensors["x"],
+            "x_sf": tensors["x_sf"],
+            "token_selected_experts": tensors["token_selected_experts"],
+            "token_final_scales": tensors["token_final_scales"],
+            "w1_weight": tensors["w1_weight"],
+            "w1_weight_sf": tensors["w1_weight_sf"],
+            "w1_alpha": tensors["w1_alpha"],
+            "fc2_input_scale": tensors["fc2_input_scale"],
+            "w2_weight": tensors["w2_weight"],
+            "w2_weight_sf": tensors["w2_weight_sf"],
+            "w2_alpha": tensors["w2_alpha"],
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "num_local_experts": num_experts,
+        }
+
+        reduced_output = cute_dsl_fused_moe_nvfp4(**kwargs)
+        physical_output = torch.full(
+            (num_owners * output_physical_rows_per_owner, hidden_size),
+            torch.nan,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        logical_output = torch.as_strided(
+            physical_output,
+            size=(num_tokens, hidden_size),
+            stride=(hidden_size, 1),
+        )
+        cute_dsl_fused_moe_nvfp4(
+            **kwargs,
+            moe_output=logical_output,
+            direct_output=True,
+            output_rows_per_owner=output_rows_per_owner,
+            output_physical_rows_per_owner=output_physical_rows_per_owner,
+        )
+
+        expanded_rows = torch.arange(num_tokens * top_k, device="cuda")
+        owners = expanded_rows // output_rows_per_owner
+        owner_rows = expanded_rows % output_rows_per_owner
+        physical_rows = owners * output_physical_rows_per_owner + owner_rows
+        direct_output = (
+            physical_output[physical_rows]
+            .view(num_tokens, top_k, hidden_size)
+            .float()
+            .sum(dim=1)
+            .to(torch.bfloat16)
+        )
+
+        passed, percent_within, atol = check_accuracy(
+            direct_output,
+            reduced_output,
+        )
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+        for owner in range(num_owners):
+            gap_start = owner * output_physical_rows_per_owner + output_rows_per_owner
+            gap_end = (owner + 1) * output_physical_rows_per_owner
+            assert torch.isnan(physical_output[gap_start:gap_end]).all()
+
+        with pytest.raises(ValueError, match="pre-allocated"):
+            cute_dsl_fused_moe_nvfp4(
+                **kwargs,
+                direct_output=True,
+            )
+        with pytest.raises(ValueError, match="backing storage"):
+            cute_dsl_fused_moe_nvfp4(
+                **kwargs,
+                moe_output=torch.empty_like(reduced_output),
+                direct_output=True,
+                output_rows_per_owner=output_rows_per_owner,
+                output_physical_rows_per_owner=output_physical_rows_per_owner,
+            )
+
     def test_swiglu_oai_accuracy(self):
         """Accuracy test for the OAI SwiGLU epilogue variant."""
         from flashinfer import cute_dsl_fused_moe_nvfp4

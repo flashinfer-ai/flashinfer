@@ -265,6 +265,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        direct_output: Whether GEMM2 stores weighted expanded rows without
+            reducing them into token rows.
+        output_rows_per_owner: Logical expanded rows reserved for each owner.
+        output_physical_rows_per_owner: Physical row stride between owners.
     """
 
     def __init__(
@@ -282,8 +286,19 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         use_per_token_activation: bool = False,
+        direct_output: bool = False,
+        output_rows_per_owner: int = 1,
+        output_physical_rows_per_owner: int = 1,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        if direct_output and (
+            output_rows_per_owner <= 0
+            or output_physical_rows_per_owner < output_rows_per_owner
+        ):
+            raise ValueError(
+                "Direct output requires a positive logical owner extent and a "
+                "physical owner stride at least as large as that extent"
+            )
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -298,6 +313,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
         self.use_per_token_activation = use_per_token_activation
+        self.direct_output = direct_output
+        self.output_rows_per_owner = output_rows_per_owner
+        self.output_physical_rows_per_owner = output_physical_rows_per_owner
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -310,6 +328,32 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
         # Instance-level so dummy expert IDs span all local experts
         # (randint(0, num_experts)) for realistic profiling.
+        def output_initializer(shapes, dtype, device):
+            if not self.direct_output:
+                return torch.empty(shapes, dtype=dtype, device=device)
+            num_tokens, hidden_size = shapes
+            logical_rows = num_tokens * self.top_k
+            last_expanded_row = logical_rows - 1
+            required_rows = 0
+            if last_expanded_row >= 0:
+                last_owner = last_expanded_row // self.output_rows_per_owner
+                last_owner_row = last_expanded_row % self.output_rows_per_owner
+                required_rows = (
+                    last_owner * self.output_physical_rows_per_owner
+                    + last_owner_row
+                    + 1
+                )
+            storage = torch.empty(
+                (required_rows, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+            return torch.as_strided(
+                storage,
+                size=shapes,
+                stride=(hidden_size, 1),
+            )
+
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -375,9 +419,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                             if use_per_token_activation
                             else []
                         ),
-                        lambda shapes, dtype, device: torch.empty(
-                            shapes, dtype=dtype, device=device
-                        ),
+                        output_initializer,
                     ],
                 ),
             ),
@@ -403,6 +445,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_beta,
                 self.swiglu_limit,
                 self.use_per_token_activation,
+                self.direct_output,
+                self.output_rows_per_owner,
+                self.output_physical_rows_per_owner,
             )
         )
 
@@ -412,6 +457,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.direct_output,
+            self.output_rows_per_owner,
+            self.output_physical_rows_per_owner,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -600,6 +648,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         else:
             per_token_scale = None
             moe_output = optional_inputs[0] if optional_inputs else None
+
+        kwargs.setdefault("direct_output", self.direct_output)
+        kwargs.setdefault("output_rows_per_owner", self.output_rows_per_owner)
+        kwargs.setdefault(
+            "output_physical_rows_per_owner",
+            self.output_physical_rows_per_owner,
+        )
 
         # Call the implementation with tactic parameters
         return self.forward_impl(

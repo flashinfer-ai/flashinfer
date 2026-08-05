@@ -174,6 +174,9 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    direct_output: bool = False,
+    output_rows_per_owner: int = 1,
+    output_physical_rows_per_owner: int = 1,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -223,6 +226,10 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
+        direct_output: Store weighted expanded token/top-k rows in the
+            caller-provided output instead of reducing them into token rows.
+        output_rows_per_owner: Logical expanded rows reserved for each owner.
+        output_physical_rows_per_owner: Physical row stride between owners.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -232,6 +239,14 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
+
+    if direct_output:
+        if not use_fused_finalize:
+            raise ValueError("Direct output requires fused routing-weight finalization")
+        if moe_output is None:
+            raise ValueError("Direct output requires a pre-allocated output buffer")
+        if moe_output.stride() != (hidden_size, 1):
+            raise ValueError("Direct output requires a contiguous row-major view")
 
     if moe_output is None:
         moe_output = torch.empty(
@@ -246,7 +261,7 @@ def _moe_core_impl(
         )
 
     # Fused finalize overlaps output zeroing with GEMM1.
-    if use_async_memset and use_fused_finalize:
+    if use_async_memset and use_fused_finalize and not direct_output:
         if aux_stream is None or main_event is None or memset_event is None:
             resources = _get_cuda_graph_resources()
             aux_stream = aux_stream or resources["aux_stream"]
@@ -273,7 +288,7 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    if use_async_memset and use_fused_finalize:
+    if use_async_memset and use_fused_finalize and not direct_output:
         main_event.record()
         moe_output.record_stream(aux_stream)
 
@@ -337,7 +352,9 @@ def _moe_core_impl(
 
     # Atomic finalize requires a zeroed token output. Deterministic finalize
     # writes each route to a unique expanded row.
-    if use_fused_finalize:
+    if direct_output:
+        gemm2_output = moe_output
+    elif use_fused_finalize:
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
@@ -372,6 +389,9 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        direct_output=direct_output,
+        output_rows_per_owner=output_rows_per_owner,
+        output_physical_rows_per_owner=output_physical_rows_per_owner,
     )
 
     # Step 4: Deterministic routing-weight reduction
@@ -807,6 +827,9 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    direct_output: bool = False,
+    output_rows_per_owner: int = 1,
+    output_physical_rows_per_owner: int = 1,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -841,6 +864,9 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        direct_output=direct_output,
+        output_rows_per_owner=output_rows_per_owner,
+        output_physical_rows_per_owner=output_physical_rows_per_owner,
     )
 
 
@@ -873,6 +899,9 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     *,
     per_token_scale: Optional[torch.Tensor] = None,
+    direct_output: bool = False,
+    output_rows_per_owner: int = 1,
+    output_physical_rows_per_owner: int = 1,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -938,6 +967,13 @@ def cute_dsl_fused_moe_nvfp4(
     per_token_scale : Optional[torch.Tensor]
         Per-token input row scale for GEMM1. Passing this enables the
         per-token activation path.
+    direct_output : bool
+        Store weighted expanded token/top-k rows in ``moe_output`` without
+        reducing them into token rows.
+    output_rows_per_owner : int
+        Logical expanded rows reserved for each output owner.
+    output_physical_rows_per_owner : int
+        Physical row stride between output owners.
 
     Returns
     -------
@@ -954,6 +990,17 @@ def cute_dsl_fused_moe_nvfp4(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
+    if direct_output:
+        if moe_output is None:
+            raise ValueError("Direct output requires a pre-allocated output buffer")
+        if (
+            output_rows_per_owner <= 0
+            or output_physical_rows_per_owner < output_rows_per_owner
+        ):
+            raise ValueError(
+                "Direct output requires a positive logical owner extent and a "
+                "physical owner stride at least as large as that extent"
+            )
     if moe_output is None:
         moe_output = torch.empty(
             (num_tokens, hidden_size),
@@ -977,6 +1024,9 @@ def cute_dsl_fused_moe_nvfp4(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         use_per_token_activation=use_per_token_activation,
+        direct_output=direct_output,
+        output_rows_per_owner=output_rows_per_owner,
+        output_physical_rows_per_owner=output_physical_rows_per_owner,
     )
 
     inputs = [

@@ -364,6 +364,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        direct_output: bool = False,
+        output_rows_per_owner: int = 1,
+        output_physical_rows_per_owner: int = 1,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -387,6 +390,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.direct_output = direct_output
+        self.output_rows_per_owner = output_rows_per_owner
+        self.output_physical_rows_per_owner = output_physical_rows_per_owner
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -1967,7 +1973,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     gather_tok = token_idx * is_valid_row
                     token_scale = token_final_scales[(gather_tok, topk_idx)]
                     output_idx = token_idx
-                    if cutlass.const_expr(not self.use_fused_finalize):
+                    if cutlass.const_expr(self.direct_output):
+                        output_owner = safe_idx // self.output_rows_per_owner
+                        output_local_row = (
+                            safe_idx - output_owner * self.output_rows_per_owner
+                        )
+                        output_idx = (
+                            output_owner * self.output_physical_rows_per_owner
+                            + output_local_row
+                        )
+                    elif cutlass.const_expr(not self.use_fused_finalize):
                         token_scale = self.final_scale_dtype(1.0)
                         output_idx = safe_idx
                     if cutlass.const_expr(self.use_a_per_token_scale):
@@ -2160,7 +2175,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     scatter_out_offset = cute.domain_offset(
                         (reduce_token_idx, coord_n, 0), out
                     )
-                    if cutlass.const_expr(not self.use_fused_finalize):
+                    if cutlass.const_expr(
+                        self.direct_output or not self.use_fused_finalize
+                    ):
                         blk_copy(
                             scatter_out_offset,
                             sC[reduce_row, None, 0],
@@ -2807,7 +2824,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             ),
         )
         output_rows = num_tokens
-        if cutlass.const_expr(not self.use_fused_finalize):
+        if cutlass.const_expr(self.direct_output):
+            logical_rows = num_tokens * top_k
+            owners = (
+                logical_rows + self.output_rows_per_owner - 1
+            ) // self.output_rows_per_owner
+            output_rows = (
+                (owners - 1) * self.output_physical_rows_per_owner
+                + logical_rows
+                - (owners - 1) * self.output_rows_per_owner
+            )
+        elif cutlass.const_expr(not self.use_fused_finalize):
             output_rows = num_tokens * top_k
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((output_rows, n, 1), order=(1, 0, 2))
