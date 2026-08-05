@@ -271,9 +271,10 @@ class BatchedGemmConfig:
     metadata_tile_n: int = 0
     """Token width represented by one external MoE metadata entry.
 
-    ``0`` means :attr:`tile_n`.  A larger value lets a smaller FC1 compute
-    tile consume routing metadata shared with a wider FC2 tile without
-    materializing duplicated ``tile_idx`` and ``mn_limit`` tensors.
+    ``0`` means the compute token width (:attr:`tile_n` for swap-AB,
+    :attr:`tile_m` otherwise). A larger value lets a smaller FC1 compute tile
+    consume routing metadata shared with a wider FC2 tile without materializing
+    duplicated ``tile_idx`` and ``mn_limit`` tensors.
     """
 
     # --- Semantic dtypes ---
@@ -1759,6 +1760,21 @@ class BatchedGemmConfig:
         return self.batch_mode == int(BatchMode.BATCH_N)
 
     @property
+    def compute_token_tile(self) -> int:
+        """Token rows consumed by one compute CTA."""
+        return self.tile_n if self.is_swap_ab else self.tile_m
+
+    @property
+    def metadata_token_tile(self) -> int:
+        """Token rows represented by one external routing-metadata entry."""
+        return self.metadata_tile_n or self.compute_token_tile
+
+    @property
+    def metadata_compute_tile_ratio(self) -> int:
+        """Compute CTAs represented by one routing-metadata entry."""
+        return self.metadata_token_tile // self.compute_token_tile
+
+    @property
     def has_gated_epilogue(self) -> bool:
         """True for gated activations (``SWIGLU``/``GEGLU``/``SILU``);
         the paired output dimension is halved.
@@ -2711,11 +2727,16 @@ def validate_config(
     if cfg.tile_n not in (8, 16, 32, 64, 128, 256):
         raise ValueError(f"tile_n must be 8/16/32/64/128/256, got {cfg.tile_n}")
 
-    metadata_tile_n = cfg.metadata_tile_n or cfg.tile_n
-    if metadata_tile_n < cfg.tile_n or metadata_tile_n % cfg.tile_n != 0:
+    compute_token_tile = cfg.compute_token_tile
+    metadata_token_tile = cfg.metadata_token_tile
+    if (
+        metadata_token_tile < compute_token_tile
+        or metadata_token_tile % compute_token_tile != 0
+    ):
         raise ValueError(
-            "metadata_tile_n must be a positive multiple of tile_n, got "
-            f"metadata_tile_n={metadata_tile_n}, tile_n={cfg.tile_n}"
+            "metadata_tile_n must be a positive multiple of the compute token "
+            f"tile, got metadata_tile_n={metadata_token_tile}, "
+            f"compute_token_tile={compute_token_tile}"
         )
 
     if cfg.epi_tile_n <= 0:
@@ -2768,6 +2789,26 @@ def validate_config(
             )
         if not cfg.fuse_sf_copy_to_mma:
             raise ValueError("fuse_operand_sf_loads requires fuse_sf_copy_to_mma=1")
+        if cfg.num_load_sfa_warps != cfg.num_load_a_warps:
+            raise ValueError(
+                "fuse_operand_sf_loads requires num_load_sfa_warps == "
+                "num_load_a_warps, got "
+                f"{cfg.num_load_sfa_warps} and {cfg.num_load_a_warps}"
+            )
+        if cfg.num_load_sfb_warps != cfg.num_gather_warps:
+            raise ValueError(
+                "fuse_operand_sf_loads requires num_load_sfb_warps == "
+                "num_gather_warps, got "
+                f"{cfg.num_load_sfb_warps} and {cfg.num_gather_warps}"
+            )
+        sfb_prefetch_depth = _ldgsts_sfb_producer_commit_prefetch_depth(cfg)
+        if sfb_prefetch_depth >= cfg.num_stages_b:
+            raise ValueError(
+                "fuse_operand_sf_loads requires the delayed SFB commit depth "
+                "to be smaller than the fused B pipeline depth, got "
+                f"prefetch_depth={sfb_prefetch_depth}, "
+                f"num_stages_b={cfg.num_stages_b}"
+            )
     if cfg.use_tma_oob_opt not in (0, 1):
         raise ValueError(f"use_tma_oob_opt must be 0 or 1, got {cfg.use_tma_oob_opt}")
 
@@ -2819,6 +2860,11 @@ def validate_config(
             raise ValueError(
                 "do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1"
             )
+    elif cfg.use_pdl and cfg.use_early_exit:
+        raise ValueError(
+            "PDL early exit requires do_pdl_wait_for_num_non_exiting_ctas=1 "
+            "before reading the routing-produced active CTA count"
+        )
 
     if cfg.use_global_scales not in (0, 1):
         raise ValueError(
@@ -2955,6 +3001,22 @@ def validate_config(
             "sf_layout_b=8x4 requires non-gather B scale-factor loading with "
             "tile_n <= 64, or routed low-N SFB"
         )
+
+    if cfg.has_scale_factors and not cfg.uses_unfused_tmem_sf_copy:
+        fused_sf_layouts = {
+            "SFA": cfg.smem_sfa_layout,
+            "SFB": cfg.smem_sfb_layout,
+        }
+        unsupported_fused_layouts = [
+            name
+            for name, layout in fused_sf_layouts.items()
+            if layout != int(SfLayout.R128c4)
+        ]
+        if unsupported_fused_layouts:
+            raise ValueError(
+                "fused SF copy requires effective R128c4 SMEM layout for "
+                + "/".join(unsupported_fused_layouts)
+            )
 
     if cfg.has_epilogue_quant:
         if not cfg.has_scale_factors:

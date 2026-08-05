@@ -73,7 +73,7 @@ def nonnegative_mod(value, divisor: int):
 def metadata_token_tile(cfg, token_tile, token_rows: int):
     """Map a compute token tile to its external routing-metadata entry."""
 
-    metadata_rows = cfg.metadata_tile_n or token_rows
+    metadata_rows = cfg.metadata_token_tile
     ratio = metadata_rows // token_rows
     if ratio > 1:
         return nonnegative_div(token_tile, ratio)

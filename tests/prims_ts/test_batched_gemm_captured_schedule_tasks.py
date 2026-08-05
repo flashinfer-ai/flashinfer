@@ -1064,6 +1064,7 @@ def test_fused_sf_copy_reserves_tmem_after_accumulator():
         mma_m=256,
         mma_n=128,
         num_stages_tmem_acc=2,
+        sf_layout_b=int(SfLayout.R128c4),
         tile_k=512,
         tile_n=128,
     )

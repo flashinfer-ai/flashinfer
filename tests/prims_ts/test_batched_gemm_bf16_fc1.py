@@ -136,6 +136,23 @@ class TestBf16Fc1TmaRoute:
         assert result
     def test_tma_route_noswap(self):
         self._run(swap_ab=False)
+
+    def test_tma_route_noswap_reuses_wider_metadata(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+        assert reference_check(
+            num_experts=2,
+            num_tokens=257,
+            top_k=1,
+            tile_n=8,
+            tile_k=128,
+            mma_n=8,
+            epi_tile_n=8,
+            metadata_tile_n=256,
+            **uniform_pipeline_stage_overrides(4),
+            **self.TMA_CFG,
+        )
+
     def test_tma_route_swap(self):
         self._run(swap_ab=True)
     def test_tma_route_swiglu_noswap(self):

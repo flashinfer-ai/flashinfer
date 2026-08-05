@@ -856,16 +856,16 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 num_k_tiles,
                 work_throttle=work_throttle,
             )
-            smem_b = smem_tma_gather
             load_b = create_load_b_task(
                 cfg,
                 gmem_b,
-                smem_b,
+                smem_tma_gather,
                 work_queue,
                 num_k_tiles,
                 pdl_wait_resource=pdl_wait_resource,
                 pdl_launch_resource=pdl_launch_resource,
             )
+            smem_b = smem_tma_gather
             task_list = [load_a, load_b]
         else:
             load_a = create_load_a_task(
@@ -1292,7 +1292,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     tmem_allocator.add_resource(tmem_c)
     if cfg.has_cast_a:
         tmem_allocator.add_resource(tmem_cast_a)
-    if cfg.has_scale_factors:
+    if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
         if cfg.use_combined_sfab_copy:
             tmem_allocator.add_resource(tmem_sfab)
         else:
@@ -1787,9 +1787,9 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
-            if cutlass.const_expr(cfg.metadata_tile_n > cfg.tile_n):
+            if cutlass.const_expr(cfg.metadata_compute_tile_ratio > 1):
                 num_non_exiting_ctas_value *= cutlass.Int32(
-                    cfg.metadata_tile_n // cfg.tile_n
+                    cfg.metadata_compute_tile_ratio
                 )
         clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
@@ -1860,7 +1860,7 @@ def _batched_gemm_kernel_bf16_body(
     tmem_allocator.add_resource(tmem_c)
     if cutlass.const_expr(cfg.has_cast_a):
         tmem_allocator.add_resource(tmem_cast_a)
-    if cutlass.const_expr(cfg.has_scale_factors):
+    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
         if cutlass.const_expr(cfg.use_combined_sfab_copy):
             tmem_allocator.add_resource(tmem_sfab)
         else:
@@ -2421,8 +2421,8 @@ def batched_gemm_kernel_bf16(
         num_non_exiting_ctas = num_non_exiting_ctas_view.load(
             idx=Int32(0), vector_size=1
         )[0]
-        if cutlass.const_expr(cfg.metadata_tile_n > cfg.tile_n):
-            num_non_exiting_ctas *= cutlass.Int32(cfg.metadata_tile_n // cfg.tile_n)
+        if cutlass.const_expr(cfg.metadata_compute_tile_ratio > 1):
+            num_non_exiting_ctas *= cutlass.Int32(cfg.metadata_compute_tile_ratio)
         block_m, block_n, _ = cute.arch.block_idx()
         if cutlass.const_expr(cfg.is_swap_ab):
             token_cta_idx = block_n

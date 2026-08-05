@@ -19,6 +19,51 @@ import sys
 import pytest
 
 
+def _fused_operand_sf_config(**overrides):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        RouteImpl,
+        SfLayout,
+        TileScheduler,
+        compute_warp_layout,
+        make_config,
+    )
+
+    values = dict(
+        batch_mode=int(BatchMode.BATCH_N),
+        cluster_m=2,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.E2M1),
+        epi_tile_n=32,
+        act_kind=int(ActKind.SWIGLU),
+        fuse_operand_sf_loads=1,
+        fuse_sf_copy_to_mma=1,
+        mma_k=64,
+        mma_m=256,
+        mma_n=128,
+        num_load_sfb_warps=4,
+        num_stages_a=3,
+        num_stages_b=3,
+        num_stages_smem_sfa=3,
+        num_stages_smem_sfb=3,
+        route_act=int(RouteImpl.LDGSTS),
+        route_sfs_act=int(RouteImpl.LDGSTS),
+        sf_layout_b=int(SfLayout.LINEAR),
+        tile_k=512,
+        tile_n=128,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        transpose_mma_output=1,
+        use_early_exit=1,
+    )
+    values.update(overrides)
+    cfg = make_config(**values)
+    compute_warp_layout(cfg)
+    return cfg
+
+
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
@@ -119,6 +164,87 @@ def test_validation_accepts_mma_unroll():
         use_unroll_loop_2x_for_mma=1,
     )
     validate_config(cfg)
+
+
+def test_validation_accepts_safe_fused_operand_sf_pipeline():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    validate_config(_fused_operand_sf_config())
+
+
+@pytest.mark.parametrize("operand", ("sfa", "sfb"))
+def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        SfLayout,
+        make_config,
+        validate_config,
+    )
+
+    overrides = {
+        "sf_layout_a": int(SfLayout.R128c4),
+        "sf_layout_b": int(SfLayout.R128c4),
+    }
+    overrides[f"sf_layout_{operand[-1]}"] = int(SfLayout.LINEAR)
+    cfg = make_config(
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.BF16),
+        fuse_sf_copy_to_mma=1,
+        mma_k=64,
+        mma_n=128,
+        tile_k=512,
+        tile_n=128,
+        **overrides,
+    )
+
+    with pytest.raises(ValueError, match=f"R128c4 SMEM layout for {operand.upper()}"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        (
+            {"num_load_sfa_warps": 2},
+            "num_load_sfa_warps == num_load_a_warps",
+        ),
+        (
+            {"num_load_sfb_warps": 2},
+            "num_load_sfb_warps == num_gather_warps",
+        ),
+        (
+            {"num_stages_b": 1, "num_stages_smem_sfb": 4},
+            "delayed SFB commit depth",
+        ),
+    ),
+)
+def test_validation_rejects_unsafe_fused_operand_sf_pipeline(overrides, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_fused_operand_sf_config(**overrides))
+
+
+def test_validation_rejects_pdl_early_exit_without_count_wait():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_k=16,
+        tile_k=64,
+        use_early_exit=1,
+        use_pdl=1,
+    )
+
+    with pytest.raises(ValueError, match="PDL early exit requires"):
+        validate_config(cfg)
 
 
 @pytest.mark.parametrize(
@@ -920,7 +1046,6 @@ def test_validation_rejects_clc_fast_drain_without_persistent_early_exit(
 ):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
-        TileScheduler,
         make_config,
         validate_config,
     )
@@ -1206,6 +1331,20 @@ def test_nvfp4_per_token_sfb_schedule_validates():
         use_per_token_sf_b=1,
         per_token_sf_dtype=int(DType.FP32),
     )
+
+
+def test_benchmark_preserves_supported_fast_drain_and_mma_unroll_knobs():
+    from flashinfer.prims_ts.batched_gemm.tools.bench import _ts_kwargs
+
+    kwargs = {
+        "use_clc_fast_drain": 1,
+        "use_unroll_loop_2x_for_mma": 1,
+    }
+
+    result = _ts_kwargs(kwargs)
+
+    assert result == kwargs
+    assert result is not kwargs
 
 
 def test_fp4_json_variant_forwards_per_token_sfb_without_skip():

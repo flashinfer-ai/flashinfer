@@ -1615,7 +1615,7 @@ def reference_check(
             f"got {out_hidden}"
         )
 
-    token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
+    token_tile_size = cfg.metadata_token_tile
     cluster_dim_in_token = 1 if cfg.is_swap_ab else cfg.cluster_m
     token_layout = _make_token_layout(
         num_tokens=total_tokens,
@@ -2754,7 +2754,7 @@ def _build_launch_io(
             f"got {out_hidden}"
         )
 
-    token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
+    token_tile_size = cfg.metadata_token_tile
     cluster_dim_in_token = 1 if cfg.is_swap_ab else cfg.cluster_m
     token_layout = _make_token_layout(
         num_tokens=num_tokens,

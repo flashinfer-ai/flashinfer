@@ -19,6 +19,24 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_metadata_token_tile_uses_external_metadata_width():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        make_config,
+    )
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_M),
+        tile_m=128,
+        tile_n=8,
+        metadata_tile_n=256,
+        transpose_mma_output=0,
+    )
+
+    assert cfg.metadata_token_tile == 256
+    assert cfg.compute_token_tile == 128
+    assert cfg.metadata_compute_tile_ratio == 2
+
+
 def test_partial_route_map_padding_keeps_trt_absolute_limits():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _launch_metadata_lists,

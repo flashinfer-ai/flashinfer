@@ -124,13 +124,8 @@ class BenchVariant:
 
 
 def _ts_kwargs(kwargs: dict) -> dict:
-    """Translate generated benchmark knobs to the TS-supported option set."""
-    result = dict(kwargs)
-    if int(result.get("use_clc_fast_drain", 0)) != 0:
-        result["use_clc_fast_drain"] = 0
-    if int(result.get("use_unroll_loop_2x_for_mma", 0)) != 0:
-        result["use_unroll_loop_2x_for_mma"] = 0
-    return result
+    """Copy generated benchmark knobs for the PrimsTS runner."""
+    return dict(kwargs)
 
 
 def _ts_unsupported_reason(kwargs: dict) -> str | None:
@@ -894,15 +889,6 @@ def _fp4_json_variant(
             "padding_regs": non_epi_regs,
         }
     )
-    ts_notes = []
-    if (
-        not has_activation_semantics
-        and kwargs["use_unroll_loop_2x_for_mma"]
-        and kwargs["cluster_m"] > 1
-        and kwargs["tile_n"] >= 128
-        and kwargs["tile_scheduler"] == int(TileScheduler.PERSISTENT)
-    ):
-        ts_notes.append("TS maps output-side clustered tile128+ unroll2x to unroll0")
     return BenchVariant(
         name=(
             f"json_fp4_i{config_index:02d}_v{combo_index:03d}_"
@@ -917,7 +903,7 @@ def _fp4_json_variant(
         config_comment=config_comment,
         combo_index=combo_index,
         generated_options=options,
-        ts_notes="; ".join(ts_notes),
+        ts_notes="",
         trtllm_gen_sf_layout_a=str(options.get("sfLayoutA", "128x4")),
         trtllm_gen_sf_layout_b=str(options.get("sfLayoutB", "128x4")),
         trtllm_gen_sf_layout_c=str(options.get("sfLayoutC", "128x4")),

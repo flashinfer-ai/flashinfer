@@ -450,7 +450,6 @@
             "dtype_c": "bf16",
             "tile_scheduler": "persistent",
             "use_clc_fast_drain": true,
-            "fuse_sf_copy_to_mma": false,
             "use_unroll_loop_2x_for_mma": true,
             "num_stages_tmem_acc": 2,
             "num_stages_c_smem": 1,

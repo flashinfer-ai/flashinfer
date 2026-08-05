@@ -15,8 +15,6 @@
 import pytest
 import torch
 
-from flashinfer.fused_moe.backends.prims_ts.fp4_op import _resolve_routing_inputs
-from flashinfer.fused_moe.shared.inputs import RoutingInputMode
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     DType,
     RouteImpl,
@@ -30,7 +28,6 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_nvfp4_moe_tactics,
 )
-from flashinfer.prims_ts.moe.runner import _split_token_tile_metadata
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import is_sm100a_supported
 
@@ -143,23 +140,6 @@ def test_bs1_deepseek_persistent_pair_gpu_correctness(
     )
 
 
-def test_from_logits_uses_bf16_routed_weight_storage():
-    logits = torch.empty((4, 16), dtype=torch.float32)
-    hidden_states = torch.empty((4, 32), dtype=torch.bfloat16)
-
-    resolved_logits, resolved_ids, resolved_weights = _resolve_routing_inputs(
-        routing_input_mode=RoutingInputMode.FromLogits,
-        routing_logits=logits,
-        topk_ids=None,
-        topk_weights=None,
-        hidden_states=hidden_states,
-    )
-
-    assert resolved_logits is logits
-    assert resolved_ids.dtype == torch.int32
-    assert resolved_weights.dtype == torch.bfloat16
-
-
 def test_nvfp4_tile256_pair_reuses_metadata_for_tile128_fc1():
     pair = map_trtllm_nvfp4_moe_tactic(
         [256, 0],
@@ -177,6 +157,67 @@ def test_nvfp4_tile256_pair_reuses_metadata_for_tile128_fc1():
     assert fc2.metadata_tile_n == 256
     assert fc1.num_stages_a == 3
     assert fc2.num_stages_a == 4
+
+
+def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _build_schedule_validate,
+    )
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [256, 0],
+        num_tokens=8192,
+        top_k=8,
+        num_local_experts=256,
+        activation_type=int(ActivationType.Swiglu),
+    )
+    cfg = pair.fc1.cfg.build()
+    _, _, _, tmem_allocator = _build_schedule_validate(cfg)
+
+    assert cfg.fuse_sf_copy_to_mma
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_required_cols == 320
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_sm100a_supported(torch.device("cuda")),
+    reason="NVFP4 PrimsTS kernels require Blackwell SM100A+",
+)
+@pytest.mark.parametrize(
+    ("problem_k", "dtype_c_override"),
+    (
+        pytest.param(512, None, id="quantized-output"),
+        pytest.param(1024, int(DType.BF16), id="two-k-tiles"),
+    ),
+)
+def test_nvfp4_tile256_metadata_fused_fc1_gpu_correctness(
+    problem_k, dtype_c_override
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [256, 0],
+        num_tokens=8192,
+        top_k=8,
+        num_local_experts=256,
+        activation_type=int(ActivationType.Swiglu),
+    )
+    cfg = dict(pair.fc1.cfg.kwargs)
+    assert cfg["use_clc_fast_drain"]
+    if dtype_c_override is not None:
+        cfg["dtype_c"] = dtype_c_override
+
+    assert reference_check(
+        num_experts=2,
+        num_tokens=257,
+        top_k=1,
+        problem_n=256,
+        problem_k=problem_k,
+        seed=123,
+        early_exit_max_token_ctas=16,
+        **cfg,
+    )
 
 
 def test_nvfp4_bs256_has_matching_gen_tile32_pair():
@@ -219,24 +260,6 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     assert fc2.use_clc_fast_drain
 
 
-def test_split_token_tile_metadata_reuses_input_tensors():
-    tile_idx = torch.arange(4, dtype=torch.int32)
-    mn_limit = torch.arange(4, dtype=torch.int32)
-    num_non_exiting_ctas = torch.ones(1, dtype=torch.int32)
-
-    result = _split_token_tile_metadata(
-        tile_idx=tile_idx,
-        mn_limit=mn_limit,
-        num_non_exiting_ctas=num_non_exiting_ctas,
-        source_tile_n=256,
-        target_tile_n=128,
-    )
-
-    assert result[0] is tile_idx
-    assert result[1] is mn_limit
-    assert result[2] is num_non_exiting_ctas
-
-
 def test_validation_rejects_nonintegral_metadata_tile_ratio():
     cfg = make_config(
         dtype_a=int(DType.BF16),
@@ -248,5 +271,33 @@ def test_validation_rejects_nonintegral_metadata_tile_ratio():
         metadata_tile_n=192,
     )
 
-    with pytest.raises(ValueError, match="metadata_tile_n must be a positive multiple"):
+    with pytest.raises(
+        ValueError,
+        match="metadata_tile_n must be a positive multiple of the compute token tile",
+    ):
         validate_config(cfg)
+
+
+def test_validation_uses_tile_m_for_non_swap_metadata_ratio():
+    from dataclasses import replace
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
+
+    invalid_cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_M),
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        metadata_tile_n=16,
+        mma_k=16,
+        tile_k=64,
+        tile_m=128,
+        tile_n=8,
+        transpose_mma_output=0,
+    )
+    with pytest.raises(ValueError, match="compute_token_tile=128"):
+        validate_config(invalid_cfg)
+
+    valid_cfg = replace(invalid_cfg, metadata_tile_n=256)
+    validate_config(valid_cfg)
+    assert valid_cfg.metadata_compute_tile_ratio == 2

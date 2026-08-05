@@ -191,8 +191,8 @@ def _launch_early_exit_max_token_ctas(
         compute_max_num_ctas_in_token_dim_for_moe,
     )
 
-    token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
-    metadata_tile_size = int(cfg.metadata_tile_n or token_tile_size)
+    token_tile_size = int(cfg.compute_token_tile)
+    metadata_tile_size = int(cfg.metadata_token_tile)
     if metadata_tile_size % token_tile_size != 0:
         raise ValueError(
             "routing metadata tile size must be a multiple of the compute "
