@@ -27,7 +27,9 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-@register_mega_kernel("sm100_fp8_nvfp4_bf16_deepgemm")
+@register_mega_kernel(
+    "sm100_fp8_nvfp4_bf16_deepgemm", deprecated_aliases=("deep_gemm_mega",)
+)
 class DeepGemmMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig) -> None:
         super().__init__(config)

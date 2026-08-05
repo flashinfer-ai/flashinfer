@@ -40,7 +40,9 @@ def _resolve_gate_up_clamp(config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig)
     return config.activation_clamp
 
 
-@register_mega_kernel("sm100_mxfp8_mxfp8_bf16_cutedsl")
+@register_mega_kernel(
+    "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
+)
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)

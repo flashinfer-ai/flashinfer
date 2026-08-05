@@ -44,7 +44,9 @@ def _resolve_gate_up_clamp(config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) 
     return config.activation_clamp
 
 
-@register_mega_kernel("sm90_fp8_fp8_bf16_pull_cutedsl")
+@register_mega_kernel(
+    "sm90_fp8_fp8_bf16_pull_cutedsl", deprecated_aliases=("sm90_pull_fp8",)
+)
 class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> None:
         super().__init__(config)

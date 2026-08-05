@@ -56,6 +56,9 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
 )
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
+# These WILL BE REMOVED in a future release, together with the matching
+# deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
+# "mxfp8_cutedsl", "sm90_pull_fp8" — see core/kernel/registry.py).
 DeepGemmMegaMoeConfig = Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig
 Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
