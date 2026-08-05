@@ -193,6 +193,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       uint8_t* kv_smem = sm.kv_bufs[ti & 1];
+      if constexpr (KV::KV_IS_NVFP4) {
+        // Expand each row's packed E2M1 nope (at [224:448)) in place to the 448B
+        // fp8 layout the math below expects; the buffer's mbar wait is satisfied by
+        // loop-top. Each warp expands its own 8 rows; the math barrier orders the
+        // cross-warp XV reads.
+        nvfp4_expand_rows_warp<KV::KV_SMEM_STRIDE>(kv_smem, mwarp * ENTRIES_PER_WARP, lane);
+        bar_sync_t<2, MATH_THREADS>();
+      }
       const int32_t* ib = idx_base + ti * BI;
       const int qk_nb = mwarp * ENTRIES_PER_WARP;
       uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
@@ -890,6 +898,11 @@ __device__ __forceinline__ void prefill_mg_impl(
 #pragma unroll 1
     for (int ti = 0; ti < loop_bound; ti++) {
       uint8_t* kv_smem = sm.kv_buf(ti & 1);
+      if constexpr (KV::KV_IS_NVFP4) {
+        // In-place E2M1->fp8 expand of this tile; mbar wait satisfied by loop-top.
+        nvfp4_expand_rows_warp<KV::KV_SMEM_STRIDE>(kv_smem, mwarp * ENTRIES_PER_WARP, lane);
+        bar_sync_t<2, MATH_THREADS>();
+      }
       const int qk_nb = mwarp * ENTRIES_PER_WARP;
       uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 

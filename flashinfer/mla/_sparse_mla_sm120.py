@@ -79,18 +79,23 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 256),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 256),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 256),
         (64, 512),
         (64, 1024),
         (128, 128),
+        (128, 256),
         (128, 512),
         (128, 1024),
     }
@@ -127,9 +132,11 @@ _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
-_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+_MODEL_TYPE_DSV4_NVFP4 = 3
+_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "nvfp4"})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
+_BPT_DSV4_NVFP4 = 360
 
 
 def _require_d_v_512(d_v: int) -> None:
@@ -161,10 +168,12 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
             return _MODEL_TYPE_GLM_NSA
         return _MODEL_TYPE_DSV3_2
     if d_qk == 512:
+        if fmt == "nvfp4":
+            return _MODEL_TYPE_DSV4_NVFP4
         if fmt != "auto":
             raise ValueError(
-                "kv_scale_format is only configurable for d_qk=576; "
-                f"got d_qk=512 with kv_scale_format={kv_scale_format!r}"
+                "kv_scale_format for d_qk=512 must be 'auto' (fp8) or 'nvfp4'; "
+                f"got kv_scale_format={kv_scale_format!r}"
             )
         return _MODEL_TYPE_DSV4
     raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
@@ -175,6 +184,8 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
+    if model_type == _MODEL_TYPE_DSV4_NVFP4:
+        return _BPT_DSV4_NVFP4
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
 
 
@@ -322,7 +333,7 @@ def get_sparse_mla_sm120_module():
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         if (
-            model_type == _MODEL_TYPE_DSV4
+            model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV4_NVFP4)
             and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
             and _decode_dsv4_dispatchable(
                 num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
@@ -351,6 +362,7 @@ def get_sparse_mla_sm120_module():
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
+                model_type=model_type,
             )
             return
 
@@ -806,11 +818,17 @@ def _get_sparse_mla_decode_dsv3_module(model_type: int):
 
 
 @functools.cache
-def _get_sparse_mla_decode_dsv4_module():
+def _get_sparse_mla_decode_dsv4_module(model_type: int):
     module = gen_sparse_mla_sm120_module().build_and_load()
 
     class SparseMlaDecodeV3Runner(TunableRunner):
         """Tactic = chunks_per_block ∈ [1, num_splits]; ≤0 → C++ heuristic."""
+
+        def __init__(self, model_type: int) -> None:
+            self.model_type = int(model_type)
+
+        def __hash__(self) -> int:
+            return hash((self.__class__.__name__, self.model_type))
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             topk_length = inputs[6] if len(inputs) > 6 else None
@@ -818,7 +836,11 @@ def _get_sparse_mla_decode_dsv4_module():
             extra_indices = inputs[8] if len(inputs) > 8 else None
             extra_topk_length = inputs[9] if len(inputs) > 9 else None
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+            # model_type selects the KV layout (FP8 584 B/token vs NVFP4
+            # 360 B/token), which changes the optimal chunks_per_block at an
+            # otherwise identical shape, so it must key the profiling cache.
             return (
+                self.model_type,
                 topk_length is not None,
                 attn_sink is not None,
                 int(extra_topk),
@@ -881,10 +903,14 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_indices,
                 extra_topk_length,
                 cpb_override,
+                self.model_type,
             )
             return output
 
-    return SimpleNamespace(module=module, runner_cls=SparseMlaDecodeV3Runner)
+    return SimpleNamespace(
+        module=module,
+        runner_cls=lambda: SparseMlaDecodeV3Runner(model_type),
+    )
 
 
 def _decode_dsv4_num_token_buckets(*_args, **_kwargs):
@@ -1007,8 +1033,8 @@ def _decode_dsv3_2_runner_singleton(model_type: int):
 
 
 @functools.cache
-def _decode_dsv4_runner_singleton():
-    return _get_sparse_mla_decode_dsv4_module().runner_cls()
+def _decode_dsv4_runner_singleton(model_type: int):
+    return _get_sparse_mla_decode_dsv4_module(model_type).runner_cls()
 
 
 def _decode_dsv3_2_default_cache_path():
@@ -1204,6 +1230,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
+    model_type: int = _MODEL_TYPE_DSV4,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
@@ -1224,12 +1251,14 @@ def sparse_mla_sm120_decode_dsv4(
     Parameters
     ----------
     q : torch.Tensor
-        ``[T, num_heads, d_qk]`` bf16. ``d_qk == 512`` (DSV4 only).
+        ``[T, num_heads, d_qk]`` bf16. ``d_qk == 512`` (DSV4 or DSV4_NVFP4).
     kv_cache : torch.Tensor
-        Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
+        Paged packed cache, shape ``[num_blocks, page_bytes]`` uint8. DSV4
+        stores 584 bytes/token (FP8 nope); DSV4_NVFP4 stores 360 bytes/token
+        (E2M1 nope with a per-64 UE8M0 scale footer).
     indices : torch.Tensor
-        ``[T, topk]`` int32. ``topk`` must be one of {128, 512, 1024}; ``-1``
-        marks invalid slots.
+        ``[T, topk]`` int32. ``topk`` must be one of {128, 256, 512, 1024};
+        ``-1`` marks invalid slots.
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
         ceil(topk / 64) + ceil(extra_topk / 64)``.
@@ -1245,6 +1274,9 @@ def sparse_mla_sm120_decode_dsv4(
         Per-token effective top-k length, ``[T]`` int32.
     chunks_per_block : Optional[int]
         Explicit override. If ``None`` and no AutoTuner active, uses heuristic.
+    model_type : int
+        KV cache layout selector: ``_MODEL_TYPE_DSV4`` (FP8, 584 bytes/token)
+        or ``_MODEL_TYPE_DSV4_NVFP4`` (NVFP4, 360 bytes/token).
 
     Returns
     -------
@@ -1254,7 +1286,7 @@ def sparse_mla_sm120_decode_dsv4(
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
 
-    runner = _decode_dsv4_runner_singleton()
+    runner = _decode_dsv4_runner_singleton(int(model_type))
     inputs = [
         q,
         indices,
@@ -1268,6 +1300,8 @@ def sparse_mla_sm120_decode_dsv4(
         extra_topk_length,
     ]
 
+    # model_type is bound on the runner (and keys its autotune cache entries),
+    # so it is not passed per-call.
     forward_kwargs = {
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
@@ -1299,6 +1333,7 @@ def sparse_mla_sm120_decode_dsv4(
             extra_topk,
             num_splits,
             runner.get_cache_key_extras(inputs),
+            int(model_type),
         )
         cached_tactic = _decode_dsv4_hot_cache.get(hot_key)
         if cached_tactic is not None:
@@ -1333,6 +1368,7 @@ def sparse_mla_sm120_decode_dsv4(
             extra_topk,
             num_splits,
             runner.get_cache_key_extras(inputs),
+            int(model_type),
         )
         _decode_dsv4_hot_cache[hot_key] = int(tactic)
     chosen(inputs=inputs, tactic=tactic, **forward_kwargs)

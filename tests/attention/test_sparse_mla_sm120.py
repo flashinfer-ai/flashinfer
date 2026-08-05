@@ -38,6 +38,12 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
 from flashinfer.utils import is_sm12x_supported
+from tests.utils_fp4 import (
+    nvfp4_dequantize_blocks,
+    nvfp4_quantize_blocks,
+    ue8m0_block_scales,
+    ue8m0_to_scale,
+)
 
 pytestmark = pytest.mark.skipif(
     not is_sm12x_supported(torch.device("cuda")),
@@ -122,6 +128,110 @@ def dequantize_kv_dsv4(packed: torch.Tensor) -> torch.Tensor:
         result[:, tok, d_nope:] = rope_bytes.view(torch.bfloat16).reshape(nb, d_rope)
 
     return result.view(nb, bs, 1, 512)
+
+
+# DSv4 NVFP4 FOOTER pack.
+#
+# 360 bytes per token. Per page block of ``bs`` tokens the data slots come
+# first, then the scale footers:
+#   [0 : bs*352)          data slot, 352 B per token
+#       [0:224)           NoPE as E2M1, 448 elements packed 2 per byte,
+#                         the even element in the low nibble
+#       [224:352)         RoPE, 64 bf16 elements
+#   [bs*352 : bs*360)     footer, 8 B per token: 7 UE8M0 scale bytes, one per
+#                         64-element NoPE tile, plus one pad byte
+#
+# Note this is not the microscaling NVFP4 of ``nvfp4_attention_sm120`` (per-16
+# E4M3 block scales); it reuses the DSv4 FP8 per-64 UE8M0 scale footer and only
+# narrows the NoPE elements to 4 bits.
+
+_NVFP4_D_NOPE = 448
+_NVFP4_D_ROPE = 64
+_NVFP4_TILE = 64
+_NVFP4_NUM_TILES = _NVFP4_D_NOPE // _NVFP4_TILE  # 7
+_NVFP4_NOPE_BYTES = _NVFP4_D_NOPE // 2  # 224
+_NVFP4_DATA_STRIDE = _NVFP4_NOPE_BYTES + _NVFP4_D_ROPE * 2  # 352
+_NVFP4_SCALE_BYTES = _NVFP4_NUM_TILES + 1  # 8
+_NVFP4_BPT = _NVFP4_DATA_STRIDE + _NVFP4_SCALE_BYTES  # 360
+
+
+def quantize_kv_dsv4_nvfp4(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV into the DSv4 NVFP4 FOOTER format."""
+    nb, bs, hk, d = kv_bf16.shape
+    assert d == _NVFP4_D_NOPE + _NVFP4_D_ROPE and hk == 1
+    kv = kv_bf16.squeeze(2).float()
+
+    nope = kv[..., :_NVFP4_D_NOPE]
+    scale, ue8m0 = ue8m0_block_scales(nope, _NVFP4_TILE)
+    nope_packed = nvfp4_quantize_blocks(nope, scale)
+    rope = (
+        kv[..., _NVFP4_D_NOPE:]
+        .to(torch.bfloat16)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(nb, bs, _NVFP4_D_ROPE * 2)
+    )
+
+    footer = torch.zeros(
+        nb, bs, _NVFP4_SCALE_BYTES, dtype=torch.uint8, device=kv.device
+    )
+    footer[..., :_NVFP4_NUM_TILES] = ue8m0
+
+    data = torch.cat((nope_packed, rope), dim=-1)
+    result = torch.cat(
+        (data.reshape(nb, bs * _NVFP4_DATA_STRIDE), footer.reshape(nb, -1)), dim=1
+    )
+    return result.view(nb, bs, 1, _NVFP4_BPT)
+
+
+def dequantize_kv_dsv4_nvfp4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack DSv4 NVFP4 FOOTER → bf16. Inverse of :func:`quantize_kv_dsv4_nvfp4`."""
+    nb, bs, _, _ = packed.shape
+    p = packed.reshape(nb, bs * _NVFP4_BPT)
+    data = p[:, : bs * _NVFP4_DATA_STRIDE].reshape(nb, bs, _NVFP4_DATA_STRIDE)
+    footer = p[:, bs * _NVFP4_DATA_STRIDE :].reshape(nb, bs, _NVFP4_SCALE_BYTES)
+
+    scale = ue8m0_to_scale(footer[..., :_NVFP4_NUM_TILES])
+    nope = nvfp4_dequantize_blocks(data[..., :_NVFP4_NOPE_BYTES], scale)
+    rope = (
+        data[..., _NVFP4_NOPE_BYTES:]
+        .contiguous()
+        .view(torch.bfloat16)
+        .reshape(nb, bs, _NVFP4_D_ROPE)
+    )
+
+    result = torch.cat((nope.to(torch.bfloat16), rope), dim=-1)
+    return result.view(nb, bs, 1, _NVFP4_D_NOPE + _NVFP4_D_ROPE)
+
+
+def vary_nvfp4_tile_magnitudes(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Give each 64-element NoPE tile its own magnitude.
+
+    KV drawn from one distribution produces the same block amax everywhere, so
+    all seven UE8M0 footer bytes of every token hold the same value and a footer
+    read at the wrong offset would still land on the right number. Spreading the
+    per-tile magnitudes makes the scale bytes distinguishable from each other.
+    """
+    gains = torch.pow(
+        2.0,
+        torch.randint(
+            -1,
+            2,
+            kv_bf16.shape[:-1] + (_NVFP4_NUM_TILES,),
+            device=kv_bf16.device,
+        ).float(),
+    ).to(kv_bf16.dtype)
+    out = kv_bf16.clone()
+    out[..., :_NVFP4_D_NOPE] *= gains.repeat_interleave(_NVFP4_TILE, dim=-1)
+    return out
+
+
+# ``kv_format`` parametrisation for the DSv4 tests: the packer, its matching
+# dequantizer, and the ``kv_scale_format`` the kernel is told to expect.
+_DSV4_KV_FORMATS = {
+    "fp8": (quantize_kv_dsv4, dequantize_kv_dsv4, "auto"),
+    "nvfp4": (quantize_kv_dsv4_nvfp4, dequantize_kv_dsv4_nvfp4, "nvfp4"),
+}
 
 
 # DSv3.2 INLINE pack.
@@ -304,16 +414,18 @@ _DSV4_DECODE_CONFIGS = [
 @pytest.mark.parametrize("num_heads,topk", _DSV4_DECODE_CONFIGS)
 @pytest.mark.parametrize("num_tokens", [1, 16, 64])
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("kv_format", list(_DSV4_KV_FORMATS))
 def test_sparse_mla_sm120_decode_dsv4(
-    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+    num_heads: int, topk: int, num_tokens: int, with_sink: bool, kv_format: str
 ) -> None:
-    """DSv4 decode."""
+    """DSv4 decode, FP8 and NVFP4 KV cache."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size  # 4096
+    quantize, dequantize, kv_scale_format = _DSV4_KV_FORMATS[kv_format]
 
     kv_bf16 = (
         torch.randn(
@@ -321,8 +433,8 @@ def test_sparse_mla_sm120_decode_dsv4(
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_dsv4(kv_bf16)
-    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    kv_packed = quantize(kv_bf16)
+    kv_dequant = dequantize(kv_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -360,6 +472,7 @@ def test_sparse_mla_sm120_decode_dsv4(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        kv_scale_format=kv_scale_format,
         mid_out=mid_out,
         mid_lse=mid_lse,
     )
@@ -899,16 +1012,18 @@ _DSV4_PREFILL_CONFIGS = [
 @pytest.mark.parametrize("num_heads,topk", _DSV4_PREFILL_CONFIGS)
 @pytest.mark.parametrize("num_tokens", [128, 256])
 @pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("kv_format", list(_DSV4_KV_FORMATS))
 def test_sparse_mla_sm120_prefill_dsv4(
-    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+    num_heads: int, topk: int, num_tokens: int, with_sink: bool, kv_format: str
 ) -> None:
-    """DSv4 prefill."""
+    """DSv4 prefill, FP8 and NVFP4 KV cache."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
+    quantize, dequantize, kv_scale_format = _DSV4_KV_FORMATS[kv_format]
 
     kv_bf16 = (
         torch.randn(
@@ -916,8 +1031,8 @@ def test_sparse_mla_sm120_prefill_dsv4(
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_dsv4(kv_bf16)
-    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    kv_packed = quantize(kv_bf16)
+    kv_dequant = dequantize(kv_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -954,6 +1069,160 @@ def test_sparse_mla_sm120_prefill_dsv4(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        kv_scale_format=kv_scale_format,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+# The two tests below exist because the shared DSv4 configuration above is a
+# weak probe of the KV layout: it keeps |q| and |kv| around 0.1 and averages
+# over ~256 candidates, so its outputs sit near 6e-3 RMS — an order of magnitude
+# inside the 5e-2 tolerance. That is enough to catch a broken kernel, but not a
+# subtly misdecoded KV cache. These two drive the output up to where the
+# tolerance actually binds on the decoded NVFP4 values.
+
+
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_tokens", [16, 128])
+@pytest.mark.parametrize("target_token", [0, 4095])
+def test_sparse_mla_sm120_dsv4_nvfp4_single_token_gather(
+    num_heads: int, num_tokens: int, target_token: int
+) -> None:
+    """Pin the NVFP4 page layout element by element.
+
+    Every candidate slot points at the same KV token, so the attention output is
+    that token's value vector verbatim whatever the scores are. Each of the 448
+    E2M1 NoPE elements, all 7 UE8M0 block scales and the 64 bf16 RoPE elements
+    have to decode correctly for the comparison to hold. ``num_tokens`` selects
+    the decode (16) or the prefill (128) kernel.
+    """
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    topk = 512
+    page_block_size = 64
+    num_blocks = 64
+
+    kv_bf16 = vary_nvfp4_tile_magnitudes(
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        ).clamp(-1, 1)
+    )
+    kv_packed = quantize_kv_dsv4_nvfp4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_nvfp4(kv_packed)
+
+    q = torch.randn(
+        num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+    ).clamp(-1, 1)
+    indices = torch.full(
+        (num_tokens, topk), target_token, device=device, dtype=torch.int32
+    )
+    sm_scale = d_qk**-0.5
+
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    # Guard the premise: with one distinct candidate the reference must reduce
+    # to the dequantized KV row, otherwise this test is not probing what its
+    # name says.
+    expected = kv_dequant.reshape(-1, d_qk)[target_token, :d_v]
+    torch.testing.assert_close(
+        ref_out, expected.expand_as(ref_out).contiguous(), atol=1e-2, rtol=1e-2
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="nvfp4",
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [32, 128])
+@pytest.mark.parametrize("num_tokens", [16, 128])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_dsv4_nvfp4_full_scale(
+    num_heads: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv4 NVFP4 over many candidates with Q and KV at full scale.
+
+    Dropping the ``/10`` peaks the softmax enough that the output lands around
+    1e-1 RMS rather than 6e-3, so the 5e-2 tolerance constrains the decoded KV
+    instead of being satisfied by near-zero outputs on both sides.
+    ``num_tokens`` selects the decode (16) or the prefill (128) kernel.
+    """
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    topk = 128
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = vary_nvfp4_tile_magnitudes(
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        ).clamp(-1, 1)
+    )
+    kv_packed = quantize_kv_dsv4_nvfp4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_nvfp4(kv_packed)
+
+    q = torch.randn(
+        num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+    sm_scale = d_qk**-0.5
+
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+    # Guard the premise: the comparison is only meaningful while the output is
+    # comfortably above the absolute tolerance.
+    assert ref_out.float().pow(2).mean().sqrt() > 5e-2
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        kv_scale_format="nvfp4",
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

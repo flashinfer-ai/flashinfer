@@ -257,13 +257,14 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
 #undef DISPATCH_DSV3_2_MG
 }
 
+template <ModelType MT>
 inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
                                  const int32_t* indices, const float* attn_sink, bf16* output,
                                  float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, const int* topk_length_ptr,
                                  cudaStream_t stream) {
 #define DISPATCH_MG_CM(CM, NH, TK, NHG)                                                  \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, NHG>(                  \
+  launch_prefill_mg<MT, ComputeMode::CM, NH, TK, 64, NHG>(                               \
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
@@ -293,6 +294,8 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
   // amortises FP8's higher Tensor-Core throughput.
   if (topk == 128)
     DISPATCH_BY_NH_CM(BF16, 128);
+  else if (topk == 256)
+    DISPATCH_BY_NH_CM(BF16, 256);
   else if (topk == 512)
     DISPATCH_BY_NH_CM(FP8, 512);
   else if (topk == 1024)
@@ -307,6 +310,7 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
   return false;  // unreachable
 }
 
+template <ModelType MT>
 inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extra_page_block_size,
                                const bf16* Q, const uint8_t* KV, const int32_t* indices,
                                const uint8_t* KV_extra, const int32_t* idx_extra,
@@ -317,7 +321,7 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
   if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
       topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
 #define DISPATCH_DUAL_MG_FULLTILE(NH, TK, PBSX, NHG)                                         \
-  launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, TK, 64, PBSX, NHG>(                   \
+  launch_prefill_mg_dual_fulltile<MT, NH, TK, 64, PBSX, NHG>(                                \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
       topk_extra, stride_kv_block, stride_kv_block_extra, stream)
 
@@ -353,7 +357,7 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 // topk_extra is runtime; extra_page_block_size stays template because it
 // changes the KV stride. NH=16 uses MG_N_HG_T=1.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                                \
-  launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                \
+  launch_prefill_mg_dual<MT, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                             \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,      \
       topk_extra, stride_kv_block, stride_kv_block_extra, topk_length_ptr, topk_length_extra_ptr, \
       stream)
@@ -403,11 +407,17 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  const float* attn_sink, const int* topk_length,
                                  const int* extra_topk_length, cudaStream_t stream) {
   if (extra_KV_cache != nullptr) {
-    if (mt != ModelType::DSV4) return false;
-    return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
-                              indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
-                              sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
-                              topk_length, extra_topk_length, stream);
+    if (mt == ModelType::DSV4)
+      return dispatch_dsv4_dual<ModelType::DSV4>(
+          num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache, indices, extra_KV_cache,
+          extra_indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+          stride_kv_block_extra, topk_length, extra_topk_length, stream);
+    if (mt == ModelType::DSV4_NVFP4)
+      return dispatch_dsv4_dual<ModelType::DSV4_NVFP4>(
+          num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache, indices, extra_KV_cache,
+          extra_indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+          stride_kv_block_extra, topk_length, extra_topk_length, stream);
+    return false;
   }
 
   switch (mt) {
@@ -420,8 +430,13 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                               output, out_lse, sm_scale, num_tokens,
                                               stride_kv_block, topk_length, stream);
     case ModelType::DSV4:
-      return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
-                                  sm_scale, num_tokens, stride_kv_block, topk_length, stream);
+      return dispatch_dsv4_single<ModelType::DSV4>(num_heads, topk, Q, KV_cache, indices, attn_sink,
+                                                   output, out_lse, sm_scale, num_tokens,
+                                                   stride_kv_block, topk_length, stream);
+    case ModelType::DSV4_NVFP4:
+      return dispatch_dsv4_single<ModelType::DSV4_NVFP4>(
+          num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse, sm_scale, num_tokens,
+          stride_kv_block, topk_length, stream);
   }
   return false;
 }

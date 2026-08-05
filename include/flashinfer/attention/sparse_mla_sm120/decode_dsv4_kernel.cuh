@@ -11,6 +11,7 @@
 #include "arch/mma_sm120.cuh"
 #include "common/d2_load_b.cuh"
 #include "common/fp8_quant.cuh"
+#include "common/kv_cache_io.cuh"
 #include "common/online_softmax.cuh"
 #include "model/kv_cache_traits.cuh"
 #include "model/scale_convert.cuh"
@@ -43,10 +44,13 @@ constexpr int DSV4_KV_BUF_COUNT = 2;
 constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;  // 8
 constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;     // 1
 
+// E2M1 (NVFP4) 4-bit code -> fp8 e4m3 byte with the same numeric magnitude.
+// E2M1 magnitudes {0,0.5,1,1.5,2,3,4,6}; bit3 = sign.
+//   0.5=0x30 1=0x38 1.5=0x3C 2=0x40 3=0x44 4=0x48 6=0x4C ; sign bit sets 0x80.
 template <ModelType MT>
 struct DecodeDsv4Smem {
   using KV = KVCacheTraits<MT>;
-  static_assert(MT == ModelType::DSV4);
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_NVFP4);
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
@@ -135,7 +139,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
     float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
-  static_assert(MT == ModelType::DSV4, "decode-dsv4 currently DSV4-only");
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_NVFP4,
+                "decode-dsv4 handles DSV4 (fp8) and DSV4_NVFP4 (E2M1 nope)");
+  constexpr bool KV_IS_NVFP4 = KV::KV_IS_NVFP4;
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 512
@@ -145,7 +151,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;                  // 464
   constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;                // 464
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 8
-  constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
+  // Data-slot bytes/token in gmem: fp8 = 448+128=576; nvfp4 = 224+128=352.
+  constexpr int NOPE_STORAGE_BYTES = KV::NOPE_STORAGE_BYTES;        // 448 fp8 / 224 nvfp4
+  constexpr int IO_STRIDE = NOPE_STORAGE_BYTES + D_ROPE_C * 2;      // 576 / 352
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
   // head slots); NUM_HEADS=8 small-TP shards write back only VALID_HPB rows.
@@ -233,8 +241,11 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   __syncthreads();
 
   // ── TMA bulk constants ──
-  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                   // 448
+  // fp8: nope = 448B at row offset 0. nvfp4: nope = 224 packed E2M1 bytes landed
+  // at row offset +224 (top half), expanded in place by the consumer.
+  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)NOPE_STORAGE_BYTES;       // 448 / 224
   constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // 128
+  constexpr int DSV4_BULK_DST_OFF = D_NOPE - NOPE_STORAGE_BYTES;                // 0 / 224
   constexpr uint32_t DSV4_BULK_TX_BYTES =
       (uint32_t)DSV4_BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
 
@@ -287,9 +298,11 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       mbarrier_arrive_expect_tx(sm.mbar_full(buf), DSV4_BULK_TX_BYTES);
     }
 
-    // Issue cp.async.bulk for NoPE (448 B/entry) + RoPE (128 B/entry).
-    // Bulk completion decrements mbar tx; phase flips when arrival count
-    // (1, by leader above) AND tx=0 both met.
+    // Issue cp.async.bulk for NoPE (fp8: 448 B/entry; nvfp4: 224 packed B/entry,
+    // landed at row offset +224 for the consumer's in-place expand) + RoPE (128
+    // B/entry, directly after the stored nope region in gmem). Bulk completion
+    // decrements mbar tx; phase flips when arrival count (1, by leader above)
+    // and tx=0 are both met.
 #pragma unroll
     for (int eo = 0; eo < DSV4_BI; eo += DSV4_IO_THREADS) {
       const int entry_idx = eo + lane;
@@ -301,10 +314,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base =
           section_kv + (size_t)block_idx_g * section_stride + (size_t)local_idx_g * IO_STRIDE;
-      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
-                        DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + D_NOPE,
-                        DSV4_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE + DSV4_BULK_DST_OFF,
+                        data_base, DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
+      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C,
+                        data_base + NOPE_STORAGE_BYTES, DSV4_BULK_ROPE_BYTES, sm.mbar_full(buf));
     }
   };
 
@@ -371,6 +384,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     uint8_t* sm_kv_fp8 = sm.kv_fp8(buf);
     uint8_t* sm_kv_sc = sm.kv_sc(buf);
     bf16* sm_kv_rope = sm.kv_rope(buf);
+
+    if constexpr (KV_IS_NVFP4) {
+      // Expand this tile's packed E2M1 nope (at row[224:448)) in place to the full
+      // 448B fp8 layout. Each warp expands its own 8 candidate rows; the math-wide
+      // barrier that separates P from XV orders the cross-warp XV reads.
+      nvfp4_expand_rows_warp<KV_SMEM_STRIDE>(sm_kv_fp8, warp_id * DSV4_ENTRIES_PER_WARP, lane);
+      bar_sync_t<3, DSV4_MATH_THREADS>();
+    }
 
     // ── Stage 2 QK ────────────────────────────────────────────
     float qk[DSV4_QK_N_TILES][4] = {0};
