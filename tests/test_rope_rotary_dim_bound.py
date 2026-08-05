@@ -67,9 +67,7 @@ def test_rotary_dim_exceeds_head_dim_raises(name, caller, rotary_dim):
         caller(rotary_dim, device="cpu")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs GPU for kernel"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU for kernel")
 @pytest.mark.parametrize("name,caller", WRAPPERS, ids=WRAPPER_IDS)
 def test_rotary_dim_equal_head_dim_does_not_raise_bound(name, caller):
     # rotary_dim == head_dim: the bound guard must NOT fire. The kernel itself
@@ -78,3 +76,57 @@ def test_rotary_dim_equal_head_dim_does_not_raise_bound(name, caller):
         caller(HEAD_DIM, device="cuda")
     except ValueError as e:
         pytest.fail(f"bound guard fired for {name} with rotary_dim==head_dim: {e}")
+
+
+def _mismatched_rope_inputs(device, dtype=torch.float16):
+    """q.head_dim=128, k.head_dim=64: the bound guard must consider min(q, k),
+    not just q, or the K path reads past one K head (silent cross-head corruption)."""
+    nnz, nq, nk = 2, 2, 2
+    q = torch.zeros((nnz, nq, 128), dtype=dtype, device=device)
+    k = torch.zeros((nnz, nk, 64), dtype=dtype, device=device)
+    indptr = torch.tensor([0, nnz], dtype=torch.int32, device=device)
+    offsets = torch.zeros((nnz,), dtype=torch.int32, device=device)
+    pos_ids = torch.arange(nnz, dtype=torch.int32, device=device)
+    return q, k, indptr, offsets, pos_ids
+
+
+def _call_mismatched_apply_rope_inplace(device):
+    q, k, indptr, offsets, _ = _mismatched_rope_inputs(device)
+    flashinfer.apply_rope_inplace(q, k, indptr, offsets, rotary_dim=128)
+
+
+def _call_mismatched_apply_rope_pos_ids_inplace(device):
+    q, k, _, _, pos_ids = _mismatched_rope_inputs(device)
+    flashinfer.apply_rope_pos_ids_inplace(q, k, pos_ids, rotary_dim=128)
+
+
+def _call_mismatched_apply_llama31_rope_inplace(device):
+    q, k, indptr, offsets, _ = _mismatched_rope_inputs(device)
+    flashinfer.apply_llama31_rope_inplace(q, k, indptr, offsets, rotary_dim=128)
+
+
+def _call_mismatched_apply_llama31_rope_pos_ids_inplace(device):
+    q, k, _, _, pos_ids = _mismatched_rope_inputs(device)
+    flashinfer.apply_llama31_rope_pos_ids_inplace(q, k, pos_ids, rotary_dim=128)
+
+
+MISMATCHED_WRAPPERS = [
+    ("apply_rope_inplace", _call_mismatched_apply_rope_inplace),
+    ("apply_rope_pos_ids_inplace", _call_mismatched_apply_rope_pos_ids_inplace),
+    ("apply_llama31_rope_inplace", _call_mismatched_apply_llama31_rope_inplace),
+    (
+        "apply_llama31_rope_pos_ids_inplace",
+        _call_mismatched_apply_llama31_rope_pos_ids_inplace,
+    ),
+]
+MISMATCHED_IDS = [name for name, _ in MISMATCHED_WRAPPERS]
+
+
+@pytest.mark.parametrize("name,caller", MISMATCHED_WRAPPERS, ids=MISMATCHED_IDS)
+def test_rotary_dim_exceeds_k_head_dim_raises_on_mismatched_qk(name, caller):
+    # [P1] lazypool: the bound guard previously checked q only, so q.head_dim=128,
+    # k.head_dim=64, rotary_dim=128 passed the guard and the K path read past one
+    # K head (the stated silent cross-head corruption). The guard must consider
+    # min(q, k). Runs without a GPU because the guard fires pre-kernel.
+    with pytest.raises(ValueError, match=r"head_dim .* must be >= rotary_dim"):
+        caller(device="cpu")
