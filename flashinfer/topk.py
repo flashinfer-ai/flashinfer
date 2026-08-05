@@ -684,6 +684,7 @@ def top_k_page_table_transform(
     dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
     page_table_row_starts: Optional[torch.Tensor] = None,
+    *,
     page_size: int = 1,
     out: Optional[torch.Tensor] = None,
     out_raw_indices: Optional[torch.Tensor] = None,
