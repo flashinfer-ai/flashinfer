@@ -17,6 +17,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    List,
     Optional,
     Sequence,
     TypeAlias,

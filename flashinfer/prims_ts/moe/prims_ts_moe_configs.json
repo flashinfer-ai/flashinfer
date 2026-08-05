@@ -465,6 +465,7 @@
             "dtype_a": ["mxe2m1", "mxe4m3"],
             "fused_act,act,eltwise_act_type": [
                 [true, "swiglu", "none"],
+                [true, "geglu", "none"],
                 [false, "none", "relu2"]
             ],
             "sf_layout_b": "linear",
@@ -501,6 +502,7 @@
             "dtype_a": ["mxe2m1", "mxe4m3"],
             "fused_act,act,eltwise_act_type": [
                 [true, "swiglu", "none"],
+                [true, "geglu", "none"],
                 [false, "none", "relu2"]
             ],
             "sf_layout_b": "linear",
@@ -520,6 +522,7 @@
             "dtype_a": ["mxe2m1", "mxe4m3"],
             "fused_act,act,eltwise_act_type": [
                 [true, "swiglu", "none"],
+                [true, "geglu", "none"],
                 [false, "none", "relu2"]
             ],
             "sf_layout_b": "linear",

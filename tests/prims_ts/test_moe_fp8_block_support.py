@@ -32,6 +32,7 @@ from flashinfer.tllm_enums import (
     WeightLayout,
 )
 
+
 def _runner(**overrides):
     values = dict(
         dtype_act=DtypeTrtllmGen.MxE4m3,
@@ -49,6 +50,7 @@ def _runner(**overrides):
     values.update(overrides)
     return SimpleNamespace(**values)
 
+
 def _inputs(**overrides):
     values = dict(
         hidden_states=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
@@ -58,6 +60,7 @@ def _inputs(**overrides):
     )
     values.update(overrides)
     return SimpleNamespace(**values)
+
 
 def _first_buildable_pair(mapper, tile_n, **kwargs):
     for config_index in range(512):
@@ -69,6 +72,7 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
             continue
         return pair
     pytest.fail(f"no buildable tactic found for tile_N={tile_n}")
+
 
 def test_mxfp8_mxfp8_mapper_supports_tile256():
     pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
@@ -86,6 +90,22 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
     assert not fc2.has_epilogue_quant
+
+
+def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
+    pair = _first_buildable_pair(
+        map_trtllm_mxfp8_mxfp8_moe_tactic,
+        8,
+        activation_type=int(ActivationType.Geglu),
+        num_tokens=1024,
+        top_k=8,
+        num_local_experts=128,
+    )
+
+    assert pair.tile_n == 8
+    assert pair.fc1.cfg.kwargs["act_kind"] == 2
+    assert pair.fc2.cfg.kwargs["act_kind"] == 0
+    assert pair.fc1.cfg.build().uses_mxfp8_output_quant
 
 
 @pytest.mark.parametrize("tile_n", [8, 16, 32, 64, 128])
@@ -109,6 +129,7 @@ def test_deepseek_fp8_mapper_supports_trtllm_tile_ladder(tile_n):
     assert fc2.dtype_c_kind != fc1.dtype_c_kind
     assert fc2.num_stages_c_smem == 1
 
+
 def test_fp8_per_tensor_mapper_supports_no_per_token_sfb_tile8():
     pair = _first_buildable_pair(
         map_trtllm_fp8_per_tensor_moe_tactic,
@@ -129,6 +150,7 @@ def test_fp8_per_tensor_mapper_supports_no_per_token_sfb_tile8():
     assert fc1.use_per_token_sf_b == 0
     assert fc2.use_per_token_sf_a == 0
     assert fc2.use_per_token_sf_b == 0
+
 
 def test_fp8_per_tensor_mapper_uses_sfa_and_fc1_sfb_tile8():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
@@ -268,9 +290,11 @@ def test_deepseek_fp8_mapper_default_matches_trtllm_fallback(
 
     assert pair.tile_n == expected_tile_n
 
+
 def test_deepseek_fp8_mapper_rejects_trtllm_unsupported_tile256():
     with pytest.raises(ValueError, match="DeepSeek FP8 tile_N=256"):
         map_trtllm_deepseek_fp8_moe_tactic([256, 0])
+
 
 def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -292,6 +316,7 @@ def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):
     assert ok
     assert reason == ""
 
+
 def test_mxfp8_block_support_accepts_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
     monkeypatch.setattr(support, "_device_supports_prims_ts", lambda device: True)
@@ -310,6 +335,7 @@ def test_mxfp8_block_support_accepts_bias(monkeypatch):
 
     assert ok
     assert reason == ""
+
 
 def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -330,6 +356,7 @@ def test_deepseek_fp8_support_rejects_oa_params(monkeypatch):
 
     assert not ok
     assert "DeepSeek FP8 Prims-TS OA params" in reason
+
 
 def test_deepseek_fp8_support_rejects_bias(monkeypatch):
     monkeypatch.setattr(support, "is_prims_ts_available", lambda: True)
@@ -353,6 +380,7 @@ def test_deepseek_fp8_support_rejects_bias(monkeypatch):
     assert not ok
     assert "DeepSeek FP8 Prims-TS bias" in reason
 
+
 def test_fp8_block_routing_resolver_accepts_unpacked_precomputed():
     hidden_states = torch.empty((4, 128), dtype=torch.bfloat16)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
@@ -369,6 +397,7 @@ def test_fp8_block_routing_resolver_accepts_unpacked_precomputed():
     assert routing_logits is None
     assert resolved_ids is topk_ids
     assert resolved_weights is topk_weights
+
 
 def test_fp8_block_routing_resolver_rejects_unpacked_fp32_weights():
     hidden_states = torch.empty((4, 128), dtype=torch.bfloat16)

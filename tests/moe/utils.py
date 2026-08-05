@@ -32,6 +32,7 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
+    RoutingMethodType,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -198,18 +199,19 @@ def skip_checks(
             f"{weight_processing['layout']} weight layout"
         )
     if moe_gemm_backend == MoeGemmBackend.PRIMS_TS:
-        is_supported_prims_impl = type(moe_impl).__name__ == "BF16Moe" or (
-            is_fp4_moe
-            and moe_impl.quant_mode
-            in (
-                QuantMode.FP4_NVFP4_NVFP4,
-                QuantMode.FP4_MXFP4_MXFP8,
-                QuantMode.FP4_MXFP4_Bf16,
+        is_supported_prims_impl = (
+            type(moe_impl).__name__ == "BF16Moe"
+            or (
+                is_fp4_moe
+                and moe_impl.quant_mode
+                in (
+                    QuantMode.FP4_NVFP4_NVFP4,
+                    QuantMode.FP4_MXFP4_MXFP8,
+                    QuantMode.FP4_MXFP4_Bf16,
+                )
             )
-        ) or (
-            type(moe_impl).__name__ == "FP8PerTensorMoe"
-        ) or (
-            is_fp8_block_scale_moe
+            or (type(moe_impl).__name__ == "FP8PerTensorMoe")
+            or (is_fp8_block_scale_moe)
         )
         if not is_supported_prims_impl:
             pytest.skip(
@@ -225,10 +227,9 @@ def skip_checks(
         if gemm1_lora_delta is not None:
             pytest.skip("Prims-TS MoE GEMM1 LoRA delta is not supported yet")
         routing_method_type = routing_config["routing_method_type"]
-        if (
-            type(moe_impl).__name__ == "BF16Moe"
-            and routing_method_type
-            in (RoutingMethodType.Sigmoid, RoutingMethodType.DeepSeekV3)
+        if type(moe_impl).__name__ == "BF16Moe" and routing_method_type in (
+            RoutingMethodType.Sigmoid,
+            RoutingMethodType.DeepSeekV3,
         ):
             pytest.skip(
                 "Prims-TS BF16 MoE Sigmoid and DeepSeekV3 routing are not supported yet"
@@ -243,10 +244,7 @@ def skip_checks(
             pytest.skip(
                 "Prims-TS FP8 per-tensor DeepSeekV3 routing requires a gated activation"
             )
-        if (
-            is_fp8_block_scale_moe
-            and routing_config.get("num_fused_shared_experts", 0)
-        ):
+        if is_fp8_block_scale_moe and routing_config.get("num_fused_shared_experts", 0):
             pytest.skip(
                 "Prims-TS FP8 block-scale fused shared experts are not supported yet"
             )
