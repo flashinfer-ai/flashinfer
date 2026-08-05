@@ -118,7 +118,7 @@ class MoEEpMegaLayer(nn.Module):
     @property
     def supports_output_view(self) -> bool:
         """Whether ``forward(return_workspace_view=True)`` is supported."""
-        return self._kernel.supports_output_view()
+        return self._kernel.supports_output_view
 
     def warmup(self, t: Optional["MoEEpTensors"] = None) -> None:
         """Run one full eager forward so ``forward`` becomes graph-capturable.
