@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from numbers import Real
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
@@ -65,8 +66,14 @@ def get_seed_and_offset(
 
 
 @functools.cache
+def get_blackwell_softmax_module():
+    """Build and retain the raw module used by the API and evidence hooks."""
+    return gen_blackwell_softmax_module().build_and_load()
+
+
+@functools.cache
 def get_blackwell_softmax_op():
-    module = gen_blackwell_softmax_module().build_and_load()
+    module = get_blackwell_softmax_module()
 
     @register_custom_op(
         "flashinfer::blackwell_softmax", mutates_args=("workspace_buffer",)
@@ -78,6 +85,7 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
+        is_sm103: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
@@ -92,6 +100,7 @@ def get_blackwell_softmax_op():
             temperature_val,
             enable_pdl,
             temperature_is_none,
+            is_sm103,
         )
         return probs
 
@@ -103,16 +112,56 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
+        is_sm103: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
     return blackwell_softmax
 
 
+_BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512 = 4
+
+
+def _blackwell_softmax_route_for_testing(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    enable_pdl: bool = False,
+) -> int:
+    """Return the C++ dispatcher route ID without launching a kernel."""
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    maybe_temperature_arr, temperature_val, temperature_is_none = (
+        _validate_softmax_temperature(logits, temperature)
+    )
+    logits_fp32 = logits.float()
+    temperature_fp32 = (
+        maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
+    )
+    return int(
+        get_blackwell_softmax_module().softmax_route(
+            logits_fp32,
+            temperature_fp32,
+            temperature_val,
+            enable_pdl,
+            temperature_is_none,
+        )
+    )
+
+
+@functools.cache
+def _blackwell_softmax_capability(device_index: int) -> Tuple[int, int]:
+    return torch.cuda.get_device_capability(device_index)
+
+
 @functools.cache
 def _supports_blackwell_softmax(device_index: int) -> bool:
-    major, minor = torch.cuda.get_device_capability(device_index)
+    major, minor = _blackwell_softmax_capability(device_index)
     return major == 10 and minor in (0, 3)
+
+
+@functools.cache
+def _is_sm103(device_index: int) -> bool:
+    return _blackwell_softmax_capability(device_index) == (10, 3)
 
 
 @functools.cache
@@ -724,6 +773,54 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
+_SOFTMAX_TEMPERATURE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
+
+
+def _validate_softmax_temperature(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]],
+) -> Tuple[Optional[torch.Tensor], float, bool]:
+    """Validate and normalize the public Softmax temperature argument."""
+    if temperature is None:
+        return None, 1.0, True
+
+    if isinstance(temperature, torch.Tensor):
+        if temperature.ndim != 1:
+            raise ValueError(
+                "temperature tensor must be 1D with one value per logits row, "
+                f"got shape {tuple(temperature.shape)}"
+            )
+        expected_rows = logits.size(0)
+        if temperature.size(0) != expected_rows:
+            raise ValueError(
+                "temperature tensor length must equal logits.size(0) "
+                f"({expected_rows}), got {temperature.size(0)}"
+            )
+        if temperature.device != logits.device:
+            raise ValueError(
+                "temperature tensor must be on the same device as logits "
+                f"({logits.device}), got {temperature.device}"
+            )
+        if temperature.dtype not in _SOFTMAX_TEMPERATURE_DTYPES:
+            raise ValueError(
+                "temperature tensor must have dtype float16, bfloat16, float32, "
+                f"or float64, got {temperature.dtype}"
+            )
+        return temperature, 0.0, False
+
+    if isinstance(temperature, bool) or not isinstance(temperature, Real):
+        raise TypeError(
+            "temperature must be None, a real scalar, or a 1D floating-point "
+            "tensor with one value per logits row"
+        )
+    return None, float(temperature), False
+
+
 def _validate_and_convert_seed_offset(
     seed: Union[int, torch.Tensor],
     offset: Union[int, torch.Tensor],
@@ -797,11 +894,13 @@ def softmax(
     Parameters
     ----------
     logits : torch.Tensor
-        Input tensor of logits.
+        Two-dimensional CUDA tensor of logits.
     temperature: Optional[Union[torch.Tensor, float]]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
         If a scalar, the same temperature is used for all requests.
-        If a tensor, each request has its own temperature.
+        If a tensor, each request has its own temperature. The tensor must be on
+        the same CUDA device as ``logits`` and have dtype float16, bfloat16,
+        float32, or float64.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
@@ -830,16 +929,18 @@ def softmax(
             [0.2401, 0.1707, 0.2249, 0.1664, 0.1979],
             [0.1724, 0.2719, 0.1991, 0.1465, 0.2101]], device='cuda:0')
     """
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+
+    maybe_temperature_arr, temperature_val, temperature_is_none = (
+        _validate_softmax_temperature(logits, temperature)
+    )
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
-    temperature_is_none = temperature is None
-    if temperature is None:
-        temperature = 1.0
 
     # Auto-detect PDL support if not specified
     if enable_pdl is None:
         enable_pdl = device_support_pdl(logits.device)
 
-    temperature_args = _to_tensor_scalar_tuple(temperature)
     device_index = logits.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -847,15 +948,18 @@ def softmax(
         return get_blackwell_softmax_op()(
             workspace_buffer,
             logits,
-            *temperature_args,
+            maybe_temperature_arr,
+            temperature_val,
             enable_pdl,
             temperature_is_none,
+            _is_sm103(device_index),
         )
 
     return get_sampling_module().softmax(
         workspace_buffer,
         logits,
-        *temperature_args,
+        maybe_temperature_arr,
+        temperature_val,
         enable_pdl,
     )
 

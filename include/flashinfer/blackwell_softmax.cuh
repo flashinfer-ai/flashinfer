@@ -17,12 +17,18 @@
 
 #include <cuda_runtime.h>
 
-// Frozen from Cake measured checkpoint 924403cd62ea6dc160ffcea63c944d1e828d393a
-// and retained byte-for-byte by MR474 cleanup d77b50ee1e56fb3701a512f1dd2765e6067b1be2.
-// Weave sm_100a and sm_103a output is byte-identical for all three kernels:
+// The three original generated payloads came from Cake checkpoint
+// 924403cd62ea6dc160ffcea63c944d1e828d393a and MR474 cleanup
+// d77b50ee1e56fb3701a512f1dd2765e6067b1be2. Their pre-integration Weave
+// sm_100a and sm_103a output was byte-identical:
 //   bootstrap: sha256:46049370dbd905ff7234d414745d197f883157c8edc01d83230562b4dff5f862
 //   rowwise:   sha256:e47f82923112e143173f32dbb145986f8c9a1503fd2bb71f22f5c065769162e3
 //   warp:      sha256:8bc9df2b57d4e6021d0add03110a11f0cbb3bab1218e94d00d92f4bbf597ee9e
+// Integration adds standard integer types, sm_103a-only PDL device control,
+// and a CUDA <12.9 2x128-bit fallback for bootstrap's 256-bit inline PTX.
+// The additive sm_103a 32K specialization comes from Cake f120b38798:
+//   mr515 exp2 t512/vec4 raw generated payload:
+//   sha256:8ca2513545faf9cb960c6393fb48f4c9f4598a781ad9c929e8d88ebda738a89b
 
 extern "C" {
 
@@ -39,5 +45,9 @@ __global__ void kernel_flashinfer_blackwell_softmax_followup_warp(float* logits,
                                                                   int vocab_size,
                                                                   int parameter_kind,
                                                                   float scalar_temperature);
+
+__global__ void kernel_mr474_manual_softmax_exp2_t512_vec4(float* logits, float* temperature,
+                                                           float* output,
+                                                           float scalar_temperature);
 
 }  // extern "C"
