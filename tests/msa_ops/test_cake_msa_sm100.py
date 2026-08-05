@@ -50,6 +50,7 @@ def _attention_case(
     selection_mode: str = "random_valid",
     force_fused: bool | None = None,
     cuda_graph: bool = False,
+    use_workspace: bool = True,
 ) -> dict[str, Any]:
     return {
         "operation": operation,
@@ -73,6 +74,7 @@ def _attention_case(
         "selection_mode": selection_mode,
         "force_fused": force_fused,
         "cuda_graph": cuda_graph,
+        "use_workspace": use_workspace,
     }
 
 
@@ -204,6 +206,7 @@ CASES = [
             causal=True,
             seed=24,
             force_fused=True,
+            use_workspace=False,
         ),
         id="decode-flat-bf16-q4-k4",
     ),
@@ -222,8 +225,9 @@ CASES = [
             causal=True,
             seed=25,
             force_fused=True,
+            use_workspace=False,
         ),
-        id="decode-flat-bf16-q4-k4-ragged-tail",
+        id="decode-flat-bf16-q4-k4-ragged-fallback",
     ),
     pytest.param(
         _attention_case(
@@ -240,6 +244,7 @@ CASES = [
             causal=True,
             seed=26,
             force_fused=True,
+            use_workspace=False,
         ),
         id="decode-flat-bf16-q8-k32",
     ),
@@ -978,14 +983,91 @@ def _invoke_attention(
     return (value,)
 
 
-def test_cuda_graph_decode_route_uses_flat_allocation_bound() -> None:
+@pytest.mark.parametrize(
+    ("seqlen_q", "kv_lens"),
+    [
+        pytest.param(4, [1024] * 8, id="q4-kv1024"),
+        pytest.param(8, [4096] * 8, id="q8-kv4096"),
+    ],
+)
+def test_eager_decode_route_uses_m64_for_block_aligned_kv(
+    seqlen_q: int, kv_lens: list[int]
+) -> None:
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops._cake_sm100 import _select_decode_route
+
+    q = torch.empty(
+        (len(kv_lens) * seqlen_q, 16, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k = torch.empty((sum(kv_lens), 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    cu_k = _indptr(kv_lens, device)
+    lengths = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+    route = _select_decode_route(
+        q=q,
+        k=k,
+        cu_k=cu_k,
+        kv_lens=lengths,
+        group_size=16,
+        seqlen_q=seqlen_q,
+        paged=False,
+        force_fused=True,
+        workspace=None,
+        route_key=("block-aligned-m64", seqlen_q),
+        capturing=False,
+    )
+
+    assert route == ("m64", False, None)
+
+
+@pytest.mark.parametrize(
+    "kv_lens",
+    [
+        pytest.param([129, 257], id="ragged"),
+        pytest.param([129, 127], id="aligned-total-ragged-sequences"),
+        pytest.param([65 * BLOCK_SIZE], id="over-64-block-limit"),
+    ],
+)
+def test_eager_decode_route_uses_m128_outside_m64_domain(
+    kv_lens: list[int],
+) -> None:
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops._cake_sm100 import _select_decode_route
+
+    q = torch.empty(
+        (len(kv_lens) * 4, 16, HEAD_DIM), dtype=torch.bfloat16, device=device
+    )
+    k = torch.empty((sum(kv_lens), 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    cu_k = _indptr(kv_lens, device)
+    lengths = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+    route = _select_decode_route(
+        q=q,
+        k=k,
+        cu_k=cu_k,
+        kv_lens=lengths,
+        group_size=16,
+        seqlen_q=4,
+        paged=False,
+        force_fused=True,
+        workspace=None,
+        route_key=("outside-m64-domain", tuple(kv_lens)),
+        capturing=False,
+    )
+
+    assert route == ("m128", False, None)
+
+
+def test_cuda_graph_decode_route_uses_m128() -> None:
     device = _require_supported_gpu()
     from flashinfer.msa_ops import MSASparseAttentionWorkspace
     from flashinfer.msa_ops._cake_sm100 import _select_decode_route
 
     workspace = MSASparseAttentionWorkspace(device)
     q = torch.empty((4, 16, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    k = torch.empty((8193, 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
+    k = torch.empty((4096, 1, HEAD_DIM), dtype=torch.bfloat16, device=device)
     cu_k = torch.tensor([0, 4096], dtype=torch.int32, device=device)
     kv_lens = torch.tensor([4096], dtype=torch.int32, device=device)
 
@@ -999,7 +1081,7 @@ def test_cuda_graph_decode_route_uses_flat_allocation_bound() -> None:
         paged=False,
         force_fused=True,
         workspace=workspace,
-        route_key=("allocation-bound-regression",),
+        route_key=("graph-stable-m128",),
         capturing=False,
     )
 
@@ -1038,7 +1120,9 @@ def test_sm100_sm103_msa_public_api_correctness(case: dict[str, Any]) -> None:
         return
 
     inputs = _make_attention_inputs(case, device)
-    workspace = MSASparseAttentionWorkspace(device=device)
+    workspace = (
+        MSASparseAttentionWorkspace(device=device) if inputs["use_workspace"] else None
+    )
     run = lambda: _invoke_attention(  # noqa: E731
         inputs, workspace, msa_sparse_attention, msa_sparse_decode_attention
     )

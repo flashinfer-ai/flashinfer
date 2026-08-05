@@ -79,8 +79,10 @@ _topk_warmed_devices: set[tuple[int, str]] = set()
 _topk_warmed_devices_lock = threading.Lock()
 _eager_decode_dummies: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
 _eager_decode_dummies_lock = threading.Lock()
-_flat_kv_max_cache: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int, int]] = {}
-_flat_kv_max_cache_lock = threading.Lock()
+_flat_kv_route_cache: dict[
+    int, tuple[weakref.ReferenceType[torch.Tensor], int, int, bool]
+] = {}
+_flat_kv_route_cache_lock = threading.Lock()
 
 
 def is_cake_msa_device(device: torch.device | str) -> bool:
@@ -413,8 +415,17 @@ def _decode_default_offsets(
     return offsets
 
 
-def _max_flat_kv_length(cu_k: torch.Tensor, kv_lens: torch.Tensor) -> int:
-    """Resolve and cache a stable indptr tensor's maximum sequence length."""
+def _flat_kv_route_properties(
+    cu_k: torch.Tensor, kv_lens: torch.Tensor
+) -> tuple[int, bool]:
+    """Resolve and cache the properties used by the eager M64 route."""
+
+    def resolve() -> tuple[int, bool]:
+        lengths = kv_lens.cpu().tolist()
+        return (
+            max(lengths, default=0),
+            all(length % _BLOCK_SIZE == 0 for length in lengths),
+        )
 
     tensor_id = id(cu_k)
     try:
@@ -422,23 +433,28 @@ def _max_flat_kv_length(cu_k: torch.Tensor, kv_lens: torch.Tensor) -> int:
     except RuntimeError:
         # Tensors created in inference mode do not expose a version counter,
         # so their contents cannot be cached safely.
-        return int(kv_lens.max().item())
-    with _flat_kv_max_cache_lock:
-        cached = _flat_kv_max_cache.get(tensor_id)
+        return resolve()
+    with _flat_kv_route_cache_lock:
+        cached = _flat_kv_route_cache.get(tensor_id)
         if cached is not None and cached[0]() is cu_k and cached[1] == version:
-            return cached[2]
-    maximum = int(kv_lens.max().item())
-    with _flat_kv_max_cache_lock:
-        if len(_flat_kv_max_cache) >= 64:
+            return cached[2], cached[3]
+    maximum, block_aligned = resolve()
+    with _flat_kv_route_cache_lock:
+        if len(_flat_kv_route_cache) >= 64:
             dead_keys = [
-                key for key, value in _flat_kv_max_cache.items() if value[0]() is None
+                key for key, value in _flat_kv_route_cache.items() if value[0]() is None
             ]
             for key in dead_keys:
-                _flat_kv_max_cache.pop(key, None)
-            if len(_flat_kv_max_cache) >= 64:
-                _flat_kv_max_cache.clear()
-        _flat_kv_max_cache[tensor_id] = (weakref.ref(cu_k), version, maximum)
-    return maximum
+                _flat_kv_route_cache.pop(key, None)
+            if len(_flat_kv_route_cache) >= 64:
+                _flat_kv_route_cache.clear()
+        _flat_kv_route_cache[tensor_id] = (
+            weakref.ref(cu_k),
+            version,
+            maximum,
+            block_aligned,
+        )
+    return maximum, block_aligned
 
 
 def _validate_scale_arguments(
@@ -977,16 +993,13 @@ def _select_decode_route(
         )
         if folded_gqa16:
             use_m64 = False
-            if not paged and seqlen_q <= _M64_Q_TILE:
-                # A graph workspace may be replayed after metadata contents
-                # change. Only choose M64 there when the allocated flat cache
-                # itself proves every sequence fits its 64-block range.
-                max_kv_len = (
-                    int(k.shape[0])
-                    if workspace is not None
-                    else _max_flat_kv_length(cu_k, kv_lens)
-                )
-                use_m64 = max_kv_len <= 64 * _BLOCK_SIZE
+            # M64 is the eager fast path for block-aligned KV sequences. A
+            # graph workspace may be replayed after cu_k contents change, and
+            # the flat allocation shape cannot prove per-sequence alignment,
+            # so workspace-backed calls conservatively use M128.
+            if not paged and seqlen_q <= _M64_Q_TILE and workspace is None:
+                max_kv_len, block_aligned = _flat_kv_route_properties(cu_k, kv_lens)
+                use_m64 = block_aligned and max_kv_len <= 64 * _BLOCK_SIZE
             if use_m64:
                 return "m64", False, None
             return "m128", False, None
