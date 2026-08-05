@@ -108,7 +108,6 @@ _ENV_VAR_EXCLUSIONS = {
 #   os.environ.get("X")            os.environ["X"]
 #   os.getenv("X")                 "X" in os.environ
 #   std::getenv("X")               getenv("X")
-#   env_var_name = "X"             # name-then-use indirect read
 _ENV_VAR_READ_RE = re.compile(
     r"""(?xs)
     (?:
@@ -122,12 +121,13 @@ _ENV_VAR_READ_RE = re.compile(
 _ENV_VAR_DOCREF_RE = re.compile(r"FLASHINFER_[A-Z][A-Z_0-9]*")
 
 
-def collect_env_vars_in_code() -> set[str]:
-    found: set[str] = set()
+def collect_env_var_reads_in_code() -> dict[str, tuple[str, int]]:
+    """Map each environment variable to a deterministic source location."""
+    found: dict[str, tuple[str, int]] = {}
     for root in (FLASHINFER_PKG, CSRC_DIR):
         if not root.exists():
             continue
-        for fp in root.rglob("*"):
+        for fp in sorted(root.rglob("*")):
             if not fp.is_file():
                 continue
             if fp.suffix not in (".py", ".cu", ".cuh", ".cpp", ".cc", ".h", ".hpp"):
@@ -139,9 +139,15 @@ def collect_env_vars_in_code() -> set[str]:
             for m in _ENV_VAR_READ_RE.finditer(text):
                 # Any of the alternation groups may have matched.
                 name = m.group(1) or m.group(2) or m.group(3)
-                if name:
-                    found.add(name)
-    return found - _ENV_VAR_EXCLUSIONS
+                if name and name not in _ENV_VAR_EXCLUSIONS and name not in found:
+                    path = str(fp.relative_to(FLASHINFER_ROOT))
+                    line = text.count("\n", 0, m.start()) + 1
+                    found[name] = (path, line)
+    return found
+
+
+def collect_env_vars_in_code() -> set[str]:
+    return set(collect_env_var_reads_in_code())
 
 
 def collect_env_vars_in_claude_md() -> set[str]:
@@ -152,15 +158,18 @@ def collect_env_vars_in_claude_md() -> set[str]:
 
 
 def check_env_vars_consistency() -> list[Finding]:
-    code = collect_env_vars_in_code()
+    code_reads = collect_env_var_reads_in_code()
     doc = collect_env_vars_in_claude_md()
     out: list[Finding] = []
-    missing_in_doc = sorted(code - doc)
+    missing_in_doc = sorted(set(code_reads) - doc)
     for v in missing_in_doc:
+        path, line = code_reads[v]
         out.append(
             Finding(
                 check=ENV_VARS_CONSISTENCY,
-                location="CLAUDE.md",
+                location=f"{path}:{line}",
+                file=path,
+                line=line,
                 message=f"env var read in code but not documented: {v}",
             )
         )

@@ -384,7 +384,8 @@ def main(argv: list[str]) -> int:
                 "findings": [asdict(f) for f in findings],
             },
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
     print(f"\nWrote: {out_json}")
 
@@ -425,7 +426,7 @@ def main(argv: list[str]) -> int:
             lines.append(
                 f"- **FAIL** `{f.module}.{f.symbol}` ({f.file}:{f.line}) — {f.message}"
             )
-    out_md.write_text("\n".join(lines))
+    out_md.write_text("\n".join(lines), encoding="utf-8")
     print(f"Wrote: {out_md}")
 
     return 0 if not findings else 1

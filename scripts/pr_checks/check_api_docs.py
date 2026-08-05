@@ -295,7 +295,9 @@ def write_json(results, out_path: Path):
         "summary": {"total_missing": total_missing, "total_stale": total_stale},
         "modules": results,
     }
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"JSON report saved: {out_path}")
 
 
@@ -335,7 +337,7 @@ def write_markdown(results, out_path: Path):
     if total_missing == 0 and total_stale == 0:
         lines.append("All documented modules are in sync with code.")
 
-    out_path.write_text("\n".join(lines))
+    out_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"Markdown report saved: {out_path}")
 
 
