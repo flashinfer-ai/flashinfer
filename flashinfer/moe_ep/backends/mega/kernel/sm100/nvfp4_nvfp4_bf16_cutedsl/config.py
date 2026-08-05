@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig:
+class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """Kernel params for ``kernel_src.cutedsl_megamoe.nvfp4_mega_moe``.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``

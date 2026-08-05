@@ -22,7 +22,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from .config import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+from .config import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 from .staging import (
     stage_mega_moe_inputs,
     staged_tokens,
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
@@ -46,9 +46,9 @@ def _resolve_gate_up_clamp(config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig) -> fl
 
 @register_mega_kernel("sm90_fp8_fp8_bf16_pull_cutedsl")
 class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig) -> None:
+    def __init__(self, config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
-        self._kernel_config: Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig = config
+        self._kernel_config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig = config
 
     @classmethod
     def kernel_name(cls) -> str:

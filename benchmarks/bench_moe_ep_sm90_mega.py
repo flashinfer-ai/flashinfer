@@ -263,10 +263,10 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
 
 
 def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
-    from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
     swap_ab = operand_order == "swap_ab"
-    return Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=args.intermediate,
         top_k=args.top_k,
         kind=args.kind,

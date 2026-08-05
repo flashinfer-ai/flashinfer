@@ -22,7 +22,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
-from .config import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
+from .config import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
 from .weights import (
     TransformedMegaWeights,
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _resolve_gate_up_clamp(config: Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig) -> float | None:
+def _resolve_gate_up_clamp(config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
     return config.activation_clamp
@@ -42,9 +42,9 @@ def _resolve_gate_up_clamp(config: Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig) -> f
 
 @register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl")
 class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig) -> None:
+    def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
-        self._kernel_config: Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig = config
+        self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_state: tuple | None = None
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.

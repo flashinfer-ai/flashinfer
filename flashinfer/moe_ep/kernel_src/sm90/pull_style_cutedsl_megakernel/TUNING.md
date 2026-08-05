@@ -129,7 +129,7 @@ this is the top e2e lever (see "Next levers").
 ## The knob surface (no tuner yet)
 
 The SM90 tree has **no `tuner.py` / `autotune.py` / knob-cache** — geometry
-and behavior knobs are explicit `Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig` fields, resolved
+and behavior knobs are explicit `Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig` fields, resolved
 once per session at workspace allocation:
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static

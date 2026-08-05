@@ -7,7 +7,7 @@ from typing import Literal
 
 
 @dataclass
-class Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig:
+class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     """Kernel params for ``kernel_src.sm90.pull_style_cutedsl_megakernel.hopper_fp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching the SM100 configs

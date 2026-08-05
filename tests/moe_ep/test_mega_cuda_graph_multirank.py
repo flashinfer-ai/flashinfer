@@ -44,7 +44,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         MoEEpLayer,
         MoEEpMegaLayer,
         MoEEpTensors,
-        Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         MoEWeightPack,
         ensure_moe_ep_cuda_device,
     )
@@ -62,7 +62,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         ),
         weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
         backend=MegaConfig(
-            megakernel=Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
+            megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],

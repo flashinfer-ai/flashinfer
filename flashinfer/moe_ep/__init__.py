@@ -39,27 +39,27 @@ from .algo_knobs import (
     HandleAlgoKnobUserStream,
 )
 from .backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm import (
-    Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
+    Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
     preprocess_mega_weights,
 )
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
-    Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig,
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
-    Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig,
+    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
-    Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig,
+    Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
-DeepGemmMegaMoeConfig = Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig
-Mxfp8CutedslMegaMoeConfig = Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
-Nvfp4CutedslMegaMoeConfig = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
-Sm90PullFp8MegaMoeConfig = Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+DeepGemmMegaMoeConfig = Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig
+Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
 from .config import (
     BootstrapConfig,
@@ -127,7 +127,7 @@ __all__ = [
     "BootstrapConfig",
     "CombineInputParams",
     "CombineOutput",
-    "Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig",
+    "Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig",
     "DeepGemmMegaMoeConfig",
     "Mxfp8CutedslMegaMoeConfig",
     "Nvfp4CutedslMegaMoeConfig",
@@ -167,13 +167,13 @@ __all__ = [
     "MoEWeightPack",
     "PrequantizedMoEWeights",
     "UnquantizedMoEWeights",
-    "Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig",
+    "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
-    "Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig",
+    "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
     "QuantType",
-    "Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig",
+    "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",

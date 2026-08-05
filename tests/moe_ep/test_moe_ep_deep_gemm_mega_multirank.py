@@ -194,7 +194,7 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     import deep_gemm
     import torch
 
-    from flashinfer.moe_ep import Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep import Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig, preprocess_mega_weights
     from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
@@ -229,7 +229,7 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
 
     y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
     kernel = DeepGemmMegaKernelBackend(
-        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
+        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(
             intermediate_size=problem["intermediate"],
             top_k=problem["topk"],
             activation_clamp=problem["activation_clamp"],
@@ -253,7 +253,7 @@ def _run_mega_layer(rank, world_size):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
+        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpLayer,
@@ -278,7 +278,7 @@ def _run_mega_layer(rank, world_size):
         ),
         weights=weights,
         backend=MegaConfig(
-            megakernel=Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
+            megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],
@@ -494,7 +494,7 @@ def _run_mega_torch_oracle(rank, world_size):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig,
+        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
         preprocess_mega_weights,
     )
@@ -543,7 +543,7 @@ def _run_mega_torch_oracle(rank, world_size):
             n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
         )
         kernel = DeepGemmMegaKernelBackend(
-            Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig(
+            Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],

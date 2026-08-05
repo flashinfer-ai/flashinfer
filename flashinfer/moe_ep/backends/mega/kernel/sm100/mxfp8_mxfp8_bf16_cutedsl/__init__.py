@@ -1,10 +1,10 @@
 from .backend import Mxfp8CutedslMegaKernelBackend
-from .config import Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig
+from .config import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 from .weights import TransformedMegaWeights, preprocess_mega_weights
 
 __all__ = [
     "Mxfp8CutedslMegaKernelBackend",
-    "Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig",
+    "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedMegaWeights",
     "preprocess_mega_weights",
 ]

@@ -345,9 +345,9 @@ def _assert_ikr_close(y, y_ref, *, topk):
 
 
 def _megakernel_config(problem: dict, *, in_kernel_fc2_reduce: bool = False):
-    from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
-    return Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         kind=problem["kind"],
@@ -817,10 +817,10 @@ def test_sm90_pull_fp8_preprocess_mega_weights_from_bf16():
 
 
 def test_sm90_pull_fp8_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     assert kernel.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"

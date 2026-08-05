@@ -7,7 +7,7 @@ from typing import Literal
 
 
 @dataclass
-class Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig:
+class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     """Kernel params for ``kernel_src.cutedsl_megamoe.mxfp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.

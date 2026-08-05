@@ -316,7 +316,7 @@ misses) — both are the right behavior as long as internal drops carry the
   2048 tokens, fb4 + reuse_dispatch_warps at >=2048 (-14.5% at 2048:
   1010.6 vs 1181.6 us kernel-mode; supersedes the 07-14 "dispatch-warp is
   ~5% slower for MXFP8" reading, which conflated it with fb8).
-- Backend configs (`Nvfp4/Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig.knobs`): explicit dict
+- Backend configs (`Nvfp4/Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the
@@ -511,7 +511,7 @@ before comparing MoE backends.
 
 Imported from TRT-LLM PR #16190, both idea families are
 plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
-(`Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig`):
+(`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`):
 
 - `in_kernel_fc2_reduce` — in-flight top-k combine via cross-rank REDG
   atomic-add; its main win is that the multi-GB per-topk combine staging
@@ -600,7 +600,7 @@ editable-installed inside the container
 ranks per (variant, token-count) point — every point pays a fresh
 `cute.compile` (amortized by cute's on-disk cache).  Variants selected
 with the bench env knobs `MEGA_IKR=1` / `MEGA_COMBINE_DTYPE=nvfp4|mxfp8`
-(mapped onto `Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig`); knobs left at the default
+(mapped onto `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`); knobs left at the default
 per-size heuristic profiles (`tuner.default_knobs`), which the quantized
 wires auto-adjust to dispatch-warp token-back.
 

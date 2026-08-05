@@ -373,7 +373,7 @@ def _assert_ikr_close(y, y_ref, *, topk):
 
 
 def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_extra):
-    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
     kwargs = dict(
         intermediate_size=problem["intermediate"],
@@ -388,7 +388,7 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
             fc1_norm_const=problem["fc1_norm_const"],
         )
     kwargs.update(config_extra)
-    return Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(**kwargs)
+    return Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**kwargs)
 
 
 def _run_mega_layer(
@@ -573,7 +573,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with on-the-fly bf16→NVFP4 staging.
 
     Per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are supplied
-    via :class:`Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig` (workspace allocation).
+    via :class:`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` (workspace allocation).
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -1086,21 +1086,21 @@ def test_nvfp4_cutedsl_staging_uses_input_norm_const():
 
 
 def test_nvfp4_cutedsl_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
 def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         in_kernel_fc2_reduce=True,
@@ -1108,7 +1108,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
-    cfg_q = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
+    cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         combine_dtype="nvfp4",

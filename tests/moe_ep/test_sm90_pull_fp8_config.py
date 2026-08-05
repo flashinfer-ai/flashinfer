@@ -16,7 +16,7 @@ import dataclasses
 
 import pytest
 
-from flashinfer.moe_ep import Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90PullFp8MegaKernelBackend,
 )
@@ -26,8 +26,8 @@ from flashinfer.moe_ep.core.kernel.registry import (
 )
 
 
-def _config(**overrides) -> Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig:
-    return Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig(intermediate_size=1024, top_k=4, **overrides)
+def _config(**overrides) -> Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=1024, top_k=4, **overrides)
 
 
 class TestSm90PullFp8Config:
@@ -66,9 +66,9 @@ class TestSm90PullFp8Config:
     def test_public_reexports(self) -> None:
         import flashinfer.moe_ep as moe_ep
 
-        assert moe_ep.Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig is Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig
+        assert moe_ep.Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig is Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
         assert callable(moe_ep.preprocess_sm90_pull_fp8_mega_weights)
-        assert "Sm90Fp8Fp8Bf16PullCutedslMegaMoeConfig" in moe_ep.__all__
+        assert "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig" in moe_ep.__all__
         assert "preprocess_sm90_pull_fp8_mega_weights" in moe_ep.__all__
 
 

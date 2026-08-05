@@ -48,8 +48,8 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         MegaConfig,
         MoEEpMegaLayer,
         MoEWeightPack,
-        Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig,
-        Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     num_experts = 4
@@ -75,11 +75,11 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
     )
 
     if backend_name == "nvfp4":
-        mk = Sm100Nvfp4Nvfp4Bf16CutedslMegaMoeConfig(
+        mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
     else:
-        mk = Sm100Mxfp8Mxfp8Bf16CutedslMegaMoeConfig(
+        mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
 

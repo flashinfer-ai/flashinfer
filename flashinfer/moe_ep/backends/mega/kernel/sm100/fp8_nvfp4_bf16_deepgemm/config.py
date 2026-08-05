@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class Sm100Fp8Nvfp4Bf16DeepgemmMegaMoeConfig:
+class Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig:
     """Kernel params for ``deep_gemm.fp8_fp4_mega_moe``."""
 
     intermediate_size: int
