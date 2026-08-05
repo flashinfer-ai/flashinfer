@@ -59,7 +59,7 @@ pip3 install --upgrade "$CUDA_PYTHON"
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]==4.7.0"
 else
   pip3 install --upgrade nvidia-cudnn-cu12
 fi
