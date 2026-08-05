@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -35,6 +36,49 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+
+namespace {
+
+// The trtllm-gen cubin manifest is a downloaded artifact, so which architectures
+// it actually covers is not knowable at compile time. Encode only the
+// cubin-arch -> SM-version compatibility rules here and let `config.mSm` decide
+// what is available. Unknown cubin families are rejected so that a newly shipped
+// one fails loudly instead of being mis-dispatched onto hardware that cannot run
+// it (see #4107).
+bool isArchCompatible(int smVersion, tg::CudaArch cubinArch) {
+  switch (cubinArch) {
+    case tg::CudaArch::Sm100a:
+      return smVersion == 100;
+    case tg::CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case tg::CudaArch::Sm103a:
+      return smVersion == 103;
+#ifdef TLLM_RUBIN_FEATURES
+    // CudaArch::Sm107a only exists in the Rubin cubin pin's generated headers,
+    // which is also the only build that defines TLLM_RUBIN_FEATURES. sm107 is
+    // unreachable in the non-Rubin module: get_trtllm_moe_sm100_module() picks
+    // the Rubin variant by device compute capability before this runs.
+    case tg::CudaArch::Sm107a:
+      return smVersion == 107;
+#endif
+    default:
+      return false;
+  }
+}
+
+void checkPassingConfigIndex(std::vector<int64_t> const& passingConfigIndices,
+                             int32_t configIndex) {
+  auto const it = std::find(passingConfigIndices.begin(), passingConfigIndices.end(), configIndex);
+  if (it == passingConfigIndices.end()) {
+    std::ostringstream msg;
+    msg << "Config index " << configIndex
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+    FLASHINFER_ERROR(msg.str());
+  }
+}
+
+}  // namespace
 
 std::vector<int64_t> prioritizePredefinedConfigs(
     int m, int n, int k, std::vector<int64_t> const& sortedIndices,
@@ -127,9 +171,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // block format's default dtype. Reject cubins that override that
       // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
       // scaling factors into a buffer sized for E4M3 factors.
-      if (tg::dtypeIsBlockFmt(options.mDtypeC)) {
-        if (options.mDtypeSfC != tg::dtypeGetBlockSfType(options.mDtypeC)) continue;
-      } else if (options.mDtypeSfC != Dtype::Void) {
+      //
+      // The published cubin packages predate BatchedGemmOptions::mDtypeSfC, so
+      // filter by kernel name instead: the offending kernels encode the linear
+      // FP32 output scale-factor dtype as the "E2m1xFp32" name token (present
+      // only in the sm_107a package). TODO: restore the typed mDtypeSfC check
+      // once packages carrying the field are published and pinned.
+      if (config.mFunctionName != nullptr &&
+          std::strstr(config.mFunctionName, "E2m1xFp32") != nullptr) {
         continue;
       }
       if (mOptions.usePerChannelScaling) {
@@ -144,13 +193,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
-      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
-      if (options.mPatchF2fp && sm_version == 103) {
-        if (config.mSm != tg::CudaArch::Sm103a) continue;
-      }
-      if (options.mPatchF2fp && sm_version == 100) {
-        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
-      }
+      if (!isArchCompatible(sm_version, config.mSm)) continue;
+      // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
+      if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
@@ -158,6 +203,23 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         mPassingConfigIndices.push_back(i);
       }
     }
+  }
+
+  if (mPassingConfigIndices.empty()) {
+    // Distinguish "this GPU has no cubins at all" from "no cubin matches these GEMM
+    // options". The former is the common failure on unsupported hardware, and the
+    // option dump below would send users looking in entirely the wrong place.
+    bool anyArchCompatible = false;
+    for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
+      if (isArchCompatible(sm_version, configs[i].mSm)) {
+        anyArchCompatible = true;
+        break;
+      }
+    }
+    std::ostringstream arch_msg;
+    arch_msg << "The trtllm-gen batched GEMM cubin manifest contains no kernels runnable on sm"
+             << sm_version << "; this backend currently ships cubins for sm100, sm103 and sm107.";
+    FLASHINFER_CHECK(anyArchCompatible, arch_msg.str());
   }
 
   std::ostringstream error_msg;
@@ -183,6 +245,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -226,7 +289,12 @@ void TrtllmGenBatchedGemmRunner::run(
   BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
+  auto const numConfigs = bmm.getNumBatchedGemmConfigs();
 
+  FLASHINFER_CHECK(
+      configIndex >= 0 && static_cast<size_t>(configIndex) < static_cast<size_t>(numConfigs),
+      "Config index", configIndex, "is out of range; the manifest has", numConfigs, "configs");
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 

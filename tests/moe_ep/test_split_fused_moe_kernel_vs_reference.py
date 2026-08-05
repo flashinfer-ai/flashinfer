@@ -26,6 +26,14 @@ from __future__ import annotations
 
 import pytest
 
+from flashinfer.fused_moe.api import (
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+)
+
 NUM_EXPERTS = 16
 TOP_K = 4
 NUM_TOKENS = 64
@@ -33,13 +41,16 @@ HIDDEN = 2048
 INTERMEDIATE = 1024
 
 
-def _require_blackwell():
+def _require_backend(config_cls):
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("trtllm-gen fused_moe requires SM100+")
+
+    major, minor = torch.cuda.get_device_capability()
+    arch = major * 10 + minor
+    if not config_cls.supported(arch):
+        pytest.skip(f"{config_cls.__name__} is not supported on sm{arch}")
 
 
 def _make_problem():
@@ -155,7 +166,7 @@ def _fp4_quant_dequant(t_2d_bf16):
 @pytest.mark.arch_blackwell
 def test_split_bf16_kernel_matches_torch_reference():
     """``trtllm_bf16_routed`` (all experts local) matches the fp32 torch oracle."""
-    _require_blackwell()
+    _require_backend(TrtllmBf16Config)
 
     import torch
 
@@ -202,7 +213,7 @@ def test_split_bf16_kernel_matches_torch_reference():
 @pytest.mark.arch_blackwell
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
-    _require_blackwell()
+    _require_backend(TrtllmFp4Config)
 
     import torch
 
@@ -265,3 +276,62 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     # at the gemm1→gemm2 round-trip dominate; 51/131072 cells past 5e-2).
     torch.testing.assert_close(yk, yr, rtol=5e-2, atol=0.15)
     assert rel_l2.item() < 0.05
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        (90, False),
+        (100, True),
+        (103, True),
+        (107, True),
+        (110, False),
+        (120, False),
+        (121, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "config_cls",
+    [TrtllmBf16Config, TrtllmFp4Config, TrtllmMxInt4Config],
+)
+def test_trtllm_routed_moe_supported_architectures(config_cls, arch, expected):
+    """CPU-only: lock down the backend support contract."""
+    assert config_cls.supported(arch) is expected
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        (90, False),
+        (100, True),
+        (103, True),
+        (107, False),
+        (110, False),
+        (120, False),
+        (121, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "config_cls",
+    [TrtllmFp8BlockConfig, TrtllmFp8PerTensorConfig],
+)
+def test_trtllm_routed_moe_fp8_supported_architectures(config_cls, arch, expected):
+    """CPU-only: the FP8 backends are SM100-family only, unlike FP4/BF16/MxInt4."""
+    assert config_cls.supported(arch) is expected
+
+
+def test_no_trtllm_routed_backend_claims_sm120():
+    """Regression guard for #4107: no trtllm-gen routed backend may claim SM120/121.
+
+    The batched-GEMM runner has no cubins there and aborts during construction, so a
+    backend that reports itself supported turns a fallback into a hard failure.
+    """
+    from flashinfer.fused_moe.api import _DEFAULT_BACKEND
+
+    for arch in (110, 120, 121):
+        claimed = [
+            type(c).__name__
+            for c in _DEFAULT_BACKEND
+            if type(c).__name__.startswith("Trtllm") and type(c).supported(arch)
+        ]
+        assert claimed == [], f"trtllm backends wrongly claim sm{arch}: {claimed}"

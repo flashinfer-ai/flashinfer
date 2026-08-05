@@ -1294,7 +1294,7 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
     """_make_tuning_config must return configs whose topk_ids initializer is the
     same object across calls and matches the launcher's routing representation.
     """
-    fn = core_mod.get_trtllm_moe_sm100_module
+    fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
         mock_module = MagicMock()

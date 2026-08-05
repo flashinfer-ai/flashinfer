@@ -223,16 +223,31 @@ class ExecutionConfig:
 # Backend configs — each declares hardware preconditions
 # ---------------------------------------------------------------------------
 
+# Architectures the TRT-LLM routed-MoE cubin manifest ships kernels for.  The
+# manifest is a downloaded artifact, so this cannot be derived at import time and
+# has to be kept in sync with the cubin-arch compatibility rules in
+# csrc/trtllm_batched_gemm_runner.cu.  SM110/120/121 need upstream cubins first;
+# claiming them here makes the batched-GEMM runner abort at dispatch (#4107).
+_TRTLLM_ROUTED_ARCHS = (100, 103, 107)
+
+# The FP8 kernels are validated on the SM100 family only — the outer JIT module
+# compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
+_TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
+
 
 @dataclass(frozen=True)
 class TrtllmFp4Config:
-    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes."""
+    """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
+
+    ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
+    restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
+    NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
+    and remains disabled on SM103.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # Current TRTLLM FP4 cubins are supported only on SM100/SM103.
-        # SM107 support from #4122 was reverted by #4171.
-        return arch in (100, 103)
+        return arch in _TRTLLM_ROUTED_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -293,10 +308,7 @@ class TrtllmFp8BlockConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM107 support from #4122 was reverted by #4171. The outer JIT can
-        # compile for major 12, but its FP8 kernels currently fail at runtime
-        # on SM120/121.
-        return arch in (100, 103)
+        return arch in _TRTLLM_ROUTED_FP8_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -346,7 +358,7 @@ class TrtllmFp8PerTensorConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103)
+        return arch in _TRTLLM_ROUTED_FP8_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -394,7 +406,7 @@ class TrtllmBf16Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103)
+        return arch in _TRTLLM_ROUTED_ARCHS
 
     @staticmethod
     def prepare_weights(
@@ -434,7 +446,33 @@ class TrtllmMxInt4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 100
+        # SM100/SM103 use the forward-compatible sm100f cubins; SM107 selects
+        # the dedicated Rubin artifact.
+        return arch in _TRTLLM_ROUTED_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build a ``trtllm_mxint4_routed`` view from canonical BF16 weights."""
+        from .prepare import prepare_trtllm_mxint4_weights
+
+        return prepare_trtllm_mxint4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"
@@ -611,12 +649,26 @@ ALL_BACKEND_CONFIGS = (
 
 @dataclass(frozen=True)
 class BackendOptions:
-    """Ordered list of backend candidates for dispatch / autotuning."""
+    """Ordered list of backend candidates for dispatch and autotuning.
+
+    Each backend config implements ``supported(arch)``, where ``arch`` uses the
+    CUDA compute-capability encoding documented by :meth:`valid_for`.
+    """
 
     candidates: Tuple[BackendConfigType, ...] = ()  # type: ignore[type-arg]
 
     def valid_for(self, arch: int) -> list:
-        """Return candidates whose hardware preconditions are met."""
+        """Return candidates whose hardware preconditions are met.
+
+        Parameters
+        ----------
+        arch : int
+            CUDA compute capability encoded as ``major * 10 + minor``. For
+            example, SM90 is ``90``, SM100 is ``100``, and SM103 is ``103``.
+            :class:`MoELayer` derives it from its selected CUDA device via
+            ``get_compute_capability(self.device)``. This is not a CUDA device
+            ordinal or CUDA toolkit version.
+        """
         return [c for c in self.candidates if c.__class__.supported(arch)]
 
     def __len__(self) -> int:
@@ -725,6 +777,8 @@ class MoEActivationPack:
     * W4A16 with ``TrtllmFp4Config``: raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
+      packed signed INT4 with BF16 block scales.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
@@ -747,8 +801,9 @@ class MoEActivationPack:
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
       back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
-      block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches a logits
-      pack only to capable backends (see each runner's ``supported_routing_modes``).
+      BF16, block-FP8, per-tensor-FP8, and MxInt4 runners support this mode;
+      ``MoELayer`` dispatches a logits pack only to capable backends (see each runner's
+      ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so

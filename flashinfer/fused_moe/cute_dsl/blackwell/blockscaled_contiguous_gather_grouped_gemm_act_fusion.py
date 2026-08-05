@@ -3656,6 +3656,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Skip unsupported A/B layout
         if not (a_major == "k" and b_major == "k"):
             can_implement = False
+        # N must not have a partial CTA tile (gh #3957 sibling): this kernel's
+        # SFC global store (autovec_copy -- see the epilogue TODO about the
+        # missing predicate) writes the full tile row with no column predicate,
+        # so a partial N-tile writes out of bounds past the intermediate
+        # buffer's row -- same class as the finalize kernel's bulk-reduce
+        # scatter OOB. Cluster padding along N cannot occur here: this kernel
+        # already requires cluster_shape_mn[1] == 1 above. M needs no
+        # analogue: rows are individually validity-guarded.
+        if n % mma_tiler_mn[1] != 0:
+            can_implement = False
         return can_implement
 
     @cute.jit

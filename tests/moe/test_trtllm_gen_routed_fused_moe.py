@@ -301,6 +301,44 @@ def test_trtllm_gen_routed_fused_moe(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize("num_experts", [128, 256])
+@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize(
+    "routing_method_type",
+    [
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+    ],
+)
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8"])
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+def test_trtllm_gen_routed_fused_moe_geglu(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    num_experts: int,
+    routing_method_type: RoutingMethodType,
+    quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8"],
+    routing_format: Literal["packed", "unpacked"],
+):
+    _run_trtllm_gen_routed_fused_moe_case(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        num_experts,
+        routing_method_type,
+        quant_mode,
+        routing_format,
+        ActivationType.Geglu,
+    )
+
+
 def test_trtllm_gen_routed_fused_moe_unpacked_fp32():
     # All quantization modes share this finalize path.
     _run_trtllm_gen_routed_fused_moe_case(
@@ -915,6 +953,7 @@ def test_trtllm_gen_mxint4_routed_fused_moe(
     "activation_type",
     [
         pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
         pytest.param(ActivationType.Relu2.value, id="Relu2"),
     ],
 )
