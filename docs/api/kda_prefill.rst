@@ -108,5 +108,7 @@ stream.
 When an explicit workspace is used with ``initial_state=None`` and
 ``output_final_state=True``, the returned final state is workspace-owned
 stable scratch. Otherwise an explicitly supplied ``initial_state`` is updated
-directly in place by the frozen kernel. The small-head ``H < 8`` path captures
-the beta copy into workspace-owned padded storage before the frozen launch.
+directly in place by the frozen kernel. Head counts that are not divisible by
+eight capture the beta copy into workspace-owned storage padded to the next
+eight-head boundary before the frozen launch. The public beta and state shapes
+keep the caller's original head count.
