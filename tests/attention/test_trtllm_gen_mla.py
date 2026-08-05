@@ -1,9 +1,11 @@
-import pytest
-import torch
-import torch.nn.functional as F
 import random
 
+import pytest
+import torch
+
+from benchmarks.mla.reference import MLAReferenceContract, mla_paged_attention_reference
 import flashinfer
+from flashinfer.mla._batch_mla._backends import trtllm_gen_backend
 from flashinfer.mla import (
     MLALayerDimensions,
     deepseek_mla_dimensions,
@@ -256,30 +258,32 @@ def torch_reference_mla(
     c_rope = kv_flat[:, kv_lora_rank:]
     q_nope = query[..., :kv_lora_rank]
     q_rope = query[..., kv_lora_rank:]
-
-    outputs = []
-    for b in range(B):
-        seq_len = seq_lens[b].item()
-        num_pages = (seq_len + page_size - 1) // page_size
-        pages = block_tables[b, :num_pages]
-        kv_indices = []
-        for p in pages:
-            start = p.item() * page_size
-            kv_indices.extend(range(start, start + page_size))
-        kv_indices = kv_indices[:seq_len]
-        kv_idx_t = torch.tensor(kv_indices, device=query.device)
-
-        k_lat = c_latent[kv_idx_t]  # [seq_len, kv_lora_rank]
-        k_rope = c_rope[kv_idx_t]  # [seq_len, rope_dim]
-
-        attn_lat = torch.einsum("qhd,kd->qhk", q_nope[b].float(), k_lat.float())
-        attn_rope = torch.einsum("qhd,kd->qhk", q_rope[b].float(), k_rope.float())
-        attn = (attn_lat + attn_rope) * softmax_scale
-        attn = F.softmax(attn, dim=-1)
-        out_b = torch.einsum("qhk,kd->qhd", attn, k_lat.float()) * output_scale
-        outputs.append(out_b)
-
-    return torch.stack(outputs, dim=0)  # [B, q_len, H, kv_lora_rank]
+    qo_indptr = torch.arange(
+        0,
+        (B + 1) * q_len,
+        q_len,
+        device=query.device,
+        dtype=torch.int32,
+    )
+    output, _ = mla_paged_attention_reference(
+        q_nope=q_nope.flatten(0, 1),
+        q_pe=q_rope.flatten(0, 1),
+        ckv_cache=c_latent.view(-1, page_size, kv_lora_rank),
+        kpe_cache=c_rope.view(-1, page_size, qk_rope_head_dim),
+        qo_indptr=qo_indptr,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        page_size=page_size,
+        sm_scale=softmax_scale,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=output_scale,
+        contract=MLAReferenceContract(
+            kv_layout="independent-split",
+            output_dtype=torch.float32,
+            scale_mode="bmm-scalar",
+        ),
+    )
+    return output.view(B, q_len, H, kv_lora_rank)
 
 
 def trtllm_batch_decode_mla(
@@ -574,6 +578,7 @@ def trtllm_batch_decode_mla(
         sm_scale,
         q_ref.dtype,
         kv_cache.dtype,
+        kv_layout="adjacent-split",
     )
     q_nope = q_ref[..., : layer_dimensions.head_dimensions.kv_lora_rank].reshape(
         -1,
@@ -1327,12 +1332,22 @@ def test_trtllm_batch_decode_mla_native_block_table_width(
 def test_trtllm_batch_decode_mla_preallocated_out(
     q_len_per_request: int,
     batch_size: int,
+    monkeypatch,
 ):
     """Issue #2856: pre-allocated out tensor rejected when q_len_per_req > 1.
     The shape check hardcoded 3D but query is 4D for multi-token generation."""
     cc = get_compute_capability(torch.device("cuda"))
     if cc[0] != 10:
         pytest.skip("trtllm-gen MLA requires SM100/SM103")
+
+    def forbid_wrapper_construction(*args, **kwargs):
+        raise AssertionError("functional TRTLLM-GEN constructed the planned wrapper")
+
+    monkeypatch.setattr(
+        trtllm_gen_backend,
+        "_BatchMLAPagedAttentionTrtllmGenBackend",
+        forbid_wrapper_construction,
+    )
 
     device = "cuda:0"
     layer_dim = supported_mla_layer_dimensions[0]

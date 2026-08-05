@@ -1,4 +1,5 @@
 from collections import defaultdict
+import argparse
 
 import numpy as np
 import torch
@@ -21,7 +22,6 @@ except OSError as e:
     is_lib_missing = any(ext in error_msg for ext in [".so", ".dll"])
     if not is_lib_missing:
         raise
-from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import (
@@ -41,7 +41,9 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    sample_actual_seq_lens,
 )
+from .mla import testBatchMLAPagedAttentionWrapper
 
 
 def normalize_backends(backends):
@@ -66,6 +68,29 @@ def normalize_backends(backends):
         else:
             normalized.append(backend)
     return normalized
+
+
+def _parse_mla_optional_int(value):
+    if value.lower() == "none":
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an integer or 'none'") from exc
+
+
+def _parse_mla_lengths(value):
+    try:
+        lengths = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated integer list"
+        ) from exc
+    if not lengths or any(item == "" for item in value.split(",")):
+        raise argparse.ArgumentTypeError(
+            "expected a nonempty comma-separated integer list"
+        )
+    return lengths
 
 
 def run_attention_test(args):
@@ -121,8 +146,11 @@ def parse_attention_args(line, parser):
             "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
             "cute-dsl",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
+            "xqa",
         ],
-        help="Kernel backends to test. Default: fa2. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. BatchMLAPagedAttentionWrapper accepts its seven concrete wrapper backends plus auto; auto uses the stateful wrapper policy.",
     )
     parser.add_argument(
         "--page_size",
@@ -202,7 +230,10 @@ def parse_attention_args(line, parser):
         "--causal",
         action="store_true",
         default=False,
-        help="Causal masking. Note: not padding masking. Only used for prefill tests.",
+        help=(
+            "Causal masking. Note: not padding masking. Used for prefill tests "
+            "and forwarded to the MLA wrapper planner."
+        ),
     )
     parser.add_argument(
         "--spec_dec_mask",
@@ -228,41 +259,158 @@ def parse_attention_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported attention routines "
-            "(BatchMLAPagedAttentionWrapper with trtllm-native / cute-dsl). "
-            "Pre-tunes the kernel configuration before timing so the steady-state "
-            "measurement reflects the autotuned tactic."
+            "Enable autotuner warmup only for attention routines that support it. "
+            "BatchMLAPagedAttentionWrapper rejects this flag; future work will "
+            'use explicit backend="autotune" instead.'
         ),
     )
     parser.add_argument(
-        "--mla_is_var_seq",
-        choices=["true", "false", "auto"],
+        "--mla-lse-mode",
+        choices=["none", "base2", "basee"],
+        default="none",
+        help="MLA-only planned LSE mode.",
+    )
+    parser.add_argument(
+        "--mla-kv-layout",
+        choices=["combined", "adjacent-split", "independent-split"],
+        default="independent-split",
+        help="MLA-only planned KV-cache layout.",
+    )
+    parser.add_argument(
+        "--mla-output-scale",
+        choices=["none", "per-tensor"],
+        default="none",
+        help="MLA-only planned output scaling mode.",
+    )
+    parser.add_argument(
+        "--mla-scale-mode",
+        choices=["default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"],
+        default="default",
+        help="MLA-only planned input/runtime scale mode.",
+    )
+    parser.add_argument(
+        "--mla-skip-softmax",
+        action="store_true",
+        default=False,
+        help="MLA-only: request skip-softmax support in the planned contract.",
+    )
+    parser.add_argument(
+        "--mla-use-sinks",
+        action="store_true",
+        default=False,
+        help="MLA-only: plan and run per-head attention sinks.",
+    )
+    parser.add_argument(
+        "--mla-qk-nope-head-dim",
+        "--qk_nope_head_dim",
+        dest="qk_nope_head_dim",
+        type=_parse_mla_optional_int,
         default=None,
         help=(
-            "MLA-only: control the is_var_seq argument passed to "
-            "trtllm_batch_decode_with_kv_cache_mla, which selects the var-seq vs. "
-            "persistent scheduler (is_persistent = not is_var_seq). "
-            "'true'/'false' force the value; 'auto' resolves to --random_actual_seq_len. "
-            "If unset (default), is_var_seq is not passed and the API default (True) "
-            "is used, preserving existing behavior and perf baselines."
+            "MLA-only logical QK NoPE plan width. The same declaration is sent "
+            "to every requested backend; planner rejections remain result data."
         ),
     )
     parser.add_argument(
-        "--mla_cute_dsl_impl",
-        choices=["auto", "modular", "monolithic"],
+        "--mla-softmax-scale-qk-nope-head-dim",
+        type=int,
         default=None,
         help=(
-            "MLA-only: control the cute_dsl_impl argument passed to "
-            "trtllm_batch_decode_with_kv_cache_mla, selecting the CuTe DSL "
-            "decode implementation. 'auto' (API default) runs monolithic and "
-            "only promotes to modular for modular-only features (e.g. sinks); "
-            "'modular'/'monolithic' force that impl. If unset (default), "
-            "cute_dsl_impl is not passed and the API default ('auto') is used, "
-            "preserving existing behavior and perf baselines."
+            "MLA-only softmax-scale QK NoPE width. This changes only sm_scale; "
+            "it does not declare a logical qk_nope_head_dim to the planner."
         ),
     )
-
+    parser.add_argument(
+        "--mla-q-lengths",
+        type=_parse_mla_lengths,
+        default=None,
+        help="MLA-only exact per-request query lengths, as comma-separated integers.",
+    )
+    parser.add_argument(
+        "--mla-kv-lengths",
+        type=_parse_mla_lengths,
+        default=None,
+        help="MLA-only exact per-request KV lengths, as comma-separated integers.",
+    )
+    parser.add_argument(
+        "--mla-metadata-form",
+        choices=["csr", "dense", "dual"],
+        default="dual",
+        help="MLA-only canonical metadata form supplied to every requested planner.",
+    )
+    parser.add_argument(
+        "--mla-enable-pdl",
+        choices=["default", "true", "false"],
+        default="default",
+        help=(
+            "MLA-only tri-state PDL planner declaration. 'default' preserves "
+            "None; the shared --enable_pdl flag remains a true alias."
+        ),
+    )
     args = parser.parse_args(line)
+
+    if args.routine == "BatchMLAPagedAttentionWrapper" and args.autotune:
+        parser.error(
+            "--autotune is not supported for BatchMLAPagedAttentionWrapper; "
+            'future work will expose explicit backend="autotune".'
+        )
+    if args.routine == "BatchMLAPagedAttentionWrapper":
+        if len(args.backends) != len(set(args.backends)):
+            parser.error(
+                "BatchMLAPagedAttentionWrapper backend requests must be unique"
+            )
+        if args.qk_nope_head_dim is not None and args.qk_nope_head_dim <= 0:
+            parser.error("--mla-qk-nope-head-dim must be positive or 'none'")
+        if (
+            args.mla_softmax_scale_qk_nope_head_dim is not None
+            and args.mla_softmax_scale_qk_nope_head_dim <= 0
+        ):
+            parser.error("--mla-softmax-scale-qk-nope-head-dim must be positive")
+        if args.enable_pdl and args.mla_enable_pdl == "false":
+            parser.error("--enable_pdl conflicts with --mla-enable-pdl false")
+        args.enable_pdl = (
+            True
+            if args.enable_pdl or args.mla_enable_pdl == "true"
+            else False
+            if args.mla_enable_pdl == "false"
+            else None
+        )
+        if (args.mla_q_lengths is None) != (args.mla_kv_lengths is None):
+            parser.error(
+                "--mla-q-lengths and --mla-kv-lengths must be supplied together"
+            )
+        if args.mla_q_lengths is not None:
+            if len(args.mla_q_lengths) != len(args.mla_kv_lengths):
+                parser.error(
+                    "--mla-q-lengths and --mla-kv-lengths must have equal lengths"
+                )
+            if len(args.mla_q_lengths) != args.batch_size:
+                parser.error("exact MLA length lists must contain --batch_size entries")
+            if any(length <= 0 for length in args.mla_q_lengths):
+                parser.error("--mla-q-lengths entries must be positive")
+            if any(length < 0 for length in args.mla_kv_lengths):
+                parser.error("--mla-kv-lengths entries must be nonnegative")
+            if args.random_actual_seq_len:
+                parser.error(
+                    "exact MLA length lists cannot be combined with "
+                    "--random_actual_seq_len"
+                )
+        mla_backends = {
+            "fa2",
+            "fa3",
+            "cutlass",
+            "trtllm-gen",
+            "cute-dsl-monolithic",
+            "cute-dsl-modular",
+            "xqa",
+            "auto",
+        }
+        unsupported = sorted(set(args.backends) - mla_backends)
+        if unsupported:
+            parser.error(
+                "BatchMLAPagedAttentionWrapper supports exactly the seven concrete "
+                "wrapper backends plus auto; unsupported: " + ", ".join(unsupported)
+            )
 
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
@@ -271,35 +419,8 @@ def parse_attention_args(line, parser):
     return args
 
 
-def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len):
-    """
-    Get an array of actual sequence lengths for given batch size and max sequence length.
-    If random_actual_seq_len is True, sample actual sequence lengths randomly.
-    Otherwise, set all actual sequence lengths to max_seqlen.
-
-    Args:
-        max_seqlen: Maximum sequence length.
-        batch_size: Batch size.
-        device: Device to sample on.
-        random_actual_seq_len: Whether to sample actual sequence lengths randomly.
-
-    Returns:
-        actual_seq_lens: Actual sequence lengths for each batch.
-    """
-    if random_actual_seq_len:
-        actual_seq_lens = torch.randint(
-            1, max_seqlen + 1, (batch_size, 1, 1, 1), device=device, dtype=torch.int32
-        )
-    else:
-        actual_seq_lens = torch.full(
-            (batch_size, 1, 1, 1), max_seqlen, device=device, dtype=torch.int32
-        )
-    return actual_seq_lens
-
-
 def generate_speculative_mask(batch_size, q_seq_len, device, mask_mode="causal"):
     """Packed draft-block mask for speculative decode (q_len > 1).
-
     mask_mode "causal": draft token i attends to draft tokens j <= i;
     "full": every draft token attends to all draft tokens. The KV prefix is
     always fully visible. Returns [batch_size, q_seq_len,
@@ -2270,579 +2391,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["out_dtype"] = out_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
-                cur_res["case_tag"] = args.case_tag
-                res.append(cur_res)
-    return res
-
-
-def testBatchMLAPagedAttentionWrapper(args):
-    """
-    Test BatchMLAPagedAttentionWrapper and equivalent APIs.
-    Supports fa2, fa3, cutlass, and trtllm-native.
-
-    This test:
-    1. Creates paged query and key-value cache tensors
-    2. Runs MLA with different backends
-    3. Verifies outputs match between backends
-    4. Measures performance metrics (TFLOPS, TB/sec)
-
-    Args:
-        args: Parsed command line arguments containing test configuration
-
-    Returns:
-        dict: List of dictionaries containing performance results
-    """
-    if args.verbose >= 1:
-        print("[INFO] Running testBatchMLAPagedAttentionWrapper")
-        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
-
-    # Basic setup
-    device = get_device(args)
-    if args.generate_repro_command:
-        print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
-        )
-
-    q_init_dtype = torch.bfloat16
-    kv_init_dtype = torch.bfloat16
-    rtol = 2e-1
-    atol = 1e-2
-    res = []
-
-    # Handle different query data types.
-    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
-    if q_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
-        print(f"[ERROR] Unsupported q_dtype: {args.q_dtype}")
-        return res
-
-    # Handle different KV cache data types.
-    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
-    if kv_dtype not in [torch.bfloat16, torch.float8_e4m3fn]:
-        print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
-        return res
-
-    if args.out_dtype is not None:
-        print(
-            "[WARNING] --out_dtype is not yet supported for BatchMLAPagedAttentionWrapper; ignoring."
-        )
-
-    backends = args.backends
-    page_size = args.page_size
-    batch_size = args.batch_size
-    s_qo = args.s_qo
-    s_kv = args.s_kv
-    num_qo_heads = args.num_qo_heads
-    # num_kv_heads not used in MLA
-    # head_dim_qk = args.head_dim_qk
-    assert args.head_dim_ckv is not None, "head_dim_ckv must be provided for MLA"
-    assert args.head_dim_kpe is not None, "head_dim_kpe must be provided for MLA"
-    head_dim_ckv = args.head_dim_ckv
-    head_dim_kpe = args.head_dim_kpe
-    is_cuda_graph_compatible = not args.no_cuda_graph
-    causal = False  # False for MLA
-    run_refcheck = args.refcheck
-
-    # Resolve the MLA is_var_seq override (selects var-seq vs. persistent
-    # scheduler). None => do not pass is_var_seq to the API, keeping its default
-    # so existing cases and perf baselines are unchanged.
-    mla_is_var_seq_arg = getattr(args, "mla_is_var_seq", None)
-    if mla_is_var_seq_arg is None:
-        resolved_is_var_seq = None
-    elif mla_is_var_seq_arg == "auto":
-        resolved_is_var_seq = getattr(args, "random_actual_seq_len", False)
-    else:
-        resolved_is_var_seq = mla_is_var_seq_arg == "true"
-    # Only forwarded to the direct trtllm API when explicitly resolved.
-    mla_api_extra_kwargs = (
-        {} if resolved_is_var_seq is None else {"is_var_seq": resolved_is_var_seq}
-    )
-    # Resolve the MLA cute_dsl_impl override (selects modular vs. monolithic
-    # CuTe DSL decode kernel). None => do not pass cute_dsl_impl, keeping the
-    # API default ('auto') so existing cases and perf baselines are unchanged.
-    mla_cute_dsl_impl_arg = getattr(args, "mla_cute_dsl_impl", None)
-    if mla_cute_dsl_impl_arg is not None:
-        mla_api_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl_arg
-
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    # Check for backend-specific constraints
-    if "fa2" in backends:
-        remove_fa2 = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA2 backend does not support FP8. Skipping.")
-            remove_fa2 = True
-        if remove_fa2:
-            backends.remove("fa2")
-    if "fa3" in backends:
-        remove_fa3 = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA3 backend does not support FP8. Skipping.")
-            remove_fa3 = True
-        if remove_fa3:
-            backends.remove("fa3")
-    if "cutlass" in backends:
-        remove_cutlass = False
-        if page_size not in [32, 64]:
-            print(
-                "[INFO] Cutlass MLA backend only supports page size 32 or 64. Skipping."
-            )
-            remove_cutlass = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
-            remove_cutlass = True
-        if remove_cutlass:
-            backends.remove("cutlass")
-    if "trtllm-native" in backends:
-        remove_trtllm_native = False
-        if page_size not in [32, 64]:
-            print(
-                "[INFO] trtllm-native backend only supports page size 32 or 64. Skipping."
-            )
-            remove_trtllm_native = True
-        if remove_trtllm_native:
-            backends.remove("trtllm-native")
-    if "cute-dsl" in backends:
-        remove_cute_dsl = False
-        if num_qo_heads < 128:
-            print("[INFO] cute-dsl MLA backend requires num_heads >= 128. Skipping.")
-            remove_cute_dsl = True
-        if remove_cute_dsl:
-            backends.remove("cute-dsl")
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
-    # Storage for timing results and outputs
-    backend_times = {backend: [] for backend in backends}
-    outputs = {}
-
-    actual_seq_lens_kv = sample_actual_seq_lens(
-        s_kv, batch_size, device, args.random_actual_seq_len
-    )
-    sum_seq_kv = torch.sum(actual_seq_lens_kv).item()
-    avg_seq_len_kv = sum_seq_kv // batch_size
-
-    if args.verbose >= 1:
-        print(f"[VERBOSE] Average actual seq len: {avg_seq_len_kv}")
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {actual_seq_lens_kv.flatten() = }")
-
-    q_nope = torch.rand(
-        batch_size, num_qo_heads, head_dim_ckv, dtype=q_init_dtype, device="cuda"
-    )
-    q_pe = torch.zeros(
-        batch_size, num_qo_heads, head_dim_kpe, dtype=q_init_dtype, device="cuda"
-    )
-    q = torch.cat([q_nope, q_pe], dim=2)
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {q_nope.shape = }")
-        print(f"[VVERBOSE] {q_pe.shape = }")
-        print(f"[VVERBOSE] {q.shape = }")
-
-    # Create KV cache
-    num_pages_per_seq = (s_kv + page_size - 1) // page_size
-    total_num_pages = num_pages_per_seq * batch_size
-
-    # Now initialize the page tables
-    block_tables = torch.tensor(
-        [
-            [k + i * num_pages_per_seq for k in torch.randperm(num_pages_per_seq)]
-            for i in range(batch_size)
-        ],
-        dtype=torch.int,
-        device=device,
-    )
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {num_pages_per_seq = }")
-        print(f"[VVERBOSE] {total_num_pages = }")
-        print(f"[VVERBOSE] {block_tables.shape = }")
-
-    # Initialize KV cache with appropriate shape and stride
-    ckv_cache_shape = (
-        total_num_pages,
-        page_size,
-        head_dim_ckv,
-    )
-    ckv_cache = torch.randn(size=ckv_cache_shape, dtype=kv_init_dtype, device=device)
-
-    kpe_cache_shape = (
-        total_num_pages,
-        page_size,
-        head_dim_kpe,
-    )
-    kpe_cache = torch.randn(size=kpe_cache_shape, dtype=kv_init_dtype, device=device)
-    kv_cache = torch.cat([ckv_cache, kpe_cache], dim=2)
-
-    qo_indptr = torch.arange(0, batch_size + 1, device=device).int()
-    kv_indptr = (
-        torch.cat(
-            [
-                torch.tensor([0], device=device),
-                torch.cumsum(
-                    (actual_seq_lens_kv.flatten() + page_size - 1) // page_size, dim=0
-                ),
-            ]
-        )
-        .int()
-        .to(device)
-    )
-
-    # kv_indices[-1] is the total number of actual pages
-    kv_indices = torch.zeros(kv_indptr[-1], device=device, dtype=torch.int32)
-    for i in range(len(kv_indptr) - 1):
-        start_idx = kv_indptr[i]
-        end_idx = kv_indptr[i + 1]
-        kv_indices[start_idx:end_idx] = block_tables[i, : end_idx - start_idx]
-
-    sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
-    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
-    mla_multi_ctas_kv_counter_buffer = None
-    if "trtllm-native" in backends:
-        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-            batch_size, num_qo_heads, get_device_sm_count(device)
-        )
-        mla_multi_ctas_kv_counter_buffer = torch.zeros(
-            counter_bytes, dtype=torch.uint8, device=device
-        )
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] {ckv_cache.shape = }")
-        print(f"[VVERBOSE] {kpe_cache.shape = }")
-        print(f"[VVERBOSE] {kv_cache.shape = }")
-        print(f"[VVERBOSE] {qo_indptr.shape = }")
-        print(f"[VVERBOSE] {kv_indptr.shape = }")
-        print(f"[VVERBOSE] {kv_indices.shape = }")
-        print(f"[VVERBOSE] {actual_seq_lens_kv.shape = }")
-        print(f"[VVERBOSE] {sm_scale = }")
-        print(f"[VVERBOSE] {workspace_buffer.shape = }")
-
-    # Create wrapper
-    backend_wrappers = {}
-    for backend in backends:
-        if backend in ["fa2", "fa3", "cutlass"]:
-            backend_wrappers[backend] = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-                float_workspace_buffer=workspace_buffer,
-                use_cuda_graph=is_cuda_graph_compatible,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
-                backend=backend,
-            )
-            if backend != "cutlass":
-                backend_wrappers[backend].plan(
-                    qo_indptr=qo_indptr,
-                    kv_indptr=kv_indptr,
-                    kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
-                    num_heads=num_qo_heads,
-                    head_dim_ckv=head_dim_ckv,
-                    head_dim_kpe=head_dim_kpe,
-                    page_size=page_size,
-                    causal=causal,
-                    sm_scale=sm_scale,
-                    q_data_type=q_dtype,
-                    kv_data_type=kv_dtype,
-                )
-
-    if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        q = q.to(q_dtype)
-        q_pe = q_pe.to(q_dtype)
-        q_nope = q_nope.to(q_dtype)
-    if kv_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        ckv_cache = ckv_cache.to(kv_dtype)
-        kpe_cache = kpe_cache.to(kv_dtype)
-        kv_cache = kv_cache.to(kv_dtype)
-
-    def run_backend_wrapper(
-        backend,
-        q_nope,
-        q_pe,
-        ckv_cache,
-        kpe_cache,
-        q,
-        kv_cache,
-        workspace_buffer,
-        block_tables,
-        actual_seq_lens_kv,
-    ):
-        """
-        Run a single MLA decode backend and return its output tensor.
-
-        Dispatches to the BatchMLAPagedAttentionWrapper for fa2/fa3/cutlass or
-        to the direct trtllm_batch_decode_with_kv_cache_mla API for
-        trtllm-native/auto/cute-dsl. The trtllm/auto/cute-dsl branches also
-        forward the resolved MLA overrides (is_var_seq / cute_dsl_impl) via
-        mla_api_extra_kwargs.
-        """
-        if backend in ["fa2", "fa3"]:
-            # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
-            return backend_wrappers[backend].run(
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                page_table=block_tables,
-                return_lse=False,
-            )
-        elif backend == "cutlass":
-            # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl.
-            return backend_wrappers[backend].run(
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                kv_len=actual_seq_lens_kv.flatten(),
-                page_table=block_tables,
-                return_lse=False,
-            )
-        elif backend == "trtllm-native":
-            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
-                query=q.unsqueeze(1),
-                kv_cache=kv_cache.unsqueeze(1),
-                workspace_buffer=workspace_buffer,
-                qk_nope_head_dim=128,  # To-do: Why??
-                kv_lora_rank=head_dim_ckv,
-                qk_rope_head_dim=head_dim_kpe,
-                block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
-                backend="trtllm-gen",
-                enable_pdl=args.enable_pdl,
-                multi_ctas_kv_counter_buffer=mla_multi_ctas_kv_counter_buffer,
-                **mla_api_extra_kwargs,
-            ).squeeze(1)
-        elif backend == "auto":
-            # Autotune dispatcher: picks between trtllm-gen and cute-dsl per
-            # input shape. Becomes meaningful when combined with --autotune,
-            # which pre-tunes the cache before the timed bench loop.
-            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
-                query=q.unsqueeze(1),
-                kv_cache=kv_cache.unsqueeze(1),
-                workspace_buffer=workspace_buffer,
-                qk_nope_head_dim=128,
-                kv_lora_rank=head_dim_ckv,
-                qk_rope_head_dim=head_dim_kpe,
-                block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
-                backend="auto",
-                enable_pdl=args.enable_pdl,
-                **mla_api_extra_kwargs,
-            ).squeeze(1)
-        elif backend == "cute-dsl":
-            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
-                query=q.unsqueeze(1),
-                kv_cache=kv_cache.unsqueeze(1),
-                workspace_buffer=workspace_buffer,
-                qk_nope_head_dim=128,
-                kv_lora_rank=head_dim_ckv,
-                qk_rope_head_dim=head_dim_kpe,
-                block_tables=block_tables,
-                seq_lens=actual_seq_lens_kv.flatten(),
-                max_seq_len=s_kv,
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
-                backend="cute-dsl",
-                enable_pdl=args.enable_pdl,
-                **mla_api_extra_kwargs,
-            ).squeeze(1)
-        else:
-            print(f"[ERROR] Unsupported backend: {backend}")
-            return None
-
-    # Autotune warmup: pre-tunes supported backends so the steady-state bench
-    # reflects the chosen tactic rather than the fallback. Only the ``auto``
-    # backend has runner choice today (it profiles both trtllm-gen and cute-dsl
-    # internally).
-    autotune_supported_backends = {"auto"}
-    cache_path = getattr(args, "autotune_cache", None)
-    if getattr(args, "autotune", False):
-        warmup_iters = (
-            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
-        )
-        for cur_backend in backends:
-            if cur_backend in autotune_supported_backends:
-                if args.verbose >= 1:
-                    print(
-                        f"[INFO] Autotune warmup for BatchMLAPagedAttentionWrapper "
-                        f"backend={cur_backend}: {warmup_iters} iters"
-                    )
-                workspace_buffer.zero_()
-                with autotune(True, cache=cache_path):
-                    for _ in range(warmup_iters):
-                        run_backend_wrapper(
-                            cur_backend,
-                            q_nope,
-                            q_pe,
-                            ckv_cache,
-                            kpe_cache,
-                            q,
-                            kv_cache,
-                            workspace_buffer,
-                            block_tables,
-                            actual_seq_lens_kv,
-                        )
-    elif cache_path:
-        with autotune(False, cache=cache_path):
-            pass
-
-    has_reference_output = False
-    # Iterate over each backend:
-    for cur_backend in backends:
-        # Clear workspace buffer to prevent unexpected interactions between backends.
-        workspace_buffer.zero_()
-        if run_refcheck:
-            outputs[cur_backend] = (
-                run_backend_wrapper(
-                    cur_backend,
-                    q_nope,
-                    q_pe,
-                    ckv_cache,
-                    kpe_cache,
-                    q,
-                    kv_cache,
-                    workspace_buffer,
-                    block_tables,
-                    actual_seq_lens_kv,
-                )
-                .detach()
-                .clone()
-            )
-            if cur_backend == "fa2":
-                has_reference_output = True
-                reference_output = outputs[cur_backend]
-        backend_times[cur_backend] = bench_gpu_time(
-            fn=run_backend_wrapper,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            sleep_after_run=False,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
-            cold_l2_cache=True,
-            input_args=(
-                cur_backend,
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                q,
-                kv_cache,
-                workspace_buffer,
-                block_tables,
-                actual_seq_lens_kv,
-            ),
-        )
-
-    # Perform reference check
-    tested_backends = list(outputs.keys())
-    tested_outputs = list(outputs.values())
-    if len(tested_backends) > 1:
-        if run_refcheck and has_reference_output:
-            if reference_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-                reference_output = reference_output.to(torch.float32)
-                tested_outputs = [output.to(torch.float32) for output in tested_outputs]
-            for i in range(len(tested_outputs)):
-                (
-                    num_different_elements,
-                    num_elements,
-                    num_different_elements_percentage,
-                ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
-                if num_different_elements > 0:
-                    print(
-                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
-                        f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
-                    )
-                    if not args.allow_output_mismatch:
-                        raise AssertionError(
-                            f"[ERROR] Backend {tested_backends[i]} output mismatch"
-                        )
-    # Compute perf metrics
-    for backend in backends:
-        if len(backend_times[backend]) > 0:
-            median_time = np.median(backend_times[backend])
-            std_time = np.std(backend_times[backend])
-            actual_seq_lens_kv_flat = actual_seq_lens_kv.flatten().to("cpu")
-            actual_seq_lens_q_flat = torch.ones_like(
-                actual_seq_lens_kv.flatten().to("cpu")
-            )
-
-            # Query bytes (q_nope + q_pe): batch_size * num_heads * head_dim
-            q_mem_bytes = (
-                q_nope.numel() * q_nope.element_size()
-                + q_pe.numel() * q_pe.element_size()
-            )
-
-            # KV cache bytes: based on actual sequence lengths accessed, not full allocation
-            actual_kv_tokens = actual_seq_lens_kv_flat.sum().item()
-            kv_elem_size = ckv_cache.element_size()  # Same dtype for ckv and kpe
-            kv_mem_bytes = (
-                actual_kv_tokens * (head_dim_ckv + head_dim_kpe) * kv_elem_size
-            )
-
-            # Output bytes: batch_size * num_heads * head_dim_ckv
-            o_elem_size = q_nope.element_size()  # Output has same dtype as query
-            o_mem_bytes = batch_size * num_qo_heads * head_dim_ckv * o_elem_size
-
-            total_mem_bytes = q_mem_bytes + kv_mem_bytes + o_mem_bytes
-            tb_per_sec = total_mem_bytes / (median_time * 1e9)
-            tflops_total = (
-                2
-                * torch.dot(
-                    actual_seq_lens_q_flat.to(torch.float32),
-                    actual_seq_lens_kv_flat.to(torch.float32),
-                )
-                * num_qo_heads
-                * (2 * head_dim_ckv + head_dim_kpe)
-            )
-            tflops = (tflops_total / (median_time * 1e9)).item()
-
-            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
-
-            # TO-Do:
-            if args.output_path is not None:
-                cur_res = defaultdict(str)
-                cur_res["routine"] = args.routine
-                cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
-                cur_res["tflops"] = tflops
-                cur_res["tb_per_sec"] = tb_per_sec
-                cur_res["backend"] = backend
-                cur_res["page_size"] = page_size
-                cur_res["batch_size"] = batch_size
-                cur_res["s_qo"] = s_qo
-                cur_res["s_kv"] = s_kv
-                cur_res["num_qo_heads"] = num_qo_heads
-                cur_res["head_dim_ckv"] = head_dim_ckv
-                cur_res["head_dim_kpe"] = head_dim_kpe
-                cur_res["causal"] = False
-                cur_res["q_dtype"] = q_dtype
-                cur_res["kv_dtype"] = kv_dtype
-                cur_res["avg_actual_seq_len"] = avg_seq_len_kv
-                cur_res["random_actual_seq_len"] = args.random_actual_seq_len
-                # Leave empty (null) when not explicitly overridden so legacy
-                # var-seq rows keep matching historical null baselines.
-                if resolved_is_var_seq is not None:
-                    cur_res["is_var_seq"] = resolved_is_var_seq
-                # Same null-preserving rule for cute_dsl_impl.
-                if mla_cute_dsl_impl_arg is not None:
-                    cur_res["cute_dsl_impl"] = mla_cute_dsl_impl_arg
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

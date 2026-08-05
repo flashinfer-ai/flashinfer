@@ -19,7 +19,15 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
-        - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
+        - Benchmarks the stateful MLA wrapper for `fa2`, `fa3`, `cutlass`,
+          `trtllm-gen`, `cute-dsl-monolithic`, `cute-dsl-modular`, `xqa`, or
+          deterministic wrapper `auto`. Auto promotion is architecture-primary
+          product policy, not a total benchmark-derived performance order;
+          backend planners still determine exact support.
+    - `batch_mla_paged_attention` - Dense functional MLA decode.
+        - Benchmarks the public functional API separately for `auto`, `xqa`,
+          `trtllm-gen`, `cute-dsl`, `fa2`, `fa3`, and `cutlass`. It never
+          dispatches through the wrapper benchmark and does not include sparse MLA.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
@@ -166,14 +174,157 @@ $ python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --i
 [PERF] cuda           :: median time 0.016 ms; std 0.000 ms; achieved tflops 3.118 TFLOPs/sec; achieved tb_per_sec 3.150 TB/sec
 ```
 
+### MLA wrapper benchmark
+
+`BatchMLAPagedAttentionWrapper` uses one two-phase lifecycle for every
+requested backend. It first constructs, plans, and captures one synchronized
+output from every candidate, then computes the independent PyTorch reference
+from the same inputs. Each candidate whose output and optional LSE match that
+reference is admitted to warm, cold-L2, and optional CUDA-graph timing. If the
+reference cannot be computed, no candidate receives timing evidence. Candidate
+attempt order is randomized from `--random_seed`, but cannot affect the
+correctness reference. Incorrect outputs, planner rejections, and runtime
+failures have no timing evidence. The planner remains the source of truth for
+support.
+
+The runtime `auto` mode promotes FA3 on SM90, TRTLLM-GEN on SM100/SM103, and
+XQA on SM120/SM121; SM80/SM89 and unrecognized architectures retain a
+conservative FA2-first complete candidate list. This is product policy, not a
+total benchmark-derived performance order. Future measurements may justify
+architecture-local ordering changes; each backend planner remains authoritative
+for exact support.
+
+The MLA-only contract flags mirror wrapper planning:
+
+```bash
+python3 flashinfer_benchmark.py --routine BatchMLAPagedAttentionWrapper \
+  --backends fa2 fa3 cutlass trtllm-gen cute-dsl-monolithic \
+  cute-dsl-modular xqa auto --batch_size 8 --s_qo 2 --s_kv 1024 \
+  --page_size 64 --num_qo_heads 128 --num_kv_heads 1 \
+  --head_dim_ckv 512 --head_dim_kpe 64 --mla-qk-nope-head-dim 128 \
+  --mla-q-lengths 2,2,2,2,2,2,2,2 \
+  --mla-kv-lengths 1024,1024,1024,1024,1024,1024,1024,1024 \
+  --mla-metadata-form dual --mla-enable-pdl default \
+  --mla-lse-mode none --mla-kv-layout combined \
+  --mla-output-scale none --mla-scale-mode default
+```
+
+`--mla-lse-mode`, `--mla-kv-layout`, `--mla-output-scale`,
+`--mla-scale-mode`, and `--mla-skip-softmax` expose the five plan/run contract
+groups. `--mla-qk-nope-head-dim` declares one logical QK NoPE profile
+unchanged to every concrete backend and `auto`; the physical query remains
+`--head_dim_ckv` wide. Its value must be positive, or `none`; omitting it also
+declares `None`, which may make
+`trtllm-gen` unsupported, while `128` lets `auto` consider that backend and
+may make other planners unsupported. Those planner decisions remain output
+rows. The underscore spelling `--qk_nope_head_dim` remains an alias.
+
+The harness does not tune or update `backend="auto"` during a benchmark run.
+
+Exact `--mla-q-lengths` and `--mla-kv-lengths` avoid substituting a requested
+shape for a randomly observed ragged shape.
+`--mla-metadata-form` controls whether CSR, dense, or both equivalent forms
+reach every planner. `--mla-enable-pdl default` preserves a `None` plan
+declaration; `true` and `false` are explicit, while the shared `--enable_pdl`
+flag remains a true alias. Rows serialize this field uniformly as
+`default|true|false`. `--causal` is also forwarded to every MLA planner.
+`--autotune` is intentionally rejected for this routine; a future explicit
+`backend="autotune"` mode will own online tuning. MLA output rows include
+requested/resolved backend, explicit correctness, the declared QK NoPE width,
+structured status/reason, phase summaries with explicit sample counts
+(`cuda_graph_*` timings map to the `graph_replay` objective), workspace bytes,
+and
+`peak_memory_delta_bytes` when it is reliably available. Every candidate that
+survives capture retains a distinct 128 MiB workspace so later timing cannot
+alias another wrapper's state. The peak field is candidate-relative: it is the
+larger of the capture and timing CUDA allocator peaks after subtracting the
+bytes allocated at the start of that phase, rather than the process-wide peak.
+Only `_BackendPlanUnsupportedError` raised by `plan()` is an unsupported
+result; the same typed exception from construction, first run, output cloning,
+trace access, or timing is an error. Planning facts already produced by a
+successful plan, including `resolved_backend` and auto rejection trace, remain
+in that error row.
+
+CSV output uses the Python CSV writer for both headers and rows. Missing output
+columns are backfilled from the parsed routine arguments; values emitted by a
+routine are preserved. Both bare `--help` and selected-routine help exit
+successfully. A local run is not performance evidence.
+
+The correctness gate compares every candidate against the independent PyTorch
+reference. It does not infer correctness from agreement between concrete
+backends or from `auto` resolving to the same concrete implementation.
+
+### Functional MLA benchmark
+
+The functional routine benchmarks only calls through
+`flashinfer.mla.batch_mla_paged_attention`. It uses a separate
+name because functional `auto` and wrapper `auto` have different lifecycles
+and backend sets:
+
+```bash
+python3 flashinfer_benchmark.py \
+  --routine batch_mla_paged_attention \
+  --backends trtllm-gen cute-dsl fa2 fa3 cutlass auto \
+  --batch_size 2 --s_qo 1 --s_kv 512 --page_size 64 \
+  --num_qo_heads 128 --head_dim_ckv 512 --head_dim_kpe 64 \
+  --mla-qk-nope-head-dim 128 \
+  --mla-q-lengths 1,1 --mla-kv-lengths 512,384 \
+  --mla-is-var-seq false --mla-cute-dsl-impl auto \
+  --mla-enable-pdl default
+```
+
+Inputs are deterministic for `--random_seed`. Every requested backend is
+captured before any candidate is timed, and timing is published only after its
+output and optional LSE match the independent PyTorch reference. Unsupported,
+incorrect, reference-unavailable, and runtime-error rows retain their status
+but have no timing evidence.
+
+The routine preserves the public functional controls for variable query
+metadata, shared or duplicated page indices, PDL, LSE, sinks, skip-softmax
+threshold scaling, BMM scaling, and CuTe DSL implementation selection.
+`--autotune` is supported only when functional `auto` is requested: it profiles
+once under `flashinfer.autotune(True, cache=...)`, then captures and measures
+under `flashinfer.autotune(False, cache=...)`. Functional `auto` leaves
+`resolved_backend` empty because the public API does not expose an
+authoritative resolution trace.
+
+The public functional entrypoint performs backend planning on each call.
+Functional benchmarking therefore defaults to eager first-run, warm, and
+cold-L2 measurements. `--cuda-graph` explicitly requests the optional graph
+phase. If graph capture is unavailable, the row preserves correctness and
+eager timing, reports zero graph repetitions, and records the graph failure in
+`mla_reason`. Use the stateful wrapper benchmark when graph-replay performance
+is required.
+
+Functional rows map the warm median and standard deviation into the shared
+`median_time` and `std_time` columns while retaining detailed phase columns.
+The CSV header defines the expanded output contract.
+
+This is the supported replacement for the removed mixed functional/wrapper
+benchmark. Legacy command lines, CSV rows, and performance baselines are not
+reproduced. Packed sparse MLA remains out of scope and requires a separate
+benchmark.
+
 ### Batch Testing
 
 Run multiple tests from a file and save results:
 ```bash
-python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
+python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path /tmp/flashinfer-benchmark-output.csv
 ```
 
-See `samples/sample_testlist.txt` for an example stdout output from the above command; `samples/sample_testlist_output.csv` for csv output from the same run.
+For a repository checkout, prefer writing generated results outside the source
+tree:
+
+```bash
+python3 flashinfer_benchmark.py \
+  --testlist samples/sample_testlist.txt \
+  --output_path /tmp/flashinfer-benchmark-output.csv
+```
+
+`samples/sample_testlist.txt` is an executable command example, not a
+performance baseline. Generated CSV and stdout depend on the GPU architecture,
+CUDA/PyTorch/FlashInfer versions, and timing provider and are intentionally not
+checked in.
 
 The output CSV will contain detailed metrics including:
 - Median execution time
@@ -200,7 +351,7 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, cute-dsl, cublas, trtllm_low_latency. (`auto` currently supported for `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper`.)|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, cute-dsl, cublas, trtllm_low_latency. `auto` is supported for `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, and the deterministic architecture-preferred `BatchMLAPagedAttentionWrapper` routine. |
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -484,7 +635,11 @@ Notes:
 - Prefill pre-L2-normalizes k and calls the kernel with `use_qk_l2norm_in_kernel=False` so the kernel and reference see identical inputs.
 
 ## `flashinfer_benchmark.py` Routine & Backend Support Matrix
-The following table summarizes the support surface of each routine & backend's on various [CUDA Compute Capabilities](https://developer.nvidia.com/cuda-gpus).
+The following table summarizes each routine's declared backend capability on
+various [CUDA Compute Capabilities](https://developer.nvidia.com/cuda-gpus).
+It is not measured performance evidence: backend planners remain authoritative,
+and SM103/SM121 entries are unvalidated unless accompanied by separate runtime
+evidence.
 
 Each column represents a compute capability. Backends inside cells represent supported backends. A blank cell means no backend is supported for that routine at that compute capability.
 
@@ -505,7 +660,8 @@ Legend:
 | **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn |
 | **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native |
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native |
-| **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl | fa2, cutlass, trtllm-native | fa2 |
+| **BatchMLAPagedAttentionWrapper** |  | fa2, auto | fa2, auto | fa2, auto | fa2, fa3, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, auto | fa2, cutlass, trtllm-gen, cute-dsl-monolithic, cute-dsl-modular, auto | fa2, xqa, auto |
+| **batch_mla_paged_attention** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-gen, cute-dsl, auto | fa2, cutlass, trtllm-gen, cute-dsl, auto | fa2, xqa, auto |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |

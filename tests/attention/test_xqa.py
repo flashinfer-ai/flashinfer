@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer import xqa, xqa_mla
+from flashinfer import xqa
+from flashinfer.xqa import xqa_mla
 from flashinfer.utils import get_compute_capability
 
 

@@ -147,8 +147,12 @@ PageAttention for MLA
 .. autosummary::
     :toctree: ../generated
 
+    batch_mla_paged_attention
     trtllm_batch_decode_with_kv_cache_mla
     xqa_batch_decode_with_kv_cache_mla
+
+``xqa_batch_decode_with_kv_cache_mla`` is deprecated. Use
+``batch_mla_paged_attention(..., backend="xqa")`` instead.
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

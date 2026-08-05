@@ -106,7 +106,7 @@ def bench_trtllm_mla(
 
     # Run decode-MLA
     # warmup
-    flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(**common_kwargs)
+    flashinfer.mla.batch_mla_paged_attention(**common_kwargs)
     # benchmark
     # NOTE: cold_l2_cache=True is requested but silently degrades to warm-L2
     # because the inputs are captured in the lambda's closure rather than
@@ -116,9 +116,7 @@ def bench_trtllm_mla(
     # cross-backend comparisons remain fair, only absolute GB/s numbers
     # are optimistic vs. a real cold-cache serving workload.
     measurements = bench_gpu_time(
-        lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            **common_kwargs
-        ),
+        lambda: flashinfer.mla.batch_mla_paged_attention(**common_kwargs),
         dry_run_iters=5,
         repeat_iters=30,
         enable_cupti=False,

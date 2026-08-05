@@ -18,6 +18,7 @@ limitations under the License.
 
 import json
 from collections.abc import Callable
+import warnings
 from contextlib import suppress
 from pathlib import Path
 from typing import cast
@@ -976,6 +977,54 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
         "kv_lora_rank",
     ]
     assert ragged["inputs"]["max_q_len"]["shape"] is None
+
+
+@pytest.mark.parametrize(
+    ("api_name", "fi_api"),
+    (
+        (
+            "trtllm_batch_decode_with_kv_cache_mla",
+            "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+        ),
+        (
+            "batch_mla_paged_attention",
+            "flashinfer.mla._core.batch_mla_paged_attention",
+        ),
+    ),
+)
+def test_neutral_mla_public_apis_have_independent_single_trace_identity(
+    api_name, fi_api
+):
+    """A facade must retain one public trace node rather than nesting another API."""
+    import flashinfer.mla
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        definition = getattr(flashinfer.mla, api_name).fi_trace(
+            query=torch.empty(2, 1, 128, 576, dtype=torch.bfloat16),
+            kv_cache=torch.empty(4, 64, 576, dtype=torch.bfloat16),
+            workspace_buffer=torch.empty(1024, dtype=torch.int8),
+            qk_nope_head_dim=512,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens=torch.full((2,), 64, dtype=torch.int32),
+            max_seq_len=64,
+        )
+
+    _check_defn(definition, "mla_paged", fi_api)
+    assert [tag for tag in definition["tags"] if tag.startswith("fi_api:")] == [
+        f"fi_api:{fi_api}"
+    ]
+    deprecations = [
+        warning for warning in caught if warning.category is DeprecationWarning
+    ]
+    if api_name == "trtllm_batch_decode_with_kv_cache_mla":
+        assert len(deprecations) == 1
+        assert "use batch_mla_paged_attention" in str(deprecations[0].message)
+        assert deprecations[0].filename == __file__
+    else:
+        assert not deprecations
 
 
 # ---------------------------------------------------------------------------

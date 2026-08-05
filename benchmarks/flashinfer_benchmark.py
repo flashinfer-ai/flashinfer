@@ -1,4 +1,5 @@
 import argparse
+import csv
 import sys
 
 # Only import utilities at module level - routine modules are imported lazily
@@ -19,7 +20,11 @@ def run_test(args):
 
     ## Depending on routine type, route to corresponding test routine
     ## Imports are done lazily to avoid loading unnecessary dependencies
-    if args.routine in benchmark_apis["attention"]:
+    if args.routine in benchmark_apis["mla"]:
+        from routines.mla import run_mla_test
+
+        res = run_mla_test(args)
+    elif args.routine in benchmark_apis["attention"]:
         from routines.attention import run_attention_test
 
         res = run_attention_test(args)
@@ -76,7 +81,8 @@ def run_test(args):
 
     # Write results to output file if specified
     if args.output_path is not None:
-        with open(args.output_path, "a") as fout:
+        with open(args.output_path, "a", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
             for cur_res in res:
                 for key in full_output_columns:
                     # Backfill every output column the routine didn't set: from
@@ -85,11 +91,7 @@ def run_test(args):
                     # KeyError below.  Routine-set values are preserved.
                     if key not in cur_res or cur_res[key] == "":
                         cur_res[key] = getattr(args, key, "")
-
-                output_line = ",".join(
-                    [str(cur_res[col]) for col in full_output_columns]
-                )
-                fout.write(output_line + "\n")
+                writer.writerow([cur_res[col] for col in full_output_columns])
             fout.flush()
     return
 
@@ -107,13 +109,16 @@ def parse_args(line=sys.argv[1:]):
     """
 
     ## Shared arguments
-    parser = argparse.ArgumentParser()
+    # Delay installing --help until after routine dispatch. Otherwise the
+    # preliminary parse exits early and hides the selected routine's options.
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--routine",
         "-R",
         type=str,
-        required=True,
-        choices=list(benchmark_apis["attention"])
+        required=False,
+        choices=list(benchmark_apis["mla"])
+        + list(benchmark_apis["attention"])
         + list(benchmark_apis["gemm"])
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
@@ -128,6 +133,10 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["sparse_attention"]),
     )
     args, _ = parser.parse_known_args(line[:])
+
+    parser.add_argument(
+        "-h", "--help", action="help", help="show this help message and exit"
+    )
 
     parser.add_argument(
         "--no_cuda_graph",
@@ -232,9 +241,20 @@ def parse_args(line=sys.argv[1:]):
         ),
     )
 
+    if args.routine is None:
+        # `--help` exits successfully after all shared options are installed.
+        # Other routine-less invocations retain the required-routine error.
+        if "-h" in line or "--help" in line:
+            parser.parse_args(line)
+        parser.error("the following arguments are required: --routine/-R")
+
     ## Check routine and pass on to routine-specific argument parser
     ## Imports are done lazily to avoid loading unnecessary dependencies
-    if args.routine in benchmark_apis["attention"]:
+    if args.routine in benchmark_apis["mla"]:
+        from routines.mla import parse_mla_args
+
+        args = parse_mla_args(line, parser, args.routine)
+    elif args.routine in benchmark_apis["attention"]:
         from routines.attention import parse_attention_args
 
         args = parse_attention_args(line, parser)
@@ -325,8 +345,8 @@ if __name__ == "__main__":
 
     # Setup output file if specified
     if testlist_args.output_path is not None:
-        with open(testlist_args.output_path, "w") as fout:
-            fout.write(",".join(full_output_columns) + "\n")
+        with open(testlist_args.output_path, "w", encoding="utf-8", newline="") as fout:
+            csv.writer(fout).writerow(full_output_columns)
 
     # Process tests either from testlist file or command line arguments
     if testlist_args.testlist is not None:

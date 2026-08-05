@@ -1,4 +1,6 @@
+from dataclasses import replace
 import random
+import threading
 import tracemalloc
 from unittest.mock import MagicMock, patch
 
@@ -7,14 +9,21 @@ import torch
 
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
+from flashinfer.autotuner.autotuner import _get_autotune_context_mode
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
 from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
 )
-from flashinfer.mla._core import (
+from flashinfer.mla._batch_mla._auto_policy import (
+    _MLAAutotuneProfile,
+    build_wrapper_tuning_config,
+)
+from flashinfer.mla._batch_mla._backends._cute_dsl_functional_common import (
     CuteDslMlaDecodeRunner,
+)
+from flashinfer.mla._batch_mla._functional import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
@@ -814,6 +823,92 @@ def test_autotune_context_restores_overrides():
     assert tuner._override_round_up is False
 
 
+def test_autotune_context_activity_is_thread_local_and_nestable():
+    assert _get_autotune_context_mode() is None
+    other_thread_activity = []
+
+    with autotune(False):
+        assert _get_autotune_context_mode() is False
+        thread = threading.Thread(
+            target=lambda: other_thread_activity.append(_get_autotune_context_mode())
+        )
+        thread.start()
+        thread.join()
+        with autotune(True):
+            assert _get_autotune_context_mode() is True
+        assert _get_autotune_context_mode() is False
+
+    assert _get_autotune_context_mode() is None
+    assert other_thread_activity == [None]
+
+
+def test_nested_cache_only_context_overrides_outer_tuning_mode(monkeypatch):
+    tuner = reset_autotuner()
+    profile_calls = []
+
+    def profile(*_args, **_kwargs):
+        profile_calls.append(True)
+        raise AssertionError("cache-only selection must not profile")
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    runner = DummyRunner(valid_tactics=(0,))
+    with autotune(True), autotune(False):
+        selected, tactic = tuner.choose_one(
+            "nested-cache-only", [runner], TuningConfig(), [torch.ones(1)]
+        )
+
+    assert selected is runner
+    assert tactic == -1
+    assert profile_calls == []
+
+
+def test_concurrent_cache_only_context_overrides_global_tuning_mode(monkeypatch):
+    tuner = reset_autotuner()
+    tuning_entered = threading.Event()
+    release_tuning = threading.Event()
+    profile_calls = []
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda *_args, **_kwargs: profile_calls.append(True),
+    )
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    bundled_lookups = []
+
+    def load_from_file(key):
+        bundled_lookups.append(key)
+        return True, None, 7, None
+
+    monkeypatch.setattr("flashinfer.autotuner.autotuner.load_from_file", load_from_file)
+
+    def tune_elsewhere():
+        with autotune(True):
+            tuning_entered.set()
+            assert release_tuning.wait(timeout=5)
+
+    thread = threading.Thread(target=tune_elsewhere)
+    thread.start()
+    assert tuning_entered.wait(timeout=5)
+    try:
+        with autotune(False):
+            selected, tactic = tuner.choose_one(
+                "concurrent-cache-only",
+                [DummyRunner(valid_tactics=(0,))],
+                TuningConfig(),
+                [torch.ones(1)],
+            )
+    finally:
+        release_tuning.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert tactic == 7
+    assert isinstance(selected, DummyRunner)
+    assert profile_calls == []
+    assert len(bundled_lookups) == 1
+
+
 def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
     """Full choose_one flow with custom buckets: profile, cache, retrieve."""
     tuner = reset_autotuner()
@@ -1400,6 +1495,69 @@ def test_find_nearest_profile_cache_grows_with_fresh_closure_initializer():
     assert cache_growth == N, (
         f"Expected {N} new cache entries (one per fresh closure), got {cache_growth}."
     )
+
+
+def _wrapper_mla_autotune_profile() -> _MLAAutotuneProfile:
+    return _MLAAutotuneProfile(
+        batch_size=2,
+        q_len=1,
+        max_q_len=1,
+        max_kv_len=7,
+        min_kv_len_bucket=4,
+        max_kv_len_bucket=8,
+        page_size=2,
+        table_width=4,
+        page_reuse=False,
+        num_heads=4,
+        head_dim_ckv=8,
+        head_dim_kpe=2,
+        query_dtype=torch.float16,
+        kv_dtype=torch.bfloat16,
+        kv_layout="combined",
+        lse_mode="none",
+        output_dtype=torch.float16,
+        output_scale="none",
+        scale_mode="none",
+        skip_softmax=False,
+        use_sinks=False,
+        causal=False,
+        sm_scale=0.5,
+        qk_nope_head_dim=None,
+        enable_pdl=None,
+        is_var_seq=None,
+        use_profiler=False,
+        use_cuda_graph=False,
+        workspace_page_capacity=128,
+    )
+
+
+def test_wrapper_mla_cache_extras_bucket_batch_and_track_plan_fields():
+    profile = _wrapper_mla_autotune_profile()
+    baseline = profile.cache_extras("fa2")
+    same_sequence_bucket = replace(profile, batch_size=8, max_kv_len=5)
+
+    assert same_sequence_bucket.cache_extras("fa2") == baseline
+    for field, value in (
+        ("causal", True),
+        ("sm_scale", 0.25),
+        ("qk_nope_head_dim", 4),
+        ("enable_pdl", True),
+        ("is_var_seq", True),
+        ("use_profiler", True),
+        ("use_cuda_graph", True),
+    ):
+        assert replace(profile, **{field: value}).cache_extras("fa2") != baseline
+
+
+def test_wrapper_mla_tuning_config_is_memoized():
+    profile = _wrapper_mla_autotune_profile()
+    build_wrapper_tuning_config.cache_clear()
+    try:
+        first = build_wrapper_tuning_config(profile, buckets=(1, 3, 7))
+        second = build_wrapper_tuning_config(replace(profile), buckets=(1, 3, 7))
+        assert second is first
+    finally:
+        build_wrapper_tuning_config.cache_clear()
 
 
 def _call_build_mla_decode_tuning_config():

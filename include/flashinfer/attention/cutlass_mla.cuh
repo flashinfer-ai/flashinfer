@@ -141,8 +141,6 @@ cudaError_t runMla(void* workspace_ptr, void* out_ptr, void* lse_ptr, void* q_ab
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
-  CUTLASS_CHECK(fmha.initialize(arguments, workspace_ptr, stream));
-
   CUTLASS_CHECK(fmha.run(arguments, workspace_ptr, stream));
 
   return cudaSuccess;

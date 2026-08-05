@@ -16,7 +16,6 @@
 
 import math
 from bisect import bisect_left
-from unittest import mock
 
 import pytest
 import torch
@@ -724,13 +723,7 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
 
     AutoTuner.get().clear_cache()
     try:
-        with (
-            mock.patch(
-                "flashinfer.mla._core._compute_mla_decode_buckets",
-                return_value=(2,),
-            ),
-            autotune(tune_mode=True),
-        ):
+        with autotune(tune_mode=True):
             out, lse = trtllm_batch_decode_with_kv_cache_mla(
                 **public_args,
                 causal_seqlens_kv_global=global_lens,

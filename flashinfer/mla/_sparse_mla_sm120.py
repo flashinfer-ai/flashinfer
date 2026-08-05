@@ -43,9 +43,10 @@ tests/benchmarks.
 from __future__ import annotations
 
 import functools
+import math
 import os
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -59,6 +60,8 @@ from ..autotuner import (
 )
 from ..jit.mla import gen_sparse_mla_sm120_module
 from ..utils import (
+    check_shape_dtype_device,
+    is_sm12x_supported,
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
@@ -122,6 +125,266 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
         (128, 2048),
     }
 )
+
+
+def _functional_workspace_tensor_view(
+    workspace_buffer: torch.Tensor,
+    *,
+    byte_offset: int,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], int]:
+    if not workspace_buffer.is_contiguous():
+        return None, byte_offset
+    elem_size = torch.empty(
+        (), dtype=dtype, device=workspace_buffer.device
+    ).element_size()
+    byte_offset = ((byte_offset + elem_size - 1) // elem_size) * elem_size
+    byte_end = byte_offset + math.prod(shape) * elem_size
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    if byte_end > workspace_bytes:
+        return None, byte_offset
+    flat = workspace_buffer.view(torch.uint8)
+    return flat[byte_offset:byte_end].view(dtype).view(shape), byte_end
+
+
+def _functional_sparse_decode_workspace(
+    workspace_buffer: torch.Tensor,
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if num_tokens > _DECODE_MAX_TOKENS:
+        return None, None
+    num_splits = (topk + _BI - 1) // _BI
+    mid_out, offset = _functional_workspace_tensor_view(
+        workspace_buffer,
+        byte_offset=0,
+        shape=(num_tokens, num_heads, num_splits, _D_V),
+        dtype=torch.bfloat16,
+    )
+    if mid_out is None:
+        return None, None
+    mid_lse, _ = _functional_workspace_tensor_view(
+        workspace_buffer,
+        byte_offset=offset,
+        shape=(num_tokens, num_heads, num_splits),
+        dtype=torch.float32,
+    )
+    if mid_lse is None:
+        return None, None
+    return mid_out, mid_lse
+
+
+def _normalize_functional_sparse_sink(
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+) -> Optional[torch.Tensor]:
+    if sinks is None or isinstance(sinks, torch.Tensor):
+        return sinks
+    if len(sinks) != 1:
+        raise ValueError(
+            "backend='sparse' expects sinks to be a single tensor or a "
+            f"length-1 list/tuple; got len={len(sinks)}."
+        )
+    return sinks[0]
+
+
+def _run_mla_decode_sparse_sm120(
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
+    sparse_mla_top_k: int,
+    out: Optional[torch.Tensor],
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[List[torch.Tensor]],
+    skip_softmax_threshold_scale_factor: Optional[float],
+    uses_shared_paged_kv_idx: bool,
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+    kv_scale_format: str,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Validate and execute the packed SM120 functional sparse MLA path."""
+    del qk_nope_head_dim
+    if sparse_mla_top_k <= 0:
+        raise ValueError("SM120 sparse MLA v32/GLM requires sparse_mla_top_k > 0")
+    if skip_softmax_threshold_scale_factor is not None:
+        raise ValueError("skip_softmax is not supported for sparse MLA")
+    if not uses_shared_paged_kv_idx:
+        raise ValueError(
+            "SM120 sparse MLA v32/GLM expects shared sparse page indices "
+            "(uses_shared_paged_kv_idx=True)"
+        )
+    if isinstance(bmm1_scale, torch.Tensor):
+        raise ValueError("SM120 sparse MLA v32/GLM expects bmm1_scale to be a float")
+    if isinstance(bmm2_scale, torch.Tensor):
+        raise ValueError("SM120 sparse MLA v32/GLM expects bmm2_scale to be a float")
+    if float(bmm2_scale) != 1.0:
+        raise ValueError("SM120 sparse MLA v32/GLM does not support bmm2_scale")
+    if not is_sm12x_supported(query.device):
+        raise ValueError(
+            "SM120 sparse MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
+        )
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+    if query.dtype != torch.bfloat16:
+        raise ValueError(
+            f"SM120 sparse MLA v32/GLM expects BF16 query, got {query.dtype}"
+        )
+    if kv_lora_rank != 512 or qk_rope_head_dim != 64 or query.size(-1) != 576:
+        raise ValueError(
+            "SM120 sparse MLA v32/GLM expects kv_lora_rank=512, "
+            "qk_rope_head_dim=64, and query head dim 576; got "
+            f"kv_lora_rank={kv_lora_rank}, "
+            f"qk_rope_head_dim={qk_rope_head_dim}, query dim={query.size(-1)}"
+        )
+    if kv_cache.device != query.device:
+        raise ValueError(
+            f"kv_cache must be on query device {query.device}, got {kv_cache.device}"
+        )
+    if workspace_buffer.device != query.device:
+        raise ValueError(
+            "workspace_buffer must be on query device "
+            f"{query.device}, got {workspace_buffer.device}"
+        )
+    if kv_cache.dtype != torch.uint8:
+        raise ValueError(
+            "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
+            f"got {kv_cache.dtype}"
+        )
+    if kv_cache.ndim == 3:
+        if kv_cache.size(-1) != 656:
+            raise ValueError(
+                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim 656, "
+                f"got {tuple(kv_cache.shape)}"
+            )
+    elif kv_cache.ndim == 4:
+        if kv_cache.size(1) != 1 or kv_cache.size(-1) != 656:
+            raise ValueError(
+                "SM120 sparse MLA v32/GLM expects public HND kv_cache shape "
+                "[num_pages, 1, page_size, 656] or 3D shorthand "
+                f"[num_pages, page_size, 656], got {tuple(kv_cache.shape)}"
+            )
+    else:
+        raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
+
+    batch_size, q_len_per_request, num_heads, _ = query.shape
+    if num_heads > 128:
+        raise ValueError(f"Expected num_heads <= 128, got {num_heads}")
+    if block_tables.dtype != torch.int32:
+        raise ValueError(
+            f"block_tables must have dtype torch.int32, got {block_tables.dtype}"
+        )
+    if block_tables.device != query.device:
+        raise ValueError(
+            f"block_tables must be on query device {query.device}, "
+            f"got {block_tables.device}"
+        )
+    expected_block_tables_shape = (
+        batch_size,
+        q_len_per_request,
+        sparse_mla_top_k,
+    )
+    if tuple(block_tables.shape) != expected_block_tables_shape:
+        raise ValueError(
+            "SM120 sparse MLA v32/GLM expects sparse block_tables shape "
+            f"{expected_block_tables_shape}, got {tuple(block_tables.shape)}"
+        )
+    indices = block_tables.reshape(batch_size * q_len_per_request, -1)
+
+    topk_length = None
+    if seq_lens is not None:
+        if seq_lens.dtype != torch.int32:
+            raise ValueError(
+                f"seq_lens must have dtype torch.int32, got {seq_lens.dtype}"
+            )
+        if seq_lens.device != query.device:
+            raise ValueError(
+                f"seq_lens must be on device {query.device}, got {seq_lens.device}"
+            )
+        flat_tokens = batch_size * q_len_per_request
+        if seq_lens.ndim == 2 and tuple(seq_lens.shape) == (
+            batch_size,
+            q_len_per_request,
+        ):
+            topk_length = seq_lens.reshape(flat_tokens).contiguous()
+        elif seq_lens.ndim == 1 and seq_lens.numel() == flat_tokens:
+            topk_length = seq_lens.contiguous()
+        elif not (seq_lens.ndim == 1 and seq_lens.numel() == batch_size):
+            raise ValueError(
+                "seq_lens for SM120 sparse MLA v32/GLM must be shaped either "
+                f"({batch_size},), ({flat_tokens},), or "
+                f"({batch_size}, {q_len_per_request}); got {tuple(seq_lens.shape)}"
+            )
+
+    query_flat = query.reshape(-1, num_heads, 576)
+    expected_out_shape = (batch_size, q_len_per_request, num_heads, _D_V)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
+    else:
+        check_shape_dtype_device(
+            out, expected_out_shape, torch.bfloat16, query.device, "out"
+        )
+    out_flat = out.view(query_flat.shape[0], num_heads, _D_V)
+
+    flat_lse_shape = (query_flat.shape[0], num_heads)
+    nested_lse_shape = (batch_size, q_len_per_request, num_heads)
+    user_lse = lse
+    out_lse_arg = None
+    if return_lse and lse is not None:
+        if tuple(lse.shape) == flat_lse_shape:
+            check_shape_dtype_device(
+                lse, flat_lse_shape, torch.float32, query.device, "lse"
+            )
+        elif tuple(lse.shape) == nested_lse_shape:
+            check_shape_dtype_device(
+                lse, nested_lse_shape, torch.float32, query.device, "lse"
+            )
+            lse = lse.view(flat_lse_shape)
+        else:
+            raise ValueError(
+                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+                f"got {tuple(lse.shape)}"
+            )
+        out_lse_arg = lse
+
+    runner = _SparseMLAPagedAttentionRunner(
+        max_num_tokens=query_flat.shape[0],
+        max_num_heads=num_heads,
+        kv_scale_format=kv_scale_format,
+        device=query.device,
+    )
+    mid_out, mid_lse = _functional_sparse_decode_workspace(
+        workspace_buffer,
+        num_tokens=query_flat.shape[0],
+        num_heads=num_heads,
+        topk=sparse_mla_top_k,
+    )
+    out_lse = runner.run(
+        query_flat,
+        kv_cache,
+        indices,
+        out_flat,
+        float(bmm1_scale),
+        topk_length=topk_length,
+        attn_sink=_normalize_functional_sparse_sink(sinks),
+        out_lse=out_lse_arg,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+        return_lse=return_lse,
+    )
+    if return_lse:
+        return out, user_lse if user_lse is not None else out_lse
+    return out
+
+
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 _MODEL_TYPE_DSV3_2 = 0
