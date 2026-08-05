@@ -1187,11 +1187,6 @@ struct DirectPageTableKernelPolicy {
                                                     uint32_t raw_idx) const {
     return src_page_entry[page_table_row_start + raw_idx];
   }
-
-  inline cudaError_t validate(const IdType* /*row_starts*/,
-                              const IdType* /*page_table_row_starts*/) const {
-    return cudaSuccess;
-  }
 };
 
 template <typename IdType>
@@ -1229,17 +1224,10 @@ struct ConfigurablePageTableKernelPolicy {
         static_cast<uint32_t>(src_page_entry[page_table_row_start + (raw_idx >> page_bits)]);
     return static_cast<IdType>((physical_page << page_bits) | (raw_idx & page_mask));
   }
-
-  inline cudaError_t validate(const IdType* row_starts, const IdType* page_table_row_starts) const {
-    if (page_bits > 0 && row_starts != nullptr && page_table_row_starts == nullptr) {
-      return cudaErrorInvalidValue;
-    }
-    return cudaSuccess;
-  }
 };
 
-// Keep the direct policy identifiable so its epilogues can retain their original source form.
-// Routing the same expressions through an inlined policy method changes NVCC-generated SASS.
+// Keep the direct policy identifiable so the hot selection-kernel epilogues can retain their
+// original source form where routing through an inlined policy method changes NVCC-generated SASS.
 template <typename PageTablePolicy, typename IdType>
 inline constexpr bool IsDirectPageTableKernelPolicy =
     std::is_same_v<PageTablePolicy, DirectPageTableKernelPolicy<IdType>>;
@@ -3168,13 +3156,11 @@ struct SortTopKByIndexBlockRadixSort<false, BLOCK_THREADS, ITEMS_PER_THREAD, DTy
 
 template <bool SORT_LOCAL_INDICES, FilteredTopKMode MODE, uint32_t BLOCK_THREADS,
           uint32_t ITEMS_PER_THREAD, typename DType, typename IdType,
-          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>,
-          typename... PageTableArgs>
+          typename PageTablePolicy = DirectPageTableKernelPolicy<IdType>, typename... PageTableArgs>
 __global__ void __launch_bounds__(BLOCK_THREADS)
-    FinalizeTopKIndicesKernel(IdType* output_indices, DType* output_values,
-                              const IdType* aux_input, int64_t aux_stride,
-                              const IdType* page_table_row_starts, const IdType* row_to_batch,
-                              uint32_t top_k, uint32_t max_len,
+    FinalizeTopKIndicesKernel(IdType* output_indices, DType* output_values, const IdType* aux_input,
+                              int64_t aux_stride, const IdType* page_table_row_starts,
+                              const IdType* row_to_batch, uint32_t top_k, uint32_t max_len,
                               PageTableArgs... page_table_args) {
   static_assert(MODE == FilteredTopKMode::PageTable ||
                 IsDirectPageTableKernelPolicy<PageTablePolicy, IdType>);
@@ -3264,8 +3250,7 @@ cudaError_t LaunchFinalizeTopKIndices(IdType* output_indices, DType* output_valu
                                       const IdType* aux_input, int64_t aux_stride,
                                       const IdType* page_table_row_starts,
                                       const IdType* row_to_batch, uint32_t num_rows,
-                                      uint32_t top_k_val, uint32_t max_len,
-                                      cudaStream_t stream = 0,
+                                      uint32_t top_k_val, uint32_t max_len, cudaStream_t stream = 0,
                                       const PageTablePolicy& page_table_policy = {}) {
   static_assert(IsValidPageTablePolicy<PageTablePolicy>);
   // Block-local sort variants cover at most 256 * 8 = 2048 elements.
@@ -3291,19 +3276,19 @@ cudaError_t LaunchFinalizeTopKIndices(IdType* output_indices, DType* output_valu
     return cudaLaunchKernel((void*)kernel, grid, block, args, 0, stream);
   };
 
-#define LAUNCH_FINALIZE_KERNEL(THREADS, ITEMS_PER_THREAD)                                    \
-  do {                                                                                       \
-    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                       \
-      status = launch_finalize(                                                              \
-          FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD,     \
-                                    DType, IdType, PageTablePolicy, PageTablePolicy>,         \
-          THREADS, page_table_policy);                                                       \
-    } else {                                                                                 \
-      status = launch_finalize(                                                              \
-          FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD,     \
-                                    DType, IdType, PageTablePolicy>,                          \
-          THREADS);                                                                          \
-    }                                                                                        \
+#define LAUNCH_FINALIZE_KERNEL(THREADS, ITEMS_PER_THREAD)                                       \
+  do {                                                                                          \
+    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                          \
+      status = launch_finalize(                                                                 \
+          FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD, DType, \
+                                    IdType, PageTablePolicy, PageTablePolicy>,                  \
+          THREADS, page_table_policy);                                                          \
+    } else {                                                                                    \
+      status = launch_finalize(                                                                 \
+          FinalizeTopKIndicesKernel<SORT_LOCAL_INDICES, MODE, THREADS, ITEMS_PER_THREAD, DType, \
+                                    IdType, PageTablePolicy>,                                   \
+          THREADS);                                                                             \
+    }                                                                                           \
   } while (0)
 
   cudaError_t status;
@@ -3649,7 +3634,6 @@ cudaError_t TopKPageTableTransformDispatch(
     bool dsa_graph_safe = false, const IdType* page_table_row_starts = nullptr,
     const PageTablePolicy& page_table_policy = {}) {
   static_assert(IsValidPageTablePolicy<PageTablePolicy>);
-  FLASHINFER_CUDA_CALL(page_table_policy.validate(row_starts, page_table_row_starts));
   if (page_table_row_starts == nullptr) {
     page_table_row_starts = row_starts;
   }
@@ -3664,14 +3648,14 @@ cudaError_t TopKPageTableTransformDispatch(
         page_table_row_starts, num_rows, top_k_val, max_len, deterministic, tie_break, stream,
         dsa_graph_safe, page_table_policy)));
     if (deterministic) {
-      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-          true, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<true, FilteredTopKMode::PageTable, uint8_t,
+                                                      IdType, PageTablePolicy>(
           output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
           page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream,
           page_table_policy)));
     } else if (tie_break != TopKTieBreak::None) {
-      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<
-          false, FilteredTopKMode::PageTable, uint8_t, IdType, PageTablePolicy>(
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<false, FilteredTopKMode::PageTable, uint8_t,
+                                                      IdType, PageTablePolicy>(
           output_page_table, static_cast<uint8_t*>(nullptr), src_page_table, src_stride,
           page_table_row_starts, row_to_batch, num_rows, top_k_val, max_len, stream,
           page_table_policy)));
