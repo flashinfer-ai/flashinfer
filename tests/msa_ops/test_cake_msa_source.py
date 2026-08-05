@@ -44,9 +44,8 @@ _VARIANTS = (
     "topk",
 )
 
-# Freeze the complete public source inventory, including the device body and
-# its host binding for every variant.  Keep these digests out of the
-# public CUDA files so they do not expose generator provenance.
+# Freeze the complete public source inventory, including each device body and
+# host binding.
 _SOURCE_SHA256 = {
     "cake_msa_decode_bf16_flat.cu": "fab06f6bd7d0febbb9949f07ffafe29ef6d7ac52fd6f8a1bc14616aefd13cf59",
     "cake_msa_decode_bf16_flat_binding.cu": "f8928306669683cca2b32d0383da941fd223faf25478a5b5c2bcb2bdefaf511f",
