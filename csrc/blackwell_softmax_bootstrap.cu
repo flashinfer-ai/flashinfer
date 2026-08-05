@@ -377,6 +377,8 @@ kernel_flashinfer_blackwell_softmax_bootstrap_seed(float* __restrict__ x, float*
                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                             :: "l"((void*)(output + (index_4))), "r"(_stv8_3_0), "r"(_stv8_3_1), "r"(_stv8_3_2), "r"(_stv8_3_3), "r"(_stv8_3_4), "r"(_stv8_3_5), "r"(_stv8_3_6), "r"(_stv8_3_7) : "memory");
 #else
+                        // This path is used only when splits == 1, so no other block
+                        // reads output while the two 128-bit stores are in flight.
                         asm volatile(
                             "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
                             :: "l"((void*)(output + (index_4))), "r"(_stv8_3_0), "r"(_stv8_3_1), "r"(_stv8_3_2), "r"(_stv8_3_3) : "memory");
@@ -543,6 +545,8 @@ kernel_flashinfer_blackwell_softmax_bootstrap_seed(float* __restrict__ x, float*
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                         :: "l"((void*)(output + (index_6))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
 #else
+                    // Phase 2 begins after the grid sync and no later phase reads
+                    // output, so replacing one 256-bit store with two is safe here.
                     asm volatile(
                         "st.global.v4.b32 [%0], {%1, %2, %3, %4};"
                         :: "l"((void*)(output + (index_6))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3) : "memory");

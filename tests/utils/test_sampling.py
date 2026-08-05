@@ -174,6 +174,53 @@ def test_blackwell_mr515_route_does_not_interpolate(rows, temperature, enable_pd
     assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
 
 
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    [
+        (1, 111, 0.5, False, 1),
+        (256, 32000, None, False, 2),
+        (1, 32000, None, False, 3),
+        (64, 32000, None, False, 4),
+    ],
+)
+def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
+    rows, vocab_size, temperature, enable_pdl, expected_route
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    if expected_route == 4 and capability != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.full((rows, vocab_size), -torch.inf, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == expected_route
+    assert actual.data_ptr() != logits.data_ptr()
+    assert torch.isnan(expected).all()
+    assert torch.isnan(actual).all()
+
+
+def test_blackwell_route_observer_falls_back_off_blackwell():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        pytest.skip("This test exercises the non-Blackwell observer gate")
+
+    logits = torch.empty((1, 111), device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5, enable_pdl=False
+    )
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(

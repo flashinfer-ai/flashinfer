@@ -316,6 +316,9 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
   }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Blackwell Softmax route query failed with error code " << cudaGetErrorString(status);
+  if (device_major != 10 || (device_minor != 0 && device_minor != 3)) {
+    return SoftmaxRoute::kFallback;
+  }
   return select_softmax_route(
       static_cast<uint32_t>(logits.size(0)), static_cast<uint32_t>(logits.size(1)), parameter_kind,
       static_cast<float>(temperature_val), enable_pdl, device_major, device_minor);

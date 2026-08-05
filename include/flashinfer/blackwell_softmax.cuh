@@ -46,6 +46,8 @@ __global__ void kernel_flashinfer_blackwell_softmax_followup_warp(float* logits,
                                                                   int parameter_kind,
                                                                   float scalar_temperature);
 
+// For this frozen TEMP_KIND==0 specialization only, a null temperature pointer
+// is an integration-private signal that PDL is enabled; the kernel never reads it.
 __global__ void kernel_mr474_manual_softmax_exp2_t512_vec4(float* logits, float* temperature,
                                                            float* output, float scalar_temperature);
 

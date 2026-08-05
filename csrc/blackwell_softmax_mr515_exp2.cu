@@ -84,6 +84,8 @@ kernel_mr474_manual_softmax_exp2_t512_vec4(float* __restrict__ x, float* __restr
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    // The integration passes nullptr only to encode PDL for this frozen
+    // TEMP_KIND==0 specialization; the temperature slot is never dereferenced.
     const bool enable_pdl = temperature == nullptr;
     if (enable_pdl) {
         asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -212,7 +214,7 @@ kernel_mr474_manual_softmax_exp2_t512_vec4(float* __restrict__ x, float* __restr
                 for (int j_2 = 0; j_2 < 4; j_2++) {
                     float value_2 = _vec_load_3[j_2];
                     float _exp2_1 = approx_exp2((value_2 - row_max) * 1.4426950408889634f);
-                    out_values[j_2] = ((row_max == -LOOM_INF) ? 0.0f : _exp2_1 * inv_sum);
+                    out_values[j_2] = _exp2_1 * inv_sum;
                 }
             }
             {

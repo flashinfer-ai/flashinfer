@@ -119,6 +119,7 @@ def get_blackwell_softmax_op():
     return blackwell_softmax
 
 
+_BLACKWELL_SOFTMAX_ROUTE_FALLBACK = 0
 _BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512 = 4
 
 
@@ -130,6 +131,11 @@ def _blackwell_softmax_route_for_testing(
     """Return the C++ dispatcher route ID without launching a kernel."""
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    device_index = logits.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if not _supports_blackwell_softmax(device_index):
+        return _BLACKWELL_SOFTMAX_ROUTE_FALLBACK
     maybe_temperature_arr, temperature_val, temperature_is_none = (
         _validate_softmax_temperature(logits, temperature)
     )
