@@ -1892,9 +1892,6 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_mxint4_routed",))
-
 
 # ---------------------------------------------------------------------------
 # SM12x b12x runners — fixed tactic, existing wrapper delegation
