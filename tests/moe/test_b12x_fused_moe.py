@@ -855,9 +855,7 @@ class TestB12xFunctional:
         )
         if expected_tile_m is not None:
             assert (
-                moe_dispatch._select_dynamic_tile_m(
-                    num_tokens * top_k, num_experts
-                )
+                moe_dispatch._select_dynamic_tile_m(num_tokens * top_k, num_experts)
                 == expected_tile_m
             )
         tensors = create_b12x_mxfp4_moe_tensors(
