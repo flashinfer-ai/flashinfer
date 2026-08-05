@@ -37,7 +37,9 @@ jobs:
           else
             status=$?
           fi
-          cat api-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          # GitHub consumes ::warning lines as annotations. Do not also render
+          # those workflow commands as literal text in the human summary.
+          sed '/^::warning /d' api-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
       - name: Check all new static documentation drift
@@ -57,7 +59,7 @@ jobs:
           else
             status=$?
           fi
-          cat static-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
+          sed '/^::warning /d' static-doc-check.txt >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
       - name: Record non-blocking checker status
