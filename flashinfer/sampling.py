@@ -904,6 +904,9 @@ def softmax(
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
+        The custom Blackwell softmax routes currently apply PDL on SM103; the
+        SM100 fast path remains non-PDL, while fallback routes preserve their
+        existing PDL behavior.
     Returns
     -------
     probs : torch.Tensor
