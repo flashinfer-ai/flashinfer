@@ -49,22 +49,23 @@ template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool Sw
           bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
-                                                float const* global_sf, int m, int n, int k,
-                                                int batch_count, CutlassGemmConfig gemmConfig,
-                                                char* workspace, const size_t workspaceBytes,
-                                                cudaStream_t stream, int* occupancy = nullptr) {
+                                                float const* global_sf, bool per_token_alpha, int m,
+                                                int n, int k, int batch_count,
+                                                CutlassGemmConfig gemmConfig, char* workspace,
+                                                const size_t workspaceBytes, cudaStream_t stream,
+                                                int* occupancy = nullptr) {
   // For SM120/SM121, only support 1x1x1 cluster shape
   // Always use 1x1x1 cluster shape regardless of gemmConfig.cluster_shape
   if constexpr (UseStreamK) {
     return genericFp4GemmKernelLauncherStreamK<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
                                                cute::Int<1>, cute::Int<1>, _1SM, SwapAB>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
-        workspaceBytes, stream, occupancy);
+        D, A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k, batch_count, gemmConfig,
+        workspace, workspaceBytes, stream, occupancy);
   } else {
     return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
                                         cute::Int<1>, _1SM, SwapAB>(
-        D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
-        workspaceBytes, stream, occupancy);
+        D, A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k, batch_count, gemmConfig,
+        workspace, workspaceBytes, stream, occupancy);
   }
 }
 
@@ -88,11 +89,11 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
  * \return Size of workspace required in bytes
  */
 // Helper macro to dispatch tile config with scheduler selection
-#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK)                     \
-  return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,    \
-                                                  cute::Int<CTA_K>, SWAP_AB, USE_STREAMK>(  \
-      D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, \
-      workspaceBytes, stream, occupancy)
+#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK)                           \
+  return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,          \
+                                                  cute::Int<CTA_K>, SWAP_AB, USE_STREAMK>(        \
+      D, A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k, batch_count, gemmConfig, \
+      workspace, workspaceBytes, stream, occupancy)
 
 // Helper macro to dispatch with scheduler check
 #define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)           \
@@ -113,10 +114,11 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
 template <typename T>
 size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
                                             void const* input_sf, void const* weight_sf,
-                                            float const* global_sf, int m, int n, int k,
-                                            int batch_count, CutlassGemmConfig gemmConfig,
-                                            char* workspace, const size_t workspaceBytes,
-                                            cudaStream_t stream, int* occupancy = nullptr) {
+                                            float const* global_sf, bool per_token_alpha, int m,
+                                            int n, int k, int batch_count,
+                                            CutlassGemmConfig gemmConfig, char* workspace,
+                                            const size_t workspaceBytes, cudaStream_t stream,
+                                            int* occupancy = nullptr) {
   // Dispatch based on tile config and scheduler type
   switch (gemmConfig.tile_config_sm120) {
     case CutlassTileConfigSM120::CtaShape128x32x64B:
@@ -158,12 +160,13 @@ CutlassFp4GemmRunner<T, fp4GemmType>::~CutlassFp4GemmRunner() {}
 template <typename T, FP4GemmType fp4GemmType>
 size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
     T* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
-    float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,
-    char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {
+    float const* global_sf, bool per_token_alpha, int m, int n, int k, int batch_count,
+    CutlassGemmConfig gemmConfig, char* workspace, const size_t workspaceBytes, cudaStream_t stream,
+    int* occupancy) {
   if constexpr (fp4GemmType == FP4GemmType::W4A4_NVFP4_NVFP4) {
-    return dispatchNVFP4xNVFP4GemmCTAShapeSm120<T>(D, A, B, input_sf, weight_sf, global_sf, m, n, k,
-                                                   batch_count, gemmConfig, workspace,
-                                                   workspaceBytes, stream, occupancy);
+    return dispatchNVFP4xNVFP4GemmCTAShapeSm120<T>(
+        D, A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k, batch_count, gemmConfig,
+        workspace, workspaceBytes, stream, occupancy);
   } else {
     throw std::runtime_error(
         "[Error][CutlassFp4GemmRunner][GEMM Dispatch] FP4 Gemm type unsupported for "
@@ -174,13 +177,13 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
 template <typename T, FP4GemmType fp4GemmType>
 void CutlassFp4GemmRunner<T, fp4GemmType>::gemm(void* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
-                                                float const* global_sf, int m, int n, int k,
-                                                int batch_count, CutlassGemmConfig gemmConfig,
-                                                char* workspace, const size_t workspaceBytes,
-                                                cudaStream_t stream) {
+                                                float const* global_sf, bool per_token_alpha, int m,
+                                                int n, int k, int batch_count,
+                                                CutlassGemmConfig gemmConfig, char* workspace,
+                                                const size_t workspaceBytes, cudaStream_t stream) {
   CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
-      reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count,
-      gemmConfig, workspace, workspaceBytes, stream);
+      reinterpret_cast<T*>(D), A, B, input_sf, weight_sf, global_sf, per_token_alpha, m, n, k,
+      batch_count, gemmConfig, workspace, workspaceBytes, stream);
 }
 
 template <typename T, FP4GemmType fp4GemmType>
@@ -229,8 +232,8 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSizeImpl(int const m, i
   for (auto const& gemmConfig : gemmConfigs) {
     try {
       size_t curr_workspace_size = CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k, batch_count, gemmConfig,
-          nullptr, 0, 0);
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, /*per_token_alpha=*/false, m, n, k,
+          batch_count, gemmConfig, nullptr, 0, 0);
       workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error& e) {
       // Swallow errors when SMEM exceeds maximum allowed

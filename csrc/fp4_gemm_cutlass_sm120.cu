@@ -51,8 +51,8 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 
 template <typename T>
 void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Scale,
-             TensorView mat2Scale, TensorView globalScale, int64_t m, int64_t n, int64_t k,
-             int64_t batch_count, CutlassGemmConfig const& gemmConfig,
+             TensorView mat2Scale, TensorView globalScale, bool per_token_alpha, int64_t m,
+             int64_t n, int64_t k, int64_t batch_count, CutlassGemmConfig const& gemmConfig,
              TensorView workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
@@ -62,9 +62,10 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Sc
 
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(), mat1Scale.data_ptr(),
-                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()), m, n, k,
-                    batch_count, gemmConfig, reinterpret_cast<char*>(workspace),
-                    required_workspace_size, get_stream(mat1.device()));
+                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()),
+                    per_token_alpha, m, n, k, batch_count, gemmConfig,
+                    reinterpret_cast<char*>(workspace), required_workspace_size,
+                    get_stream(mat1.device()));
   };
 
   if (provided_workspace_size < required_workspace_size) {
@@ -135,7 +136,14 @@ void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tensor
   // k_packed stores 2 FP4 values per byte
   int64_t k = k_packed * 2;
 
-  TVM_FFI_ICHECK_EQ(globalScale.numel(), 1) << "globalScale must be a scalar tensor";
+  // A globalScale with one entry per row of mat1 is a per-token dequant scale;
+  // a single entry is the usual per-tensor scale.
+  bool const per_token_alpha = globalScale.numel() != 1;
+  TVM_FFI_ICHECK(!per_token_alpha || globalScale.numel() == m)
+      << "globalScale must be a scalar tensor, or hold one scale per row of mat1 (" << m
+      << "), got " << globalScale.numel();
+  TVM_FFI_ICHECK(!per_token_alpha || b == 1)
+      << "per-token globalScale is not supported for batched FP4 GEMM";
 
   // Configure the kernel
   CutlassGemmConfig config =
@@ -156,12 +164,12 @@ void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tensor
 
   switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
-      runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
-                    workspace_buffer);
+      runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, per_token_alpha, m, n, k, b,
+                    config, workspace_buffer);
       break;
     case bfloat16_code:
-      runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
-                             workspace_buffer);
+      runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, per_token_alpha, m,
+                             n, k, b, config, workspace_buffer);
       break;
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";

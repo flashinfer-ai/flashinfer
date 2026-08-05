@@ -58,6 +58,7 @@ def _compile_block_scaled_gemm(
     cluster_shape_k=1,
     cache_module_name=None,
     device_index=None,
+    per_token_alpha=False,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -100,6 +101,7 @@ def _compile_block_scaled_gemm(
         sf_k=sf_k,
         batch_size=batch_size,
         max_active_clusters=max_active_clusters,
+        per_token_alpha=per_token_alpha,
     )
 
     if cache_module_name is None:
@@ -160,6 +162,7 @@ def _make_blockscaled_gemm_compile_fn(
     sf_k,
     batch_size,
     max_active_clusters,
+    per_token_alpha=False,
 ):
     """Build a zero-arg closure that runs ``cute.compile`` for gemm."""
     import cutlass
@@ -201,8 +204,10 @@ def _make_blockscaled_gemm_compile_fn(
 
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+        # Per-token alpha is one scale per output row; binding it to the same
+        # sym_m as A keeps a single compiled kernel across all M.
         alpha_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (1,), assumed_align=4
+            cutlass.Float32, (sym_m if per_token_alpha else 1,), assumed_align=4
         )
 
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)

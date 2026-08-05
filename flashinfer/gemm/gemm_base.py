@@ -1536,6 +1536,10 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
                     a_descale = a_descale.view(torch.uint8)
                 if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
                     b_descale = b_descale.view(torch.uint8)
+                if _is_per_token_alpha(alpha):
+                    # The binding reads per-token mode off alpha's element
+                    # count, so it has to be a flat contiguous m-vector.
+                    alpha = alpha.reshape(-1).contiguous()
                 module.fp4_gemm(
                     a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
                 )
@@ -4739,6 +4743,20 @@ def _get_sm100_block_scaled_tactics(
 _CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
 
 
+# FP4 backends whose epilogue can apply one alpha per output row.
+_PER_TOKEN_ALPHA_BACKENDS = frozenset({"b12x", "cutlass"})
+
+
+def _is_per_token_alpha(alpha_tensor) -> bool:
+    """True when *alpha_tensor* carries one dequant scale per output row.
+
+    A per-token alpha comes from quantizing activations with a dynamic
+    per-token NVFP4 global scale, so the row scale can only be applied once
+    the GEMM knows each output row's index.
+    """
+    return alpha_tensor is not None and alpha_tensor.numel() > 1
+
+
 def _prepare_alpha_for_launch(alpha_tensor, device):
     """Prepare alpha as a 1-dim float32 device tensor with shape [1].
 
@@ -5601,9 +5619,7 @@ def _check_mm_fp4_problem_size(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -5633,8 +5649,20 @@ def _check_mm_fp4_problem_size(
         )
     if alpha is not None and alpha.dtype != torch.float:
         raise ValueError(f"alpha must be a float tensor, got {alpha.dtype}")
+    # A non-scalar alpha is a per-token row scale, which only the b12x
+    # backend's epilogue applies; every other backend requires a scalar.
     if alpha is not None and alpha.numel() != 1:
-        raise ValueError(f"alpha must be a scalar, got {alpha.numel()}")
+        if alpha.numel() != a.shape[0]:
+            raise ValueError(
+                "alpha must be a scalar, or one scale per row of a for the "
+                f"per-token path. Got {alpha.numel()} for m={a.shape[0]}."
+            )
+        if backend != "auto" and backend not in _PER_TOKEN_ALPHA_BACKENDS:
+            raise ValueError(
+                "per-token alpha is only supported by the "
+                f"{sorted(_PER_TOKEN_ALPHA_BACKENDS)} backends, got "
+                f"backend={backend!r}."
+            )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
@@ -5725,7 +5753,7 @@ def _cutlass_gemm_fp4_requirement(
     b: torch.Tensor,  # unused
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,  # unused
+    alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,  # unused
@@ -5738,6 +5766,18 @@ def _cutlass_gemm_fp4_requirement(
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if _is_per_token_alpha(alpha):
+        # Only the SM120/SM121 kernels build the per-row alpha epilogue.
+        if get_compute_capability(a.device)[0] != 12:
+            raise ValueError(
+                "The CUTLASS FP4 GEMM backend only supports per-token alpha on "
+                "SM120/SM121."
+            )
+        if alpha.numel() != a.shape[0]:
+            raise ValueError(
+                "CUTLASS FP4 GEMM per-token alpha must have one scale per row "
+                f"of a: got {alpha.numel()} for m={a.shape[0]}."
+            )
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     if out is not None and not out.is_contiguous():
@@ -5783,7 +5823,7 @@ def _b12x_gemm_fp4_requirement(
     b: torch.Tensor,  # unused
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,  # unused
+    alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
@@ -5804,6 +5844,11 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    if _is_per_token_alpha(alpha) and alpha.numel() != a.shape[0]:
+        raise ValueError(
+            "b12x FP4 GEMM per-token alpha must have one scale per row of a: "
+            f"got {alpha.numel()} for m={a.shape[0]}."
+        )
     # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k=128: the
     # mainloop predicates the partial tile, so ragged K (192) works. Mirror can_implement.
     real_k = a.shape[1] * 2
@@ -6249,6 +6294,13 @@ def _b12x_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN
             batch_size = 1
 
+            per_token_alpha = _is_per_token_alpha(alpha_tensor)
+            if per_token_alpha and alpha_tensor.numel() != m:
+                raise ValueError(
+                    "b12x FP4 GEMM per-token alpha must have one scale per row "
+                    f"of a: got {alpha_tensor.numel()} for m={m}."
+                )
+
             if tactic is None or tactic == -1:
                 # Default path: the m-aware plan picks the tile (and swap_ab for
                 # narrow-N) for this shape; expected_m=m since m is the actual size.
@@ -6288,6 +6340,7 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
                 enable_pdl,
                 out_dtype,
+                per_token_alpha,
             )
 
             # ctor takes mma_k/tile_k/single_work_tile_per_cta before use_prefetch,
@@ -6299,6 +6352,7 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                per_token_alpha=per_token_alpha,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
@@ -6318,9 +6372,17 @@ def _b12x_gemm_fp4_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
+                per_token_alpha=per_token_alpha,
             )
 
-            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+            if per_token_alpha:
+                alpha_for_launch = alpha_tensor.reshape(m).to(
+                    device=a.device, dtype=torch.float32
+                )
+                if not alpha_for_launch.is_contiguous():
+                    alpha_for_launch = alpha_for_launch.contiguous()
+            else:
+                alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
             # `out` passed as-is (row-major (m, n)).
             compiled_gemm(
@@ -6480,6 +6542,24 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 )
 
 
+# Per-token alpha holds one scale per row of a, so it has to follow the M the
+# tuner picks for its profiling shapes; without this the kernel would read past
+# the caller's alpha while profiling a larger bucket.
+_MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA = TuningConfig(
+    use_cuda_graph=_MM_FP4_TUNING_CONFIG_128x4.use_cuda_graph,
+    use_cold_l2_cache=_MM_FP4_TUNING_CONFIG_128x4.use_cold_l2_cache,
+    dynamic_tensor_specs=_MM_FP4_TUNING_CONFIG_128x4.dynamic_tensor_specs,
+    constraint_specs=(
+        *_MM_FP4_TUNING_CONFIG_128x4.constraint_specs,
+        ConstraintSpec(
+            4,  # alpha_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -6559,7 +6639,11 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar.
+        Global scale tensor, float scalar. On SM120/SM121 the ``"b12x"`` and
+        ``"cutlass"`` backends additionally accept a per-token alpha: a float32
+        tensor of ``m`` elements holding one dequant scale per row of ``a``, for
+        activations quantized with a dynamic per-token NVFP4 global scale. No
+        other backend or architecture supports it.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -6640,10 +6724,28 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
+    # Only the SM120 b12x and cutlass epilogues apply a row scale; any other
+    # backend would silently consume alpha[0] for every row, so narrow the
+    # candidate list rather than let the tuner pick one that mis-scales.
+    per_token_alpha = _is_per_token_alpha(alpha)
+    if per_token_alpha:
+        supported = [bk for bk in backends if bk in _PER_TOKEN_ALPHA_BACKENDS]
+        if not supported or major != 12:
+            raise ValueError(
+                "Per-token alpha (one scale per row of a) is only implemented "
+                f"by the {sorted(_PER_TOKEN_ALPHA_BACKENDS)} FP4 backends on "
+                f"SM120/SM121. Got alpha with {alpha.numel()} elements for "
+                f"backends {backends} on SM{major}{minor}."
+            )
+        backends = supported
+
     tuner = AutoTuner.get()
-    tuning_config = (
-        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
-    )
+    if use_8x4_sf_layout:
+        tuning_config = _MM_FP4_TUNING_CONFIG_8x4
+    elif per_token_alpha:
+        tuning_config = _MM_FP4_TUNING_CONFIG_128x4_PER_TOKEN_ALPHA
+    else:
+        tuning_config = _MM_FP4_TUNING_CONFIG_128x4
 
     backend_to_runner_factory = {
         "cudnn": lambda: _cudnn_gemm_fp4_runner(tuning_config),
