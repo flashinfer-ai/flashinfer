@@ -21,6 +21,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           CANDIDATE_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         with:
           result-encoding: string
@@ -30,16 +31,33 @@ jobs:
 
             const { owner, repo } = context.repo;
             const headSha = process.env.HEAD_SHA;
-            const { data: associated } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner,
-              repo,
-              commit_sha: headSha,
-            });
-            const matches = associated.filter((pr) =>
+            const headRepository = process.env.HEAD_REPOSITORY || `${owner}/${repo}`;
+            const [headOwner, headRepo] = headRepository.split('/', 2);
+            let associated = [];
+            try {
+              const response = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: headOwner,
+                repo: headRepo,
+                commit_sha: headSha,
+              });
+              associated = response.data;
+            } catch (error) {
+              core.warning(`Could not query associated PRs in ${headRepository}: ${error.message}`);
+            }
+            let matches = associated.filter((pr) =>
               pr.state === 'open'
               && pr.head.sha === headSha
               && pr.base.repo.full_name === `${owner}/${repo}`
             );
+            if (!matches.length) {
+              const openPullRequests = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                per_page: 100,
+              });
+              matches = openPullRequests.filter((pr) => pr.head.sha === headSha);
+            }
             const pullRequest = matches.find((pr) => pr.base.ref === 'main') || matches[0];
             if (!pullRequest) {
               core.warning(`No open pull request found for workflow head ${headSha}`);
