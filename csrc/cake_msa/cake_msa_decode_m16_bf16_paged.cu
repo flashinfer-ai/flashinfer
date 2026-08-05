@@ -2804,7 +2804,8 @@ kernel_cake_msa_decode_m16_bf16_paged(const __grid_constant__ CakeMsaTensorMap Q
                                             unsigned _stv8_0_6 = __float_as_uint(values_lo[0 + 6]);
                                             unsigned _stv8_0_7 = __float_as_uint(values_lo[0 + 7]);
                                             asm volatile(
-                                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                                "st.global.v4.b32 [%0], {%1, %2, %3, %4};\n\t"
+                                                "st.global.v4.b32 [%0+16], {%5, %6, %7, %8};"
                                                 :: "l"((void*)(partial_O + partial_o_idx_1 + (0))), "r"(_stv8_0_0), "r"(_stv8_0_1), "r"(_stv8_0_2), "r"(_stv8_0_3), "r"(_stv8_0_4), "r"(_stv8_0_5), "r"(_stv8_0_6), "r"(_stv8_0_7) : "memory");
                                         }
                                         {
@@ -2817,7 +2818,8 @@ kernel_cake_msa_decode_m16_bf16_paged(const __grid_constant__ CakeMsaTensorMap Q
                                             unsigned _stv8_1_6 = __float_as_uint(values_hi[0 + 6]);
                                             unsigned _stv8_1_7 = __float_as_uint(values_hi[0 + 7]);
                                             asm volatile(
-                                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                                "st.global.v4.b32 [%0], {%1, %2, %3, %4};\n\t"
+                                                "st.global.v4.b32 [%0+16], {%5, %6, %7, %8};"
                                                 :: "l"((void*)(partial_O + (partial_o_idx_1 + 8) + (0))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
                                         }
                                     }
@@ -2904,7 +2906,8 @@ kernel_cake_msa_decode_m16_bf16_paged(const __grid_constant__ CakeMsaTensorMap Q
                                                 unsigned _ldv8_2_6;
                                                 unsigned _ldv8_2_7;
                                                 asm volatile(
-                                                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                                    "ld.global.v4.b32 {%0, %1, %2, %3}, [%8];\n\t"
+                                                    "ld.global.v4.b32 {%4, %5, %6, %7}, [%8+16];"
                                                     : "=r"(_ldv8_2_0), "=r"(_ldv8_2_1), "=r"(_ldv8_2_2), "=r"(_ldv8_2_3), "=r"(_ldv8_2_4), "=r"(_ldv8_2_5), "=r"(_ldv8_2_6), "=r"(_ldv8_2_7) : "l"((const void*)(partial_O + (split_o_idx_1))) : "memory");
                                                 split_o_1[0 + 0] = __uint_as_float(_ldv8_2_0);
                                                 split_o_1[0 + 1] = __uint_as_float(_ldv8_2_1);

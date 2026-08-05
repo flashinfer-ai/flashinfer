@@ -47,21 +47,21 @@ _VARIANTS = (
 # Freeze the complete public source inventory, including each device body and
 # host binding.
 _SOURCE_SHA256 = {
-    "cake_msa_decode_bf16_flat.cu": "fab06f6bd7d0febbb9949f07ffafe29ef6d7ac52fd6f8a1bc14616aefd13cf59",
+    "cake_msa_decode_bf16_flat.cu": "1c2b6c95a0a3f16ade59dcd936a8495cafcccedb1d0a6f6585c29f0685792381",
     "cake_msa_decode_bf16_flat_binding.cu": "f8928306669683cca2b32d0383da941fd223faf25478a5b5c2bcb2bdefaf511f",
-    "cake_msa_decode_bf16_paged.cu": "d209ef72eaf2fe6912fbbda5cd3272f60615a594307254706c2a89aedf1aa12a",
+    "cake_msa_decode_bf16_paged.cu": "e6ac952bc77780efa28fb38bd90a687c1e422b983ff4036e7c7481efe21c6494",
     "cake_msa_decode_bf16_paged_binding.cu": "3276e49a018424f4e9c8097cd3aec3b0693deabc5ce6bada8b94d98bb8515f1b",
-    "cake_msa_decode_fp16_flat.cu": "717e3b26f6c879cf9c99cd4f619502f9f690be2f89385d2b8d696302a1fcf6d7",
+    "cake_msa_decode_fp16_flat.cu": "e94c19b626732dd925540bcdf7b006818200bc12660c4d2548acec678e8971ea",
     "cake_msa_decode_fp16_flat_binding.cu": "f25374e00b7645618b148ca1f3aab55568143ffa29abbc36480dcf6e275c1f44",
-    "cake_msa_decode_fp16_paged.cu": "c6d7d79a6a626d4861ba97a352e2a8057b82f53ccec9f60d2c4a71d65575ca16",
+    "cake_msa_decode_fp16_paged.cu": "ed94d6f23528eb62a4c9e3217519f714d22115b5ddc661caa868a9339858d75b",
     "cake_msa_decode_fp16_paged_binding.cu": "a2c92ee7646527ebed5afacc7315f20e3f2e8b63c8961001b0a7742ba1877b99",
-    "cake_msa_decode_fp8_flat.cu": "f62fb8ee4474ef842be2664a8f7c69bd92ab6ebf3ee5b81c193d3b4413fbb979",
+    "cake_msa_decode_fp8_flat.cu": "42a2016e362b30839e6e5b1fee08549cfe9c67e3f17ed2be46a42b3bf346f298",
     "cake_msa_decode_fp8_flat_binding.cu": "65246382bb9d4780a202a2bf404f99090ad508cb06c5074f9478852df6cd2c10",
-    "cake_msa_decode_fp8_paged.cu": "e394e0ad905f2c759f5e8e8efb7d61ca16c5b358f563e0e8d1b2e359f211542d",
+    "cake_msa_decode_fp8_paged.cu": "c78a640e14e357f4b2329c5056dd1c6818628019c73552f615f8078f1379814b",
     "cake_msa_decode_fp8_paged_binding.cu": "181136cb7e22c18db0408180a0537a055b46b710a4d64d44c64ba08c771a1160",
-    "cake_msa_decode_m16_bf16_flat.cu": "edcc630818d1cfd1b9de03a4ff16ea0a1726e5c8d4990e0b2f372274dfacd1a3",
+    "cake_msa_decode_m16_bf16_flat.cu": "12d8893e92b2d0dbe3a7f45a894d1d98f1235922c58f09d9a69936f724343569",
     "cake_msa_decode_m16_bf16_flat_binding.cu": "7cce6013f914c642e5f3243d9ed94c2f28773bdd28f7df775aea46438924436e",
-    "cake_msa_decode_m16_bf16_paged.cu": "87ac97c531e8a7822e805eccfb6a65fbaf97b42ef0d0dc3715bc747646317fcb",
+    "cake_msa_decode_m16_bf16_paged.cu": "d974c367cf2fcda56b4adb0940cd122a236e5963295a67699b49f75a598e732a",
     "cake_msa_decode_m16_bf16_paged_binding.cu": "3a05f2bfb8550b692eae38921931d90f604e3ecefc7c2f246a24683bf7fd352a",
     "cake_msa_prefill_m128_bf16_flat.cu": "4e1fc08163989f181ef0f2de316eccb9c6a7037bdd233ad2c5e6ed74b1b0f600",
     "cake_msa_prefill_m128_bf16_flat_binding.cu": "d8654b6215ce53f4315281c5dd74ecd7d45848fc26475b3036249e885a7276f0",
@@ -122,6 +122,7 @@ _TENSOR_MAP_ENCODER_DEFINITION = re.compile(
     r"\binline CUtensorMap EncodeTma_([A-Za-z0-9_]+)\("
 )
 _DIRECT_TENSOR_MAP_LAUNCH_ARG = re.compile(r"&h_([A-Za-z0-9_]+)(?=,|})")
+_CUDA_12_8_ILLEGAL_GLOBAL_VECTOR = re.compile(r"\b(?:ld|st)\.global\.v8\.b32\b")
 
 
 def _device_name(variant):
@@ -176,6 +177,21 @@ def test_cake_msa_device_binding_pairs_use_neutral_kernel_symbols():
         assert not forbidden_apis, (
             f"{binding_name} uses forbidden generated-host APIs: {forbidden_apis}"
         )
+
+
+def test_cake_msa_sources_use_cuda_12_8_global_vector_widths():
+    illegal_sites = {}
+    for variant in _VARIANTS:
+        device_name = _device_name(variant)
+        device_source = (_CAKE_MSA_CSRC_DIR / device_name).read_text(encoding="utf-8")
+        matches = _CUDA_12_8_ILLEGAL_GLOBAL_VECTOR.findall(device_source)
+        if matches:
+            illegal_sites[device_name] = len(matches)
+
+    assert not illegal_sites, (
+        "CUDA 12.8 ptxas limits global b32 vectors to 128 bits; split each "
+        f"v8 instruction into two v4 instructions: {illegal_sites}"
+    )
 
 
 def test_cake_msa_tma_variants_use_grid_constant_tensor_map_parameters():
