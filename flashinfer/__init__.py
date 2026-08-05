@@ -89,12 +89,18 @@ from .fused_moe import (
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
+    prims_ts_bf16_moe,
+    prims_ts_bf16_routed_moe,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_routed_moe,
+    prims_ts_fp8_block_scale_moe,
+    prims_ts_fp8_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
-    trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
 # CuteDSL high-level APIs (conditionally if cute_dsl available)

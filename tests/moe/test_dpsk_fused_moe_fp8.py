@@ -542,7 +542,7 @@ TUNE_MAX_NUM_TOKENS = 4096
                 "top_k_groups": 1,
                 "routed_scaling": 2.5,
                 "compatible_intermediate_size": [384, 768],
-                "enable_autotune": False,
+                "enable_autotune": True,
             },
             id="DSLite",
         ),
