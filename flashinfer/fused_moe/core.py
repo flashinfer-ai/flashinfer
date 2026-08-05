@@ -435,16 +435,13 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
         def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
-            """Return stable launch parameters for persisted stage-tuning keys.
-
-            Stage profiling passes only activation and weight tensors, so the
-            profile key captures their shapes but not constructor-fixed options
-            such as top-k, parallel ranks, quantization mode, or activation.
-            The in-memory runner hash distinguishes instances, but it is
-            intentionally excluded from persisted file keys. Include those
-            options here to prevent runners with identical tensor profiles from
-            reusing incompatible saved tactics.
-            """
+            # Stage profiling passes only activation and weight tensors, so the
+            # profile key captures their shapes but not constructor-fixed options
+            # such as top-k, parallel ranks, quantization mode, or activation.
+            # The in-memory runner hash distinguishes instances, but it is
+            # intentionally excluded from persisted file keys. Include those
+            # options here to prevent runners with identical tensor profiles from
+            # reusing incompatible saved tactics.
             return (
                 self.x_dtype,
                 self.weight_dtype,
