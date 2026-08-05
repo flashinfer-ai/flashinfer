@@ -35,6 +35,7 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.attention import (
     mla_paged_decode_trace,
 )
+from flashinfer.autotuner.autotuner import _get_autotune_context_mode
 from flashinfer.utils import get_compute_capability
 from ._backends.cute_dsl_modular_backend import (
     _BatchMLAPagedAttentionCuteDslModularBackend,
@@ -195,6 +196,12 @@ class BatchMLAPagedAttentionWrapper:
     order. Every ordering remains a complete candidate list, and backend
     planners may fall through only when they report the request unsupported.
 
+    When run inside :func:`flashinfer.autotune(True)`, ``backend="auto"``
+    profiles compatible concrete wrapper backends over synthetic batch
+    buckets. Inside :func:`flashinfer.autotune(False)`, it performs cache-only
+    selection. :meth:`run` always dispatches directly to the concrete backend
+    selected by the successful plan.
+
     Example
     -------
     >>> import torch
@@ -292,8 +299,11 @@ class BatchMLAPagedAttentionWrapper:
             ``"trtllm-gen"``, ``"cute-dsl"``, ``"cute-dsl-monolithic"``,
             ``"cute-dsl-modular"``, or ``"xqa"``. Default ``"auto"``.
 
-            ``"auto"`` ranks every wrapper backend (as defined in `_auto_policy.py`), then asks each backend planner in order until one
-            accepts the request.
+            ``"auto"`` normally ranks every wrapper backend (as defined in
+            `_auto_policy.py`), then asks each backend planner in order until
+            one accepts the request. Inside ``autotune(True)`` it profiles that
+            candidate set; inside ``autotune(False)`` it performs cache-only
+            selection. Neither mode adds work to ``run()``.
 
             ``"cutlass"`` uses the SM100/SM110 CUTLASS MLA decode kernel. Only
             ``float_workspace_buffer`` is required at construction. Pass
@@ -455,6 +465,15 @@ class BatchMLAPagedAttentionWrapper:
         self._backend_impl = backend_type.plan_from_wrapper(args)
         self._selected_backend = backend
         self._input_contract = args.input_contract
+
+    def _publish_auto_plan(
+        self, args: _MLAPlanArguments, result: _auto_policy._MLAAutoPlanResult
+    ) -> None:
+        """Atomically publish a completed automatic selection result."""
+        self._backend_impl = result.backend_impl
+        self._selected_backend = result.backend_name
+        self._input_contract = args.input_contract
+        self._auto_selection_trace = result.trace
 
     # Preferred value-object form
     @overload
@@ -781,32 +800,15 @@ class BatchMLAPagedAttentionWrapper:
         else:
             auto_candidates = ranked_candidates
 
-        rejections = []
-        last_rejection = None
-        for candidate in auto_candidates:
-            try:
-                self._plan_backend(candidate, plan_args)
-            except _BackendPlanUnsupportedError as err:
-                last_rejection = err
-                reason = str(err)
-                rejections.append((candidate, reason))
-                continue
-
-            self._auto_selection_trace = _auto_policy.MLAAutoSelectionTrace(
-                candidates=tuple(auto_candidates),
-                rejections=tuple(rejections),
-                resolved_backend=candidate,
-            )
-            return
-
-        candidate_names = ", ".join(auto_candidates)
-        rejection_summary = "; ".join(
-            f"{candidate}: {reason}" for candidate, reason in rejections
+        result = _auto_policy.plan_auto_backend(
+            plan_args,
+            candidates=tuple(auto_candidates),
+            backend_types=_BATCH_MLA_BACKENDS,
+            autotune_mode=_get_autotune_context_mode(),
         )
-        raise _BackendPlanUnsupportedError(
-            f"backend='auto' rejected all candidates [{candidate_names}]: "
-            f"{rejection_summary}"
-        ) from last_rejection
+        # Publish only after selection and the real winner plan have both
+        # completed successfully. A failed replan leaves prior state live.
+        self._publish_auto_plan(plan_args, result)
 
     # Output-only form –– ``return_lse=False`` returns the output tensor.
     # Preferred value-object form.

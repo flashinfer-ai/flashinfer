@@ -1,11 +1,15 @@
 """Canonical numerical coverage for the public stateful MLA wrapper."""
 
 from dataclasses import replace
+from contextlib import nullcontext
 import warnings
 
 import pytest
 import torch
 
+from flashinfer import autotune
+from flashinfer.autotuner import AutoTuner
+from flashinfer.mla._batch_mla import _auto_policy
 from flashinfer.mla import (
     BatchMLAPagedAttentionWrapper,
     MLAKVCache,
@@ -194,6 +198,24 @@ _AUTO_CASES = (
     MLATestCase("sm121-auto", (12, 1), "auto", softmax_scale_qk_nope_head_dim=128),
 )
 
+_AUTOTUNE_CASES = (
+    MLATestCase(
+        "sm90-autotune-split-base2",
+        (9, 0),
+        "auto",
+        kv_layout="independent-split",
+        lse_mode="base2",
+    ),
+    MLATestCase("sm90-autotune-fixed-q2", (9, 0), "auto", q_len=2),
+    MLATestCase("sm100-autotune", (10, 0), "auto", qk_nope_head_dim=128),
+    MLATestCase(
+        "sm120-autotune",
+        (12, 0),
+        "auto",
+        softmax_scale_qk_nope_head_dim=128,
+    ),
+)
+
 
 def _workspace() -> torch.Tensor:
     return torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
@@ -222,12 +244,18 @@ def _query_and_kv(inputs):
     return query, MLAKVCache.split(inputs.ckv_cache, inputs.kpe_cache)
 
 
-def _run_public_wrapper(case, inputs):
+def _run_public_wrapper(case, inputs, *, tuning_buckets=None, tune_mode=True):
     wrapper = BatchMLAPagedAttentionWrapper(_workspace(), backend=case.backend)
     plan_kwargs = wrapper_plan_kwargs(case, inputs)
     for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
         plan_kwargs.pop(name)
-    wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
+    tuning_context = (
+        autotune(tune_mode, tuning_buckets=tuning_buckets)
+        if tuning_buckets is not None
+        else nullcontext()
+    )
+    with tuning_context:
+        wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
     query, kv = _query_and_kv(inputs)
     run_kwargs = wrapper_run_kwargs(case, inputs)
     for name in ("kv_cache", "ckv_cache", "kpe_cache"):
@@ -238,6 +266,11 @@ def _run_public_wrapper(case, inputs):
 
 def test_wrapper_case_table_covers_every_explicit_backend():
     assert {case.backend for case in _WRAPPER_CASES} == _WRAPPER_BACKENDS
+
+
+def test_wrapper_rejects_removed_autotune_selector():
+    with pytest.raises(ValueError, match="backend must be one of"):
+        BatchMLAPagedAttentionWrapper(torch.empty(1), backend="autotune")
 
 
 def test_wrapper_case_table_covers_public_configuration_dimensions():
@@ -298,6 +331,8 @@ def test_wrapper_auto_matches_selected_backend_and_reference(case):
 
     automatic, automatic_result = _run_public_wrapper(case, inputs)
     assert automatic.resolved_backend in _WRAPPER_BACKENDS
+    assert automatic.auto_selection_trace is not None
+    assert automatic.auto_selection_trace.mode == "deterministic"
     explicit, explicit_result = _run_public_wrapper(
         replace(case, backend=automatic.resolved_backend), inputs
     )
@@ -308,6 +343,160 @@ def test_wrapper_auto_matches_selected_backend_and_reference(case):
     if expected_lse is not None:
         assert_mla_close(automatic_result[1], expected_lse)
         assert_mla_close(automatic_result[1], explicit_result[1])
+
+
+def test_failed_auto_replan_preserves_previous_state(monkeypatch):
+    class BackendImpl:
+        def __init__(self, result):
+            self.result = result
+
+        def run_from_wrapper(self, **_kwargs):
+            return self.result
+
+    trace = _auto_policy.MLAAutoSelectionTrace(
+        candidates=("fa2",),
+        rejections=(),
+        mode="cache-only",
+        bypass_reason=None,
+        resolved_backend="fa2",
+    )
+    responses = iter(
+        (
+            _auto_policy._MLAAutoPlanResult("fa2", BackendImpl("old-result"), trace),
+            RuntimeError("replan failed"),
+        )
+    )
+
+    def resolve(*_args, **_kwargs):
+        response = next(responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    monkeypatch.setattr(_auto_policy, "plan_auto_backend", resolve)
+    wrapper = BatchMLAPagedAttentionWrapper(torch.empty(1), backend="auto")
+    plan_kwargs = {
+        "metadata": MLAPlanMetadata.csr(
+            qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            kv_indices=torch.tensor([0], dtype=torch.int32),
+            kv_len_arr=torch.tensor([1], dtype=torch.int32),
+        ),
+        "num_heads": 1,
+        "head_dim_ckv": 2,
+        "head_dim_kpe": 1,
+        "page_size": 1,
+        "causal": False,
+        "sm_scale": 1.0,
+        "q_data_type": torch.float32,
+        "kv_data_type": torch.float32,
+        "kv_layout": "independent-split",
+    }
+
+    with autotune(False):
+        wrapper.plan(**plan_kwargs)
+    old_trace = wrapper.auto_selection_trace
+
+    with pytest.raises(RuntimeError, match="replan failed"), autotune(False):
+        wrapper.plan(**plan_kwargs)
+
+    assert wrapper.resolved_backend == "fa2"
+    assert wrapper.auto_selection_trace is old_trace
+    assert (
+        wrapper.run(
+            query=MLAQuery.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+            kv=MLAKVCache.split(torch.empty(1, 1, 2), torch.empty(1, 1, 1)),
+        )
+        == "old-result"
+    )
+
+
+@pytest.mark.parametrize("case", _AUTOTUNE_CASES, ids=lambda case: case.case_id)
+def test_wrapper_autotune_populates_cache_and_matches_reference(case):
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, expected_lse = reference_result(case, inputs)
+    AutoTuner.get().clear_cache()
+
+    tuned, tuned_result = _run_public_wrapper(
+        case, inputs, tuning_buckets=(1, 2, 4), tune_mode=True
+    )
+    warm, warm_result = _run_public_wrapper(
+        case, inputs, tuning_buckets=(1, 2, 4), tune_mode=False
+    )
+
+    assert tuned.resolved_backend in _WRAPPER_BACKENDS
+    assert warm.resolved_backend == tuned.resolved_backend
+    assert tuned.auto_selection_trace is not None
+    assert tuned.auto_selection_trace.mode == "tuning"
+    assert warm.auto_selection_trace is not None
+    assert warm.auto_selection_trace.mode == "cache-only"
+    assert_mla_close(tuned_result[0], expected_output)
+    assert_mla_close(warm_result[0], expected_output)
+    assert_mla_close(warm_result[0], tuned_result[0])
+    if expected_lse is not None:
+        assert_mla_close(tuned_result[1], expected_lse)
+        assert_mla_close(warm_result[1], expected_lse)
+
+
+def test_sm100_wrapper_autotune_run_is_cuda_graph_capturable():
+    case = MLATestCase(
+        "sm100-autotune-cuda-graph", (10, 0), "auto", qk_nope_head_dim=128
+    )
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, _ = reference_result(case, inputs)
+    AutoTuner.get().clear_cache()
+    wrapper = BatchMLAPagedAttentionWrapper(
+        _workspace(),
+        use_cuda_graph=True,
+        qo_indptr=torch.empty_like(inputs.qo_indptr),
+        kv_indptr=torch.empty_like(inputs.kv_indptr),
+        kv_indices=torch.empty_like(inputs.kv_indices),
+        kv_len_arr=torch.empty_like(inputs.kv_len_arr),
+        backend="auto",
+    )
+    plan_kwargs = wrapper_plan_kwargs(case, inputs)
+    for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
+        plan_kwargs.pop(name)
+    with autotune(True, tuning_buckets=(1, 2, 4)):
+        wrapper.plan(metadata=_metadata(case, inputs), **plan_kwargs)
+
+    query, kv = _query_and_kv(inputs)
+    graph_output = torch.empty_like(inputs.q_nope)
+    wrapper.run(query=query, kv=kv, out=graph_output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(query=query, kv=kv, out=graph_output)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert_mla_close(graph_output, expected_output)
+
+
+def test_sm90_wrapper_autotune_supports_profiler():
+    case = MLATestCase("sm90-autotune-profiler", (9, 0), "auto")
+    require_architecture(case.architecture)
+    inputs = make_mla_inputs(case)
+    expected_output, _ = reference_result(case, inputs)
+    AutoTuner.get().clear_cache()
+    wrapper = BatchMLAPagedAttentionWrapper(_workspace(), backend="auto")
+    plan_kwargs = wrapper_plan_kwargs(case, inputs)
+    for name in ("cum_seq_lens_q", "block_tables", "seq_lens", "max_q_len"):
+        plan_kwargs.pop(name)
+    with autotune(True, tuning_buckets=(1, 2, 4)):
+        wrapper.plan(metadata=_metadata(case, inputs), use_profiler=True, **plan_kwargs)
+
+    query, kv = _query_and_kv(inputs)
+    output = wrapper.run(
+        query=query,
+        kv=kv,
+        profiler_buffer=torch.empty(1 << 20, dtype=torch.uint64, device="cuda"),
+    )
+
+    assert wrapper.auto_selection_trace is not None
+    assert wrapper.auto_selection_trace.mode == "tuning"
+    assert_mla_close(output, expected_output)
 
 
 def test_legacy_wrapper_split_calls_warn_once_and_match_reference():
