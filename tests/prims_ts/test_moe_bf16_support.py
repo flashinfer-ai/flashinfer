@@ -36,6 +36,7 @@ from flashinfer.tllm_enums import (
     RoutingMethodType,
     WeightLayout,
 )
+from flashinfer.utils import is_sm100a_supported
 
 def _runner(**overrides):
     values = dict(
@@ -338,6 +339,36 @@ def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
     pytest.fail("GPT-OSS high-throughput MXFP4xMXFP8 config pair is missing")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_sm100a_supported(torch.device("cuda")),
+    reason="MXFP4 PrimsTS kernels require Blackwell SM100A+",
+)
+def test_gpt_oss_high_throughput_fused_fc1_gpu_correctness():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [128, 6],
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=8192,
+        top_k=4,
+        num_local_experts=128,
+        fc1_has_bias=True,
+        fc2_has_bias=True,
+    )
+
+    assert reference_check(
+        num_experts=2,
+        num_tokens=257,
+        top_k=1,
+        problem_n=256,
+        problem_k=512,
+        seed=123,
+        **pair.fc1.cfg.kwargs,
+    )
+
+
 def test_runner_filter_drops_unbuildable_json_tactics():
     valid_pair = _first_buildable_pair(
         map_trtllm_bf16_moe_tactic,
@@ -542,10 +573,11 @@ def test_support_accepts_nvfp4_per_token_scale_local_config(monkeypatch):
             dtype_act=DtypeTrtllmGen.E2m1,
             dtype_weights=DtypeTrtllmGen.E2m1,
             weight_layout=WeightLayout.BlockMajorK,
+            hidden_size=256,
             use_per_token_scaling=True,
         ),
         _inputs(
-            hidden_states=torch.empty((4, 64), dtype=torch.uint8),
+            hidden_states=torch.empty((4, 128), dtype=torch.uint8),
             hidden_states_scale=torch.empty((4, 4), dtype=torch.float8_e4m3fn),
             per_token_scale=torch.ones((4,), dtype=torch.float32),
         ),
