@@ -18,9 +18,14 @@ jobs:
       dev_suffix: ${{ steps.set-suffix.outputs.dev_suffix }}
       release_tag: ${{ steps.set-suffix.outputs.release_tag }}
       version: ${{ steps.set-suffix.outputs.version }}
+      release_sha: ${{ steps.capture-sha.outputs.release_sha }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Capture release commit SHA
+        id: capture-sha
+        run: echo "release_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Set date suffix and release tag
         id: set-suffix
@@ -52,6 +57,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.setup.outputs.release_sha }}
           submodules: true
 
       - name: Set up Python
@@ -87,6 +93,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.setup.outputs.release_sha }}
           submodules: true
 
       - name: Set up Python
@@ -148,6 +155,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.setup.outputs.release_sha }}
           submodules: true
 
       - name: Build wheel in container
@@ -210,12 +218,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.release_sha }}
 
       - name: Create GitHub Release (empty first)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ needs.setup.outputs.release_tag }}"
+          SHA="${{ needs.setup.outputs.release_sha }}"
 
           # Delete existing release and tag if they exist
           if gh release view "$TAG" &>/dev/null; then
@@ -223,8 +234,9 @@ jobs:
             gh release delete "$TAG" --yes --cleanup-tag
           fi
 
-          # Create new release without assets first
+          # Create new release without assets first (pin tag to the commit from setup, not latest default branch)
           gh release create "$TAG" \
+            --target "$SHA" \
             --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
             --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
             --prerelease
@@ -311,6 +323,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.setup.outputs.release_sha }}
           submodules: true
 
       - name: Download flashinfer-python artifact
@@ -359,12 +372,14 @@ jobs:
           retention-days: 7
 
   jit-cache-summary:
-    needs: test-nightly-build
+    needs: [setup, test-nightly-build]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.release_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -397,6 +412,8 @@ jobs:
     steps:
       - name: Checkout flashinfer repo
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.release_sha }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
