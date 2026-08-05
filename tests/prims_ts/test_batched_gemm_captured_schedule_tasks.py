@@ -227,10 +227,6 @@ class _DummyResource(MemoryResource):
         pass
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
-    def sync_sttm_copy(self, stage_info):
-        pass
-
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
     def sync_cast_a_warps(self, stage_info):
         pass
 

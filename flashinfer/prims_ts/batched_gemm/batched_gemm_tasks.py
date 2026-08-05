@@ -669,7 +669,6 @@ def create_copy_sfa_task(
     num_k_tiles: int,
 ) -> Task:
     is_persistent = _is_persistent(cfg)
-    needs_copy_sync = hasattr(tmem_sfa, "sync_sttm_copy")
 
     @schedule
     def copy_sfa_schedule(
@@ -687,8 +686,6 @@ def create_copy_sfa_task(
                 smem_sfa_stage_ptr=smem_sfa_stage_ptr,
             )
             tmem.commit()
-            if needs_copy_sync:
-                tmem.sync_sttm_copy()
             smem.release()
 
     captured_schedule = _call_schedule_with_optional_work_queue(
@@ -714,7 +711,6 @@ def create_copy_sfb_task(
     num_k_tiles: int,
 ) -> Task:
     is_persistent = _is_persistent(cfg)
-    needs_copy_sync = hasattr(tmem_sfb, "sync_sttm_copy")
 
     @schedule
     def copy_sfb_schedule(
@@ -729,8 +725,6 @@ def create_copy_sfb_task(
             desc_b_s2t_base = smem.build_sfb_s2t_desc()
             tmem.acquire()
             tmem.copy_sfb(desc_b_s2t_base=desc_b_s2t_base)
-            if needs_copy_sync:
-                tmem.sync_sttm_copy()
 
         with _k_tile_schedule_loop(cfg, wq, num_k_tiles):
             issue_sfb_copy()

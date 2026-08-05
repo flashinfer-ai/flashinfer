@@ -553,8 +553,8 @@ class TmemSfRouteResource(MemoryResource):
                 raise AssertionError(
                     f"Unsupported LDS+STTM SMEM SF layout: {smem_layout}"
                 )
-            if cutlass.const_expr(self.cfg.has_cluster):
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            # Lowers to tcgen05.wait::st.sync.aligned, ordering the STTM
+            # writes above before the TS full-barrier commit consumed by MMA.
             cute.arch.fence_view_async_tmem_store()
         else:
             s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
@@ -579,22 +579,6 @@ class TmemSfRouteResource(MemoryResource):
                         )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
                 cute.arch.fence_view_async_tmem_store()
-
-    @producer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def sync_sttm_copy(self, stage_info: StageInfo) -> None:
-        """Sync all LDS+STTM CopySf warps before releasing reused SMEM."""
-        is_b = cutlass.const_expr(self._operand == "b")
-        copy_mode = (
-            self.cfg.sfb_smem_to_tmem_copy if is_b else self.cfg.sfa_smem_to_tmem_copy
-        )
-        use_sttm = cutlass.const_expr(copy_mode == int(SfSmemToTmemCopy.LDS_STTM))
-        if cutlass.const_expr(use_sttm and self.cfg.has_cluster):
-            barrier_id = 4 if is_b else 5
-            thread_count = (
-                self.cfg.num_copy_sfb_warps if is_b else self.cfg.num_copy_sfa_warps
-            ) * 32
-            prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=thread_count)
 
     @cute.jit
     def _consumer_work_impl(self, stage_info: StageInfo):

@@ -292,11 +292,14 @@ def _make_pipeline_configs(cfg):
                 num_stages=cfg.num_stages_smem_sfa,
                 num_bytes=cfg.num_bytes_sfa_per_stage,
                 producer_group=one_thread,
+                # With no separate CTA barrier, wait for every LDS+STTM copy
+                # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfa_warps
+                    pipeline.Agent.Thread, cfg.num_copy_sfa_warps * 32
                 ),
                 cta_layout_vmnk=None,
                 producer_signaling_threads=SignalingThreads.TaskWarpLeader,
+                consumer_signaling_threads=SignalingThreads.All,
                 num_bytes_per_warp_per_cta=sfa_tma_num_bytes_per_warp,
             )
     if cfg.has_scale_factors:
@@ -349,10 +352,13 @@ def _make_pipeline_configs(cfg):
                 producer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread, cfg.num_load_sfb_warps
                 ),
+                # With no separate CTA barrier, wait for every LDS+STTM copy
+                # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps
+                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps * 32
                 ),
                 cta_layout_vmnk=None,
+                consumer_signaling_threads=SignalingThreads.All,
             )
         elif cfg.has_routed_sfs and cfg.uses_tma_routed_sfs and cfg.is_swap_ab:
             # Linear SFB SMEM layout (routed via TMA gather4) is consumed by the
@@ -377,11 +383,14 @@ def _make_pipeline_configs(cfg):
                 num_stages=cfg.num_stages_smem_sfb,
                 num_bytes=cfg.num_bytes_sfb_per_stage,
                 producer_group=one_thread,
+                # With no separate CTA barrier, wait for every LDS+STTM copy
+                # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps
+                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps * 32
                 ),
                 cta_layout_vmnk=None,
                 producer_signaling_threads=SignalingThreads.TaskWarpLeader,
+                consumer_signaling_threads=SignalingThreads.All,
                 num_bytes_per_warp_per_cta=sfb_tma_num_bytes_per_warp,
             )
     tmem_c_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
