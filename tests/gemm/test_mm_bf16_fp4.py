@@ -301,9 +301,7 @@ def test_cute_dsl_every_tactic_matches_reference(m, n, k):
     for tactic, cfg in enumerate(
         _bf16_fp4_cute_dsl_tactic_configs(n, k, get_device_sm_count(device))
     ):
-        if cfg[7] == "gemv" and (
-            m != 1 or get_compute_capability(device)[0] != 12
-        ):
+        if cfg[7] == "gemv" and (m != 1 or get_compute_capability(device)[0] != 12):
             continue
         outs = []
         for _ in range(2):

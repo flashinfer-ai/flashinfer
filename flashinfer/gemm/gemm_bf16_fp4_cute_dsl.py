@@ -606,9 +606,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 if m_opt != 1 or not gemv_ok:
                     return False
                 warps_per_sm = (n // 64) * cfg[5] / sm_count
-                return (
-                    _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM
-                )
+                return _GEMV_MIN_WARPS_PER_SM <= warps_per_sm <= _GEMV_MAX_WARPS_PER_SM
 
             return [
                 i
