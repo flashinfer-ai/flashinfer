@@ -162,10 +162,29 @@ class KVScope:
     indices_in_kvcache: torch.Tensor
     topk_length: torch.Tensor | None
 
-    def get_kvcache_for_flashinfer(self, kv_layout: KVLayout) -> torch.Tensor:
+    def get_kvcache_for_flashinfer(
+        self, kv_layout: KVLayout, page_stride_padding_elements: int = 0
+    ) -> torch.Tensor:
         if kv_layout == "HND":
-            return self.blocked_k.transpose(1, 2).contiguous()
-        return self.blocked_k.contiguous()
+            kv_cache = self.blocked_k.transpose(1, 2).contiguous()
+        else:
+            kv_cache = self.blocked_k.contiguous()
+        if page_stride_padding_elements == 0:
+            return kv_cache
+
+        strides = list(kv_cache.stride())
+        strides[0] += page_stride_padding_elements
+        storage_size = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(kv_cache.shape, strides, strict=True)
+        )
+        backing = torch.full(
+            (storage_size,),
+            7.0,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        return torch.as_strided(backing, kv_cache.shape, strides).copy_(kv_cache)
 
 
 @dataclasses.dataclass
@@ -672,13 +691,25 @@ def _scale_for_flashinfer(t: TestParam, value: float) -> float | torch.Tensor:
     return value
 
 
-def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Tensor:
+def run_flashinfer_decode(
+    t: TestParam,
+    testcase: TestcaseForDecode,
+    *,
+    swa_page_stride_padding_elements: int = 0,
+    compressed_page_stride_padding_elements: int = 0,
+    sparse_indices_are_storage_offsets: bool | None = None,
+    remapped_sparse_indices_buffer: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     assert t.decode is not None
     swa_indices = testcase.kv_scope.indices_in_kvcache[testcase.valid_q].contiguous()
+    swa_kv_cache = testcase.kv_scope.get_kvcache_for_flashinfer(
+        t.kv_layout, swa_page_stride_padding_elements
+    )
     if testcase.extra_kv_scope is not None:
         assert testcase.extra_kv_scope.topk_length is not None
         compressed_kv_cache = testcase.extra_kv_scope.get_kvcache_for_flashinfer(
-            t.kv_layout
+            t.kv_layout, compressed_page_stride_padding_elements
         )
         compressed_indices = testcase.extra_kv_scope.indices_in_kvcache[
             testcase.valid_q
@@ -690,10 +721,35 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
             + DSV4_SWA_TOPK
         ).contiguous()
     else:
-        compressed_kv_cache = testcase.kv_scope.get_kvcache_for_flashinfer(t.kv_layout)
+        compressed_kv_cache = swa_kv_cache
         compressed_indices = swa_indices.new_empty((swa_indices.size(0), 0))
         sparse_topk_lens = swa_indices.new_full((swa_indices.size(0),), DSV4_SWA_TOPK)
     sparse_indices = torch.cat((swa_indices, compressed_indices), dim=-1).contiguous()
+    if sparse_indices_are_storage_offsets:
+        sparse_indices = sparse_indices.clone()
+        segments = [
+            (
+                sparse_indices[:, :DSV4_SWA_TOPK],
+                t.decode.block_size,
+                swa_page_stride_padding_elements,
+            )
+        ]
+        if compressed_indices.numel() > 0:
+            assert t.decode.extra_block_size is not None
+            segments.append(
+                (
+                    sparse_indices[:, DSV4_SWA_TOPK:],
+                    t.decode.extra_block_size,
+                    compressed_page_stride_padding_elements,
+                )
+            )
+        for indices, page_size, padding in segments:
+            valid = indices >= 0
+            page_span = page_size + padding // DSV4_HEAD_DIM
+            indices[valid] = (
+                torch.div(indices[valid], page_size, rounding_mode="floor") * page_span
+                + indices[valid] % page_size
+            )
     if t.decode.is_varlen:
         query = testcase.q[testcase.valid_q].contiguous()
         cum_seq_lens_q = _make_cum_seq_lens(testcase.q_lens)
@@ -706,7 +762,7 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
     try:
         return trtllm_batch_decode_sparse_mla_dsv4(
             query=query,
-            swa_kv_cache=testcase.kv_scope.get_kvcache_for_flashinfer(t.kv_layout),
+            swa_kv_cache=swa_kv_cache,
             workspace_buffer=testcase.workspace_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
@@ -719,6 +775,9 @@ def run_flashinfer_decode(t: TestParam, testcase: TestcaseForDecode) -> torch.Te
             cum_seq_lens_q=cum_seq_lens_q,
             max_q_len=max_q_len,
             enable_pdl=False,
+            out=out,
+            remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
+            sparse_indices_are_storage_offsets=sparse_indices_are_storage_offsets,
         )
     except RuntimeError as err:
         err_msg = str(err)
@@ -823,4 +882,153 @@ def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
     if p.decode is not None and p.decode.is_varlen:
         out_ref = out_ref[testcase.valid_q]
+    _assert_close(out_ans, out_ref, p.dtype)
+
+
+@pytest.mark.parametrize("kv_layout", ("HND", "NHD"))
+@pytest.mark.parametrize(
+    "dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
+)
+@pytest.mark.parametrize("sparse_indices_are_storage_offsets", (False, True))
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
+    kv_layout: KVLayout,
+    dtype: torch.dtype,
+    sparse_indices_are_storage_offsets: bool,
+) -> None:
+    _skip_unless_sm100_or_sm103()
+    p = RawTestParamForDecode(
+        b=2,
+        h_q=64,
+        s_q=1,
+        h_kv=1,
+        s_kv=512,
+        is_varlen=False,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=1024,
+        extra_topk=_c4_topk(64),
+        block_size=SWA_PAGE_SIZE,
+        extra_block_size=C4_PAGE_SIZE,
+        seed=TEST_SEED_BASE + len(TESTCASES),
+        dtype=dtype,
+        kv_layout=kv_layout,
+        sparse_case="swa128+topk4x",
+    ).to_test_param()
+    testcase = generate_testcase_for_decode(p)
+    testcase.kv_scope.indices_in_kvcache[0, 0, 0] = -1
+    assert testcase.extra_kv_scope is not None
+    testcase.extra_kv_scope.indices_in_kvcache[0, 0, 0] = -1
+    assert testcase.extra_kv_scope.topk_length is not None
+    for batch_idx, topk_len in enumerate(
+        testcase.extra_kv_scope.topk_length[:, 0].tolist()
+    ):
+        testcase.extra_kv_scope.indices_in_kvcache[batch_idx, 0, topk_len:] = -1
+    assert torch.any(testcase.kv_scope.indices_in_kvcache >= p.decode.block_size)
+    assert torch.any(
+        testcase.extra_kv_scope.indices_in_kvcache >= p.decode.extra_block_size
+    )
+    out_ans = run_flashinfer_decode(
+        p,
+        testcase,
+        swa_page_stride_padding_elements=512,
+        compressed_page_stride_padding_elements=1024,
+        sparse_indices_are_storage_offsets=sparse_indices_are_storage_offsets,
+    )
+    out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    _assert_close(out_ans, out_ref, p.dtype)
+
+
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph() -> None:
+    _skip_unless_sm100_or_sm103()
+    p = RawTestParamForDecode(
+        b=2,
+        h_q=64,
+        s_q=3,
+        h_kv=1,
+        s_kv=512,
+        is_varlen=True,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=1024,
+        extra_topk=_c4_topk(64),
+        block_size=SWA_PAGE_SIZE,
+        extra_block_size=C4_PAGE_SIZE,
+        seed=TEST_SEED_BASE + len(TESTCASES) + 1,
+        dtype=torch.bfloat16,
+        kv_layout="HND",
+        sparse_case="swa128+topk4x",
+    ).to_test_param()
+    testcase = generate_testcase_for_decode(p)
+    assert p.decode is not None
+    assert p.decode.extra_topk is not None
+    num_queries = int(testcase.valid_q.sum().item())
+    remapped_sparse_indices_buffer = torch.empty(
+        (num_queries, DSV4_SWA_TOPK + p.decode.extra_topk),
+        dtype=torch.int32,
+        device="cuda:0",
+    )
+    out = torch.empty(
+        (num_queries, p.h_q, p.d_v),
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="sparse_indices_are_storage_offsets must be set for strided KV pools",
+    ):
+        run_flashinfer_decode(
+            p,
+            testcase,
+            swa_page_stride_padding_elements=512,
+            compressed_page_stride_padding_elements=1024,
+        )
+
+    run_flashinfer_decode(
+        p,
+        testcase,
+        swa_page_stride_padding_elements=512,
+        compressed_page_stride_padding_elements=1024,
+        sparse_indices_are_storage_offsets=False,
+        remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
+        out=out,
+    )
+    assert testcase.extra_kv_scope is not None
+    expected_indices = torch.cat(
+        (
+            testcase.kv_scope.indices_in_kvcache[testcase.valid_q],
+            testcase.extra_kv_scope.indices_in_kvcache[testcase.valid_q],
+        ),
+        dim=-1,
+    ).contiguous()
+    for indices, page_size, padding in (
+        (expected_indices[:, :DSV4_SWA_TOPK], SWA_PAGE_SIZE, 512),
+        (expected_indices[:, DSV4_SWA_TOPK:], C4_PAGE_SIZE, 1024),
+    ):
+        valid = indices >= 0
+        page_span = page_size + padding // DSV4_HEAD_DIM
+        indices[valid] = (
+            torch.div(indices[valid], page_size, rounding_mode="floor") * page_span
+            + indices[valid] % page_size
+        )
+    torch.testing.assert_close(remapped_sparse_indices_buffer, expected_indices)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_ans = run_flashinfer_decode(
+            p,
+            testcase,
+            swa_page_stride_padding_elements=512,
+            compressed_page_stride_padding_elements=1024,
+            sparse_indices_are_storage_offsets=False,
+            remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
+            out=out,
+        )
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert out_ans.data_ptr() == out.data_ptr()
+    out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    out_ref = out_ref[testcase.valid_q]
     _assert_close(out_ans, out_ref, p.dtype)
