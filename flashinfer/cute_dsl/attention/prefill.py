@@ -329,7 +329,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         # V's byte count (None means uniform: plain acquires).
         self.loader_role.set_v_tx_bytes(
             lp.tma_copy_v_bytes if self.k_dtype.width != self.v_dtype.width else None,
-            self.mainloop.kv_stages,
         )
 
         if cutlass.const_expr(not self.has_logits_transform):
@@ -616,7 +615,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 load_q_producer,
                 load_kv_producer,
                 tile_sched_params,
-                storage.load_kv_mbar_ptr.data_ptr(),
                 sK_tma,
                 sV_tma,
                 kv_page_table,

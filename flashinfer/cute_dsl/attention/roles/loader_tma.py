@@ -9,7 +9,7 @@ Reusable primitives (pipeline-unaware, for composing new kernel variants):
 - partition_v(): partition V global tensor for TMA loads
 - load_tile(): issue a single TMA load with barrier
 
-Orchestration (prefill-specific, uses raw CuTe ops for JIT compatibility):
+Orchestration (prefill-specific):
 - run(): Q0/Q1 double-buffered loads with KV streaming
 """
 
@@ -46,41 +46,17 @@ class LoaderRole:
         # Populated by set_v_tx_bytes() once dtypes are known at __call__
         # time.  None means K and V have the same width (plain acquires).
         self.v_tx_bytes = None
-        self.kv_stages = None
 
-    def set_v_tx_bytes(self, v_tx_bytes, kv_stages) -> None:
+    def set_v_tx_bytes(self, v_tx_bytes) -> None:
         """Set V's TMA byte count for mixed K/V dtype builds.
 
         The shared K/V ring's barriers are initialized with K's byte
-        count; when the widths differ, each V acquire must re-arm its
-        slot with V's byte count instead (pass None for uniform builds).
+        count; when the widths differ, each V acquire re-arms its slot
+        with V's byte count via ``acquire_and_advance(expected_tx=...)``
+        (pass None for uniform builds: expected_tx=None keeps the
+        barrier-init count).
         """
         self.v_tx_bytes = v_tx_bytes
-        self.kv_stages = kv_stages
-
-    def _acquire_v(self, load_kv_producer: PipelineProducer, load_kv_mbar_base_ptr):
-        """Acquire a V slot on the shared K/V ring.
-
-        Returns (slot index, barrier pointer for the TMA copy).  With
-        mixed K/V dtypes this bypasses acquire_and_advance() to arm the
-        full barrier with V's byte count — the same scheme as the
-        vendored FMHA kernel's kv_producer_update_tx_acquire_and_advance.
-        Undecorated on purpose: it is inlined at trace time (like the
-        vendored helper) because it handles pipeline participant objects.
-        """
-        if self.v_tx_bytes is None:
-            handle = load_kv_producer.acquire_and_advance()
-            return handle.index, handle.barrier
-        state = load_kv_producer._PipelineProducer__state.clone()
-        cute.arch.mbarrier_wait(
-            load_kv_mbar_base_ptr + self.kv_stages + state.index, state.phase
-        )
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                load_kv_mbar_base_ptr + state.index, self.v_tx_bytes
-            )
-        load_kv_producer.advance()
-        return state.index, load_kv_mbar_base_ptr + state.index
 
     @cute.jit
     def _load_paged_tile(
@@ -149,14 +125,14 @@ class LoaderRole:
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
     #
-    #  NOTE on CuTe DSL JIT limitations:
-    #  - partition_q/k/v(): Return tensor tuples — CuTe DSL JIT does not
-    #    reliably handle returning tensors from @cute.jit methods.
-    #  - load_tile(): Uses runtime indexing (handle.index) to create tensor
-    #    views internally — causes correctness issues in CuTe DSL JIT.
-    #  These primitives document the intended decomposition but cannot be
-    #  used inside run() until CuTe DSL JIT support improves. Use the
-    #  inline patterns in run() as the working reference.
+    #  Hazard (nvidia-cutlass-dsl 4.6.0): the DSL picks a dynamic loop's
+    #  carried values from the CALLER's own syntax (assignments and
+    #  x.method() receivers), so pipeline/scheduler state advanced inside
+    #  a helper is not yielded across while/for iterations and silently
+    #  resets each iteration.  Keep acquire/advance calls in run()'s loop
+    #  body and pass handle.index / handle.barrier into helpers (the
+    #  _load_paged_tile pattern), or return the mutated object and rebind
+    #  it at the call site (the softmax.py step() pattern).
     # =========================================================================
 
     @cute.jit
@@ -231,15 +207,21 @@ class LoaderRole:
         tma_atom: cute.CopyAtom,
         src_global: cute.Tensor,
         dst_smem: cute.Tensor,
-        producer: PipelineProducer,
+        index: Int32,
+        barrier,
     ):
-        """Issue a single TMA load into SMEM with pipeline barrier."""
-        handle = producer.acquire_and_advance()
+        """Issue a single TMA load into a runtime-indexed SMEM stage slot.
+
+        The pipeline acquire stays in the caller's loop body (see the
+        helper-method rules above): do ``handle =
+        producer.acquire_and_advance()`` inline and pass ``handle.index``
+        / ``handle.barrier`` here.
+        """
         cute.copy(
             tma_atom,
             src_global,
-            dst_smem[None, handle.index],
-            tma_bar_ptr=handle.barrier,
+            dst_smem[None, index],
+            tma_bar_ptr=barrier,
         )
 
     # =========================================================================
@@ -267,7 +249,6 @@ class LoaderRole:
         load_q_producer: PipelineProducer,
         load_kv_producer: PipelineProducer,
         tile_sched_params: FmhaStaticTileSchedulerParams,
-        load_kv_mbar_base_ptr,
         sK_tma: cute.Tensor | None,
         sV_tma: cute.Tensor | None,
         kv_page_table: cute.Tensor | None,
@@ -334,18 +315,9 @@ class LoaderRole:
                         )
 
                 # Local tile partition global tensors
-                gQ_qdl = cute.flat_divide(
-                    mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2])
+                tQsQ, tQgQ = self.partition_q(
+                    qk_thr_mma, tma_atom_q, mQ_qdl_, sQ, curr_block_coord_q
                 )
-                tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
-                tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_q,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sQ, 0, 3),
-                    cute.group_modes(tSgQ_qdl, 0, 3),
-                )
-                tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]
 
                 table_base = Int32(0)
                 num_pages_kv = Int32(0)
@@ -393,31 +365,12 @@ class LoaderRole:
                         lo_min = q0 + (seqlen_k - seqlen_q) - window_left
                         page_idx_lb = cutlass.max(lo_min, Int32(0)) // self.page_size
                 else:
-                    gK_kdl = cute.flat_divide(
-                        mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                    tKsK, tKgK = self.partition_k(
+                        qk_thr_mma, tma_atom_k, mK_kdl_, sK, curr_block_coord_kv
                     )
-                    tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
-                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_k,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sK, 0, 3),
-                        cute.group_modes(tSgK_kdl, 0, 3),
+                    tVsV, tVgV = self.partition_v(
+                        pv_thr_mma, tma_atom_v, mV_dkl_, sV, curr_block_coord_kv
                     )
-                    tKgK = tKgK_kdl[None, None, 0, curr_block_coord_kv[2]]
-
-                    gV_dkl = cute.flat_divide(
-                        mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
-                    )
-                    tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
-                    tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_v,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sV, 0, 3),
-                        cute.group_modes(tSgV_dkl, 0, 3),
-                    )
-                    tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
 
                 # Q0
                 q0_coord = 2 * curr_block_coord_q[0]
@@ -471,17 +424,19 @@ class LoaderRole:
                     tQsQ[None, q1_handle_producer.index],
                     tma_bar_ptr=q1_handle_producer.barrier,
                 )
-                # V0
-                v_index, v_bar_ptr = self._acquire_v(
-                    load_kv_producer, load_kv_mbar_base_ptr
+                # V0.  With mixed K/V widths, expected_tx re-arms the slot
+                # with V's byte count (the ring's barriers are init-armed
+                # with K's); expected_tx=None is the plain acquire.
+                v_handle = load_kv_producer.acquire_and_advance(
+                    expected_tx=self.v_tx_bytes
                 )
                 if cutlass.const_expr(self.page_size is not None):
                     self._load_paged_tile(
                         tma_atom_v,
                         tVgV,
                         tVsV,
-                        v_index,
-                        v_bar_ptr,
+                        v_handle.index,
+                        v_handle.barrier,
                         kv_coord,
                         table_base,
                         page_idx_lb,
@@ -494,8 +449,8 @@ class LoaderRole:
                     cute.copy(
                         tma_atom_v,
                         tVgV[None, kv_coord],
-                        tVsV[None, v_index],
-                        tma_bar_ptr=v_bar_ptr,
+                        tVsV[None, v_handle.index],
+                        tma_bar_ptr=v_handle.barrier,
                     )
                 kv_coord += 1
 
@@ -525,17 +480,17 @@ class LoaderRole:
                             tKsK[None, k_handle_producer.index],
                             tma_bar_ptr=k_handle_producer.barrier,
                         )
-                    # Vi
-                    v_index, v_bar_ptr = self._acquire_v(
-                        load_kv_producer, load_kv_mbar_base_ptr
+                    # Vi (see V0 for the expected_tx contract)
+                    v_handle = load_kv_producer.acquire_and_advance(
+                        expected_tx=self.v_tx_bytes
                     )
                     if cutlass.const_expr(self.page_size is not None):
                         self._load_paged_tile(
                             tma_atom_v,
                             tVgV,
                             tVsV,
-                            v_index,
-                            v_bar_ptr,
+                            v_handle.index,
+                            v_handle.barrier,
                             kv_coord,
                             table_base,
                             page_idx_lb,
@@ -548,8 +503,8 @@ class LoaderRole:
                         cute.copy(
                             tma_atom_v,
                             tVgV[None, kv_coord],
-                            tVsV[None, v_index],
-                            tma_bar_ptr=v_bar_ptr,
+                            tVsV[None, v_handle.index],
+                            tma_bar_ptr=v_handle.barrier,
                         )
                     kv_coord += 1
 
