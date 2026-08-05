@@ -13,8 +13,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
-
 import quack.activation
+
+from ..bsa_utils.nvvm_compat import NVVM_FMAX_REQUIRES_RESULT_TYPE
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -222,11 +223,7 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
+    if NVVM_FMAX_REQUIRES_RESULT_TYPE:
         return Float32(
             nvvm.fmax(
                 T.f32(),
@@ -238,7 +235,6 @@ def fmax(
             )
         )
     else:
-        # New API: infers result type automatically
         return Float32(
             nvvm.fmax(
                 Float32(a).ir_value(loc=loc, ip=ip),

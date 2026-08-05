@@ -46,6 +46,22 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo ""
 fi
 
+# Install quack for the VSA SM100 (blk128) backend tests.
+# quack is NOT a runtime requirement of flashinfer — only users of the blk128
+# VSA backend need it, so it is intentionally kept out of requirements.txt and
+# installed here for CI only. The blk128 backend supports SM100/SM110, so we
+# install quack only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The quack package on PyPI is unrelated — install from source.
+SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
+if [ "${SM_MAJOR}" = "10" ] || [ "${SM_MAJOR}" = "11" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_MAJOR} (SM100/SM110 Blackwell); installing quack for VSA blk128 tests"
+  echo "========================================"
+  pip install "git+https://github.com/Dao-AILab/quack.git"
+  echo "quack install complete."
+  echo ""
+fi
+
 # Override nvidia-cutlass-dsl if specified
 if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   # Detect CUDA major version: only CUDA 13+ needs [cu13] extra

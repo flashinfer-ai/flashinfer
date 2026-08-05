@@ -25,7 +25,7 @@ import torch
 import flashinfer
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 # ---------------------------------------------------------------------------
 # Hardware / dependency gates
@@ -37,12 +37,16 @@ from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 
 pytestmark = [
     pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-        reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
+        not torch.cuda.is_available()
+        or not (
+            is_sm100a_supported(torch.device("cuda"))
+            or is_sm110a_supported(torch.device("cuda"))
+        ),
+        reason="VSA SM100 backend requires SM100 or SM110 (Blackwell GPU)",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,
-        reason="VSA Blackwell backend requires the quack package "
+        reason="VSA SM100 backend requires the quack package "
         "(pip install git+https://github.com/Dao-AILab/quack.git)",
     ),
     pytest.mark.skipif(
@@ -139,7 +143,7 @@ def workspace():
 
 
 def _make_wrapper(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +262,7 @@ def test_vsa_vs_auto_80k(workspace):
     )
     o_ref = ref_w.run(q, k, v)
 
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         indptr,
         indices,
@@ -509,7 +513,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     Stage 1: compress attention on mean-pooled tokens → output_compress [M, H, D]
              + per-head block_mask [H, MB, NB] from softmax block scores.
-    Stage 2: BlockSparseAttentionWrapper vsa_blackwell → output_select [M, H, D].
+    Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 → output_select [M, H, D].
     Final:   output_compress + output_select  (mirrors fastvideo final_output).
     Dense:   flashinfer.single_prefill_with_kv_cache(backend="auto").
 
@@ -542,7 +546,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     )
 
     # Stage 2: block-sparse attention (select branch)
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         None,
         None,
@@ -586,7 +590,7 @@ def test_vsa_performance_vs_dense(workspace):
       compress_ms – Stage 1: compress attention (pool Q/K/V, dense attn on pooled tokens,
                              softmax top-K → block_mask).  This is the "free" byproduct:
                              output_compress is also produced here.
-      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_blackwell (output_select).
+      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 (output_select).
       total_ms    – compress_ms + attn_ms  (output_compress + output_select = final output)
     Dense:
       dense_ms    – flashinfer.single_prefill_with_kv_cache (auto backend)
@@ -623,7 +627,7 @@ def test_vsa_performance_vs_dense(workspace):
             C,
             topk,
         )
-        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
         vsa_w.plan(
             None,
             None,
@@ -675,7 +679,53 @@ HEAD_DIM_BLK64 = 128  # blk64 kernel requires head_dim=128
 
 
 def _make_wrapper_blk64(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell_blk64")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
+
+
+def test_vsa_blk64_rejects_empty_rows(workspace):
+    """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    MB = NB = 4
+    M = N = MB * R64
+    num_heads = 8
+
+    # BSR path: first Q-block has no KV blocks (indptr[1] == indptr[0])
+    indptr = torch.tensor([0, 0, 2, 3, 4], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    wrapper = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper.plan(
+            indptr,
+            indices,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+        )
+
+    # block_mask path: second Q-block is all False
+    block_mask = torch.ones(num_heads, MB, NB, dtype=torch.bool, device=device)
+    block_mask[:, 1, :] = False
+    wrapper2 = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper2.plan(
+            None,
+            None,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+            block_mask=block_mask,
+        )
 
 
 @pytest.mark.parametrize(
