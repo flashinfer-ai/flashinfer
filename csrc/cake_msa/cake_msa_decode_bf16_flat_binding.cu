@@ -118,6 +118,42 @@ inline void CheckCakeMsaTarget(int32_t device_id) {
 #endif
 }
 
+// 3D TMA descriptor for buffer 'Q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_Q(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'Q' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'Q' trailing dims must be positive";
+  int64_t outer1 = t.numel() / (d1);
+  CheckDenseLeadingFold(t, 1, "Q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'Q' physical strides must be positive";
+  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
+      << "TMA source 'Q' extent " << d1 << " must divide exactly by " << 64;
+  uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'Q' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 16u <= global_dim[1] && 2u <= global_dim[2], ValueError)
+      << "TMA box (64, 16, 2) exceeds resolved global dims for 'Q'";
+  uint64_t global_strides[2] = {
+      (uint64_t)((s2 * 16) / 8),
+      (uint64_t)((64 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 16u, 2u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, t.data_ptr(), global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
+  return tm;
+}
+
 // 4D TMA descriptor for buffer 'Q_prefill' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_Q_prefill(const TensorView& t) {

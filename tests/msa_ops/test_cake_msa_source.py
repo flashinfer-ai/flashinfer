@@ -49,21 +49,21 @@ _VARIANTS = (
 # public CUDA files so they do not expose generator provenance.
 _SOURCE_SHA256 = {
     "cake_msa_decode_bf16_flat.cu": "fab06f6bd7d0febbb9949f07ffafe29ef6d7ac52fd6f8a1bc14616aefd13cf59",
-    "cake_msa_decode_bf16_flat_binding.cu": "f4a571d272ffdf86e15fde03efd6e93ab8c647b7dfb3233e5ff2701d2d9c9c72",
+    "cake_msa_decode_bf16_flat_binding.cu": "f8928306669683cca2b32d0383da941fd223faf25478a5b5c2bcb2bdefaf511f",
     "cake_msa_decode_bf16_paged.cu": "d209ef72eaf2fe6912fbbda5cd3272f60615a594307254706c2a89aedf1aa12a",
-    "cake_msa_decode_bf16_paged_binding.cu": "8e592b19235991605abeda9f85845a4986be07346f1c2563eb3c1964c923c09f",
+    "cake_msa_decode_bf16_paged_binding.cu": "3276e49a018424f4e9c8097cd3aec3b0693deabc5ce6bada8b94d98bb8515f1b",
     "cake_msa_decode_fp16_flat.cu": "717e3b26f6c879cf9c99cd4f619502f9f690be2f89385d2b8d696302a1fcf6d7",
-    "cake_msa_decode_fp16_flat_binding.cu": "44c1ebf4a7b99ae742274174f45c27edcd032556a7f009c714d12505a6518e4c",
+    "cake_msa_decode_fp16_flat_binding.cu": "f25374e00b7645618b148ca1f3aab55568143ffa29abbc36480dcf6e275c1f44",
     "cake_msa_decode_fp16_paged.cu": "c6d7d79a6a626d4861ba97a352e2a8057b82f53ccec9f60d2c4a71d65575ca16",
-    "cake_msa_decode_fp16_paged_binding.cu": "d340771abcb8f46f3c7e0eb101112429f2f85a67c5d9438d4e8ff27536d7f0eb",
+    "cake_msa_decode_fp16_paged_binding.cu": "a2c92ee7646527ebed5afacc7315f20e3f2e8b63c8961001b0a7742ba1877b99",
     "cake_msa_decode_fp8_flat.cu": "f62fb8ee4474ef842be2664a8f7c69bd92ab6ebf3ee5b81c193d3b4413fbb979",
-    "cake_msa_decode_fp8_flat_binding.cu": "9d78c1662f68e8293bf9efdf6724b62865a71406ee736debfc0bb14df047a0b8",
+    "cake_msa_decode_fp8_flat_binding.cu": "65246382bb9d4780a202a2bf404f99090ad508cb06c5074f9478852df6cd2c10",
     "cake_msa_decode_fp8_paged.cu": "e394e0ad905f2c759f5e8e8efb7d61ca16c5b358f563e0e8d1b2e359f211542d",
-    "cake_msa_decode_fp8_paged_binding.cu": "6691058a919ce2608c6473fa09c86f4944c4aecb752067eeb37ab79b9c5ab17e",
+    "cake_msa_decode_fp8_paged_binding.cu": "181136cb7e22c18db0408180a0537a055b46b710a4d64d44c64ba08c771a1160",
     "cake_msa_decode_m16_bf16_flat.cu": "edcc630818d1cfd1b9de03a4ff16ea0a1726e5c8d4990e0b2f372274dfacd1a3",
-    "cake_msa_decode_m16_bf16_flat_binding.cu": "8eea81aed8b4fd692077a6ff2c2977b04cc13aadd2e70b49e7293d204eda1edf",
+    "cake_msa_decode_m16_bf16_flat_binding.cu": "7cce6013f914c642e5f3243d9ed94c2f28773bdd28f7df775aea46438924436e",
     "cake_msa_decode_m16_bf16_paged.cu": "87ac97c531e8a7822e805eccfb6a65fbaf97b42ef0d0dc3715bc747646317fcb",
-    "cake_msa_decode_m16_bf16_paged_binding.cu": "93bce3b701dc04adb82a7ab00d948e99fa90664df60eae0fdf3eb03d7da44beb",
+    "cake_msa_decode_m16_bf16_paged_binding.cu": "3a05f2bfb8550b692eae38921931d90f604e3ecefc7c2f246a24683bf7fd352a",
     "cake_msa_prefill_m128_bf16_flat.cu": "93862a578172467b9de3003d355ca3a3edcab2624c001a8f80683a8aac412ac2",
     "cake_msa_prefill_m128_bf16_flat_binding.cu": "d8654b6215ce53f4315281c5dd74ecd7d45848fc26475b3036249e885a7276f0",
     "cake_msa_prefill_m128_bf16_gqa16_flat.cu": "e70a8c8ab606b42e82bd53fae5e9d2ebe14dd2b182a129100a53929b91ee7c38",
@@ -118,6 +118,9 @@ _GRID_CONSTANT_TENSOR_MAP = re.compile(
 )
 _ENCODED_HOST_TENSOR_MAP = re.compile(
     r"\bCUtensorMap h_([A-Za-z0-9_]+) = EncodeTma_[A-Za-z0-9_]+\("
+)
+_TENSOR_MAP_ENCODER_DEFINITION = re.compile(
+    r"\binline CUtensorMap EncodeTma_([A-Za-z0-9_]+)\("
 )
 _DIRECT_TENSOR_MAP_LAUNCH_ARG = re.compile(r"&h_([A-Za-z0-9_]+)(?=,|})")
 
@@ -204,9 +207,12 @@ def test_cake_msa_tma_variants_use_grid_constant_tensor_map_parameters():
         assert len(grid_constant_params) == len(expected_maps)
 
         encoded_host_maps = _ENCODED_HOST_TENSOR_MAP.findall(binding_source)
+        encoder_definitions = _TENSOR_MAP_ENCODER_DEFINITION.findall(binding_source)
         direct_launch_maps = _DIRECT_TENSOR_MAP_LAUNCH_ARG.findall(binding_source)
         assert set(encoded_host_maps) == expected_maps
         assert len(encoded_host_maps) == len(expected_maps)
+        assert set(encoder_definitions) == expected_maps
+        assert len(encoder_definitions) == len(expected_maps)
         assert direct_launch_maps == encoded_host_maps
 
         assert "static_assert(sizeof(CUtensorMap) == 128);" in binding_source
