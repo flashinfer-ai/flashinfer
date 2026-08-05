@@ -460,6 +460,8 @@ def test_vsa_sm120_empty_row(workspace):
     assert torch.all(lse2[empty_slice].isinf() & (lse2[empty_slice] < 0)), (
         "empty row LSE should be -inf (block_mask path)"
     )
+    assert torch.all(lse2[:R].isfinite()), "non-empty rows should have finite LSE (block_mask path)"
+    assert torch.all(lse2[2 * R :].isfinite()), "non-empty rows should have finite LSE (block_mask path)"
 
 
 # ---------------------------------------------------------------------------
