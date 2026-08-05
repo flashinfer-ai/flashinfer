@@ -19,12 +19,14 @@ Each measured backend/shape pair runs in a fresh process because
 samples.  Timings are cold-L2 spans from the first to the last correlated GPU
 activity (kernel, memcpy, or memset) launched by exactly one public API call.
 Each comparable row is first checked in another isolated process that invokes
-both public APIs on the same tensor objects.
+both public APIs on the same tensor objects.  Correctness and performance are
+driven by the same frozen manifest below.  Its prefix preserves the original
+six production cases; the remaining rows are coverage points selected from the
+pinned MiniMax benchmark/correctness suites and FlashInfer boundary tests.
 
-The six cases reproduce the canonical SM100/SM103 performance matrix.  The
-pinned MiniMax public sparse-forward API supports BF16 and FP8 E4M3 storage,
-but not FP16 input, so the FP16 row is reported explicitly as unsupported and
-never cast to another dtype.
+The pinned MiniMax public sparse-forward API supports BF16 and FP8 E4M3
+storage, but not FP16 input, so FP16 rows are reported explicitly as
+candidate-only and are never cast to another dtype.
 
 Example
 -------
@@ -49,6 +51,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Callable
@@ -59,9 +62,6 @@ BASELINE_SHA = "80434d7f67877c6570ca19cac444b84bc9855dac"
 SOURCE_REPOSITORY = "https://github.com/flashinfer-ai/flashinfer.git"
 BLOCK_SIZE = 128
 HEAD_DIM = 128
-NUM_Q_HEADS = 64
-NUM_KV_HEADS = 4
-TOPK = 16
 SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 ACTIVITY_SCOPE = "first_to_last_correlated_gpu_activity_for_one_public_api_call"
 CORRECTNESS_TOLERANCES = {
@@ -69,87 +69,396 @@ CORRECTNESS_TOLERANCES = {
     "float8_e4m3fn": {"atol": 0.1, "rtol": 0.1},
 }
 
-SHAPES: tuple[dict[str, Any], ...] = (
-    {
-        "label": "prefill_bf16_b1_q4096_kv4096_h64",
-        "operation": "sparse_prefill",
-        "batch_size": 1,
-        "seqlen_q": 4096,
-        "seqlen_kv": 4096,
-        "q_dtype": "bfloat16",
-        "kv_dtype": "bfloat16",
-        "kv_layout": "flat_varlen",
-        "causal": True,
-        "force_fused": None,
-        "seed": 43,
-    },
-    {
-        "label": "decode_bf16_b128_q1_kv4096_h64",
-        "operation": "sparse_decode",
-        "batch_size": 128,
-        "seqlen_q": 1,
-        "seqlen_kv": 4096,
-        "q_dtype": "bfloat16",
-        "kv_dtype": "bfloat16",
-        "kv_layout": "flat_varlen",
-        "causal": True,
-        "force_fused": True,
-        "seed": 47,
-    },
-    {
-        "label": "speculative_bf16_b128_q4_kv4096_h64",
-        "operation": "sparse_decode",
-        "batch_size": 128,
-        "seqlen_q": 4,
-        "seqlen_kv": 4096,
-        "q_dtype": "bfloat16",
-        "kv_dtype": "bfloat16",
-        "kv_layout": "flat_varlen",
-        "causal": True,
-        "force_fused": True,
-        "seed": 48,
-    },
-    {
-        "label": "mtp_bf16_b128_q16_kv4096_h64",
-        "operation": "sparse_decode",
-        "batch_size": 128,
-        "seqlen_q": 16,
-        "seqlen_kv": 4096,
-        "q_dtype": "bfloat16",
-        "kv_dtype": "bfloat16",
-        "kv_layout": "flat_varlen",
-        "causal": True,
-        "force_fused": True,
-        "seed": 50,
-    },
-    {
-        "label": "decode_fp16_b128_q1_kv4096_h64",
-        "operation": "sparse_decode",
-        "batch_size": 128,
-        "seqlen_q": 1,
-        "seqlen_kv": 4096,
-        "q_dtype": "float16",
-        "kv_dtype": "float16",
-        "kv_layout": "flat_varlen",
-        "causal": True,
-        "force_fused": True,
-        "seed": 49,
-    },
-    {
-        "label": "decode_fp8_b128_q1_kv4096_h64",
-        "operation": "sparse_decode",
-        "batch_size": 128,
-        "seqlen_q": 1,
-        "seqlen_kv": 4096,
-        "q_dtype": "bfloat16",
-        "kv_dtype": "float8_e4m3fn",
-        "kv_layout": "paged",
-        "causal": True,
-        "force_fused": True,
-        "seed": 53,
-    },
+MANIFEST_VERSION = "msa-sm100-sm103-v2"
+MINIMAX_BENCHMARK_PROVENANCE = (
+    "MiniMax-AI/MSA@80434d7f benchmarks/bench_sparse_attention_ops.py:421-528"
 )
-SHAPES_BY_LABEL = {shape["label"]: shape for shape in SHAPES}
+MINIMAX_CORRECTNESS_PROVENANCE = (
+    "MiniMax-AI/MSA@80434d7f "
+    "python/fmha_sm100/cute/test_sparse_atten.py:1474-1711,1914-2035"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MSAShape:
+    """One immutable correctness/performance row in the public-API harness."""
+
+    stable_id: str
+    tier: str
+    source: str
+    provenance: str
+    selection_rationale: str
+    operation: str
+    batch_size: int
+    seqlen_q: int
+    seqlen_kv: int
+    q_dtype: str
+    kv_dtype: str
+    kv_layout: str
+    num_q_heads: int
+    num_kv_heads: int
+    topk: int
+    causal: bool
+    force_fused: bool | None
+    seed: int
+    baseline_mode: str
+    head_dim: int = HEAD_DIM
+    block_size: int = BLOCK_SIZE
+    selection_mode: str = "random_valid_bottom_right_causal"
+
+    @property
+    def baseline_comparable(self) -> bool:
+        return self.baseline_mode == "minimax_public"
+
+    def as_public_dict(self) -> dict[str, Any]:
+        # Keep ``label`` for schema-v1 readers while making the stable key
+        # explicit in schema v2.
+        return {"label": self.stable_id, **asdict(self)}
+
+
+PRODUCTION_SHAPE_IDS = (
+    "prefill_bf16_b1_q4096_kv4096_h64",
+    "decode_bf16_b128_q1_kv4096_h64",
+    "speculative_bf16_b128_q4_kv4096_h64",
+    "mtp_bf16_b128_q16_kv4096_h64",
+    "decode_fp16_b128_q1_kv4096_h64",
+    "decode_fp8_b128_q1_kv4096_h64",
+)
+
+_PRODUCTION = {
+    "tier": "production",
+    "source": "flashinfer_pr_4355_original_matrix",
+    "provenance": "https://github.com/flashinfer-ai/flashinfer/pull/4355",
+    "selection_rationale": (
+        "Preserved verbatim from the original six-row production matrix; "
+        "random-valid sparse blocks use a recorded seed."
+    ),
+    "num_q_heads": 64,
+    "num_kv_heads": 4,
+    "topk": 16,
+    "causal": True,
+}
+
+SHAPE_MANIFEST: tuple[MSAShape, ...] = (
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[0],
+        operation="sparse_prefill",
+        batch_size=1,
+        seqlen_q=4096,
+        seqlen_kv=4096,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="flat_varlen",
+        force_fused=None,
+        seed=43,
+        baseline_mode="minimax_public",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[1],
+        operation="sparse_decode",
+        batch_size=128,
+        seqlen_q=1,
+        seqlen_kv=4096,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="flat_varlen",
+        force_fused=True,
+        seed=47,
+        baseline_mode="minimax_public",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[2],
+        operation="sparse_decode",
+        batch_size=128,
+        seqlen_q=4,
+        seqlen_kv=4096,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="flat_varlen",
+        force_fused=True,
+        seed=48,
+        baseline_mode="minimax_public",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[3],
+        operation="sparse_decode",
+        batch_size=128,
+        seqlen_q=16,
+        seqlen_kv=4096,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="flat_varlen",
+        force_fused=True,
+        seed=50,
+        baseline_mode="minimax_public",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[4],
+        operation="sparse_decode",
+        batch_size=128,
+        seqlen_q=1,
+        seqlen_kv=4096,
+        q_dtype="float16",
+        kv_dtype="float16",
+        kv_layout="flat_varlen",
+        force_fused=True,
+        seed=49,
+        baseline_mode="candidate_only_fp16",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id=PRODUCTION_SHAPE_IDS[5],
+        operation="sparse_decode",
+        batch_size=128,
+        seqlen_q=1,
+        seqlen_kv=4096,
+        q_dtype="bfloat16",
+        kv_dtype="float8_e4m3fn",
+        kv_layout="paged",
+        force_fused=True,
+        seed=53,
+        baseline_mode="minimax_public",
+        **_PRODUCTION,
+    ),
+    MSAShape(
+        stable_id="official_decode_bf16_b32_q8_kv8192_h64_hkv4_k16_paged",
+        tier="official_coverage",
+        source="minimax_official_sparse_decode_benchmark",
+        provenance=MINIMAX_BENCHMARK_PROVENANCE,
+        selection_rationale=(
+            "Smallest official sparse-decode benchmark coordinate; adds B32, "
+            "Q8, KV8192, and the BF16 paged decode route."
+        ),
+        operation="sparse_decode",
+        batch_size=32,
+        seqlen_q=8,
+        seqlen_kv=8192,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        force_fused=True,
+        seed=61,
+        baseline_mode="minimax_public",
+    ),
+    MSAShape(
+        stable_id="official_decode_bf16_b64_q8_kv65536_h64_hkv4_k32_paged",
+        tier="official_coverage",
+        source="minimax_official_sparse_decode_benchmark",
+        provenance=MINIMAX_BENCHMARK_PROVENANCE,
+        selection_rationale=(
+            "Official long-KV decode coordinate with the documented TopK32 "
+            "option; covers B64, KV65536, and the largest supported TopK."
+        ),
+        operation="sparse_decode",
+        batch_size=64,
+        seqlen_q=8,
+        seqlen_kv=65536,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=32,
+        causal=True,
+        force_fused=True,
+        seed=67,
+        baseline_mode="minimax_public",
+    ),
+    MSAShape(
+        stable_id="official_prefill_mixed_fp8_b3_q1024_kv8192_h32_hkv2_k8_flat",
+        tier="official_coverage",
+        source="minimax_official_mixed_fp8_correctness",
+        provenance=MINIMAX_CORRECTNESS_PROVENANCE,
+        selection_rationale=(
+            "Exact nominal coordinate from the official BF16-query/FP8-KV "
+            "matrix; adds asymmetric prefill, TP2 heads, TopK8, and flat FP8."
+        ),
+        operation="sparse_prefill",
+        batch_size=3,
+        seqlen_q=1024,
+        seqlen_kv=8192,
+        q_dtype="bfloat16",
+        kv_dtype="float8_e4m3fn",
+        kv_layout="flat_varlen",
+        num_q_heads=32,
+        num_kv_heads=2,
+        topk=8,
+        causal=True,
+        force_fused=None,
+        seed=71,
+        baseline_mode="minimax_public",
+    ),
+    MSAShape(
+        stable_id="official_prefill_bf16_b3_q4096_kv8192_h8_hkv2_k4_paged",
+        tier="official_coverage",
+        source="minimax_official_paged_correctness",
+        provenance=MINIMAX_CORRECTNESS_PROVENANCE,
+        selection_rationale=(
+            "Nominal official paged-correctness coordinate chosen to add GQA4, "
+            "TopK4, batched asymmetric prefill, and a non-GQA16 route."
+        ),
+        operation="sparse_prefill",
+        batch_size=3,
+        seqlen_q=4096,
+        seqlen_kv=8192,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        num_q_heads=8,
+        num_kv_heads=2,
+        topk=4,
+        causal=True,
+        force_fused=None,
+        seed=73,
+        baseline_mode="minimax_public",
+    ),
+    MSAShape(
+        stable_id="coverage_decode_fp16_b32_q4_kv8192_h64_hkv4_k16_paged",
+        tier="flashinfer_coverage",
+        source="flashinfer_paged_fp16_correctness_route",
+        provenance=("tests/msa_ops/test_cake_msa_sm100.py::decode-paged-fp16-q2"),
+        selection_rationale=(
+            "Completes the production FP16 row's missing paged-layout axis at "
+            "an official decode batch/KV coordinate; MiniMax remains unsupported."
+        ),
+        operation="sparse_decode",
+        batch_size=32,
+        seqlen_q=4,
+        seqlen_kv=8192,
+        q_dtype="float16",
+        kv_dtype="float16",
+        kv_layout="paged",
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        force_fused=True,
+        seed=79,
+        baseline_mode="candidate_only_fp16",
+    ),
+    MSAShape(
+        stable_id="coverage_decode_mixed_fp8_b32_q1_kv8192_h64_hkv4_k16_flat",
+        tier="flashinfer_coverage",
+        source="production_fp8_layout_complement",
+        provenance=(
+            "csrc/cake_msa/cake_msa_decode_fp8_flat.cu and "
+            "MiniMax-AI/MSA@80434d7f mixed-FP8 correctness matrix"
+        ),
+        selection_rationale=(
+            "Complements the production paged FP8 decode row so the distinct "
+            "flat FP8 decode kernel is correctness-checked and timed."
+        ),
+        operation="sparse_decode",
+        batch_size=32,
+        seqlen_q=1,
+        seqlen_kv=8192,
+        q_dtype="bfloat16",
+        kv_dtype="float8_e4m3fn",
+        kv_layout="flat_varlen",
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        force_fused=True,
+        seed=83,
+        baseline_mode="minimax_public",
+    ),
+    MSAShape(
+        stable_id="boundary_decode_bf16_b2_q1_kv257_h8_hkv1_k4_paged",
+        tier="boundary",
+        source="flashinfer_partial_page_regression",
+        provenance=(
+            "tests/msa_ops/test_cake_msa_sm100.py::decode-paged-bf16-m16-ragged"
+        ),
+        selection_rationale=(
+            "Freezes a partial-final-page boundary where only three blocks are "
+            "valid for TopK4; exercises -1 padding and the paged M16 tail path."
+        ),
+        operation="sparse_decode",
+        batch_size=2,
+        seqlen_q=1,
+        seqlen_kv=257,
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="paged",
+        num_q_heads=8,
+        num_kv_heads=1,
+        topk=4,
+        causal=True,
+        force_fused=True,
+        seed=89,
+        baseline_mode="minimax_public",
+    ),
+)
+
+
+def _validate_shape_manifest(shapes: tuple[MSAShape, ...]) -> None:
+    stable_ids = tuple(shape.stable_id for shape in shapes)
+    if stable_ids[: len(PRODUCTION_SHAPE_IDS)] != PRODUCTION_SHAPE_IDS:
+        raise ValueError("the original production shape prefix must not change")
+    if len(set(stable_ids)) != len(stable_ids):
+        raise ValueError("MSA shape stable IDs must be unique")
+
+    for shape in shapes:
+        if not all(
+            value.strip()
+            for value in (
+                shape.stable_id,
+                shape.tier,
+                shape.source,
+                shape.provenance,
+                shape.selection_rationale,
+            )
+        ):
+            raise ValueError(f"shape metadata must be non-empty: {shape.stable_id!r}")
+        if shape.operation not in {"sparse_prefill", "sparse_decode"}:
+            raise ValueError(f"unsupported operation in {shape.stable_id}")
+        if shape.kv_layout not in {"flat_varlen", "paged"}:
+            raise ValueError(f"unsupported KV layout in {shape.stable_id}")
+        if shape.q_dtype not in {"bfloat16", "float16"}:
+            raise ValueError(f"unsupported Q dtype in {shape.stable_id}")
+        if shape.kv_dtype not in {"bfloat16", "float16", "float8_e4m3fn"}:
+            raise ValueError(f"unsupported KV dtype in {shape.stable_id}")
+        if shape.kv_dtype == "float8_e4m3fn" and shape.q_dtype != "bfloat16":
+            raise ValueError(f"FP8 KV requires BF16 Q in {shape.stable_id}")
+        if min(shape.batch_size, shape.seqlen_q, shape.seqlen_kv) <= 0:
+            raise ValueError(f"non-positive extent in {shape.stable_id}")
+        if shape.seqlen_q > shape.seqlen_kv:
+            raise ValueError(f"Q cannot exceed KV in {shape.stable_id}")
+        if shape.num_q_heads % shape.num_kv_heads:
+            raise ValueError(f"Q heads must divide by KV heads in {shape.stable_id}")
+        group_size = shape.num_q_heads // shape.num_kv_heads
+        if not 1 <= group_size <= 16:
+            raise ValueError(f"GQA group size out of range in {shape.stable_id}")
+        if shape.topk not in {4, 8, 16, 32}:
+            raise ValueError(f"unsupported TopK in {shape.stable_id}")
+        if shape.head_dim != HEAD_DIM or shape.block_size != BLOCK_SIZE:
+            raise ValueError(f"MSA requires D128/block128 in {shape.stable_id}")
+        if (
+            not shape.causal
+            or shape.selection_mode != "random_valid_bottom_right_causal"
+        ):
+            raise ValueError(f"manifest protocol changed in {shape.stable_id}")
+        if shape.operation == "sparse_prefill" and shape.force_fused is not None:
+            raise ValueError(f"prefill cannot set force_fused in {shape.stable_id}")
+        if shape.baseline_mode not in {"minimax_public", "candidate_only_fp16"}:
+            raise ValueError(f"unsupported baseline mode in {shape.stable_id}")
+        if (shape.q_dtype == "float16") != (
+            shape.baseline_mode == "candidate_only_fp16"
+        ):
+            raise ValueError(f"baseline support metadata is stale in {shape.stable_id}")
+
+
+_validate_shape_manifest(SHAPE_MANIFEST)
+SHAPES_BY_ID = {shape.stable_id: shape for shape in SHAPE_MANIFEST}
 
 
 def _git_output(root: Path, *args: str) -> str:
@@ -217,20 +526,20 @@ def _torch_dtype(torch, name: str):
         raise ValueError(f"unsupported dtype {name!r}") from error
 
 
-def _make_q2k(torch, shape: dict[str, Any], device) -> Any:
+def _make_q2k(torch, shape: MSAShape, device) -> Any:
     """Reproduce the canonical random-valid, bottom-right-causal selection."""
 
-    batch_size = int(shape["batch_size"])
-    seqlen_q = int(shape["seqlen_q"])
-    seqlen_kv = int(shape["seqlen_kv"])
+    batch_size = shape.batch_size
+    seqlen_q = shape.seqlen_q
+    seqlen_kv = shape.seqlen_kv
     total_q = batch_size * seqlen_q
     output = torch.full(
-        (NUM_KV_HEADS, total_q, TOPK),
+        (shape.num_kv_heads, total_q, shape.topk),
         -1,
         dtype=torch.int32,
     )
-    generator = torch.Generator(device="cpu").manual_seed(int(shape["seed"]) + 101)
-    all_blocks = (seqlen_kv + BLOCK_SIZE - 1) // BLOCK_SIZE
+    generator = torch.Generator(device="cpu").manual_seed(shape.seed + 101)
+    all_blocks = (seqlen_kv + shape.block_size - 1) // shape.block_size
     q_start = 0
     for _ in range(batch_size):
         offset = seqlen_kv - seqlen_q
@@ -240,12 +549,12 @@ def _make_q2k(torch, shape: dict[str, Any], device) -> Any:
                 0,
                 min(
                     all_blocks,
-                    (visible_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,
+                    (visible_tokens + shape.block_size - 1) // shape.block_size,
                 ),
             )
-            for kv_head in range(NUM_KV_HEADS):
+            for kv_head in range(shape.num_kv_heads):
                 candidates = torch.randperm(visible_blocks, generator=generator)
-                selected = candidates[: min(TOPK, visible_blocks)].sort().values
+                selected = candidates[: min(shape.topk, visible_blocks)].sort().values
                 output[kv_head, q_start + local_q, : selected.numel()] = selected.to(
                     torch.int32
                 )
@@ -253,19 +562,40 @@ def _make_q2k(torch, shape: dict[str, Any], device) -> Any:
     return output.to(device=device).contiguous()
 
 
-def _make_paged_cache(torch, logical, *, batch_size: int, seqlen_kv: int):
-    pages_per_sequence = seqlen_kv // BLOCK_SIZE
+def _make_paged_cache(
+    torch,
+    logical,
+    *,
+    batch_size: int,
+    seqlen_kv: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+):
+    pages_per_sequence = (seqlen_kv + block_size - 1) // block_size
     total_pages = batch_size * pages_per_sequence
+    padded_tokens_per_sequence = pages_per_sequence * block_size
+    if padded_tokens_per_sequence == seqlen_kv:
+        padded = logical.view(batch_size, seqlen_kv, num_kv_heads, head_dim)
+    else:
+        padded = torch.zeros(
+            (batch_size, padded_tokens_per_sequence, num_kv_heads, head_dim),
+            dtype=logical.dtype,
+            device=logical.device,
+        )
+        padded[:, :seqlen_kv] = logical.view(
+            batch_size, seqlen_kv, num_kv_heads, head_dim
+        )
     logical_pages = (
-        logical.view(
+        padded.view(
             batch_size,
             pages_per_sequence,
-            BLOCK_SIZE,
-            NUM_KV_HEADS,
-            HEAD_DIM,
+            block_size,
+            num_kv_heads,
+            head_dim,
         )
         .permute(0, 1, 3, 2, 4)
-        .reshape(total_pages, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM)
+        .reshape(total_pages, num_kv_heads, block_size, head_dim)
     )
     paged = logical_pages.flip(0).contiguous()
     page_table = torch.arange(
@@ -278,19 +608,19 @@ def _make_paged_cache(torch, logical, *, batch_size: int, seqlen_kv: int):
     return paged, page_table.contiguous()
 
 
-def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
-    batch_size = int(shape["batch_size"])
-    seqlen_q = int(shape["seqlen_q"])
-    seqlen_kv = int(shape["seqlen_kv"])
+def _make_inputs(torch, shape: MSAShape, device) -> dict[str, Any]:
+    batch_size = shape.batch_size
+    seqlen_q = shape.seqlen_q
+    seqlen_kv = shape.seqlen_kv
     total_q = batch_size * seqlen_q
     total_k = batch_size * seqlen_kv
-    q_dtype = _torch_dtype(torch, str(shape["q_dtype"]))
-    kv_dtype = _torch_dtype(torch, str(shape["kv_dtype"]))
-    generator = torch.Generator(device=device).manual_seed(int(shape["seed"]))
+    q_dtype = _torch_dtype(torch, shape.q_dtype)
+    kv_dtype = _torch_dtype(torch, shape.kv_dtype)
+    generator = torch.Generator(device=device).manual_seed(shape.seed)
 
     q = (
         torch.randn(
-            (total_q, NUM_Q_HEADS, HEAD_DIM),
+            (total_q, shape.num_q_heads, shape.head_dim),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -299,7 +629,7 @@ def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
     ).to(q_dtype)
     logical_k = (
         torch.randn(
-            (total_k, NUM_KV_HEADS, HEAD_DIM),
+            (total_k, shape.num_kv_heads, shape.head_dim),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -308,7 +638,7 @@ def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
     ).to(kv_dtype)
     logical_v = (
         torch.randn(
-            (total_k, NUM_KV_HEADS, HEAD_DIM),
+            (total_k, shape.num_kv_heads, shape.head_dim),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -334,23 +664,27 @@ def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
 
     page_table = None
     seqused_k = None
-    if shape["kv_layout"] == "flat_varlen":
+    if shape.kv_layout == "flat_varlen":
         k = logical_k.contiguous()
         v = logical_v.contiguous()
-    elif shape["kv_layout"] == "paged":
-        if seqlen_kv % BLOCK_SIZE:
-            raise ValueError("paged canonical shapes require a full final page")
+    elif shape.kv_layout == "paged":
         k, page_table = _make_paged_cache(
             torch,
             logical_k,
             batch_size=batch_size,
             seqlen_kv=seqlen_kv,
+            num_kv_heads=shape.num_kv_heads,
+            head_dim=shape.head_dim,
+            block_size=shape.block_size,
         )
         v, v_page_table = _make_paged_cache(
             torch,
             logical_v,
             batch_size=batch_size,
             seqlen_kv=seqlen_kv,
+            num_kv_heads=shape.num_kv_heads,
+            head_dim=shape.head_dim,
+            block_size=shape.block_size,
         )
         if not torch.equal(page_table, v_page_table):
             raise RuntimeError("K/V page tables differ")
@@ -361,7 +695,7 @@ def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
             device=device,
         )
     else:
-        raise ValueError(f"unsupported KV layout {shape['kv_layout']!r}")
+        raise ValueError(f"unsupported KV layout {shape.kv_layout!r}")
 
     return {
         "q": q.contiguous(),
@@ -376,10 +710,10 @@ def _make_inputs(torch, shape: dict[str, Any], device) -> dict[str, Any]:
 
 
 def _candidate_call(
-    shape: dict[str, Any], inputs: dict[str, Any]
+    shape: MSAShape, inputs: dict[str, Any]
 ) -> tuple[Callable[[], Any], str, dict[str, Any]]:
     msa_ops = importlib.import_module("flashinfer.msa_ops")
-    if shape["operation"] == "sparse_prefill":
+    if shape.operation == "sparse_prefill":
         public_api = "flashinfer.msa_ops.msa_sparse_attention"
 
         def call():
@@ -390,7 +724,7 @@ def _candidate_call(
                 inputs["q2k"],
                 inputs["cu_q"],
                 inputs["cu_k"],
-                causal=bool(shape["causal"]),
+                causal=shape.causal,
                 page_table=inputs["page_table"],
                 seqused_k=inputs["seqused_k"],
                 return_softmax_lse=False,
@@ -408,31 +742,34 @@ def _candidate_call(
                 page_table=inputs["page_table"],
                 seqused_k=inputs["seqused_k"],
                 cu_seqlens_k=inputs["cu_k"],
-                seqlen_q=int(shape["seqlen_q"]),
-                causal=bool(shape["causal"]),
+                seqlen_q=shape.seqlen_q,
+                causal=shape.causal,
                 return_softmax_lse=False,
-                force_fused=shape["force_fused"],
+                force_fused=shape.force_fused,
             )
 
     return call, public_api, {"excluded_setup": ["deterministic_input_construction"]}
 
 
 def _baseline_call(
-    torch, shape: dict[str, Any], inputs: dict[str, Any]
+    torch, shape: MSAShape, inputs: dict[str, Any]
 ) -> tuple[Callable[[], Any], str, dict[str, Any]]:
-    if shape["q_dtype"] == "float16":
+    if not shape.baseline_comparable:
         raise RuntimeError("the pinned public baseline does not accept FP16 input")
     baseline = importlib.import_module("fmha_sm100")
     k2q_row_ptr, k2q_q_indices, schedule = baseline.build_k2q_csr(
         inputs["q2k"],
         inputs["cu_q"],
         inputs["cu_k"],
-        BLOCK_SIZE,
-        total_k=int(shape["batch_size"]) * int(shape["seqlen_kv"]),
-        max_seqlen_k=int(shape["seqlen_kv"]),
-        max_seqlen_q=int(shape["seqlen_q"]),
-        total_rows=(int(shape["batch_size"]) * int(shape["seqlen_kv"]) // BLOCK_SIZE),
-        qhead_per_kv=NUM_Q_HEADS // NUM_KV_HEADS,
+        shape.block_size,
+        total_k=shape.batch_size * shape.seqlen_kv,
+        max_seqlen_k=shape.seqlen_kv,
+        max_seqlen_q=shape.seqlen_q,
+        total_rows=(
+            shape.batch_size
+            * ((shape.seqlen_kv + shape.block_size - 1) // shape.block_size)
+        ),
+        qhead_per_kv=shape.num_q_heads // shape.num_kv_heads,
         return_schedule=True,
     )
     torch.cuda.synchronize()
@@ -445,13 +782,13 @@ def _baseline_call(
             inputs["v"],
             k2q_row_ptr,
             k2q_q_indices,
-            TOPK,
+            shape.topk,
             cu_seqlens_q=inputs["cu_q"],
             cu_seqlens_k=inputs["cu_k"],
-            max_seqlen_q=int(shape["seqlen_q"]),
-            max_seqlen_k=int(shape["seqlen_kv"]),
-            blk_kv=BLOCK_SIZE,
-            causal=bool(shape["causal"]),
+            max_seqlen_q=shape.seqlen_q,
+            max_seqlen_k=shape.seqlen_kv,
+            blk_kv=shape.block_size,
+            causal=shape.causal,
             return_softmax_lse=False,
             page_table=inputs["page_table"],
             seqused_k=inputs["seqused_k"],
@@ -483,7 +820,7 @@ def _primary_output(value):
 
 def _verify_public_outputs(
     torch,
-    shape: dict[str, Any],
+    shape: MSAShape,
     candidate_call: Callable[[], Any],
     baseline_call: Callable[[], Any],
     *,
@@ -494,16 +831,16 @@ def _verify_public_outputs(
     baseline_output = _primary_output(baseline_call())
     torch.cuda.synchronize()
     expected_shape = (
-        int(shape["batch_size"]) * int(shape["seqlen_q"]),
-        NUM_Q_HEADS,
-        HEAD_DIM,
+        shape.batch_size * shape.seqlen_q,
+        shape.num_q_heads,
+        shape.head_dim,
     )
     shape_matches = (
         tuple(candidate_output.shape) == expected_shape
         and tuple(baseline_output.shape) == expected_shape
     )
     dtype_matches = candidate_output.dtype == baseline_output.dtype
-    tolerance = CORRECTNESS_TOLERANCES[str(shape["kv_dtype"])]
+    tolerance = CORRECTNESS_TOLERANCES[shape.kv_dtype]
     if not shape_matches or not dtype_matches:
         return {
             "status": "failed",
@@ -668,7 +1005,7 @@ def _run_worker(args: argparse.Namespace) -> None:
     torch, flashinfer = _configure_imports(source_root, baseline_root)
     hardware = _hardware(torch)
     device = torch.device("cuda", torch.cuda.current_device())
-    shape = SHAPES_BY_LABEL[args.worker_shape]
+    shape = SHAPES_BY_ID[args.worker_shape]
     inputs = _make_inputs(torch, shape, device)
     software = {
         "torch_version": torch.__version__,
@@ -697,7 +1034,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         result = {
             "status": "verified" if correctness["passed"] else "failed",
             "backend": "verify",
-            "shape": shape["label"],
+            "shape": shape.stable_id,
             "correctness": correctness,
             "source_sha": source_sha,
             "baseline_sha": baseline_sha,
@@ -735,7 +1072,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         "public_api": public_api,
         **setup,
         **timing,
-        "shape": shape["label"],
+        "shape": shape.stable_id,
         "source_sha": source_sha,
         "baseline_sha": baseline_sha,
         "hardware": hardware,
@@ -751,7 +1088,7 @@ def _run_isolated(
     args: argparse.Namespace,
     *,
     backend: str,
-    shape: dict[str, Any],
+    shape: MSAShape,
     output: Path,
 ) -> dict[str, Any]:
     command = [
@@ -770,7 +1107,7 @@ def _run_isolated(
         "--worker-backend",
         backend,
         "--worker-shape",
-        shape["label"],
+        shape.stable_id,
         "--worker-json",
         str(output),
     ]
@@ -784,7 +1121,7 @@ def _run_isolated(
     )
     if completed.returncode:
         raise RuntimeError(
-            f"isolated {backend}/{shape['label']} worker failed "
+            f"isolated {backend}/{shape.stable_id} worker failed "
             f"with exit code {completed.returncode}\n"
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
@@ -792,25 +1129,27 @@ def _run_isolated(
     if not output.is_file():
         raise RuntimeError(f"worker did not write {output}")
     result = json.loads(output.read_text(encoding="utf-8"))
-    if result.get("backend") != backend or result.get("shape") != shape["label"]:
+    if result.get("backend") != backend or result.get("shape") != shape.stable_id:
         raise RuntimeError(f"worker returned mismatched result: {result}")
     return result
 
 
-def _public_shape(shape: dict[str, Any]) -> dict[str, Any]:
-    return {
-        **shape,
-        "num_q_heads": NUM_Q_HEADS,
-        "num_kv_heads": NUM_KV_HEADS,
-        "head_dim": HEAD_DIM,
-        "topk": TOPK,
-        "block_size": BLOCK_SIZE,
-    }
+def _public_shape(shape: MSAShape) -> dict[str, Any]:
+    return shape.as_public_dict()
 
 
-def _validate_common_metadata(results: list[dict[str, Any]]) -> None:
+def _validate_common_metadata(
+    results: list[dict[str, Any]],
+    expected_measurements: list[tuple[str, str]],
+) -> None:
     if not results:
         raise RuntimeError("no measurements were collected")
+    actual_measurements = [(result["shape"], result["backend"]) for result in results]
+    if sorted(actual_measurements) != sorted(expected_measurements):
+        raise RuntimeError(
+            "timing workers did not traverse the selected manifest exactly: "
+            f"expected {expected_measurements}, got {actual_measurements}"
+        )
     expected_hardware = results[0]["hardware"]
     expected_software = results[0]["software"]
     for result in results:
@@ -829,10 +1168,16 @@ def _validate_common_metadata(results: list[dict[str, Any]]) -> None:
 
 
 def _validate_correctness_metadata(
-    results: list[dict[str, Any]], measured_reference: dict[str, Any]
+    results: list[dict[str, Any]],
+    measured_reference: dict[str, Any],
+    expected_shape_ids: list[str],
 ) -> None:
-    if len(results) != 5:
-        raise RuntimeError(f"expected five correctness results, got {len(results)}")
+    actual_shape_ids = [result["shape"] for result in results]
+    if actual_shape_ids != expected_shape_ids:
+        raise RuntimeError(
+            "correctness workers did not traverse the comparable manifest rows "
+            f"exactly: expected {expected_shape_ids}, got {actual_shape_ids}"
+        )
     for result in results:
         if result["hardware"] != measured_reference["hardware"]:
             raise RuntimeError("correctness and timing workers used different hardware")
@@ -853,13 +1198,14 @@ def _validate_correctness_metadata(
             )
 
 
-def _unsupported_baseline() -> dict[str, Any]:
+def _unsupported_baseline(shape: MSAShape) -> dict[str, Any]:
     return {
         "status": "unsupported",
+        "baseline_mode": shape.baseline_mode,
         "public_api": "fmha_sm100.sparse_atten_func",
         "reason": (
             "The pinned public sparse-forward API accepts BF16 or FP8 E4M3 "
-            "Q/K/V storage, not FP16 input."
+            "Q/K/V storage, not FP16 input. No cross-dtype timing proxy is used."
         ),
         "evidence": {
             "source_path": "python/fmha_sm100/cute/interface.py",
@@ -867,6 +1213,17 @@ def _unsupported_baseline() -> dict[str, Any]:
             "baseline_sha": BASELINE_SHA,
         },
     }
+
+
+def _selected_shapes(args: argparse.Namespace) -> tuple[MSAShape, ...]:
+    if args.shapes is None:
+        return SHAPE_MANIFEST
+    if len(set(args.shapes)) != len(args.shapes):
+        raise ValueError("--shapes must not contain duplicate stable IDs")
+    requested = set(args.shapes)
+    # Preserve manifest order even when the CLI list is reordered, keeping
+    # backend alternation and output JSON deterministic.
+    return tuple(shape for shape in SHAPE_MANIFEST if shape.stable_id in requested)
 
 
 def _run_parent(args: argparse.Namespace) -> None:
@@ -880,16 +1237,18 @@ def _run_parent(args: argparse.Namespace) -> None:
     if not (baseline_root / "python" / "fmha_sm100").is_dir():
         raise RuntimeError("baseline checkout does not contain python/fmha_sm100")
 
+    selected_shapes = _selected_shapes(args)
     rows = []
     measured_results: list[dict[str, Any]] = []
     correctness_results: list[dict[str, Any]] = []
+    expected_measurements: list[tuple[str, str]] = []
     with tempfile.TemporaryDirectory(prefix="flashinfer-msa-bench-") as temp_dir:
         temp_root = Path(temp_dir)
-        for index, shape in enumerate(SHAPES):
-            comparable = shape["q_dtype"] != "float16"
+        for index, shape in enumerate(selected_shapes):
+            comparable = shape.baseline_comparable
             if comparable:
                 print(
-                    f"Verifying public output parity for {shape['label']}", flush=True
+                    f"Verifying public output parity for {shape.stable_id}", flush=True
                 )
                 correctness_worker = _run_isolated(
                     args,
@@ -900,7 +1259,7 @@ def _run_parent(args: argparse.Namespace) -> None:
                 correctness_results.append(correctness_worker)
                 if not correctness_worker["correctness"]["passed"]:
                     raise RuntimeError(
-                        f"public output parity failed for {shape['label']}: "
+                        f"public output parity failed for {shape.stable_id}: "
                         f"{correctness_worker['correctness']}"
                     )
                 correctness = correctness_worker["correctness"]
@@ -917,7 +1276,7 @@ def _run_parent(args: argparse.Namespace) -> None:
             else:
                 process_order = ("flashinfer",)
             print(
-                f"Measuring {shape['label']} ({', '.join(process_order)})",
+                f"Measuring {shape.stable_id} ({', '.join(process_order)})",
                 flush=True,
             )
             by_backend = {}
@@ -931,6 +1290,7 @@ def _run_parent(args: argparse.Namespace) -> None:
                 )
                 by_backend[backend] = result
                 measured_results.append(result)
+                expected_measurements.append((shape.stable_id, backend))
 
             candidate = by_backend["flashinfer"]
             if comparable:
@@ -938,11 +1298,11 @@ def _run_parent(args: argparse.Namespace) -> None:
                 speedup = baseline["median_ms"] / candidate["median_ms"]
                 if not math.isfinite(speedup) or speedup <= 0.0:
                     raise RuntimeError(
-                        f"invalid speedup for {shape['label']}: {speedup}"
+                        f"invalid speedup for {shape.stable_id}: {speedup}"
                     )
                 comparison_status = "measured"
             else:
-                baseline = _unsupported_baseline()
+                baseline = _unsupported_baseline(shape)
                 speedup = None
                 comparison_status = "official_baseline_unsupported"
             row = {
@@ -964,23 +1324,37 @@ def _run_parent(args: argparse.Namespace) -> None:
 
     _validate_checkout(source_root, source_sha, "FlashInfer source")
     _validate_checkout(baseline_root, baseline_sha, "MiniMax baseline")
-    _validate_common_metadata(measured_results)
-    _validate_correctness_metadata(correctness_results, measured_results[0])
+    _validate_common_metadata(measured_results, expected_measurements)
+    expected_correctness_ids = [
+        shape.stable_id for shape in selected_shapes if shape.baseline_comparable
+    ]
+    _validate_correctness_metadata(
+        correctness_results,
+        measured_results[0],
+        expected_correctness_ids,
+    )
     comparable_speedups = [
         row["speedup_baseline_over_candidate"]
         for row in rows
         if row["speedup_baseline_over_candidate"] is not None
     ]
-    if len(comparable_speedups) != 5:
+    if len(comparable_speedups) != len(expected_correctness_ids):
         raise RuntimeError(
-            f"expected five comparable rows, got {len(comparable_speedups)}"
+            f"expected {len(expected_correctness_ids)} comparable rows, "
+            f"got {len(comparable_speedups)}"
         )
-    geometric_mean = math.exp(
-        sum(math.log(value) for value in comparable_speedups) / len(comparable_speedups)
+    geometric_mean = (
+        math.exp(
+            sum(math.log(value) for value in comparable_speedups)
+            / len(comparable_speedups)
+        )
+        if comparable_speedups
+        else None
     )
     first = measured_results[0]
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "manifest_version": MANIFEST_VERSION,
         "repositories": {
             "candidate": {
                 "repository": SOURCE_REPOSITORY,
@@ -1010,9 +1384,9 @@ def _run_parent(args: argparse.Namespace) -> None:
             ),
             "correctness_reference": "pinned_public_fmha_sm100_sparse_atten_func",
             "baseline_api_selection": (
-                "sparse_atten_func supports the required flat BF16 and mixed "
-                "BF16-query/paged-FP8-KV inputs; the pinned decode API requires "
-                "paged FP8 Q/K/V."
+                "sparse_atten_func supports the required flat/paged BF16 and "
+                "mixed BF16-query/FP8-KV inputs. FP16 rows are candidate-only; "
+                "no cross-dtype proxy is reported."
             ),
             "fallback_policy": "reject",
             "samples_per_pair": args.samples,
@@ -1025,15 +1399,25 @@ def _run_parent(args: argparse.Namespace) -> None:
             ),
         },
         "matrix": {
-            "shape_count": len(SHAPES),
-            "comparable_shape_count": 5,
-            "official_baseline_unsupported_shape_count": 1,
+            "manifest_shape_count": len(SHAPE_MANIFEST),
+            "selected_shape_count": len(selected_shapes),
+            "selected_shape_ids": [shape.stable_id for shape in selected_shapes],
+            "comparable_shape_count": len(expected_correctness_ids),
+            "official_baseline_unsupported_shape_count": sum(
+                not shape.baseline_comparable for shape in selected_shapes
+            ),
             "output_parity_checked_shape_count": len(correctness_results),
-            "num_q_heads": NUM_Q_HEADS,
-            "num_kv_heads": NUM_KV_HEADS,
-            "head_dim": HEAD_DIM,
-            "topk": TOPK,
-            "block_size": BLOCK_SIZE,
+            "num_q_heads_values": sorted(
+                {shape.num_q_heads for shape in selected_shapes}
+            ),
+            "num_kv_heads_values": sorted(
+                {shape.num_kv_heads for shape in selected_shapes}
+            ),
+            "head_dim_values": sorted({shape.head_dim for shape in selected_shapes}),
+            "topk_values": sorted({shape.topk for shape in selected_shapes}),
+            "block_size_values": sorted(
+                {shape.block_size for shape in selected_shapes}
+            ),
         },
         "rows": rows,
         "summary": {
@@ -1041,8 +1425,12 @@ def _run_parent(args: argparse.Namespace) -> None:
             "all_comparable_outputs_match": True,
             "measured_comparisons": len(comparable_speedups),
             "geometric_mean_speedup": geometric_mean,
-            "minimum_speedup": min(comparable_speedups),
-            "maximum_speedup": max(comparable_speedups),
+            "minimum_speedup": min(comparable_speedups)
+            if comparable_speedups
+            else None,
+            "maximum_speedup": max(comparable_speedups)
+            if comparable_speedups
+            else None,
         },
     }
     args.json.write_text(
@@ -1061,13 +1449,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--json", type=Path)
     parser.add_argument(
+        "--shapes",
+        nargs="+",
+        choices=tuple(SHAPES_BY_ID),
+        metavar="STABLE_ID",
+        help=(
+            "run only these frozen manifest rows (default: all rows); output "
+            "records both the full manifest count and the selected stable IDs"
+        ),
+    )
+    parser.add_argument(
         "--worker-backend",
         choices=("flashinfer", "minimax", "verify"),
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--worker-shape",
-        choices=tuple(SHAPES_BY_LABEL),
+        choices=tuple(SHAPES_BY_ID),
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--worker-json", type=Path, help=argparse.SUPPRESS)
@@ -1080,6 +1478,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error("all internal worker options must be supplied together")
         if args.json is not None:
             parser.error("--json is not valid in worker mode")
+        if args.shapes is not None:
+            parser.error("--shapes is not valid in worker mode")
     elif args.json is None:
         parser.error("--json is required")
     return args
