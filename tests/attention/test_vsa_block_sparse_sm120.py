@@ -84,9 +84,9 @@ def _bsr_to_dense_mask(
 
 
 def _pytorch_ref(
-    q: torch.Tensor,   # [M, H, D]
-    k: torch.Tensor,   # [N, H, D]
-    v: torch.Tensor,   # [N, H, D]
+    q: torch.Tensor,  # [M, H, D]
+    k: torch.Tensor,  # [N, H, D]
+    v: torch.Tensor,  # [N, H, D]
     indptr: torch.Tensor,
     indices: torch.Tensor,
     R: int,
@@ -102,20 +102,20 @@ def _pytorch_ref(
 
     mask = _bsr_to_dense_mask(indptr, indices, MB, NB, R, C, q.device)
 
-    qf = q.float().permute(1, 0, 2)   # [H, M, D]
-    kf = k.float().permute(1, 0, 2)   # [H, N, D]
-    vf = v.float().permute(1, 0, 2)   # [H, N, D]
+    qf = q.float().permute(1, 0, 2)  # [H, M, D]
+    kf = k.float().permute(1, 0, 2)  # [H, N, D]
+    vf = v.float().permute(1, 0, 2)  # [H, N, D]
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale  # [H, M, N]
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
-    out = torch.matmul(probs, vf)    # [H, M, D]
+    out = torch.matmul(probs, vf)  # [H, M, D]
     return out.permute(1, 0, 2).to(q.dtype)  # [M, H, D]
 
 
 def _pytorch_ref_gqa(
-    q: torch.Tensor,   # [M, Hq, D]
-    k: torch.Tensor,   # [N, Hkv, D]
-    v: torch.Tensor,   # [N, Hkv, D]
+    q: torch.Tensor,  # [M, Hq, D]
+    k: torch.Tensor,  # [N, Hkv, D]
+    v: torch.Tensor,  # [N, Hkv, D]
     indptr: torch.Tensor,
     indices: torch.Tensor,
     R: int,
@@ -180,7 +180,9 @@ def test_vsa_sm120_accuracy(dtype, density, num_blocks, num_heads, workspace):
     o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C)
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+    wrapper.plan(
+        indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype
+    )
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
@@ -203,8 +205,17 @@ def test_vsa_sm120_sm_scale(sm_scale, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype, sm_scale=sm_scale,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
     )
     o = wrapper.run(q, k, v)
 
@@ -228,14 +239,27 @@ def test_vsa_sm120_per_head_mask_correctness(workspace):
     k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
-    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for h in range(num_heads):
         chosen = torch.randperm(num_blocks)[: max(1, num_blocks // 2)]
         block_mask[h, :, chosen] = True
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(None, None, M, N, R, C, num_heads, num_heads, HEAD_DIM,
-                 q_data_type=dtype, block_mask=block_mask)
+    wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
     o_vsa = wrapper.run(q, k, v)
 
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -265,10 +289,10 @@ def test_vsa_sm120_per_head_mask_correctness(workspace):
 @pytest.mark.parametrize(
     "num_qo_heads,num_kv_heads,dtype",
     [
-        (8, 4, torch.bfloat16),   # GQA 2x
-        (8, 2, torch.bfloat16),   # GQA 4x
-        (8, 1, torch.bfloat16),   # MQA
-        (8, 4, torch.float16),    # GQA 2x, fp16
+        (8, 4, torch.bfloat16),  # GQA 2x
+        (8, 2, torch.bfloat16),  # GQA 4x
+        (8, 1, torch.bfloat16),  # MQA
+        (8, 4, torch.float16),  # GQA 2x, fp16
     ],
 )
 def test_vsa_sm120_gqa(num_qo_heads, num_kv_heads, dtype, workspace):
@@ -285,7 +309,18 @@ def test_vsa_sm120_gqa(num_qo_heads, num_kv_heads, dtype, workspace):
     o_ref = _pytorch_ref_gqa(q, k, v, indptr, indices, R, C)
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(indptr, indices, M, N, R, C, num_qo_heads, num_kv_heads, HEAD_DIM, q_data_type=dtype)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_qo_heads,
+        num_kv_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+    )
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
@@ -317,7 +352,9 @@ def test_vsa_sm120_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
     o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C)
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+    wrapper.plan(
+        indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype
+    )
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
@@ -355,12 +392,16 @@ def test_vsa_sm120_return_lse(dtype, num_blocks, num_heads, workspace):
     lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)  # [M, H]
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+    wrapper.plan(
+        indptr, indices, M, N, R, C, num_heads, num_heads, HEAD_DIM, q_data_type=dtype
+    )
     _, lse = wrapper.run(q, k, v, return_lse=True)
 
     finite = lse_ref.isfinite()
     assert finite.any()
-    torch.testing.assert_close(lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -380,15 +421,28 @@ def test_vsa_sm120_variable_blocks_per_q(workspace):
     k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
-    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for i in range(num_blocks):
         cnt = i + 1
         chosen = torch.randperm(num_blocks)[:cnt]
         block_mask[:, i, chosen] = True
 
     wrapper = _make_wrapper(workspace)
-    wrapper.plan(None, None, M, N, R, C, num_heads, num_heads, HEAD_DIM,
-                 q_data_type=dtype, block_mask=block_mask)
+    wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
     o_vsa = wrapper.run(q, k, v)
 
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -444,16 +498,30 @@ def test_vsa_sm120_perf_sweep(workspace):
             active_blocks = len(indices)
 
             wrapper = _make_wrapper(workspace)
-            wrapper.plan(indptr, indices, seqlen, seqlen, R, C,
-                         num_heads, num_heads, HEAD_DIM, q_data_type=dtype)
+            wrapper.plan(
+                indptr,
+                indices,
+                seqlen,
+                seqlen,
+                R,
+                C,
+                num_heads,
+                num_heads,
+                HEAD_DIM,
+                q_data_type=dtype,
+            )
             wrapper.run(q, k, v)  # warm-up
 
-            times = bench_gpu_time(lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v))
+            times = bench_gpu_time(
+                lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v)
+            )
             ms = statistics.median(times)
 
             flops = 2 * 2 * active_blocks * R * C * num_heads * HEAD_DIM
             tflops = flops / (ms * 1e-3) / 1e12
             actual_density = active_blocks / (num_blocks * num_blocks)
-            print(f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}")
+            print(
+                f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}"
+            )
 
         print(sep)

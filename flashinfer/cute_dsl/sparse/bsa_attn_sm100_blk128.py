@@ -58,6 +58,9 @@ torch2cute_dtype_map = {
 }
 
 
+_sm100_blk128_compile_cache = get_jit_cache("bsa_fwd")
+
+
 @flashinfer_api
 def bsa_attn_sm100_blk128_fwd(
     q: torch.Tensor,
@@ -108,7 +111,9 @@ def bsa_attn_sm100_blk128_fwd(
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
     arch = _get_device_arch()
-    assert arch // 10 in [10, 11], f"bsa_attn_sm100_blk128_fwd (sm100_blk128) only supports SM100/SM110, got SM{arch}"
+    assert arch // 10 in [10, 11], (
+        f"bsa_attn_sm100_blk128_fwd (sm100_blk128) only supports SM100/SM110, got SM{arch}"
+    )
     assert num_head % num_head_kv == 0
 
     assert q2k_block_index.dtype == torch.int32, "q2k_block_index must be int32"
@@ -181,7 +186,7 @@ def bsa_attn_sm100_blk128_fwd(
         has_block_sizes,
     )
 
-    if compile_key not in bsa_attn_sm100_blk128_fwd.compile_cache:  # type: ignore[attr-defined]
+    if compile_key not in _sm100_blk128_compile_cache:
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out)
         ]
@@ -206,7 +211,7 @@ def bsa_attn_sm100_blk128_fwd(
             has_block_sizes=has_block_sizes,
         )
 
-        bsa_attn_sm100_blk128_fwd.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
+        _sm100_blk128_compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -224,7 +229,7 @@ def bsa_attn_sm100_blk128_fwd(
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_sm100_blk128_fwd_kernel"):
-            bsa_attn_sm100_blk128_fwd.compile_cache[compile_key](  # type: ignore[attr-defined]
+            _sm100_blk128_compile_cache[compile_key](
                 q.detach(),
                 k.detach(),
                 v.detach(),
@@ -239,6 +244,3 @@ def bsa_attn_sm100_blk128_fwd(
             )
 
     return out, lse
-
-
-bsa_attn_sm100_blk128_fwd.compile_cache = get_jit_cache("bsa_fwd")  # type: ignore[attr-defined]

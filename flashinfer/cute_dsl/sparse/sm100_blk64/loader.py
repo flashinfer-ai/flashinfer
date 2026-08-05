@@ -39,11 +39,10 @@ def load_blk64_ext():
     cutlass_root = _get_cutlass_root()
 
     build_dir = (
-        Path(
-            os.environ.get(
-                "FLASHINFER_WORKSPACE_BASE", Path.home()
-            )
-        ) / ".cache" / "flashinfer" / "sm100_blk64_ext"
+        Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home()))
+        / ".cache"
+        / "flashinfer"
+        / "sm100_blk64_ext"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
 

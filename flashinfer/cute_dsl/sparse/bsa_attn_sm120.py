@@ -89,7 +89,17 @@ def _prepare_sm120_sparse_metadata(
     if not has_block_sizes:
         block_sizes_t = q2k_nums_t
 
-    return has_block_nums, has_block_sizes, block_sizes_mode, q2k_t, q2k_nums_t, block_sizes_t
+    return (
+        has_block_nums,
+        has_block_sizes,
+        block_sizes_mode,
+        q2k_t,
+        q2k_nums_t,
+        block_sizes_t,
+    )
+
+
+_sm120_compile_cache = get_jit_cache("bsa_fwd_sm120")
 
 
 @flashinfer_api
@@ -155,16 +165,20 @@ def bsa_attn_sm120_blk64_fwd(
     num_kv_blocks = _ceil_div(seqlen_k, _BLOCK_SIZE)
 
     if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
+        softmax_scale = head_dim**-0.5
 
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
 
     if out is None:
-        out = torch.empty((batch, seqlen_q, num_heads, head_dim_v), dtype=q.dtype, device=q.device)
+        out = torch.empty(
+            (batch, seqlen_q, num_heads, head_dim_v), dtype=q.dtype, device=q.device
+        )
     if lse is None:
-        lse = torch.empty((batch, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
+        lse = torch.empty(
+            (batch, num_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
 
     (
         has_block_nums,
@@ -201,11 +215,21 @@ def bsa_attn_sm120_blk64_fwd(
     q_cute = to_cute_tensor(q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
     k_cute = to_cute_tensor(k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
     v_cute = to_cute_tensor(v_t, assumed_align=128, leading_dim=0, enable_tvm_ffi=False)
-    out_cute = to_cute_tensor(out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    lse_cute = to_cute_tensor(lse_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False)
-    q2k_cute = to_cute_tensor(q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    q2k_nums_cute = to_cute_tensor(q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    block_sizes_cute = to_cute_tensor(block_sizes_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
+    out_cute = to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    lse_cute = to_cute_tensor(
+        lse_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    block_sizes_cute = to_cute_tensor(
+        block_sizes_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
 
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -260,15 +284,12 @@ def bsa_attn_sm120_blk64_fwd(
         current_stream,
     )
 
-    if compile_key not in bsa_attn_sm120_blk64_fwd.compile_cache:  # type: ignore[attr-defined]
-        bsa_attn_sm120_blk64_fwd.compile_cache[compile_key] = cute.compile(fwd_kernel, *args)  # type: ignore[attr-defined]
+    if compile_key not in _sm120_compile_cache:
+        _sm120_compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_sm120_blk64_fwd_kernel"):
-            bsa_attn_sm120_blk64_fwd.compile_cache[compile_key](*args)  # type: ignore[attr-defined]
+            _sm120_compile_cache[compile_key](*args)
 
     # out_t and lse_t are views of out/lse — kernel already wrote results in-place.
     return out, lse if return_lse else None
-
-
-bsa_attn_sm120_blk64_fwd.compile_cache = get_jit_cache("bsa_fwd_sm120")  # type: ignore[attr-defined]

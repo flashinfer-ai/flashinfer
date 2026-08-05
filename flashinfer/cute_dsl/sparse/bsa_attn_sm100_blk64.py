@@ -70,7 +70,9 @@ def bsa_attn_sm100_blk64_fwd(
     major, minor = torch.cuda.get_device_capability(q.device)
     arch = major * 10 + minor
     if arch // 10 != 10:
-        raise RuntimeError(f"bsa_attn_sm100_blk64_fwd (sm100_blk64) only supports SM100, current device is SM{arch}")
+        raise RuntimeError(
+            f"bsa_attn_sm100_blk64_fwd (sm100_blk64) only supports SM100, current device is SM{arch}"
+        )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)

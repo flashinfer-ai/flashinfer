@@ -1,3 +1,17 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import operator
 
 import cutlass
@@ -32,12 +46,16 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
-        assert self.dtype in [cutlass.Float16, cutlass.BFloat16], "SM120 blk64 fwd supports fp16/bf16"
+        assert self.dtype in [cutlass.Float16, cutlass.BFloat16], (
+            "SM120 blk64 fwd supports fp16/bf16"
+        )
         assert self.acc_dtype in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
 
         self.tile_size = 64
 
-        assert blocksparse_blocksize_q == 64, "Only block_size_m=64 is supported in this kernel."
+        assert blocksparse_blocksize_q == 64, (
+            "Only block_size_m=64 is supported in this kernel."
+        )
         assert blocksparse_blocksize_k in [64], "block_size_n should be one of [64]"
         self.num_threads = 128
         self.kv_stage = 1
@@ -109,52 +127,98 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         Q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=1,
             producer_group=cg,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_threads // 32),
-            tx_count=cute.size_in_bytes(self.Q_dtype, cute.select(Q_smem_layout, mode=[0, 1])),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_threads // 32
+            ),
+            tx_count=cute.size_in_bytes(
+                self.Q_dtype, cute.select(Q_smem_layout, mode=[0, 1])
+            ),
             barrier_storage=shared_storage.Q_barrier.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
-        Q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        Q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        Q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, 1
+        )
+        Q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, 1
+        )
         K_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_stage,
             producer_group=cg,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_threads // 32),
-            tx_count=cute.size_in_bytes(self.K_dtype, cute.select(K_smem_layout, mode=[0, 1])),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_threads // 32
+            ),
+            tx_count=cute.size_in_bytes(
+                self.K_dtype, cute.select(K_smem_layout, mode=[0, 1])
+            ),
             barrier_storage=shared_storage.K_barrier.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
         V_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_stage,
             producer_group=cg,
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_threads // 32),
-            tx_count=cute.size_in_bytes(self.V_dtype, cute.select(V_smem_layout, mode=[0, 1])),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_threads // 32
+            ),
+            tx_count=cute.size_in_bytes(
+                self.V_dtype, cute.select(V_smem_layout, mode=[0, 1])
+            ),
             barrier_storage=shared_storage.V_barrier.data_ptr(),
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
         )
-        K_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
-        K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stage)
-        V_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_stage)
-        V_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_stage)
+        K_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.kv_stage
+        )
+        K_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.kv_stage
+        )
+        V_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.kv_stage
+        )
+        V_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.kv_stage
+        )
 
         # partition tensors
-        sQ = shared_storage.Q_smem.get_tensor(Q_smem_layout.outer, swizzle=Q_smem_layout.inner)
-        sK = shared_storage.K_smem.get_tensor(K_smem_layout.outer, swizzle=K_smem_layout.inner)
-        sV = shared_storage.V_smem.get_tensor(V_smem_layout.outer, swizzle=V_smem_layout.inner)
+        sQ = shared_storage.Q_smem.get_tensor(
+            Q_smem_layout.outer, swizzle=Q_smem_layout.inner
+        )
+        sK = shared_storage.K_smem.get_tensor(
+            K_smem_layout.outer, swizzle=K_smem_layout.inner
+        )
+        sV = shared_storage.V_smem.get_tensor(
+            V_smem_layout.outer, swizzle=V_smem_layout.inner
+        )
 
         mO_slice = mO[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
         mLSE_slice = mLSE[None, work_desc.qo_head_idx, work_desc.batch_idx]
         mQ_slice = mQ[None, None, work_desc.qo_head_idx, work_desc.batch_idx]
         mK_slice = mK[None, None, work_desc.kv_head_idx, work_desc.batch_idx]
         mV_slice = mV[None, None, work_desc.kv_head_idx, work_desc.batch_idx]
-        gO = cute.local_tile(mO_slice, (self.tile_shape_pv[0], self.tile_shape_pv[1]), coord=(work_desc.qo_tile_idx, 0))
-        gQ = cute.local_tile(mQ_slice, (self.tile_shape_qk[0], self.tile_shape_qk[2]), coord=(work_desc.qo_tile_idx, 0))
-        gK = cute.local_tile(mK_slice, (self.tile_shape_qk[1], self.tile_shape_qk[2]), coord=(None, 0))
-        gV = cute.local_tile(mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None))
+        gO = cute.local_tile(
+            mO_slice,
+            (self.tile_shape_pv[0], self.tile_shape_pv[1]),
+            coord=(work_desc.qo_tile_idx, 0),
+        )
+        gQ = cute.local_tile(
+            mQ_slice,
+            (self.tile_shape_qk[0], self.tile_shape_qk[2]),
+            coord=(work_desc.qo_tile_idx, 0),
+        )
+        gK = cute.local_tile(
+            mK_slice, (self.tile_shape_qk[1], self.tile_shape_qk[2]), coord=(None, 0)
+        )
+        gV = cute.local_tile(
+            mV_slice, (self.tile_shape_pv[1], self.tile_shape_pv[2]), coord=(0, None)
+        )
 
-        gIndices = blocksparse_indices_q2k[None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+        gIndices = blocksparse_indices_q2k[
+            None, work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
+        ]
         if cutlass.const_expr(self.has_block_nums):
-            num_n_tiles = blocksparse_num_blocks_q2k[work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx]
+            num_n_tiles = blocksparse_num_blocks_q2k[
+                work_desc.qo_tile_idx, work_desc.qo_head_idx, work_desc.batch_idx
+            ]
         else:
             num_n_tiles = block_sparse_num
         if cutlass.const_expr(self.has_block_sizes):
@@ -163,9 +227,14 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             elif cutlass.const_expr(self.block_sizes_mode == 2):
                 gBSZ = blocksparse_varblk[None, work_desc.batch_idx]
             else:
-                gBSZ = blocksparse_varblk[None, work_desc.qo_head_idx, work_desc.batch_idx]
+                gBSZ = blocksparse_varblk[
+                    None, work_desc.qo_head_idx, work_desc.batch_idx
+                ]
 
-        cta_coord_layout = (0, cute.make_layout(1))  # CTA coord layout for TMA multicasting, effectively no multicast
+        cta_coord_layout = (
+            0,
+            cute.make_layout(1),
+        )  # CTA coord layout for TMA multicasting, effectively no multicast
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
             tma_atom_Q,
             *cta_coord_layout,
@@ -192,13 +261,23 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tSsK = thr_mma_qk.partition_B(sK)
         tSrQ = tiled_mma_qk.make_fragment_A(tSsQ[None, None, None, 0])
         tSrK = tiled_mma_qk.make_fragment_B(tSsK[None, None, None, 0])
-        tSrS = cute.make_rmem_tensor(thr_mma_qk.partition_shape_C((self.tile_shape_qk[0], self.tile_shape_qk[1])), self.acc_dtype)
+        tSrS = cute.make_rmem_tensor(
+            thr_mma_qk.partition_shape_C(
+                (self.tile_shape_qk[0], self.tile_shape_qk[1])
+            ),
+            self.acc_dtype,
+        )
         tScS = thr_mma_qk.partition_C(cS)
 
         thr_mma_pv = tiled_mma_pv.get_slice(tidx)
         tOsV = thr_mma_pv.partition_B(sV)
         tOrV = tiled_mma_pv.make_fragment_B(tOsV[None, None, None, 0])
-        tOrO = cute.make_rmem_tensor(thr_mma_pv.partition_shape_C((self.tile_shape_pv[0], self.tile_shape_pv[1])), self.acc_dtype)
+        tOrO = cute.make_rmem_tensor(
+            thr_mma_pv.partition_shape_C(
+                (self.tile_shape_pv[0], self.tile_shape_pv[1])
+            ),
+            self.acc_dtype,
+        )
 
         atom_copy_ldmatrix_Q = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(self.Q_layout.is_m_major_a(), 4),
@@ -224,7 +303,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tSsK_copy = thr_copy_K.partition_S(sK)
         tOsV_copy = thr_copy_V.partition_S(sV)
 
-        max_m_layout = cute.make_layout(cute.size(layout_utils.reshape_acc_to_mn(tOrO).layout, mode=[0]))
+        max_m_layout = cute.make_layout(
+            cute.size(layout_utils.reshape_acc_to_mn(tOrO).layout, mode=[0])
+        )
         max_m = cute.make_rmem_tensor_like(max_m_layout, cutlass.Float32)
         sum_m = cute.make_rmem_tensor_like(max_m, cutlass.Float32)
 
@@ -395,7 +476,9 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
         tOrO_cvt.store(tOrO.load().to(self.O_dtype))
 
         # R2S, reusing Q smem for the TMA-store epilogue.
-        sO = shared_storage.Q_smem.get_tensor(O_smem_layout.outer, swizzle=O_smem_layout.inner)
+        sO = shared_storage.Q_smem.get_tensor(
+            O_smem_layout.outer, swizzle=O_smem_layout.inner
+        )
         tiled_copy_o_r2s = cute.make_tiled_copy_C(
             cute.make_copy_atom(
                 cute.nvgpu.warp.StMatrix8x8x16bOp(self.O_layout.is_m_major_c(), 4),
@@ -515,9 +598,15 @@ class BlockSparseAttnForwardSm120Blk64(BatchedStaticSchedulerMixin):
             K_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
             V_barrier: cute.struct.MemRange[cutlass.Int64, self.kv_stage * 2]
 
-            Q_smem: cute.struct.Align[cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128]
-            K_smem: cute.struct.Align[cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128]
-            V_smem: cute.struct.Align[cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128]
+            Q_smem: cute.struct.Align[
+                cute.struct.MemRange[self.Q_dtype, cute.cosize(self.Q_smem_layout)], 128
+            ]
+            K_smem: cute.struct.Align[
+                cute.struct.MemRange[self.K_dtype, cute.cosize(self.K_smem_layout)], 128
+            ]
+            V_smem: cute.struct.Align[
+                cute.struct.MemRange[self.V_dtype, cute.cosize(self.V_smem_layout)], 128
+            ]
 
         self.shared_storage_t = SharedStorage
 
@@ -711,7 +800,9 @@ def online_softmax(
 
         row_max_prev = row_max[m]
         row_max[m] = row_max_cur
-        row_max_safe = cutlass.Float32(0.0) if row_max_cur == -cutlass.Float32.inf else row_max_cur
+        row_max_safe = (
+            cutlass.Float32(0.0) if row_max_cur == -cutlass.Float32.inf else row_max_cur
+        )
         row_max_scaled = row_max_safe * softmax_scale_log2e
 
         acc_S_row_exp = cute.math.exp2(
@@ -748,7 +839,15 @@ def finalize_softmax(
         final_ratio[m] = cute.arch.rcp_approx(final_sum if not is_zero_or_nan else 1.0)
 
         ln2 = 0.693147180559945309417
-        lse[m] = -cutlass.Float32.inf if is_zero_or_nan else (row_max[m] * softmax_scale_log2e + cute.math.log2(final_sum, fastmath=True)) * ln2
+        lse[m] = (
+            -cutlass.Float32.inf
+            if is_zero_or_nan
+            else (
+                row_max[m] * softmax_scale_log2e
+                + cute.math.log2(final_sum, fastmath=True)
+            )
+            * ln2
+        )
 
     return final_ratio, lse
 

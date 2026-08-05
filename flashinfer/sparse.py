@@ -542,8 +542,18 @@ class BlockSparseAttentionWrapper:
                     f"vsa_sm100_blk128 backend requires head_dim in {{64, 96, 128}} (got {head_dim})"
                 )
             _vsa_common_checks(
-                "vsa_sm100_blk128", R, C, M, N, num_qo_heads, num_kv_heads,
-                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+                "vsa_sm100_blk128",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
             )
 
             MB = M // R
@@ -619,8 +629,7 @@ class BlockSparseAttentionWrapper:
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
             if R != 64 or C != 64:
                 raise ValueError(
-                    "vsa_sm100_blk64 backend requires R == C == 64 "
-                    f"(got R={R}, C={C})"
+                    f"vsa_sm100_blk64 backend requires R == C == 64 (got R={R}, C={C})"
                 )
             if head_dim != 128:
                 raise ValueError(
@@ -631,8 +640,18 @@ class BlockSparseAttentionWrapper:
                     "vsa_sm100_blk64 backend only supports bfloat16 inputs"
                 )
             _vsa_common_checks(
-                "vsa_sm100_blk64", R, C, M, N, num_qo_heads, num_kv_heads,
-                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+                "vsa_sm100_blk64",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
             )
 
             MB = M // R
@@ -676,8 +695,7 @@ class BlockSparseAttentionWrapper:
                 )
             if R != 64 or C != 64:
                 raise ValueError(
-                    "vsa_sm120_blk64 backend requires R == C == 64 "
-                    f"(got R={R}, C={C})"
+                    f"vsa_sm120_blk64 backend requires R == C == 64 (got R={R}, C={C})"
                 )
             if head_dim != 128:
                 raise ValueError(
@@ -688,8 +706,18 @@ class BlockSparseAttentionWrapper:
                     "vsa_sm120_blk64 backend only supports float16 and bfloat16 inputs"
                 )
             _vsa_common_checks(
-                "vsa_sm120_blk64", R, C, M, N, num_qo_heads, num_kv_heads,
-                mask, packed_mask, causal, pos_encoding_mode, logits_soft_cap,
+                "vsa_sm120_blk64",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
             )
 
             MB = M // R
@@ -729,9 +757,7 @@ class BlockSparseAttentionWrapper:
                 "and vsa_sm120_blk64 backends."
             )
         if indptr is None or indices is None:
-            raise ValueError(
-                "indptr and indices are required for non-VSA backends."
-            )
+            raise ValueError("indptr and indices are required for non-VSA backends.")
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -986,29 +1012,59 @@ class BlockSparseAttentionWrapper:
 
         # ---- VSA SM100 blk128 backend (BSA blk128 CuTe-DSL kernel, SM100/SM110) ----
         if self._backend == "vsa_sm100_blk128":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import bsa_attn_sm100_blk128_fwd  # noqa: PLC0415
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk128 import (
+                bsa_attn_sm100_blk128_fwd,
+            )  # noqa: PLC0415
+
             return _vsa_run_core(
-                bsa_attn_sm100_blk128_fwd, q, k, v,
-                self._vsa_q2k_index, self._vsa_q2k_num,
-                self._sm_scale, out, lse, return_lse,
+                bsa_attn_sm100_blk128_fwd,
+                q,
+                k,
+                v,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._sm_scale,
+                out,
+                lse,
+                return_lse,
             )
 
         # ---- VSA SM100 blk64 backend (BSA blk64 C++ kernel, SM100 only) -----------
         if self._backend == "vsa_sm100_blk64":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd  # noqa: PLC0415
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
+                bsa_attn_sm100_blk64_fwd,
+            )  # noqa: PLC0415
+
             return _vsa_run_core(
-                bsa_attn_sm100_blk64_fwd, q, k, v,
-                self._vsa_q2k_index, self._vsa_q2k_num,
-                self._sm_scale, out, lse, return_lse,
+                bsa_attn_sm100_blk64_fwd,
+                q,
+                k,
+                v,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._sm_scale,
+                out,
+                lse,
+                return_lse,
             )
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
         if self._backend == "vsa_sm120_blk64":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import bsa_attn_sm120_blk64_fwd  # noqa: PLC0415
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+                bsa_attn_sm120_blk64_fwd,
+            )  # noqa: PLC0415
+
             return _vsa_run_core(
-                bsa_attn_sm120_blk64_fwd, q, k, v,
-                self._vsa_q2k_index, self._vsa_q2k_num,
-                self._sm_scale, out, lse, return_lse,
+                bsa_attn_sm120_blk64_fwd,
+                q,
+                k,
+                v,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._sm_scale,
+                out,
+                lse,
+                return_lse,
             )
 
         pos_encoding_mode = self._pos_encoding_mode

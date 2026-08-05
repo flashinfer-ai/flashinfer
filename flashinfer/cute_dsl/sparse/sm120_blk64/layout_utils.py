@@ -1,8 +1,17 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# Adapted from quack-kernels 0.4.1 (Apache-2.0).
 #
-# Adapted from quack-kernels 0.4.1 (Apache-2.0) and kept local so the
-# block-sparse kernels use the same self-contained helper style as the other
-# cudnn-frontend CuTe DSL kernels.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -21,7 +30,9 @@ def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
 
-def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
+def convert_layout_acc_mn(
+    acc_layout: cute.Layout, transpose: bool = False
+) -> cute.Layout:
     """Convert an MMA accumulator layout to a logical M-by-N layout."""
     acc_layout_col_major = cute.make_layout(acc_layout.shape)
     shape = (
@@ -49,7 +60,9 @@ def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> c
 
 
 def make_acc_tensor_mn_view(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
+    return cute.make_tensor(
+        acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose)
+    )
 
 
 def reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
@@ -95,16 +108,26 @@ def reshape_acc_to_frgA(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
 
 
-def mma_partition_C_vec(s_vec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool) -> cute.Tensor:
+def mma_partition_C_vec(
+    s_vec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
+) -> cute.Tensor:
     """Broadcast a staged vector and partition it like an MMA C operand."""
     assert cute.rank(s_vec) == 2
     assert s_vec.stride[0] == 1
     stage = s_vec.shape[1]
-    shape = (s_vec.shape[0], expand_shape, stage) if const_expr(is_colvec) else (expand_shape, s_vec.shape[0], stage)
-    stride = (1, 0, s_vec.stride[1]) if const_expr(is_colvec) else (0, 1, s_vec.stride[1])
+    shape = (
+        (s_vec.shape[0], expand_shape, stage)
+        if const_expr(is_colvec)
+        else (expand_shape, s_vec.shape[0], stage)
+    )
+    stride = (
+        (1, 0, s_vec.stride[1]) if const_expr(is_colvec) else (0, 1, s_vec.stride[1])
+    )
     s_vec_mma = cute.make_tensor(s_vec.iterator, cute.make_layout(shape, stride=stride))
     partition = make_acc_tensor_mn_view(thr_mma.partition_C(s_vec_mma))
-    return partition[None, 0, None] if const_expr(is_colvec) else partition[0, None, None]
+    return (
+        partition[None, 0, None] if const_expr(is_colvec) else partition[0, None, None]
+    )
 
 
 __all__ = [

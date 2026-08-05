@@ -127,4 +127,3 @@ def assume_tensor_aligned(t):
     return cute.make_tensor(
         t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
     )
-
