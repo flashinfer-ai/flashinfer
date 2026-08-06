@@ -185,6 +185,35 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         )
 
     @cute.jit
+    def _rms_arrive_and_wait(self, rms_group: Int32) -> None:
+        barrier_0 = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.rms_threads_per_token
+        )
+        if cutlass.const_expr(self.rms_token_groups > 1):
+            barrier_1 = pipeline.NamedBarrier(
+                barrier_id=3, num_threads=self.rms_threads_per_token
+            )
+            if cutlass.const_expr(self.rms_token_groups == 4):
+                barrier_2 = pipeline.NamedBarrier(
+                    barrier_id=4, num_threads=self.rms_threads_per_token
+                )
+                barrier_3 = pipeline.NamedBarrier(
+                    barrier_id=5, num_threads=self.rms_threads_per_token
+                )
+            if rms_group == 0:
+                barrier_0.arrive_and_wait()
+            elif cutlass.const_expr(self.rms_token_groups == 2):  # noqa: SIM114
+                barrier_1.arrive_and_wait()
+            elif rms_group == 1:
+                barrier_1.arrive_and_wait()
+            elif rms_group == 2:
+                barrier_2.arrive_and_wait()
+            else:
+                barrier_3.arrive_and_wait()
+        else:
+            barrier_0.arrive_and_wait()
+
+    @cute.jit
     def __call__(
         self,
         routed_output: cute.Tensor,
@@ -482,20 +511,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                 consumer_wave += self.cta_groups
                 token = consumer_wave * self.tp + cta_slot
             finalize_join.arrive_and_wait()
-            rms_barrier_0 = pipeline.NamedBarrier(
-                barrier_id=2, num_threads=self.rms_threads_per_token
-            )
             if cutlass.const_expr(self.rms_token_groups > 1):
-                rms_barrier_1 = pipeline.NamedBarrier(
-                    barrier_id=3, num_threads=self.rms_threads_per_token
-                )
-                if cutlass.const_expr(self.rms_token_groups == 4):
-                    rms_barrier_2 = pipeline.NamedBarrier(
-                        barrier_id=4, num_threads=self.rms_threads_per_token
-                    )
-                    rms_barrier_3 = pipeline.NamedBarrier(
-                        barrier_id=5, num_threads=self.rms_threads_per_token
-                    )
                 rms_group = (warp - 1) // self.rms_warps_per_token
                 rms_group_warp = warp - 1 - rms_group * self.rms_warps_per_token
                 copy_tid = rms_group_warp * WARP_SIZE + lane
@@ -607,19 +623,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                                     ).llvm_ptr,
                                     warp_sum,
                                 )
-                    if cutlass.const_expr(self.rms_token_groups > 1):
-                        if rms_group == 0:
-                            rms_barrier_0.arrive_and_wait()
-                        elif cutlass.const_expr(self.rms_token_groups == 2):  # noqa: SIM114
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 1:
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 2:
-                            rms_barrier_2.arrive_and_wait()
-                        else:
-                            rms_barrier_3.arrive_and_wait()
-                    else:
-                        rms_barrier_0.arrive_and_wait()
+                    self._rms_arrive_and_wait(rms_group)
                     if warp == 1 + rms_group * self.rms_warps_per_token:
                         for rms_stage in cutlass.range_constexpr(
                             self.rms_pipeline_stages
@@ -651,19 +655,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                                         (norm_inv_rms + stage_slot).llvm_ptr,
                                         inv_rms,
                                     )
-                    if cutlass.const_expr(self.rms_token_groups > 1):
-                        if rms_group == 0:
-                            rms_barrier_0.arrive_and_wait()
-                        elif cutlass.const_expr(self.rms_token_groups == 2):  # noqa: SIM114
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 1:
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 2:
-                            rms_barrier_2.arrive_and_wait()
-                        else:
-                            rms_barrier_3.arrive_and_wait()
-                    else:
-                        rms_barrier_0.arrive_and_wait()
+                    self._rms_arrive_and_wait(rms_group)
                     gamma_values = []
                     for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
                         pack = rms_pack_base + item * rms_pack_stride
@@ -797,19 +789,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                     warp_sum = cute.arch.warp_reduction_sum(thread_sum)
                     if lane == 0:
                         cute.arch.store((norm_warp_sums + warp - 1).llvm_ptr, warp_sum)
-                    if cutlass.const_expr(self.rms_token_groups > 1):
-                        if rms_group == 0:
-                            rms_barrier_0.arrive_and_wait()
-                        elif cutlass.const_expr(self.rms_token_groups == 2):  # noqa: SIM114
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 1:
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 2:
-                            rms_barrier_2.arrive_and_wait()
-                        else:
-                            rms_barrier_3.arrive_and_wait()
-                    else:
-                        rms_barrier_0.arrive_and_wait()
+                    self._rms_arrive_and_wait(rms_group)
                     if warp == 1 + rms_group * self.rms_warps_per_token:
                         cta_sum = Float32(0.0)
                         if lane < self.rms_warps_per_token:
@@ -831,19 +811,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                             cute.arch.store(
                                 (norm_inv_rms + rms_group).llvm_ptr, inv_rms
                             )
-                    if cutlass.const_expr(self.rms_token_groups > 1):
-                        if rms_group == 0:
-                            rms_barrier_0.arrive_and_wait()
-                        elif cutlass.const_expr(self.rms_token_groups == 2):  # noqa: SIM114
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 1:
-                            rms_barrier_1.arrive_and_wait()
-                        elif rms_group == 2:
-                            rms_barrier_2.arrive_and_wait()
-                        else:
-                            rms_barrier_3.arrive_and_wait()
-                    else:
-                        rms_barrier_0.arrive_and_wait()
+                    self._rms_arrive_and_wait(rms_group)
                     inv_rms = cute.arch.load(
                         (norm_inv_rms + rms_group).llvm_ptr, Float32
                     )
