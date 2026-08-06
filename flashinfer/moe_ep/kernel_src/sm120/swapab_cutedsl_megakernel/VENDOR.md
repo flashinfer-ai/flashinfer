@@ -14,12 +14,14 @@ replace, what to audit) lives in `SKILL.md`.
   ("Adapt SM120 runner to latest MXFP8 host utils", 2026-07-27)
 - **Last synced**: 2026-08-06 (copied from the local worktree
   `/home/scratch.mhoqueanik_gpu/cutedsl_megamoe_sm120/sm120_swapab_wt`)
-- **Vendored subset**: the four kernel packages only (`common/`, `src/`,
-  `moe_sm120_mxfp8_swapab/`, `moe_mxfp8_glu/`) under `src/` — no repo
-  scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
-  `moe_mxfp8_glu/` is included because
+- **Vendored subset**: the five kernel packages only (`common/`, `src/`,
+  `moe_sm120_mxfp8_swapab/`, `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under
+  `src/` — no repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
+  `pyproject.toml`, …). `moe_mxfp8_glu/` is included because
   `moe_sm120_mxfp8_swapab/mega_reference.py` lazily imports its torch
-  reference (`mega_reference_mxfp8`).
+  reference (`mega_reference_mxfp8`); `moe_nvfp4_swapab/` is included
+  because that reference module in turn imports
+  `moe_nvfp4_swapab.runner_common` / `.mega_reference` at module top.
 
 ## Policy
 
