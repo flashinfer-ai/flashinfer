@@ -46,6 +46,17 @@ from .mega_oracle_compare import (  # noqa: E402
 )
 
 
+# Upstream gap (see the tree's VENDOR.md): the current drop's REDG in-flight
+# combine crashes the kernel team's own mega_runner with an illegal memory
+# access (verified 2026-08-06, RTX PRO 6000, DSL 4.6.1) and appears in none of
+# their test scripts; the FI backend rejects the flag. Drop this skip together
+# with the backend guard once a fixed drop lands.
+_IKR_BROKEN_UPSTREAM = pytest.mark.skip(
+    reason="in_kernel_fc2_reduce is broken in the current SM120 kernel drop "
+    "(upstream REDG path crashes; see swapab_cutedsl_megakernel/VENDOR.md)"
+)
+
+
 def _require_cuda():
     import torch
 
@@ -525,6 +536,7 @@ def test_moe_ep_sm120_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_referenc
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
+@_IKR_BROKEN_UPSTREAM
 def test_moe_ep_sm120_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for SM120 MXFP8.
 
@@ -816,7 +828,10 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
-@pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
+@pytest.mark.parametrize(
+    "in_kernel_fc2_reduce",
+    [False, pytest.param(True, marks=_IKR_BROKEN_UPSTREAM)],
+)
 def test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     """Real cross-rank EP kernel vs the drop's torch global math (see helper doc)."""
     _require_cuda()
