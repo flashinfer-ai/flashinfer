@@ -99,6 +99,7 @@ from .jit.gemm import (
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
+    gen_blackwell_bf16_bmm_module,
 )
 from .jit.mamba import (
     gen_selective_state_update_module,
@@ -632,6 +633,7 @@ def gen_all_modules(
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
         if has_sm103:
+            jit_specs.append(gen_blackwell_bf16_bmm_module())
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
         if has_sm107:
