@@ -229,16 +229,34 @@ class LayerNormKernel:
         beta_reg = cute.make_rmem_tensor(x.shape, Float32)
         gamma_reg.store(cute.zeros_like(gamma_reg, dtype=Float32))
         beta_reg.store(cute.zeros_like(beta_reg, dtype=Float32))
-
-        col_offset = tidx * vec_size
-        for v in cutlass.range_constexpr(num_vec_blocks):
-            for e in cutlass.range_constexpr(vec_size):
-                idx = col_offset + v * threads_per_row * vec_size + e
-                reg_idx = v * vec_size + e
-                if idx < H:
-                    gamma_reg[reg_idx] = mGamma[idx]
-                    beta_reg[reg_idx] = mBeta[idx]
-
+        num_elems = vec_size * num_vec_blocks
+        # Vectorized fp32 gamma/beta: recast [H] fp32 -> [H//4] Int128 (128b). Each group of 4
+        # consecutive columns = one LDG.E.128. Uses the verified col formula (input block stride),
+        # so the loaded values land in the correct x-aligned register slots. Guarded to
+        # vec_size % 4 == 0 (col base 4-aligned); scalar fallback for odd/small H.
+        if cutlass.const_expr(vec_size % 4 == 0):
+            # recast the fp32 gamma [H] and the fp32 register fragment BOTH to Int128, so a single
+            # 128-bit assignment moves 4 fp32 at once (LDG.E.128). Column via verified formula.
+            gI = cute.recast_tensor(mGamma, cutlass.Int128)
+            bI = cute.recast_tensor(mBeta, cutlass.Int128)
+            gR = cute.recast_tensor(gamma_reg, cutlass.Int128)
+            bR = cute.recast_tensor(beta_reg, cutlass.Int128)
+            for g in cutlass.range_constexpr(num_elems // 4):
+                i0 = g * 4
+                vec_idx = i0 % vec_size
+                block_idx = i0 // vec_size
+                col = tidx * vec_size + vec_idx + block_idx * vec_size * threads_per_row
+                if col < H:
+                    gR[g] = gI[col // 4]  # 128-bit reg <- 128-bit gmem (4 fp32)
+                    bR[g] = bI[col // 4]
+        else:
+            for i in cutlass.range_constexpr(num_elems):
+                vec_idx = i % vec_size
+                block_idx = i // vec_size
+                col = tidx * vec_size + vec_idx + block_idx * vec_size * threads_per_row
+                if col < H:
+                    gamma_reg[i] = mGamma[col]
+                    beta_reg[i] = mBeta[col]
         gamma = gamma_reg.load()
         beta = beta_reg.load()
 
