@@ -51,7 +51,7 @@ automatically only when every row equals that bound; it is not a public knob.
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
 | Page size | 16, 32, 64, or 128 tokens |
-| Maximum K/V length | No fixed model limit; the static bound and metadata must fit signed `int32` |
+| Maximum K/V length | `2,147,483,520` (`INT32_MAX - 127`), reserving the padded endpoint of a 128-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
 | Scheduling | Automatic direct or CLC-persistent launch; eligible underfilled fixed-Q grids may use split-KV. Packed-Q and sliding-window grids remain nonsplit. No public tuning knob. |
