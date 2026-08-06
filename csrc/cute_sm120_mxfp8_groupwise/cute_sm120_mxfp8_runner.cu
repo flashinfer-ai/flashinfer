@@ -16,7 +16,6 @@
 
 // clang-format off
 #include <algorithm>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -86,20 +85,11 @@ static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_
 
 static int select_plain_m64_or_m128(int m_per_expert, int shape_n, int num_experts, int num_sms) {
   constexpr int kPlainTileOverhead = 48;
-  auto expected_tiles_per_expert = [&](int tile_m) {
-    double mean = double(m_per_expert);
-    double denom = std::sqrt(2.0 * mean);
-    double tiles = 0.0;
-    int j_max = m_per_expert / tile_m + 5;
-    for (int j = 0; j <= j_max; ++j) {
-      tiles += 0.5 * (1.0 + std::erf((mean - double(j) * tile_m) / denom));
-    }
-    return tiles;
-  };
   auto cost = [&](int tile_m) {
-    double num_n = double((shape_n + 127) / 128);
-    double num_tiles = double(num_experts) * expected_tiles_per_expert(tile_m) * num_n;
-    int64_t num_waves = int64_t(std::ceil(num_tiles / double(num_sms)));
+    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
+    int64_t num_n = (int64_t(shape_n) + 127) / 128;
+    int64_t num_tiles = int64_t(num_experts) * num_m * num_n;
+    int64_t num_waves = (num_tiles + num_sms - 1) / num_sms;
     return num_waves * int64_t(tile_m + kPlainTileOverhead);
   };
   return (cost(64) < cost(128)) ? 64 : 128;

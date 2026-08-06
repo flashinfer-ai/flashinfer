@@ -123,7 +123,7 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   runner.moe_gemm_fp8_nt_groupwise(
       out.data_ptr(), static_cast<void const*>(a.data_ptr()),
       static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
-      num_experts, total_rows, out_n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
+      num_experts, total_rows, n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
       static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_m),
       static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
 }
