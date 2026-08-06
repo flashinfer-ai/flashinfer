@@ -65,6 +65,8 @@ from .kernels.utils import (
     _select_sm100_mm_fp4_cute_dsl_tactic,
 )
 from ..utils import (
+    _cache_buf,
+    _retired_cache_buf,
     get_device_index,
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -124,6 +126,33 @@ from ..utils import (
 )
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+
+
+def _grow_workspace(workspace: torch.Tensor, workspace_size: int) -> torch.Tensor:
+    """Grow a workspace tensor without freeing its current storage.
+
+    ``resize_()`` reallocates and frees the old device buffer, but the old
+    address may already be baked into a captured CUDA graph as a kernel
+    argument; replaying such a graph after the free faults with a GPU MMU
+    fault (Xid 31). Long-lived cached buffers are therefore retired (kept
+    alive) rather than freed; short-lived tensors (autotuner profiling
+    scratch) are freed normally unless a capture is in progress.
+    """
+    if workspace.numel() >= workspace_size:
+        return workspace
+    new_workspace = torch.empty(
+        workspace_size, dtype=workspace.dtype, device=workspace.device
+    )
+    retire = torch.cuda.is_current_stream_capturing()
+    for key, buf in _cache_buf.items():
+        if buf is workspace:
+            _cache_buf[key] = new_workspace
+            retire = True
+            break
+    if retire:
+        _retired_cache_buf.append(workspace)
+    return new_workspace
+
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -2898,7 +2927,7 @@ def execute_cudnn_gemm_fp4_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        workspace_buffer = _grow_workspace(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3133,7 +3162,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3217,7 +3246,7 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
 
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        workspace_buffer = _grow_workspace(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3440,7 +3469,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3559,7 +3588,7 @@ def execute_cudnn_gemm_fp8_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3698,7 +3727,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3993,7 +4022,7 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -4169,7 +4198,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         override_strides,
     )
     if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+        workspace = _grow_workspace(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(

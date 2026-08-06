@@ -224,6 +224,11 @@ def get_alibi_slopes(
 SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+# Buffers replaced by a larger allocation. A captured CUDA graph may hold the
+# old buffer's device address as a baked kernel argument, so its storage must
+# outlive any graph that references it; freeing it makes replay fault with a
+# GPU MMU fault (Xid 31). Growth per key is monotone, so this stays small.
+_retired_cache_buf: list = []
 
 
 def _get_cache_buf(
@@ -232,6 +237,8 @@ def _get_cache_buf(
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < bytes:
+        if buf is not None:
+            _retired_cache_buf.append(buf)
         if zero_init:
             buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
         else:
