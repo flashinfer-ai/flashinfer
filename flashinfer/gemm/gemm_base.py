@@ -813,7 +813,7 @@ def _tgv_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([103])
+@supported_compute_capability([100, 103])
 def _cake_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -942,9 +942,9 @@ def bmm_bf16(
 
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"]
         Backend to use, defaults to "cudnn". ``"cake"`` selects the frozen
-        SM103a CAKE-generated dispatcher for contiguous A/output, exact transposed
-        column-major B, 16-byte-aligned tensor data, N divisible by 8, and K in
-        {64, 256, 1024}. The output must not overlap either input.
+        SM100a/SM103a CAKE-generated dispatcher for contiguous A/output, exact
+        transposed column-major B, 16-byte-aligned tensor data, N divisible by
+        8, and K in {64, 256, 1024}. The output must not overlap either input.
         ``"cake"`` is explicit-only and is not considered by ``"auto"``;
         ``"auto"`` continues to select from the existing autotuned backends.
 
@@ -997,7 +997,7 @@ def bmm_bf16(
         return bmm_bf16_cutile(A, B, out)
 
     if backend == "cake":
-        get_blackwell_bf16_bmm_module().run(A, B, out)
+        get_blackwell_bf16_bmm_module(A.device).run(A, B, out)
         return out
 
     workspace_buffer = _get_cache_buf(
@@ -1014,8 +1014,25 @@ def bmm_bf16(
 
 
 @functools.cache
-def get_blackwell_bf16_bmm_module():
-    return gen_blackwell_bf16_bmm_module().build_and_load()
+def _get_blackwell_bf16_bmm_module(target: Literal["sm100a", "sm103a"]):
+    return gen_blackwell_bf16_bmm_module(target).build_and_load()
+
+
+def get_blackwell_bf16_bmm_module(device: Optional[torch.device] = None):
+    if device is None:
+        device = torch.device("cuda")
+    compute_capability = get_compute_capability(device)
+    target_by_compute_capability: dict[tuple[int, int], Literal["sm100a", "sm103a"]] = {
+        (10, 0): "sm100a",
+        (10, 3): "sm103a",
+    }
+    target = target_by_compute_capability.get(compute_capability)
+    if target is None:
+        raise ValueError(
+            "CAKE BF16 BMM requires SM100 or SM103; "
+            f"got compute capability {compute_capability}"
+        )
+    return _get_blackwell_bf16_bmm_module(target)
 
 
 @functools.cache

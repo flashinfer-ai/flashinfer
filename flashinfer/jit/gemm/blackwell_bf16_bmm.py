@@ -14,20 +14,41 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Literal
+
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
+from ..core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 
-def gen_blackwell_bf16_bmm_module() -> JitSpec:
-    """Build the frozen SM103a CAKE-generated BF16 BMM dispatcher."""
+BlackwellBf16BmmTarget = Literal["sm100a", "sm103a"]
+
+_BLACKWELL_BF16_BMM_NVCC_FLAGS = {
+    "sm100a": sm100a_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+}
+_BLACKWELL_BF16_BMM_TARGET_MINOR = {
+    "sm100a": 0,
+    "sm103a": 3,
+}
+
+
+def gen_blackwell_bf16_bmm_module(target: BlackwellBf16BmmTarget) -> JitSpec:
+    """Build the frozen CAKE BF16 BMM dispatcher for one Blackwell target."""
+
+    if target not in _BLACKWELL_BF16_BMM_NVCC_FLAGS:
+        raise ValueError(f"unsupported CAKE BF16 BMM target: {target}")
 
     return gen_jit_spec(
-        "blackwell_bf16_bmm_cake_sm103a",
+        f"blackwell_bf16_bmm_cake_{target}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "blackwell_bf16_bmm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "blackwell_bf16_bmm_sm103.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "blackwell_bf16_bmm_kernels.cu",
         ],
-        extra_cuda_cflags=sm103a_nvcc_flags + ["--use_fast_math"],
+        extra_cuda_cflags=_BLACKWELL_BF16_BMM_NVCC_FLAGS[target]
+        + [
+            f"-DFLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR={_BLACKWELL_BF16_BMM_TARGET_MINOR[target]}",
+            "--use_fast_math",
+        ],
     )
 
 

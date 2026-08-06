@@ -25,6 +25,14 @@ namespace blackwell_bf16_bmm {
 
 namespace {
 
+#ifndef FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR
+#error "FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR must be defined by the JIT/AOT spec"
+#endif
+
+constexpr int kTargetMinor = FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR;
+static_assert(kTargetMinor == 0 || kTargetMinor == 3,
+              "CAKE BF16 BMM target must be exact SM100a or SM103a");
+
 constexpr int kOutBf16 = 0;
 constexpr int kOutF16 = 1;
 constexpr int kOutF32 = 2;
@@ -66,6 +74,22 @@ struct Problem {
   int b_stride_n;
   int b_stride_k;
 };
+
+void CheckCuda(cudaError_t status, const char* operation) {
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
+}
+
+void CheckTarget(int device_id) {
+  int major = 0;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
+  TVM_FFI_ICHECK(major == 10 && minor == kTargetMinor)
+      << "this CAKE BF16 BMM module was compiled for exact compute capability 10." << kTargetMinor
+      << ", got " << major << "." << minor;
+}
 
 int CheckedInt(int64_t value, const char* name) {
   TVM_FFI_ICHECK_GE(value, 0) << name << " must be non-negative";
@@ -305,6 +329,7 @@ void Run(TensorView A, TensorView B, TensorView out) {
   const LaunchSpec launch = SelectLaunch(problem);
 
   ffi::CUDADeviceGuard device_guard(A.device().device_id);
+  CheckTarget(A.device().device_id);
   cudaError_t status = cudaFuncSetAttribute(
       launch.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, launch.dynamic_smem_bytes);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
@@ -335,6 +360,7 @@ void Run(TensorView A, TensorView B, TensorView out) {
 
 int RouteOf(TensorView A, TensorView B, TensorView out) {
   const Problem problem = ValidateProblem(A, B, out);
+  CheckTarget(A.device().device_id);
   return static_cast<int>(SelectLaunch(problem).route);
 }
 

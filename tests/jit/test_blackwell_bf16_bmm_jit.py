@@ -15,21 +15,42 @@
 import hashlib
 import re
 
+import pytest
+
+from flashinfer.aot import _gen_blackwell_bf16_bmm_aot_specs
 from flashinfer.jit.gemm import blackwell_bf16_bmm
 
 
-def test_blackwell_bf16_bmm_jit_spec_and_frozen_source():
-    spec = blackwell_bf16_bmm.gen_blackwell_bf16_bmm_module()
+@pytest.mark.parametrize(
+    "target,expected_gencode,expected_target_define",
+    [
+        (
+            "sm100a",
+            "-gencode=arch=compute_100a,code=sm_100a",
+            "-DFLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR=0",
+        ),
+        (
+            "sm103a",
+            "-gencode=arch=compute_103a,code=sm_103a",
+            "-DFLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR=3",
+        ),
+    ],
+)
+def test_blackwell_bf16_bmm_jit_spec_and_frozen_source(
+    target, expected_gencode, expected_target_define
+):
+    spec = blackwell_bf16_bmm.gen_blackwell_bf16_bmm_module(target)
 
-    assert spec.name == "blackwell_bf16_bmm_cake_sm103a"
+    assert spec.name == f"blackwell_bf16_bmm_cake_{target}"
     assert [source.name for source in spec.sources] == [
         "blackwell_bf16_bmm.cu",
-        "blackwell_bf16_bmm_sm103.cu",
+        "blackwell_bf16_bmm_kernels.cu",
     ]
     assert all(source.is_file() for source in spec.sources)
     assert [
         flag for flag in spec.extra_cuda_cflags if flag.startswith("-gencode=")
-    ] == ["-gencode=arch=compute_103a,code=sm_103a"]
+    ] == [expected_gencode]
+    assert expected_target_define in spec.extra_cuda_cflags
     assert "--use_fast_math" in spec.extra_cuda_cflags
 
     generated_text = spec.sources[1].read_text()
@@ -59,3 +80,28 @@ def test_blackwell_bf16_bmm_jit_spec_and_frozen_source():
         exact_symbol = rf"\b{re.escape(symbol)}\b"
         assert len(re.findall(exact_symbol, declarations)) == 1
         assert len(re.findall(exact_symbol, generated_text)) == 1
+
+
+def test_blackwell_bf16_bmm_jit_rejects_unsupported_target():
+    with pytest.raises(ValueError, match="unsupported CAKE BF16 BMM target"):
+        blackwell_bf16_bmm.gen_blackwell_bf16_bmm_module("sm100f")
+
+
+@pytest.mark.parametrize(
+    "sm_capabilities,expected_names",
+    [
+        ({"sm100a_exact": True}, ["blackwell_bf16_bmm_cake_sm100a"]),
+        ({"sm103a_exact": True}, ["blackwell_bf16_bmm_cake_sm103a"]),
+        (
+            {"sm100a_exact": True, "sm103a_exact": True},
+            [
+                "blackwell_bf16_bmm_cake_sm100a",
+                "blackwell_bf16_bmm_cake_sm103a",
+            ],
+        ),
+        ({"sm100": True, "sm103": True}, []),
+    ],
+)
+def test_blackwell_bf16_bmm_aot_target_matrix(sm_capabilities, expected_names):
+    specs = _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities)
+    assert [spec.name for spec in specs] == expected_names

@@ -15,6 +15,16 @@ from flashinfer.gemm.kernels.cutile.bmm_bf16_cutile import (
 from flashinfer.utils import get_compute_capability
 
 
+def _skip_unless_cake_bf16_bmm_supported():
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if compute_capability not in {
+        (10, 0),
+        (10, 3),
+    } or not bmm_bf16.is_backend_supported("cake", compute_capability_number):
+        pytest.skip("CAKE BF16 BMM requires SM100 or SM103.")
+
+
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("m", [48, 128])
 @pytest.mark.parametrize("n", [80, 64])
@@ -90,10 +100,7 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     ],
 )
 def test_bmm_bf16_cake_routes_and_output_identity(shape, res_dtype, expected_route):
-    if not bmm_bf16.is_backend_supported("cake", 103):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     b, m, n, k = shape
     torch.manual_seed(7)
@@ -116,8 +123,7 @@ def test_bmm_bf16_cake_routes_and_output_identity(shape, res_dtype, expected_rou
 
 
 def test_bmm_bf16_cake_repeat_reuses_module_and_output():
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     torch.manual_seed(0)
     a = torch.randn((4, 128, 256), device="cuda", dtype=torch.bfloat16)
@@ -127,9 +133,11 @@ def test_bmm_bf16_cake_repeat_reuses_module_and_output():
     out = torch.empty((4, 128, 256), device="cuda", dtype=torch.bfloat16)
     expected = torch.bmm(a.float(), mat2.float()).to(torch.bfloat16)
 
+    module = get_blackwell_bf16_bmm_module(a.device)
     first = bmm_bf16(a, mat2, out=out, backend="cake")
     second = bmm_bf16(a, mat2, out=out, backend="cake")
 
+    assert get_blackwell_bf16_bmm_module(a.device) is module
     assert first is out
     assert second is out
     torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
@@ -137,8 +145,7 @@ def test_bmm_bf16_cake_repeat_reuses_module_and_output():
 
 @pytest.mark.parametrize("k", [56, 128])
 def test_bmm_bf16_cake_rejects_unsupported_k(k):
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     a = torch.randn((1, 16, k), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 32, k), device="cuda", dtype=torch.bfloat16).transpose(
@@ -149,8 +156,7 @@ def test_bmm_bf16_cake_rejects_unsupported_k(k):
 
 
 def test_bmm_bf16_cake_rejects_non_transposed_b():
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 64, 32), device="cuda", dtype=torch.bfloat16)
@@ -159,8 +165,7 @@ def test_bmm_bf16_cake_rejects_non_transposed_b():
 
 
 def test_bmm_bf16_cake_rejects_odd_n():
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 65, 64), device="cuda", dtype=torch.bfloat16).transpose(
@@ -172,8 +177,7 @@ def test_bmm_bf16_cake_rejects_odd_n():
 
 @pytest.mark.parametrize("misaligned", ["A", "B", "out"])
 def test_bmm_bf16_cake_rejects_misaligned_data_pointer(misaligned):
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     b, m, n, k = 1, 16, 32, 64
     a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16)
@@ -199,8 +203,7 @@ def test_bmm_bf16_cake_rejects_misaligned_data_pointer(misaligned):
 
 
 def test_bmm_bf16_cake_rejects_output_input_overlap():
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 64, 64), device="cuda", dtype=torch.bfloat16).transpose(
@@ -211,11 +214,16 @@ def test_bmm_bf16_cake_rejects_output_input_overlap():
     with pytest.raises(ValueError, match="out must not overlap A"):
         bmm_bf16(a, mat2, out=a, backend="cake")
 
+    out_overlapping_b = mat2.transpose(-2, -1).view(-1)[: 16 * 64].view(1, 16, 64)
+    with pytest.raises(ValueError, match="out must not overlap B"):
+        get_blackwell_bf16_bmm_module().route_of(a, mat2, out_overlapping_b)
+    with pytest.raises(ValueError, match="out must not overlap B"):
+        bmm_bf16(a, mat2, out=out_overlapping_b, backend="cake")
+
 
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_bmm_bf16_cake_fresh_output_allocation(res_dtype):
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+    _skip_unless_cake_bf16_bmm_supported()
 
     a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 32, 64), device="cuda", dtype=torch.bfloat16).transpose(
