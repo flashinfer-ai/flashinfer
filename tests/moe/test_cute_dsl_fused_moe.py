@@ -1472,23 +1472,39 @@ class TestCuteDslFusedMoeFunctional:
             use_fused_finalize=False,
         )
 
+    @pytest.mark.parametrize(
+        "quant_mode, use_per_token_activation",
+        _MOE_QUANT_MODE_CASES,
+    )
     @pytest.mark.parametrize("hidden_size", [256, 384])
-    def test_finalize_handles_cluster_padding_and_partial_n_tiles(
+    def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
+        quant_mode: str,
+        use_per_token_activation: bool,
         hidden_size: int,
         monkeypatch: pytest.MonkeyPatch,
     ):
         from flashinfer.autotuner import AutoTuner
 
-        # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
-        # configuration. hidden=384 also gives the second CTA a partial tile.
-        # Force the 256-row route so both cases execute the kernel path that
-        # previously had to be filtered out.
-        tail_config = (
-            256,
-            ((256, 128), (2, 1), False),
-            ((256, 256), (2, 2), False),
-        )
+        if quant_mode == "w4a4":
+            # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
+            # configuration. hidden=384 also gives the second CTA a partial tile.
+            # Force the 256-row route so both cases execute the kernel path that
+            # previously had to be filtered out.
+            tail_config = (
+                256,
+                ((256, 128), (2, 1), False),
+                ((256, 256), (2, 2), False),
+            )
+        elif quant_mode == "w4a16":
+            # W4A16 clusters 128-wide M CTAs in pairs, so hidden=384 leaves a
+            # padding peer.
+            tail_config = (
+                ((256, 128, 256), (2, 1), True),
+                ((256, 128, 256), (2, 1), True),
+            )
+        else:
+            raise ValueError(f"unsupported quant_mode {quant_mode!r}")
 
         def choose_tail_config(
             _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
@@ -1503,41 +1519,8 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=512,
             num_experts=8,
-            quant_mode="w4a4",
-            use_per_token_activation=True,
-            use_fused_finalize=True,
-        )
-
-    @pytest.mark.parametrize("hidden_size", [128, 320])
-    def test_w4a16_finalize_handles_cluster_padding_and_partial_m_tiles(
-        self,
-        hidden_size: int,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        from flashinfer.autotuner import AutoTuner
-
-        # The 2-CTA M cluster has an empty peer at hidden=128. At hidden=320,
-        # it also has a partial 64-column CTA before the empty peer.
-        tail_config = (
-            ((256, 128, 256), (2, 1), True),
-            ((256, 128, 256), (2, 1), True),
-        )
-
-        def choose_tail_config(
-            _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
-        ):
-            return runners[0], tail_config
-
-        monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
-        self._run_numerical_accuracy(
-            activation_type=ActivationType.Relu2,
-            num_tokens=128,
-            top_k=2,
-            hidden_size=hidden_size,
-            intermediate_size=512,
-            num_experts=8,
-            quant_mode="w4a16",
-            use_per_token_activation=False,
+            quant_mode=quant_mode,
+            use_per_token_activation=use_per_token_activation,
             use_fused_finalize=True,
         )
 
