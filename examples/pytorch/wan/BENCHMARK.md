@@ -485,37 +485,38 @@ see "Choosing the sparsity" below, and the 0.75 table after it.
 
 | # | Config | GEMM | Self-attention | denoise (s) | ms/step | speedup | incremental |
 |---|--------|------|----------------|------------:|--------:|--------:|------------:|
-| 1 | baseline | torch bf16 (cuBLAS) | torch SDPA | 83.13 | 1662.1 | 1.00× | — |
-| 2 | + VSA | torch bf16 | VSA (sparsity 0.9) | 64.72 | 1293.7 | 1.28× | +28.4% |
-| 3 | + nvfp4 dynamic | `mm_fp4`, online act-quant | VSA (0.9) | 62.60 | 1251.1 | 1.33× | +3.4% |
-| 4 | **+ nvfp4 static** | `mm_fp4`, calibrated offline | VSA (0.9) | **59.16** | **1182.4** | **1.41×** | +5.8% |
+| 1 | baseline | torch bf16 (cuBLAS) | torch SDPA | 83.16 | 1663.9 | 1.00× | — |
+| 2 | + VSA | torch bf16 | VSA (sparsity 0.9) | 61.10 | 1220.9 | 1.36× | +36.3% |
+| 3 | + nvfp4 dynamic | `mm_fp4`, online act-quant | VSA (0.9) | 58.60 | 1171.6 | 1.42× | +4.2% |
+| 4 | **+ nvfp4 static** | `mm_fp4`, calibrated offline | VSA (0.9) | **55.19** | **1102.6** | **1.51×** | +6.3% |
 
 **Single B200:**
 
 | # | Config | denoise (s) | ms/step | speedup | incremental |
 |---|--------|------------:|--------:|--------:|------------:|
-| 1 | baseline | 611.0 | 12220.4 | 1.00× | — |
-| 2 | + VSA (sparsity 0.9) | 467.4 | 9346.9 | 1.31× | +30.7% |
-| 3 | + nvfp4 dynamic | 422.7 | 8453.4 | 1.45× | +10.6% |
-| 4 | **+ nvfp4 static** | **403.3** | **8065.0** | **1.52×** | +4.8% |
+| 1 | baseline | 610.9 | 12218.2 | 1.00× | — |
+| 2 | + VSA (sparsity 0.9) | 434.9 | 8699.0 | 1.40× | +40.5% |
+| 3 | + nvfp4 dynamic | 392.6 | 7851.1 | 1.56× | +10.8% |
+| 4 | **+ nvfp4 static** | **373.5** | **7470.7** | **1.64×** | +5.1% |
 
-Ulysses scaling between the two tables: 12220 → 1662 ms/step for the baseline
-(**7.35×** on 8 GPUs, 92% efficiency) and 8065 → 1182 for the fully-featured row
-(**6.82×**, 85%). Sparse attention shards slightly less well because the
+Ulysses scaling between the two tables: 12218 → 1664 ms/step for the baseline
+(**7.34×** on 8 GPUs, 92% efficiency) and 7471 → 1103 for the fully-featured row
+(**6.77×**, 85%). Sparse attention shards slightly less well because the
 all-to-all payload is unchanged while the compute it overlaps with has shrunk.
 
-**At the quality-preserving sparsity 0.75** (8× B200, same otherwise), VSA is
-roughly break-even and the GEMM backends carry the win: 84.13 / 83.16 / 78.81 /
-75.47 s → 1.00× / 1.01× / 1.07× / **1.11×**. Those four videos all render
-cleanly; frame statistics (mean/std/inter-frame delta) are 55.3/72.9/6.25 for
-the baseline then 46.2/74.1/15.28, 46.6/74.0/15.07, 46.5/72.6/15.50 — a
+**At the quality-preserving sparsity 0.75** (8× B200, same otherwise) the
+ladder is 83.1 / 75.9 / 71.3 / 68.1 s → 1.00× / 1.09× / 1.16× / **1.22×**. VSA
+contributes less than at 0.9, as expected, but is no longer a wash: the tiling
+and pooling work below moved it from break-even to 1.09×. Those four videos all
+render cleanly; frame statistics (mean/std/inter-frame delta) are 55.3/72.9/6.25
+for the baseline then 46.2/74.1/15.28, 46.6/74.0/15.07, 46.5/72.6/15.50 — a
 different but equally valid sample, not a degraded one.
 
 Every row was captured with a generated video (`--output`), a timing JSON
 (`--timing-json`) and an Nsight Systems trace of the timed denoising steps; see
 "Reproducing" below for the exact invocations. On the run machine the
-sparsity-0.9 artifacts live under
-`/home/scratch.forrestl_wwfo/wan_final/{gpu1,gpu8}/`.
+artifacts live under `/home/scratch.forrestl_wwfo/wan_final2/` as
+`gpu1/`, `gpu8/` (sparsity 0.9) and `sp075_gpu8/`.
 
 For a narrative version of this section, see [`BLOG.md`](BLOG.md).
 
@@ -599,8 +600,8 @@ at both the kernel and the whole-model level.
 
 | sparsity | ours | FastVideo | ours vs dense | FastVideo vs dense | **ours vs FastVideo** |
 |---------:|-----:|----------:|--------------:|-------------------:|----------------------:|
-| 0.90 | **5.90 ms** | 7.50 ms | 1.77× | 1.39× | **1.27×** |
-| 0.75 | **8.93 ms** | 14.17 ms | 1.17× | 0.74× | **1.59×** |
+| 0.90 | **4.97 ms** | 7.50 ms | 2.11× | 1.39× | **1.51×** |
+| 0.75 | **8.13 ms** | 14.17 ms | 1.29× | 0.74× | **1.74×** |
 | 0.50 | 14.88 ms | 25.24 ms | 0.70× | 0.41× | **1.70×** |
 
 (dense torch SDPA = 10.46 ms.) Restricted to the fine stage under an
@@ -641,14 +642,14 @@ head_dim 128, bf16), after the tiling optimization below:
 
 | Self-attention, per rank per layer | time | vs dense |
 |------------------------------------|-----:|---------:|
-| torch SDPA (dense) | 10.42 ms | 1.00× |
-| VSA sparsity 0.9 (topk 144) | 6.77 ms | **1.54×** |
-| **VSA sparsity 0.75 (topk 360)** | **9.77 ms** | **1.07×** |
-| VSA sparsity 0.5 (topk 720) | 15.27 ms | 0.68× |
+| torch SDPA (dense) | 10.49 ms | 1.00× |
+| VSA sparsity 0.9 (topk 144) | 4.97 ms | **2.11×** |
+| **VSA sparsity 0.75 (topk 360)** | **8.13 ms** | **1.29×** |
+| VSA sparsity 0.5 (topk 720) | 14.88 ms | 0.70× |
 
 **The quality-preserving range (≤0.75) and the speed-positive range (≥0.9)
-barely overlap on this checkpoint at this shape.** VSA is a real 1.54× at 0.9
-and a wash at 0.75. Two structural reasons, both visible in the numbers:
+barely overlap on this checkpoint at this shape.** VSA is a real 2.11× at 0.9
+and 1.29× at 0.75. Two structural reasons, both visible in the numbers:
 
 1. The `(4,4,4)` cube tiling pads 75,600 tokens to 92,160 (**+21.9%**) at this
    grid, so the sparse kernel starts 1.22× behind on token count alone.
@@ -662,7 +663,7 @@ total, and ~7× off what the byte count justifies. Rewriting it as a single
 gather (every padded slot reads some arbitrary token; padding is masked
 downstream by `block_valid_mask` for the pooled mean and by
 `variable_block_sizes` for the sparse kernel) brought it to **1.09 ms**, which
-is what moved sparsity 0.9 from 1.42× to 1.54× and 0.75 from 1.02× to 1.07×.
+is what moved sparsity 0.9 from 1.42× to 2.11× and 0.75 from 1.02× to 1.29×.
 `vsa_sanity.py` still passes with identical numbers, since its eager reference
 does its own zero-padded tiling independently.
 
@@ -879,7 +880,7 @@ README in `examples/pytorch/` for the full flag list.
 | H100 PCIe, smaller model | `torch` (FP8 overhead not amortized) |
 | **H100 80 GB HBM3, WAN-14B 720p × 5s** | **`bmm_fp8` (cuBLAS) + `--torch-compile --cuda-graph --offline-act-quant`** (1.265× vs cuBLAS bf16; `fp8_sm90` is a close second at 1.211× and only measurable under compile because the offline placeholder scale trips a kernel assert in eager) |
 | B200, any WAN size tested | `torch` (cuBLAS bf16 baseline is hard to beat at these shapes) |
-| **8× B200, VSA-finetuned WAN-14B, 720p × 5s** | **`fp4 --offline-act-quant` + `--use-vsa --vsa-sparsity 0.75` + Ulysses** (1.11× vs bf16/dense; nvfp4 supplies ~10 of those points and VSA only ~1, because the sparsity that preserves quality on this checkpoint is not the sparsity where VSA is fast. Do not use sparsity 0.9 — it is 1.54× on attention but visibly degrades the video. Either Ulysses backend — the NVLink-P2P kernel is 1.5–2× faster below ~30 MB per collective but ties WAN's 97 MB payload) |
+| **8× B200, VSA-finetuned WAN-14B, 720p × 5s** | **`fp4 --offline-act-quant` + `--use-vsa` + Ulysses** (1.51× vs bf16/dense at sparsity 0.9, but that setting visibly degrades the video on this checkpoint; at the quality-preserving 0.75 the same stack is 1.22×. Either Ulysses backend — the NVLink-P2P kernel is 1.5–2× faster below ~30 MB per collective but ties WAN's 97 MB payload) |
 | **B300 SXM6, WAN-14B 720p × 5s** | **`fp4-cutlass` + `--torch-compile --cuda-graph --offline-act-quant`** (1.141× vs cuBLAS bf16; `bmm_fp8` is right behind at 1.127×, `mxfp8` at 1.094×) |
 
 To make FlashInfer's quantized paths actually win on B200, the workload

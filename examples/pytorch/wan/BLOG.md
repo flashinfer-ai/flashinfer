@@ -55,24 +55,24 @@ sparsity of 0.9.
 
 | Config | ms/step | vs baseline |
 |--------|--------:|------------:|
-| baseline (bf16 GEMM + dense SDPA) | 12220 | 1.00x |
-| + VSA | 9347 | **1.31x** |
-| + NVFP4 dynamic | 8453 | **1.45x** |
-| + NVFP4 static | 8065 | **1.52x** |
+| baseline (bf16 GEMM + dense SDPA) | 12218 | 1.00x |
+| + VSA | 8699 | **1.40x** |
+| + NVFP4 dynamic | 7851 | **1.56x** |
+| + NVFP4 static | 7471 | **1.64x** |
 
 **8x B200 (Ulysses)**
 
 | Config | ms/step | vs baseline |
 |--------|--------:|------------:|
-| baseline | 1662 | 1.00x |
-| + VSA | 1294 | **1.28x** |
-| + NVFP4 dynamic | 1251 | **1.33x** |
-| + NVFP4 static | 1182 | **1.41x** |
+| baseline | 1664 | 1.00x |
+| + VSA | 1221 | **1.36x** |
+| + NVFP4 dynamic | 1172 | **1.42x** |
+| + NVFP4 static | 1103 | **1.51x** |
 
-Ulysses is the step between the two tables: 12220 → 1662 ms/step for the
-baseline (**7.35x** on 8 GPUs, 92% efficiency) and 8065 → 1182 for the
-fully-featured row (**6.82x**, 85%). End to end, five seconds of 720p goes from
-**10.2 minutes on one GPU to 59 seconds on eight**.
+Ulysses is the step between the two tables: 12218 → 1664 ms/step for the
+baseline (**7.34x** on 8 GPUs, 92% efficiency) and 7471 → 1103 for the
+fully-featured row (**6.77x**, 85%). End to end, five seconds of 720p goes from
+**10.2 minutes on one GPU to 55 seconds on eight**.
 
 ## Why it works
 
@@ -92,8 +92,9 @@ where the next round of effort belongs.
 Two things were worth the engineering. FlashInfer's block-sparse kernel is
 **1.75x–1.89x** faster than the reference ThunderKittens/Triton implementation
 given an identical block selection, and the cube permutation feeding it — a
-single gather rather than zero-fill + gather + scatter — is what took VSA from
-1.42x to **1.77x** over dense attention at the per-rank shape. NVFP4's static
+single gather per tensor rather than zero-fill + gather + scatter, with an
+in-place combine — is what took VSA from
+1.42x to **2.11x** over dense attention at the per-rank shape. NVFP4's static
 mode calibrates the activation scale during warmup instead of assuming one, so
 the timed steps skip the amax reduction without paying for it in quality.
 
@@ -101,15 +102,15 @@ the timed steps skip the amax reduction without paying for it in quality.
 
 **Sparsity 0.9 is a speed setting, not a quality setting.** At 0.9 the video is
 visibly degraded — oversaturated colour and lost detail, composition intact. The
-quality-preserving ceiling on this checkpoint is around **0.75**, where VSA is
-roughly break-even against B200's very fast dense attention and the NVFP4 rows
-carry the win (1.11x on 8 GPUs).
+quality-preserving ceiling on this checkpoint is around **0.75**, where the same
+four-row ladder gives 1.00x / 1.09x / 1.16x / **1.22x** on 8 GPUs — VSA buys less
+against B200's very fast dense attention, and NVFP4 carries proportionally more.
 
 This is not a defect in FlashInfer's implementation: FastVideo's own pipeline,
 transformer and kernel produce the same degradation on the same checkpoint at
 the same setting, and they keep no layer or denoising step dense to compensate.
 
-So quote 1.41x–1.52x when talking about kernels, and sparsity 0.75 when talking
+So quote 1.51x–1.64x when talking about kernels, and sparsity 0.75 when talking
 about videos you intend to ship.
 
 ## Reproducing
