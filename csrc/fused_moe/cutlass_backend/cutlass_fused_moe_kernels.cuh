@@ -2583,13 +2583,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   // Select block size (up to MAX_ACTIVATION_THREADS_PER_BLOCK) per the threads
   // needed to process each row to avoid inactive warps and improve occupancy.
 #ifdef ENABLE_FP4
-  constexpr bool use_fpx_elem_per_thread =
-      std::is_same_v<T, Fp4Type> || std::is_same_v<T, __nv_fp8_e4m3>;
+  bool const use_mxfp8_block_scaling = quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+                                       quant_params.mxfp8_mxfp8.fc2.weight_block_scale;
+  bool const use_fpx_block_scaling =
+      std::is_same_v<T, Fp4Type> || (std::is_same_v<T, __nv_fp8_e4m3> && use_mxfp8_block_scaling);
 #else
-  constexpr bool use_fpx_elem_per_thread = false;
+  constexpr bool use_fpx_block_scaling = false;
 #endif
-  constexpr int64_t elem_per_thread =
-      use_fpx_elem_per_thread
+  int64_t const elem_per_thread =
+      use_fpx_block_scaling
           ? CVT_ELTS_PER_THREAD
           : (128 / std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value));
   int64_t const loads_per_row = std::max<int64_t>(inter_size / elem_per_thread, int64_t{1});
@@ -2680,10 +2682,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           });
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
-              quant_params.mxfp8_mxfp8.fc2.weight_block_scale)
-                 ? fn(MXFPX, std::false_type{}, std::false_type{})
-                 : fn(NONE, std::false_type{}, std::false_type{});
+      return use_mxfp8_block_scaling ? fn(MXFPX, std::false_type{}, std::false_type{})
+                                     : fn(NONE, std::false_type{}, std::false_type{});
     } else
 #endif
     {
