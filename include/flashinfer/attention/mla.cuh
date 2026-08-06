@@ -489,10 +489,15 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
   smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
-              KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
-  compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
-              KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  if constexpr (KTraits::NUM_MMA_D_KPE > 0) {
+    compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
+                KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
+    compute_qk_</*init=*/false, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+                KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  } else {
+    compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_CKV, KTraits::UPCAST_STRIDE_Q_NOPE,
+                KTraits::UPCAST_STRIDE_CKV>(q_smem_nope, ckv_smem, s_frag);
+  }
 }
 
 template <typename KTraits>
