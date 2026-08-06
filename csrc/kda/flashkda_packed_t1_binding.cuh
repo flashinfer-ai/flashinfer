@@ -32,6 +32,7 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <cstdint>
 #include <limits>

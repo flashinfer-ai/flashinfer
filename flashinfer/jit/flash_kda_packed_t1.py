@@ -234,8 +234,8 @@ def get_flash_kda_packed_t1_module(
 
 
 __all__ = [
-    "FLASH_KDA_PACKED_T1_VARIANT_METADATA",
     "FLASH_KDA_PACKED_T1_VARIANTS",
+    "FLASH_KDA_PACKED_T1_VARIANT_METADATA",
     "FlashKDAPackedT1Target",
     "FlashKDAPackedT1Variant",
     "FlashKDAPackedT1VariantMetadata",
