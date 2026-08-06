@@ -566,10 +566,11 @@ def test_moe_ep_sm120_mxfp8_cutedsl_mega_layer_large_tokens_dispatch_token_back(
 
     Pins the non-default correctness paths in one profile: dispatch-warp
     token-back (``reuse_dispatch_warps``, which stages fc2 output through the
-    local workspace), atomic-counter load balancing, batched release flags,
-    and a 2-CTA cluster.  Exercises the ``fc2_output_workspace`` local region
-    and the token-back push path end to end, bit-exact vs the direct-shim
-    parity reference.
+    local workspace), atomic-counter load balancing, and batched release
+    flags.  (Multi-CTA clusters stay at the (1,1,1) default — cluster_m > 1
+    does not compile on the current drop, see VENDOR.md.)  Exercises the
+    ``fc2_output_workspace`` local region and the token-back push path end to
+    end, bit-exact vs the direct-shim parity reference.
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -583,7 +584,6 @@ def test_moe_ep_sm120_mxfp8_cutedsl_mega_layer_large_tokens_dispatch_token_back(
         max_tokens=2048,
         token_back_mode="reuse_dispatch_warps",
         knobs={
-            "cluster_shape_mnk": (2, 1, 1),
             "flag_batch": 4,
             "epi_flag_batch": (2, 4),
             "load_balance_mode": "atomic_counter",
