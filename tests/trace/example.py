@@ -34,6 +34,8 @@ gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
+fp8_paged_mqa_logits_nn2_H64_D128_pbk64.json
+fp4_paged_mqa_logits_nn2_H64_Dp64_pbk64.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -2021,4 +2023,50 @@ with contextlib.suppress(Exception):
             cu_seqlens_k=_dec_cu_k,
             seqlen_q=1,
             causal=True,
+        )
+
+# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103) ──
+# FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
+# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103. Inputs
+# are built with each template's own init (H=64, D=128).
+with contextlib.suppress(Exception):
+    import flashinfer.attn_scores  # noqa: F401  (triggers @flashinfer_api registration)
+    from flashinfer.trace.templates.attn_scores import (
+        fp4_paged_mqa_logits_trace as _fp4_pmqa_trace,
+    )
+    from flashinfer.trace.templates.attn_scores import (
+        fp8_paged_mqa_logits_trace as _fp8_pmqa_trace,
+    )
+
+    _pmqa_kw = dict(
+        batch_size=4,
+        next_n=2,
+        num_heads=64,
+        head_dim=128,
+        phys_block_kv=64,
+        max_context_len=4096,
+        device=device,
+    )
+
+    with contextlib.suppress(Exception):
+        _fp8_in = _fp8_pmqa_trace.init(**_pmqa_kw)
+        flashinfer.fp8_paged_mqa_logits(
+            _fp8_in["q"],
+            _fp8_in["kv_fused"],
+            _fp8_in["weights"],
+            _fp8_in["context_lens"],
+            _fp8_in["block_table"],
+            _fp8_in["max_context_len"],
+        )
+
+    with contextlib.suppress(Exception):
+        _fp4_in = _fp4_pmqa_trace.init(**_pmqa_kw)
+        flashinfer.fp4_paged_mqa_logits(
+            _fp4_in["q"],
+            _fp4_in["sf_q"],
+            _fp4_in["kv_fused"],
+            _fp4_in["weights"],
+            _fp4_in["context_lens"],
+            _fp4_in["block_table"],
+            _fp4_in["max_context_len"],
         )

@@ -38,6 +38,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.attention._core",
     "flashinfer.attention.prims_ts.decode",
     "flashinfer.attention.prims_ts.mla_decode",
+    "flashinfer.attn_scores.attn_scores",
     "flashinfer.cascade",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
