@@ -23,7 +23,7 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Int32, Int64, Uint32
+from cutlass import BFloat16, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import VEC_BF16
@@ -403,7 +403,7 @@ class BTProtocol:
             BFloat16, alignment=16, divisibility=self.hidden_size
         )
         common = (
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -442,7 +442,7 @@ class BTProtocol:
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int64(0),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -467,7 +467,7 @@ class BTProtocol:
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
             make_fake_compact_tensor(BFloat16, (self.hidden_size,), assumed_align=16),
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
             current_cu_stream(),
         )
@@ -507,5 +507,5 @@ class BTProtocol:
         return BTProtocolState(
             contribution_mailbox=contribution,
             prenorm_mailbox=prenorm,
-            stage_state=torch.zeros((2,), dtype=torch.uint32, device=device),
+            stage_state=torch.zeros((2,), dtype=torch.int32, device=device),
         )

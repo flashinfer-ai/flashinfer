@@ -22,7 +22,7 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Int32, Int64, Uint32
+from cutlass import BFloat16, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import QUAD_BF16
@@ -370,7 +370,7 @@ class LLProtocol:
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int64(0),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -392,7 +392,7 @@ class LLProtocol:
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int64(0),
             Int32(self.capacity_m),
             current_cu_stream(),
@@ -430,7 +430,7 @@ class LLProtocol:
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
-            make_fake_compact_tensor(Uint32, (2,), assumed_align=4),
+            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
             Int32(self.capacity_m),
             current_cu_stream(),
         )
@@ -457,5 +457,5 @@ class LLProtocol:
         mailbox.tensor.view(torch.int16).fill_(-32768)
         return LLProtocolState(
             contribution_mailbox=mailbox,
-            stage_state=torch.zeros((2,), dtype=torch.uint32, device=device),
+            stage_state=torch.zeros((2,), dtype=torch.int32, device=device),
         )
