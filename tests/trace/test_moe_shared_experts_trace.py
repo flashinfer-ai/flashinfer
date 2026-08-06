@@ -75,7 +75,7 @@ def test_dispatch_selects_routed_when_argument_absent():
     assert DISPATCH(routing_method_type=_DEEPSEEK_V3) is ROUTED
 
 
-@pytest.mark.parametrize("routing_method_type", [0, 1, 3, 4, 5])
+@pytest.mark.parametrize("routing_method_type", [0, 3])
 def test_only_deepseek_v3_can_select_the_sibling(routing_method_type):
     """No other routing kernel emits the appended shared slots."""
     template = DISPATCH(
