@@ -2210,6 +2210,38 @@ struct SwigluStepAdaptor {
   }
 };
 
+// SiTU activation used by Kimi-K3:
+//   beta * tanh(gate / beta) * sigmoid(gate) *
+//   linear_beta * tanh(up / linear_beta)
+// This is selected by ActivationType::Swiglu plus situ_beta/situ_linear_beta
+// activation parameters, matching the parameterized design used by newer
+// FlashInfer MoE paths without adding a new activation enum.
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+    auto tanh_array = [](T const& x) {
+      T out;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < T::kElements; ++i) {
+        out[i] = cutlass::epilogue::thread::tanh_opt(x[i]);
+      }
+      return out;
+    };
+    T gate_act = tanh_array(gate / alpha) * alpha * sigmoid(gate);
+    T up_act = linear;
+    if (limit != std::numeric_limits<float>::infinity()) {
+      up_act = tanh_array(linear / limit) * limit;
+    }
+    return gate_act * up_act;
+  }
+};
+
 // ============================== Gated Activation =================================
 constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
 
@@ -2244,14 +2276,22 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   float gate_alpha = 1.0f;
   float gate_bias = 0.0f;
   float gate_limit = std::numeric_limits<float>::infinity();
-  if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit) {
+  bool const has_situ_params = activation_type.situ_beta || activation_type.situ_linear_beta;
+  if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit ||
+      has_situ_params) {
     int expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
                                              (int64_t)token + 1) -
                  1;
-    gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
-    gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
-    gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
-                                              : std::numeric_limits<float>::infinity();
+    if (has_situ_params) {
+      gate_alpha = activation_type.situ_beta ? activation_type.situ_beta[expert] : 4.0f;
+      gate_limit = activation_type.situ_linear_beta ? activation_type.situ_linear_beta[expert]
+                                                    : std::numeric_limits<float>::infinity();
+    } else {
+      gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
+      gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
+      gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
+                                                : std::numeric_limits<float>::infinity();
+    }
   }
 
   ActFn fn{};
@@ -2259,7 +2299,7 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   fn.beta = gate_bias;
   // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
   // supplied a per-expert swiglu_limit tensor.
-  if (activation_type.swiglu_limit) {
+  if (activation_type.swiglu_limit || activation_type.situ_linear_beta) {
     fn.limit = gate_limit;
   }
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
@@ -2280,7 +2320,10 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
   int64_t const blocks = num_tokens;
   int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
 
-  auto* fn = (activation_type == ActivationType::Swiglu)
+  auto* fn = (activation_type == ActivationType::Swiglu &&
+              (activation_type.situ_beta || activation_type.situ_linear_beta))
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
+             : (activation_type == ActivationType::Swiglu)
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType,
                                             GLUAdaptor<cutlass::epilogue::thread::SiLu>>
              : activation_type == ActivationType::Geglu
@@ -2361,16 +2404,25 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     float gate_limit = std::numeric_limits<float>::infinity();
     if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale ||
         activation_params.swiglu_alpha || activation_params.swiglu_beta ||
-        activation_params.swiglu_limit) {
+        activation_params.swiglu_limit || activation_params.situ_beta ||
+        activation_params.situ_linear_beta) {
       // TODO this is almost certainly faster as a linear scan
       expert =
           findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) -
           1;
 
-      gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
-      gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
-      gate_limit = activation_params.swiglu_limit ? activation_params.swiglu_limit[expert]
-                                                  : std::numeric_limits<float>::infinity();
+      if (activation_params.situ_beta || activation_params.situ_linear_beta) {
+        gate_alpha = activation_params.situ_beta ? activation_params.situ_beta[expert] : 4.0f;
+        gate_limit = activation_params.situ_linear_beta
+                         ? activation_params.situ_linear_beta[expert]
+                         : std::numeric_limits<float>::infinity();
+      } else {
+        gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert]
+                                                    : 1.0f;
+        gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
+        gate_limit = activation_params.swiglu_limit ? activation_params.swiglu_limit[expert]
+                                                    : std::numeric_limits<float>::infinity();
+      }
     }
 
     size_t act_scale_idx = use_per_expert_act_scale ? expert : 0;
@@ -2408,7 +2460,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     fn.beta = gate_beta;
     // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
     // supplied a per-expert swiglu_limit tensor.
-    if (activation_params.swiglu_limit) {
+    if (activation_params.swiglu_limit || activation_params.situ_linear_beta) {
       fn.limit = gate_limit;
     }
     auto compute_activation = [&](int64_t elem_index) {
@@ -2573,8 +2625,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
+                              decltype(nvfp4_4over6_config_tag)>,  // Identity
       };
+      if (activation_type.activation_type == ActivationType::Swiglu &&
+          (activation_type.situ_beta || activation_type.situ_linear_beta)) {
+        return &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                                   decltype(block_scaling_type)::value,
+                                   decltype(disableFP4QuantFastMathTag)::value,
+                                   decltype(nvfp4_4over6_config_tag)>;
+      }
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
 #ifdef ENABLE_FP4

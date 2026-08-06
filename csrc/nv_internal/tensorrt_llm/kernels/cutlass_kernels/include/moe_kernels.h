@@ -118,6 +118,8 @@ struct ActivationParams {
   float const* swiglu_alpha = nullptr;
   float const* swiglu_beta = nullptr;
   float const* swiglu_limit = nullptr;
+  float const* situ_beta = nullptr;
+  float const* situ_linear_beta = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -126,11 +128,14 @@ struct ActivationParams {
   }
 
   ActivationParams(ActivationType activation_type, float const* swiglu_alpha,
-                   float const* swiglu_beta, float const* swiglu_limit)
+                   float const* swiglu_beta, float const* swiglu_limit,
+                   float const* situ_beta = nullptr, float const* situ_linear_beta = nullptr)
       : activation_type(activation_type),
         swiglu_alpha(swiglu_alpha),
         swiglu_beta(swiglu_beta),
-        swiglu_limit(swiglu_limit) {}
+        swiglu_limit(swiglu_limit),
+        situ_beta(situ_beta),
+        situ_linear_beta(situ_linear_beta) {}
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }

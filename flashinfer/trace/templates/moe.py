@@ -2206,9 +2206,12 @@ def _moe_bf16_run_experts(
     gemm1_clamp_limit=None,
     activation_type=ActivationType.Swiglu.value,
 ):
-    """Un-quantized (bf16) MoE expert computation (SwiGLU/OAI or ReLU^2)."""
+    """Un-quantized (bf16) MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.Relu2,
+    ):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
             f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
