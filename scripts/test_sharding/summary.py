@@ -713,7 +713,7 @@ def _failure_detail_lines(
             diagnostic = encoded[:diagnostic_limit].decode("utf-8", errors="replace")
         lines.extend(
             [
-                f"  - {failure['source_file']} :: {failure['nodeid']}",
+                f"  - {failure['nodeid']}",
                 "    " + diagnostic.replace("\n", "\n    "),
             ]
         )
