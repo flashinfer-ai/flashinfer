@@ -2145,18 +2145,24 @@ class Sm100W4A16GroupedGemmKernel:
                             hidden_base = (
                                 work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                             )
-                            scatter_out = cute.domain_offset(
-                                (hidden_base, reduce_token_idx, 0), final_output
+                            valid_elements = (
+                                cutlass.Int64(final_output.shape[0]) - hidden_base
                             )
-                            copy_elements = cutlass.min(
-                                cutlass.Int32(self.cta_tile_shape_mnk[0]),
-                                cutlass.Int32(final_output.shape[0]) - hidden_base,
-                            )
-                            blk_reduce_bf16(
-                                scatter_out,
-                                sFinalize[(reduce_route, None)],
-                                copy_elements * (self.c_dtype.width // 8),
-                            )
+                            if valid_elements > 0:
+                                scatter_out = cute.domain_offset(
+                                    (hidden_base, reduce_token_idx, 0), final_output
+                                )
+                                copy_elements = cutlass.Int32(
+                                    cutlass.min(
+                                        cutlass.Int64(self.cta_tile_shape_mnk[0]),
+                                        valid_elements,
+                                    )
+                                )
+                                blk_reduce_bf16(
+                                    scatter_out,
+                                    sFinalize[(reduce_route, None)],
+                                    copy_elements * (self.c_dtype.width // 8),
+                                )
 
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
