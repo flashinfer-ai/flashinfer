@@ -599,7 +599,11 @@ def _all_gather_stack(t):
     """all_gather a per-rank tensor and stack it on a new leading rank dim.
 
     FP8 payloads and E8M0 scale planes travel as uint8 bytes (NCCL supports
-    neither dtype) and are reinterpreted after the stack.
+    neither dtype) and are reinterpreted after the stack.  Under the
+    rank-sharing gloo process group (MEGA_SINGLE_GPU_GLOO=1, single-GPU
+    sm_12x boxes) the wire additionally stages through the host: gloo has no
+    CUDA all_gather and silently corrupts device tensors (the kernel drop's
+    own bootstrap monkey-patches the same CPU staging).
     """
     import torch
     import torch.distributed as dist
@@ -608,9 +612,14 @@ def _all_gather_stack(t):
     tc = t.contiguous()
     byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
     wire = tc.view(torch.uint8) if byte_wire else tc
+    cpu_wire = "nccl" not in str(dist.get_backend()).lower()
+    if cpu_wire:
+        wire = wire.cpu()
     gathered = [torch.empty_like(wire) for _ in range(world_size)]
     dist.all_gather(gathered, wire)
     stacked = torch.stack(gathered)
+    if cpu_wire:
+        stacked = stacked.to(tc.device)
     return stacked.view(tc.dtype) if byte_wire else stacked
 
 
