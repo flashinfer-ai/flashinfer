@@ -165,6 +165,9 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
     config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
     config.addinivalue_line(
+        "markers", "arch_sm120: requires sm_120/sm_121 (Blackwell-consumer)"
+    )
+    config.addinivalue_line(
         "markers",
         "long_running: front-load this test file at the start of the parallel CI queue",
     )
@@ -210,12 +213,20 @@ def pytest_collection_modifyitems(config, items):
                         reason="requires torchrun launch (WORLD_SIZE unset)"
                     )
                 )
-        if "arch_blackwell" in item.keywords and cc < (10, 0):
-            item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
+        # Exactly the sm_10x family: the sm_100 tree's kernels do not target
+        # Hopper (below) or the consumer sm_11x/sm_12x families (which use
+        # their own kernel trees), so >= would let them collect on hosts
+        # where the kernel cannot compile.
+        if "arch_blackwell" in item.keywords and cc[0] != 10:
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103"))
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):
             item.add_marker(pytest.mark.skip(reason="needs sm_90 (Hopper)"))
+        # Exactly the sm_12x family (Blackwell-consumer): the SM120 swap-AB
+        # mega kernel's warp-level MMA path targets sm_120/sm_121 only.
+        if "arch_sm120" in item.keywords and cc[0] != 12:
+            item.add_marker(pytest.mark.skip(reason="needs sm_120/sm_121"))
 
 
 def is_cuda_oom_error_str(e: str) -> bool:
