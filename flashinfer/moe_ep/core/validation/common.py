@@ -248,6 +248,25 @@ def validate_mega_arch_sm90() -> None:
         )
 
 
+def validate_mega_arch_sm120() -> None:
+    """Arch gate for the SM120 (Blackwell-consumer) mega kernels.
+
+    The SM120 swap-AB MXFP8 CuTeDSL mega kernel uses the warp-level MMA path
+    compiled for the consumer Blackwell family (sm_120 / sm_121). Datacenter
+    Blackwell (sm_100/sm_103) hosts use the sm_100 tree's kernels instead.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc[0] != 12:
+        raise MoEEpArchError(
+            f"sm120_mxfp8_mxfp8_bf16_cutedsl mega kernel requires sm_120/sm_121 "
+            f"(Blackwell-consumer); host has sm_{cc[0]}{cc[1]}"
+        )
+
+
 def validate_fleet_weights(
     weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:

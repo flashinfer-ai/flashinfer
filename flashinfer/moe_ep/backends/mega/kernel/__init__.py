@@ -5,6 +5,6 @@ The vendored kernel sources they wrap live in ``moe_ep/kernel_src/``, which is
 organized by provenance (one directory per upstream kernel repo snapshot).
 """
 
-from . import sm90, sm100
+from . import sm90, sm100, sm120
 
-__all__ = ["sm90", "sm100"]
+__all__ = ["sm90", "sm100", "sm120"]
