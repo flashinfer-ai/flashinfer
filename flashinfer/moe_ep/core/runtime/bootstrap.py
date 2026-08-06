@@ -51,17 +51,31 @@ def _launched_via_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
 
+def _resolve_local_device(bootstrap: BootstrapConfig) -> int:
+    """CUDA device ordinal for this rank.
+
+    ``bootstrap.device`` wins when set (host frameworks pass the device they
+    already bound); otherwise fall back to the LOCAL_RANK env var and then
+    ``bootstrap.rank`` (torchrun convention).
+    """
+    if bootstrap.device is not None:
+        return bootstrap.device
+    return int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+
+
 def _ensure_cuda_device(bootstrap: BootstrapConfig) -> None:
     import torch
 
     if not torch.cuda.is_available():
         return
-    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(_resolve_local_device(bootstrap))
 
 
 def ensure_moe_ep_cuda_device(bootstrap: BootstrapConfig) -> None:
-    """Bind the current process to ``LOCAL_RANK`` before any CUDA allocations."""
+    """Bind the process to this rank's device before any CUDA allocations.
+
+    See :func:`_resolve_local_device` for how the device is chosen.
+    """
     _ensure_cuda_device(bootstrap)
 
 
@@ -79,8 +93,7 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
     _ensure_cuda_device(bootstrap)
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
-        device = torch.device(f"cuda:{local_rank}")
+        device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
         dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
         dist.init_process_group(
@@ -134,9 +147,9 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     pg = bootstrap_comm_group(bootstrap)
     rank, world_size = bootstrap_ep_rank_world(bootstrap)
 
-    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
-    torch.cuda.set_device(local_rank)
-    dev = Device(local_rank)
+    local_device = _resolve_local_device(bootstrap)
+    torch.cuda.set_device(local_device)
+    dev = Device(local_device)
     dev.set_current()
 
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))

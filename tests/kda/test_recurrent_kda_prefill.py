@@ -280,7 +280,12 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
-    [(False, 64, "m64"), (True, 64, "m128"), (True, 2, "m128")],
+    [
+        (False, 64, "m64"),
+        (True, 64, "m128"),
+        (True, 2, "m128"),
+        (False, 12, "m128"),
+    ],
 )
 @pytest.mark.parametrize(
     ("compute_capability", "expected_target"),
@@ -339,7 +344,7 @@ def test_frozen_route_and_ffi_abi(
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
     assert args[5].shape == (
         max(inputs["q"].numel() // (num_heads * 128), 32),
-        max(num_heads, 8),
+        (num_heads + 7) // 8 * 8,
     )
     assert args[8].dtype == torch.int64
     assert args[9].dtype == torch.int32
@@ -353,7 +358,7 @@ def test_frozen_route_and_ffi_abi(
     assert math.isclose(args[18], 128**-0.5)
     assert args[19] == -5.0
     assert args[20] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
-    if num_heads < 8:
+    if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
 
 
@@ -776,6 +781,81 @@ def test_frozen_prefill_h6_full_tma_chunk_matches_reference(flash_kda_device):
     )
 
 
+@pytest.mark.parametrize("seq_len", [32, 33])
+def test_frozen_prefill_h12_tma_chunks_match_reference(flash_kda_device, seq_len):
+    inputs = _make_inputs(
+        seq_lens=[seq_len],
+        num_heads=12,
+        packed=False,
+        initial_state=True,
+        seed=2012 + seq_len,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    output = torch.empty_like(inputs["q"])
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+    )
+
+    assert actual_output.data_ptr() == output.data_ptr()
+    assert actual_state is inputs["initial_state"]
+    torch.testing.assert_close(
+        actual_output.float(),
+        expected_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_state.float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[32, 3],
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=2047,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    output = torch.empty_like(inputs["q"])
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+    )
+
+    assert actual_output.data_ptr() == output.data_ptr()
+    assert actual_state is inputs["initial_state"]
+    torch.testing.assert_close(
+        actual_output.float(),
+        expected_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_state.float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[2],
@@ -898,13 +978,16 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     )
 
 
-def test_frozen_prefill_h6_full_chunk_graph_refreshes_beta(flash_kda_device):
+@pytest.mark.parametrize("num_heads", [6, 12])
+def test_frozen_prefill_non_aligned_heads_graph_refreshes_beta(
+    flash_kda_device, num_heads
+):
     inputs = _make_inputs(
         seq_lens=[32],
-        num_heads=6,
+        num_heads=num_heads,
         packed=False,
         initial_state=True,
-        seed=2033,
+        seed=2033 + num_heads,
     )
     initial_state_seed = inputs["initial_state"].clone()
     output = torch.empty_like(inputs["q"])
