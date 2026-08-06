@@ -580,7 +580,7 @@ class _CutlassRunnerBase(MoERunner):
         return hash((self.backend_key, self.config, self._device_arch))
 
     def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
-        return (self._device_arch,)
+        return (self._device_arch, self._enable_pdl)
 
 
 class CutlassBf16Runner(_CutlassRunnerBase):

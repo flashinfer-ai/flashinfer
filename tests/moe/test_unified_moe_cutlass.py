@@ -297,6 +297,13 @@ def test_moe_layer_checks_support_before_build(monkeypatch):
                 local_num_experts=2,
             )
         ),
+        _config(
+            experts=ExpertConfig(
+                intermediate_size=256,
+                local_expert_offset=0,
+                local_num_experts=2,
+            )
+        ),
     ),
 )
 def test_moe_layer_rejects_cutlass_config_before_build(monkeypatch, config):
@@ -412,6 +419,19 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
         ("moe_cutlass_bf16_sm100_gemm2", 2),
     ]
     assert runner._inner.gemm_idx_for_tuning is None
+
+
+def test_cutlass_outer_cache_key_includes_enable_pdl():
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner._device_arch = 90
+    runner._enable_pdl = False
+    without_pdl = runner.get_cache_key_extras([])
+
+    runner._enable_pdl = True
+    with_pdl = runner.get_cache_key_extras([])
+
+    assert without_pdl == (90, False)
+    assert with_pdl == (90, True)
 
 
 def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
