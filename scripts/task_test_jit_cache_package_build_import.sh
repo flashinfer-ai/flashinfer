@@ -192,7 +192,7 @@ if [[ "${CUDA_VERSION}" == 13* ]]; then
     FLASHINFER_EDITABLE_SPEC=".[cu13]"
 fi
 run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
-    pip install -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
+    pip install --no-build-isolation -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
