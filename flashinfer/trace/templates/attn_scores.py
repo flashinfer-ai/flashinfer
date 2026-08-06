@@ -39,10 +39,17 @@ def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_paged_block_table(context_lens, phys_block_kv, device):
-    """Random paged block table + total block count for a batch of context lens."""
+    """Random paged block table + total block count for a batch of context lens.
+
+    Sized for the kernel's access pattern: it reads ceil(ctx/128) compute tiles *
+    (128 // phys_block_kv) physical blocks per row, which exceeds ceil(ctx/pbk)
+    when ctx is not a multiple of 128. The extra columns default to physical index
+    0 (a valid pool block); those positions are beyond ctx (masked), so this avoids
+    an out-of-bounds block_table / KV read."""
     n_blk = (context_lens + phys_block_kv - 1) // phys_block_kv
+    kern_blk = ((context_lens + 127) // 128) * (128 // phys_block_kv)
     total = int(n_blk.sum().item()) + context_lens.shape[0] * 2
-    max_blk = int(n_blk.max().item())
+    max_blk = int(kern_blk.max().item())
     block_table = torch.zeros(
         (context_lens.shape[0], max_blk), dtype=torch.int32, device=device
     )
@@ -183,14 +190,13 @@ def _paged_mqa_logits_masked_check(
         return True
     rv, av = r[valid], a[valid]
     if not torch.allclose(av, rv, rtol=rtol, atol=atol):
-        # supplement with cosine similarity (robust to a few boundary mismatches)
-        denom = (rv.double() ** 2 + av.double() ** 2).sum()
-        cos_diff = (
-            0.0
-            if denom == 0
-            else float(1 - 2 * (rv.double() * av.double()).sum() / denom)
-        )
-        if cos_diff > 0.02:
+        # Fallback: relative-L2 error ||a-r|| / ||r||. Tolerates a few boundary
+        # mismatches and fp8/fp4 quantization noise (both well under 5%), but —
+        # unlike a loose cosine floor — REJECTS a systematic k*ref scale error
+        # (rel-L2 == |k-1|), so a mis-scaled / bad-weight-cast kernel cannot pass.
+        rnorm = rv.double().norm()
+        rel_l2 = float((av.double() - rv.double()).norm() / rnorm) if rnorm > 0 else 0.0
+        if rel_l2 > 0.05:
             return False
     return True
 

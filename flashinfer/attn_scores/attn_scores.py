@@ -58,11 +58,23 @@ def _cached_num_sms(device_index: int) -> int:
 
 
 def _validate_paged_inputs(
-    context_lens: torch.Tensor, block_table: torch.Tensor
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    batch_size: int,
 ) -> None:
-    """context_lens / block_table must be int32 CUDA tensors (the kernels are
-    compiled against on-device Int32 fakes; a CPU or int64 tensor would make the
-    kernel dereference a bad pointer or misread storage)."""
+    """Validate context_lens / block_table (cheap host-side checks; no device sync).
+
+    They must be int32 CUDA tensors (the kernels are compiled against on-device
+    Int32 fakes; a CPU or int64 tensor would make the kernel dereference a bad
+    pointer or misread storage) and have exactly ``batch_size`` rows.
+
+    NOTE (caller invariant, not checked here — would need a device sync): the
+    kernel reads ceil(context_lens[b]/128) compute tiles * (128 // phys_block_kv)
+    physical blocks per row, so ``block_table`` must have at least
+    ``max_b ceil(context_lens[b]/128) * (128 // phys_block_kv)`` columns. A
+    narrower block_table causes an out-of-bounds read. Verifying this cheaply is
+    impossible without a D2H copy of context_lens (which would break CUDA-graph
+    capture), so it is the caller's responsibility."""
     if not (context_lens.is_cuda and context_lens.dtype == torch.int32):
         raise ValueError(
             f"context_lens must be an int32 CUDA tensor, got "
@@ -72,6 +84,31 @@ def _validate_paged_inputs(
         raise ValueError(
             f"block_table must be an int32 CUDA tensor, got "
             f"dtype={block_table.dtype}, device={block_table.device}"
+        )
+    if context_lens.shape[0] != batch_size:
+        raise ValueError(
+            f"context_lens.shape[0] ({context_lens.shape[0]}) must equal "
+            f"batch_size ({batch_size}) inferred from q.shape[0]"
+        )
+    if block_table.dim() != 2 or block_table.shape[0] != batch_size:
+        raise ValueError(
+            f"block_table must be 2-D with shape[0] == batch_size ({batch_size}) "
+            f"inferred from q.shape[0]; got shape {tuple(block_table.shape)}"
+        )
+
+
+def _validate_schedule_meta(schedule_meta: torch.Tensor, num_sms: int, device) -> None:
+    """A caller-supplied schedule_meta must be an int32 CUDA [num_sms+1, 2] tensor;
+    a smaller one causes an out-of-bounds schedule read in the kernel."""
+    if not (schedule_meta.is_cuda and schedule_meta.dtype == torch.int32):
+        raise ValueError(
+            f"schedule_meta must be an int32 CUDA tensor, got "
+            f"dtype={schedule_meta.dtype}, device={schedule_meta.device}"
+        )
+    if tuple(schedule_meta.shape) != (num_sms + 1, 2):
+        raise ValueError(
+            f"schedule_meta must have shape ({num_sms + 1}, 2) for this device; "
+            f"got {tuple(schedule_meta.shape)}. Use compute_paged_mqa_logits_schedule()."
         )
 
 
@@ -543,6 +580,13 @@ def fp8_paged_mqa_logits(
     num_phys_blocks = kv_fused.shape[0]
     num_sms = _cached_num_sms(get_device_index(q.device))
 
+    if q.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"fp8_paged_mqa_logits requires q.dtype == float8_e4m3fn; got {q.dtype}. "
+            "(e5m2 has a different byte layout and would be silently misread as e4m3.)"
+        )
+    if num_epi_subtiles < 1:
+        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
     if (
         output_dtype not in _FP8_DTYPES
         or epi_dtype not in _FP8_DTYPES
@@ -553,7 +597,14 @@ def fp8_paged_mqa_logits(
             f"float16}}; got output_dtype={output_dtype}, epi_dtype={epi_dtype}, "
             f"acc_dtype={acc_dtype}."
         )
-    _validate_paged_inputs(context_lens, block_table)
+    if kv_fused.dim() != 4 or kv_fused.shape[2] != 1 or kv_fused.shape[-1] != D + 4:
+        raise ValueError(
+            f"kv_fused must be [num_blocks, phys_block_kv, 1, head_dim+4={D + 4}] "
+            f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(context_lens, block_table, B)
+    if schedule_meta is not None:
+        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_acc = _to_cutlass(acc_dtype)
@@ -677,13 +728,36 @@ def fp4_paged_mqa_logits(
     num_phys_blocks = kv_fused.shape[0]
     num_sms = _cached_num_sms(get_device_index(q.device))
 
+    if q.dtype != torch.uint8:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires q.dtype == uint8 (packed FP4 e2m1, two "
+            f"per byte); got {q.dtype}"
+        )
+    if sf_q.dtype != torch.int32 or tuple(sf_q.shape) != (B, next_n, H):
+        raise ValueError(
+            f"sf_q must be an int32 [B={B}, next_n={next_n}, H={H}] tensor; "
+            f"got dtype={sf_q.dtype}, shape={tuple(sf_q.shape)}"
+        )
+    if num_epi_subtiles < 1:
+        raise ValueError(f"num_epi_subtiles must be >= 1, got {num_epi_subtiles}")
     if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
         raise ValueError(
             "fp4_paged_mqa_logits supports output/epi dtype in {float32, "
             f"float16, bfloat16}}; got output_dtype={output_dtype}, "
             f"epi_dtype={epi_dtype}."
         )
-    _validate_paged_inputs(context_lens, block_table)
+    if (
+        kv_fused.dim() != 4
+        or kv_fused.shape[2] != 1
+        or kv_fused.shape[-1] != half_D + 4
+    ):
+        raise ValueError(
+            f"kv_fused must be [num_blocks, phys_block_kv, 1, head_dim//2+4="
+            f"{half_D + 4}] (head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(context_lens, block_table, B)
+    if schedule_meta is not None:
+        _validate_schedule_meta(schedule_meta, num_sms, q.device)
 
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_out = _to_cutlass(output_dtype)
