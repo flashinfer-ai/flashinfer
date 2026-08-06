@@ -65,6 +65,7 @@ from typing import Any, Optional, TypeAlias
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
+from cutlass._mlir import ir
 from ..tensor_map import transform_ragged_coords
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -104,6 +105,34 @@ SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 # Stored at module level (not on self) to avoid adding a non-dynamic-expression
 # field to the dataclass, which breaks the framework's scf.if handling.
 _tmem_sp_sdata: dict[int, list] = {}
+
+
+@dsl_user_op
+def _tcgen05_ld_red_x128_max_f32(
+    tmem_addr: Int32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> tuple[cutlass.Vector, Float32]:
+    """Load 128 FP32 TMEM columns and compute their per-row maximum.
+
+    Public CUTLASS DSL 4.7 lacks a typed ``tcgen05.ld.red`` Python binding, so
+    use its public ``nvvm.inline_ptx`` wrapper, as the CTM operation does.
+    """
+    num_values = 128
+    data_operands = ", ".join(f"{{$w{i}}}" for i in range(num_values))
+    outputs = cute.arch.inline_ptx(
+        (
+            "tcgen05.ld.red.sync.aligned.32x32b.x128.max.f32 "
+            f"{{{data_operands}}}, {{$w{num_values}}}, [{{$r0}}];"
+        ),
+        write_only_types=[Int32] * (num_values + 1),
+        read_only_args=[tmem_addr],
+        loc=loc,
+        ip=ip,
+    )
+    values = tuple(output.bitcast(Float32, loc=loc, ip=ip) for output in outputs)
+    return cutlass.Vector.from_elements(values[:num_values], Float32), values[-1]
 
 
 @cute.jit
@@ -2552,12 +2581,7 @@ class TmemSPResource(MemoryResource):
         tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
-        loaded_values, tile_row_max = prims.tcgen05_ld_red(
-            "32x32b",
-            prims.make_tmem_ptr(tmem_s_addr, self.cfg.qk_acc_dtype),
-            prims.ReductionKind.MAX,
-            num=self.cfg.qk_mma_tiler[1],
-        )
+        loaded_values, tile_row_max = _tcgen05_ld_red_x128_max_f32(Int32(tmem_s_addr))
         # tcgen05 load-reduce results are asynchronous until the LOAD wait
         # completes.
         prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
