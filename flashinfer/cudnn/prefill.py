@@ -67,6 +67,18 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
     return _cudnn_handle
 
 
+def _tensor_descriptor_signature(
+    tensor: Optional[torch.Tensor], *, ignore_leading_dim: bool = False
+):
+    """Return hashable metadata used to build a cuDNN tensor descriptor."""
+    if tensor is None:
+        return None
+    shape = tuple(tensor.shape)
+    if ignore_leading_dim and tensor.dim() == 3:
+        shape = shape[1:]
+    return tensor.dim(), tensor.dtype, tensor.device, shape, tuple(tensor.stride())
+
+
 # Tensor ids
 class UIDs(Enum):
     RESERVED_INVALID_UID = 0
@@ -140,12 +152,20 @@ def _sdpa_prefill_key_fn(
         h_qo, d_qk = q.shape[1], q.shape[3]
 
     if v_cache.dim() == 3:
-        h_kv, d_vo = k_cache.shape[1], k_cache.shape[2]
-    elif k_cache.dim() == 4:
-        h_kv, d_vo = k_cache.shape[1], k_cache.shape[3]
+        h_kv, d_vo = v_cache.shape[1], v_cache.shape[2]
+    elif v_cache.dim() == 4:
+        h_kv, d_vo = v_cache.shape[1], v_cache.shape[3]
 
+    block_tables_signature = None
     if block_tables is not None:
         page_size = k_cache.shape[2]
+        nd_block_tables = block_tables.reshape(
+            block_tables.shape[0], 1, block_tables.shape[1], 1
+        )
+        block_tables_signature = _tensor_descriptor_signature(nd_block_tables)
+
+    if o_data_type is None:
+        o_data_type = q.dtype
 
     key = (
         graph_b,
@@ -167,6 +187,20 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        o_data_type,
+        _tensor_descriptor_signature(q, ignore_leading_dim=True),
+        _tensor_descriptor_signature(k_cache, ignore_leading_dim=True),
+        _tensor_descriptor_signature(v_cache, ignore_leading_dim=True),
+        _tensor_descriptor_signature(actual_seq_lens_q),
+        _tensor_descriptor_signature(actual_seq_lens_kv),
+        _tensor_descriptor_signature(cu_seq_lens_q),
+        _tensor_descriptor_signature(cu_seq_lens_kv),
+        block_tables_signature,
+        _tensor_descriptor_signature(batch_offsets_q),
+        _tensor_descriptor_signature(batch_offsets_o),
+        _tensor_descriptor_signature(batch_offsets_k),
+        _tensor_descriptor_signature(batch_offsets_v),
+        _tensor_descriptor_signature(batch_offsets_stats),
     )
     return key
 
