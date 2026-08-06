@@ -53,6 +53,17 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         super().__init__(config)
         self._kernel_config: Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+        if config.in_kernel_fc2_reduce:
+            # Verified 2026-08-06 on RTX PRO 6000 (sm_120): the vendored
+            # drop's REDG path is broken upstream — the kernel team's own
+            # mega_runner crashes with an illegal memory access under
+            # --in_kernel_fc2_reduce, and the path is absent from their test
+            # scripts. Re-enable after a drop that validates it (VENDOR.md).
+            raise NotImplementedError(
+                "in_kernel_fc2_reduce is not functional in the current SM120 "
+                "kernel drop (upstream REDG path crashes); use the default "
+                "explicit topk reduce."
+            )
         if config.knobs is not None and not isinstance(config.knobs, dict):
             raise ValueError(
                 "sm120_mxfp8_mxfp8_bf16_cutedsl supports only knobs=None or an "
