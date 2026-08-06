@@ -58,11 +58,14 @@ constexpr int64_t CUB_TOPK_MAX_LEN = int64_t{1} << 21;
 // which supports k up to 2048 (mirroring the FilteredTopK deterministic path).
 constexpr int64_t CUB_TOPK_MAX_DETERMINISTIC_K = 2048;
 
+// When query_bytes_out is non-null, only the temp-storage size query runs (nothing is
+// launched); the result is written there and the outputs/workspace are not touched.
 template <int64_t MAX_LEN_BOUND, typename DType, typename RequirementsT>
 cudaError_t CubBatchedTopKRun(const DType* input, int32_t* output_indices, DType* output_values,
                               const int32_t* lengths, Optional<TensorView>& maybe_temp_storage,
                               int64_t num_rows, int64_t max_len, int64_t top_k,
-                              const RequirementsT& requirements, cudaStream_t stream) {
+                              const RequirementsT& requirements, size_t* query_bytes_out,
+                              cudaStream_t stream) {
   // Per-segment iterators over the dense (num_rows, max_len) input and (num_rows, top_k)
   // outputs: d_keys_in[i] yields a pointer to row i.
   auto d_keys_in = cuda::make_strided_iterator(cuda::make_counting_iterator(input), max_len);
@@ -88,6 +91,10 @@ cudaError_t CubBatchedTopKRun(const DType* input, int32_t* output_indices, DType
                                              d_values_in, d_values_out, segment_sizes, k_arg,
                                              num_segs, env)) {
       return error;
+    }
+    if (query_bytes_out != nullptr) {
+      *query_bytes_out = temp_storage_bytes;
+      return cudaSuccess;
     }
 
     void* d_temp_storage = nullptr;
@@ -141,7 +148,8 @@ cudaError_t CubBatchedTopKDispatchBound(const DType* input, int32_t* output_indi
                                         DType* output_values, const int32_t* lengths,
                                         Optional<TensorView>& maybe_temp_storage,
                                         int64_t num_rows, int64_t max_len, int64_t top_k,
-                                        const RequirementsT& requirements, cudaStream_t stream) {
+                                        const RequirementsT& requirements,
+                                        size_t* query_bytes_out, cudaStream_t stream) {
   // CUB picks its backend from the compile-time bound: up to 8192 it can use the single-block
   // backend, which runs on any architecture. Anything larger needs the cluster backend and
   // therefore SM90+, so without this tier pre-SM90 GPUs couldn't run cub_topk at all. 8192 is
@@ -149,7 +157,7 @@ cudaError_t CubBatchedTopKDispatchBound(const DType* input, int32_t* output_indi
   if (max_len <= 8192) {
     return CubBatchedTopKRun<int64_t{8192}>(input, output_indices, output_values, lengths,
                                             maybe_temp_storage, num_rows, max_len, top_k,
-                                            requirements, stream);
+                                            requirements, query_bytes_out, stream);
   } else {
     // Cluster backend, SM90+ only. On an older device this doesn't crash or fall back — the
     // CUB dispatch notices at runtime and returns cudaErrorNotSupported (see the
@@ -159,7 +167,7 @@ cudaError_t CubBatchedTopKDispatchBound(const DType* input, int32_t* output_indi
     // forced the CUB backend explicitly.
     return CubBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, output_indices, output_values, lengths,
                                                maybe_temp_storage, num_rows, max_len, top_k,
-                                               requirements, stream);
+                                               requirements, query_bytes_out, stream);
   }
 }
 
@@ -168,7 +176,8 @@ cudaError_t CubBatchedTopKDispatch(const DType* input, int32_t* output_indices,
                                    DType* output_values, const int32_t* lengths,
                                    Optional<TensorView>& maybe_temp_storage, int64_t num_rows,
                                    int64_t max_len, int64_t top_k, bool deterministic,
-                                   int64_t tie_break, cudaStream_t stream) {
+                                   int64_t tie_break, size_t* query_bytes_out,
+                                   cudaStream_t stream) {
   namespace exec = cuda::execution;
   // Each require(...) call has a distinct type (requirements are encoded at compile time), so
   // the runtime flags must fan out into separate branches; the generic lambda factors out the
@@ -176,7 +185,7 @@ cudaError_t CubBatchedTopKDispatch(const DType* input, int32_t* output_indices,
   auto run = [&](auto requirements) {
     return CubBatchedTopKDispatchBound(input, output_indices, output_values, lengths,
                                        maybe_temp_storage, num_rows, max_len, top_k, requirements,
-                                       stream);
+                                       query_bytes_out, stream);
   };
   // Requirement mapping (all output orderings are unsorted; Python owns any post-hoc sort):
   //   tie_break SMALL/LARGE -> gpu_to_gpu + prefer_{smaller,larger}_index (a concrete
@@ -201,23 +210,12 @@ cudaError_t CubBatchedTopKDispatch(const DType* input, int32_t* output_indices,
   }
 }
 
-}  // namespace
-
-// CUB-backed batched top-k over the rows of a dense (num_rows, max_len) tensor.
-//   maybe_lengths: optional (num_rows,) int32 per-row valid sizes; row i selects its top-k over
-//     input[i, 0:lengths[i]]. Absent => every row uses the full width max_len. Rows with
-//     lengths[i] < top_k return all lengths[i] elements, with the remaining output_indices
-//     padded to -1 (output_values at padded positions are unspecified).
-void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
-              Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_temp_storage,
-              int64_t top_k, bool deterministic, int64_t tie_break) {
+// Validation shared by cub_topk and cub_topk_workspace_size. Returns the lengths pointer
+// (nullptr when absent).
+const int32_t* CheckCubTopKArgs(const TensorView& input, const Optional<TensorView>& maybe_lengths,
+                                int64_t top_k, bool deterministic, int64_t tie_break) {
   CHECK_INPUT(input);
-  CHECK_INPUT(output_indices);
-  CHECK_INPUT(output_values);
-  CHECK_DIM(2, input);           // input: (batch_size, d)
-  CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
-  CHECK_DIM(2, output_values);   // output_values: (batch_size, top_k)
-  CHECK_INPUT_TYPE(output_indices, dl_int32);
+  CHECK_DIM(2, input);  // input: (batch_size, d)
   TVM_FFI_ICHECK(tie_break >= 0 && tie_break <= 2)
       << "Invalid tie_break mode " << tie_break
       << ", expected 0 (none), 1 (prefer small indices), or 2 (prefer large indices)";
@@ -232,18 +230,39 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
       << "cub_topk deterministic mode supports top_k <= " << CUB_TOPK_MAX_DETERMINISTIC_K
       << ", got top_k=" << top_k;
 
-  const int32_t* lengths_ptr = nullptr;
-  if (maybe_lengths.has_value()) {
-    const auto& lengths = maybe_lengths.value();
-    CHECK_INPUT(lengths);
-    CHECK_DIM(1, lengths);  // lengths: (batch_size,)
-    CHECK_INPUT_TYPE(lengths, dl_int32);
-    TVM_FFI_ICHECK(lengths.size(0) == num_rows)
-        << "cub_topk lengths must have one entry per row: expected " << num_rows << ", got "
-        << lengths.size(0);
-    lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
+  if (!maybe_lengths.has_value()) {
+    return nullptr;
   }
+  const auto& lengths = maybe_lengths.value();
+  CHECK_INPUT(lengths);
+  CHECK_DIM(1, lengths);  // lengths: (batch_size,)
+  CHECK_INPUT_TYPE(lengths, dl_int32);
+  TVM_FFI_ICHECK(lengths.size(0) == num_rows)
+      << "cub_topk lengths must have one entry per row: expected " << num_rows << ", got "
+      << lengths.size(0);
+  return static_cast<const int32_t*>(lengths.data_ptr());
+}
 
+}  // namespace
+
+// CUB-backed batched top-k over the rows of a dense (num_rows, max_len) tensor.
+//   maybe_lengths: optional (num_rows,) int32 per-row valid sizes; row i selects its top-k over
+//     input[i, 0:lengths[i]]. Absent => every row uses the full width max_len. Rows with
+//     lengths[i] < top_k return all lengths[i] elements, with the remaining output_indices
+//     padded to -1 (output_values at padded positions are unspecified).
+void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
+              Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_temp_storage,
+              int64_t top_k, bool deterministic, int64_t tie_break) {
+  const int32_t* lengths_ptr =
+      CheckCubTopKArgs(input, maybe_lengths, top_k, deterministic, tie_break);
+  CHECK_INPUT(output_indices);
+  CHECK_INPUT(output_values);
+  CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
+  CHECK_DIM(2, output_values);   // output_values: (batch_size, top_k)
+  CHECK_INPUT_TYPE(output_indices, dl_int32);
+
+  const int64_t num_rows = input.size(0);
+  const int64_t max_len = input.size(1);
   if (num_rows == 0) {
     return;
   }
@@ -269,7 +288,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
     auto* values_ptr = static_cast<c_type*>(output_values.data_ptr());
     status = CubBatchedTopKDispatch(input_ptr, indices_ptr, values_ptr, lengths_ptr,
                                     maybe_temp_storage, num_rows, max_len, top_k, deterministic,
-                                    tie_break, stream);
+                                    tie_break, /*query_bytes_out=*/nullptr, stream);
     if (status == cudaSuccess && deterministic) {
       // CUB's determinism pins the selected set but not its output positions; sort each row
       // by source index so repeated runs return an identical tensor (FlashInfer's contract).
@@ -287,4 +306,40 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
       << "cub_topk failed with error code " << cudaGetErrorString(status);
 }
 
+// Returns the temporary-storage bytes DeviceBatchedTopK needs for this problem shape and
+// requirement configuration, so the caller can allocate a workspace once (outside CUDA graph
+// capture) and pass it to every cub_topk call. Launches nothing.
+int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_lengths,
+                                int64_t top_k, bool deterministic, int64_t tie_break) {
+  const int32_t* lengths_ptr =
+      CheckCubTopKArgs(input, maybe_lengths, top_k, deterministic, tie_break);
+
+  const int64_t num_rows = input.size(0);
+  const int64_t max_len = input.size(1);
+  if (num_rows == 0) {
+    return 0;
+  }
+
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  auto stream = get_stream(input.device());
+
+  Optional<TensorView> no_workspace;
+  size_t temp_storage_bytes = 0;
+  cudaError_t status;
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
+    // The size query only inspects types and bounds; output pointers are never dereferenced.
+    status = CubBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()),
+                                    static_cast<int32_t*>(nullptr),
+                                    static_cast<c_type*>(nullptr), lengths_ptr, no_workspace,
+                                    num_rows, max_len, top_k, deterministic, tie_break,
+                                    &temp_storage_bytes, stream);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk workspace-size query failed with error code " << cudaGetErrorString(status);
+  return static_cast<int64_t>(temp_storage_bytes);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);
