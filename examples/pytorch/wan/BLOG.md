@@ -119,12 +119,20 @@ video is visibly degraded — blown-out colour and lost detail, with global
 composition intact. The quality-preserving ceiling on this checkpoint is around
 **0.75**, where VSA is roughly break-even against B200's dense attention.
 
-This is not a bug in this port. Swapping FastVideo's own kernel into this
-pipeline produces an identically degraded video, the tile tables are bit-identical
-to theirs, the block selection overlaps 143/144, and the RoPE tables match
-diffusers exactly. It also is not the partial blocks, not CFG, not the multistep
-solver, and not sequence parallelism — each was ruled out with a dedicated run.
-See `BENCHMARK.md` for the full elimination.
+This is not a bug in this port: **FastVideo's own pipeline, DiT and kernel
+produce the same failure mode on the same checkpoint** — frame mean/std/Δ of
+39.1/77.5/17.72 against our 38.6/77.4/16.07, versus 55.3/72.9/6.25 for dense.
+Nor do they keep any layer or any denoising step dense to compensate: the block
+class is chosen once for the whole stack, and although their attention metadata
+carries `current_timestep`, the top-k only ever reads the constant sparsity (the
+knobs that ramp it are training-time). Their own inference default is in fact
+`VSA_sparsity = 0.0`.
+
+Beyond that, the tile tables are bit-identical to theirs, the block selection
+overlaps 143/144, and the RoPE tables match diffusers exactly. It also is not the
+partial blocks, not CFG, not the multistep solver, and not sequence parallelism —
+each was ruled out with a dedicated run. See `BENCHMARK.md` for the full
+elimination.
 
 So: quote 1.41x when you are talking about kernels, and quote sparsity 0.75 when
 you are talking about videos you intend to ship.

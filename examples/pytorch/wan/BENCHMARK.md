@@ -533,8 +533,32 @@ against sparsity, all else fixed:
 | 0.9 | 144 | **degraded** | 38.6 / 77.4 / 16.07 |
 | *(dense reference)* | — | clean | 55.3 / 72.9 / 6.25 |
 
-**This is not an implementation bug.** The port was verified against
-FastVideo's own `fastvideo_kernel` at every level:
+**This is not an implementation bug — FastVideo's own stack does the same
+thing.** Running their pipeline, their DiT and their kernel end to end on this
+checkpoint at sparsity 0.9 for 50 steps produces the same failure mode
+(oversaturated colour, smeared detail, composition intact):
+
+| output | frame mean | std | inter-frame Δ |
+|--------|-----------:|----:|--------------:|
+| FastVideo, own pipeline, sparsity 0.9 | 39.1 | 77.5 | 17.72 |
+| this example, sparsity 0.9 | 38.6 | 77.4 | 16.07 |
+| dense baseline | 55.3 | 72.9 | 6.25 |
+
+It is worth being explicit about what FastVideo does *not* do, since a natural
+guess is that they keep some layers or some denoising steps dense:
+
+- **No per-layer gating.** `wanvideo.py` picks the block class once for the
+  whole stack (`WanTransformerBlock_VSA if attn_backend == "VIDEO_SPARSE_ATTN"
+  else WanTransformerBlock`); all 40 blocks are sparse.
+- **No per-step schedule.** `VideoSparseAttentionMetadata` carries
+  `current_timestep`, but `_compute_cur_topk()` only reads the constant
+  `VSA_sparsity`. The `VSA_decay_rate` / `VSA_decay_interval_steps` knobs that
+  do ramp sparsity live in `TrainingArgs`, i.e. they are for finetuning.
+- Their own inference default is `VSA_sparsity = 0.0`; 0.9 only appears when
+  passed explicitly, as the model card's example does.
+
+The port was additionally verified against FastVideo's `fastvideo_kernel` at
+every level:
 
 | Checked | Result |
 |---|---|
