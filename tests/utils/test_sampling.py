@@ -294,6 +294,33 @@ def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_softmax_blackwell_random_per_row_temperature_contract(vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Loom Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    rows = 989
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = torch.rand(rows, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(
+        probs,
+        probs_ref,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
     [
