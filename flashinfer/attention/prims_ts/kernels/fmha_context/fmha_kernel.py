@@ -178,18 +178,14 @@ from .fmha_resources import (
 )
 from .fmha_tasks import (
     PackedContextWorkQueue,
-    create_correction_epilogue_task_staged_head_dim,
     create_correction_task,
     create_epilogue_task,
     create_load_task,
-    create_load_task_staged_head_dim,
     create_mma_task,
-    create_mma_task_staged_head_dim,
     create_padding_task,
     create_page_offsets_task,
     create_scheduler_task,
     create_softmax_task,
-    create_softmax_task_staged_head_dim,
 )
 
 
@@ -1152,77 +1148,45 @@ def build_context_task_manager(
         # The non-split single-instance schedule performs every QK/PV pair
         # inside its loop; it has no separate HEAD QK or TAIL PV iteration.
         mma_domain_kwargs = domain_n_kwargs
-    if cfg.staged_head_dim:
-        if tmem_p0 is None:
-            raise ValueError("staged-head-dim scheduling requires a P handoff")
-        load_task = create_load_task_staged_head_dim(
-            gmem_qkv,
-            smem_q,
-            smem_kv,
-            work_queue,
-            debug_print=debug_print,
-            **domain_n_minus_1_kwargs,
-        )
-        mma_task = create_mma_task_staged_head_dim(
-            smem_q,
-            smem_kv,
-            tmem_sp0,
-            tmem_o,
-            tmem_stats_done_0,
-            tmem_p0,
-            work_queue,
-            debug_print=debug_print,
-            **domain_n_minus_1_kwargs,
-        )
-    else:
-        load_task = create_load_task(
-            gmem_qkv,
-            smem_q,
-            smem_kv,
-            work_queue,
-            smem_page_offsets_kv=smem_page_offsets_kv,
-            smem_page_offsets_v=smem_page_offsets_v,
-            debug_print=debug_print,
-            **domain_n_kwargs,
-        )
-        mma_task = create_mma_task(
-            smem_q,
-            smem_kv,
-            tmem_sp0,
-            tmem_sp1,
-            tmem_p0,
-            tmem_o,
-            tmem_stats_done_0,
-            tmem_stats_done_1,
-            work_queue,
-            debug_print=debug_print,
-            **mma_domain_kwargs,
-        )
+    load_domain_kwargs = (
+        domain_n_minus_1_kwargs if cfg.staged_head_dim else domain_n_kwargs
+    )
+    load_task = create_load_task(
+        gmem_qkv,
+        smem_q,
+        smem_kv,
+        work_queue,
+        smem_page_offsets_kv=smem_page_offsets_kv,
+        smem_page_offsets_v=smem_page_offsets_v,
+        debug_print=debug_print,
+        **load_domain_kwargs,
+    )
+    mma_task = create_mma_task(
+        smem_q,
+        smem_kv,
+        tmem_sp0,
+        tmem_sp1,
+        tmem_p0,
+        tmem_o,
+        tmem_stats_done_0,
+        tmem_stats_done_1,
+        work_queue,
+        debug_print=debug_print,
+        **mma_domain_kwargs,
+    )
 
     # Causal query-paired moves masked/invalid K iterations from LOOP to TAIL
     # with no runtime branch. SP resources derive mask selection from cfg.
-    if cfg.staged_head_dim:
-        if tmem_p0 is None:
-            raise ValueError("staged-head-dim softmax requires a P handoff")
-        softmax0_task = create_softmax_task_staged_head_dim(
-            tmem_sp0,
-            tmem_vec0,
-            tmem_p0,
-            work_queue,
-            debug_print=debug_print,
-            **softmax0_domain_kwargs,
-        )
-    else:
-        softmax0_task = create_softmax_task(
-            0,
-            tmem_sp0,
-            tmem_vec0,
-            tmem_p0,
-            s0s1_seq,
-            work_queue,
-            debug_print=debug_print,
-            **softmax0_domain_kwargs,
-        )
+    softmax0_task = create_softmax_task(
+        0,
+        tmem_sp0,
+        tmem_vec0,
+        tmem_p0,
+        s0s1_seq,
+        work_queue,
+        debug_print=debug_print,
+        **softmax0_domain_kwargs,
+    )
     softmax1_task: Task | None = None
     if not single_qkv_instance:
         if tmem_sp1 is None or tmem_vec1 is None:
@@ -1237,36 +1201,20 @@ def build_context_task_manager(
             debug_print=debug_print,
             **softmax1_domain_kwargs,
         )
-    if cfg.staged_head_dim:
-        if smem_o_1 is None or gmem_o_1 is None:
-            raise ValueError("staged-head-dim output requires two O resources")
-        correction_task = create_correction_epilogue_task_staged_head_dim(
-            tmem_vec0,
-            tmem_o,
-            smem_o_0,
-            smem_o_1,
-            gmem_o_0,
-            gmem_o_1,
-            tmem_stats_done_0,
-            work_queue,
-            debug_print=debug_print,
-            **domain_n_minus_1_kwargs,
-        )
-    else:
-        correction_task = create_correction_task(
-            tmem_vec0,
-            tmem_vec1,
-            tmem_o,
-            smem_o_0,
-            smem_o_1,
-            gmem_o_0,
-            gmem_o_1,
-            tmem_stats_done_0,
-            tmem_stats_done_1,
-            work_queue,
-            debug_print=debug_print,
-            **domain_n_minus_1_kwargs,
-        )
+    correction_task = create_correction_task(
+        tmem_vec0,
+        tmem_vec1,
+        tmem_o,
+        smem_o_0,
+        smem_o_1,
+        gmem_o_0,
+        gmem_o_1,
+        tmem_stats_done_0,
+        tmem_stats_done_1,
+        work_queue,
+        debug_print=debug_print,
+        **domain_n_minus_1_kwargs,
+    )
     epilogue_task: Task | None = None
     freed_epilogue_task: Task | None = None
     if cfg.fuse_epilogue_into_correction:
