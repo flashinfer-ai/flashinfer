@@ -283,7 +283,7 @@ jobs:
                 line,
                 side: 'RIGHT',
                 body: finding.category === 'public_api'
-                  ? `<!-- ${marker} --><!-- key:${key} -->\n🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
+                  ? `<!-- ${marker} --><!-- key:${key} -->\n🚨🚨🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
                   : `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}`,
               })
             );
