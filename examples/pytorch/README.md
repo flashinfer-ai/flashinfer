@@ -143,6 +143,7 @@ The WAN example lives in `wan/` and provides:
 | `wan/pipeline_wan_flashinfer.py` | Diffusers `WanPipeline` loader that swaps in FlashInfer transformer(s), plus the Ulysses multi-GPU launcher |
 | `wan/vsa_attention.py` | Video Sparse Attention (VSA) on FlashInfer's `bsa_attn_blk64_fwd` |
 | `wan/vsa_sanity.py` | Correctness checks for the VSA path |
+| `wan/BLOG.md` | Feature-by-feature speedup walkthrough (blog format) |
 
 ### Load a Transformer Checkpoint
 

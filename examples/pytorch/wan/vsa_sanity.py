@@ -195,7 +195,7 @@ def main() -> None:
     print("[3] head independence holds up to bf16 rounding  OK")
 
     # --- 4. approximation quality vs dense attention -------------------------
-    # gate=0 isolates the sparse branch; gate=1 is the full VSA output.
+    # gate=0 isolates the sparse branch from the gated coarse term.
     zero = torch.zeros_like(g)
     dense = _dense(q, k, v)
     for sparsity in (0.0, 0.5, 0.75, 0.9):

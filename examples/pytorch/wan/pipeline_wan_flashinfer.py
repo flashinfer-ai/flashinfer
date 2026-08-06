@@ -325,6 +325,18 @@ def parse_args() -> argparse.Namespace:
             "(the FastVideo VSA 14B card asks for 5.0, the config ships 3.0)."
         ),
     )
+    parser.add_argument(
+        "--scheduler",
+        default="default",
+        choices=["default", "flow-euler"],
+        help=(
+            "Override the checkpoint's scheduler. 'default' keeps whatever the "
+            "repo ships (UniPCMultistep for Wan). 'flow-euler' switches to the "
+            "first-order FlowMatchEulerDiscrete solver, which does not "
+            "extrapolate from previous steps -- useful when a per-step "
+            "approximation (e.g. sparse attention) makes multistep unstable."
+        ),
+    )
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--guidance-scale-2", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -366,8 +378,8 @@ def parse_args() -> argparse.Namespace:
 
 def _pipeline_call_kwargs(
     args: argparse.Namespace,
+    pipe,
     output_type: Optional[str] = None,
-    pipe=None,
 ):
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
     kwargs = {
@@ -384,7 +396,7 @@ def _pipeline_call_kwargs(
     # ``guidance_scale_2`` is the second-stage CFG scale of the dual-transformer
     # (Wan 2.2 MoE) pipelines, which is what ``boundary_ratio`` gates on. Wan 2.1
     # pipelines accept the kwarg in their signature but reject a non-None value.
-    if pipe is None or getattr(pipe.config, "boundary_ratio", None) is not None:
+    if getattr(pipe.config, "boundary_ratio", None) is not None:
         kwargs["guidance_scale_2"] = args.guidance_scale_2
     return kwargs
 
@@ -489,7 +501,14 @@ def main() -> None:
     )
     load_seconds = time.perf_counter() - load_start
 
-    if args.flow_shift is not None:
+    if args.scheduler == "flow-euler":
+        from diffusers import FlowMatchEulerDiscreteScheduler
+
+        shift = args.flow_shift if args.flow_shift is not None else 5.0
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler(shift=shift)
+        if rank == 0:
+            print(f"Scheduler: FlowMatchEulerDiscreteScheduler(shift={shift})")
+    elif args.flow_shift is not None:
         pipe.scheduler = pipe.scheduler.from_config(
             pipe.scheduler.config, flow_shift=args.flow_shift
         )
@@ -502,7 +521,7 @@ def main() -> None:
             warmup_args.num_inference_steps = args.warmup_steps
             if rank == 0:
                 print(f"Warmup: {args.warmup_steps} denoising step(s)...")
-            pipe(**_pipeline_call_kwargs(warmup_args, output_type="latent", pipe=pipe))
+            pipe(**_pipeline_call_kwargs(warmup_args, pipe, output_type="latent"))
 
         timer = _StepTimer(check_rank_sync=args.check_rank_sync and world_size > 1)
         timer.start()
@@ -510,7 +529,7 @@ def main() -> None:
         if args.cuda_profiler_range:
             torch.cuda.profiler.start()
         output = pipe(
-            **_pipeline_call_kwargs(args, output_type=args.output_type, pipe=pipe),
+            **_pipeline_call_kwargs(args, pipe, output_type=args.output_type),
             callback_on_step_end=timer,
         )
         torch.cuda.synchronize()

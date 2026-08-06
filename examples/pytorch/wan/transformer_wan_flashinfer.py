@@ -63,15 +63,14 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-_EXAMPLES_PYTORCH_DIR = Path(__file__).resolve().parents[1]
-if str(_EXAMPLES_PYTORCH_DIR) not in sys.path:
-    sys.path.insert(0, str(_EXAMPLES_PYTORCH_DIR))
-
-# Sibling modules in this directory (vsa_attention) — importable even when this
-# file is loaded from somewhere other than its own directory.
+# ``flashinfer_modules`` lives one level up; ``vsa_attention`` is a sibling.
+# Both are added explicitly so this file imports cleanly no matter where it is
+# loaded from.
 _WAN_DIR = Path(__file__).resolve().parent
-if str(_WAN_DIR) not in sys.path:
-    sys.path.insert(0, str(_WAN_DIR))
+_EXAMPLES_PYTORCH_DIR = _WAN_DIR.parent
+for _p in (_EXAMPLES_PYTORCH_DIR, _WAN_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from flashinfer_modules import (
     GEMMBackend,
@@ -139,7 +138,7 @@ class WanTransformer3DConfig:
     text_encoder_context_length: int = 512
     # Video Sparse Attention (see vsa_attention.py). Replaces dense
     # self-attention with the two-stage VSA path. Only meaningful on a
-    # VSA-finetuned checkpoint: the gated combine reads a per-block
+    # VSA-finetuned checkpoint: the gated combine reads a per-token
     # ``to_gate_compress`` projection that only such checkpoints carry.
     use_vsa: bool = False
     vsa_sparsity: float = 0.9  # fraction of KV blocks dropped; 0.9 keeps top 10%

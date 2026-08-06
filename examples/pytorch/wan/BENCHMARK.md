@@ -449,9 +449,8 @@ python examples/pytorch/wan/transformer_wan_flashinfer.py \
 
 Everything above measures a single transformer forward. This section measures
 **full video generation** — 50 denoising steps, VAE decode, mp4 export — on
-8× B200 with Ulysses context parallelism, and adds the two knobs the earlier
-sections identified as missing: a **faster attention path** (VSA) and a
-**faster all-to-all** (FlashInfer's NVLink-P2P Ulysses kernel).
+8× B200 with Ulysses context parallelism, adding a sparse attention path (VSA)
+on top of the quantized GEMM backends.
 
 ### Setup
 
@@ -461,137 +460,216 @@ sections identified as missing: a **faster attention path** (VSA) and a
   same checkpoint; only the attention and GEMM paths change.
 - **Config** (FastVideo's published inference settings for this checkpoint):
   720×1280, 81 frames, 50 steps, guidance 5.0, flow-shift 5.0, seed 1024,
-  VSA sparsity 0.9, fps 16.
+  fps 16. **VSA sparsity 0.75** — see "Choosing the sparsity" below for why
+  not the 0.9 the model card suggests.
 - **Shapes**: latent 21×90×160 → post-patch grid **21×45×80 = 75,600 tokens**,
   sharded 9,450 tokens/rank across 8 ranks; 40 heads → 5 heads/rank.
-- **Hardware**: `umbriel-b200-094`, 8× B200 180 GB on NVSwitch, driver-level
-  all-pairs NVLink.
+- **Hardware**: 8× B200 180 GB on NVSwitch (`umbriel-b200-094` for the
+  Ulysses-backend study, `umb-b200-237` for the final table).
 - **Stack**: `nvcr.io/nvidia/pytorch:26.03-py3` (PyTorch 2.11, CUDA 13),
-  flashinfer 0.6.17 (editable), diffusers 0.38, `quack` from source.
-- **Timing**: 2 warmup denoising steps (absorbs JIT + autotune), then 50 timed
-  steps via `callback_on_step_end`; the first timed interval is dropped from
-  the per-step mean. Model load is excluded.
-- **Attention baseline**: `--attention-backend torch` (SDPA) everywhere, so
-  the VSA rows change *only* self-attention. Cross-attention stays SDPA in all
-  rows.
+  flashinfer 0.6.17 (editable), diffusers 0.39, `quack` from source.
+- **Timing**: 3 warmup denoising steps (absorbs JIT, autotune, and the offline
+  activation-scale calibration), then 50 timed steps via
+  `callback_on_step_end`; the first timed interval is dropped from the mean.
+  Model load is excluded.
+- **Attention baseline**: `--attention-backend torch` (SDPA) everywhere, so the
+  VSA rows change *only* self-attention. Cross-attention stays SDPA in all rows.
 
 ### Results
 
-| # | Config | GEMM | Self-attention | Ulysses | denoise (s) | ms/step | speedup |
-|---|--------|------|----------------|---------|------------:|--------:|--------:|
-| 1 | baseline | torch bf16 (cuBLAS) | torch SDPA | NCCL | 83.26 | 1664.6 | 1.00× |
-| 2 | nvfp4 dynamic | `mm_fp4`, online act-quant | torch SDPA | NCCL | 80.21 | 1603.5 | 1.04× |
-| 3 | nvfp4 static ¹ | `mm_fp4`, offline act-quant | torch SDPA | NCCL | 76.86 | 1536.8 | 1.08× |
-| 4 | **nvfp4 static ¹ + VSA** | `mm_fp4`, offline | **VSA (sparsity 0.9)** | NCCL | **64.11** | **1281.4** | **1.30×** |
-| 5 | nvfp4 static ¹ + VSA + NVLink A2A | `mm_fp4`, offline | VSA (sparsity 0.9) | **NVLink-P2P** | 64.28 | 1284.5 | 1.30× |
-| 6 | nvfp4 dynamic + VSA | `mm_fp4`, online | VSA (sparsity 0.9) | NCCL | 67.61 | 1351.4 | 1.23× |
-| 7 | nvfp4 dynamic + VSA + NVLink A2A | `mm_fp4`, online | VSA (sparsity 0.9) | NVLink-P2P | 67.78 | 1354.7 | 1.23× |
+Cumulative, at FastVideo's recommended **sparsity 0.9**. Read these as
+performance numbers: 0.9 does not preserve video quality on this checkpoint —
+see "Choosing the sparsity" below, and the 0.75 table after it.
 
-¹ Speed upper bound only — see the caveat below. Rows 3–5 are not
-quality-preserving; **row 6 is the fastest numerically valid configuration**
-at 1.23×.
+**8× B200 (Ulysses, NCCL):**
 
-The two quantization modes and the two Ulysses backends compose cleanly:
-static buys the same ~4% over dynamic whether or not VSA is on (1536.8/1603.5
-= 0.96, 1281.4/1351.4 = 0.95), and NVLink-vs-NCCL is a wash in both pairs.
+| # | Config | GEMM | Self-attention | denoise (s) | ms/step | speedup | incremental |
+|---|--------|------|----------------|------------:|--------:|--------:|------------:|
+| 1 | baseline | torch bf16 (cuBLAS) | torch SDPA | 83.13 | 1662.1 | 1.00× | — |
+| 2 | + VSA | torch bf16 | VSA (sparsity 0.9) | 64.72 | 1293.7 | 1.28× | +28.4% |
+| 3 | + nvfp4 dynamic | `mm_fp4`, online act-quant | VSA (0.9) | 62.60 | 1251.1 | 1.33× | +3.4% |
+| 4 | **+ nvfp4 static** | `mm_fp4`, calibrated offline | VSA (0.9) | **59.16** | **1182.4** | **1.41×** | +5.8% |
 
-Each row was captured with a generated video (`--output`), a timing JSON
-(`--timing-json`), and an Nsight Systems trace of the timed denoising steps;
-see "Reproducing" below for the exact invocations. On the run machine these
-live under `/home/scratch.forrestl_wwfo/wan_vsa_videos/`.
+**Single B200:**
 
-### VSA is where the win is (+17–18% over nvfp4 alone)
+| # | Config | denoise (s) | ms/step | speedup | incremental |
+|---|--------|------------:|--------:|--------:|------------:|
+| 1 | baseline | 611.0 | 12220.4 | 1.00× | — |
+| 2 | + VSA (sparsity 0.9) | 467.4 | 9346.9 | 1.31× | +30.7% |
+| 3 | + nvfp4 dynamic | 422.7 | 8453.4 | 1.45× | +10.6% |
+| 4 | **+ nvfp4 static** | **403.3** | **8065.0** | **1.52×** | +4.8% |
 
-VSA cuts 252 ms/step off row 2 (dynamic) and 255 ms/step off row 3 (static) —
-the same absolute saving, as expected for a change that only touches attention.
-An isolated measurement at exactly the per-rank shape (75,600 tokens, 5 heads,
-head_dim 128, bf16) accounts for almost all of it:
+Ulysses scaling between the two tables: 12220 → 1662 ms/step for the baseline
+(**7.35×** on 8 GPUs, 92% efficiency) and 8065 → 1182 for the fully-featured row
+(**6.82×**, 85%). Sparse attention shards slightly less well because the
+all-to-all payload is unchanged while the compute it overlaps with has shrunk.
 
-| Self-attention, per rank per layer | time | ×2 CFG × 40 layers | vs dense |
-|------------------------------------|-----:|-------------------:|---------:|
-| torch SDPA (dense)                  | 10.26 ms | 0.82 s/step | 1.00× |
-| **VSA sparsity 0.9** (topk 144/1440)| **7.22 ms** | **0.58 s/step** | **1.42×** |
-| VSA sparsity 0.75 (topk 360)        | 10.03 ms | 0.80 s/step | 1.02× |
-| VSA sparsity 0.50 (topk 720)        | 15.08 ms | 1.21 s/step | 0.68× |
+**At the quality-preserving sparsity 0.75** (8× B200, same otherwise), VSA is
+roughly break-even and the GEMM backends carry the win: 84.13 / 83.16 / 78.81 /
+75.47 s → 1.00× / 1.01× / 1.07× / **1.11×**. Those four videos all render
+cleanly; frame statistics (mean/std/inter-frame delta) are 55.3/72.9/6.25 for
+the baseline then 46.2/74.1/15.28, 46.6/74.0/15.07, 46.5/72.6/15.50 — a
+different but equally valid sample, not a degraded one.
 
-Predicted saving 0.24 s/step, measured 0.25 s/step — the end-to-end delta is
-fully explained by the attention path.
+Every row was captured with a generated video (`--output`), a timing JSON
+(`--timing-json`) and an Nsight Systems trace of the timed denoising steps; see
+"Reproducing" below for the exact invocations. On the run machine the
+sparsity-0.9 artifacts live under
+`/home/scratch.forrestl_wwfo/wan_final/{gpu1,gpu8}/`.
 
-Two things are worth noting. First, **0.9 sparsity buys only 1.42×, not 10×**,
-and VSA is a *loss* below ~0.8 sparsity. Second, the sparse kernel is only half
-the cost. Stage breakdown at sparsity 0.9 (sums to the 7.22 ms above):
+For a narrative version of this section, see [`BLOG.md`](BLOG.md).
 
-| Stage | time | share |
-|-------|-----:|------:|
-| `bsa_attn_blk64_fwd` (fine stage) | 3.45 ms | 48% |
-| **tile: cube gather + padded scatter** | **2.02 ms** | **28%** |
-| top-k(144) + sort | 0.66 ms | 9% |
-| block masked mean ×3 | 0.64 ms | 9% |
-| combine + untile | 0.27 ms | 4% |
-| stack q/k/v/gate | 0.12 ms | 2% |
-| coarse attention (1440 pooled tokens) | 0.07 ms | 1% |
+### Choosing the sparsity: 0.9 does not work here
 
-The **tile step is the obvious target**: it moves ~860 MB per layer, which at
-B200 HBM bandwidth should take ~0.1 ms, but costs 2.02 ms because it is an
-`int64` fancy-index gather feeding an uncoalesced scatter. A fused
-tile-into-padded-buffer kernel would recover ~1.9 ms/layer ≈ 0.15 s/step,
-roughly another 11% end-to-end. The `(4,4,4)` cube layout also forces 21.9%
-padding at this grid (21×45×80 → 24×48×80), which inflates the fine stage by
-~1.5× on its own.
+The model card asks for sparsity 0.9. At 0.9 the output is badly degraded —
+blown-out colour, lost detail, global composition roughly intact. Quality
+against sparsity, all else fixed:
 
-### Where the GPU time goes (nsys)
+| sparsity | topk / 1440 blocks | video | frame mean/std/Δ |
+|---------:|-------------------:|-------|------------------|
+| 0.0 (all blocks) | 1440 | clean | 66.9 / 72.5 / 9.29 |
+| 0.5 | 720 | clean | 55.4 / 78.0 / 7.63 |
+| **0.75** | **360** | **clean** | **46.2 / 74.1 / 15.28** |
+| 0.9 | 144 | **degraded** | 38.6 / 77.4 / 16.07 |
+| *(dense reference)* | — | clean | 55.3 / 72.9 / 6.25 |
 
-Nsight Systems traces of the timed denoising steps, all 8 ranks, bucketed by
-kernel. Summed kernel time ÷ (8 ranks × 3 steps) reproduces the measured
-per-step latency to within 1%, so the GPU is essentially never idle and these
-shares are directly meaningful.
+**This is not an implementation bug.** The port was verified against
+FastVideo's own `fastvideo_kernel` at every level:
 
-| Config | GPU s (8 ranks × 3 steps) | attention | VSA tiling | GEMM | all-to-all | other |
-|--------|--------------------------:|----------:|-----------:|-----:|-----------:|------:|
-| 1 baseline | 39.8 | **47%** (cuDNN SDPA) | — | 18% | 8% | 27% |
-| 2 nvfp4 dynamic | 38.3 | 48% (SDPA) | — | 6% | 9% | 38% |
-| 3 nvfp4 static | 36.8 | 50% (SDPA) | — | 6% | 8% | 36% |
-| 4 nvfp4 static + VSA | 30.4 | **14%** (VSA fine) | **12%** | 7% | 6% | 60% |
-| 5 … + NVLink A2A | 30.2 | 14% | 12% | 7% | 9% | 57% |
-| 6 nvfp4 dynamic + VSA | 31.9 | 13% (VSA fine) | 11% | 7% | 6% | 62% |
-| 7 … + NVLink A2A | 31.6 | 13% | 12% | 7% | 9% | 59% |
+| Checked | Result |
+|---|---|
+| tile tables (`tile_partition_indices`, `variable_block_sizes`, `non_pad_index`) | bit-identical to FastVideo `vsa_utils` |
+| pooled block scores, **real activations** | 0.28% relative |
+| top-k selection, real activations | 143/144 set overlap; diagonal-block rate 61.5% vs 61.5% |
+| fine-stage kernels under a **forced identical selection** | FlashInfer blk64 vs FastVideo `block_sparse_attn` within 0.03–0.2%; both mask padding |
+| head splitting (the invariant Ulysses relies on), production grid | difference exactly 0 |
+| RoPE tables and application | bit-identical to diffusers (`apply_rotary_emb` character-for-character) |
+| `to_gate_compress` weights | raw checkpoint std 2.696e-4 == loaded |
 
-Three things the profile confirms independently of the microbenchmarks:
+The decisive check: **swapping FastVideo's own `video_sparse_attn` into this
+pipeline, changing nothing else, produces an identically degraded video**
+(frame mean 38.6, std 78.0, against 38.6/77.4 for ours). Two independent
+kernels fed the same inputs fail the same way.
 
-1. **Dense attention really is ~half the workload** (47%, 9.66 ms per layer per
-   rank for `cudnn_generated_..._sdpa_sm100_flash_fprop_...` — the isolated
-   measurement said 10.26 ms). That is why VSA moves the needle and NVFP4 does
-   not: dropping GEMM from 18% to 6% only buys 4%.
-2. **The tile permute costs nearly as much as the sparse kernel it feeds.** The
-   `index_elementwise_kernel` gather (948 µs) and `index_put_kernel` scatter
-   (946 µs) per layer per rank sum to 1.89 ms against the VSA fine stage's
-   2.20 ms — 12% vs 14% of total GPU time. This matches the 2.02 ms measured in
-   the stage breakdown above, from a completely different measurement path, and
-   makes the fused-tile-kernel optimization the clearest remaining win.
-3. **The NVLink kernel shows a *larger* all-to-all share (9% vs 6%) at equal
-   total time**, which is exactly what the decomposition below predicts: it
-   absorbs the permute that NCCL performs separately (and which lands in
-   "other" for the NCCL rows), so it does more work inside the collective.
+Also ruled out, each with a dedicated run: NVFP4 (row 2 of the older matrix —
+fp4 with dense attention — renders perfectly); Ulysses (reproduces on a single
+GPU, and 1-GPU vs 8-GPU VSA agree); partial edge blocks (the model's training
+resolution 77×768×1280 gives 1200 blocks that are all exactly 64 tokens — still
+degraded); CFG amplification (guidance 1.0 still degraded); and the multistep
+solver (`FlowMatchEulerDiscrete` instead of `UniPCMultistep` still degraded).
+`block_sizes` indexing — global block id vs position in the selected list, a
+difference that would be invisible at sparsity 0.0 — was checked against an
+eager reference and matches to 0.2%.
 
-The "other" bucket grows in the VSA rows (60% vs 27%) partly because the total
-shrinks and partly because VSA adds real elementwise work — masked block means,
-top-k, the gated combine, and the extra `to_gate_compress` projection.
+So the sparse *algorithm* at 0.9 is what this checkpoint cannot absorb, at
+least through diffusers' `WanPipeline`. 0.75 is the highest sparsity that
+still renders cleanly.
 
-Regenerate any of these with the `nsys profile` invocation in "Reproducing"
-below.
+### Against FastVideo's own implementation
 
-### The NVLink Ulysses kernel ties here — WAN 720p sits exactly at its crossover
+VSA's end-to-end win came in under expectation, so the obvious question is
+whether this port is simply slower than the reference. It is not — it is faster
+at both the kernel and the whole-model level.
 
-Rows 4 and 5 are identical within noise (64.11 vs 64.28 s), as are rows 6 and 7
-(67.61 vs 67.78 s). That is *not*
-because there is nothing to win: the NCCL path (`_nccl_scatter_heads`) really
-does run a full-tensor permute+`.contiguous()` before the collective, which the
-fused NVLink-P2P kernel folds into its cross-GPU writes. At the production
-shape that permute costs **0.115 ms, 39% of NCCL's 0.300 ms scatter**.
+**Attention op, per rank per layer** (75,600 tokens, 5 heads, head_dim 128, bf16):
 
-The fused kernel gives that back on raw transfer. Decomposing the collective
-across payload sizes (8 ranks, 40 heads, head_dim 128, bf16; each number is a
-burst of 20 collectives, barriered, median of 10 bursts):
+| sparsity | ours | FastVideo | ours vs dense | FastVideo vs dense | **ours vs FastVideo** |
+|---------:|-----:|----------:|--------------:|-------------------:|----------------------:|
+| 0.90 | **5.90 ms** | 7.50 ms | 1.77× | 1.39× | **1.27×** |
+| 0.75 | **8.93 ms** | 14.17 ms | 1.17× | 0.74× | **1.59×** |
+| 0.50 | 14.88 ms | 25.24 ms | 0.70× | 0.41× | **1.70×** |
+
+(dense torch SDPA = 10.46 ms.) Restricted to the fine stage under an
+*identical* block selection, FlashInfer's `bsa_attn_blk64_fwd` beats FastVideo's
+ThunderKittens/Triton `block_sparse_attn` by **1.75×–1.89×** across the same
+sparsities.
+
+**Whole DiT, end to end** (single B200, 720p × 5s, 20 steps, bf16 GEMM), which
+also separates the attention op from the rest of the model:
+
+| sparsity | ours | our DiT + FastVideo's op | FastVideo end to end | ours vs FastVideo |
+|---------:|-----:|-------------------------:|---------------------:|------------------:|
+| dense | 12.31 s/step | — | *cannot load* | — |
+| 0.90 | **9.48 s/step** | 10.32 s/step | 11.97 s/step | **1.26×** |
+| 0.75 | **11.67 s/step** | — | 15.64 s/step | **1.34×** |
+
+Swapping only the op inside an identical DiT (9.48 → 10.32) attributes 1.09× to
+the attention kernel; the remaining 1.16× (10.32 → 11.97) is the rest of the
+model. So roughly a third of the end-to-end lead is VSA itself and two thirds is
+the surrounding transformer.
+
+Two things worth recording:
+
+- **FastVideo cannot run this checkpoint densely.** Selecting a non-VSA
+  attention backend builds a block without `to_gate_compress`, and loading dies
+  with `ValueError: Parameter blocks.27.to_gate_compress.bias not found in
+  custom model state dict`. Their own dense baseline is therefore unobtainable
+  on this model, which is why the dense row above only has our number — and why
+  only this example can quote "VSA versus dense" for this checkpoint at all.
+- **At sparsity 0.75, FastVideo's VSA (15.64 s/step) is slower than our dense
+  attention (12.31 s/step).** The sparse path only pays off there against a
+  slow enough dense baseline.
+
+### Why VSA only buys 1% at a usable sparsity
+
+Isolated self-attention at exactly the per-rank shape (75,600 tokens, 5 heads,
+head_dim 128, bf16), after the tiling optimization below:
+
+| Self-attention, per rank per layer | time | vs dense |
+|------------------------------------|-----:|---------:|
+| torch SDPA (dense) | 10.42 ms | 1.00× |
+| VSA sparsity 0.9 (topk 144) | 6.77 ms | **1.54×** |
+| **VSA sparsity 0.75 (topk 360)** | **9.77 ms** | **1.07×** |
+| VSA sparsity 0.5 (topk 720) | 15.27 ms | 0.68× |
+
+**The quality-preserving range (≤0.75) and the speed-positive range (≥0.9)
+barely overlap on this checkpoint at this shape.** VSA is a real 1.54× at 0.9
+and a wash at 0.75. Two structural reasons, both visible in the numbers:
+
+1. The `(4,4,4)` cube tiling pads 75,600 tokens to 92,160 (**+21.9%**) at this
+   grid, so the sparse kernel starts 1.22× behind on token count alone.
+2. Block-sparse attention does not convert density into time linearly: at
+   sparsity 0.75 the kernel touches 25% of the blocks but runs only ~1.5×
+   faster than dense.
+
+**Tiling optimization (kept).** The cube permutation was originally
+zero-allocate + gather + scatter, costing 2.02 ms per layer — 28% of VSA's
+total, and ~7× off what the byte count justifies. Rewriting it as a single
+gather (every padded slot reads some arbitrary token; padding is masked
+downstream by `block_valid_mask` for the pooled mean and by
+`variable_block_sizes` for the sparse kernel) brought it to **1.09 ms**, which
+is what moved sparsity 0.9 from 1.42× to 1.54× and 0.75 from 1.02× to 1.07×.
+`vsa_sanity.py` still passes with identical numbers, since its eager reference
+does its own zero-padded tiling independently.
+
+### NVFP4 static: calibrated, not a placeholder
+
+Rows 3→4 show static beating dynamic by 4%, and unlike the earlier revision of
+this document **the static row is now numerically usable**. The offline scale
+used to be a fixed `448 * 6`, which assumes the activation amax is exactly 1.0;
+measured WAN activations run 4–28, so it over-scaled by 4–28× and clipped —
+producing visibly washed-out video (frame mean 124/255, std 21). It now
+calibrates over the first `FLASHINFER_OFFLINE_CALIB_STEPS` (default 3) forwards
+and freezes:
+
+```
+step 0: x_amax= 4.250  sf=632.5   step 2: x_amax=16.750  sf=160.5  <- frozen
+step 1: x_amax= 8.750  sf=307.2   step 3+: reuse, no amax reduction
+```
+
+Calibration lands in warmup, so timed steps still skip the amax pass, and the
+scale tensor keeps a stable address so CUDA-graph capture is unaffected. The
+FP8 offline paths are still fixed placeholders — see the "Online vs. offline"
+section.
+
+### Ulysses backend: NCCL vs the NVLink-P2P kernel
+
+Measured separately (on the 8× B200 NVSwitch node), with VSA at 0.9. The two
+backends tie end-to-end (67.61 s vs 67.78 s) and are **numerically identical** —
+same seed, latents matching to the last bit. That is *not* because there is
+nothing to win: the NCCL path really does run a full-tensor permute before the
+collective, worth **0.115 ms, 39% of NCCL's 0.300 ms scatter**, which the fused
+kernel folds into its cross-GPU writes. It gives that back on raw transfer:
 
 | S_local | payload | permute alone | raw `all_to_all_single` | NCCL total | NVLink fused | NVLink win |
 |--------:|--------:|--------------:|------------------------:|-----------:|-------------:|-----------:|
@@ -604,37 +682,24 @@ burst of 20 collectives, barriered, median of 10 bursts):
 | **9450 (WAN 720p)** | **96.8 MB** | 0.115 | 0.183 | **0.300** | **0.302** | **0.99×** |
 | 18900 | 193.5 MB | 0.226 | 0.328 | 0.556 | 0.586 | 0.95× |
 
-Two regimes, and the reason is bandwidth, not topology:
+Small payloads (≤ ~30 MB) win 1.25–2.07× because collapsing two kernel launches
+into one dominates. Large payloads tie then lose: NCCL's raw all-to-all reaches
+529 GB/s at 96.8 MB and 590 GB/s at 193.5 MB (payload ÷ time), while the fused
+kernel plateaus at ~320–330 GB/s. WAN 720p lands exactly on the crossover. The
+optimization is real and the intuition behind it is right — it should pay off
+for LLM-scale Ulysses (a few MB per collective, squarely in the 1.5–2× region),
+and it would pay off here too if the fused kernel closed that ~1.7×
+raw-bandwidth gap. That gap, not NVSwitch topology, is what to chase.
 
-- **Small payloads (≤ ~30 MB): the fused kernel wins 1.25–2.07×.** NCCL pays a
-  separate permute launch plus the collective; the fused kernel does both in one
-  kernel. At 1.3 MB the permute and the transfer are both launch-bound, so
-  collapsing two launches into one is worth 2×.
-- **Large payloads (≥ ~97 MB): it ties, then loses.** NCCL's raw all-to-all
-  reaches 529 GB/s at 96.8 MB and 590 GB/s at 193.5 MB (payload ÷ time), while
-  the fused kernel plateaus at ~320–330 GB/s. So the fused path saves the
-  0.115 ms permute but spends ~0.12 ms more moving the same bytes. Net zero at
-  WAN's 96.8 MB, and slightly negative beyond.
-
-So the optimization is real and the intuition behind it is right — the WAN 720p
-shape just lands on the crossover. It should pay off for LLM-scale Ulysses
-(4K–32K tokens per rank is a few MB per collective, squarely in the 1.5–2×
-region), and it would pay off for video diffusion too if the fused kernel closed
-the ~1.7× raw-bandwidth gap against NCCL at ~100 MB payloads. That gap, not
-NVSwitch topology, is what to chase.
-
-For context on scale: all-to-all is ~120 ms of a 1281 ms VSA step (9.4%), so
-even a 2× faster collective would only buy ~5% end-to-end at this shape.
-
-The two backends are also **numerically identical**: the same seed produces
-latents that match to the last bit.
+For scale: all-to-all is ~120 ms of a ~1500 ms step (8%), so even a 2× faster
+collective buys ~4% end-to-end at this shape.
 
 ### Correctness
 
-`vsa_sanity.py` covers the VSA path itself: tile/untile is an exact
-round-trip, the cube permutation really groups each `(4,4,4)` neighbourhood,
-the kernel matches an independent eager reference to ≤6e-3 relative error at
-sparsity 0/0.5/0.9, and splitting heads across ranks does not change the result.
+`vsa_sanity.py` covers the VSA path itself: tile/untile is an exact round-trip,
+the cube permutation really groups each `(4,4,4)` neighbourhood, the kernel
+matches an independent eager reference to ≤6e-3 relative error at sparsity
+0/0.5/0.9, and splitting heads across ranks does not change the result.
 
 For the sequence-parallel path, comparing 1-GPU against 8-GPU latents after one
 denoising step:
@@ -645,31 +710,26 @@ denoising step:
 | VSA, sparsity 0.0 (all blocks kept) | 0.99979 |
 | VSA, sparsity 0.9 | 0.917 |
 
-The first two show Ulysses is correct. The third is **expected and not a bug**:
-top-k block selection is discrete, so bf16-level differences in the pooled
-scores flip which blocks a query block attends to, and 40 layers × 2 CFG passes
-amplify that. Dense attention cannot exhibit this because it is
-permutation-invariant once RoPE is baked in. The practical consequence is that
-**VSA output is not reproducible across different world sizes** — the samples
-are equally valid, not equal. Setting sparsity to 0 restores reproducibility.
+The first two show Ulysses is correct. The third is **expected**: top-k block
+selection is discrete, so bf16-level differences in the pooled scores flip which
+blocks a query block attends to, and 40 layers × 2 CFG passes amplify that.
+Dense attention cannot exhibit this because it is permutation-invariant once
+RoPE is baked in. So **VSA output is not reproducible across world sizes** — the
+samples are equally valid, not equal. Sparsity 0 restores reproducibility.
 
 ### Caveats
 
-- **The static rows (3, 4, 5) are speed numbers only.** `--offline-act-quant`
-  uses a fixed placeholder scale rather than calibrated per-layer scales (see
-  the "Online vs. offline" section below). Their ~4% over the matching dynamic
-  row is a real upper bound on what removing the online amax pass can buy, but
-  the videos are visibly washed out — frame mean 124/255 and std 21 for row 3
-  against 55/73 for the baseline. **Row 6 (dynamic + VSA, 1.23×) is the
-  fastest configuration that is also numerically valid.**
 - **VSA needs a VSA-finetuned checkpoint.** The gated combine reads
   `to_gate_compress`, which stock Wan checkpoints do not have; running
   `--use-vsa` on one silently uses a randomly initialized gate.
-- Rows 1–3 run *dense* attention on a VSA-finetuned checkpoint. That is the
-  controlled comparison (same weights, only attention changes), but it is not
-  the same as the original Wan2.1-14B release.
+- Row 1 runs *dense* attention on a VSA-finetuned checkpoint. That is the
+  controlled comparison (same weights, only attention changes), not the same as
+  the original Wan2.1-14B release.
 - The `vsa_blackwell_blk64` kernel is SM100-only, bf16-only, and requires
   `head_dim == 128`.
+- `flashinfer.cute_dsl.sparse`'s package `__init__` imports the blk128 backend
+  unconditionally, so `quack` must be installed even to reach the pure-CUDA
+  blk64 path used here.
 
 ### Reproducing
 
@@ -678,26 +738,27 @@ torchrun --nproc_per_node=8 examples/pytorch/wan/pipeline_wan_flashinfer.py \
   --model-id FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers \
   --height 720 --width 1280 --num-frames 81 \
   --num-inference-steps 50 --guidance-scale 5.0 --flow-shift 5.0 --seed 1024 \
-  --gemm-backend fp4 --attention-backend torch \
-  --use-vsa --vsa-sparsity 0.9 --ulysses-backend nccl \
-  --warmup-steps 2 --timing-json timing.json --output wan_vsa.mp4
+  --gemm-backend fp4 --offline-act-quant --attention-backend torch \
+  --use-vsa --vsa-sparsity 0.75 --ulysses-backend nccl \
+  --warmup-steps 3 --timing-json timing.json --output wan_vsa.mp4
 ```
 
-That is row 6. Add `--offline-act-quant` for row 4, swap
-`--ulysses-backend nvlink` for rows 5/7, drop `--use-vsa` for rows 2/3, or use
-`--gemm-backend torch` for row 1. `--check-rank-sync` asserts every rank holds
-identical latents at every step.
+That is row 4. Drop `--offline-act-quant` for row 3, use `--gemm-backend torch`
+for row 2, and drop `--use-vsa` as well for row 1. `--check-rank-sync` asserts
+every rank holds identical latents at every step. `--scheduler flow-euler`
+swaps the multistep solver for a first-order one.
 
 To capture an Nsight Systems trace of just the denoising steps (the model load
 would otherwise dominate the report):
 
 ```bash
-nsys profile -o row6 --trace=cuda,nvtx --sample=none \
+nsys profile -o row4 --trace=cuda,nvtx --sample=none \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   torchrun --nproc_per_node=8 examples/pytorch/wan/pipeline_wan_flashinfer.py \
-    ... --num-inference-steps 3 --warmup-steps 2 --output-type latent \
+    ... --num-inference-steps 3 --warmup-steps 3 --output-type latent \
     --cuda-profiler-range
 ```
+
 
 ## Online vs. offline activation quantization
 
@@ -721,13 +782,25 @@ and cheap; online vs offline is in the noise. For block/groupwise FP8, the
 amax must be computed over each `(M, K_block)` tile (~3× more reductions per
 activation), and that step dominates — going offline saves 25–35%.
 
-**⚠️ Caveat:** the current `--offline-act-quant` implementation uses a
-**fixed** scale (`1.0` for per-tensor, `1.0 / fp8_max` for blockwise). This
-is a placeholder. Real offline quantization requires per-layer scales
-collected from a calibration pass; using `1.0` everywhere will produce
-incorrect activations whenever the actual amax differs significantly from
-`fp8_max`. Treat the offline numbers in this report as **upper-bound speed
-estimates**, not as drop-in production settings.
+**NVFP4 offline is now calibrated.** `--offline-act-quant` on the `fp4`
+backend observes the real activation amax over the first
+`FLASHINFER_OFFLINE_CALIB_STEPS` (default 3) forwards and then freezes the
+scale, so the timed steps still skip the amax reduction but the scale is
+representative. The previous fixed `448 * 6` is the scale you would get if the
+activation amax were exactly 1.0; measured WAN activations run 4–28, so the
+old placeholder over-scaled by 4–28× and clipped hard — that is why the
+earlier `nvfp4 static` videos came out washed out (frame mean 124/255, std 21,
+against 55/73 for the baseline). With calibration the static output matches
+the dynamic one (46.5/72.6 vs 46.6/74.1). Put the calibration in warmup
+(`--warmup-steps ≥ 2`) so it finishes before timing and before any CUDA-graph
+capture; the scale tensor keeps a stable address so capture is unaffected.
+
+**⚠️ The FP8 offline paths are still placeholders:** `--offline-act-quant`
+uses a **fixed** scale (`1.0` for per-tensor, `1.0 / fp8_max` for blockwise)
+for `fp8`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled` and
+`batch_deepgemm_fp8`. Treat *those* offline numbers as **upper-bound speed
+estimates**, not drop-in production settings; they would need the same
+calibration treatment as `fp4`.
 
 ## Known issues discovered during benchmarking
 
@@ -782,7 +855,7 @@ README in `examples/pytorch/` for the full flag list.
 | H100 PCIe, smaller model | `torch` (FP8 overhead not amortized) |
 | **H100 80 GB HBM3, WAN-14B 720p × 5s** | **`bmm_fp8` (cuBLAS) + `--torch-compile --cuda-graph --offline-act-quant`** (1.265× vs cuBLAS bf16; `fp8_sm90` is a close second at 1.211× and only measurable under compile because the offline placeholder scale trips a kernel assert in eager) |
 | B200, any WAN size tested | `torch` (cuBLAS bf16 baseline is hard to beat at these shapes) |
-| **8× B200, VSA-finetuned WAN-14B, 720p × 5s** | **`fp4` + `--use-vsa --vsa-sparsity 0.9` + Ulysses** (1.23× vs bf16/dense, or 1.30× with the not-quality-preserving `--offline-act-quant`; VSA supplies ~18 of those points, nvfp4 the rest. Either Ulysses backend — the NVLink-P2P kernel is 1.5–2× faster below ~30 MB per collective but ties WAN's 97 MB payload) |
+| **8× B200, VSA-finetuned WAN-14B, 720p × 5s** | **`fp4 --offline-act-quant` + `--use-vsa --vsa-sparsity 0.75` + Ulysses** (1.11× vs bf16/dense; nvfp4 supplies ~10 of those points and VSA only ~1, because the sparsity that preserves quality on this checkpoint is not the sparsity where VSA is fast. Do not use sparsity 0.9 — it is 1.54× on attention but visibly degrades the video. Either Ulysses backend — the NVLink-P2P kernel is 1.5–2× faster below ~30 MB per collective but ties WAN's 97 MB payload) |
 | **B300 SXM6, WAN-14B 720p × 5s** | **`fp4-cutlass` + `--torch-compile --cuda-graph --offline-act-quant`** (1.141× vs cuBLAS bf16; `bmm_fp8` is right behind at 1.127×, `mxfp8` at 1.094×) |
 
 To make FlashInfer's quantized paths actually win on B200, the workload

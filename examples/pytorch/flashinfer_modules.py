@@ -14,6 +14,7 @@
 """Model-independent FlashInfer modules shared by PyTorch examples."""
 
 import math
+import os
 import warnings
 from enum import Enum
 from typing import Dict, Optional, Tuple
@@ -40,6 +41,16 @@ _DEFAULT_WORKSPACE_SIZE = 128 * 1024 * 1024
 # and is always available; it acts as the universal fallback when the FlashInfer
 # attention kernels are unsupported on the current GPU.
 _VALID_ATTENTION_BACKENDS = {"auto", "single", "cudnn", "trtllm", "torch"}
+
+# NVFP4 global scale numerator: the E4M3 block-scale absmax times the E2M1
+# element absmax, i.e. what an activation amax of 1.0 would map to.
+_NVFP4_GLOBAL_SF_NUM = 448.0 * 6.0
+
+# Forward passes used to calibrate the offline (static) NVFP4 activation scale
+# before freezing it. Calibration is meant to land in warmup, so the timed
+# forwards never pay for an amax reduction. Set to 0 to restore the old fixed
+# placeholder scale (kept only for A/B-ing the calibration itself).
+_OFFLINE_CALIB_STEPS = int(os.getenv("FLASHINFER_OFFLINE_CALIB_STEPS", "3"))
 
 
 def _split_backend_choice(value: str) -> Tuple[str, Optional[str]]:
@@ -201,6 +212,8 @@ class FlashInferLinear(nn.Module):
         self._offline_per_tensor_scale: Optional[torch.Tensor] = None
         self._offline_blockwise_scale: Optional[torch.Tensor] = None
         self._offline_fp4_global_sf: Optional[torch.Tensor] = None
+        self._offline_fp4_amax: Optional[torch.Tensor] = None
+        self._offline_fp4_calib_left: int = 0
 
         # Resolve device — FlashInfer kernels require CUDA. We accept None (default
         # to current CUDA device) but reject CPU since none of the GEMM backends
@@ -594,7 +607,7 @@ class FlashInferLinear(nn.Module):
         # amax in the weight dtype is sufficient (and far cheaper than
         # casting weight to fp32 first); weight prep runs once per layer.
         weight_amax = weight.abs().amax().to(torch.float32).clamp(min=1e-12)
-        weight_global_sf = (448.0 * 6.0) / weight_amax
+        weight_global_sf = _NVFP4_GLOBAL_SF_NUM / weight_amax
 
         weight_fp4, weight_descale = flashinfer.nvfp4_quantize(weight, weight_global_sf)
 
@@ -956,6 +969,44 @@ class FlashInferLinear(nn.Module):
         # avoid unexpected upcasts in the surrounding model graph.
         return out.to(x.dtype)
 
+    def _offline_fp4_activation_scale(self, x: torch.Tensor) -> torch.Tensor:
+        """Static (offline) NVFP4 activation scale, calibrated then frozen.
+
+        The point of offline quantization is to drop the per-forward amax
+        reduction, not to guess the amax. The previous placeholder used a fixed
+        ``_NVFP4_GLOBAL_SF_NUM``, which is the scale you would get if the activation amax
+        were exactly 1.0 — WAN activations are nowhere near that, so the
+        quantizer wasted most of the FP4 range and the outputs were visibly
+        degraded. Instead observe the real amax over the first
+        ``_OFFLINE_CALIB_STEPS`` forwards, then freeze it: calibration happens
+        during warmup and the timed steps pay nothing.
+
+        The returned tensor keeps a stable identity and is only written during
+        calibration, so a CUDA graph captured after warmup sees a fixed address
+        and a constant value.
+        """
+        if (
+            self._offline_fp4_global_sf is None
+            or self._offline_fp4_global_sf.device != x.device
+        ):
+            self._offline_fp4_global_sf = torch.full(
+                (), _NVFP4_GLOBAL_SF_NUM, device=x.device, dtype=torch.float32
+            )
+            self._offline_fp4_amax = torch.zeros(
+                (), device=x.device, dtype=torch.float32
+            )
+            self._offline_fp4_calib_left = _OFFLINE_CALIB_STEPS
+
+        if self._offline_fp4_calib_left > 0:
+            self._offline_fp4_calib_left -= 1
+            amax = x.abs().amax().to(torch.float32).clamp(min=1e-12)
+            torch.maximum(self._offline_fp4_amax, amax, out=self._offline_fp4_amax)
+            self._offline_fp4_global_sf.copy_(
+                _NVFP4_GLOBAL_SF_NUM / self._offline_fp4_amax
+            )
+
+        return self._offline_fp4_global_sf
+
     def _forward_fp4(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FlashInfer mm_fp4."""
         if not self._fp4_prepared:
@@ -970,25 +1021,13 @@ class FlashInferLinear(nn.Module):
         # from the current activation's amax (.float()/.nan_to_num() were
         # the culprit in the original wrapper; .abs().amax() is already
         # cheap, see the wrapper-hot-paths note in wan/BENCHMARK.md).
-        # Offline: use a fixed default global SF — the same shape as the
-        # FP8 offline path, so calibration / overrides can later swap in
-        # a real per-layer constant.
+        # Offline: calibrated during warmup and then frozen, see
+        # ``_offline_fp4_activation_scale``.
         if self.online_act_quant:
             x_amax = x_contig.abs().amax().to(torch.float32).clamp(min=1e-12)
-            x_global_sf = (448.0 * 6.0) / x_amax
+            x_global_sf = _NVFP4_GLOBAL_SF_NUM / x_amax
         else:
-            # Cache the constant SF tensor so cuda-graph capture doesn't
-            # re-allocate or copy from CPU on each call. The value is
-            # NVFP4's E4M3 absmax (448 * 6) and would be a per-layer
-            # calibration constant in a real offline-quant pipeline.
-            if (
-                self._offline_fp4_global_sf is None
-                or self._offline_fp4_global_sf.device != x.device
-            ):
-                self._offline_fp4_global_sf = torch.full(
-                    (), 448.0 * 6.0, device=x.device, dtype=torch.float32
-                )
-            x_global_sf = self._offline_fp4_global_sf
+            x_global_sf = self._offline_fp4_activation_scale(x_contig)
 
         # Quantize input to FP4 — shape (M, K) -> (M, K/2)
         x_fp4, x_descale = flashinfer.nvfp4_quantize(x_contig, x_global_sf)
