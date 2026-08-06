@@ -324,6 +324,7 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     the structural tests from running.
     """
     # Trigger @flashinfer_api decorators by importing all modules that use them.
+    import flashinfer.attn_scores  # fp8_paged_mqa_logits, fp4_paged_mqa_logits
     import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
     import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
     import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp

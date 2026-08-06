@@ -34,6 +34,10 @@ import numpy as np
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.attn_scores import (
+    fp4_paged_mqa_logits_trace,
+    fp8_paged_mqa_logits_trace,
+)
 from ..utils import (
     get_device_index,
     get_device_sm_count,
@@ -484,7 +488,7 @@ def compute_paged_mqa_logits_schedule(
 
 
 @supported_compute_capability(_SM100_CCS)
-@flashinfer_api
+@flashinfer_api(trace=fp8_paged_mqa_logits_trace)
 def fp8_paged_mqa_logits(
     q: torch.Tensor,
     kv_fused: torch.Tensor,
@@ -614,7 +618,7 @@ def fp8_paged_mqa_logits(
 
 
 @supported_compute_capability(_SM100_CCS)
-@flashinfer_api
+@flashinfer_api(trace=fp4_paged_mqa_logits_trace)
 def fp4_paged_mqa_logits(
     q: torch.Tensor,
     sf_q: torch.Tensor,
