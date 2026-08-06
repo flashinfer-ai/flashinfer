@@ -505,6 +505,8 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
   (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
+- `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
+  (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
