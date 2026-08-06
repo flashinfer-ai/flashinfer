@@ -256,13 +256,15 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
         runner.check_support()
 
 
-def test_moe_layer_checks_support_before_build(monkeypatch):
+def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     from flashinfer.fused_moe import layer as layer_module
 
     events = []
 
     class RecordingRunner:
         supported_quant_variants = (QuantVariant.BF16,)
+        supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+        backend_key = "recording"
 
         def __init__(self, config, device):
             events.append("init")
@@ -273,15 +275,41 @@ def test_moe_layer_checks_support_before_build(monkeypatch):
         def build(self):
             events.append("build")
 
+        def pack_inputs(self, act_pack, weight_pack):
+            events.append("pack_inputs")
+            return []
+
+        def forward(self, inputs, tactic=-1):
+            events.append("forward")
+            return torch.empty(0)
+
     monkeypatch.setattr(layer_module, "get_compute_capability", lambda device: (9, 0))
     monkeypatch.setitem(
         layer_module._BACKEND_RUNNERS, CutlassBf16Config, RecordingRunner
     )
+    monkeypatch.setattr(
+        MoELayer,
+        "_select_winner",
+        lambda self, act_pack, weight_pack, runners: (runners[0], -1),
+    )
 
     layer = MoELayer(_config(), device=torch.device("cuda"))
+    act = MoEActivationPack(
+        torch.empty(1, 1, dtype=torch.bfloat16),
+        None,
+        torch.zeros(1, 2, dtype=torch.int32),
+        torch.full((1, 2), 0.5),
+    )
+    layer(act, MoEWeightPack())
 
     assert len(layer.runners) == 1
-    assert events == ["init", "check_support", "build"]
+    assert events == [
+        "init",
+        "check_support",
+        "build",
+        "pack_inputs",
+        "forward",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -338,25 +366,37 @@ def test_cutlass_constructor_does_not_load_module(monkeypatch):
     assert runner._inner is None
 
 
-def test_cutlass_direct_runner_builds_lazily_after_support_check():
+@pytest.mark.parametrize(
+    "execute",
+    (
+        lambda runner: runner.pack_inputs(None, None),
+        lambda runner: runner.get_valid_tactics([], None),
+        lambda runner: runner.forward([]),
+    ),
+    ids=("pack_inputs", "get_valid_tactics", "forward"),
+)
+def test_cutlass_direct_execution_requires_explicit_build(monkeypatch, execute):
+    from flashinfer.fused_moe import core
+
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner._inner = None
-    events = []
+    backend_calls = []
 
-    def check_support():
-        events.append("check_support")
+    monkeypatch.setattr(
+        core,
+        "get_cutlass_fused_moe_module",
+        lambda *args, **kwargs: backend_calls.append("module"),
+    )
+    monkeypatch.setattr(
+        core,
+        "cutlass_fused_moe_workspace_size",
+        lambda *args, **kwargs: backend_calls.append("workspace"),
+    )
 
-    def build():
-        events.append("build")
-        runner._inner = object()
+    with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
+        execute(runner)
 
-    runner.check_support = check_support
-    runner.build = build
-
-    runner._ensure_built()
-    runner._ensure_built()
-
-    assert events == ["check_support", "build"]
+    assert backend_calls == []
 
 
 def test_legacy_cutlass_config_is_not_runnable(monkeypatch):
@@ -438,6 +478,7 @@ def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner.config = _config()
     runner.device = torch.device("cpu")
+    runner._inner = object()
     num_tokens, hidden_size, top_k = 65, 128, 2
     act = MoEActivationPack(
         torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16),
@@ -452,7 +493,7 @@ def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
         runner.pack_inputs(act, MoEWeightPack())
 
 
-def test_cutlass_direct_pack_checks_support_before_workspace_query():
+def test_cutlass_direct_pack_succeeds_after_explicit_build():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner.config = _config()
     runner.device = torch.device("cpu")
@@ -492,6 +533,8 @@ def test_cutlass_direct_pack_checks_support_before_workspace_query():
         },
     )
 
+    runner.check_support()
+    runner.build()
     runner.pack_inputs(act, weights)
 
     assert events == ["check_support", "build", "workspace"]

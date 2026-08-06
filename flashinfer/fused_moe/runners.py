@@ -213,6 +213,10 @@ class MoERunner(TunableRunner):
 class _CutlassRunnerBase(MoERunner):
     """Shared launch, tuning, and workspace mechanics for CUTLASS MoE.
 
+    Direct callers must invoke ``check_support()`` followed by ``build()``
+    before ``pack_inputs()``, ``get_valid_tactics()``, or ``forward()``.
+    ``MoELayer`` enforces this lifecycle when constructing its runners.
+
     A runner is a single-stream resource. Concurrent use or CUDA-graph replay
     on multiple streams requires one runner (or ``MoELayer``) per stream.
     """
@@ -310,11 +314,13 @@ class _CutlassRunnerBase(MoERunner):
                 use_wfp4afp8_humming=False,
             )
 
-    def _ensure_built(self) -> None:
-        """Preserve direct-runner use while enforcing check-before-build."""
+    def _require_built(self) -> None:
+        """Reject execution before the explicit runner lifecycle completes."""
         if self._inner is None:
-            self.check_support()
-            self.build()
+            raise RuntimeError(
+                f"{type(self).__name__} must be initialized with "
+                "check_support() followed by build()."
+            )
 
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
@@ -333,8 +339,8 @@ class _CutlassRunnerBase(MoERunner):
         return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
         self._validate_input_count(inputs)
-        self._ensure_built()
         # The two GEMMs have independent tactic spaces. Preserve the legacy
         # O(n1+n2) tuning flow, then let the outer unified tuner profile only
         # the selected pair as one full-MoE candidate.
@@ -412,6 +418,7 @@ class _CutlassRunnerBase(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only PackedPrecomputed routing."
@@ -454,10 +461,6 @@ class _CutlassRunnerBase(MoERunner):
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
-
-        # Workspace-size querying loads the CUTLASS module. Validate backend
-        # support and finish the lazy build before that first JIT entry point.
-        self._ensure_built()
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
@@ -514,10 +517,10 @@ class _CutlassRunnerBase(MoERunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        self._require_built()
         self._validate_input_count(inputs)
         if self._workspace is None:
             raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
-        self._ensure_built()
         if tactic == -1:
             profile_ids = [-1, -1]
         elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
