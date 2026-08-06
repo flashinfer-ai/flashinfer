@@ -1,6 +1,7 @@
 # Bot command handler for CI permissions
 # Authorized users (ci-users team) can comment to control CI:
-#   @flashinfer-bot run          - Add run-ci label to trigger CI
+#   @flashinfer-bot run          - Apply run-ci label to start CI on the current
+#                                  commit; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
@@ -85,6 +86,12 @@ jobs:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
+
+          # pr-test triggers on run-ci being applied, and re-applying a label the
+          # PR already carries emits no event, so drop any leftover copy first.
+          gh pr edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label "run-ci" || true
 
           # Add run-ci label
           gh pr edit ${{ github.event.issue.number }} \
