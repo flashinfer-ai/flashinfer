@@ -45,6 +45,11 @@ if TYPE_CHECKING:
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
 _SUPPORTED_PAGE_SIZES = (16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
+# Decode K/V masks form an exclusive tile endpoint as
+# ``tile_offset_k + tile_size_kv`` in signed Int32.  Public policies use at
+# most a 128-token K/V tile, so reserve its full 127-token padded tail.
+_DECODE_MAX_KV_TILE_SIZE = 128
+_DECODE_MAX_KV_LEN = _MAX_INT32 - (_DECODE_MAX_KV_TILE_SIZE - 1)
 _SUPPORTED_INPUT_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -431,10 +436,26 @@ def _resolve_q_mode(
 
 
 def _validate_max_kv_len(value: int, name: str) -> int:
+    """Reserve the largest padded decode K/V tile in signed Int32."""
+
     value = _validate_positive_int(value, name)
-    if value > _MAX_INT32:
-        raise ValueError(f"{name} must fit in signed int32 metadata")
+    if value > _DECODE_MAX_KV_LEN:
+        raise NotImplementedError(
+            f"{name} must be <= {_DECODE_MAX_KV_LEN} so padded FMHA decode "
+            "K/V coordinates fit in a signed int32"
+        )
     return value
+
+
+def _validate_decode_policy_kv_tile_size(config: "FmhaDecodeConfig") -> None:
+    """Keep the public K/V bound coupled to generated decode policies."""
+
+    tile_size_kv = int(config.tile_size_kv)
+    if tile_size_kv > _DECODE_MAX_KV_TILE_SIZE:
+        raise RuntimeError(
+            "FMHA decode Int32 extent safety assumes a K/V tile no larger "
+            f"than {_DECODE_MAX_KV_TILE_SIZE}, got {tile_size_kv}"
+        )
 
 
 def _validate_decode_query_head_extent(
@@ -1135,6 +1156,8 @@ def _resolve_decode_launch_spec(
                 ):
                     cfg = head_band_cfg
 
+    _validate_decode_policy_kv_tile_size(cfg)
+
     head_ratio = num_qo_heads // num_kv_heads
     geometry = make_q_tile_geometry(
         rows_per_cta=cfg.tile_size_q,
@@ -1539,6 +1562,8 @@ def get_prims_ts_batch_decode_workspace_size(
     tensor and zero it before its first FMHA launch. Fixed-Q launches use
     ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
     static ``max_seq_len_q`` bound used for workspace geometry and JIT policy.
+    ``max_seq_len`` must be no larger than ``2,147,483,520`` so the padded
+    128-token K/V tile endpoint remains representable as signed Int32.
     This sizing helper validates that every cumulative-offset delta is positive
     and no larger than the bound. If ``device`` is omitted, it is inferred from
     ``qo_indptr`` for a packed launch.
@@ -1812,6 +1837,8 @@ def prims_ts_batch_decode_with_kv_cache(
     ``[pages, Hkv, page_size, D]`` tensors. The metadata uses FlashInfer's
     native CSR page-ID ABI; ``seq_lens`` is explicit and ``max_seq_len`` is the
     exact static maximum used for automatic policy selection and JIT caching.
+    It must be no larger than ``2,147,483,520`` so the padded 128-token K/V
+    tile endpoint remains representable as signed Int32.
     Each request must own enough CSR entries for its live length::
 
         (seq_lens[b] + page_size - 1) // page_size <= (
@@ -2032,7 +2059,9 @@ class BatchDecodePagedTSWrapper:
         full-prefix and fixed-length specializations. If ``max_kv_len`` is
         omitted, the metadata maximum becomes the exact plan bound. An explicit
         value is a static upper bound and planning rejects metadata that exceeds
-        it. The fixed-length specialization is selected only when every row is
+        it. The bound must be no larger than ``2,147,483,520`` so the padded
+        128-token K/V tile endpoint remains representable as signed Int32. The
+        fixed-length specialization is selected only when every row is
         exactly equal to that bound. Because the launch still uses the planned
         CSR row starts, both ``paged_kv_indptr`` and
         ``paged_kv_last_page_len`` values must remain unchanged until the next

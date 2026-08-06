@@ -407,9 +407,28 @@ def test_prims_ts_ragged_context_adapter_contract(
     assert benchmark_outputs[0].shape == q.shape
 
 
+@pytest.mark.parametrize(
+    ("spec_dec_mask", "expected_plan_mask", "expected_recorded_causal"),
+    (("causal", "causal", True), ("full", "dense", False)),
+)
 def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
+    monkeypatch,
     mocked_prims_ts_benchmark,
+    spec_dec_mask,
+    expected_plan_mask,
+    expected_recorded_causal,
 ):
+    metric_causal = []
+
+    def record_tflops(*args):
+        metric_causal.append(args[5])
+        return 0.0
+
+    monkeypatch.setattr(
+        attention_routine,
+        "attention_tflops_per_sec_with_actual_seq_lens",
+        record_tflops,
+    )
     install_wrapper, benchmark_outputs = mocked_prims_ts_benchmark
     wrapper = install_wrapper("BatchDecodePagedTSWrapper")
     args = _parse_prims_ts_case(
@@ -435,10 +454,14 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
             "bfloat16",
             "--kv_dtype",
             "bfloat16",
+            "--spec_dec_mask",
+            spec_dec_mask,
+            "--output_path",
+            "unused.csv",
         ],
     )
 
-    attention_routine.testBatchDecodeWithPagedKVCacheWrapper(args)
+    results = attention_routine.testBatchDecodeWithPagedKVCacheWrapper(args)
 
     assert wrapper.constructor_call == (("HND",), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
@@ -451,9 +474,12 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
         "q_data_type": torch.bfloat16,
         "kv_data_type": torch.bfloat16,
         "o_data_type": torch.bfloat16,
-        "mask_type": "causal",
+        "mask_type": expected_plan_mask,
         "max_kv_len": 16,
     }
+    assert len(results) == 1
+    assert results[0]["causal"] is expected_recorded_causal
+    assert metric_causal == [expected_recorded_causal]
 
     run_args, run_kwargs = wrapper.run_calls[0]
     runtime_q, runtime_kv_cache = run_args
@@ -466,6 +492,49 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
     # The public benchmark schema remains packed even though PrimTS receives
     # the rank-4 multi-query form.
     assert benchmark_outputs[0].shape == (6, 2, 128)
+
+
+def test_prims_ts_fmha_decode_sq_one_keeps_causal_plan(
+    mocked_prims_ts_benchmark,
+):
+    install_wrapper, _ = mocked_prims_ts_benchmark
+    wrapper = install_wrapper("BatchDecodePagedTSWrapper")
+    args = _parse_prims_ts_case(
+        "BatchDecodeWithPagedKVCacheWrapper",
+        [
+            "--page_size",
+            "16",
+            "--batch_size",
+            "1",
+            "--s_qo",
+            "1",
+            "--s_kv",
+            "16",
+            "--num_qo_heads",
+            "2",
+            "--num_kv_heads",
+            "1",
+            "--head_dim_qk",
+            "128",
+            "--head_dim_vo",
+            "128",
+            "--q_dtype",
+            "bfloat16",
+            "--kv_dtype",
+            "bfloat16",
+            # The speculative-mask option has no effect when SQ == 1.
+            "--spec_dec_mask",
+            "full",
+            "--output_path",
+            "unused.csv",
+        ],
+    )
+
+    results = attention_routine.testBatchDecodeWithPagedKVCacheWrapper(args)
+
+    assert wrapper.plan_calls[0][1]["mask_type"] == "causal"
+    assert len(results) == 1
+    assert results[0]["causal"] is False
 
 
 def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(

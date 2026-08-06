@@ -608,6 +608,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     s_qo = args.s_qo
     speculative_decode = s_qo > 1
     spec_dec_mask_mode = args.spec_dec_mask
+    effective_causal = speculative_decode and spec_dec_mask_mode == "causal"
     s_kv = args.s_kv
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
@@ -969,6 +970,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     prims_ts_out = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
+        prims_ts_mask_type = (
+            "causal" if not speculative_decode or effective_causal else "dense"
+        )
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
@@ -992,7 +996,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=o_data_type,
-            mask_type="causal",
+            mask_type=prims_ts_mask_type,
             max_kv_len=s_kv,
         )
 
@@ -1220,7 +1224,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 head_dim_qk,
                 head_dim_vo,
                 num_qo_heads,
-                True,
+                effective_causal,
                 median_time,
             )
             tb_per_sec = attention_tb_per_sec_with_actual_seq_lens(
@@ -1267,9 +1271,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["num_kv_heads"] = num_kv_heads
                 cur_res["head_dim_qk"] = head_dim_qk
                 cur_res["head_dim_vo"] = head_dim_vo
-                cur_res["causal"] = (
-                    spec_dec_mask_mode == "causal" if speculative_decode else False
-                )
+                cur_res["causal"] = effective_causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["out_dtype"] = o_data_type

@@ -43,9 +43,13 @@ from flashinfer.attention.prims_ts import (
     batch_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.decode import (
+    _DECODE_MAX_KV_LEN,
+    _DECODE_MAX_KV_TILE_SIZE,
     _DecodeRuntime,
     _validate_decode_query_head_extent,
     _validate_decode_output_aliasing,
+    _validate_decode_policy_kv_tile_size,
+    _validate_max_kv_len,
 )
 from flashinfer.attention.prims_ts._tensor_aliasing import (
     _validate_tensor_does_not_overlap_inputs,
@@ -1406,6 +1410,107 @@ def test_attention_ts_decode_query_head_extent_guard() -> None:
             max_seq_len=128,
             seq_len_q=2**27,
             device="cuda:0",
+        )
+
+
+def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
+    """The public K/V bound leaves room for the final exclusive tile endpoint."""
+
+    safe_max = 2**31 - 128
+    assert safe_max == _DECODE_MAX_KV_LEN
+    assert _validate_max_kv_len(safe_max, "max_seq_len") == safe_max
+    assert safe_max + _DECODE_MAX_KV_TILE_SIZE - 1 == 2**31 - 1
+    assert (
+        safe_max + _DECODE_MAX_KV_TILE_SIZE - 1
+    ) // _DECODE_MAX_KV_TILE_SIZE * _DECODE_MAX_KV_TILE_SIZE <= 2**31 - 1
+    assert (
+        safe_max + 1 + _DECODE_MAX_KV_TILE_SIZE - 1
+    ) // _DECODE_MAX_KV_TILE_SIZE * _DECODE_MAX_KV_TILE_SIZE == 2**31
+
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"max_seq_len must be <= {safe_max}.*signed int32",
+    ):
+        _validate_max_kv_len(safe_max + 1, "max_seq_len")
+
+    _validate_decode_policy_kv_tile_size(
+        type("Config", (), {"tile_size_kv": _DECODE_MAX_KV_TILE_SIZE})()
+    )
+    with pytest.raises(RuntimeError, match=r"K/V tile no larger than 128.*got 256"):
+        _validate_decode_policy_kv_tile_size(
+            type("Config", (), {"tile_size_kv": 256})()
+        )
+
+
+def test_attention_ts_decode_workspace_rejects_unsafe_int32_kv_bound() -> None:
+    """Workspace policy lookup rejects the first unsafe bound before CUDA work."""
+
+    with pytest.raises(
+        NotImplementedError, match=r"padded FMHA decode K/V coordinates"
+    ):
+        get_prims_ts_batch_decode_workspace_size(
+            batch_size=1,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            page_size=32,
+            max_seq_len=_DECODE_MAX_KV_LEN + 1,
+            device="cuda:0",
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> None:
+    """Standalone launch and reusable planning share the padded-coordinate cap."""
+
+    device = torch.device("cuda")
+    page_size = 16
+    assert (
+        get_prims_ts_batch_decode_workspace_size(
+            batch_size=1,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=64,
+            page_size=page_size,
+            max_seq_len=_DECODE_MAX_KV_LEN,
+            device=device,
+        )
+        > 0
+    )
+    q = torch.empty((1, 8, 64), dtype=torch.float16, device=device)
+    kv_cache = torch.empty((1, 2, 1, page_size, 64), dtype=torch.float16, device=device)
+    paged_kv_indptr = torch.tensor((0, 1), dtype=torch.int32, device=device)
+    paged_kv_indices = torch.tensor((0,), dtype=torch.int32, device=device)
+    last_page_len = torch.tensor((page_size,), dtype=torch.int32, device=device)
+    seq_lens = last_page_len.clone()
+    unsafe_max = _DECODE_MAX_KV_LEN + 1
+
+    with pytest.raises(
+        NotImplementedError, match=r"padded FMHA decode K/V coordinates"
+    ):
+        prims_ts_batch_decode_with_kv_cache(
+            q,
+            kv_cache,
+            torch.empty(1, dtype=torch.uint8, device=device),
+            paged_kv_indptr,
+            paged_kv_indices,
+            seq_lens,
+            unsafe_max,
+        )
+
+    with pytest.raises(
+        NotImplementedError, match=r"padded FMHA decode K/V coordinates"
+    ):
+        BatchDecodePagedTSWrapper().plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            last_page_len,
+            8,
+            1,
+            64,
+            page_size,
+            max_kv_len=unsafe_max,
         )
 
 
