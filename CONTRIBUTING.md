@@ -43,19 +43,21 @@ Code Contribution Procedure
 
 FlashInfer distinguishes stable functionality (normal review and support
 expectations) from **experimental** functionality intended for fast-moving
-work such as client-GPU (e.g. SM12x) kernels. Two separate concerns:
+work — client-GPU (e.g. SM12x) kernels, new operations from the latest
+models, or highly specialized kernels for specific problem sizes. Two
+separate concerns:
 
 * an **experimental API** — a public interface that may change or disappear;
 * an **experimental backend** — an implementation not yet ready for stable support.
 
-A stable API may expose an experimental backend through explicit opt-in, and an
-experimental API must be clearly identified and gated.
+A stable API may route to an experimental backend once experimental features
+are enabled, and an experimental API must be clearly identified and gated.
 
 **Placement:**
 
 * Experimental **APIs** live in core, marked with `@flashinfer_experimental_api`
   (defined in `flashinfer/api_logging.py`). The core entry point stays thin:
-  signature, shared validation, feature-gate check, explicit backend selection,
+  signature, shared validation, feature-gate check, backend selection,
   direct handoff.
 * Experimental **backends** and all backend-specific logic (support checks,
   heuristics, routing, compilation, caching, kernels) live under
@@ -63,9 +65,11 @@ experimental API must be clearly identified and gated.
 
 **Gating:** all experimental behavior requires
 `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1`. The variable *permits*
-experimental functionality; it does not *select* it — stable APIs must never
-silently route to an experimental backend, and automatic routing (dispatch,
-autotuning, trace-apply) considers only stable backends.
+experimental functionality everywhere: with it set, stable APIs may route to
+experimental backends automatically — dispatch, autotuning, and trace-apply
+may consider experimental backends alongside stable ones. Without it,
+experimental APIs raise `RuntimeError` and automatic routing considers only
+stable backends.
 
 **Requirements for every experimental feature:**
 

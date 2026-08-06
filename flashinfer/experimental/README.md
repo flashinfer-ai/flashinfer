@@ -8,9 +8,10 @@ FlashInfer. Code under `flashinfer/experimental/` and every API marked with
 
 FlashInfer applies uniform review and support expectations to stable
 user-facing functionality. That works well for long-term-supported features,
-especially on datacenter architectures, but less well for fast-moving work
-(e.g. client-GPU kernels on SM12x) where users value functional availability
-over API or implementation stability.
+but less well for fast-moving work — client-GPU (e.g. SM12x) kernels, new
+operations from the latest models, or highly specialized kernels for specific
+problem sizes — where users value functional availability over API or
+implementation stability.
 
 FlashInfer therefore distinguishes:
 
@@ -26,7 +27,7 @@ These are separate concerns:
 | Stable API       | Normal path           | Allowed with opt-in  |
 | Experimental API | Not a target use case | Allowed with opt-in  |
 
-In this document, **core** refers to the existing non-experimental codebase
+In this README, **core** refers to the existing non-experimental codebase
 (everything outside `flashinfer/experimental/`).
 
 ## Selected design
@@ -42,7 +43,7 @@ Where core contains an experimental entry point, it may include only:
 - the public API signature;
 - general (shared) validation;
 - the feature-gate check;
-- explicit backend selection;
+- backend selection;
 - a direct handoff to `flashinfer.experimental`.
 
 Backend-specific support checks, heuristics, routing, compilation, caching,
@@ -58,18 +59,19 @@ All experimental behavior requires:
 export FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1
 ```
 
-Without this opt-in:
+**Without** this opt-in:
 
 - experimental APIs raise `RuntimeError` when called;
 - stable APIs must not select experimental backends;
 - automatic routing (backend dispatch, autotuning, trace-apply substitution)
   must consider only stable backends.
 
-**The environment variable permits experimental functionality; it does not
-select it.** A stable API must additionally require explicit selection (e.g.
-an explicit `backend=` argument) to route to an experimental backend. Stable
-APIs must never silently select experimental backends, with or without the
-flag.
+**The environment variable is the single opt-in.** With it set, stable APIs
+may route to experimental backends automatically: backend dispatch,
+autotuning, and trace-apply substitution may consider experimental backends
+alongside stable ones. Setting the flag is consent to experimental behavior
+wherever it applies; an explicit `backend=` argument remains available to
+force a specific backend but is not required.
 
 Importing `flashinfer.experimental` is always allowed so that tooling, docs,
 and introspection work without the flag; the gate is enforced at call time.
@@ -79,15 +81,53 @@ and introspection work without the flag; the gate is enforced at call time.
 Defined in `flashinfer/api_logging.py` and re-exported from
 `flashinfer.experimental`:
 
-- `@flashinfer_experimental_api(trace=..., feature=..., tracking_issue=...)`
+- `@flashinfer_experimental_api(trace=..., feature=...)`
   — marks a public experimental API. Composes with `@flashinfer_api`
   (logging/dump/trace still work), enforces the gate, emits an
   `ExperimentalWarning` once per process, and sets `is_experimental = True`
   for mechanical identification.
-- `require_experimental(feature, tracking_issue=None)` — call in the thin
-  core entry point of a stable API before handing off to an experimental
-  backend.
+- `require_experimental(feature)` — call in the thin core entry point of a
+  stable API before handing off to an experimental backend.
 - `is_experimental_enabled()` — raw gate check.
+
+### Adding an experimental API (new public function)
+
+Implement the backend under `flashinfer/experimental/<feature>/`, then add
+the public function in the appropriate core module, decorated:
+
+```python
+from .api_logging import flashinfer_experimental_api
+
+@flashinfer_experimental_api
+def my_new_op(x, ...):
+    """Docstring (the decorator prepends the experimental banner)."""
+    # shared validation only
+    from .experimental.my_feature import run  # deferred import
+    return run(x, ...)
+```
+
+The decorator enforces the gate (`RuntimeError` when off), warns once per
+process (`ExperimentalWarning`), and sets `is_experimental = True`.
+
+Note that the function body is exactly the **thin core entry point** from the
+selected design: shared validation, then a deferred (function-local) import
+and a direct handoff to `flashinfer.experimental`. Everything
+backend-specific stays under `flashinfer/experimental/`, and the deferred
+import keeps `import flashinfer` from ever loading experimental code.
+
+### Exposing an experimental backend from a stable API
+
+In the stable API's dispatch — behind an explicit `backend=` value or an
+automatic-routing branch — guard the handoff with `require_experimental`:
+
+```python
+from .api_logging import require_experimental
+
+if backend == "experimental_xyz":
+    require_experimental("op_name experimental_xyz backend")
+    from .experimental.xyz import run  # deferred import
+    return run(...)
+```
 
 ## Ownership and lifecycle
 
@@ -114,8 +154,16 @@ reasons for removal **without** stable deprecation guarantees.
 
 ## Admission criteria
 
-The initial focus is fast-moving client-GPU kernels and backends, including
-SM12x. Other categories may be admitted with maintainer approval.
+The admitted use cases are the fast-moving work this policy exists for:
+
+- **client-GPU kernels and backends** (e.g. SM12x);
+- **new operations from the latest models**, where functional support can
+  land ahead of a finalized stable API;
+- **highly specialized kernels for specific problem sizes**, which enter as
+  experimental backends behind an existing stable API rather than as new
+  APIs.
+
+Other categories may be admitted with maintainer approval.
 
 A feature requires documented justification, such as:
 
@@ -141,11 +189,17 @@ Tests live under `tests/experimental/` and run in a separate CI lane; they
 must pass for PRs that modify the feature.
 
 Changes under `flashinfer/experimental/` receive narrower review focused on
-eligibility, correctness, containment, licensing, and obvious safety or
+eligibility, correctness, containment, and obvious safety or
 maintainability risks. Changes to core (including thin entry points) follow
 the normal core review process; reviewers verify that integration is
 explicit, stable behavior is unchanged by default, and backend-specific logic
 has not leaked into core.
+
+The tracking issue is reviewed together with the PR itself, especially when
+the PR introduces a new experimental feature (as opposed to small
+improvements to an existing experimental backend): reviewers assess the
+documented use case, the reason for taking the experimental path, and the
+graduation plan as part of admission.
 
 Broad portability, comprehensive performance coverage, and long-term
 maintainability are **not** required at admission.
@@ -155,7 +209,7 @@ maintainability are **not** required at admission.
 Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
 
 - **Trace templates** (`flashinfer/trace/templates/`) are optional for
-  experimental APIs (recommended before graduation).
+  experimental APIs (needed for graduation).
 - **AOT registration** (`flashinfer/aot.py`) is **prohibited**: experimental
   features are JIT-only so they never ship in `flashinfer-jit-cache` /
   `flashinfer-cubin` pre-built packages. Exceptions require maintainer
@@ -171,10 +225,12 @@ Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
 - `flashinfer/__init__.py` must not eagerly import `flashinfer.experimental`
   (import cost; experimental code may depend on optional packages).
 - Code under `flashinfer/experimental/` may import freely from core.
-- Autotuner tactic enumeration and `trace_apply` kernel substitution must not
-  select experimental paths unless the gate is set *and* the caller
-  explicitly opted in. Experimental tactics serialized into autotune caches
-  must be skippable by loaders after the feature is removed.
+- Experimental backends for stable, autotunable APIs must ensure that
+  experimental tactics captured while experimental features are enabled do
+  not interfere with environments where experimental features are turned
+  off: autotune caches and `trace_apply` configurations containing
+  experimental tactics must be safely skippable by loaders — falling back to
+  stable tactics — when the gate is off or the feature has been removed.
 
 ## User contract
 
@@ -186,7 +242,8 @@ Documentation for each feature must identify:
 - whether the API, the backend, or both are experimental;
 - supported use cases and limitations;
 - required feature gates;
-- any explicit backend-selection requirement.
+- whether the feature participates in automatic routing (dispatch,
+  autotuning, trace-apply) once the gate is set.
 
 Experimental features are intended primarily for main-branch users, community
 containers, and local framework integrations. They should not be enabled by

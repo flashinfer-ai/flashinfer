@@ -581,7 +581,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
-| `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES` | unset | `flashinfer/api_logging.py` | `1` permits experimental APIs and backends (see "Experimental Code" below). It permits but never selects: stable APIs still require explicit backend selection to route to an experimental backend. Without it, experimental APIs raise `RuntimeError`. |
+| `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES` | unset | `flashinfer/api_logging.py` | `1` permits experimental APIs and backends (see "Experimental Code" below). The flag is the single opt-in: with it set, stable APIs may route to experimental backends automatically (dispatch, autotuning, trace-apply). Without it, experimental APIs raise `RuntimeError` and automatic routing considers only stable backends. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |

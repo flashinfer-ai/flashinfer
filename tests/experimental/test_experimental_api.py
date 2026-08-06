@@ -30,9 +30,6 @@ from flashinfer.api_logging import (
     require_experimental,
 )
 
-ISSUE_URL = "https://github.com/flashinfer-ai/flashinfer/issues/0"
-
-
 def _make_add():
     @flashinfer_experimental_api
     def sample_add(x, y):
@@ -80,15 +77,13 @@ def test_mechanical_identification(monkeypatch):
 def test_decorator_with_arguments(monkeypatch):
     monkeypatch.delenv(_EXPERIMENTAL_ENV_VAR, raising=False)
 
-    @flashinfer_experimental_api(feature="my_feature", tracking_issue=ISSUE_URL)
+    @flashinfer_experimental_api(feature="my_feature")
     def sample_mul(x, y):
         return x * y
 
     assert sample_mul.experimental_feature == "my_feature"
-    assert sample_mul.tracking_issue == ISSUE_URL
-    with pytest.raises(RuntimeError, match="my_feature") as excinfo:
+    with pytest.raises(RuntimeError, match="my_feature"):
         sample_mul(2, 3)
-    assert ISSUE_URL in str(excinfo.value)
 
     monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, "1")
     with pytest.warns(ExperimentalWarning, match="my_feature"):
@@ -97,9 +92,8 @@ def test_decorator_with_arguments(monkeypatch):
 
 def test_require_experimental(monkeypatch):
     monkeypatch.delenv(_EXPERIMENTAL_ENV_VAR, raising=False)
-    with pytest.raises(RuntimeError, match="some backend") as excinfo:
-        require_experimental("some backend", tracking_issue=ISSUE_URL)
-    assert ISSUE_URL in str(excinfo.value)
+    with pytest.raises(RuntimeError, match="some backend"):
+        require_experimental("some backend")
 
     monkeypatch.setenv(_EXPERIMENTAL_ENV_VAR, "1")
     require_experimental("some backend")  # must not raise

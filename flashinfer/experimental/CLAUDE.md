@@ -20,13 +20,14 @@ point that validates, checks the feature gate, and hands off to this package.
   import after calling `require_experimental(...)`.
 - **Never** register experimental modules in `flashinfer/aot.py` —
   experimental features are JIT-only and must not ship in pre-built packages.
-- **Never** let a stable API route here by default. The env var
-  `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1` *permits* experimental
-  behavior; explicit selection (e.g. `backend="experimental_xyz"`) *selects*
-  it. Both are required.
+- **Never** let a stable API route here while the gate is off. Setting
+  `FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES=1` permits experimental behavior,
+  including automatic routing from stable APIs to experimental backends
+  (dispatch, autotuning, trace-apply); without it, routing must consider
+  only stable backends.
 - **Never** eagerly import this package from `flashinfer/__init__.py`.
 - Autotuner tactic enumeration and trace_apply substitution must not pick
-  experimental paths without the gate plus explicit opt-in.
+  experimental paths without the gate.
 
 ## Adding an experimental API (new public function)
 
@@ -36,9 +37,7 @@ point that validates, checks the feature gate, and hands off to this package.
    ```python
    from .api_logging import flashinfer_experimental_api
 
-   @flashinfer_experimental_api(
-       tracking_issue="https://github.com/flashinfer-ai/flashinfer/issues/NNNN",
-   )
+   @flashinfer_experimental_api
    def my_new_op(x, ...):
        """Docstring (the decorator prepends the experimental banner)."""
        # shared validation only
@@ -51,13 +50,14 @@ point that validates, checks the feature gate, and hands off to this package.
 
 ## Exposing an experimental backend from a stable API
 
-In the stable API's dispatch, behind an explicit `backend=` value:
+In the stable API's dispatch — behind an explicit `backend=` value or an
+automatic-routing branch — guard the handoff with `require_experimental`:
 
 ```python
 from .api_logging import require_experimental
 
 if backend == "experimental_xyz":
-    require_experimental("op_name experimental_xyz backend", tracking_issue="...")
+    require_experimental("op_name experimental_xyz backend")
     from .experimental.xyz import run  # deferred import
     return run(...)
 ```

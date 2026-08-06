@@ -2563,9 +2563,10 @@ def is_experimental_enabled() -> bool:
     Experimental features are permitted when the environment variable
     ``FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES`` is set to ``1``.
 
-    Note that this flag *permits* experimental functionality; it never
-    *selects* it. Stable APIs must still require explicit opt-in (e.g. an
-    explicit ``backend=`` argument) to route to an experimental backend.
+    Setting the flag is the single opt-in for experimental functionality:
+    with it set, stable APIs may route to experimental backends
+    automatically (dispatch, autotuning, trace-apply). When unset,
+    automatic routing must consider only stable backends.
 
     The environment variable is read on every call so the gate can be
     toggled at runtime (e.g. in tests). The check is a single dict lookup
@@ -2574,29 +2575,24 @@ def is_experimental_enabled() -> bool:
     return os.environ.get(_EXPERIMENTAL_ENV_VAR, "0") == "1"
 
 
-def _experimental_disabled_message(
-    feature: str, tracking_issue: Optional[str] = None
-) -> str:
-    msg = (
+def _experimental_disabled_message(feature: str) -> str:
+    return (
         f"'{feature}' is experimental FlashInfer functionality and is disabled "
         f"by default. Set {_EXPERIMENTAL_ENV_VAR}=1 to enable it. Experimental "
         f"features provide no compatibility guarantees and may change or be "
         f"removed without deprecation."
     )
-    if tracking_issue:
-        msg += f" Tracking issue: {tracking_issue}"
-    return msg
 
 
-def require_experimental(feature: str, tracking_issue: Optional[str] = None) -> None:
+def require_experimental(feature: str) -> None:
     """Raise ``RuntimeError`` unless experimental features are enabled.
 
-    Use this in the thin core entry point of a *stable* API that exposes an
-    *experimental* backend through explicit selection, before handing off to
-    code under ``flashinfer.experimental``:
+    Use this in the thin core entry point of a *stable* API that routes to an
+    *experimental* backend — via explicit ``backend=`` selection or automatic
+    routing — before handing off to code under ``flashinfer.experimental``:
 
     >>> if backend == "experimental_xyz":
-    ...     require_experimental("mm_xyz experimental backend", tracking_issue="...")
+    ...     require_experimental("mm_xyz experimental backend")
     ...     from flashinfer.experimental import xyz  # deferred import
     ...     return xyz.run(...)
 
@@ -2605,12 +2601,9 @@ def require_experimental(feature: str, tracking_issue: Optional[str] = None) -> 
     feature : str
         Human-readable name of the experimental feature, used in the error
         message.
-    tracking_issue : Optional[str]
-        URL of the tracking issue for this feature, appended to the error
-        message when provided.
     """
     if not is_experimental_enabled():
-        raise RuntimeError(_experimental_disabled_message(feature, tracking_issue))
+        raise RuntimeError(_experimental_disabled_message(feature))
 
 
 def flashinfer_experimental_api(
@@ -2618,7 +2611,6 @@ def flashinfer_experimental_api(
     *,
     trace=None,
     feature: Optional[str] = None,
-    tracking_issue: Optional[str] = None,
 ) -> Callable:
     """Decorator marking a public FlashInfer API as experimental.
 
@@ -2644,16 +2636,10 @@ def flashinfer_experimental_api(
     feature : Optional[str]
         Human-readable feature name used in the gate error and warning.
         Defaults to the function's qualified name.
-    tracking_issue : Optional[str]
-        URL of the feature's tracking issue. Optional in code, but required
-        by policy for merged experimental APIs (see the README); prefer
-        passing it so error messages point users at the feature's status.
 
     Examples
     --------
-    >>> @flashinfer_experimental_api(
-    ...     tracking_issue="https://github.com/flashinfer-ai/flashinfer/issues/1234"
-    ... )
+    >>> @flashinfer_experimental_api
     ... def my_new_op(x, y):
     ...     ...
     """
@@ -2667,9 +2653,7 @@ def flashinfer_experimental_api(
         def wrapper(*args, **kwargs):
             nonlocal warned
             if not is_experimental_enabled():
-                raise RuntimeError(
-                    _experimental_disabled_message(feature_name, tracking_issue)
-                )
+                raise RuntimeError(_experimental_disabled_message(feature_name))
             if not warned:
                 warned = True
                 warn_msg = (
@@ -2677,14 +2661,11 @@ def flashinfer_experimental_api(
                     f"provides no compatibility guarantees and may change or be "
                     f"removed without deprecation."
                 )
-                if tracking_issue:
-                    warn_msg += f" Tracking issue: {tracking_issue}"
                 warnings.warn(warn_msg, ExperimentalWarning, stacklevel=2)
             return logged(*args, **kwargs)
 
         wrapper.is_experimental = True  # type: ignore[attr-defined]
         wrapper.experimental_feature = feature_name  # type: ignore[attr-defined]
-        wrapper.tracking_issue = tracking_issue  # type: ignore[attr-defined]
         banner = (
             ".. warning::\n"
             f"    ``{feature_name}`` is experimental. It requires "
