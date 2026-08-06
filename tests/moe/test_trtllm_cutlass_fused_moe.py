@@ -3887,6 +3887,7 @@ def _small_moe_inputs(m, hidden, inter, e, top_k, dtype=torch.bfloat16):
     return w31, w2, weights.float().contiguous(), ids.to(torch.int)
 
 
+@_WS_CUTLASS_MOE_SKIP
 def test_vectorized_kernel_rejects_misaligned_input():
     """The vectorized expand/activation kernels need 16B-aligned rows; a
     misaligned input base must fail fast on the host with a clear diagnostic
