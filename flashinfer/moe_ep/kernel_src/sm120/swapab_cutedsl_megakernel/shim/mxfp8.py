@@ -1405,7 +1405,9 @@ def _main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     if world_size > 1 or not bool(int(os.environ.get("MEGA_NO_DIST", "0"))):
-        torch.cuda.set_device(local_rank)
+        # Fold onto the physical GPUs (rank-sharing single-GPU boxes; the
+        # kernel drop's bootstrap does the same).
+        torch.cuda.set_device(local_rank % max(torch.cuda.device_count(), 1))
 
     HIDDEN = 2048
     INTERMEDIATE = 1024
