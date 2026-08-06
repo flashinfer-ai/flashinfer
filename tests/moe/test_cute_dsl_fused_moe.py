@@ -1036,6 +1036,41 @@ class TestCuteDslFusedMoeFunctional:
             use_fused_finalize=False,
         )
 
+    @pytest.mark.parametrize("hidden_size", [256, 384])
+    def test_finalize_handles_cluster_padding_and_partial_n_tiles(
+        self,
+        hidden_size: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from flashinfer.autotuner import AutoTuner
+
+        # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
+        # configuration. hidden=384 also gives the second CTA a partial tile.
+        # Force the 256-row route so both cases execute the kernel path that
+        # previously had to be filtered out.
+        tail_config = (
+            256,
+            ((256, 128), (2, 1), False),
+            ((256, 256), (2, 2), False),
+        )
+
+        def choose_tail_config(
+            _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
+        ):
+            return runners[0], tail_config
+
+        monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
+        self._run_numerical_accuracy(
+            activation_type=ActivationType.Relu2,
+            num_tokens=128,
+            top_k=2,
+            hidden_size=hidden_size,
+            intermediate_size=512,
+            num_experts=8,
+            use_per_token_activation=True,
+            use_fused_finalize=True,
+        )
+
     def _run_numerical_accuracy(
         self,
         activation_type: ActivationType,

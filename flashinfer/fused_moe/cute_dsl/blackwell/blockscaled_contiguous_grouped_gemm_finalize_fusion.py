@@ -836,7 +836,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         epi_tile_size = epi_tile_m * epi_tile_n
         num_epilogue_threads = 32 * len(self.epilog_warp_id)
         self.ttr_racc_size = epi_tile_size // num_epilogue_threads
-        self.copy_size = self.cta_tile_shape_mnk[1] * (self.out_dtype.width // 8)
 
         if cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
             # 8-element vectorization for BF16
@@ -2153,37 +2152,48 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 reduce_permuted_row = tile_m_start + reduce_row
                 is_valid_reduce_row = reduce_permuted_row < tile_info[4]
                 if is_valid_reduce_row:
-                    reduce_token_idx = sMetaTokenIdx[
-                        (reduce_row, meta_consumer_state.index)
-                    ]
                     coord_n = tile_info[1] * self.cta_tile_shape_mnk[1]
-                    scatter_out_offset = cute.domain_offset(
-                        (reduce_token_idx, coord_n, 0), out
+                    valid_columns = cutlass.min(
+                        cutlass.Int64(out.shape[1]) - coord_n,
+                        cutlass.Int64(self.cta_tile_shape_mnk[1]),
                     )
-                    if cutlass.const_expr(not self.use_fused_finalize):
-                        blk_copy(
-                            scatter_out_offset,
-                            sC[reduce_row, None, 0],
-                            cutlass.Int32(self.copy_size),
+                    if valid_columns > 0:
+                        reduce_token_idx = sMetaTokenIdx[
+                            (reduce_row, meta_consumer_state.index)
+                        ]
+                        scatter_out_offset = cute.domain_offset(
+                            (reduce_token_idx, coord_n, 0), out
                         )
-                    elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
-                        blk_reduce_bf16(
-                            scatter_out_offset,
-                            sC[reduce_row, None, 0],
-                            cutlass.Int32(self.copy_size),
+                        valid_copy_size = cutlass.Int32(
+                            valid_columns * (self.out_dtype.width // 8)
                         )
-                    elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
-                        blk_reduce_fp32(
-                            scatter_out_offset,
-                            sC[reduce_row, None, 0],
-                            cutlass.Int32(self.copy_size),
-                        )
-                    elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
-                        blk_reduce_fp16(
-                            scatter_out_offset,
-                            sC[reduce_row, None, 0],
-                            cutlass.Int32(self.copy_size),
-                        )
+                        # is_valid_tensor_alignment requires each output row to
+                        # end on a 16-byte boundary, matching the bulk-copy
+                        # instruction's size and address requirements.
+                        if cutlass.const_expr(not self.use_fused_finalize):
+                            blk_copy(
+                                scatter_out_offset,
+                                sC[reduce_row, None, 0],
+                                valid_copy_size,
+                            )
+                        elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                            blk_reduce_bf16(
+                                scatter_out_offset,
+                                sC[reduce_row, None, 0],
+                                valid_copy_size,
+                            )
+                        elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
+                            blk_reduce_fp32(
+                                scatter_out_offset,
+                                sC[reduce_row, None, 0],
+                                valid_copy_size,
+                            )
+                        elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
+                            blk_reduce_fp16(
+                                scatter_out_offset,
+                                sC[reduce_row, None, 0],
+                                valid_copy_size,
+                            )
 
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
