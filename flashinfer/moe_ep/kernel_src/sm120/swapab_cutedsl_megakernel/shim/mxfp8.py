@@ -171,11 +171,12 @@ class MegaMoESm120Mxfp8Config:
                 f"got {self.cluster_shape_mnk}."
             )
         # C3 pool constraint: cluster_tile_tokens (= N * cluster_n under
-        # swap-AB) must be a multiple of the token padding block (64).
-        if (n * cn) % _CTA_TOKEN_TILE != 0:
+        # swap-AB; cluster_n is pinned to 1 above) must be a multiple of the
+        # token padding block (64).
+        if n % _CTA_TOKEN_TILE != 0:
             raise ValueError(
-                f"mma_tiler N * cluster_n ({n} * {cn}) must be a multiple of "
-                f"the token padding block ({_CTA_TOKEN_TILE})."
+                f"mma_tiler N ({n}) must be a multiple of the token padding "
+                f"block ({_CTA_TOKEN_TILE})."
             )
         if self.token_back_mode not in _TOKEN_BACK_MODES:
             raise ValueError(
