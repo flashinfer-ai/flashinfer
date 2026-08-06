@@ -201,10 +201,11 @@ def pytest_collection_modifyitems(config, items):
                     "check install log for skipped-backend warnings)"
                 )
             )
+        launched_ranks = int(os.environ.get("WORLD_SIZE", "0"))
         for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):
-            if mk in item.keywords and ngpu < req:
-                item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
-            elif mk in item.keywords and "WORLD_SIZE" not in os.environ:
+            if mk not in item.keywords:
+                continue
+            if "WORLD_SIZE" not in os.environ:
                 # Multi-rank tests must be launched via torchrun (see
                 # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
                 # (e.g. CI unit-test sweeps) they would hang on dist init.
@@ -213,6 +214,13 @@ def pytest_collection_modifyitems(config, items):
                         reason="requires torchrun launch (WORLD_SIZE unset)"
                     )
                 )
+            elif ngpu < req and launched_ranks < req:
+                # An explicit torchrun with WORLD_SIZE >= req overrides the
+                # physical GPU count: single-GPU sm_12x boxes (RTX/GB10,
+                # DGX-Spark style) run multirank with ranks sharing one GPU
+                # (the sm120 kernel drop's bootstrap maps
+                # local_rank % device_count and supports MEGA_SINGLE_GPU_GLOO).
+                item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
         # Exactly the sm_10x family: the sm_100 tree's kernels do not target
         # Hopper (below) or the consumer sm_11x/sm_12x families (which use
         # their own kernel trees), so >= would let them collect on hosts
