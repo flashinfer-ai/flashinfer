@@ -33,6 +33,15 @@ replace, what to audit) lives in `SKILL.md`.
   is unavoidable, list it here as a pending-upstream diff until the next drop
   absorbs it.
 
+## Known-broken upstream features at this snapshot
+
+- **`in_kernel_fc2_reduce` (REDG in-flight combine)**: the drop's own
+  `mega_runner` crashes with `cudaErrorIllegalAddress` under
+  `--in_kernel_fc2_reduce` (verified 2026-08-06, RTX PRO 6000 / 4 ranks on
+  1 GPU, DSL 4.6.1), and the flag appears in none of the drop's test
+  scripts. The FI backend rejects the flag; the shim keeps the plumbing so a
+  fixed drop only needs the backend guard and test skips removed.
+
 ## Pending local diffs vs upstream
 
 The snapshot was taken from a **dirty worktree**: two files carried
