@@ -265,6 +265,16 @@ def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
+def sm120_mxfp8_cutedsl_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the SM120 swap-AB MXFP8 mega kernel.
+
+    Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
+    """
+    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+
 __all__ = [
     "MoEEpRuntimeHandle",
     "NVSHMEM",
@@ -275,5 +285,6 @@ __all__ = [
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",
+    "sm120_mxfp8_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]

@@ -661,6 +661,8 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 - `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo; a push-style tree will be added later)
+- `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
+  (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
