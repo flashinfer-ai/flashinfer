@@ -362,7 +362,7 @@ struct BlockBatchPagedAttentionPersistent {
                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
                   kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
                                  NUM_MMA_KV * 16,
-                  q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
+                  q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
             }
             if constexpr (WITH_MASK) {
               logits_mask<KTraits>(
@@ -418,7 +418,7 @@ struct BlockBatchPagedAttentionPersistent {
               params, variant, /*batch_idx=*/0, qo_packed_idx_base,
               kv_start +
                   (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
-              q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
+              q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
         }
         logits_mask<KTraits>(
             params, variant, /*batch_idx=*/0, qo_packed_idx_base,

@@ -82,6 +82,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
+    trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 

@@ -171,6 +171,67 @@ def _test_prefill_kernel(
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
 
+@torch.inference_mode()
+def test_prefill_block_end_decay(qkv_factory, seed=0):
+    _skip_if_unsupported()
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    seq_lens = [64, 111, 192]
+    total_seqlen = sum(seq_lens)
+    num_heads = 1
+    head_size = 128
+    dtype = torch.float16
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_heads, num_heads, num_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = 0.99 + 0.01 * torch.rand(total_seqlen, num_heads)
+        beta = 0.99 + 0.01 * torch.rand(total_seqlen, num_heads)
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+
+    our_o = torch.empty_like(q)
+    our_state = torch.empty(
+        (len(seq_lens), num_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,
+        None,
+        True,
+        cu_seqlens,
+        True,
+        output=our_o,
+        output_state=our_state,
+        use_cp=False,
+    )
+
+    ref_o, ref_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        alpha=alpha,
+        beta=beta,
+        block_size=64,
+        state_dtype=torch.float32,
+    )
+    torch.testing.assert_close(our_o, ref_o.to(dtype), atol=2e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        our_state.transpose(-1, -2), ref_state, atol=1e-3, rtol=1e-4
+    )
+
+
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])

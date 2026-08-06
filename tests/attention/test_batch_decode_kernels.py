@@ -53,6 +53,13 @@ def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
         )
 
 
+def skip_if_nvfp4_kv_unsupported():
+    # Mirrors the guard in flashinfer.decode/prefill: no NVFP4-KV decode
+    # kernels exist for SM107.
+    if get_compute_capability(torch.device("cuda:0")) == (10, 7):
+        pytest.skip("KV Cache NVFP4 is not supported on SM107")
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -734,6 +741,7 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_decode_with_kv_cache per batch item.
     """
+    skip_if_nvfp4_kv_unsupported()
     kv_layout = "NHD"
     torch.manual_seed(42)
 
