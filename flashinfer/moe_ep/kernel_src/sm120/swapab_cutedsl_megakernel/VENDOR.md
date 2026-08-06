@@ -46,6 +46,19 @@ replace, what to audit) lives in `SKILL.md`.
   2026-08-06, same setup, reproduced with the drop's own `mega_runner` at
   `--cluster_shape_mnk 2,1,1`); the drop's test scripts always use `1,1,1`.
   The shim config rejects anything but `(1, 1, 1)`.
+- **`gate_up_clamp`**: dead plumbing — `kernel_fc12.py` stores the ctor arg
+  and never reads it; kernel output is bit-identical with and without the
+  clamp while the torch reference applies it (verified 2026-08-06 by A/B on
+  dense data; the drop's ±0.5-sparse test data never reaches any clamp, so
+  its own runner cannot see this). The FI backend rejects a set clamp; the
+  shim keeps passing it to the ctor for a fixed drop.
+- **world_size=1 (`MEGA_NO_DIST`) numerics with `mma_tiler` N=128**: silently
+  wrong outputs (5–20% of cells off, worst-hit tokens scattered per expert),
+  reproduced with the drop's own `mega_runner` at
+  `MEGA_NO_DIST=1 --mma_tiler_mnk 64,128,128` on both its standard geometry
+  and ours; the same N=128 tile is bit-exact at world_size=4, and N=64 is
+  bit-exact at world_size=1. Multi-rank use is unaffected; avoid the
+  single-rank path with N=128 until a fixed drop.
 
 ## Pending local diffs vs upstream
 

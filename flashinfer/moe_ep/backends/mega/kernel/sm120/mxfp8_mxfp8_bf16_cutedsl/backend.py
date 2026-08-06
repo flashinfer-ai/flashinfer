@@ -64,6 +64,17 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 "kernel drop (upstream REDG path crashes); use the default "
                 "explicit topk reduce."
             )
+        if _resolve_gate_up_clamp(config) is not None:
+            # Verified 2026-08-06 at kernel-source level: the drop's
+            # kernel_fc12 stores gate_up_clamp and never reads it (dead
+            # plumbing; kernel output is bit-identical with and without the
+            # clamp). Silently dropping a DeepSeek-V4 swiglu_limit would be a
+            # correctness hazard, so reject until a drop wires it (VENDOR.md).
+            raise NotImplementedError(
+                "gate_up_clamp/activation_clamp is not functional in the "
+                "current SM120 kernel drop (the kernel ignores it); leave it "
+                "unset."
+            )
         if config.knobs is not None and not isinstance(config.knobs, dict):
             raise ValueError(
                 "sm120_mxfp8_mxfp8_bf16_cutedsl supports only knobs=None or an "
