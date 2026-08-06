@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""CuTe-DSL backend for the bf16 x fp4 GEMM (weight repack / kernel launch)."""
+"""Architecture-specific CuTe-DSL backend for the BF16 x NVFP4 GEMM."""
 
-from typing import List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -20,6 +20,7 @@ from ..fused_moe.utils import (
 )
 from .gemm_base import _check_cute_dsl_availability
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
+from ..utils import get_compute_capability
 
 _BF16_FP4_ALPHA_ONE_CACHE: dict = {}
 
@@ -116,8 +117,8 @@ def _get_cute_dsl_bf16_fp4_gemm(
     import cutlass.cute as cute
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
-    from .kernels.cute_dsl.dense_gemm_bf16_fp4_blackwell import (
-        BlackwellDenseGemmBf16Fp4Kernel,
+    from .kernels.cute_dsl.dense_gemm_bf16_fp4_sm12x import (
+        Sm12xDenseGemmBf16Fp4Kernel,
     )
 
     from ..cute_dsl.utils import torch_to_cutlass_dtype
@@ -151,7 +152,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    gemm = BlackwellDenseGemmBf16Fp4Kernel(
+    gemm = Sm12xDenseGemmBf16Fp4Kernel(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
@@ -253,7 +254,7 @@ def _cute_dsl_pack_fp4_weight(b: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _prepare_cute_dsl(
+def _prepare_cute_dsl_sm12x(
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor],
@@ -280,6 +281,50 @@ def _prepare_cute_dsl(
     sf_ksf_n = linear_sf.t().contiguous()  # (K_sf, N) uint8 (E4M3)
     sf_ksf_n = _e4m3_to_s0e5m3(sf_ksf_n)  # -> S0E5M3
     return b_packed, sf_ksf_n, alpha
+
+
+def _prepare_cute_dsl_sm100(
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """cute-DSL-backend prep: keep SF in swizzled layout.
+
+    ``convert_sf_to_mma_layout`` only creates the six-dimensional strided view
+    consumed by the SM100 TMA descriptor; it does not copy or linearize the
+    canonical 128x4 scale-factor buffer.
+    """
+    from ..cute_dsl.utils import convert_sf_to_mma_layout
+
+    n = int(b.shape[0])
+    k = int(b.shape[1]) * 2
+    weight_sf = convert_sf_to_mma_layout(
+        b_descale,
+        m=n,
+        k=k,
+        num_groups=1,
+        sf_vec_size=block_size,
+    )
+    return b.contiguous(), weight_sf, alpha
+
+
+def _prepare_cute_dsl(
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Dispatch weight preparation to the architecture-specific DSL kernel."""
+    major, minor = get_compute_capability(b.device)
+    if (major, minor) in ((10, 0), (10, 3)):
+        return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
+    elif major == 12:
+        return _prepare_cute_dsl_sm12x(b, b_descale, alpha, block_size)
+    else:
+        raise NotImplementedError(
+            f"cute-dsl w4a16 GEMM only supports SM100/103 and SM12x; got {major}.{minor}"
+        )
 
 
 def _bf16_fp4_cute_dsl_tactic_configs(
@@ -367,6 +412,179 @@ _BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
 )
 
 
+_SM100_BF16_FP4_KERNEL_CACHE: Dict[Tuple, object] = {}
+
+
+def _get_sm100_bf16_fp4_kernel(
+    weight_ptr,
+    weight_sf_ptr,
+    activation_ptr,
+    alpha_ptr,
+    output_ptr,
+    n: int,
+    m: int,
+    k: int,
+    max_active_clusters: int,
+    stream,
+    enable_pdl: bool,
+):
+    """Compile the SM100/103 dense W4A16 kernel for its static tactic."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.dense_gemm_bf16_fp4_sm100 import (
+        Sm100DenseGemmBf16Fp4Kernel,
+    )
+
+    mma_tiler_mnk = (256, 128, 256)
+    cluster_shape_mn = (2, 1)
+    transform_fragment_size = 128 if k == mma_tiler_mnk[2] else 32
+    cache_key = (
+        mma_tiler_mnk,
+        cluster_shape_mn,
+        transform_fragment_size,
+        int(max_active_clusters),
+        bool(enable_pdl),
+    )
+    compiled = _SM100_BF16_FP4_KERNEL_CACHE.get(cache_key)
+    if compiled is not None:
+        return compiled
+
+    kernel = Sm100DenseGemmBf16Fp4Kernel(
+        acc_dtype=cutlass.Float32,
+        use_2cta_instrs=True,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mn=cluster_shape_mn,
+        enable_pdl=enable_pdl,
+        raster_along_m=True,
+        transform_fragment_size=transform_fragment_size,
+    )
+    compiled = cute.compile(
+        kernel.wrapper,
+        weight_ptr,
+        weight_sf_ptr,
+        activation_ptr,
+        alpha_ptr,
+        output_ptr,
+        n,
+        m,
+        k,
+        max_active_clusters=max_active_clusters,
+        stream=stream,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _SM100_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _compute_cute_dsl_sm100(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Launch the SM100 native-layout NVFP4 x BF16 GEMM."""
+    if a.device != b.device or a.device != b_descale.device:
+        raise ValueError(
+            "a, b, and b_descale must be on the same CUDA device; got "
+            f"{a.device}, {b.device}, and {b_descale.device}."
+        )
+    if not a.is_contiguous() or not b.is_contiguous():
+        raise ValueError("SM100 cute-dsl requires contiguous a and b tensors.")
+    if b.dtype != torch.uint8:
+        raise TypeError(
+            "SM100 cute-dsl expects the uint8 NVFP4 weight returned by "
+            "prepare_bf16_fp4_weights(..., backend='cute-dsl'); "
+            f"got {b.dtype}."
+        )
+    if out_dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"SM100 cute-dsl currently requires a bfloat16 output; got {out_dtype}."
+        )
+
+    m, k = map(int, a.shape)
+    n = int(b.shape[0])
+    if int(b.shape[1]) * 2 != k:
+        raise ValueError(
+            f"a.shape[1]={k} but b.shape={tuple(b.shape)} encodes K="
+            f"{int(b.shape[1]) * 2}"
+        )
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    else:
+        if tuple(out.shape) != (m, n):
+            raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
+        if out.dtype != out_dtype:
+            raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
+        if out.device != a.device or not out.is_contiguous():
+            raise ValueError(
+                "out must be contiguous and on the same device as a; got "
+                f"device={out.device}, contiguous={out.is_contiguous()}."
+            )
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..cute_dsl.utils import current_cuda_stream, get_max_active_clusters, make_ptr
+
+    alpha_for_launch = _prepare_bf16_fp4_alpha(alpha, a.device)
+    stream = current_cuda_stream()
+    weight_ptr = make_ptr(
+        cutlass.Float4E2M1FN, b.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+    )
+    weight_sf_ptr = make_ptr(
+        cutlass.Float8E4M3FN,
+        b_descale.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    activation_ptr = make_ptr(
+        cutlass.BFloat16,
+        a.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    alpha_ptr = make_ptr(
+        cutlass.Float32,
+        alpha_for_launch.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    output_ptr = make_ptr(
+        cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+    )
+    max_active_clusters = get_max_active_clusters(2)
+    compiled = _get_sm100_bf16_fp4_kernel(
+        weight_ptr,
+        weight_sf_ptr,
+        activation_ptr,
+        alpha_ptr,
+        output_ptr,
+        n,
+        m,
+        k,
+        max_active_clusters,
+        stream,
+        enable_pdl,
+    )
+    compiled(
+        b.data_ptr(),
+        b_descale.data_ptr(),
+        a.data_ptr(),
+        alpha_for_launch.data_ptr(),
+        out.data_ptr(),
+        n,
+        m,
+        k,
+        stream,
+    )
+    return out
+
+
 def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
     """Build a ``CuteDslBf16Fp4Runner`` for the cute-DSL bf16 x fp4 GEMM."""
 
@@ -436,13 +654,26 @@ def _compute_cute_dsl(
     block_size: int,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    """cute-DSL-backend compute: dispatch to the compiled Blackwell kernel.
+    """Dispatch to the SM100/103 or SM12x compiled Blackwell kernel.
 
-    ``b`` is the packed ``(K // 16, N * 2)`` int32 weight and
-    ``b_descale`` the ``(K // block_size, N)`` uint8 SF in S0E5M3 format
-    (reformatted from FP8-E4M3 by :func:`_e4m3_to_s0e5m3`) returned by
-    :func:`_prepare_cute_dsl`.
+    SM100 consumes the native ``(N, K // 2)`` uint8 NVFP4 weight and 128x4 SF.
+
+    SM12x consumes the packed ``(K // 16, N * 2)`` int32 weight and
+    ``(K // block_size, N)`` uint8 SF in S0E5M3 format (reformatted from FP8-E4M3
+    by :func:`_e4m3_to_s0e5m3`) returned by :func:`_prepare_cute_dsl`.
     """
+    if get_compute_capability(a.device) in ((10, 0), (10, 3)):
+        return _compute_cute_dsl_sm100(
+            a,
+            b,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            enable_pdl,
+        )
+
     if b.dtype != torch.int32:
         raise TypeError(
             f"cute-dsl backend expects the packed int32 weight from "

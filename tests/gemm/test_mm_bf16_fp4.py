@@ -313,6 +313,27 @@ def test_backend_shape_mismatch_raises(backend):
         )
 
 
+def test_cute_dsl_prepare_uses_architecture_specific_layout():
+    """SM100 keeps 128x4 SF storage; SM12x uses the legacy linear repack."""
+    _skip_if_backend_unavailable("cute-dsl")
+    device = torch.device("cuda")
+    n, k = 192, 192
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
+    major, minor = get_compute_capability(device)
+    if major * 10 + minor in (100, 103):
+        assert b_p.dtype == torch.uint8
+        assert b_p.shape == b_fp4.shape
+        assert sf_p.data_ptr() == b_sf.data_ptr()
+        assert sf_p.dim() == 6
+    else:
+        assert b_p.dtype == torch.int32
+        assert sf_p.shape == (k // 16, n)
+
+
 # =============================================================================
 # Dispatcher-level input validation
 # =============================================================================
