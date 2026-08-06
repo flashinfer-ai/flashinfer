@@ -190,6 +190,10 @@ def test_flash_kda_descriptor_workspace_contract():
     assert "major == 10 && (minor == 0 || minor == 3)" in common_text
     assert "CheckFlashKDATarget" in common_text
     assert "PackBetaForTmaKernel" in common_text
+    assert "RoundUpBetaTmaHeads(num_heads)" in common_text
+    assert "padded_num_heads == num_heads" in common_text
+    assert "linear_index / padded_num_heads" in common_text
+    assert "linear_index % padded_num_heads" in common_text
     assert (
         'CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma")'
         in common_text
