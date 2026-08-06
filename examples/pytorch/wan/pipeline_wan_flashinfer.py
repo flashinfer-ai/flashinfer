@@ -106,11 +106,9 @@ def load_wan_pipeline_with_flashinfer_transformers(
     # ``*.index.json`` (the FastVideo VSA releases), which diffusers can't load
     # but ``_load_checkpoint_state_dict`` can.
     model_index = WanPipeline.load_config(model_id)
-    denoisers = [
-        name for name in ("transformer", "transformer_2") if name in model_index
-    ]
-    for name in denoisers:
-        pipe_kwargs[name] = None
+    for name in ("transformer", "transformer_2"):
+        if name in model_index:
+            pipe_kwargs[name] = None
 
     pipe = WanPipeline.from_pretrained(model_id, **pipe_kwargs)
 
@@ -128,7 +126,7 @@ def load_wan_pipeline_with_flashinfer_transformers(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if "transformer_2" in denoisers:
+    if "transformer_2" in pipe_kwargs:
         flash_transformer_2 = _load_flashinfer_transformer(
             model_id,
             "transformer_2",
@@ -200,14 +198,15 @@ def ulysses_context(pipe, args: argparse.Namespace, dtype: torch.dtype):
             f"effective={comm.backend!r}"
             + (f" (fallback: {comm.fallback_reason})" if comm.fallback_reason else "")
         )
-    set_ulysses_communicator(comm)
-    try:
-        yield comm
-    finally:
-        # Clear the global first: closing is collective on the NVLink backend,
-        # and no forward may reference the communicator past this point.
-        set_ulysses_communicator(None)
-        comm.close()
+    # ``comm`` closes itself on exit; clearing the global has to happen first,
+    # since closing is collective on the NVLink backend and no forward may
+    # reference the communicator past this point.
+    with comm:
+        set_ulysses_communicator(comm)
+        try:
+            yield comm
+        finally:
+            set_ulysses_communicator(None)
 
 
 def _assert_ranks_in_sync(latents: torch.Tensor, step: int) -> None:
@@ -220,12 +219,11 @@ def _assert_ranks_in_sync(latents: torch.Tensor, step: int) -> None:
     """
     import torch.distributed as dist
 
-    if not dist.is_initialized() or dist.get_world_size() == 1:
-        return
     checksum = latents.detach().float().sum()
     gathered = [torch.empty_like(checksum) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, checksum)
-    spread = max(abs(g.item() - gathered[0].item()) for g in gathered)
+    stacked = torch.stack(gathered)
+    spread = (stacked - stacked[0]).abs().max().item()
     if spread != 0.0:
         raise RuntimeError(
             f"ranks diverged at denoising step {step}: latent checksums differ "

@@ -970,20 +970,14 @@ class FlashInferLinear(nn.Module):
         return out.to(x.dtype)
 
     def _offline_fp4_activation_scale(self, x: torch.Tensor) -> torch.Tensor:
-        """Static (offline) NVFP4 activation scale, calibrated then frozen.
+        """Static (offline) NVFP4 activation scale: observe the real amax over
+        the first ``_OFFLINE_CALIB_STEPS`` forwards, then freeze it.
 
         The point of offline quantization is to drop the per-forward amax
-        reduction, not to guess the amax. The previous placeholder used a fixed
-        ``_NVFP4_GLOBAL_SF_NUM``, which is the scale you would get if the activation amax
-        were exactly 1.0 — WAN activations are nowhere near that, so the
-        quantizer wasted most of the FP4 range and the outputs were visibly
-        degraded. Instead observe the real amax over the first
-        ``_OFFLINE_CALIB_STEPS`` forwards, then freeze it: calibration happens
-        during warmup and the timed steps pay nothing.
-
-        The returned tensor keeps a stable identity and is only written during
-        calibration, so a CUDA graph captured after warmup sees a fixed address
-        and a constant value.
+        reduction, not to guess the amax, so calibration is meant to land in
+        warmup. The returned tensor keeps a stable identity and is only written
+        during calibration, so a CUDA graph captured afterwards sees a fixed
+        address and a constant value.
         """
         if (
             self._offline_fp4_global_sf is None

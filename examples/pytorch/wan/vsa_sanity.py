@@ -42,18 +42,20 @@ from vsa_attention import (
 )
 
 
+def _ref_tile(x, meta):
+    """Zero-padded tiling, written independently of ``vsa_attention._tile``."""
+    buf = x.new_zeros((x.shape[0], meta.padded_seq_len, *x.shape[2:]))
+    buf[:, meta.non_pad_index] = x[:, meta.tile_partition_indices]
+    return buf
+
+
 def _reference_vsa(q, k, v, gate, meta, sparsity):
     """Eager reimplementation of the VSA math, independent of the kernel."""
     b, _, h, d = q.shape
     scale = 1.0 / math.sqrt(d)
     nb, blk = meta.num_blocks, VSA_BLOCK_SIZE
 
-    def tile(x):
-        buf = x.new_zeros((b, meta.padded_seq_len, h, d))
-        buf[:, meta.non_pad_index] = x[:, meta.tile_partition_indices]
-        return buf
-
-    q_t, k_t, v_t, g_t = (tile(x) for x in (q, k, v, gate))
+    q_t, k_t, v_t, g_t = (_ref_tile(x, meta) for x in (q, k, v, gate))
     sizes = meta.variable_block_sizes.view(1, -1, 1, 1).float()
 
     def pool(x):
@@ -125,8 +127,7 @@ def main() -> None:
 
     # --- 1. layout ------------------------------------------------------------
     x = torch.randn(b, s, h, d, device=device, dtype=torch.bfloat16)
-    buf = x.new_zeros((b, meta.padded_seq_len, h, d))
-    buf[:, meta.non_pad_index] = x[:, meta.tile_partition_indices]
+    buf = _ref_tile(x, meta)
     assert torch.equal(buf[:, meta.untile_combined_index], x), "tile/untile mismatch"
 
     # First block must hold exactly the (4,4,4) corner cube of the grid.

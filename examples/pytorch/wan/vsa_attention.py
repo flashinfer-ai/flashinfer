@@ -62,15 +62,26 @@ VSA_TILE_SIZE: Tuple[int, int, int] = (4, 4, 4)
 VSA_BLOCK_SIZE: int = VSA_TILE_SIZE[0] * VSA_TILE_SIZE[1] * VSA_TILE_SIZE[2]
 
 
+def vsa_supported(head_dim: int, device: Optional[torch.device] = None) -> bool:
+    """Can ``bsa_attn_blk64_fwd`` run here? SM100 and head_dim 128 only.
+
+    (The kernel is also bf16-only, which the WAN example always satisfies.)
+    Mirrors the capability gates the GEMM and attention backends already apply,
+    so an unsupported GPU gets a warning and dense attention rather than a
+    kernel error deep in the forward pass. Defaults to the current CUDA device,
+    since models are typically constructed before being moved onto one.
+    """
+    if not torch.cuda.is_available() or head_dim != 128:
+        return False
+    return torch.cuda.get_device_capability(device)[0] == 10
+
+
 @dataclass(frozen=True)
 class VSAMetadata:
     """Layout tables for one ``(T, H, W)`` token grid. Built once per shape."""
 
     dit_seq_shape: Tuple[int, int, int]
     num_tiles: Tuple[int, int, int]
-    seq_len: int  # unpadded token count, prod(dit_seq_shape)
-    num_blocks: int  # prod(num_tiles)
-    padded_seq_len: int  # num_blocks * 64
     tile_partition_indices: torch.Tensor  # [seq_len] int64, original -> tile order
     non_pad_index: torch.Tensor  # [seq_len] int64, tile order -> padded buffer
     untile_combined_index: torch.Tensor  # [seq_len] int64, padded buffer -> original
@@ -80,7 +91,20 @@ class VSAMetadata:
     # never observed because block_valid_mask masks it in the pooled mean and
     # variable_block_sizes masks it inside the sparse kernel.
     padded_src_index: torch.Tensor  # [padded_seq_len] int64
-    block_valid_mask: torch.Tensor  # [1, num_blocks, 64, 1, 1] float32, 1 = real
+    block_valid_mask: torch.Tensor  # [1, num_blocks, 64, 1, 1] bf16, 1 = real
+
+    @property
+    def seq_len(self) -> int:
+        """Unpadded token count."""
+        return math.prod(self.dit_seq_shape)
+
+    @property
+    def num_blocks(self) -> int:
+        return self.variable_block_sizes.numel()
+
+    @property
+    def padded_seq_len(self) -> int:
+        return self.num_blocks * VSA_BLOCK_SIZE
 
     def topk_for_sparsity(self, sparsity: float) -> int:
         """KV blocks kept per query block, matching FastVideo's convention."""
@@ -147,16 +171,14 @@ def build_vsa_metadata(
         num_blocks * VSA_BLOCK_SIZE, dtype=torch.int64, device=device
     )
     padded_src_index[non_pad_index] = tile_partition_indices
-    block_valid_mask = valid.to(device=device, dtype=torch.float32).view(
+    # Stored in the kernel's compute dtype so the multiply below never casts.
+    block_valid_mask = valid.to(device=device, dtype=torch.bfloat16).view(
         1, num_blocks, VSA_BLOCK_SIZE, 1, 1
     )
 
     return VSAMetadata(
         dit_seq_shape=(t, h, w),
         num_tiles=(n_t, n_h, n_w),
-        seq_len=t * h * w,
-        num_blocks=num_blocks,
-        padded_seq_len=num_blocks * VSA_BLOCK_SIZE,
         tile_partition_indices=tile_partition_indices,
         non_pad_index=non_pad_index,
         untile_combined_index=untile_combined_index,
@@ -167,18 +189,19 @@ def build_vsa_metadata(
 
 
 def _tile(x: torch.Tensor, meta: VSAMetadata) -> torch.Tensor:
-    """``[G, B, S, H, D] -> [G, B, S_padded, H, D]`` in cube order.
+    """``[B, S, H, D] -> [B, S_padded, H, D]`` in cube order.
 
-    One gather. The obvious formulation — allocate zeros, gather into tile order,
-    scatter into the non-padding slots — moves roughly 2.5x the bytes for the
-    same result. Here every padded slot instead reads token 0; padding is masked
-    downstream (``block_valid_mask`` for the pooled mean,
+    A single gather per tensor. The obvious formulation — allocate zeros, gather
+    into tile order, scatter into the non-padding slots — moves roughly 2.5x the
+    bytes for the same result. Here every padded slot instead reads token 0;
+    padding is masked downstream (``block_valid_mask`` for the pooled mean,
     ``variable_block_sizes`` for the sparse kernel) so it never reaches the
     output. See wan/BENCHMARK.md for the measured difference.
 
-    Grouped over the leading dim so q/k/v/gate cost one gather in total.
+    Tiling q/k/v/gate as one stacked tensor would need a full copy of all four
+    to build the stack, which costs more than the extra kernel launches saves.
     """
-    return x[:, :, meta.padded_src_index]
+    return x[:, meta.padded_src_index]
 
 
 def _block_masked_mean(x: torch.Tensor, meta: VSAMetadata) -> torch.Tensor:
@@ -233,8 +256,7 @@ def vsa_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
 
-    tiled = _tile(torch.stack((query, key, value, gate_compress), dim=0), meta)
-    q_t, k_t, v_t, gate_t = tiled.unbind(0)
+    q_t, k_t, v_t, gate_t = (_tile(x, meta) for x in (query, key, value, gate_compress))
 
     # --- coarse stage: dense attention over one pooled token per cube --------
     q_c = _block_masked_mean(q_t, meta)
@@ -242,15 +264,17 @@ def vsa_attention(
     v_c = _block_masked_mean(v_t, meta)
 
     scores = torch.matmul(q_c, k_c.transpose(-2, -1)) * softmax_scale
-    out_coarse = torch.matmul(torch.softmax(scores, dim=-1), v_c)  # [B,H,NB,D]
 
     # --- selection: top-k KV blocks per (head, query block) -----------------
+    # Taken before the coarse output below so ``scores`` can be freed early; at
+    # this shape it is a 331 MB fp32 tensor. Left unsorted on purpose: the kernel
+    # accepts any order and runs at the same speed either way, so sorting only
+    # costs a kernel launch. It would change the result by bf16 rounding alone
+    # (same blocks, different accumulation order).
     topk = meta.topk_for_sparsity(sparsity)
-    # Left unsorted on purpose: the kernel accepts any order and runs at the same
-    # speed either way, so sorting only costs a kernel launch. It would change
-    # the result by bf16 rounding alone (same blocks, different accumulation
-    # order).
     block_index = torch.topk(scores, topk, dim=-1).indices.to(torch.int32)
+
+    out_coarse = torch.matmul(torch.softmax(scores, dim=-1), v_c)  # [B,H,NB,D]
 
     # --- fine stage: token-level attention inside the selected blocks -------
     out_fine, _ = bsa_attn_blk64_fwd(
@@ -264,8 +288,13 @@ def vsa_attention(
     )
 
     # --- combine, then drop padding and restore the original token order ----
+    # In place into the (dead) gate buffer and then into the kernel's freshly
+    # allocated output: same two roundings in the same order as
+    # ``out + coarse * gate``, one allocation instead of three. Not ``addcmul_``,
+    # which fuses in fp32 and rounds once, changing the low bits.
     out = out_fine.view(b, meta.num_blocks, VSA_BLOCK_SIZE, h, d)
     gate_view = gate_t.view(b, meta.num_blocks, VSA_BLOCK_SIZE, h, d)
     coarse_view = out_coarse.permute(0, 2, 1, 3).unsqueeze(2).to(out.dtype)
-    out = out + coarse_view * gate_view
+    torch.mul(coarse_view, gate_view, out=gate_view)
+    out.add_(gate_view)
     return out.view(b, meta.padded_seq_len, h, d)[:, meta.untile_combined_index]
