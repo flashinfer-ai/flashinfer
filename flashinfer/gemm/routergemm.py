@@ -15,7 +15,8 @@ from types import SimpleNamespace
 from typing import Optional
 import torch
 from flashinfer.utils import (
-    is_sm100a_supported,
+    get_compute_capability,
+    version_at_least,
     register_custom_op,
     supported_compute_capability,
     backend_requirement,
@@ -451,10 +452,20 @@ def get_tinygemm2_sm100_module():
     return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
 
 
+# The generated variants are exact-arch cubins; gate on exact compute
+# capabilities like the FlashKDA export does, NOT on `major == 10` — SM107
+# is whitelisted for tinygemm_bf16 but must take the reference kernel.
+_TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
+
+
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
-    return is_sm100a_supported(device)
+    return get_compute_capability(
+        device
+    ) in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES and version_at_least(
+        torch.version.cuda, "12.8"
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
