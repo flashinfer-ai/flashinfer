@@ -95,7 +95,9 @@ class LoaderRole:
         Only an item's first tile can contain the window lower bound,
         so only ``first_tile`` applies the window clamp.  The table
         index is min-clamped separately so the table read itself never
-        goes past the item's slice.
+        goes past the item's slice; this relies on every item having at
+        least one page (``num_pages_kv >= 1``, i.e. ``safe_page >= 0``),
+        which plan() enforces by rejecting zero-length KV items.
         """
         logical0 = kv_tile * self.pages_per_kv_tile
         for p in cutlass.range(self.pages_per_kv_tile, unroll=1):

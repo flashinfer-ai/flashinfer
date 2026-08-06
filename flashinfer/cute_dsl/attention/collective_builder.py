@@ -62,14 +62,9 @@ def build_fmha_launch_params(
     config = mainloop.config
 
     # Paged KV shares the K/V smem ring layouts with ragged; only the TMA
-    # atoms (per-page box) and their smem partition views differ.  Mixed
-    # K/V dtypes would need the stage-stride padding below replicated on
-    # the *_for_tma views — not wired up yet.
-    if config.page_size is not None and k_dtype.width != v_dtype.width:
-        raise ValueError(
-            "paged KV cache with mixed K/V dtypes is not supported yet; "
-            "use a uniform dtype or the ragged (contiguous) KV path"
-        )
+    # atoms (per-page box) and their smem partition views differ.  With
+    # mixed K/V dtypes the stage-stride padding below is replicated on the
+    # *_for_tma views so page copies land in the shared ring's slots.
 
     cta_group = tcgen05.CtaGroup.ONE
     p_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -186,6 +181,14 @@ def build_fmha_launch_params(
             k_dtype,
             mainloop.kv_stages,
         )
+        if v_dtype.width > k_dtype.width:
+            # Mixed widths: the shared ring's slot pitch is the wider
+            # operand's tile footprint (see the staged padding above) —
+            # rebuild the stage mode with the same padded stride.
+            k_smem_layout_for_tma = cute.append(
+                cute.select(k_smem_layout_for_tma, mode=[0, 1]),
+                cute.make_layout(mainloop.kv_stages, stride=k_stage_stride),
+            )
         k_smem_layout_for_tma = cute.tiled_divide(
             k_smem_layout_for_tma, (config.page_size, config.qk_mma_tiler[2])
         )
@@ -204,6 +207,13 @@ def build_fmha_launch_params(
             v_dtype,
             mainloop.kv_stages,
         )
+        if k_dtype.width > v_dtype.width:
+            # Mixed widths: pad V's stage stride to K's tile footprint,
+            # mirroring the staged-layout padding above.
+            v_smem_layout_for_tma = cute.append(
+                cute.select(v_smem_layout_for_tma, mode=[0, 1]),
+                cute.make_layout(mainloop.kv_stages, stride=v_stage_stride),
+            )
         v_smem_layout_for_tma = cute.tiled_divide(
             v_smem_layout_for_tma, (config.pv_mma_tiler[1], config.page_size)
         )

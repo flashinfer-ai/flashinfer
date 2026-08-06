@@ -398,6 +398,9 @@ def test_paged_wrapper_windowed_bitwise_vs_ragged_wrapper():
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
     )
+    # Routing contract: windowed ragged plans must stay on the modular
+    # kernel, or the bitwise comparison below compares different kernels.
+    assert not w_rag._cute_dsl_use_fmha
     out_rag = w_rag.run(q, k_rag, v_rag)
     assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
 
@@ -493,7 +496,125 @@ def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper():
         q_data_type=dt,
         kv_data_type=dt,
     )
+    # Routing contract: windowed ragged plans must stay on the modular
+    # kernel, or the bitwise comparison below compares different kernels.
+    assert not w_rag._cute_dsl_use_fmha
     out_rag = w_rag.run(q8, k8, v8)
+    assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
+
+
+def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
+    """Mixed-dtype paged cache: bf16 Q/K with an fp8 V cache (tuple form).
+
+    The ragged route already serves mixed V as a run()-time property; the
+    paged route reuses the same lazily compiled per-V-dtype kernel variant,
+    so the outputs must be bitwise-equal to the ragged mixed run.
+    """
+    _skip_unless_sm100()
+
+    (q, k_rag, v_rag, cache, qo, kv_tok, kv_pg, ids, lpl) = _build_wrapper_problem(
+        [300, 1291], [300, 1547], 16
+    )
+    plan_kw = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        causal=True,
+        # windowed on BOTH plans: keeps the ragged wrapper off its FMHA
+        # route (a different kernel, not bitwise-comparable) and covers
+        # the window clamp x paged x mixed-V combination.
+        window_left=127,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+
+    w = _paged_wrapper()
+    w.plan(qo, kv_pg, ids, lpl, page_size=16, **plan_kw)
+    out_paged = w.run(q, (cache[:, 0], cache[:, 1].to(torch.float8_e4m3fn)))
+
+    # Reference via the INTERNAL wrapper: it always runs the modular
+    # kernel, so this comparison is pinned regardless of future changes
+    # to the public ragged wrapper's FMHA-vs-modular routing policy.
+    from flashinfer.cute_dsl.attention import BatchPrefillCuteDSLWrapper
+
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    w_rag = BatchPrefillCuteDSLWrapper(ws)
+    w_rag.plan(
+        qo,
+        kv_tok,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        causal=True,
+        window_left=127,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    out_rag = w_rag.run(q, k_rag, v_rag.to(torch.float8_e4m3fn))
+    assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
+
+
+@pytest.mark.parametrize("variant_name", ["sigmoid", "alibi", "sink"])
+def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name):
+    """Attention variants must compose with paged KV.
+
+    The loader is the only stage that differs between the paged and ragged
+    plans, so under the same variant the outputs must be bitwise-equal.
+    Covers one variant per fusion mechanism: sigmoid (logits transform —
+    the softmax->epilogue pipeline topology), ALiBi (score_mod with
+    per-head extra_params and position math), sink (statistics update +
+    output transform in the correction path).
+    """
+    _skip_unless_sm100()
+    from flashinfer.cute_dsl.attention import (
+        ALiBiAttention,
+        AttentionWithSink,
+        BatchPrefillCuteDSLWrapper,
+        SigmoidAttention,
+    )
+
+    (q, k_rag, v_rag, cache, qo, kv_tok, kv_pg, ids, lpl) = _build_wrapper_problem(
+        [300, 1291], [300, 1547], 16
+    )
+    h_q = 8
+
+    def make_variant():
+        if variant_name == "sigmoid":
+            return SigmoidAttention(scale=1.0 / math.sqrt(128), bias=-2.0)
+        if variant_name == "alibi":
+            return ALiBiAttention(
+                torch.linspace(0.1, 0.9, h_q, dtype=torch.float32, device="cuda")
+            )
+        return AttentionWithSink(
+            torch.linspace(-1.0, 1.0, h_q, dtype=torch.float32, device="cuda")
+        )
+
+    plan_kw = dict(
+        num_qo_heads=h_q,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    w_paged = BatchPrefillCuteDSLWrapper(ws)
+    w_paged.plan(
+        qo,
+        page_size=16,
+        paged_kv_indptr=kv_pg,
+        paged_kv_indices=ids,
+        paged_kv_last_page_len=lpl,
+        variant=make_variant(),
+        **plan_kw,
+    )
+    out_paged = w_paged.run_paged(q, cache)
+
+    ws2 = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    w_rag = BatchPrefillCuteDSLWrapper(ws2)
+    w_rag.plan(qo, kv_tok, variant=make_variant(), **plan_kw)
+    out_rag = w_rag.run(q, k_rag, v_rag)
     assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
 
 
@@ -528,15 +649,27 @@ def test_paged_wrapper_rejections():
             q_data_type=torch.bfloat16,
             kv_data_type=torch.float8_e4m3fn,
         )
-    # mixed-dtype cache tuple at run
+    # mixed K at run (only V may differ from the plan); the top-level
+    # wrapper's q/k dtype check fires first, the internal wrapper's
+    # k_cache check backstops direct callers.
     w = _paged_wrapper()
     w.plan(qo, kv_pg, ids, lpl, page_size=16, **plan_kw)
-    k_c, v_c = cache[:, 0], cache[:, 1].to(torch.float8_e4m3fn)
-    with pytest.raises(NotImplementedError, match="mixed"):
+    k_c, v_c = cache[:, 0].to(torch.float8_e4m3fn), cache[:, 1]
+    with pytest.raises(ValueError, match="k_cache|dtype of k"):
         w.run(q, (k_c, v_c))
+    # unsupported V dtype at run
+    with pytest.raises(ValueError, match="v_cache"):
+        w.run(q, (cache[:, 0], cache[:, 1].to(torch.float32)))
     # kv_cache_sf reject
     with pytest.raises(NotImplementedError, match="kv_cache_sf|NVFP4"):
         w.run(q, cache, kv_cache_sf=torch.zeros(1, device="cuda"))
+    # zero-length KV item (would read page-table index -1 in the loader)
+    w = _paged_wrapper()
+    qo_e = torch.tensor([0, 300, 316], dtype=qo.dtype, device=qo.device)
+    kv_pg_e = torch.cat([kv_pg, kv_pg[-1:]])  # second item: zero pages
+    lpl_e = torch.cat([lpl, torch.zeros_like(lpl[:1])])
+    with pytest.raises(ValueError, match="zero-length KV"):
+        w.plan(qo_e, kv_pg_e, ids, lpl_e, page_size=16, **plan_kw)
 
 
 def test_paged_wrapper_validate_inputs_nan_scan(monkeypatch):
