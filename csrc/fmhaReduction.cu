@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
   int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr
-                               ? batchIdx * params.mMaxNumCtasQ * params.mNumTokensPerCtaQ
+                               ? batchIdx * params.mMaxSeqLenQ
                                : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
   int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
@@ -83,6 +83,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     return;
   }
 
+  // The last tokenQ index (relative to the request) processed by this CTA.
+  int32_t const lastTokenIdxQ{ctaIdxQ * params.mNumTokensPerCtaQ + numValidTokens - 1};
+
   // The actual number of seqLenKv. Block-sparse attention uses per-KV-head sequence lengths
   // laid out as [numHeadsKv, batchSize].
   int32_t seqLenKv;
@@ -93,7 +96,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     seqLenKv = params.ptrSeqLensKv[batchIdx];
   }
   // Consider the causal-mask speculative decoding.
-  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
+  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - lastTokenIdxQ);
   // Consider sparseAttnTopK and variable sparse MLA topK lengths.
   if (supportsVarSparseMlaTopKLens) {
     seqLenKv = params.ptrSparseMlaTopKLens[seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ];
