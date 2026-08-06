@@ -252,12 +252,15 @@ Topology Probing and Backend Selection
 .. autosummary::
     :toctree: ../generated
 
-    resolve_ulysses_backend
-    decide_ulysses_backend
-    probe_ulysses_rank_topology
     UlyssesBackendDecision
     UlyssesRankTopology
     UlyssesBackendError
+
+.. autofunction:: resolve_ulysses_backend
+
+.. autofunction:: decide_ulysses_backend
+
+.. autofunction:: probe_ulysses_rank_topology
 
 Raw Kernel Entry Points (advanced)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

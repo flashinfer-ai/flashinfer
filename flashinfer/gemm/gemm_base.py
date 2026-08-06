@@ -18,7 +18,7 @@ import functools
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
@@ -387,6 +387,60 @@ def _tgv_gemm_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
+def _cute_dsl_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cute-dsl", "auto"
+    ] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
+    if out is not None and out.dtype != torch.bfloat16:
+        raise ValueError("The CuTeDSL low-M backend requires a bfloat16 out tensor.")
+    if not is_sm100a_supported(a.device):
+        raise ValueError(
+            "The CuTeDSL low-M backend requires SM100/SM103 with CUDA 12.8+."
+        )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("The CuTeDSL low-M backend requires 2D inputs.")
+    if not a.is_contiguous():
+        raise ValueError("The CuTeDSL low-M backend requires row-major A.")
+    if not b.T.is_contiguous():
+        raise ValueError("The CuTeDSL low-M backend requires column-major B.")
+    if b.shape[0] != a.shape[1]:
+        raise ValueError(
+            f"Incompatible shapes: A is {tuple(a.shape)}, B is {tuple(b.shape)}."
+        )
+    if b.device != a.device:
+        raise ValueError("A and B must be on the same CUDA device.")
+    if out is not None and not out.is_contiguous():
+        raise ValueError("The CuTeDSL low-M backend requires row-major output.")
+    if bias is not None and (
+        bias.device != a.device
+        or bias.shape != (b.shape[1],)
+        or not bias.is_contiguous()
+    ):
+        raise ValueError(
+            f"Bias must be contiguous on A's device with shape {(b.shape[1],)}."
+        )
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
+
+    from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
+
+    default_tactic(a.shape[0], b.shape[1], a.shape[1])
+    return True
+
+
 @supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _cutile_mm_bf16_requirement(
     a: torch.Tensor,
@@ -534,6 +588,7 @@ def _heuristic_func_mm_bf16(
         "cublaslt": _cublaslt_mm_bf16_requirement,
         "tinygemm": _tinygemm_mm_bf16_requirement,
         "cutile": _cutile_mm_bf16_requirement,
+        "cute-dsl": _cute_dsl_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -547,7 +602,14 @@ def mm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
-        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
+        "cudnn",
+        "cutlass",
+        "tgv",
+        "cublaslt",
+        "tinygemm",
+        "cutile",
+        "cute-dsl",
+        "auto",
     ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
@@ -561,20 +623,23 @@ def mm_bf16(
         Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
-        Optional bias tensor, shape (n,). Enabled for TGV and TinyGEMM backends. Defaults to ``None``.
+        Optional bias tensor, shape (n,). Enabled for TGV, TinyGEMM, and
+        CuTeDSL backends. Defaults to ``None``.
 
     pdl: bool
-        Whether to use Programmatic Dependent Launch. Enabled for TGV and TinyGEMM backends. Defaults to ``False``.
+        Whether to use Programmatic Dependent Launch. Enabled for TGV,
+        TinyGEMM, and CuTeDSL backends. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
-        for CUTLASS and cuDNN backends; TinyGEMM requires bf16 output.
+        for CUTLASS and cuDNN backends; TinyGEMM and CuTeDSL require bf16 output.
 
     out_dtype: torch.dtype
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
-        Defaults to ``torch.bfloat16``.
+        TinyGEMM and CuTeDSL require ``torch.bfloat16``. Defaults to
+        ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
@@ -584,6 +649,11 @@ def mm_bf16(
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
+        ``"cute-dsl"`` uses standalone Blackwell low-M direct and split-K
+        kernels for M <= 32. It is never auto-selected; serving frameworks
+        must select it explicitly. Without autotuning, a measured shape
+        heuristic chooses between the algorithms. With autotuning, both tactic
+        spaces are profiled when bias is disabled; bias uses split-K only.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -667,6 +737,8 @@ def mm_bf16(
         backends = _heuristic_func_mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
+    elif backend == "cute-dsl":
+        backends = ["cute-dsl"]
     else:
         backends = [backend]
 
@@ -1416,6 +1488,131 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
     return TGVRunner()
 
 
+@functools.cache
+def _cute_dsl_splitk_bf16_gemm_runner(
+    compute_capability: int,
+):
+    from .kernels.dense_bf16_gemm_sm100_splitk import (
+        SplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_splitk_dense,
+    )
+
+    class CuteDSLSplitKBf16Runner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, bias, pdl, out, *_ = inputs
+            return (
+                str(a.dtype),
+                str(out.dtype),
+                bias is not None,
+                bool(pdl),
+                compute_capability,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list[tuple[int, int, int, int]]:
+            a, b, *_ = inputs
+            m, k = a.shape
+            n = b.shape[1]
+            try:
+                default = default_tactic(m, n, k)
+            except ValueError:
+                return []
+            return list(
+                dict.fromkeys(
+                    astuple(config)
+                    for config in (
+                        default,
+                        *autotune_tactics(m, n, k),
+                    )
+                )
+            )
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            if tactic == -1:
+                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            else:
+                try:
+                    tactic = SplitKTactic(*tactic)
+                except TypeError as error:
+                    raise ValueError(
+                        "CuTeDSL split-K tactics must be "
+                        "(mma_m, mma_n, split_k, ab_stages)."
+                    ) from error
+            return run_splitk_dense(a, b, bias, out, bool(pdl), tactic)
+
+    return CuteDSLSplitKBf16Runner()
+
+
+@functools.cache
+def _cute_dsl_direct_bf16_gemm_runner(
+    compute_capability: int,
+):
+    from .kernels.dense_bf16_gemm_direct import (
+        DirectTactic,
+        autotune_tactics,
+        default_tactic,
+        run_direct_dense,
+    )
+
+    class CuteDSLDirectBf16Runner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, _, _, pdl, out, *_ = inputs
+            return (
+                str(a.dtype),
+                str(out.dtype),
+                bool(pdl),
+                compute_capability,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list[tuple[int, int, int]]:
+            a, b, bias, *_ = inputs
+            if bias is not None:
+                return []
+            m, k = a.shape
+            n = b.shape[1]
+            return [astuple(config) for config in autotune_tactics(m, n, k)]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            if bias is not None:
+                raise ValueError("CuTeDSL direct GEMM does not support bias.")
+            if tactic == -1:
+                tactic = default_tactic(a.shape[0], b.shape[1], a.shape[1])
+            else:
+                try:
+                    tactic = DirectTactic(*tactic)
+                except TypeError as error:
+                    raise ValueError(
+                        "CuTeDSL direct tactics must be "
+                        "(block_size, outputs_per_block, rows_per_block)."
+                    ) from error
+            return run_direct_dense(a, b, out, bool(pdl), tactic)
+
+    return CuteDSLDirectBf16Runner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1452,6 +1649,26 @@ def bf16_gemm_sm100(
         runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f))
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())
+    if "cute-dsl" in runner_names:
+        compute_capability = torch.cuda.get_device_capability(a.device)
+        compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+        splitk_runner = _cute_dsl_splitk_bf16_gemm_runner(compute_capability_number)
+        if bias is None:
+            from .kernels.dense_bf16_gemm_direct import (
+                prefer_direct_bf16_gemm_sm100,
+            )
+
+            direct_runner = _cute_dsl_direct_bf16_gemm_runner(compute_capability_number)
+            prefer_direct = prefer_direct_bf16_gemm_sm100(
+                a.shape[0], b.shape[1], a.shape[1]
+            )
+            runners.extend(
+                (direct_runner, splitk_runner)
+                if prefer_direct
+                else (splitk_runner, direct_runner)
+            )
+        else:
+            runners.append(splitk_runner)
     assert runners, "No suitable runners found"
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]
@@ -7529,7 +7746,7 @@ def group_gemm_fp8_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, (m_granularity, n_granularity, k_granularity).
@@ -7774,7 +7991,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     mma_sm: int
         How many SMs to use for the MMA operation, must be 1 or 2. 2 is not supported on SM120/121.
@@ -8028,7 +8245,7 @@ def group_gemm_nvfp4_nt_groupwise(
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(batch_size + 1,)``, data type is ``torch.int32``.
-        Element element in ``m_indptr`` must be a multiple of 4.
+        Each element in ``m_indptr`` must be a multiple of 4.
 
     alpha: Optional[torch.Tensor] = None, # (batch_size, )
         The alpha tensor, shape ``(batch_size, )``, data type is ``torch.float32``.

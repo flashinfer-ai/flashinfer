@@ -60,12 +60,12 @@ from .utils import (
 def is_sm100_family():
     """Check for SM100 family (Blackwell: SM100, SM103).
 
-    CuteDSL MoE NVFP4 kernels are optimized for SM10x architecture.
+    CuteDSL MoE NVFP4 does not target Rubin SM107.
     """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10
+    return (props.major, props.minor) in ((10, 0), (10, 3))
 
 
 # Skip decorators
@@ -74,7 +74,7 @@ cute_dsl_available = pytest.mark.skipif(
 )
 sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
-    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
+    reason="Requires CuteDSL MoE target SM100 or SM103",
 )
 
 
@@ -445,6 +445,13 @@ class TestAutotuneReplayMemsetContract:
         self, monkeypatch, api, is_tuning_mode
     ):
         from flashinfer.fused_moe.cute_dsl import fused_moe
+
+        # CPU-only contract test (see class header): stub out the functional
+        # API's arch guard, which otherwise calls torch.cuda.get_device_capability()
+        # on the CPU input tensors and raises "Expected a cuda device, but got: cpu".
+        monkeypatch.setattr(
+            fused_moe, "_require_cute_dsl_arch_for", lambda *a, **k: None
+        )
 
         calls = []
 
@@ -1027,6 +1034,41 @@ class TestCuteDslFusedMoeFunctional:
             num_experts,
             use_per_token_activation,
             use_fused_finalize=False,
+        )
+
+    @pytest.mark.parametrize("hidden_size", [256, 384])
+    def test_finalize_handles_cluster_padding_and_partial_n_tiles(
+        self,
+        hidden_size: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from flashinfer.autotuner import AutoTuner
+
+        # hidden=256 leaves one padding CTA in the N=256, cluster_n=2
+        # configuration. hidden=384 also gives the second CTA a partial tile.
+        # Force the 256-row route so both cases execute the kernel path that
+        # previously had to be filtered out.
+        tail_config = (
+            256,
+            ((256, 128), (2, 1), False),
+            ((256, 256), (2, 2), False),
+        )
+
+        def choose_tail_config(
+            _self, _custom_op, runners, _tuning_config, _inputs, **_kwargs
+        ):
+            return runners[0], tail_config
+
+        monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
+        self._run_numerical_accuracy(
+            activation_type=ActivationType.Relu2,
+            num_tokens=128,
+            top_k=2,
+            hidden_size=hidden_size,
+            intermediate_size=512,
+            num_experts=8,
+            use_per_token_activation=True,
+            use_fused_finalize=True,
         )
 
     def _run_numerical_accuracy(

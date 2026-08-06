@@ -38,6 +38,7 @@ from .api import (
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from .runners import (
     B12xNvfp4Runner,
@@ -47,6 +48,7 @@ from .runners import (
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -60,6 +62,7 @@ _RunnerT = Union[
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
 ]
@@ -71,6 +74,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorConfig: TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
