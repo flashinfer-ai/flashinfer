@@ -40,6 +40,8 @@
 // Kernel bodies are byte-identical to the generated output modulo the symbol
 // rename.
 
+#include <mutex>
+#include <vector>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -1395,6 +1397,9 @@ constexpr int kTileM = 16;  // output-features tile
 constexpr int kTileN = 8;   // batch tile
 constexpr int kTileK = 64;  // reduction tile (one TMA box)
 constexpr int kThreads = 384;
+// One TMA K loop of the generated schedules covers 1024 reduction elements;
+// mirrors the (former) Python-side selection constant.
+constexpr int kKPerLoop = 1024;
 
 struct ProblemDims {
   int batch;
@@ -1407,6 +1412,16 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 }
 
 inline void CheckSm100Family(int device_id) {
+  // The verdict is a device property; cache it so steady-state launches skip
+  // the two cudaDeviceGetAttribute calls.
+  static std::mutex fam_mu;
+  static std::vector<int> fam_ok;
+  {
+    std::lock_guard<std::mutex> lock(fam_mu);
+    for (int cached : fam_ok) {
+      if (cached == device_id) return;
+    }
+  }
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
@@ -1416,6 +1431,10 @@ inline void CheckSm100Family(int device_id) {
   TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
       << "tinygemm2_sm100 requires an SM100/SM103 (B200/B300 class) device, got sm_" << major
       << minor;
+  {
+    std::lock_guard<std::mutex> lock(fam_mu);
+    fam_ok.push_back(device_id);
+  }
 }
 
 inline void CheckBf16(const TensorView& t, const char* name) {
@@ -1526,6 +1545,27 @@ inline CUtensorMap EncodeActivationTma(const TensorView& input) {
 using GeneratedKernel = void (*)(LoomTensorMap, LoomTensorMap, __nv_bfloat16*, __nv_bfloat16*, int,
                                  int, int);
 
+// Set the dynamic-SMEM opt-in once per (kernel, current device): the
+// attribute is sticky, and setting it on every launch costs a host API call
+// on the critical path of a ~5us kernel.
+inline void EnsureKernelSmemAttr(GeneratedKernel kernel, int smem_bytes) {
+  static std::mutex attr_mu;
+  static std::vector<std::pair<const void*, int>> attr_done;
+  int device_id = -1;
+  CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice(tinygemm2_sm100 smem attr)");
+  {
+    std::lock_guard<std::mutex> lock(attr_mu);
+    for (const auto& entry : attr_done) {
+      if (entry.first == reinterpret_cast<const void*>(kernel) && entry.second == device_id) {
+        return;
+      }
+    }
+  }
+  EnsureKernelSmemAttr(kernel, smem_bytes);
+  std::lock_guard<std::mutex> lock(attr_mu);
+  attr_done.emplace_back(reinterpret_cast<const void*>(kernel), device_id);
+}
+
 inline void LaunchVariant(GeneratedKernel kernel, int smem_bytes, bool pdl,
                           const CUtensorMap& weight_map, const CUtensorMap& activation_map,
                           __nv_bfloat16* out, __nv_bfloat16* bias, const ProblemDims& dims,
@@ -1561,6 +1601,36 @@ inline void LaunchVariant(GeneratedKernel kernel, int smem_bytes, bool pdl,
                                                 dims.batch, dims.in_features);
     CheckCuda(cudaGetLastError(), "tinygemm2_sm100 kernel launch");
   }
+}
+
+// Shallow-vs-deep ring selection from the measured B200 crossover axes,
+// evaluated in the binding like the reference launcher selects STAGES.
+// The SM count is a device constant; cache it per device.
+inline bool UseStage4(const ProblemDims& dims) {
+  static std::mutex sm_mu;
+  static std::vector<std::pair<int, int>> sm_counts;
+  int device_id = -1;
+  CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice(tinygemm2_sm100 stage select)");
+  int num_sms = -1;
+  {
+    std::lock_guard<std::mutex> lock(sm_mu);
+    for (const auto& entry : sm_counts) {
+      if (entry.first == device_id) {
+        num_sms = entry.second;
+        break;
+      }
+    }
+  }
+  if (num_sms < 0) {
+    CheckCuda(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id),
+              "cudaDeviceGetAttribute(multiprocessor count)");
+    std::lock_guard<std::mutex> lock(sm_mu);
+    sm_counts.emplace_back(device_id, num_sms);
+  }
+  const int tiles_m = (dims.out_features + kTileM - 1) / kTileM;
+  const int tiles_n = (dims.batch + kTileN - 1) / kTileN;
+  const int total_ctas = tiles_m * tiles_n;
+  return dims.in_features <= kKPerLoop || total_ctas > 2 * num_sms;
 }
 
 // out = input @ weight.T + bias (bf16, fp32 accumulation), column-major
@@ -1611,9 +1681,33 @@ void RunStage8Pdl(TensorView input, TensorView weight, TensorView bias, TensorVi
                 reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), dims, stream);
 }
 
+// Combined entry: selects among the four generated variants inside the
+// binding (stage by problem dims, PDL by flag), mirroring the reference
+// csrc/tinygemm2.cu launcher convention.
+void Run(TensorView input, TensorView weight, TensorView bias, TensorView out, bool use_pdl) {
+  const ProblemDims dims = CheckInputs(input, weight, bias, out);
+  const CUtensorMap weight_map = EncodeWeightTma(weight);
+  const CUtensorMap activation_map = EncodeActivationTma(input);
+  const cudaStream_t stream = get_stream(input.device());
+  const bool stage4 = UseStage4(dims);
+  GeneratedKernel kernel;
+  int smem_bytes;
+  if (stage4) {
+    kernel = use_pdl ? &kernel_tinygemm2_sm100_stage4_pdl : &kernel_tinygemm2_sm100_stage4;
+    smem_bytes = use_pdl ? kSmemBytesStage4Pdl : kSmemBytesStage4;
+  } else {
+    kernel = use_pdl ? &kernel_tinygemm2_sm100_stage8_pdl : &kernel_tinygemm2_sm100_stage8;
+    smem_bytes = use_pdl ? kSmemBytesStage8Pdl : kSmemBytesStage8;
+  }
+  LaunchVariant(kernel, smem_bytes, use_pdl, weight_map, activation_map,
+                reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+                reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()), dims, stream);
+}
+
 }  // namespace tinygemm2_sm100
 }  // namespace flashinfer
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(tinygemm2_sm100_op, flashinfer::tinygemm2_sm100::Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stage4_op, flashinfer::tinygemm2_sm100::RunStage4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stage4_pdl_op, flashinfer::tinygemm2_sm100::RunStage4Pdl);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stage8_op, flashinfer::tinygemm2_sm100::RunStage8);

@@ -444,20 +444,9 @@ def get_tinygemm2_sm100_module():
         out: torch.Tensor,
         use_pdl: bool = False,
     ) -> None:
-        device_index = input.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-        stage4 = _tinygemm2_sm100_use_stage4(
-            input.shape[0],
-            weight.shape[0],
-            input.shape[1],
-            _tinygemm2_sm100_num_sms(device_index),
-        )
-        if use_pdl:
-            op = module.stage4_pdl_op if stage4 else module.stage8_pdl_op
-        else:
-            op = module.stage4_op if stage4 else module.stage8_op
-        op(input, weight, bias, out)
+        # Stage and PDL selection happen inside the binding (the same
+        # convention as the reference csrc/tinygemm2.cu launcher).
+        module.tinygemm2_sm100_op(input, weight, bias, out, use_pdl)
 
     return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
 
