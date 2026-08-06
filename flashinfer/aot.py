@@ -101,6 +101,7 @@ from .jit.gemm import (
     gen_trtllm_low_latency_gemm_module,
     gen_blackwell_bf16_bmm_module,
 )
+from .jit.gemm.blackwell_bf16_bmm import BlackwellBf16BmmTarget
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
@@ -490,7 +491,7 @@ def gen_xqa(
 
 
 def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
-    targets = []
+    targets: List[BlackwellBf16BmmTarget] = []
     if sm_capabilities.get("sm100a_exact", False):
         targets.append("sm100a")
     if sm_capabilities.get("sm103a_exact", False):
