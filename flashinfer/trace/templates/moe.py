@@ -976,6 +976,16 @@ def _moe_fp8_block_scale_ds_shared_experts_init(
             f"derived routed expert count must be > 0, got {routed} "
             f"(num_weight_rows={num_weight_rows}, num_fused_shared_experts={S})."
         )
+    # A definition carries both the physical row count and the routed count, and
+    # replay derives one from the other. If they disagree the rebuilt inputs are
+    # not the workload the definition describes, so fail rather than silently
+    # rebuild a different geometry.
+    if num_weight_rows and routed != int(num_experts):
+        raise ValueError(
+            "inconsistent shared-expert definition: num_weight_rows - "
+            f"num_fused_shared_experts = {num_weight_rows} - {S} = {routed}, "
+            f"which does not match num_experts={num_experts}."
+        )
     out = _moe_fp8_block_scale_ds_init(
         seq_len=seq_len,
         num_experts=num_experts,

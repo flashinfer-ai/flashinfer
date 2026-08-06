@@ -1019,6 +1019,7 @@ def _make_shared_expert_case(
 def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
     """Same launch through the legacy flat API, for cross-checking the unified path."""
     from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+    from flashinfer.tllm_enums import Fp8QuantizationType
 
     return trtllm_fp8_block_scale_moe(
         logits,
@@ -1038,11 +1039,21 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
         config.routing.num_experts,
         config.routing.routed_scaling_factor,
         routing_method_type=int(RoutingMethodType.DeepSeekV3),
+        # The flat API defaults to DeepSeekFp8; MXFP8 uses a different
+        # activation-scale layout ([M, H/32] vs [H/128, M]) and the shuffled
+        # weight view, so both must be passed for the cross-check to compare
+        # the same launch the unified runner performs.
+        fp8_quantization_type=(
+            Fp8QuantizationType.MxFp8
+            if config.quant.variant is QuantVariant.MxFp8
+            else Fp8QuantizationType.DeepSeekFp8
+        ),
+        use_shuffled_weight=config.quant.variant is QuantVariant.MxFp8,
         num_fused_shared_experts=num_shared,
     )
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8])
+@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
 @pytest.mark.parametrize("num_shared", [1, 2])
 def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     pack, weights, config, view, (logits, bias) = _make_shared_expert_case(
@@ -1080,3 +1091,29 @@ def test_block_fp8_fused_shared_experts_contribute(num_shared):
         f"S={num_shared}: zeroing the shared rows moved the output by only "
         f"{rel:.4f}; the shared experts are not being applied."
     )
+
+
+@pytest.mark.parametrize("num_shared", [1, 2])
+def test_block_fp8_fused_shared_experts_cuda_graph_replay(num_shared):
+    """S>0 must survive graph capture and replay.
+
+    The shared slots are produced inside the routing kernel, and S reaches it
+    through the runner's static launch kwargs rather than a captured tensor, so
+    capture is the case where a mis-plumbed S would show up as a graph that
+    silently replays the routed-only launch.
+    """
+    pack, weights, config, _, _ = _make_shared_expert_case(
+        QuantVariant.DeepSeekFp8, num_shared=num_shared
+    )
+    from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
+
+    runner = TrtllmFp8BlockRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(pack, weights)
+    eager = runner.forward(inputs).clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_fp8_close(inputs[0], eager)
