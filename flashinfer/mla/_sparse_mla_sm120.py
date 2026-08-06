@@ -76,21 +76,28 @@ _DECODE_MAX_TOKENS = 64
 # decode-dsv4 instantiation set. Shapes outside this table fall through to
 # decode-dsv3_2 / prefill. NH=8 is the small-TP corner case; the kernel pads
 # the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
+# TOPK=256 covers DeepSeek-V4-Flash-0731 draft attention (NH=32 at TP=2);
+# the other NH values cover other TP sizes.
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 256),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 256),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 256),
         (64, 512),
         (64, 1024),
         (128, 128),
+        (128, 256),
         (128, 512),
         (128, 1024),
     }
@@ -1228,7 +1235,7 @@ def sparse_mla_sm120_decode_dsv4(
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
-        ``[T, topk]`` int32. ``topk`` must be one of {128, 512, 1024}; ``-1``
+        ``[T, topk]`` int32. ``topk`` must be one of {128, 256, 512, 1024}; ``-1``
         marks invalid slots.
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =

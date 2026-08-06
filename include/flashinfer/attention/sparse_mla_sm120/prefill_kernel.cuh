@@ -55,8 +55,8 @@
 // Template params (all constexpr):
 //   MT:              ModelType (DSV3_2 / DSV4)
 //   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
-//   NUM_HEADS:       8, 16, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
-//   TOPK:            128, 512, 1024, 2048
+//   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
+//   TOPK:            128, 256, 512, 1024, 2048
 //   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
 // ============================================================================
 
