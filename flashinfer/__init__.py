@@ -85,6 +85,13 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
+from .attn_scores import aligned_context_len as aligned_context_len
+from .attn_scores import (
+    compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
+)
+from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
+from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
