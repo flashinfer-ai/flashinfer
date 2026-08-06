@@ -133,7 +133,10 @@ def _mega_problem(
     intermediate = 1024
     num_experts = 8
     topk = 4
-    gate_up_clamp = 10.0
+    # Unlike the sm100 twin, no gate_up_clamp: the current SM120 drop's
+    # kernel silently ignores it (dead plumbing — see VENDOR.md), so the
+    # backend rejects a set clamp until a fixed drop lands.
+    gate_up_clamp = None
     fast_math = True
     kind = "mxfp8_e4m3"
 
