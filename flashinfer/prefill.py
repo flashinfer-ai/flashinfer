@@ -1660,10 +1660,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
+            or ``cute-dsl``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+            The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,

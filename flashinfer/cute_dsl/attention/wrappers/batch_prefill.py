@@ -431,6 +431,15 @@ class BatchPrefillCuteDSLWrapper:
         s_k_all = int(kv_indptr[-1].item())
         max_s_q = int(torch.max(s_q).item())
         max_s_k = int(torch.max(s_k).item())
+        # The kernel loads the first KV tile of every valid Q tile
+        # unconditionally (all four warp roles assume >= 1 KV tile), so a
+        # zero-length KV item would read out of range (paged: page-table
+        # index -1) and produce undefined output (empty-row softmax).
+        if s_k.numel() > 0 and int(torch.min(s_k).item()) <= 0:
+            raise ValueError(
+                "cute-dsl prefill requires kv_len >= 1 for every batch item; "
+                "zero-length KV items are not supported"
+            )
 
         # Store for runtime
         self._qo_indptr = qo_indptr.to(torch.int32)
@@ -666,6 +675,9 @@ class BatchPrefillCuteDSLWrapper:
             of ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD) /
             ``[num_pages, num_kv_heads, page_size, head_dim]`` (HND).
             Referenced pages must be finite everywhere (see ``plan``).
+            The tuple form may carry a V cache whose dtype differs from
+            the planned K dtype (mixed-dtype PV path, e.g. an fp8 V cache
+            with bf16 Q/K); K must always match the plan.
         out, return_lse, lse
             As in :meth:`run`.
         """
@@ -692,12 +704,21 @@ class BatchPrefillCuteDSLWrapper:
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
+        if k_cache.dtype != self._q_data_type:
+            raise ValueError(
+                f"k_cache.dtype={k_cache.dtype} != planned {self._q_data_type}; "
+                "K must match the planned kv dtype (the QK MMA operands share it)"
+            )
+        # V may differ from Q/K (mixed-dtype PV path, e.g. fp8 V cache with
+        # bf16 Q/K); the kernel variant is selected per V dtype in
+        # _invoke_kernel, same as the ragged route.  Only the
+        # (k_cache, v_cache) tuple form can express a mixed cache.
+        if v_cache.dtype != self._q_data_type and v_cache.dtype not in _V_DTYPE_MAP:
+            raise ValueError(
+                f"v_cache.dtype={v_cache.dtype} is not supported; expected "
+                f"{self._q_data_type} or one of {sorted(map(str, _V_DTYPE_MAP))}"
+            )
         for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
-            if t.dtype != self._q_data_type:
-                raise NotImplementedError(
-                    f"{name}.dtype={t.dtype} != planned {self._q_data_type}; "
-                    "mixed K/V dtypes are not supported on the paged route yet"
-                )
             if t.shape[-3:] != (
                 self._page_size,
                 self._num_kv_heads,
