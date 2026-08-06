@@ -347,6 +347,3 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
       << "cub_topk workspace-size query failed with error code " << cudaGetErrorString(status);
   return static_cast<int64_t>(temp_storage_bytes);
 }
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);
