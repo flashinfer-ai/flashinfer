@@ -2412,7 +2412,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
                 if cute_variant is not None:
                     raise NotImplementedError(
-                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                        "the public cute-dsl route cannot combine ALiBi with "
+                        "logits_soft_cap (one plan-time variant per kernel); "
+                        "a fused custom variant can express both — use "
+                        "flashinfer.cute_dsl.attention."
+                        "BatchPrefillCuteDSLWrapper with plan(..., variant=...)"
                     )
                 cute_variant = SoftCappingAttention(cap=logits_soft_cap)
 
@@ -2761,7 +2765,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             if sinks is not None:
                 raise NotImplementedError(
-                    "cute-dsl paged backend does not support attention sinks"
+                    "the public cute-dsl paged route does not accept run-time "
+                    "attention sinks yet; the backend supports sinks as a "
+                    "plan-time variant — use flashinfer.cute_dsl.attention."
+                    "BatchPrefillCuteDSLWrapper with "
+                    "plan(..., variant=AttentionWithSink(sinks))"
                 )
             if skip_softmax_threshold_scale_factor is not None:
                 raise NotImplementedError(
@@ -3590,7 +3598,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
                 if variant is not None:
                     raise NotImplementedError(
-                        "cute-dsl backend does not support combining ALiBi with logits_soft_cap"
+                        "the public cute-dsl route cannot combine ALiBi with "
+                        "logits_soft_cap (one plan-time variant per kernel); "
+                        "a fused custom variant can express both — use "
+                        "flashinfer.cute_dsl.attention."
+                        "BatchPrefillCuteDSLWrapper with plan(..., variant=...)"
                     )
                 variant = SoftCappingAttention(cap=logits_soft_cap)
 
@@ -4033,6 +4045,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl backend does not support NVFP4 packed KV cache "
                     "(kv_cache_sf)"
+                )
+            # vLLM's metadata builder stashes attention sinks on the wrapper
+            # for the fmha_v2 route; the cute-dsl route would silently
+            # ignore them (wrong results), so fail loudly with the
+            # supported alternative.
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but "
+                    "the public cute-dsl ragged route does not consume "
+                    "them; the backend supports sinks as a plan-time "
+                    "variant — use flashinfer.cute_dsl.attention."
+                    "BatchPrefillCuteDSLWrapper with "
+                    "plan(..., variant=AttentionWithSink(sinks))"
                 )
             # enable_pdl is a launch-latency hint: forwarded on the FMHA
             # route below; the modular kernel has no PDL support.
