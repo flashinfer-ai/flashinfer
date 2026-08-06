@@ -1794,6 +1794,16 @@ void expandInputRowsKernelLauncher(
                        "Per-expert act scale for FC1 is only supported for NVFP4 activations");
 #endif
 
+  TLLM_CHECK_WITH_INFO(((hidden_size * std::min(sizeof_bits<InputActivationsType>::value,
+                                                sizeof_bits<ExpandedActivationsType>::value)) %
+                        128) == 0,
+                       "hidden_size %ld rows are not a multiple of 16B; expandInputRowsKernel "
+                       "requires 16B-aligned rows",
+                       hidden_size);
+  TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(unpermuted_input) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(permuted_output) % 16 == 0,
+                       "expandInputRowsKernel input/output pointers must be 16B-aligned");
+
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
@@ -2558,6 +2568,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
                   float* fp8_token_dequant_scale, float const* fp8_token_residual_scale,
                   bool enable_pdl, cudaStream_t stream) {
+  TLLM_CHECK_WITH_INFO(
+      (inter_size * std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value)) % 128 == 0,
+      "inter_size %ld rows are not a multiple of 16B; doActivationKernel requires 16B-aligned rows",
+      inter_size);
+  TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(gemm_result) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(output) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(bias) % 16 == 0,
+                       "doActivationKernel input/output/bias pointers must be 16B-aligned");
+
   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
 
