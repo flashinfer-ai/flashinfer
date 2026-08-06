@@ -83,6 +83,64 @@ recurrent_kda_trace = TraceTemplate(
 )
 
 
+packed_kda_decode_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="packed_kda_decode",
+    description=(
+        "Serving-native Kimi K3 T=1 recurrent decode from a packed, "
+        "post-convolution QKV row. The recurrent state pool is mutated in place."
+    ),
+    axes={
+        "batch_size": Var(description="Number of one-token decode rows."),
+        # The public output is rank four, while no required input carries its
+        # fixed singleton axis. Keep it sweepable in the schema and constrain
+        # it to one; a caller-owned output resolves it directly when present.
+        "singleton": Var(description="Single-token output dimension."),
+        "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
+        "head_dim": Const(description="KDA head dimension.", abbrev="d"),
+        "mixed_width": Const(description="Width of the packed QKV row.", abbrev=""),
+        "gate_width": Const(
+            description="Width of the raw per-channel gate.", abbrev=""
+        ),
+        "state_pool_size": Var(description="Number of writable recurrent-state slots."),
+    },
+    inputs={
+        "mixed_qkv": Tensor(["batch_size", "mixed_width"]),
+        "raw_gate": Tensor(["batch_size", "gate_width"]),
+        "raw_beta": Tensor(["batch_size", "num_heads"]),
+        "A_log": Tensor(["num_heads"]),
+        "dt_bias": Tensor(["gate_width"]),
+        "state": Tensor(["state_pool_size", "num_heads", "head_dim", "head_dim"]),
+        "state_indices": Tensor(["batch_size"]),
+        "output": Tensor(
+            ["batch_size", "singleton", "num_heads", "head_dim"],
+            optional=True,
+            description="Optional caller-owned output allocation.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "singleton", "num_heads", "head_dim"],
+            dtype_from="mixed_qkv",
+        ),
+        "state": Tensor(
+            ["state_pool_size", "num_heads", "head_dim", "head_dim"],
+            dtype_from="state",
+            param="state",
+            description="Updated recurrent-state pool (in place).",
+        ),
+    },
+    constraints=[
+        "num_heads == 12",
+        "head_dim == 128",
+        "singleton == 1",
+        "mixed_width == 3 * num_heads * head_dim",
+        "gate_width == num_heads * head_dim",
+    ],
+    tags=["stage:decode", "status:verified"],
+)
+
+
 fused_kda_decode_trace = TraceTemplate(
     op_type="kda",
     name_prefix="fused_kda_decode",
