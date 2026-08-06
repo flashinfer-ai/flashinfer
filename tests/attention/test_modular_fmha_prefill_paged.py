@@ -655,13 +655,13 @@ def test_paged_wrapper_rejections():
     w = _paged_wrapper()
     w.plan(qo, kv_pg, ids, lpl, page_size=16, **plan_kw)
     k_c, v_c = cache[:, 0].to(torch.float8_e4m3fn), cache[:, 1]
-    with pytest.raises(ValueError, match="k_cache|dtype of k"):
+    with pytest.raises(ValueError, match=r"k_cache|dtype of k"):
         w.run(q, (k_c, v_c))
     # unsupported V dtype at run
     with pytest.raises(ValueError, match="v_cache"):
         w.run(q, (cache[:, 0], cache[:, 1].to(torch.float32)))
     # kv_cache_sf reject
-    with pytest.raises(NotImplementedError, match="kv_cache_sf|NVFP4"):
+    with pytest.raises(NotImplementedError, match=r"kv_cache_sf|NVFP4"):
         w.run(q, cache, kv_cache_sf=torch.zeros(1, device="cuda"))
     # zero-length KV item (would read page-table index -1 in the loader)
     w = _paged_wrapper()
