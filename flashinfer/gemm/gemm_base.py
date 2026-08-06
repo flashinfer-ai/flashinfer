@@ -814,42 +814,42 @@ def _tgv_bmm_bf16_requirement(
 
 
 @supported_compute_capability([103])
-def _weave_bmm_bf16_requirement(
+def _cake_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "weave", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
     if A.ndim != 3 or B.ndim != 3:
-        raise ValueError("The Weave backend requires 3D A and B tensors.")
+        raise ValueError("The CAKE backend requires 3D A and B tensors.")
     batch_size, m, k = A.shape
     if B.shape[0] != batch_size or B.shape[1] != k:
         raise ValueError(
-            "The Weave backend requires A [B,M,K] and B [B,K,N] "
+            "The CAKE backend requires A [B,M,K] and B [B,K,N] "
             "with matching batch and K dimensions."
         )
     n = B.shape[2]
     if min(batch_size, m, n, k) <= 0:
-        raise ValueError("The Weave backend requires positive B, M, N, and K.")
+        raise ValueError("The CAKE backend requires positive B, M, N, and K.")
     if n % 8 != 0:
-        raise ValueError("The Weave backend requires N to be divisible by 8.")
+        raise ValueError("The CAKE backend requires N to be divisible by 8.")
     if k not in (64, 256, 1024):
-        raise ValueError("The Weave backend requires K to be 64, 256, or 1024.")
+        raise ValueError("The CAKE backend requires K to be 64, 256, or 1024.")
     if not A.is_cuda or not B.is_cuda or A.device != B.device:
-        raise ValueError("The Weave backend requires A and B on the same CUDA device.")
+        raise ValueError("The CAKE backend requires A and B on the same CUDA device.")
     if not A.is_contiguous():
-        raise ValueError("The Weave backend requires exact row-major A storage.")
+        raise ValueError("The CAKE backend requires exact row-major A storage.")
     expected_b_stride = (k * n, 1, k)
     if B.stride() != expected_b_stride:
         raise ValueError(
-            "The Weave backend requires B to be the exact column-major/"
+            "The CAKE backend requires B to be the exact column-major/"
             f"transposed [B,K,N] view with stride {expected_b_stride}; "
             f"got {B.stride()}."
         )
     if out is not None and not out.is_contiguous():
-        raise ValueError("The Weave backend requires contiguous row-major output.")
+        raise ValueError("The CAKE backend requires contiguous row-major output.")
     return True
 
 
@@ -858,7 +858,7 @@ def _check_bmm_bf16_problem_size(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "weave", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"] = "cudnn",
 ):
     if A.dtype != torch.bfloat16:
         raise ValueError(
@@ -893,7 +893,7 @@ def _heuristic_func_bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "weave", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"] = "cudnn",
 ):
     heuristic_backends = []
     if "cudnn" in suitable_backends:
@@ -911,7 +911,7 @@ def _heuristic_func_bmm_bf16(
         "cudnn": _cudnn_bmm_bf16_requirement,
         "cutile": _cutile_bmm_bf16_requirement,
         "tgv": _tgv_bmm_bf16_requirement,
-        "weave": _weave_bmm_bf16_requirement,
+        "cake": _cake_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -922,7 +922,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "weave", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -940,11 +940,12 @@ def bmm_bf16(
     out_dtype: torch.dtype
         Output dtype, bf16 (default), fp16, or fp32.
 
-    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "weave", "auto"]
-        Backend to use, defaults to "cudnn". ``"weave"`` selects the frozen
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "cake", "auto"]
+        Backend to use, defaults to "cudnn". ``"cake"`` selects the frozen
         SM103a CAKE-generated dispatcher for contiguous A/output, exact transposed
-        column-major B, N divisible by 8, and K in {64, 256, 1024}.
-        ``"weave"`` is explicit-only and is not considered by ``"auto"``;
+        column-major B, 16-byte-aligned tensor data, N divisible by 8, and K in
+        {64, 256, 1024}. The output must not overlap either input.
+        ``"cake"`` is explicit-only and is not considered by ``"auto"``;
         ``"auto"`` continues to select from the existing autotuned backends.
 
     Returns
@@ -995,7 +996,7 @@ def bmm_bf16(
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return bmm_bf16_cutile(A, B, out)
 
-    if backend == "weave":
+    if backend == "cake":
         get_blackwell_bf16_bmm_module().run(A, B, out)
         return out
 

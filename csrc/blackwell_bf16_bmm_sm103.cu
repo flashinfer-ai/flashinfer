@@ -22,19 +22,9 @@
 // shared generated prelude is retained once; every kernel body is unchanged,
 // and section-local generated macros are undefined before the next section.
 // clang-format off
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-typedef unsigned long long uint64_t;
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
-template <int N>
-struct __align__(128) LoomTensorMapPack { LoomTensorMap maps[N]; };
-
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
-
+#include <cstdint>
 #include <cuda_bf16.h>
+#include <flashinfer/gemm/blackwell_bf16_bmm.cuh>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;

@@ -21,7 +21,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("k", [64, 256])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
-    "backend", ["cutlass", "cudnn", "cutile", "tgv", "weave", "auto"]
+    "backend", ["cutlass", "cudnn", "cutile", "tgv", "cake", "auto"]
 )
 def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -89,46 +89,46 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
         ((2, 8, 1024, 1024), torch.float32, 2),
     ],
 )
-def test_bmm_bf16_weave_routes_and_output_identity(shape, res_dtype, expected_route):
-    if not bmm_bf16.is_backend_supported("weave", 103):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+def test_bmm_bf16_cake_routes_and_output_identity(shape, res_dtype, expected_route):
+    if not bmm_bf16.is_backend_supported("cake", 103):
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
     if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
 
     b, m, n, k = shape
     torch.manual_seed(7)
-    input = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((b, n, k), device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     out = torch.empty((b, m, n), device="cuda", dtype=res_dtype)
-    expected = torch.bmm(input.float(), mat2.float()).to(res_dtype)
+    expected = torch.bmm(a.float(), mat2.float()).to(res_dtype)
 
     result = bmm_bf16(
-        input,
+        a,
         mat2,
         out=out,
         out_dtype=res_dtype,
-        backend="weave",
+        backend="cake",
     )
 
     assert result is out
     torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    assert get_blackwell_bf16_bmm_module().route_of(input, mat2, out) == expected_route
+    assert get_blackwell_bf16_bmm_module().route_of(a, mat2, out) == expected_route
 
 
-def test_bmm_bf16_weave_repeat_reuses_module_and_output():
+def test_bmm_bf16_cake_repeat_reuses_module_and_output():
     if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
 
     torch.manual_seed(0)
-    input = torch.randn((4, 128, 256), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((4, 128, 256), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((4, 256, 256), device="cuda", dtype=torch.bfloat16).transpose(
         -2, -1
     )
     out = torch.empty((4, 128, 256), device="cuda", dtype=torch.bfloat16)
-    expected = torch.bmm(input.float(), mat2.float()).to(torch.bfloat16)
+    expected = torch.bmm(a.float(), mat2.float()).to(torch.bfloat16)
 
-    first = bmm_bf16(input, mat2, out=out, backend="weave")
-    second = bmm_bf16(input, mat2, out=out, backend="weave")
+    first = bmm_bf16(a, mat2, out=out, backend="cake")
+    second = bmm_bf16(a, mat2, out=out, backend="cake")
 
     assert first is out
     assert second is out
@@ -136,38 +136,101 @@ def test_bmm_bf16_weave_repeat_reuses_module_and_output():
 
 
 @pytest.mark.parametrize("k", [56, 128])
-def test_bmm_bf16_weave_rejects_unsupported_k(k):
+def test_bmm_bf16_cake_rejects_unsupported_k(k):
     if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
 
-    input = torch.randn((1, 16, k), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((1, 16, k), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 32, k), device="cuda", dtype=torch.bfloat16).transpose(
         -2, -1
     )
     with pytest.raises(ValueError, match="K to be 64, 256, or 1024"):
-        bmm_bf16(input, mat2, backend="weave")
+        bmm_bf16(a, mat2, backend="cake")
 
 
-def test_bmm_bf16_weave_rejects_non_transposed_b():
+def test_bmm_bf16_cake_rejects_non_transposed_b():
     if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
 
-    input = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 64, 32), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="exact column-major"):
-        bmm_bf16(input, mat2, backend="weave")
+        bmm_bf16(a, mat2, backend="cake")
 
 
-def test_bmm_bf16_weave_rejects_odd_n():
+def test_bmm_bf16_cake_rejects_odd_n():
     if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Weave BF16 BMM requires exact SM103.")
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
 
-    input = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn((1, 65, 64), device="cuda", dtype=torch.bfloat16).transpose(
         -2, -1
     )
     with pytest.raises(ValueError, match="N to be divisible by 8"):
-        bmm_bf16(input, mat2, backend="weave")
+        bmm_bf16(a, mat2, backend="cake")
+
+
+@pytest.mark.parametrize("misaligned", ["A", "B", "out"])
+def test_bmm_bf16_cake_rejects_misaligned_data_pointer(misaligned):
+    if get_compute_capability(torch.device("cuda")) != (10, 3):
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+
+    b, m, n, k = 1, 16, 32, 64
+    a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn((b, n, k), device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    out = torch.empty((b, m, n), device="cuda", dtype=torch.bfloat16)
+    if misaligned == "A":
+        a = torch.empty(a.numel() + 1, device="cuda", dtype=a.dtype)[1:].view_as(a)
+    elif misaligned == "B":
+        b_storage = torch.empty(b * n * k + 1, device="cuda", dtype=torch.bfloat16)[
+            1:
+        ].view(b, n, k)
+        mat2 = b_storage.transpose(-2, -1)
+    else:
+        out = torch.empty(out.numel() + 1, device="cuda", dtype=out.dtype)[1:].view_as(
+            out
+        )
+
+    expected_error = f"{misaligned} data pointer must be 16-byte aligned"
+    with pytest.raises(ValueError, match=expected_error):
+        get_blackwell_bf16_bmm_module().route_of(a, mat2, out)
+    with pytest.raises(ValueError, match=expected_error):
+        bmm_bf16(a, mat2, out=out, backend="cake")
+
+
+def test_bmm_bf16_cake_rejects_output_input_overlap():
+    if get_compute_capability(torch.device("cuda")) != (10, 3):
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+
+    a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn((1, 64, 64), device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    with pytest.raises(ValueError, match="out must not overlap A"):
+        get_blackwell_bf16_bmm_module().route_of(a, mat2, a)
+    with pytest.raises(ValueError, match="out must not overlap A"):
+        bmm_bf16(a, mat2, out=a, backend="cake")
+
+
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_bmm_bf16_cake_fresh_output_allocation(res_dtype):
+    if get_compute_capability(torch.device("cuda")) != (10, 3):
+        pytest.skip("CAKE BF16 BMM requires exact SM103.")
+
+    a = torch.randn((1, 16, 64), device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn((1, 32, 64), device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    expected = torch.bmm(a.float(), mat2.float()).to(res_dtype)
+
+    first = bmm_bf16(a, mat2, out_dtype=res_dtype, backend="cake")
+    second = bmm_bf16(a, mat2, out_dtype=res_dtype, backend="cake")
+
+    assert first.dtype == res_dtype
+    assert second.dtype == res_dtype
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
 
 
 def test_bmm_bf16_cutile_repeat_uses_tune_cache():

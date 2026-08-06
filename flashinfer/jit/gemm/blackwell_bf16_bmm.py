@@ -22,7 +22,7 @@ def gen_blackwell_bf16_bmm_module() -> JitSpec:
     """Build the frozen SM103a CAKE-generated BF16 BMM dispatcher."""
 
     return gen_jit_spec(
-        "blackwell_bf16_bmm_weave_sm103a",
+        "blackwell_bf16_bmm_cake_sm103a",
         [
             jit_env.FLASHINFER_CSRC_DIR / "blackwell_bf16_bmm.cu",
             jit_env.FLASHINFER_CSRC_DIR / "blackwell_bf16_bmm_sm103.cu",

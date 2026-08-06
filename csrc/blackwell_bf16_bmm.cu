@@ -74,6 +74,26 @@ int CheckedInt(int64_t value, const char* name) {
   return static_cast<int>(value);
 }
 
+void CheckDataAlignment(const TensorView& tensor, const char* name) {
+  const auto address = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+  if (address % 16 != 0) {
+    TVM_FFI_THROW(ValueError) << name << " data pointer must be 16-byte aligned";
+  }
+}
+
+bool ByteRangesOverlap(const TensorView& lhs, std::uint64_t lhs_bytes, const TensorView& rhs,
+                       std::uint64_t rhs_bytes) {
+  const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data_ptr());
+  const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data_ptr());
+  TVM_FFI_ICHECK_LE(lhs_bytes, std::numeric_limits<std::uintptr_t>::max() - lhs_begin)
+      << "lhs tensor byte range overflows uintptr_t";
+  TVM_FFI_ICHECK_LE(rhs_bytes, std::numeric_limits<std::uintptr_t>::max() - rhs_begin)
+      << "rhs tensor byte range overflows uintptr_t";
+  const auto lhs_end = lhs_begin + lhs_bytes;
+  const auto rhs_end = rhs_begin + rhs_bytes;
+  return lhs_begin < rhs_end && rhs_begin < lhs_end;
+}
+
 int OutputType(const TensorView& out) {
   if (out.dtype() == dl_bfloat16) {
     return kOutBf16;
@@ -209,6 +229,10 @@ Problem ValidateProblem(const TensorView& A, const TensorView& B, const TensorVi
   CHECK_DEVICE(A, B);
   CHECK_DEVICE(A, out);
 
+  CheckDataAlignment(A, "A");
+  CheckDataAlignment(B, "B");
+  CheckDataAlignment(out, "out");
+
   TVM_FFI_ICHECK_EQ(A.dtype(), dl_bfloat16) << "A must be bfloat16";
   TVM_FFI_ICHECK_EQ(B.dtype(), dl_bfloat16) << "B must be bfloat16";
 
@@ -223,7 +247,7 @@ Problem ValidateProblem(const TensorView& A, const TensorView& B, const TensorVi
   TVM_FFI_ICHECK_GT(problem.m, 0) << "M must be positive";
   TVM_FFI_ICHECK_GT(problem.n, 0) << "N must be positive";
   TVM_FFI_ICHECK_LE(problem.batch_size, 65535) << "batch size exceeds CUDA grid.z";
-  TVM_FFI_ICHECK_LE((static_cast<int64_t>(problem.n) + 15) / 16, 65535)
+  TVM_FFI_ICHECK_LE((static_cast<int64_t>(problem.n) + 31) / 32, 65535)
       << "N exceeds CUDA grid.y for the narrowest dispatcher tile";
   TVM_FFI_ICHECK_EQ(problem.n % 8, 0) << "CAKE BF16 BMM requires N to be a multiple of 8";
   TVM_FFI_ICHECK(problem.k == 64 || problem.k == 256 || problem.k == 1024)
@@ -257,11 +281,20 @@ Problem ValidateProblem(const TensorView& A, const TensorView& B, const TensorVi
   problem.b_stride_b = CheckedInt(B.stride(0), "B batch stride");
   problem.b_stride_n = CheckedInt(B.stride(2), "B N stride");
   problem.b_stride_k = CheckedInt(B.stride(1), "B K stride");
-  CheckedInt(static_cast<int64_t>(problem.batch_size) * problem.m * problem.k, "A element count");
-  CheckedInt(static_cast<int64_t>(problem.batch_size) * problem.k * problem.n, "B element count");
+  const int64_t a_element_count = static_cast<int64_t>(problem.batch_size) * problem.m * problem.k;
+  const int64_t b_element_count = static_cast<int64_t>(problem.batch_size) * problem.k * problem.n;
+  CheckedInt(a_element_count, "A element count");
+  CheckedInt(b_element_count, "B element count");
   const int out_element_bytes = problem.out_type == kOutF32 ? 4 : 2;
-  CheckedInt(static_cast<int64_t>(problem.batch_size) * problem.m * problem.n * out_element_bytes,
-             "output byte span");
+  const int64_t out_byte_span =
+      static_cast<int64_t>(problem.batch_size) * problem.m * problem.n * out_element_bytes;
+  CheckedInt(out_byte_span, "output byte span");
+  if (ByteRangesOverlap(out, out_byte_span, A, a_element_count * 2)) {
+    TVM_FFI_THROW(ValueError) << "out must not overlap A";
+  }
+  if (ByteRangesOverlap(out, out_byte_span, B, b_element_count * 2)) {
+    TVM_FFI_THROW(ValueError) << "out must not overlap B";
+  }
   return problem;
 }
 
