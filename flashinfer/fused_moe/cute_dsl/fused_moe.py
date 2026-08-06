@@ -179,6 +179,7 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -233,6 +234,8 @@ def _moe_core_impl(
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        apply_router_weight_on_input: Apply routing weights to the expert
+            activation output, on the FC2 input, instead of after FC2.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -326,6 +329,8 @@ def _moe_core_impl(
             num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
             **output_kwargs,
+            token_final_scales=token_final_scales,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
@@ -393,6 +398,7 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
     # Step 4: Deterministic routing-weight reduction
@@ -405,6 +411,7 @@ def _moe_core_impl(
             num_tokens=num_tokens,
             top_k=top_k,
             input_is_expanded=True,
+            apply_topk_scales=not apply_router_weight_on_input,
             enable_pdl=enable_pdl,
         )
 
@@ -435,6 +442,8 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
+        apply_router_weight_on_input: Whether this wrapper applies routing
+            weights to the expert activation output before FC2.
         quant_mode: Selected W4A4 or W4A16 compute mode.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
@@ -487,6 +496,7 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
+        apply_router_weight_on_input: bool = False,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -541,6 +551,9 @@ class CuteDslMoEWrapper:
         quant_mode : str
             Compute mode: ``"w4a4"`` / ``"nvfp4"`` or ``"w4a16"``.
             Defaults to ``"w4a4"``.
+        apply_router_weight_on_input : bool
+            Apply routing weights after the expert activation, on the FC2
+            input, instead of after FC2. Defaults to ``False``.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = quant_mode.lower()
@@ -566,6 +579,7 @@ class CuteDslMoEWrapper:
         self.situ_linear_beta = situ_linear_beta
         self.use_fused_finalize = use_fused_finalize
         self.quant_mode = quant_mode
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -608,6 +622,7 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=False,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
             self._per_token_runner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_forward_with_tactic_weak,
@@ -625,6 +640,7 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=True,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
             if use_cuda_graph:
@@ -646,6 +662,7 @@ class CuteDslMoEWrapper:
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
         else:
             raise ValueError(
@@ -680,6 +697,7 @@ class CuteDslMoEWrapper:
         per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         use_async_memset: bool = True,
+        apply_router_weight_on_input: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -722,6 +740,7 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -913,6 +932,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -949,6 +969,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
 
@@ -984,6 +1005,7 @@ def cute_dsl_fused_moe_nvfp4(
     *,
     quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1061,6 +1083,9 @@ def cute_dsl_fused_moe_nvfp4(
         Optional SiTU tanh clamp for the up branch.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
+    apply_router_weight_on_input : bool
+        Apply routing weights after the expert activation, on the FC2 input,
+        instead of after FC2. Defaults to ``False``.
 
     Returns
     -------
@@ -1106,6 +1131,7 @@ def cute_dsl_fused_moe_nvfp4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             use_per_token_activation=use_per_token_activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
         inputs = [
@@ -1151,6 +1177,7 @@ def cute_dsl_fused_moe_nvfp4(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
         inputs = [
             x,

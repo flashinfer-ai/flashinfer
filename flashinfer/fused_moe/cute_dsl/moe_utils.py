@@ -261,6 +261,7 @@ def moe_unpermute(
     top_k: int,
     enable_pdl: bool = False,
     input_is_expanded: bool = False,
+    apply_topk_scales: bool = True,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -284,10 +285,12 @@ def moe_unpermute(
                     Default is False.
         input_is_expanded: Whether input rows use expanded (token, top-k slot)
             order instead of expert-permuted order.
+        apply_topk_scales: Whether to multiply each expert contribution by its
+            top-k scale before reduction. Defaults to True.
 
     Note:
-        Output is the weighted sum of expert contributions:
-        output[i] = sum(topk_scales[i, k] * expert_output[i, k] for k in range(top_k))
+        When ``apply_topk_scales`` is True, output is the weighted sum of expert
+        contributions. Otherwise, output is their unweighted sum.
     """
     module = _get_moe_utils_module()
     input_dtype_suffix = _get_dtype_suffix(permuted_input.dtype)
@@ -316,6 +319,7 @@ def moe_unpermute(
         hidden_size,
         top_k,
         input_is_expanded,
+        apply_topk_scales,
         enable_pdl,
         _get_cuda_stream_ptr(),
     )

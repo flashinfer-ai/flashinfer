@@ -85,6 +85,7 @@ class Sm100W4A16GroupedGemmKernel:
         swiglu_beta: float,
         swiglu_limit: float,
         use_fused_finalize: bool,
+        apply_router_weight_on_input: bool,
         enable_pdl: bool,
         use_clc_scheduler: bool,
         raster_along_m: bool,
@@ -123,6 +124,8 @@ class Sm100W4A16GroupedGemmKernel:
                 "W4A16 fused finalize is only implemented for the non-gated epilogue"
             )
         self.use_fused_finalize = use_fused_finalize
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.load_router_weight = self.fuse_activation and apply_router_weight_on_input
         self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -592,7 +595,7 @@ class Sm100W4A16GroupedGemmKernel:
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((self.group_count,)))
         permuted_idx_to_expanded_idx = (
             cute.make_tensor(permuted_idx_to_expanded_idx_ptr, cute.make_layout((n,)))
-            if cutlass.const_expr(self.use_fused_finalize)
+            if cutlass.const_expr(self.use_fused_finalize or self.load_router_weight)
             else None
         )
         token_final_scales = (
@@ -600,7 +603,7 @@ class Sm100W4A16GroupedGemmKernel:
                 token_final_scales_ptr,
                 cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
             )
-            if cutlass.const_expr(self.use_fused_finalize)
+            if cutlass.const_expr(self.use_fused_finalize or self.load_router_weight)
             else None
         )
         return self(
@@ -1031,13 +1034,13 @@ class Sm100W4A16GroupedGemmKernel:
                 byte_alignment=self.smem_buffer_align_bytes,
                 swizzle=a_smem_layout_transform.inner,
             )
-        sFinalizeScale = (
+        sRouteScale = (
             smem.allocate_tensor(
                 element_type=cutlass.Float32,
                 layout=cute.make_layout((self.epi_tile_n,)),
                 byte_alignment=16,
             )
-            if cutlass.const_expr(self.use_fused_finalize)
+            if cutlass.const_expr(self.use_fused_finalize or self.load_router_weight)
             else None
         )
         sTile_info = storage.tile_info.get_tensor(
@@ -1944,6 +1947,30 @@ class Sm100W4A16GroupedGemmKernel:
                         gated_identity_mn = gated_tTR_identity_base[
                             (None, None, None, 0, gated_subtile_idx)
                         ]
+                        if cutlass.const_expr(self.load_router_weight):
+                            top_k = token_final_scales.shape[1]
+                            route = epi_tidx
+                            route_in_tile = gated_subtile_idx * self.epi_tile_n + route
+                            if route < self.epi_tile_n:
+                                permuted_row = work_tile.coord_n + route_in_tile
+                                expanded_idx = permuted_idx_to_expanded_idx[
+                                    permuted_row
+                                ]
+                                safe_idx = cutlass.max(expanded_idx, cutlass.Int32(0))
+                                token_idx = safe_idx // top_k
+                                topk_idx = safe_idx % top_k
+                                is_valid = cutlass.Int32(
+                                    route_in_tile < work_tile.distance_to_boundary
+                                )
+                                token_scale = token_final_scales[
+                                    (token_idx * is_valid, topk_idx)
+                                ]
+                                sRouteScale[route] = cutlass.Float32(
+                                    token_scale
+                                ) * cutlass.Float32(is_valid)
+
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.epilog_sync_barrier.arrive_and_wait()
                         up = cute.coalesce(
                             cute.flatten(gated_tTR_rAcc[(None, 0, None)])
                         ).load()
@@ -1955,6 +1982,8 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                         up_size = cute.size(gated_tTR_rAcc[(None, 0, None)])
                         for i in cutlass.range_constexpr(0, up_size, 2):
+                            coord_0 = up_coords[i]
+                            coord_1 = up_coords[i + 1]
                             up_pair = cute.arch.mul_packed_f32x2(
                                 (up[i], up[i + 1]),
                                 (gated_alpha_f32, gated_alpha_f32),
@@ -2004,9 +2033,17 @@ class Sm100W4A16GroupedGemmKernel:
                                     up_pair, (swiglu_beta, swiglu_beta)
                                 )
                             result = cute.arch.mul_packed_f32x2(up_pair, silu)
+                            if cutlass.const_expr(self.load_router_weight):
+                                # Route in FP32 after activation and before the
+                                # BF16 FC2-input store.
+                                result = cute.arch.mul_packed_f32x2(
+                                    result,
+                                    (
+                                        sRouteScale[coord_0[1] % self.epi_tile_n],
+                                        sRouteScale[coord_1[1] % self.epi_tile_n],
+                                    ),
+                                )
 
-                            coord_0 = up_coords[i]
-                            coord_1 = up_coords[i + 1]
                             # Fold paired TMEM rows back into the reduced-M
                             # output tile and keep the staged N coordinate local.
                             output_m_0 = coord_0[0] // 32 * 16 + coord_0[0] % 16
@@ -2060,6 +2097,33 @@ class Sm100W4A16GroupedGemmKernel:
 
                     if cutlass.const_expr(self.fuse_activation):
                         alpha_f32 = cutlass.Float32(alpha_val)
+                        activation_thr_slice = m_thr_offset[
+                            (None, None, None, subtile_idx)
+                        ]
+                        if cutlass.const_expr(self.load_router_weight):
+                            top_k = token_final_scales.shape[1]
+                            route = epi_tidx
+                            route_in_tile = subtile_idx * self.epi_tile_n + route
+                            if route < self.epi_tile_n:
+                                permuted_row = work_tile.coord_n + route_in_tile
+                                expanded_idx = permuted_idx_to_expanded_idx[
+                                    permuted_row
+                                ]
+                                safe_idx = cutlass.max(expanded_idx, cutlass.Int32(0))
+                                token_idx = safe_idx // top_k
+                                topk_idx = safe_idx % top_k
+                                is_valid = cutlass.Int32(
+                                    route_in_tile < work_tile.distance_to_boundary
+                                )
+                                token_scale = token_final_scales[
+                                    (token_idx * is_valid, topk_idx)
+                                ]
+                                sRouteScale[route] = cutlass.Float32(
+                                    token_scale
+                                ) * cutlass.Float32(is_valid)
+
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.epilog_sync_barrier.arrive_and_wait()
                         acc_up = tTR_rAcc.load()
                         for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                             value = cute.arch.mul_packed_f32x2(
@@ -2070,9 +2134,22 @@ class Sm100W4A16GroupedGemmKernel:
                                 cute.arch.fmax(value[0], cutlass.Float32(0.0)),
                                 cute.arch.fmax(value[1], cutlass.Float32(0.0)),
                             )
-                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
-                                relu, relu
-                            )
+                            activated = cute.arch.mul_packed_f32x2(relu, relu)
+                            if cutlass.const_expr(self.load_router_weight):
+                                coord_0 = activation_thr_slice[(i)]
+                                coord_1 = activation_thr_slice[(i + 1)]
+                                # Route in FP32 after activation and before the
+                                # BF16 FC2-input store.
+                                activated = cute.arch.mul_packed_f32x2(
+                                    activated,
+                                    (
+                                        sRouteScale[coord_0[1] % self.epi_tile_n],
+                                        sRouteScale[coord_1[1] % self.epi_tile_n],
+                                    ),
+                                )
+                            tTR_rAcc[i], tTR_rAcc[i + 1] = activated
+                        if cutlass.const_expr(self.load_router_weight):
+                            self.epilog_sync_barrier.arrive_and_wait()
                     if cutlass.const_expr(self.use_fused_finalize):
                         finalize_thr_slice = m_thr_offset[
                             (None, None, None, subtile_idx)
@@ -2089,32 +2166,42 @@ class Sm100W4A16GroupedGemmKernel:
                             finalize_scale_expanded_idx = permuted_idx_to_expanded_idx[
                                 finalize_scale_permuted_row
                             ]
-                            finalize_scale_safe_idx = cutlass.max(
-                                finalize_scale_expanded_idx, cutlass.Int32(0)
-                            )
-                            finalize_scale_token_idx = finalize_scale_safe_idx // top_k
-                            finalize_scale_topk_idx = finalize_scale_safe_idx % top_k
                             finalize_scale_is_valid = cutlass.Int32(
                                 finalize_scale_route_in_tile
                                 < work_tile.distance_to_boundary
                             )
-                            finalize_token_scale = token_final_scales[
-                                (
-                                    finalize_scale_token_idx * finalize_scale_is_valid,
-                                    finalize_scale_topk_idx,
+                            finalize_scale = cutlass.Float32(
+                                alpha_val
+                            ) * cutlass.Float32(finalize_scale_is_valid)
+                            if cutlass.const_expr(
+                                not self.apply_router_weight_on_input
+                            ):
+                                finalize_scale_safe_idx = cutlass.max(
+                                    finalize_scale_expanded_idx, cutlass.Int32(0)
                                 )
-                            ]
-                            sFinalizeScale[finalize_scale_route] = (
-                                cutlass.Float32(alpha_val)
-                                * cutlass.Float32(finalize_token_scale)
-                                * cutlass.Float32(finalize_scale_is_valid)
-                            )
+                                finalize_scale_token_idx = (
+                                    finalize_scale_safe_idx // top_k
+                                )
+                                finalize_scale_topk_idx = (
+                                    finalize_scale_safe_idx % top_k
+                                )
+                                finalize_token_scale = token_final_scales[
+                                    (
+                                        finalize_scale_token_idx
+                                        * finalize_scale_is_valid,
+                                        finalize_scale_topk_idx,
+                                    )
+                                ]
+                                finalize_scale = finalize_scale * cutlass.Float32(
+                                    finalize_token_scale
+                                )
+                            sRouteScale[finalize_scale_route] = finalize_scale
 
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
                         for i in cutlass.range(cute.size(tTR_rC), unroll_full=True):
                             finalize_route = finalize_thr_slice[(i)][1]
-                            finalize_value = sFinalizeScale[
+                            finalize_value = sRouteScale[
                                 finalize_route % self.epi_tile_n
                             ] * cutlass.Float32(tTR_rAcc[i])
                             sFinalize[

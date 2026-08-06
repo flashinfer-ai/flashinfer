@@ -216,6 +216,7 @@ def _get_compiled_gather_kernel(
     num_tiles_ptr,
     norm_const_ptr,
     a_per_token_scale_ptr,
+    token_final_scales_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -240,6 +241,7 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    apply_router_weight_on_input: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -288,6 +290,7 @@ def _get_compiled_gather_kernel(
         situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        apply_router_weight_on_input,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -308,6 +311,7 @@ def _get_compiled_gather_kernel(
             situ_linear_beta=situ_linear_beta,
             gated=gated,
             use_a_per_token_scale=use_a_per_token_scale,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -315,6 +319,7 @@ def _get_compiled_gather_kernel(
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
         #  num_non_exiting_tiles_ptr, global_sf_ptr, a_per_token_scale_ptr,
+        #  token_final_scales_ptr,
         #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
         #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
@@ -332,6 +337,7 @@ def _get_compiled_gather_kernel(
             num_tiles_ptr,
             norm_const_ptr,
             a_per_token_scale_ptr,
+            token_final_scales_ptr,
             orig_m,
             permuted_m,
             n,
@@ -363,6 +369,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     global_scale: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    token_final_scales: Optional[torch.Tensor] = None,
+    apply_router_weight_on_input: bool = False,
     topk: int = 8,
     ab_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
@@ -416,6 +424,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
+        token_final_scales: Routing weights of shape (seq_len, topk). Required
+            when ``apply_router_weight_on_input`` is true.
+        apply_router_weight_on_input: Apply each route's weight to the expert
+            activation output before the FC2-input store. Defaults to False.
         topk: Number of experts per token. Default: 8
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
@@ -517,6 +529,23 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             raise ValueError(
                 f"a_per_token_scale must have shape ({seq_len},), "
                 f"got {tuple(a_per_token_scale.shape)}"
+            )
+
+    if apply_router_weight_on_input:
+        if token_final_scales is None:
+            raise ValueError(
+                "token_final_scales is required when apply_router_weight_on_input=True"
+            )
+        if token_final_scales.device.type != "cuda":
+            raise ValueError("token_final_scales must be on CUDA device")
+        if token_final_scales.dtype != torch.float32:
+            raise ValueError("token_final_scales must have dtype torch.float32")
+        if not token_final_scales.is_contiguous():
+            raise ValueError("token_final_scales must be contiguous")
+        if token_final_scales.shape != (seq_len, topk):
+            raise ValueError(
+                f"token_final_scales must have shape ({seq_len}, {topk}), "
+                f"got {tuple(token_final_scales.shape)}"
             )
 
     if n % 128 != 0:
@@ -646,6 +675,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         )
     else:
         a_per_token_scale_ptr = None
+    token_final_scales_ptr = (
+        make_ptr(
+            cutlass.Float32,
+            token_final_scales.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
+        if apply_router_weight_on_input
+        else None
+    )
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -685,6 +723,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
+        token_final_scales_ptr=token_final_scales_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -708,13 +747,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
     # Execute kernel with runtime parameters
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  a_per_token_scale_ptr, orig_m, m, n, k, l, stream)
+    #  a_per_token_scale_ptr, token_final_scales_ptr, orig_m, m, n, k, l,
+    #  stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -729,6 +770,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         num_tiles_ptr,
         norm_const_ptr,
         a_per_token_scale_ptr,
+        token_final_scales_ptr,
         seq_len,  # orig_m
         permuted_m,
         n,

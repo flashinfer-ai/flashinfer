@@ -245,6 +245,9 @@ class CuteDslNvfp4Runner(MoERunner):
                 enable_pdl=enable_pdl,
                 activation_type=int(config.activation.type),
                 use_per_token_activation=bool(config.quant.per_token_scale),
+                apply_router_weight_on_input=(
+                    config.execution.apply_router_weight_on_input
+                ),
             )
         elif config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
@@ -255,6 +258,9 @@ class CuteDslNvfp4Runner(MoERunner):
                 use_fused_finalize=config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 activation_type=int(config.activation.type),
+                apply_router_weight_on_input=(
+                    config.execution.apply_router_weight_on_input
+                ),
             )
         else:
             raise NotImplementedError(

@@ -1535,6 +1535,7 @@ class TestCuteDslFusedMoeFunctional:
         quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
+        apply_router_weight_on_input: bool = False,
     ):
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
@@ -1570,6 +1571,7 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=activation_type,
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             **api_inputs,
         )
 
@@ -1587,6 +1589,7 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=activation_type,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             **reference_inputs,
         )
 
@@ -1893,6 +1896,10 @@ class TestCuteDslMoEWrapper:
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -1907,12 +1914,15 @@ class TestCuteDslMoEWrapper:
         use_fused_finalize: bool,
         quant_mode: str,
         use_per_token_activation: bool,
+        apply_router_weight_on_input: bool,
+        activation_type: ActivationType,
     ):
         """Accuracy test for wrapper API."""
         from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
 
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1920,6 +1930,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=gated,
             use_per_token_activation=use_per_token_activation,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
@@ -1934,7 +1945,9 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             use_fused_finalize=use_fused_finalize,
+            activation_type=activation_type,
             quant_mode=quant_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
         result = moe.run(
@@ -1961,6 +1974,8 @@ class TestCuteDslMoEWrapper:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             **reference_inputs,
         )
 
