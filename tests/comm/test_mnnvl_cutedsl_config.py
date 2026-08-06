@@ -17,6 +17,8 @@
 import pytest
 import torch
 
+pytest.importorskip("cutlass.cute", reason="requires nvidia-cutlass-dsl")
+
 from flashinfer.comm.mnnvl_cutedsl import (
     BT_ONLY_CONFIG,
     DEFAULT_CONFIG,
@@ -44,6 +46,22 @@ from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
 
 def _target(protocol: ProtocolKind, preset: str) -> KernelTarget[str]:
     return KernelTarget(protocol=protocol, preset=preset)
+
+
+def test_static_profile_rejects_hidden_size_without_vector_alignment():
+    routes = MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, "ll"),),
+    )
+    with pytest.raises(ValueError, match="multiple of 8"):
+        StaticProfile(
+            tp_size=8,
+            hidden_size=8191,
+            top_k=10,
+            dtype=torch.bfloat16,
+            finalize_routes=routes,
+            all_reduce_routes=routes,
+        )
 
 
 def test_m_range_dispatch_selects_contiguous_ranges():

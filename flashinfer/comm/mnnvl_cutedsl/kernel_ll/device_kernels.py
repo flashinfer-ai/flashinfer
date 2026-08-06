@@ -108,6 +108,8 @@ class _ScalarFinalizePublishDeviceKernel:
         enable_pdl: bool,
         prefetch_group: int,
     ) -> None:
+        if hidden <= 0 or hidden % 2:
+            raise ValueError("hidden must be a positive multiple of 2")
         self.hidden = hidden
         self.top_k = top_k
         self.tp = tp
@@ -274,6 +276,7 @@ class _ScalarFinalizePublishDeviceKernel:
             if bits == Uint32(NEGATIVE_ZERO_BF16_BITS):
                 bits = Uint32(0)
 
+        # Unlike the quad path, this publishes first; Lamport sentinels gate consumers.
         if block == 0 and tidx == 0:
             store_global_u32(
                 stage_state.iterator + ACTIVE_STAGE,
@@ -315,6 +318,8 @@ class _QuadFinalizePublishDeviceKernel:
         enable_pdl: bool,
         prefetch_group: int,
     ) -> None:
+        if hidden <= 0 or hidden % QUAD_BF16:
+            raise ValueError("hidden must be a positive multiple of 4")
         self.hidden = hidden
         self.top_k = top_k
         self.tp = tp
@@ -555,6 +560,10 @@ class _SharedOnlyPublishDeviceKernel:
         release_before_store: bool,
         enable_pdl: bool,
     ) -> None:
+        if elements_per_thread not in (1, QUAD_BF16, VEC_BF16):
+            raise ValueError("elements_per_thread must be 1, 4, or 8")
+        if hidden <= 0 or hidden % elements_per_thread:
+            raise ValueError("hidden must divide evenly across thread fragments")
         self.hidden = hidden
         self.tp = tp
         self.rank = rank
@@ -718,6 +727,14 @@ class _LamportResidualRMSNormDeviceKernel:
         write_residual_output: bool,
         enable_pdl: bool,
     ) -> None:
+        if rank_lanes not in (1, 2, 4, 8):
+            raise ValueError("rank_lanes must be 1, 2, 4, or 8")
+        if tp % rank_lanes:
+            raise ValueError("tp must be divisible by rank_lanes")
+        if threads <= 0 or threads % WARP_SIZE or threads % rank_lanes:
+            raise ValueError("threads must be a positive warp and rank-lane multiple")
+        if hidden <= 0 or hidden % VEC_BF16:
+            raise ValueError("hidden must be a positive multiple of 8")
         self.hidden = hidden
         self.tp = tp
         self.capacity_m = capacity_m

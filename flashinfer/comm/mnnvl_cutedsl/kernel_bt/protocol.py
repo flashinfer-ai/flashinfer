@@ -354,6 +354,8 @@ class BTProtocol:
         }
 
     def _compile_finalize(self, tuning: BTFinalizeTuning):
+        if tuning.elements_per_thread not in (1, 2, 4, VEC_BF16):
+            raise ValueError("BT finalize elements_per_thread must be 1, 2, 4, or 8")
         kwargs: dict[str, Any] = {
             "hidden_size": self.hidden_size,
             "top_k": self.top_k,

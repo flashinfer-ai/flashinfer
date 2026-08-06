@@ -65,11 +65,27 @@ def _check_tensor(
         raise ValueError(f"{name} must be {alignment}-byte aligned")
 
 
+def _warn_pdl_mismatch(
+    workspace: "MNNVLCuteDSLAllReduceFusionWorkspace",
+    pattern: int,
+    m: int,
+    launch_with_pdl: bool,
+) -> None:
+    preset_pdl = workspace._uses_pdl(pattern, m)
+    if launch_with_pdl != preset_pdl:
+        logger.warning(
+            "launch_with_pdl does not match the selected MNNVL CuTe DSL "
+            "preset; using enable_pdl=%s",
+            preset_pdl,
+        )
+
+
 class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     """Compiled LL, BT, and HT protocols for one static problem shape.
 
     Workspace construction compiles the selected kernels and must finish before
     the first invocation. Calls using the same workspace must not overlap.
+    Feature-disabled tensor slots use internal placeholders that are not read.
     """
 
     _destroyed: bool
@@ -186,6 +202,9 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                     all_reduce_tunings=all_reduce_tunings,
                 )
             self._protocols[protocol] = instance
+
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
 
     @staticmethod
     def _tunings(
@@ -371,23 +390,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
     if unsupported:
         raise ValueError("MNNVL CuTe DSL does not support: " + ", ".join(unsupported))
 
-    m = None
-    if pattern == AllReduceFusionPattern.kARResidualRMSNorm and input.ndim:
-        m = input.shape[0]
-    elif (
-        pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm
-        and expanded_idx_to_permuted_idx is not None
-        and expanded_idx_to_permuted_idx.ndim
-    ):
-        m = expanded_idx_to_permuted_idx.shape[0]
-    if m is not None:
-        preset_pdl = workspace._uses_pdl(pattern, m)
-        if launch_with_pdl != preset_pdl:
-            logger.warning(
-                "launch_with_pdl does not match the selected MNNVL CuTe DSL "
-                "preset; using enable_pdl=%s",
-                preset_pdl,
-            )
     if rms_eps != workspace.rms_eps:
         raise ValueError("rms_eps does not match the compiled workspace")
     if weight_bias != workspace.weight_bias:
@@ -433,6 +435,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
         m = input.shape[0]
         if not 1 <= m <= workspace.max_token_num:
             raise ValueError("input token count exceeds workspace capacity")
+        _warn_pdl_mismatch(workspace, pattern, m, launch_with_pdl)
         if residual_in is not None:
             _check_tensor(
                 residual_in,
@@ -486,6 +489,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
         m = expanded_idx_to_permuted_idx.shape[0]
         if not 1 <= m <= workspace.max_token_num:
             raise ValueError("input token count exceeds workspace capacity")
+        _warn_pdl_mismatch(workspace, pattern, m, launch_with_pdl)
         _check_tensor(
             input,
             "input",
