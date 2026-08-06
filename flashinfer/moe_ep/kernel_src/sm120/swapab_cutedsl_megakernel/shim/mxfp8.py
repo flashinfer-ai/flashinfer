@@ -159,10 +159,15 @@ class MegaMoESm120Mxfp8Config:
                 f"M in {_TILE_M_CHOICES} and N in {_TILE_N_CHOICES}; "
                 f"got mma_tiler_mnk={self.mma_tiler_mnk}."
             )
-        cm, cn, cl = self.cluster_shape_mnk
-        if cn != 1 or cl != 1 or cm < 1 or cm > 16:
+        # The kernel ctor nominally accepts cluster_m in [1, 16], but the
+        # drop never tests > 1 and its own runner fails to compile there
+        # ("expects num_multicast to be 1 for non multicast G2S copies",
+        # verified 2026-08-06 on sm_120 / DSL 4.6.1) — see VENDOR.md.  Loosen
+        # when a drop validates multi-CTA clusters.
+        if self.cluster_shape_mnk != (1, 1, 1):
             raise ValueError(
-                "cluster_shape_mnk must be (m, 1, 1) with m in [1, 16]; "
+                "cluster_shape_mnk must be (1, 1, 1) on the current SM120 "
+                f"drop (multi-CTA clusters do not compile upstream); "
                 f"got {self.cluster_shape_mnk}."
             )
         # C3 pool constraint: cluster_tile_tokens (= N * cluster_n under

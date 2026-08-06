@@ -41,6 +41,11 @@ replace, what to audit) lives in `SKILL.md`.
   1 GPU, DSL 4.6.1), and the flag appears in none of the drop's test
   scripts. The FI backend rejects the flag; the shim keeps the plumbing so a
   fixed drop only needs the backend guard and test skips removed.
+- **`cluster_shape_mnk` with cluster_m > 1**: fails at `cute.compile` with
+  "expects num_multicast to be 1 for non multicast G2S copies" (verified
+  2026-08-06, same setup, reproduced with the drop's own `mega_runner` at
+  `--cluster_shape_mnk 2,1,1`); the drop's test scripts always use `1,1,1`.
+  The shim config rejects anything but `(1, 1, 1)`.
 
 ## Pending local diffs vs upstream
 
