@@ -680,6 +680,7 @@ class _VectorFinalizeUnicastDeviceKernel:
             if cutlass.const_expr(self.routed_scaling_factor != 1.0):
                 weight = weight * Float32(self.routed_scaling_factor)
             if routed_index == Int32(-1):
+                # Vector loads are unpredicated; row zero is safe and its weight is zero.
                 routed_index = Int32(0)
                 weight = Float32(0.0)
             cute.arch.store(

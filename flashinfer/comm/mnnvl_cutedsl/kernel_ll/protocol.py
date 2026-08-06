@@ -25,6 +25,7 @@ import torch.distributed as dist
 from cutlass import BFloat16, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
+from ..cute_dsl_primitives import QUAD_BF16
 from ..runtime import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -336,6 +337,8 @@ class LLProtocol:
         }
 
     def _compile_finalize(self, tuning: LLFinalizeTuning):
+        if tuning.elements_per_thread not in (1, QUAD_BF16):
+            raise ValueError("LL finalize elements_per_thread must be 1 or 4")
         kwargs: dict[str, Any] = {
             "hidden": self.hidden_size,
             "top_k": self.top_k,

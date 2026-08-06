@@ -145,6 +145,10 @@ class StaticProfile:
     finalize_routes: MRangeDispatch[KernelTarget[object]]
     all_reduce_routes: MRangeDispatch[KernelTarget[object]]
 
+    def __post_init__(self) -> None:
+        if self.hidden_size <= 0 or self.hidden_size % 8:
+            raise ValueError("hidden_size must be a positive multiple of 8")
+
     def matches(
         self,
         *,

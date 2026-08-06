@@ -567,6 +567,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                                 packed_prenorm = bf16x8_to_packed_u32x4(prenorm)
                                 if cutlass.const_expr(self.write_residual_output):
                                     prenorm_packed.append(packed_prenorm)
+                                # Finalize has drained `rows`; __init__ verifies the RMS layout fits.
                                 store_shared_u32x4(
                                     rows.iterator
                                     + stage_slot * self.hidden

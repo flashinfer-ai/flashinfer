@@ -40,11 +40,11 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "KernelTarget",
     "BT_ONLY_CONFIG",
     "DEFAULT_CONFIG",
     "HT_ONLY_CONFIG",
     "LL_ONLY_CONFIG",
+    "KernelTarget",
     "MNNVLCuteDSLConfig",
     "MRangeDispatch",
     "ProtocolKind",

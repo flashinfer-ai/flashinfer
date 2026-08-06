@@ -33,6 +33,7 @@ from flashinfer.comm.mnnvl_cutedsl import (
 from flashinfer.comm.mnnvl_cutedsl_ar import (
     MNNVLCuteDSLAllReduceFusionWorkspace,
 )
+from flashinfer.utils import is_sm100a_supported
 
 
 HIDDEN_SIZE = 8192
@@ -58,11 +59,11 @@ def distributed_group():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    if not is_sm100a_supported(device):
+        pytest.skip("SM100 or newer data-center Blackwell is required")
     owns_group = not dist.is_initialized()
     if owns_group:
         dist.init_process_group("nccl", device_id=device)
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("SM100 or newer is required")
     try:
         yield dist.group.WORLD
     finally:

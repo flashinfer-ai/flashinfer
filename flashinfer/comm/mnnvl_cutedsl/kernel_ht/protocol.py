@@ -209,6 +209,7 @@ class AllReduceRMSNormHTKernel(_HTPath):
             residual_output if residual_output is not None else norm_output
         )
         index_arg = state.all_reduce_processed_counters.view(torch.int32)
+        # top_k=0 disables metadata reads, so the aliased placeholders stay unused.
         self._compiled(
             to_cute_dynamic(
                 local_contribution.flatten(),
@@ -301,12 +302,20 @@ class HTProtocol:
         }
 
     def _resolve_ctas(self, persistent_ctas: int | None) -> int:
-        if persistent_ctas is not None:
-            return persistent_ctas
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        return (sm_count // self.tp_size) * self.tp_size
+        # min_blocks_per_mp=1 guarantees one resident CTA per SM for this kernel.
+        resident_ctas = (sm_count // self.tp_size) * self.tp_size
+        if resident_ctas == 0:
+            raise ValueError("tp_size exceeds the available SM count")
+        if persistent_ctas is None:
+            return resident_ctas
+        if persistent_ctas <= 0 or persistent_ctas % self.tp_size:
+            raise ValueError(
+                "persistent_ctas must be positive and divisible by tp_size"
+            )
+        return min(persistent_ctas, resident_ctas)
 
     def _compile_finalize(self, tuning: HTFinalizeTuning):
         active_ctas = self._resolve_ctas(tuning.persistent_ctas)

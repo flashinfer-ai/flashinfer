@@ -27,6 +27,7 @@ class _GraphSafeDLPack:
         self.tensor = tensor
 
     def __dlpack__(self, stream=None):
+        # stream=-1 skips producer sync; CuTe launches on the current captured stream.
         return self.tensor.__dlpack__(stream=-1)
 
     def __dlpack_device__(self):
