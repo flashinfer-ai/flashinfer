@@ -1624,6 +1624,300 @@ class TrtllmBf16RoutedRunner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+# TRTLLM MxInt4 runner — BF16 activations, packed INT4 BlockMajorK weights
+# ---------------------------------------------------------------------------
+
+
+class TrtllmMxInt4RoutedRunner(MoERunner):
+    """MxInt4 adapter over the canonical TRTLLM MoE runner."""
+
+    backend_key = "trtllm_mxint4_routed"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
+    supported_quant_variants = (QuantVariant.MxInt4,)
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only do_finalize=True."
+            )
+        from ..utils import get_compute_capability
+        from .api import TrtllmMxInt4Config
+
+        major, minor = get_compute_capability(self.device)
+        arch = major * 10 + minor
+        if not TrtllmMxInt4Config.supported(arch):
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on supported "
+                f"SM100/SM103/SM107 targets, got sm{arch}."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
+        from .core import get_trtllm_moe_sm100_module
+
+        self.config = config
+        self.device = device
+        self._module = get_trtllm_moe_sm100_module()
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        self._dtype_act = DtypeTrtllmGen.Bfloat16
+        self._dtype_weights = DtypeTrtllmGen.MxInt4
+        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        self._inner: Any = None
+        self._static_kwargs: dict = {}
+        self.tuning_config: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.BlockMajorK),
+            use_per_token_scaling=False,
+            num_experts=self.config.routing.num_experts,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
+        )
+        return inputs[0]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        from .core import MoeRunnerInputs
+
+        view = weights.get_view(self.backend_key)
+        routing = self.config.routing
+        hidden_states = act.hidden_states_q
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"{type(self).__name__}: hidden_states_q must be 2D BF16.")
+        if not hidden_states.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__}: hidden_states_q must be contiguous."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__}: hidden_states_scale must be None."
+            )
+        num_tokens, hidden_size = hidden_states.shape
+        if hidden_size % 256 != 0 or self._intermediate_size % 256 != 0:
+            raise ValueError(
+                f"{type(self).__name__}: hidden_size and intermediate_size "
+                "must be divisible by 256."
+            )
+        routing_input_mode = act.routing_input_mode
+        if routing_input_mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, type(self).__name__
+            )
+            if act.routing_logits.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"{type(self).__name__}: FromLogits currently requires "
+                    f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
+                )
+            if act.routing_bias is not None:
+                if act.routing_bias.dtype != torch.bfloat16:
+                    raise TypeError(
+                        f"{type(self).__name__}: routing_bias must be bfloat16, "
+                        f"got {act.routing_bias.dtype}."
+                    )
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            topk_ids = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.int32
+            )
+            expert_weights = hidden_states.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, type(self).__name__
+            )
+            routing_logits = None
+            routing_bias = None
+            topk_ids = _pack_prerouted_topk_ids(act)
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only FromLogits and "
+                "PackedPrecomputed routing."
+            )
+
+        required = (
+            "gemm1_weights",
+            "gemm1_weights_scale",
+            "gemm2_weights",
+            "gemm2_weights_scale",
+        )
+        missing = [key for key in required if key not in view]
+        if missing:
+            raise KeyError(f"{self.backend_key} weight view is missing {missing}.")
+        for key in required:
+            tensor = view[key]
+            if tensor.device != hidden_states.device:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} is on {tensor.device}, "
+                    f"expected {hidden_states.device}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+        if (
+            view["gemm1_weights"].dtype != torch.uint8
+            or view["gemm2_weights"].dtype != torch.uint8
+        ):
+            raise TypeError("MxInt4 packed weights must be uint8.")
+        if (
+            view["gemm1_weights_scale"].dtype != torch.bfloat16
+            or view["gemm2_weights_scale"].dtype != torch.bfloat16
+        ):
+            raise TypeError("MxInt4 weight scales must be bfloat16.")
+        expected_shapes = {
+            "gemm1_weights": (
+                self._num_local_experts,
+                hidden_size // 256,
+                2 * self._intermediate_size,
+                128,
+            ),
+            "gemm1_weights_scale": (
+                self._num_local_experts,
+                2 * self._intermediate_size * hidden_size // 32,
+            ),
+            "gemm2_weights": (
+                self._num_local_experts,
+                self._intermediate_size // 256,
+                hidden_size,
+                128,
+            ),
+            "gemm2_weights_scale": (
+                self._num_local_experts,
+                hidden_size * self._intermediate_size // 32,
+            ),
+        }
+        for key, expected in expected_shapes.items():
+            if tuple(view[key].shape) != expected:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} shape "
+                    f"{tuple(view[key].shape)} != expected {expected}."
+                )
+        for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            tensor = view.get(key)
+            if tensor is None:
+                continue
+            if tensor.device != hidden_states.device:
+                raise ValueError(
+                    f"{type(self).__name__}: {key} is on {tensor.device}, "
+                    f"expected {hidden_states.device}."
+                )
+            if tensor.dtype != torch.float32:
+                raise TypeError(
+                    f"{type(self).__name__}: {key} must be float32, got {tensor.dtype}."
+                )
+            if tuple(tensor.shape) != (self._num_local_experts,):
+                raise ValueError(
+                    f"{type(self).__name__}: {key} shape {tuple(tensor.shape)} "
+                    f"!= expected ({self._num_local_experts},)."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+
+        output = hidden_states.new_empty((num_tokens, hidden_size))
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        self._static_kwargs = dict(
+            routing_bias=routing_bias,
+            gemm1_weights=view["gemm1_weights"],
+            gemm1_weights_scale=view["gemm1_weights_scale"],
+            gemm1_alpha=view.get("gemm1_alpha"),
+            gemm1_beta=view.get("gemm1_beta"),
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
+            gemm2_weights=view["gemm2_weights"],
+            gemm2_weights_scale=view["gemm2_weights_scale"],
+            num_experts=routing.num_experts,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method),
+            do_finalize=self.config.execution.do_finalize,
+            enable_pdl=self._enable_pdl,
+            norm_topk_prob=True,
+        )
+
+        self._ensure_inner(hidden_size)
+        self.tuning_config = self._inner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        return moe_inputs.to_list()
+
+    def __hash__(self):
+        return hash(("trtllm_mxint4_routed",))
+
+
+# ---------------------------------------------------------------------------
 # SM12x b12x runners — fixed tactic, existing wrapper delegation
 # ---------------------------------------------------------------------------
 

@@ -53,16 +53,19 @@ def _atomic_add_i32(a, ptr: cute.Pointer) -> cutlass.Int32:
 class TopKSelectRadixSm12x:
     """Multi-stage MSD radix top-K selection over per-block proxy scores."""
 
-    def __init__(self, topk: int):
+    def __init__(self, topk: int, per_token_nvp: bool = False):
         if topk != 16:
             raise ValueError(f"topk must be 16, got {topk}")
         self._topk = topk
+        # See TopKSelectCountRankSm12x: per-token causal KV extents.
+        self._per_token_nvp = per_token_nvp
 
     @cute.jit
     def __call__(
         self,
         mMaxScore: cute.Tensor,  # (H, P, S) f32  (P = max_k_tiles)
         mOut: cute.Tensor,  # (S, H, topk) int32
+        mNumValidPages: cute.Tensor,  # (S,) int32; dummy when not per-token
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
         force_end: cutlass.Int32,
@@ -71,7 +74,9 @@ class TopKSelectRadixSm12x:
         stream: cuda.CUstream,
     ):
         mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
-        self.kernel(mBits, mOut, num_valid_pages, force_begin, force_end).launch(
+        self.kernel(
+            mBits, mOut, mNumValidPages, num_valid_pages, force_begin, force_end
+        ).launch(
             grid=(total_qo_len, num_qo_heads, 1),
             block=(_KTHREADS, 1, 1),
             stream=stream,
@@ -90,6 +95,7 @@ class TopKSelectRadixSm12x:
         self,
         mBits: cute.Tensor,  # (H, P, S) uint32, raw bits of max_score
         mOut: cute.Tensor,  # (S, H, topk) int32
+        mNumValidPages: cute.Tensor,  # (S,) int32
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
         force_end: cutlass.Int32,
@@ -126,10 +132,26 @@ class TopKSelectRadixSm12x:
         #   [5] done: selection complete, remaining stages no-op
         #   [6] need: slots still to fill this stage (target - found)
 
-        nvp = num_valid_pages
-        mid_lo = force_begin
-        mid_hi = num_valid_pages - force_end
-        n_forced = force_begin + force_end
+        if cutlass.const_expr(self._per_token_nvp):
+            # Clamp the device-side count to the score tensor's own block extent;
+            # see TopKSelectCountRankSm12x. Nothing on the host bounds it, and an
+            # out-of-range entry would read mBits past its end and emit block
+            # indices the attend kernel cannot address.
+            nvp = cutlass.max(
+                cutlass.Int32(0),
+                cutlass.min(mNumValidPages[q], cutlass.Int32(mBits.shape[1])),
+            )
+        else:
+            nvp = num_valid_pages
+
+        # Shrink the forced region to fit a token whose causal extent is
+        # shorter than it; see TopKSelectCountRankSm12x.
+        fb = cutlass.min(force_begin, nvp)
+        fe = cutlass.min(force_end, nvp - fb)
+
+        mid_lo = fb
+        mid_hi = nvp - fe
+        n_forced = fb + fe
         target = cutlass.Int32(self._topk) - n_forced
 
         n_groups = _NUM_BINS // _GROUP
@@ -138,13 +160,13 @@ class TopKSelectRadixSm12x:
         if tid == 0:
             w = cutlass.Int32(0)
             i = cutlass.Int32(0)
-            while i < force_begin:
+            while i < fb:
                 sel[w] = i
                 w += 1
                 i += 1
             j = cutlass.Int32(0)
-            while j < force_end:
-                sel[w] = (nvp - force_end) + j
+            while j < fe:
+                sel[w] = mid_hi + j
                 w += 1
                 j += 1
             k = w

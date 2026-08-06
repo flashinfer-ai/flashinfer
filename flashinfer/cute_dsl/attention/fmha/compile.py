@@ -212,6 +212,7 @@ def compile_cute_dsl_fmha_kernel(
 @functools.cache
 def compile_cute_dsl_fmha_blockscaled_kernel(
     qk_mode: str,
+    pv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     num_qo_heads: int,
     num_kv_heads: int,
@@ -221,12 +222,17 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
     enable_skip_softmax: bool,
     use_pdl: bool,
     device: torch.device,
+    has_window_left: bool = False,
+    has_window_right=None,
 ):
     """Compile (and cache) the trtllm block-scaled FMHA kernel (batched, non-varlen)."""
     from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
 
+    if has_window_right is None:
+        has_window_right = is_causal
     enable_ex2_emulation = _ex2_emulation_enabled(device)
     qk, sf_dt, sf_vec = _BLOCKSCALED_MODES[qk_mode]
+    pv = _CUTLASS_DTYPE[pv_dtype]
     out = _CUTLASS_DTYPE[out_dtype]
     d = dv = head_dim
 
@@ -236,7 +242,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         mma_tiler=(128, 128),
         head_dim=d,
         is_persistent=False,
-        mask_type=_mask_type(is_causal),
+        mask_type=_mask_type(has_window_left or has_window_right),
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
@@ -264,7 +270,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         assumed_align=16,
     )
     v_fake = make_fake_compact_tensor(
-        cutlass.Float8E4M3FN,
+        pv,
         (sym_b, sym_s_k, sym_hk, 1, sym_dv),
         stride_order=(4, 3, 2, 1, 0),
         assumed_align=16,
@@ -275,11 +281,21 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         stride_order=(4, 3, 2, 1, 0),
         assumed_align=32,
     )
-    # SF: the kernel reconstructs the blocked layout from q.shape via
-    # tile_atom_to_shape_SF and only reads the SF pointer, so a flat 1D tensor
-    # (the fused quantizer's SF, flattened) is sufficient.
-    q_sf_fake = make_fake_compact_tensor(sf_dt, (cute.sym_int(),), assumed_align=16)
-    k_sf_fake = make_fake_compact_tensor(sf_dt, (cute.sym_int(),), assumed_align=16)
+    # The fused quantizer produces the same contiguous 128x4-swizzled storage.
+    # Expose it through the compiler's 6D ABI: (L, M/128, SF_K/4, 32, 4, 4).
+    sym_sf_k_tiles = cute.sym_int()
+    q_sf_fake = make_fake_compact_tensor(
+        sf_dt,
+        (cute.sym_int(), cute.sym_int(), sym_sf_k_tiles, 32, 4, 4),
+        stride_order=(5, 4, 3, 2, 1, 0),
+        assumed_align=16,
+    )
+    k_sf_fake = make_fake_compact_tensor(
+        sf_dt,
+        (cute.sym_int(), cute.sym_int(), sym_sf_k_tiles, 32, 4, 4),
+        stride_order=(5, 4, 3, 2, 1, 0),
+        assumed_align=16,
+    )
     lse_fake = (
         make_fake_compact_tensor(
             cutlass.Float32,
@@ -294,7 +310,8 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
     problem_size = (1, 1, 1, 1, num_qo_heads, num_kv_heads, d, dv)
     scale_softmax = 1.0 / math.sqrt(d)
     skip_threshold_log2 = Float32(0.0) if enable_skip_softmax else None
-    ws_right = Int32(0) if is_causal else None
+    ws_left = Int32(0) if has_window_left else None
+    ws_right = Int32(0) if has_window_right else None
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
@@ -315,7 +332,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         1.0,
         None,  # scale_v_channels
         skip_threshold_log2,
-        None,
+        ws_left,
         ws_right,
         None,
         None,

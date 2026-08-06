@@ -451,10 +451,33 @@ class TrtllmMxInt4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # Same trtllm-gen routed batched-GEMM path as the FP4/BF16 backends, so it
-        # inherits the same manifest coverage. The pinned Rubin manifest includes
-        # MxInt4 sm107a kernels, although unified MxInt4 still has no runner.
+        # SM100/SM103 use the forward-compatible sm100f cubins; SM107 selects
+        # the dedicated Rubin artifact.
         return arch in _TRTLLM_ROUTED_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build a ``trtllm_mxint4_routed`` view from canonical BF16 weights."""
+        from .prepare import prepare_trtllm_mxint4_weights
+
+        return prepare_trtllm_mxint4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"
@@ -759,6 +782,8 @@ class MoEActivationPack:
     * W4A16 with ``TrtllmFp4Config``: raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
+      packed signed INT4 with BF16 block scales.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
@@ -781,8 +806,9 @@ class MoEActivationPack:
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
       back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
-      BF16, block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches
-      a logits pack only to capable backends (see each runner's ``supported_routing_modes``).
+      BF16, block-FP8, per-tensor-FP8, and MxInt4 runners support this mode;
+      ``MoELayer`` dispatches a logits pack only to capable backends (see each runner's
+      ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so

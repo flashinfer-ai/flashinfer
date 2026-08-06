@@ -39,7 +39,6 @@ import pytest
 import torch
 
 from flashinfer.trace.template import TraceTemplate, Var
-from tests.trace.template_registry import collect_registered_trace_templates
 
 # ---------------------------------------------------------------------------
 # Auto-discovery (imports the modules to populate _TRACE_REGISTRY).
@@ -47,9 +46,47 @@ from tests.trace.template_registry import collect_registered_trace_templates
 
 
 def _collect_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
-    """Return all available (func, template, label) triples."""
+    """Discover (func, template, label) triples by importing every module
+    that decorates a function with ``@flashinfer_api(trace=...)``.
 
-    return collect_registered_trace_templates()
+    Each import is wrapped individually because some submodules require
+    optional dependencies (e.g. ``cuda.tile`` for ``comm.allreduce``) that
+    may not be installed in the current environment — we still want to
+    test whatever templates are available.
+    """
+    import contextlib
+    import importlib
+
+    _MODULES = [
+        "flashinfer.activation",
+        "flashinfer.cascade",
+        "flashinfer.comm.allreduce",
+        "flashinfer.comm.dcp_alltoall",
+        "flashinfer.decode",
+        "flashinfer.fused_moe",
+        "flashinfer.gdn_decode",
+        "flashinfer.gdn_prefill",
+        "flashinfer.gemm",
+        "flashinfer.mamba",
+        "flashinfer.mla",
+        "flashinfer.msa_ops",
+        "flashinfer.norm",
+        "flashinfer.page",
+        "flashinfer.prefill",
+        "flashinfer.quantization.fp4_quantization",
+        "flashinfer.quantization.fp8_quantization",
+        "flashinfer.rope",
+        "flashinfer.sampling",
+        "flashinfer.xqa",
+    ]
+    for mod in _MODULES:
+        # Optional dependency missing → skip; whatever's available will still test.
+        with contextlib.suppress(ImportError):
+            importlib.import_module(mod)
+
+    from flashinfer.api_logging import _TRACE_REGISTRY
+
+    return list(_TRACE_REGISTRY)
 
 
 _ALL_PAIRS = _collect_pairs()

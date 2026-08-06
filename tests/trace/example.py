@@ -21,6 +21,7 @@ gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -701,6 +702,37 @@ flashinfer.kda_decode.recurrent_kda(
     initial_state_source=rk_source,
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
+)
+
+# ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
+fk_N, fk_H, fk_D = 4, 12, 128
+fk_hidden = fk_H * fk_D
+fk_x = torch.randn(fk_N, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+fk_weight = torch.randn(3, 4, fk_hidden, dtype=torch.float32, device=device)
+fk_conv_storage = torch.zeros(
+    fk_N + 1, 3 * fk_hidden, 3, dtype=torch.bfloat16, device=device
+)
+fk_conv_state = fk_conv_storage.transpose(1, 2).contiguous().transpose(1, 2)
+fk_raw_gate = torch.randn(1, fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_raw_beta = torch.randn(1, fk_N, fk_H, dtype=torch.bfloat16, device=device)
+fk_A_log = torch.randn(fk_H, dtype=torch.float32, device=device)
+fk_dt_bias = torch.randn(fk_hidden, dtype=torch.float32, device=device)
+fk_indices = torch.arange(fk_N, 0, -1, dtype=torch.int32, device=device)
+fk_state = torch.zeros(fk_N + 1, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
+fk_output_gate = torch.randn(fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_norm_weight = torch.randn(fk_D, dtype=torch.float32, device=device)
+flashinfer.kda_decode.fused_kda_decode(
+    fk_x,
+    fk_weight,
+    fk_conv_state,
+    fk_raw_gate,
+    fk_raw_beta,
+    fk_A_log,
+    fk_dt_bias,
+    fk_indices,
+    fk_state,
+    fk_output_gate,
+    fk_norm_weight,
 )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
