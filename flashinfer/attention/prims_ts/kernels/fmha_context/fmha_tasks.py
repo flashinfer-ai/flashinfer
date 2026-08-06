@@ -187,12 +187,24 @@ def create_load_task(
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp TMA load task.
+    """Create the one-warp TMA load task for the configured topology.
 
     When ``smem_page_offsets_kv`` is provided, each K/V TMA load consumes page
     IDs prefetched by the auxiliary warp through the ordinary asynchronous
     page-offset pipeline.
     """
+    if smem_q.cfg.staged_head_dim:
+        if smem_page_offsets_kv is not None or smem_page_offsets_v is not None:
+            raise ValueError("staged-head-dim context does not use page offsets")
+        return _create_load_task_staged_head_dim(
+            gmem_qkv,
+            smem_q,
+            smem_kv,
+            work_queue,
+            task_class=task_class,
+            **task_kwargs,
+        )
+
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
     src = _src_resources(gmem_qkv, work_queue=work_queue)
@@ -644,7 +656,7 @@ def create_load_task(
     )
 
 
-def create_load_task_staged_head_dim(
+def _create_load_task_staged_head_dim(
     gmem_qkv: GmemQKVResource,
     smem_q: SmemQResource,
     smem_kv: SmemKVResource,
@@ -771,7 +783,22 @@ def create_mma_task(
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp MMA compute task."""
+    """Create the one-warp MMA compute task for the configured topology."""
+    if smem_q.cfg.staged_head_dim:
+        if tmem_p0 is None:
+            raise ValueError("staged-head-dim MMA requires a P handoff")
+        return _create_mma_task_staged_head_dim(
+            smem_q,
+            smem_kv,
+            tmem_sp0,
+            tmem_o,
+            tmem_vec_done_0,
+            tmem_p0,
+            work_queue,
+            task_class=task_class,
+            **task_kwargs,
+        )
+
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
     src = _src_resources(smem_q, smem_kv, work_queue=work_queue)
@@ -1162,7 +1189,7 @@ def create_mma_task(
     )
 
 
-def create_mma_task_staged_head_dim(
+def _create_mma_task_staged_head_dim(
     smem_q: SmemQResource,
     smem_kv: SmemKVResource,
     tmem_sp: TmemSPResource,
@@ -1323,6 +1350,10 @@ def create_softmax_task(
     Args:
         task_class: Task subclass used to instantiate the softmax schedule.
     """
+    if tmem_sp.cfg.staged_head_dim:
+        if index != 0 or tmem_p is None or s0s1_seq is not None:
+            raise ValueError("staged-head-dim softmax requires index 0 and a P handoff")
+
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
 
@@ -1592,7 +1623,11 @@ def create_softmax_task(
                 num_warps=4,
                 schedule=captured_schedule,
                 num_registers=tmem_sp.cfg.num_regs_softmax,
-                name=f"Softmax{index}Task",
+                name=(
+                    "SoftmaxTaskStagedD"
+                    if tmem_sp.cfg.staged_head_dim
+                    else f"Softmax{index}Task"
+                ),
                 **task_kwargs,
             )
 
@@ -2062,161 +2097,6 @@ def create_softmax_task(
     )
 
 
-def create_softmax_task_staged_head_dim(
-    tmem_sp: TmemSPResource,
-    tmem_vec: TmemStatsResource,
-    tmem_p_ready: TmemPResource,
-    work_queue: WorkQueue | None,
-    task_class: type[Task] = Task,
-    **task_kwargs: Any,
-) -> Task:
-    """Create the single softmax warpgroup for the explicit D256 schedule."""
-    loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
-    skip_work_tile_if = _packed_context_skip_predicate(work_queue)
-    src = _src_resources(tmem_sp, work_queue=work_queue)
-
-    @schedule
-    def softmax_schedule(
-        sp: TmemSPResource,
-        vec: TmemStatsResource,
-        pr: TmemPResource,
-        wq: WorkQueue | None = None,
-    ) -> None:
-        p_chunk = sp.init_softmax_state()
-        scale_softmax_log2 = sp.load_scale_softmax_log2()
-        vec.init_store_state()
-        with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):
-            old_row_max, row_max, row_sum, q_offset = sp.init_softmax_work_tile_state()
-            vec.init_store_work_tile_state()
-            if tmem_sp.uses_varlen_q_offset_cache:
-                q_offset = sp.cache_q_offset()
-            if tmem_sp.uses_packed_dense_k_mask:
-                seqlen_k = sp.cache_seqlen_k()
-            vec.acquire()
-            with domain_loop(loop_start, loop_end, loop_step):
-                sp.wait()
-                if tmem_sp.uses_left_window_loop_mask:
-                    old_row_max, row_max = sp.left_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                    )
-                elif tmem_sp.uses_varlen_loop_right_mask:
-                    old_row_max, row_max = sp.right_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                        section=FmhaStage.Loop,
-                    )
-                elif tmem_sp.uses_query_paired_q_offset_loop_mask:
-                    old_row_max, row_max = sp.loop_masked_row_max(
-                        row_max=row_max,
-                        q_offset=q_offset,
-                    )
-                elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                        row_max=row_max,
-                    )
-                elif tmem_sp.uses_packed_dense_k_mask:
-                    old_row_max, row_max = sp.packed_dense_k_masked_row_max(
-                        row_max=row_max,
-                        seqlen_k=seqlen_k,
-                        section=FmhaStage.Loop,
-                    )
-                else:
-                    old_row_max, row_max = sp.compute_row_max(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                )
-                vec.commit()
-                pr.acquire()
-                p_chunk = sp.exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
-                pr.commit()
-                sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
-                vec.acquire()
-
-            if tmem_sp.cfg.is_causal:
-                sp.wait()
-                old_row_max, row_max = sp.masked_row_max(
-                    row_max=row_max,
-                    q_offset=q_offset,
-                )
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                )
-                vec.commit()
-                pr.acquire()
-                p_chunk = sp.masked_exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
-                pr.commit()
-                sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
-                sp.wait()
-                sp.release()
-                pr.acquire()
-                pr.commit()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.acquire()
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
-            else:
-                sp.wait()
-                sp.release()
-                pr.acquire()
-                pr.commit()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
-
-    captured_schedule = _schedule_with_work_queue(
-        softmax_schedule,
-        tmem_sp,
-        tmem_vec,
-        tmem_p_ready,
-        work_queue=work_queue,
-    )
-    return task_class(
-        src_resources=src,
-        dst_resources=[tmem_vec, tmem_p_ready],
-        warp_idx=tmem_sp.cfg.softmax0_warp_ids[0],
-        num_warps=4,
-        schedule=captured_schedule,
-        num_registers=tmem_sp.cfg.num_regs_softmax,
-        name="SoftmaxTaskStagedD",
-        **task_kwargs,
-    )
-
-
 def create_correction_task(
     tmem_vec0: TmemStatsResource,
     tmem_vec1: TmemStatsResource | None,
@@ -2231,7 +2111,23 @@ def create_correction_task(
     task_class: type[Task] = Task,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the four-warp Correction task (warps 8-11)."""
+    """Create the four-warp correction task for the configured topology."""
+    if smem_o_0.cfg.staged_head_dim:
+        if smem_o_1 is None or gmem_o_1 is None:
+            raise ValueError("staged-head-dim output requires two O resources")
+        return _create_correction_epilogue_task_staged_head_dim(
+            tmem_vec0,
+            tmem_o,
+            smem_o_0,
+            smem_o_1,
+            gmem_o_0,
+            gmem_o_1,
+            tmem_vec_done_0,
+            work_queue,
+            task_class=task_class,
+            **task_kwargs,
+        )
+
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
 
@@ -2502,7 +2398,7 @@ def create_correction_task(
     return _create_paired_task()
 
 
-def create_correction_epilogue_task_staged_head_dim(
+def _create_correction_epilogue_task_staged_head_dim(
     tmem_vec0: TmemStatsResource,
     tmem_o: TmemOResource,
     smem_o_0: SmemOResource,

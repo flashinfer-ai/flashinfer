@@ -2214,17 +2214,16 @@ def test_attention_ts_context_d256_bf16_fixed_dense_static_runtime():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
-    ("q_length", "kv_length", "num_qo_heads", "seed"),
+    ("q_length", "kv_length", "num_qo_heads"),
     (
-        pytest.param(129, 257, 8, 2026072701, id="partial-tail"),
-        pytest.param(512, 512, 32, 2026072702, id="target-shape"),
+        pytest.param(129, 257, 8, id="partial-tail"),
+        pytest.param(512, 512, 32, id="target-shape"),
     ),
 )
 def test_attention_ts_context_d256_fp8_fixed_dense_runtime(
     q_length: int,
     kv_length: int,
     num_qo_heads: int,
-    seed: int,
 ):
     """The explicit D256 schedule matches an E4M3-quantized output oracle."""
 
@@ -2239,7 +2238,7 @@ def test_attention_ts_context_d256_fp8_fixed_dense_runtime(
         mask_type="dense",
         output_dtype=_FP8,
         device="cuda",
-        seed=seed,
+        seed=2026072701,
     )
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
@@ -2252,11 +2251,7 @@ def test_attention_ts_context_d256_fp8_fixed_dense_runtime(
 
     output = wrapper.run(case.q, case.k, case.v)
     expected = _context_reference(case).to(_FP8).float()
-    assert torch.isfinite(output.float()).all()
-    torch.testing.assert_close(output.float(), expected, rtol=5e-2, atol=2.5e-1)
-    denominator = torch.linalg.vector_norm(expected).clamp_min(1e-6)
-    relative_l2 = torch.linalg.vector_norm(output.float() - expected) / denominator
-    assert float(relative_l2) <= 1e-1
+    _assert_context_correct(output, case, expected=expected)
 
 
 @pytest.mark.arch_blackwell

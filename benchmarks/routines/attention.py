@@ -166,7 +166,7 @@ def _validate_prims_ts_context_samples(
     total_expected_sq = 0.0
     max_abs_error = 0.0
     if out.dtype == torch.float8_e4m3fn:
-        rtol, atol, relative_l2_limit = 5e-2, 2.5e-1, 1e-1
+        rtol, atol, relative_l2_limit = 5e-2, 1.3e-1, 1e-1
     else:
         rtol, atol, relative_l2_limit = 1e-1, 3e-2, 5e-2
     sample_points = _context_reference_sample_points(qo_indptr_host, num_qo_heads)
