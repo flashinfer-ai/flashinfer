@@ -18,12 +18,13 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from check_pr_api_diff import extract_public_apis  # noqa: E402
-from scripts.pr_checks.check_cross_sources import (
+from check_pr_api_diff import extract_public_apis, module_reexports  # noqa: E402
+from pr_checks.check_cross_sources import (
+    _parse_toctree_entries,
     _env_var_reads,
     iter_markdown_paths,
 )  # noqa: E402
-from scripts.pr_checks.inspect_sources import iter_decorated_functions  # noqa: E402
+from pr_checks.inspect_sources import iter_decorated_functions  # noqa: E402
 
 
 def test_api_diff_visits_class_body_once() -> None:
@@ -37,6 +38,12 @@ class PublicClass:
     apis = extract_public_apis("flashinfer/example.py", source)
 
     assert set(apis) == {"PublicClass.method"}
+
+
+def test_module_reexports_include_plain_relative_imports() -> None:
+    assert module_reexports("flashinfer/comm.py", "from . import all_reduce\n") == {
+        "all_reduce": ("flashinfer", "all_reduce")
+    }
 
 
 def test_env_var_reads_include_constant_aliases() -> None:
@@ -74,6 +81,22 @@ python scripts/check_pr_document.py
         ".github/workflows/docs.yml",
         "scripts/check_pr_document.py",
         "docs/api/index.rst",
+    ]
+
+
+def test_toctree_entries_skip_free_text_and_keep_explicit_titles() -> None:
+    rst = """
+.. toctree::
+   :maxdepth: 1
+
+   Free text caption
+   API Reference <api/index>
+   tutorials/quickstart
+"""
+
+    assert [entry for _line, entry in _parse_toctree_entries(rst)] == [
+        "api/index",
+        "tutorials/quickstart",
     ]
 
 

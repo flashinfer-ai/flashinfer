@@ -495,6 +495,7 @@ def check_skill_refs_exist() -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 _TOCTREE_HEADER_RE = re.compile(r"^\s*\.\.\s+toctree::\s*$", re.MULTILINE)
+_TOCTREE_EXPLICIT_TITLE_RE = re.compile(r"^.+\s+<([^<>]+)>$")
 
 
 def _collect_sphinx_gallery_dirs() -> set[str]:
@@ -573,9 +574,16 @@ def _parse_toctree_entries(rst_text: str) -> list[tuple[int, str]]:
                 if ind < base_indent:
                     break
                 entry = line.strip()
-                # Skip lines that contain spaces (e.g. captions, options)
-                # but accept slash-separated paths.
-                if entry and not entry.startswith(":"):
+                # Keep Sphinx's ``Title <document/path>`` form, but ignore
+                # other free-text lines containing whitespace.
+                explicit_title = _TOCTREE_EXPLICIT_TITLE_RE.match(entry)
+                if explicit_title:
+                    entry = explicit_title.group(1).strip()
+                if (
+                    entry
+                    and not entry.startswith(":")
+                    and not any(char.isspace() for char in entry)
+                ):
                     entries.append((i + 1, entry))
                 i += 1
         else:

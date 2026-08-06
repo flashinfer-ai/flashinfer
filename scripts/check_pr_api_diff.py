@@ -161,7 +161,7 @@ def module_reexports(path: str, source: str | None) -> dict[str, tuple[str, str]
     result: dict[str, tuple[str, str]] = {}
     for node in module_scope_imports(tree):
         module = resolve_import_module(node, path)
-        if not module or not node.module:
+        if not module:
             continue
         for alias in node.names:
             exported_name = alias.asname or alias.name

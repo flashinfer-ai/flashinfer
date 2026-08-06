@@ -10,9 +10,9 @@ higher-ROI checks:
       a "Parameters" (or "Args") section.
 
   args_consistency
-      The Parameters section in the docstring lists exactly the same
-      argument names as the function signature (ignoring self / *args /
-      **kwargs).
+      Every argument in the function signature (ignoring self / cls /
+      *args / **kwargs) appears in the docstring Parameters section.
+      Documented names absent from the signature are not reported.
 
 Pure AST + text parsing, no imports of flashinfer, no GPU needed.
 """

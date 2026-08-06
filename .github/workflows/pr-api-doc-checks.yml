@@ -15,6 +15,9 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
+      # This pull_request job is intentionally the untrusted, read-only producer.
+      # The write-capable workflow_run reporter stays on the default branch and
+      # treats these reports as escaped data; it never executes this checkout.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
