@@ -51,16 +51,32 @@ def _launched_via_torchrun() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
 
+def _single_gpu_gloo() -> bool:
+    # Same env the kernel drops' own bootstraps honor (read at call time):
+    # rank-sharing single-GPU boxes (RTX sm_12x, GB10 / DGX Spark) cannot
+    # build an NCCL communicator with two ranks on one device, so the process
+    # group falls back to gloo and NVSHMEM UID travels over CPU.
+    return bool(int(os.environ.get("MEGA_SINGLE_GPU_GLOO", "0")))
+
+
 def _resolve_local_device(bootstrap: BootstrapConfig) -> int:
     """CUDA device ordinal for this rank.
 
     ``bootstrap.device`` wins when set (host frameworks pass the device they
     already bound); otherwise fall back to the LOCAL_RANK env var and then
-    ``bootstrap.rank`` (torchrun convention).
+    ``bootstrap.rank`` (torchrun convention), folded onto the physical GPUs
+    (``local_rank % device_count``, drop-bootstrap parity): the sm_12x
+    rank-sharing multirank flow runs N ranks per GPU, and the modulo is the
+    identity whenever there are enough GPUs, so the normal one-rank-per-GPU
+    mapping is unchanged.
     """
     if bootstrap.device is not None:
         return bootstrap.device
-    return int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+    import torch
+
+    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
+    count = torch.cuda.device_count()
+    return local_rank % count if count else 0
 
 
 def _ensure_cuda_device(bootstrap: BootstrapConfig) -> None:
@@ -93,8 +109,11 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
     _ensure_cuda_device(bootstrap)
 
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
-        dist.init_process_group(backend="nccl", device_id=device)
+        if _single_gpu_gloo():
+            dist.init_process_group(backend="gloo")
+        else:
+            device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
+            dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
         dist.init_process_group(
             backend="gloo",
@@ -156,10 +175,17 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
 
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(uid_tensor, src=0, group=pg)
-    dist.barrier(group=pg)
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
+    if _single_gpu_gloo():
+        # gloo has no CUDA broadcast; the UID travels on the host.
+        uid_tensor = torch.from_numpy(uid_bytes)
+        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.barrier(group=pg)
+        uid._data[:] = uid_tensor.numpy().view(uid._data.dtype)
+    else:
+        uid_tensor = torch.from_numpy(uid_bytes).cuda()
+        dist.broadcast(uid_tensor, src=0, group=pg)
+        dist.barrier(group=pg)
+        uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
 
     nvshmem.core.init(
         device=dev,
