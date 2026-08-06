@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""CuTeDSL MegaMoE kernel drop (NVFP4 + MXFP8).
+"""CuTeDSL MegaMoE kernel drop (NVFP4, MXFP8, and BF16).
 
 This package is the single public boundary FlashInfer ``moe_ep`` imports from.
 It exposes the symmetric-buffer allocators and fused-launch entry points and
@@ -31,7 +31,9 @@ from __future__ import annotations
 from .shim import (
     CORRECTNESS_KNOBS,
     MegaMoEMxfp8SymmBuffer,
+    MegaMoEBf16SymmBuffer,
     MegaMoESymmBuffer,
+    autotune_bf16_mega_moe,
     autotune_knobs,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
@@ -51,6 +53,7 @@ from .shim import (
     fused_quant_stage_supported,
     get_symm_buffer_for_mega_moe,
     get_symm_buffer_for_mxfp8_mega_moe,
+    get_symm_buffer_for_bf16_mega_moe,
     init_dist,
     iter_candidates,
     kind_data_dtype,
@@ -60,6 +63,8 @@ from .shim import (
     staged_tokens,
     mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
+    bf16_mega_launch_thunk,
+    bf16_mega_moe,
     mxfp8_quantize_per_block_32,
     nvfp4_mega_launch_thunk,
     nvfp4_mega_moe,
@@ -82,6 +87,7 @@ _LAZY_HELPERS = (
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
     "combine_roundtrip_to_fp32",
+    "compute_megamoe_reference_bf16",
     "compute_megamoe_reference_mxfp8",
 )
 
@@ -100,18 +106,21 @@ create_dummy_inputs = create_dummy_nvfp4_inputs
 __all__ = [
     "CombineFormat",
     "MegaMoEMxfp8SymmBuffer",
+    "MegaMoEBf16SymmBuffer",
     "MegaMoESymmBuffer",
     "Mxfp8BlockSize",
     "Mxfp8ScaleDtype",
     "Nvfp4BlockSize",
     "TransformedWeights",
     "autotune_knobs",
+    "autotune_bf16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "bootstrap_paths",
     "ceil_div",
     "combine_roundtrip_to_fp32",
     "compute_megamoe_reference_mxfp8",
+    "compute_megamoe_reference_bf16",
     "create_dummy_inputs",
     "create_dummy_mxfp8_inputs",
     "create_dummy_nvfp4_inputs",
@@ -121,6 +130,7 @@ __all__ = [
     "fused_quant_stage_supported",
     "get_symm_buffer_for_mega_moe",
     "get_symm_buffer_for_mxfp8_mega_moe",
+    "get_symm_buffer_for_bf16_mega_moe",
     "init_dist",
     "kind_data_dtype",
     "lookup_knobs",
@@ -129,6 +139,8 @@ __all__ = [
     "staged_tokens",
     "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
+    "bf16_mega_launch_thunk",
+    "bf16_mega_moe",
     "mxfp8_quantize_per_block_32",
     "nvfp4_mega_launch_thunk",
     "nvfp4_mega_moe",

@@ -37,6 +37,7 @@ from common.megamoe_constants import (
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
+from common.host_utils import get_cutedsl_target_arch
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
 from src.token_comm import CombineFormat
@@ -129,7 +130,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         self.sf_vec_size = sf_vec_size
         self.scenario = scenario
-        self.arch = "sm_100"
+        self.arch = get_cutedsl_target_arch()
 
         self.fc2_output_dtype = fc2_output_dtype
         self.non_ubulk_fc2_store = non_ubulk_fc2_store
@@ -183,7 +184,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.epi_reg_cnt = 256
         self.task_reg_cnt = 72
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def name(self) -> str:
@@ -1496,6 +1497,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.arch,
         )
 
         # Sched

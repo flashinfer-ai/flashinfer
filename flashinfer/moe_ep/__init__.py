@@ -42,6 +42,10 @@ from .backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm import (
     Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
     preprocess_mega_weights,
 )
+from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl import (
+    Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_bf16_cutedsl_mega_weights,
+)
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
@@ -54,11 +58,13 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )
+
 # Deprecated aliases (pre-taxonomy names, kept for external callers such as
 # the vLLM integration patch). New code should use the Sm<arch>... names.
 # These WILL BE REMOVED in a future release, together with the matching
 # deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
-# "mxfp8_cutedsl", "sm90_pull_fp8" — see core/kernel/registry.py).
+# "mxfp8_cutedsl", "bf16_cutedsl", "sm90_pull_fp8" — see core/kernel/registry.py).
+Bf16CutedslMegaMoeConfig = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 DeepGemmMegaMoeConfig = Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig
 Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
@@ -128,6 +134,8 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "Bf16CutedslMegaMoeConfig",
+    "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
     "CombineInputParams",
     "CombineOutput",
     "Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig",
@@ -193,6 +201,7 @@ __all__ = [
     "have_nixl_ep",
     "kernel_requires_weights",
     "preprocess_mega_weights",
+    "preprocess_bf16_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",

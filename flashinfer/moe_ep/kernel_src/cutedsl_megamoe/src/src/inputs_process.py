@@ -687,10 +687,10 @@ def _run_case(
 
     # -- routing (exact) --
     if not torch.equal(idx_out, topk_idx_in.to(torch.int64)):
-        print("  [FAIL] topk_idx mismatch")
+        print(f"  [FAIL] topk_idx mismatch")
         ok = False
     if not torch.equal(w_out, topk_w_in):
-        print("  [FAIL] topk_weights mismatch")
+        print(f"  [FAIL] topk_weights mismatch")
         ok = False
 
     # -- quant vs reference quantizer --
@@ -704,7 +704,7 @@ def _run_case(
                 f"  online norm_const={norm_const_used:.4g} expected={expected:.4g} rel={rel:.2e}"
             )
             if rel > 1e-2:
-                print("  [FAIL] online norm_const off")
+                print(f"  [FAIL] online norm_const off")
                 ok = False
         ref_q, ref_sf = nvfp4_quantize_per_block_16(x_fp32, norm_const_used)
         deq_ker = dequant_block_scale_to_fp32(quant, sf, sf_vec)
@@ -722,7 +722,7 @@ def _run_case(
     max_abs = (deq_ker - deq_ref).abs().max().item()
     print(f"  sf_exact={sf_exact} quant_snr={snr_db:.1f}dB max_abs_diff={max_abs:.3e}")
     if not sf_exact or snr_db < 40.0:
-        print("  [FAIL] quant vs reference")
+        print(f"  [FAIL] quant vs reference")
         ok = False
 
     return ok
