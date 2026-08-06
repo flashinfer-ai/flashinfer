@@ -114,6 +114,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -293,6 +294,17 @@ run_sm90_push() {
     tests/moe_ep/test_sm90_push_fp8_backend.py -v
 }
 
+# 4-GPU Blackwell-consumer sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank.
+# Own torchrun pytest process for the same reason as run_mega_sm90: the
+# SM120 kernel tree shares top-level module names with the SM100/SM90 trees
+# and is mutually exclusive per process (and is excluded from run_unit).
+run_mega_sm120() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py -v \
+    -m "gpu_4 and arch_sm120"
+}
+
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
 # survives, so it runs under torchrun -m pytest) and a smoke half (a rank that
 # really dies). The smoke half cannot be a pytest test: torchrun reports the
@@ -392,12 +404,13 @@ case "${1:-all}" in
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|mega_sm120|smoke|ft|all]" >&2
     exit 1
     ;;
 esac
