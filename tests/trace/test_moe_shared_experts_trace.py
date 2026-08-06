@@ -293,3 +293,39 @@ def test_fi_trace_emits_routed_definition_when_no_shared_experts():
     assert "shared_experts" not in defn["name"]
     assert "num_fused_shared_experts" not in defn["axes"]
     assert defn["axes"]["num_local_experts"]["value"] == 32
+
+
+@pytest.mark.parametrize(
+    "rows,num_shared,num_experts",
+    [
+        (40, 1, 32),  # rows too large for the declared routed count
+        (33, 2, 32),  # S disagrees with the row count
+        (33, 1, 40),  # num_experts disagrees with rows - S
+    ],
+)
+def test_shared_expert_init_rejects_inconsistent_geometry(
+    rows, num_shared, num_experts
+):
+    """A definition's row count and routed count must agree on replay.
+
+    Replay derives the routed count as ``num_weight_rows - S``. If that
+    disagrees with ``num_experts``, the rebuilt inputs are a different workload
+    than the definition describes, which would silently invalidate any
+    benchmark or comparison run from it.
+    """
+    from flashinfer.trace.templates.moe import (
+        _moe_fp8_block_scale_ds_shared_experts_init as init,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent shared-expert definition"):
+        init(
+            seq_len=8,
+            num_weight_rows=rows,
+            num_fused_shared_experts=num_shared,
+            num_experts=num_experts,
+            hidden_size=1024,
+            intermediate_size=512,
+            n_group=8,
+            topk_group=4,
+            top_k=8,
+        )
