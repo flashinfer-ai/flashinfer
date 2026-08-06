@@ -97,10 +97,13 @@ def _ref_fp8_paged_mqa_logits(
             weighted = weighted * scales[None, :]
 
             start = blk_idx * phys_block_kv
-            end = start + phys_block_kv
+            end = min(start + phys_block_kv, max_model_len)
+            if start >= max_model_len:
+                break
+            ncol = end - start
             logits[b * next_n : (b + 1) * next_n, start:end] = torch.where(
-                mask,
-                weighted,
+                mask[:, :ncol],
+                weighted[:, :ncol],
                 torch.tensor(float("-inf"), device=device, dtype=out_dtype),
             )
     return logits
@@ -237,8 +240,9 @@ def _ref_fp4_paged_mqa_logits(
         s = torch.where(mask[None, :, :], s, float("-inf"))
         s = torch.relu(s) * weight_slice[..., None]
         s = s.sum(dim=0)
-        logits[i * next_n : (i + 1) * next_n, :total_len] = torch.where(
-            k_offsets[None, :] <= q_offsets[:, None], s, float("-inf")
+        w = min(total_len, max_model_len)
+        logits[i * next_n : (i + 1) * next_n, :w] = torch.where(
+            k_offsets[None, :w] <= q_offsets[:, None], s[:, :w], float("-inf")
         )
     return logits
 
@@ -250,9 +254,15 @@ def _ref_fp4_paged_mqa_logits(
 
 def _make_paged_kv(batch_size, phys_block_kv, context_lens, device):
     n_blk_per_seq = (context_lens + phys_block_kv - 1) // phys_block_kv
+    # The kernel reads ceil(ctx/128) compute tiles * (128 // phys_block_kv) physical
+    # blocks per row, which can exceed ceil(ctx/phys_block_kv) when ctx is not a
+    # multiple of 128. Size block_table for that access pattern; the extra columns
+    # default to physical index 0 (a valid pool block) since those positions are
+    # beyond ctx (masked) — this avoids an out-of-bounds block_table/KV read.
+    kern_blk = ((context_lens + 127) // 128) * (128 // phys_block_kv)
     total = int(n_blk_per_seq.sum().item())
     num_total_blocks = total + batch_size * 2
-    max_blk = int(n_blk_per_seq.max().item())
+    max_blk = int(kern_blk.max().item())
     block_table = torch.zeros((batch_size, max_blk), dtype=torch.int32, device=device)
     pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
     off = 0
