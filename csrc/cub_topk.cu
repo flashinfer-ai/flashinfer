@@ -48,12 +48,12 @@ namespace {
 // radix backend.
 constexpr int64_t CUB_TOPK_MAX_LEN = int64_t{1} << 21;
 
-// When query_bytes_out is non-null, only the temp-storage size query runs (nothing is
+// When query_bytes_out is non-null, only the workspace-size query runs (nothing is
 // launched); the result is written there and the outputs/workspace are not touched.
 template <int64_t MAX_LEN_BOUND, typename DType, typename RequirementsT>
 cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* output_indices,
                               DType* output_values, const int32_t* lengths,
-                              Optional<TensorView>& maybe_temp_storage, int64_t num_rows,
+                              Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
                               int64_t max_len, int64_t top_k, const RequirementsT& requirements,
                               size_t* query_bytes_out, cudaStream_t stream) {
   // Per-segment iterators over the dense (num_rows, max_len) input and (num_rows, top_k)
@@ -73,44 +73,44 @@ cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* o
   auto env = cuda::std::execution::env{requirements, cuda::stream_ref{stream}};
 
   // The uniform and per-row-lengths paths differ only in the segment_sizes argument (distinct
-  // types); the two-phase temp-storage flow is shared through this generic lambda.
+  // types); the two-phase workspace flow (CUB's "temporary storage") is shared through this generic lambda.
   auto run_with = [&](auto segment_sizes) -> cudaError_t {
-    size_t temp_storage_bytes = 0;
+    size_t workspace_bytes = 0;
     if (const auto error =
-            cub::DeviceBatchedTopK::MaxPairs(nullptr, temp_storage_bytes, d_keys_in, d_keys_out,
+            cub::DeviceBatchedTopK::MaxPairs(nullptr, workspace_bytes, d_keys_in, d_keys_out,
                                              d_values_in, d_values_out, segment_sizes, k_arg,
                                              num_segs, env)) {
       return error;
     }
     if (query_bytes_out != nullptr) {
-      *query_bytes_out = temp_storage_bytes;
+      *query_bytes_out = workspace_bytes;
       return cudaSuccess;
     }
 
-    void* d_temp_storage = nullptr;
+    void* d_workspace = nullptr;
     bool owned = false;
-    if (maybe_temp_storage.has_value()) {
-      const auto& workspace = maybe_temp_storage.value();
-      const size_t workspace_bytes =
+    if (maybe_workspace_buffer.has_value()) {
+      const auto& workspace = maybe_workspace_buffer.value();
+      const size_t provided_bytes =
           static_cast<size_t>(workspace.numel()) * get_element_size(workspace);
-      TVM_FFI_ICHECK(workspace_bytes >= temp_storage_bytes)
-          << "cub_topk workspace too small: need " << temp_storage_bytes << " bytes, have "
-          << workspace_bytes;
-      d_temp_storage = workspace.data_ptr();
+      TVM_FFI_ICHECK(provided_bytes >= workspace_bytes)
+          << "cub_topk workspace too small: need " << workspace_bytes << " bytes, have "
+          << provided_bytes;
+      d_workspace = workspace.data_ptr();
     } else {
-      if (const auto error = cudaMallocAsync(&d_temp_storage, temp_storage_bytes, stream)) {
+      if (const auto error = cudaMallocAsync(&d_workspace, workspace_bytes, stream)) {
         return error;
       }
       owned = true;
     }
 
-    // No early return below this point: the owned temp storage must be freed on every path.
+    // No early return below this point: the owned workspace must be freed on every path.
     cudaError_t status = cub::DeviceBatchedTopK::MaxPairs(
-        d_temp_storage, temp_storage_bytes, d_keys_in, d_keys_out, d_values_in, d_values_out,
+        d_workspace, workspace_bytes, d_keys_in, d_keys_out, d_values_in, d_values_out,
         segment_sizes, k_arg, num_segs, env);
 
     if (owned) {
-      if (const auto free_error = cudaFreeAsync(d_temp_storage, stream)) {
+      if (const auto free_error = cudaFreeAsync(d_workspace, stream)) {
         // Prefer the MaxPairs error over the free error when both fail.
         return status == cudaSuccess ? free_error : status;
       }
@@ -137,7 +137,7 @@ template <typename DType, typename RequirementsT>
 cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
                                         int32_t* output_indices, DType* output_values,
                                         const int32_t* lengths,
-                                        Optional<TensorView>& maybe_temp_storage,
+                                        Optional<TensorView>& maybe_workspace_buffer,
                                         int64_t num_rows, int64_t max_len, int64_t top_k,
                                         const RequirementsT& requirements,
                                         size_t* query_bytes_out, cudaStream_t stream) {
@@ -147,7 +147,7 @@ cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
   // the largest bound the single-block backend accepts for our key/value types.
   if (max_len <= 8192) {
     return CUBBatchedTopKRun<int64_t{8192}>(input, row_stride, output_indices, output_values,
-                                            lengths, maybe_temp_storage, num_rows, max_len,
+                                            lengths, maybe_workspace_buffer, num_rows, max_len,
                                             top_k, requirements, query_bytes_out, stream);
   } else {
     // Cluster backend, SM90+ only. On an older device this doesn't crash or fall back — the
@@ -157,7 +157,7 @@ cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
     // calls to the radix backend instead, so reaching this branch pre-SM90 means someone
     // forced the CUB backend explicitly.
     return CUBBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, output_indices, output_values,
-                                               lengths, maybe_temp_storage, num_rows, max_len,
+                                               lengths, maybe_workspace_buffer, num_rows, max_len,
                                                top_k, requirements, query_bytes_out, stream);
   }
 }
@@ -166,7 +166,7 @@ template <typename DType>
 cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
                                    int32_t* output_indices, DType* output_values,
                                    const int32_t* lengths,
-                                   Optional<TensorView>& maybe_temp_storage, int64_t num_rows,
+                                   Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
                                    int64_t max_len, int64_t top_k, int64_t tie_break,
                                    size_t* query_bytes_out, cudaStream_t stream) {
   namespace exec = cuda::execution;
@@ -175,7 +175,7 @@ cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
   // otherwise-identical call.
   auto run = [&](auto requirements) {
     return CUBBatchedTopKDispatchBound(input, row_stride, output_indices, output_values,
-                                       lengths, maybe_temp_storage, num_rows, max_len, top_k,
+                                       lengths, maybe_workspace_buffer, num_rows, max_len, top_k,
                                        requirements, query_bytes_out, stream);
   };
 
@@ -235,7 +235,7 @@ const int32_t* CheckCUBTopKArgs(const TensorView& input, const Optional<TensorVi
 //     lengths[i] < top_k return all lengths[i] elements, with the remaining output_indices
 //     padded to -1 (output_values at padded positions are unspecified).
 void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
-              Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_temp_storage,
+              Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_workspace_buffer,
               int64_t top_k, int64_t tie_break) {
   const int32_t* lengths_ptr = CheckCUBTopKArgs(input, maybe_lengths, top_k, tie_break);
   CHECK_INPUT(output_indices);
@@ -270,7 +270,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
     auto* indices_ptr = static_cast<int32_t*>(output_indices.data_ptr());
     auto* values_ptr = static_cast<c_type*>(output_values.data_ptr());
     status = CUBBatchedTopKDispatch(input_ptr, input.stride(0), indices_ptr, values_ptr,
-                                    lengths_ptr, maybe_temp_storage, num_rows, max_len, top_k,
+                                    lengths_ptr, maybe_workspace_buffer, num_rows, max_len, top_k,
                                     tie_break, /*query_bytes_out=*/nullptr, stream);
     return true;
   });
@@ -279,9 +279,9 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
       << "cub_topk failed with error code " << cudaGetErrorString(status);
 }
 
-// Returns the temporary-storage bytes DeviceBatchedTopK needs for this problem shape and
-// requirement configuration, so the caller can allocate a workspace once (outside CUDA graph
-// capture) and pass it to every cub_topk call. Launches nothing.
+// Returns the workspace bytes (CUB's temporary storage) DeviceBatchedTopK needs for this
+// problem shape and requirement configuration, so the caller can allocate a workspace once
+// (outside CUDA graph capture) and pass it to every cub_topk call. Launches nothing.
 int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_lengths,
                                 int64_t top_k, int64_t tie_break) {
   const int32_t* lengths_ptr = CheckCUBTopKArgs(input, maybe_lengths, top_k, tie_break);
@@ -296,19 +296,19 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
   auto stream = get_stream(input.device());
 
   Optional<TensorView> no_workspace;
-  size_t temp_storage_bytes = 0;
+  size_t workspace_bytes = 0;
   cudaError_t status;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     // The size query only inspects types and bounds; output pointers are never dereferenced.
     status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()),
                                     input.stride(0), static_cast<int32_t*>(nullptr),
                                     static_cast<c_type*>(nullptr), lengths_ptr, no_workspace,
-                                    num_rows, max_len, top_k, tie_break, &temp_storage_bytes,
+                                    num_rows, max_len, top_k, tie_break, &workspace_bytes,
                                     stream);
     return true;
   });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cub_topk workspace-size query failed with error code " << cudaGetErrorString(status);
-  return static_cast<int64_t>(temp_storage_bytes);
+  return static_cast<int64_t>(workspace_bytes);
 }
