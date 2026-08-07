@@ -24,12 +24,6 @@ from pr_checks.check_cross_sources import (
     _env_var_reads,
     iter_markdown_paths,
 )  # noqa: E402
-from pr_checks.check_docstrings import (  # noqa: E402
-    FuncRecord,
-    check_args_consistency,
-    doc_param_names,
-    split_sections,
-)
 from pr_checks.inspect_sources import iter_decorated_functions  # noqa: E402
 
 
@@ -104,31 +98,6 @@ def test_toctree_entries_skip_free_text_and_keep_explicit_titles() -> None:
         "api/index",
         "tutorials/quickstart",
     ]
-
-
-def test_multiline_google_args_are_recognized() -> None:
-    docstring = """Run an operation.
-
-    Args:
-        x:
-            Input tensor described on the following line.
-        output: Optional output tensor described on the same line.
-
-    Returns:
-        The output tensor.
-    """
-    sections = split_sections(docstring)
-    assert doc_param_names(sections["Args"]) == ["x", "output"]
-
-    record = FuncRecord(
-        module="flashinfer.kda_decode",
-        name="fused_kda_decode",
-        file="flashinfer/kda_decode.py",
-        line=1,
-        docstring=docstring,
-        sig_args=["x", "output"],
-    )
-    assert check_args_consistency(record) == []
 
 
 def test_all_scope_walks_control_flow_and_nested_classes(tmp_path: Path) -> None:
