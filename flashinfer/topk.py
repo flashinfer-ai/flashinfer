@@ -970,6 +970,7 @@ def top_k_ragged_transform(
 def top_k_cub(
     input: torch.Tensor,
     k: int,
+    lengths: Optional[torch.Tensor] = None,
     sorted: bool = False,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
@@ -986,6 +987,13 @@ def top_k_cub(
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     k : int
         Number of top elements to select from each row.
+    lengths : Optional[torch.Tensor], optional
+        Per-row valid sizes of shape ``(batch_size,)`` with dtype ``int32``.
+        Row ``i`` selects its top-k over ``input[i, :lengths[i]]``. Default is
+        None, meaning every row uses the full width ``d`` (this also takes a
+        faster uniform-size path). For a row with ``lengths[i] < k``, all
+        ``lengths[i]`` elements are returned and the remaining ``indices`` are
+        padded with ``-1``; ``values`` at padded positions are unspecified.
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Note: this is currently not supported and will raise a
@@ -1056,6 +1064,24 @@ def top_k_cub(
     ...     logits, k, tie_break=flashinfer.TopKTieBreak.SMALL
     ... )
 
+    With per-row lengths, each row is a sequence padded to a common width, and
+    the top-k is taken over ``scores[i, :lengths[i]]`` only. Here row 0 uses all
+    8 elements, row 1 the first 5 (the 5.0 pad values past its length are
+    ignored), and row 2 has only 2 valid elements — fewer than k, so its output
+    is padded with ``-1`` indices:
+
+    >>> scores = torch.tensor([
+    ...     [0.1, 0.9, 0.5, 0.7, 0.3, 0.8, 0.2, 0.6],
+    ...     [0.4, 0.2, 0.9, 0.1, 0.7, 5.0, 5.0, 5.0],
+    ...     [0.6, 0.3, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+    ... ], device="cuda")
+    >>> lengths = torch.tensor([8, 5, 2], dtype=torch.int32, device="cuda")
+    >>> values, indices = flashinfer.top_k_cub(scores, 3, lengths)
+    >>> indices  # within-row order may vary
+    tensor([[ 1,  3,  5],
+            [ 0,  2,  4],
+            [ 0,  1, -1]], device='cuda:0', dtype=torch.int32)
+
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
@@ -1077,7 +1103,7 @@ def top_k_cub(
     # Host-side size query (launches nothing); the workspace is cached per device so
     # repeated calls (including under CUDA graph capture) reuse a stable allocation.
     workspace_bytes = topk_module.cub_topk_workspace_size(
-        input, None, k, int(tie_break)
+        input, lengths, k, int(tie_break)
     )
     workspace_buffer: torch.Tensor = _get_cache_buf(
         f"cub_topk_workspace_{device}", workspace_bytes, device
@@ -1085,7 +1111,7 @@ def top_k_cub(
 
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
     indices = topk_module.cub_topk(
-        input, k, int(tie_break), None, workspace_buffer, output_values
+        input, k, int(tie_break), lengths, workspace_buffer, output_values
     )
 
     return output_values, indices

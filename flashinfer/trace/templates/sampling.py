@@ -895,14 +895,33 @@ top_k_ragged_transform_trace = TraceTemplate(
 def _top_k_cub_reference(
     input: torch.Tensor,
     k: int,
+    lengths=None,
     sorted: bool = False,
     deterministic: bool = False,
     tie_break: int = 0,
     **_unused,
 ):
-    """Reference for top_k_cub: per-row top-k values and indices via torch.topk."""
-    values, indices = torch.topk(input, int(k), dim=-1, sorted=True)
-    return values, indices.to(torch.int32)
+    """Reference for top_k_cub: per-row top-k values and indices via torch.topk.
+
+    With ``lengths``, each row selects over its leading ``lengths[i]`` entries;
+    indices past the valid count are padded with -1 (padded values are
+    unspecified in the API; the reference uses 0).
+    """
+    if lengths is None:
+        values, indices = torch.topk(input, int(k), dim=-1, sorted=True)
+        return values, indices.to(torch.int32)
+    num_rows = input.shape[0]
+    out_v = torch.zeros(num_rows, int(k), dtype=input.dtype, device=input.device)
+    out_i = torch.full((num_rows, int(k)), -1, dtype=torch.int32, device=input.device)
+    for i in range(num_rows):
+        valid = int(lengths[i].item())
+        kk = min(int(k), valid)
+        if kk <= 0:
+            continue
+        v, idx = torch.topk(input[i, :valid], kk, sorted=True)
+        out_v[i, :kk] = v
+        out_i[i, :kk] = idx.to(torch.int32)
+    return out_v, out_i
 
 
 def _top_k_cub_init(
@@ -933,6 +952,7 @@ top_k_cub_trace = TraceTemplate(
     inputs={
         "input": Tensor(["batch_size", "d"]),
         "k": Scalar("int32"),
+        "lengths": Tensor(["batch_size"], dtype="int32", optional=True),
         "sorted": Scalar("int32", optional=True),
         "deterministic": Scalar("int32", optional=True),
         "tie_break": Scalar("int32", optional=True),

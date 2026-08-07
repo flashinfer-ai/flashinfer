@@ -3024,8 +3024,8 @@ def test_top_k_cub_pre_sm90_envelope():
 
 @pytest.mark.parametrize("seq_len", [4096, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cub_topk_varlen_correctness(seq_len, dtype):
-    """The binding's variable-length path: per-row windows and -1 padding.
+def test_top_k_cub_varlen(seq_len, dtype):
+    """top_k_cub with per-row lengths: windows and -1 padding.
 
     fp32 asserts exact per-row set equality (float32 randn is effectively
     tie-free at these sizes); fp16/bf16 use an accuracy threshold like the
@@ -3035,9 +3035,7 @@ def test_cub_topk_varlen_correctness(seq_len, dtype):
     _require_cub_support(seq_len)
     if dtype == torch.bfloat16:
         _require_sm80_for_bf16()
-    from flashinfer.topk import get_topk_module
 
-    module = get_topk_module()
     torch.manual_seed(11)
     num_rows, k = 16, 512
     scores = torch.randn(num_rows, seq_len, device="cuda", dtype=dtype)
@@ -3049,12 +3047,8 @@ def test_cub_topk_varlen_correctness(seq_len, dtype):
         1, k, (len(lengths[::3]),), dtype=torch.int32, device="cuda"
     )
 
-    workspace_bytes = module.cub_topk_workspace_size(scores, lengths, k, 0)
-    workspace = torch.empty(
-        max(int(workspace_bytes), 1), dtype=torch.uint8, device="cuda"
-    )
-    output_values = torch.empty(num_rows, k, dtype=dtype, device="cuda")
-    indices = module.cub_topk(scores, k, 0, lengths, workspace, output_values)
+    values, indices = flashinfer.top_k_cub(scores, k, lengths)
+    assert indices.dtype == torch.int32 and values.dtype == dtype
 
     exact = dtype == torch.float32
     matched = 0
@@ -3083,12 +3077,8 @@ def test_cub_topk_varlen_correctness(seq_len, dtype):
         full_lengths = torch.full(
             (num_rows,), seq_len, dtype=torch.int32, device="cuda"
         )
-        ws2_bytes = module.cub_topk_workspace_size(scores, None, k, 0)
-        ws2 = torch.empty(max(int(ws2_bytes), 1), dtype=torch.uint8, device="cuda")
-        vals_a = torch.empty(num_rows, k, dtype=dtype, device="cuda")
-        vals_b = torch.empty(num_rows, k, dtype=dtype, device="cuda")
-        idx_uniform = module.cub_topk(scores, k, 0, None, ws2, vals_a)
-        idx_full = module.cub_topk(scores, k, 0, full_lengths, workspace, vals_b)
+        _, idx_uniform = flashinfer.top_k_cub(scores, k)
+        _, idx_full = flashinfer.top_k_cub(scores, k, full_lengths)
         assert torch.equal(
             idx_uniform.long().sort(dim=-1).values,
             idx_full.long().sort(dim=-1).values,
@@ -3112,7 +3102,12 @@ def test_top_k_cub_strided_input():
 
 
 def test_cub_topk_workspace_paths():
-    """No workspace falls back to internal allocation; a too-small one raises."""
+    """No workspace falls back to internal allocation; a too-small one raises.
+
+    Deliberately wrapper-level: the public API does not expose the workspace
+    argument, and nothing else exercises the launcher's cudaMallocAsync
+    fallback or its workspace-size ICHECK.
+    """
     from flashinfer.topk import get_topk_module
 
     module = get_topk_module()
@@ -3220,47 +3215,32 @@ def test_top_k_cub_cuda_graph_replay(d, tie_break):
 
 
 @pytest.mark.parametrize("max_len", [4096, 65536])
-def test_cub_topk_varlen_cuda_graph_replay(max_len):
-    """The CUB binding's variable-length path must be replay-correct.
+def test_top_k_cub_varlen_cuda_graph_replay(max_len):
+    """top_k_cub's variable-length path must be replay-correct.
 
     Fixed physical shape, dynamism through data (the FlashInfer graph idiom):
     capture with a static lengths tensor, replay with mutated length values --
     including rows with lengths[i] < k -- and check the selected sets and the
-    -1 tail padding against a torch reference. max_len = 65536 exercises the
-    cluster backend's deferred path under capture on SM90+.
+    -1 tail padding against a torch reference. Goes through the public API so
+    the cached-workspace path is exercised under capture. max_len = 65536
+    exercises the cluster backend's deferred path under capture on SM90+.
     """
     _require_cub_support(max_len)
-    from flashinfer.jit.topk import gen_topk_module
-
-    module = gen_topk_module().build_and_load()
     torch.manual_seed(1)
     num_rows, k = 16, 512
     static_scores = torch.randn(num_rows, max_len, device="cuda")
     static_lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device="cuda")
-    out_indices = torch.empty(num_rows, k, dtype=torch.int32, device="cuda")
-    out_values = torch.empty(num_rows, k, device="cuda")
-    workspace_bytes = module.cub_topk_workspace_size(
-        static_scores, static_lengths, k, 0
-    )
-    workspace = torch.empty(
-        max(int(workspace_bytes), 1), dtype=torch.uint8, device="cuda"
-    )
-
-    def run():
-        module.cub_topk(
-            static_scores, out_indices, out_values, static_lengths, workspace, k, 0
-        )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            run()
+            flashinfer.top_k_cub(static_scores, k, static_lengths)
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run()
+        out_values, out_indices = flashinfer.top_k_cub(static_scores, k, static_lengths)
 
     for trial in range(3):
         fresh = torch.randn(num_rows, max_len, device="cuda")
