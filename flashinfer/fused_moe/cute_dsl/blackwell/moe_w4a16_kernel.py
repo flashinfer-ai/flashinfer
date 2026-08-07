@@ -1983,7 +1983,10 @@ class Sm100W4A16GroupedGemmKernel:
                                 (gate[i], gate[i + 1]),
                                 (gated_alpha_f32, gated_alpha_f32),
                             )
-                            if cutlass.const_expr(self.situ_beta is not None):
+                            if cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                                and self.situ_beta is not None
+                            ):
                                 situ_beta = cutlass.Float32(self.situ_beta)
                                 situ_gate_pair = (
                                     situ_f32(gate_pair[0], situ_beta, fastmath=True),
@@ -2016,7 +2019,9 @@ class Sm100W4A16GroupedGemmKernel:
                                         gelu_tanh_f32(gate_pair[1], fastmath=True),
                                     ),
                                 )
-                            else:
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                            ):
                                 if cutlass.const_expr(self.parameterized_swiglu):
                                     gate_pair = (
                                         fmin(gate_pair[0], swiglu_limit, nan=True),

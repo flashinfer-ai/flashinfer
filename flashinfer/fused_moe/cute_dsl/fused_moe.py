@@ -824,7 +824,7 @@ class CuteDslMoEWrapper:
                 "Situ" if self.situ_beta is not None else self.activation_type.name
             )
             op_name = f"CuteDslMoEWrapper::run::{activation_name}"
-        else:
+        elif self.quant_mode == "w4a16":
             if (
                 x_sf is not None
                 or fc2_input_scale is not None
@@ -851,6 +851,8 @@ class CuteDslMoEWrapper:
                 "Situ" if self.situ_beta is not None else self.activation_type.name
             )
             op_name = f"CuteDslMoEWrapper::run::W4A16::{activation_name}"
+        else:
+            raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
 
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
@@ -863,18 +865,24 @@ class CuteDslMoEWrapper:
             runner.tuning_config,
             inputs,
         )
-        runner_kwargs = {}
-        if self.quant_mode != "w4a16":
+        if self.quant_mode in ("nvfp4", "w4a4"):
             # Timed tactic runs retain the default async path; only this
             # selected-tactic execution is single-stream while tuning.
-            runner_kwargs["use_async_memset"] = not tuner.is_tuning_mode
+            runner_kwargs = {"use_async_memset": not tuner.is_tuning_mode}
+        elif self.quant_mode == "w4a16":
+            runner_kwargs = {}
+        else:
+            raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
         return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
-        return (
-            list(W4A16_MOE_TACTICS) if self.quant_mode == "w4a16" else ALL_MOE_TACTICS
-        )
+        if self.quant_mode in ("nvfp4", "w4a4"):
+            return ALL_MOE_TACTICS
+        elif self.quant_mode == "w4a16":
+            return list(W4A16_MOE_TACTICS)
+        else:
+            raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
 
 
 # =============================================================================
@@ -1181,9 +1189,15 @@ def cute_dsl_fused_moe_nvfp4(
         inputs,
         aux_stream=aux_stream,
     )
-    runner_kwargs = {"aux_stream": aux_stream}
-    if quant_mode != "w4a16":
-        runner_kwargs["use_async_memset"] = not tuner.is_tuning_mode
+    if quant_mode in ("nvfp4", "w4a4"):
+        runner_kwargs = {
+            "aux_stream": aux_stream,
+            "use_async_memset": not tuner.is_tuning_mode,
+        }
+    elif quant_mode == "w4a16":
+        runner_kwargs = {"aux_stream": aux_stream}
+    else:
+        raise RuntimeError(f"Unexpected quant_mode {quant_mode!r}")
     return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
 
