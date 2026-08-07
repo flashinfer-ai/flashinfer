@@ -1929,7 +1929,12 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
 
 
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
-    """FP8 block-scale OA params are currently scoped to MxFp8 SwiGLU."""
+    """FP8 block-scale OA params are scoped to the block-scale recipes with SwiGLU.
+
+    MxFp8 applies them in the fused FC1 epilogue and DeepSeekFp8 in its separate
+    activation kernel; every other quantization type, and every non-SwiGLU
+    activation, would silently drop them.
+    """
     kwargs = {
         "routing_logits": torch.empty((1, 1), dtype=torch.bfloat16),
         "routing_bias": None,
@@ -1954,7 +1959,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
         trtllm_fp8_block_scale_moe(
             **kwargs,
-            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             activation_type=ActivationType.Swiglu.value,
             gemm1_alpha=per_expert,
         )
@@ -1975,7 +1980,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
-            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             activation_type=ActivationType.Swiglu.value,
             gemm1_beta=per_expert,
         )
@@ -1983,7 +1988,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     with pytest.raises(ValueError, match="ActivationType.Swiglu"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
-            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
             activation_type=ActivationType.Geglu.value,
             gemm1_alpha=per_expert,
         )
@@ -2427,6 +2432,64 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     torch.testing.assert_close(output_beta_oa, output_beta_oa_ref, atol=1e-1, rtol=1e-1)
     assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
+
+
+def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
+    """DeepSeekFp8 MoE applies the SwiGLU OA params in its unfused activation kernel.
+
+    Unlike MxFp8 there is no fused FC1 epilogue here: the activation kernel reads the
+    per-expert entries itself, resolving the local expert from the permuted token
+    index. Random inputs are used instead of the near-identity setup of the MxFp8 test
+    above, whose mostly-zero 128-element blocks degenerate under DeepSeek block scales.
+
+    ``run_moe_test``'s dequantized reference applies alpha/beta/clamp itself, so a
+    kernel that dropped them would not match it. FC1 outputs land around unit scale
+    for this data generator, so a limit of 2.0 clamps a meaningful fraction of both
+    halves rather than being a no-op.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+
+    num_tokens = 64
+    hidden_size = 512
+    intermediate_size = 512
+    routing_config = {
+        "num_experts": 32,
+        "top_k": 2,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+        "compatible_intermediate_size": [intermediate_size],
+        "enable_autotune": False,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+    }
+    num_experts = routing_config["num_experts"]
+
+    def per_expert(value):
+        return torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
+
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+        routing_config,
+        weight_processing,
+        ActivationType.Swiglu,
+        cache_permute_indices,
+        gemm1_alpha=per_expert(1.702),
+        gemm1_beta=per_expert(1.0),
+        gemm1_clamp_limit=per_expert(2.0),
+    )
 
 
 # ====================================================================================
