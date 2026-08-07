@@ -25,6 +25,7 @@ import torch
 from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
 from .trace.templates.sampling import (
+    top_k_cub_trace,
     top_k_page_table_transform_trace,
     top_k_ragged_transform_trace,
 )
@@ -343,10 +344,50 @@ def get_topk_module():
     ) -> None:
         pass
 
+    @register_custom_op(
+        "flashinfer::cub_topk", mutates_args=("workspace_buffer", "output_values")
+    )
+    def cub_topk(
+        input: torch.Tensor,
+        top_k: int,
+        tie_break: int,
+        lengths: Optional[torch.Tensor],
+        workspace_buffer: Optional[torch.Tensor],
+        output_values: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = input.size(0)
+        output_indices = torch.empty(
+            batch_size, top_k, dtype=torch.int32, device=input.device
+        )
+        module.cub_topk(
+            input,
+            output_indices,
+            output_values,
+            lengths,
+            workspace_buffer,
+            top_k,
+            tie_break,
+        )
+        return output_indices
+
+    @register_fake_op("flashinfer::cub_topk")
+    def _fake_cub_topk(
+        input: torch.Tensor,
+        top_k: int,
+        tie_break: int,
+        lengths: Optional[torch.Tensor],
+        workspace_buffer: Optional[torch.Tensor],
+        output_values: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = input.size(0)
+        return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
+
     return SimpleNamespace(
         radix_topk=radix_topk,
         radix_topk_page_table_transform=radix_topk_page_table_transform,
         radix_topk_ragged_transform=radix_topk_ragged_transform,
+        cub_topk=cub_topk,
+        cub_topk_workspace_size=module.cub_topk_workspace_size,
         can_implement_filtered_topk=module.can_implement_filtered_topk,
         fast_topk_clusters_exact=_fast_topk_clusters_exact,
         fast_topk_clusters_exact_page_table_transform=_fast_topk_clusters_exact_page_table_transform,
@@ -553,10 +594,6 @@ def top_k(
         Tie-breaking controls which boundary elements are selected; it does not
         imply deterministic output ordering. Set ``deterministic=True`` when
         repeatable output ordering is also required.
-    dsa_graph_safe : bool, optional
-        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
-        Default is False.
-
     Returns
     -------
     values : torch.Tensor
@@ -927,3 +964,125 @@ def top_k_ragged_transform(
     )
 
     return output_indices
+
+
+@flashinfer_api(trace=top_k_cub_trace)
+def top_k_cub(
+    input: torch.Tensor,
+    k: int,
+    sorted: bool = False,
+    deterministic: bool = False,
+    tie_break: int = TopKTieBreak.NONE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Top-K selection backed by ``cub::DeviceBatchedTopK``.
+
+    Same call shape as :func:`top_k`, but served by the CUB backend. Unlike top_k,
+    the indices returned are int32, not int64.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``(batch_size, d)`` containing the values to select from.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
+    k : int
+        Number of top elements to select from each row.
+    sorted : bool, optional
+        If True, the returned top-k elements will be sorted in descending order.
+        Note: this is currently not supported and will raise a
+        ``NotImplementedError``. Future support is planned.
+    deterministic : bool, optional
+        If True, uses deterministic mode.
+        Default is False (non-deterministic, which is faster).
+
+        Deterministic mode guarantees repeatable FlashInfer output ordering for
+        the selected top-k set on a fixed input and system.
+
+        Note: this is currently not supported and will raise a
+        ``NotImplementedError``. Future support is planned.
+    tie_break : int, optional
+        Tie-breaking mode for equal values at the selection boundary.
+        Supported modes are (or use ``TopKTieBreak`` enum values):
+
+        - ``0``: no explicit index tie-break
+        - ``1``: prefer smaller indices
+        - ``2``: prefer larger indices
+
+        Default is ``0``.
+        Tie-breaking controls which boundary elements are selected; it does not
+        imply deterministic output ordering. Setting this to ``1`` or ``2`` results
+        in these boundary elements being selected deterministically across runs and
+        GPUs. Requires a device with compute capability 9.0 or higher.
+
+    Returns
+    -------
+    values : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` containing the top-k values.
+        Same dtype as input.
+    indices : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` with int32 dtype containing the
+        indices of the top-k elements.
+
+    Note
+    ----
+    - Unlike ``torch.topk``, the default behavior returns unsorted results for
+      better performance.
+    - ``d`` (the row width) must be at most ``2^21``. On devices with compute
+      capability below 9.0, ``d`` must additionally be at most 8192 and
+      ``tie_break`` is unavailable. Violations raise a ``RuntimeError`` from
+      the kernel launcher at call time.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 32000
+    >>> k = 256
+    >>> logits = torch.randn(batch_size, vocab_size, device="cuda")
+    >>> values, indices = flashinfer.top_k_cub(logits, k)
+    >>> values.shape, indices.shape
+    (torch.Size([4, 256]), torch.Size([4, 256]))
+    >>> indices.dtype
+    torch.int32
+
+    With a tie-break rule (boundary ties resolved toward smaller indices,
+    deterministically across runs and GPUs; requires compute capability 9.0+):
+
+    >>> values, indices = flashinfer.top_k_cub(
+    ...     logits, k, tie_break=flashinfer.TopKTieBreak.SMALL
+    ... )
+
+    See Also
+    --------
+    torch.topk : PyTorch's built-in top-k function
+    sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
+    sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
+    """
+    if sorted:
+        raise NotImplementedError(
+            "top_k_cub does not support sorted=True. Future support is planned"
+        )
+    if deterministic:
+        raise NotImplementedError(
+            "top_k_cub does not support deterministic=True. Future support is planned"
+        )
+    batch_size = input.size(0)
+    device = input.device
+
+    topk_module = get_topk_module()
+    # Host-side size query (launches nothing); the workspace is cached per device so
+    # repeated calls (including under CUDA graph capture) reuse a stable allocation.
+    workspace_bytes = topk_module.cub_topk_workspace_size(
+        input, None, k, int(tie_break)
+    )
+    workspace_buffer: torch.Tensor = _get_cache_buf(
+        f"cub_topk_workspace_{device}", workspace_bytes, device
+    )
+
+    output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
+    indices = topk_module.cub_topk(
+        input, k, int(tie_break), None, workspace_buffer, output_values
+    )
+
+    return output_values, indices

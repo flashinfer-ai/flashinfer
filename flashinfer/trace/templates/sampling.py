@@ -891,6 +891,62 @@ top_k_ragged_transform_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
+def _top_k_cub_reference(
+    input: torch.Tensor,
+    k: int,
+    sorted: bool = False,
+    deterministic: bool = False,
+    tie_break: int = 0,
+    **_unused,
+):
+    """Reference for top_k_cub: per-row top-k values and indices via torch.topk."""
+    values, indices = torch.topk(input, int(k), dim=-1, sorted=True)
+    return values, indices.to(torch.int32)
+
+
+def _top_k_cub_init(
+    *,
+    batch_size: int,
+    d: int = 4096,
+    k: int = 256,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``top_k_cub``: a [batch_size, d] logits tensor."""
+    torch.manual_seed(seed)
+    return {"input": make_logits(batch_size, d, device=device), "k": int(k)}
+
+
+top_k_cub_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="top_k_cub",
+    description=(
+        "Batched top-k selection over the rows of a dense (batch_size, d) tensor, "
+        "backed by cub::DeviceBatchedTopK. Returns (values, indices)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "d": Var(description="Row width (e.g. vocabulary size or sequence length)."),
+        "k": Const(abbrev="k"),
+    },
+    inputs={
+        "input": Tensor(["batch_size", "d"]),
+        "k": Scalar("int32"),
+        "sorted": Scalar("int32", optional=True),
+        "deterministic": Scalar("int32", optional=True),
+        "tie_break": Scalar("int32", optional=True),
+    },
+    outputs={
+        "values": Tensor(["batch_size", "k"], dtype_from="input"),
+        "indices": Tensor(["batch_size", "k"], dtype="int32"),
+    },
+    tags=["sparse"],
+    reference=_top_k_cub_reference,
+    init=_top_k_cub_init,
+)
+
+
 # ── DeepSeek-V3 fused expert routing (top-k) ─────────────────────────────────
 
 
