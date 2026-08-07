@@ -218,7 +218,8 @@ jobs:
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."
-              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+              gh run cancel "$run_id" --repo ${{ github.repository }} \
+                || echo "::error::Cancel failed for $run_id"
               CANCEL_COUNT=$((CANCEL_COUNT + 1))
             fi
           done
