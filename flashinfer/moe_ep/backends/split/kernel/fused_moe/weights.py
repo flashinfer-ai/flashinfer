@@ -112,7 +112,9 @@ def materialize_fused_moe_weights(
             pack.prepare_for("trtllm_fp4_routed", view)
             return pack
 
-        if variant == QuantVariant.NVFP4 and isinstance(backend_cfg, CuteDslConfig):
+        if variant in (QuantVariant.NVFP4, QuantVariant.W4A16) and isinstance(
+            backend_cfg, CuteDslConfig
+        ):
             view = CuteDslConfig.prepare_weights(
                 weights.w13,
                 weights.w2,

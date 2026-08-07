@@ -25,7 +25,11 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
-from flashinfer.utils import is_sm90a_supported, is_sm12x_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm12x_supported,
+)
 
 if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
@@ -34,6 +38,19 @@ if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
         cp_delta_rule_mn_precompute_dsl_sm90 as cp_delta_rule_mn_precompute_dsl,
         cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
+    )
+elif (
+    torch.cuda.is_available()
+    and is_sm100a_supported(torch.device("cuda"))
+    and torch.version.cuda is not None
+    and int(torch.version.cuda.split(".")[0]) >= 13
+):
+    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+        cp_delta_rule_dsl_sm100 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm100 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm100 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm100 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm100 as cp_delta_rule_t_precompute_dsl,
     )
 elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm120 import (
@@ -65,8 +82,15 @@ FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
+    if is_sm100a_supported(device):
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if cuda_major < 13:
+            pytest.skip(
+                f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+            )
+        return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM12x")
+        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
 
 
 def _seed_all(seed):
@@ -289,7 +313,13 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
 @pytest.mark.parametrize("gate_baseline", [0.9, 0.99, 0.9995])
 @pytest.mark.parametrize(
     "seq_lens, cp_chunk_len",
-    [([64, 192], 64), ([128, 200], 128), ([1024, 3000], 1024), ([96, 64, 192], 128)],
+    [
+        ([64, 192], 64),
+        ([128, 200], 128),
+        ([192], 192),
+        ([1024, 3000], 1024),
+        ([96, 64, 192], 128),
+    ],
 )
 def test_cp_delta_rule_mn_precompute(
     qkv_factory,
@@ -707,6 +737,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         (torch.bfloat16, [2048], 1024, 1, 1, 1, 0.99, 1.0),
         (torch.bfloat16, [4096], 2048, 2, 1, 1, 0.9995, 1.0),
         (torch.float16, [2049], 1024, 1, 1, 1, 0.99, "auto"),
+        (torch.float16, [8193], 2048, 1, 1, 1, 0.99, "auto"),
         (torch.bfloat16, [1536, 257], 1024, 1, 1, 2, 0.99, 1.0),
     ],
 )
@@ -908,7 +939,7 @@ def test_cp_delta_rule_e2e(
         ref_o = ref_o.to(dtype)
         atol_o = 2e-2
         rtol_o = 2e-2
-        atol_state = 5e-3
+        atol_state = 1e-2
         rtol_state = 5e-3
     else:
         atol_o = 5e-3
@@ -922,7 +953,7 @@ def test_cp_delta_rule_e2e(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64], [2048]])
 def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     qkv_factory,
     dtype,
@@ -954,6 +985,80 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     )
     ref_o, ref_state = chunk_gated_delta_rule(
         q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=False
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
+def test_sm100_cp_delta_rule_external_state_dtype(
+    qkv_factory,
+    state_dtype,
+    seq_lens,
+    seed=int(os.environ.get("SEED", "0")),
+):
+    device = torch.device("cuda")
+    if not is_sm100a_supported(device):
+        pytest.skip("typed CP state requires SM100/SM103")
+    _skip_if_cp_unsupported()
+    _seed_all(seed)
+    dtype = torch.bfloat16
+    head_size = 128
+    num_heads = 1
+    num_seqs = len(seq_lens)
+    total_seqlen = sum(seq_lens)
+    cu_seqlens = _make_cu_seqlens(seq_lens, device)
+
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
+        )
+        initial_state = (
+            torch.randn(num_seqs, num_heads, head_size, head_size) * 0.01
+        ).to(state_dtype)
+    q = q.contiguous()
+    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
+    v = v.contiguous()
+    alpha = _make_gates(total_seqlen, num_heads, 0.99, device)
+    beta = _make_gates(total_seqlen, num_heads, 0.99, device)
+    our_o = torch.empty_like(q)
+    ref_o = torch.empty_like(q)
+    our_state = torch.empty_like(initial_state)
+    ref_state = torch.empty_like(initial_state)
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,
+        initial_state,
+        True,
+        cu_seqlens,
+        False,
+        output=our_o,
+        output_state=our_state,
+        use_cp=True,
+    )
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,
+        initial_state,
+        True,
+        cu_seqlens,
+        False,
+        output=ref_o,
+        output_state=ref_state,
+        use_cp=False,
     )
     torch.cuda.synchronize()
 

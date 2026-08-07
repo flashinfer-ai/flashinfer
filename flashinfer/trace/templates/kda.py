@@ -81,3 +81,65 @@ recurrent_kda_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
 )
+
+
+fused_kda_decode_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="fused_kda_decode",
+    description=(
+        "Kimi width-four causal convolution, recurrent KDA update, and "
+        "gated RMSNorm fused into one decode kernel. The convolution and "
+        "recurrent state pools are mutated in-place."
+    ),
+    axes={
+        "num_rows": Var(description="Number of decode rows."),
+        "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
+        "head_dim": Const(description="KDA head dimension.", abbrev="d"),
+        "singleton": Const(description="Leading singleton dimension.", abbrev=""),
+        "projection_groups": Const(
+            description="Packed QKV projection groups.", abbrev=""
+        ),
+        "hidden_size": Const(
+            description="Channels in one Q, K, or V projection.", abbrev=""
+        ),
+        "qkv_width": Const(
+            description="Width of the packed QKV projection.", abbrev=""
+        ),
+        "conv_width": Const(description="Depthwise convolution width.", abbrev=""),
+        "conv_history": Const(
+            description="Cached convolution history length.", abbrev=""
+        ),
+        "num_slots": Var(description="Number of cache slots."),
+    },
+    inputs={
+        "x": Tensor(["num_rows", "qkv_width"]),
+        "weight": Tensor(["projection_groups", "conv_width", "hidden_size"]),
+        "conv_state": Tensor(["num_slots", "qkv_width", "conv_history"]),
+        "raw_gate": Tensor(["singleton", "num_rows", "num_heads", "head_dim"]),
+        "raw_beta": Tensor(["singleton", "num_rows", "num_heads"]),
+        "A_log": Tensor(["num_heads"]),
+        "dt_bias": Tensor(["hidden_size"]),
+        "state_indices": Tensor(["num_rows"]),
+        "state": Tensor(["num_slots", "num_heads", "head_dim", "head_dim"]),
+        "output_gate": Tensor(["num_rows", "num_heads", "head_dim"]),
+        "norm_weight": Tensor(["head_dim"]),
+        "lower_bound": Scalar("float32", optional=True),
+        "norm_eps": Scalar("float32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["singleton", "num_rows", "num_heads", "head_dim"], dtype_from="x"
+        ),
+    },
+    constraints=[
+        "qkv_width == 3 * num_heads * head_dim",
+        "hidden_size == num_heads * head_dim",
+        "singleton == 1",
+        "projection_groups == 3",
+        "head_dim == 128",
+        "num_heads in (12, 24, 32, 48, 96)",
+        "conv_width == 4",
+        "conv_history == 3",
+    ],
+    tags=["stage:decode", "status:verified"],
+)

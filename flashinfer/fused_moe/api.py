@@ -202,11 +202,14 @@ class ExecutionConfig:
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
     """
 
     do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
+    use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
@@ -216,6 +219,8 @@ class ExecutionConfig:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -446,10 +451,33 @@ class TrtllmMxInt4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # Same trtllm-gen routed batched-GEMM path as the FP4/BF16 backends, so it
-        # inherits the same manifest coverage. The pinned Rubin manifest includes
-        # MxInt4 sm107a kernels, although unified MxInt4 still has no runner.
+        # SM100/SM103 use the forward-compatible sm100f cubins; SM107 selects
+        # the dedicated Rubin artifact.
         return arch in _TRTLLM_ROUTED_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build a ``trtllm_mxint4_routed`` view from canonical BF16 weights."""
+        from .prepare import prepare_trtllm_mxint4_weights
+
+        return prepare_trtllm_mxint4_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            permute_cache=permute_cache,
+        )
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"
@@ -754,6 +782,8 @@ class MoEActivationPack:
     * W4A16 with ``TrtllmFp4Config``: raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
+      packed signed INT4 with BF16 block scales.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
@@ -776,13 +806,14 @@ class MoEActivationPack:
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
       runner allocates internal kernel-filled buffers, and the routing result is not surfaced
       back through the pack (routing replay is a separate, future capability). TRTLLM FP4,
-      BF16, block-FP8, and per-tensor-FP8 runners support this mode; ``MoELayer`` dispatches
-      a logits pack only to capable backends (see each runner's ``supported_routing_modes``).
+      BF16, block-FP8, per-tensor-FP8, and MxInt4 runners support this mode;
+      ``MoELayer`` dispatches a logits pack only to capable backends (see each runner's
+      ``supported_routing_modes``).
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
-    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
-    are keyword-only.
+    positional construction of pre-routed packs is unchanged. Additional activation metadata
+    and the in-kernel routing fields are keyword-only.
     """
 
     # Backend-native activation payload; layouts documented above.
@@ -794,6 +825,8 @@ class MoEActivationPack:
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM FP4 UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
+    # Per-token NVFP4 row scale, shape [M].
+    per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -896,6 +929,7 @@ class MoEActivationPack:
             "hidden_states_scale",
             "topk_ids",
             "topk_weights",
+            "per_token_scale",
             "routing_logits",
             "routing_bias",
         ):
