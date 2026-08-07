@@ -572,9 +572,9 @@ class TunableRunner(ABC):
         on dtype, is-None flags, or scalar-argument values -- not on
         per-tensor content).
 
-        Persisted keys use ``str(extras)`` and omit ``runner_hash``. Extras must
-        therefore have stable cross-process string representations and include
-        every configuration the persisted cache must distinguish.
+        Persisted keys stringify ``extras`` and omit ``runner_hash``. Use
+        cross-process-stable values and include every configuration the file
+        cache must distinguish.
         """
         return ()
 

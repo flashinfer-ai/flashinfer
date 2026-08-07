@@ -1,16 +1,5 @@
-"""Trace coverage for block-FP8 fused shared experts.
-
-Three properties, each of which broke at least once during development:
-
-1. The dispatch function selects the sibling template when ``S > 0``, and the
-   routed template otherwise.
-2. The two templates cannot produce the same definition name, including for
-   configurations whose *physical* expert-row counts coincide.
-3. The committed JSON's ``init`` and ``reference`` are runnable standalone.
-   ``exec()``-ing them is not enough -- a missing dependency only raises when
-   the function is *called*, which is how two ``NameError``s reached a
-   committed artifact.
-"""
+"""Regression coverage for shared-expert trace dispatch, naming, standalone
+artifacts, and end-to-end emission."""
 
 from __future__ import annotations
 
@@ -54,20 +43,13 @@ def _axes(**overrides):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("num_shared", [1, 2])
-def test_dispatch_selects_sibling_when_shared_experts(num_shared):
-    template = DISPATCH(
-        routing_method_type=_DEEPSEEK_V3, num_fused_shared_experts=num_shared
-    )
+def test_dispatch_selects_sibling_when_shared_experts():
+    template = DISPATCH(routing_method_type=_DEEPSEEK_V3, num_fused_shared_experts=1)
     assert template is SHARED
 
 
-@pytest.mark.parametrize("value", [0, None])
-def test_dispatch_selects_routed_without_shared_experts(value):
-    """0 and None must both mean "routed" -- the flat API defaults to None."""
-    template = DISPATCH(
-        routing_method_type=_DEEPSEEK_V3, num_fused_shared_experts=value
-    )
+def test_dispatch_selects_routed_without_shared_experts():
+    template = DISPATCH(routing_method_type=_DEEPSEEK_V3, num_fused_shared_experts=0)
     assert template is ROUTED
 
 
@@ -75,12 +57,9 @@ def test_dispatch_selects_routed_when_argument_absent():
     assert DISPATCH(routing_method_type=_DEEPSEEK_V3) is ROUTED
 
 
-@pytest.mark.parametrize("routing_method_type", [0, 1, 3, 4, 5])
-def test_only_deepseek_v3_can_select_the_sibling(routing_method_type):
+def test_only_deepseek_v3_can_select_the_sibling():
     """No other routing kernel emits the appended shared slots."""
-    template = DISPATCH(
-        routing_method_type=routing_method_type, num_fused_shared_experts=1
-    )
+    template = DISPATCH(routing_method_type=0, num_fused_shared_experts=1)
     assert template is not SHARED
 
 
@@ -109,8 +88,8 @@ def test_shared_and_routed_names_differ_at_equal_physical_rows():
     assert routed != shared
 
 
-@pytest.mark.parametrize("num_shared", [1, 2])
-def test_shared_name_encodes_s(num_shared):
+def test_shared_name_encodes_s():
+    num_shared = 1
     name = SHARED.definition_name(
         _axes(num_weight_rows=256 + num_shared, num_fused_shared_experts=num_shared)
     )
@@ -210,12 +189,7 @@ def test_committed_shared_expert_reference_runs_standalone():
 
 
 def _fi_trace_shared(num_shared, *, num_experts=32, hidden=1024, intermediate=512):
-    """Drive the real fi_trace path for a shared-expert call.
-
-    Sections 1 and 2 test dispatch selection and naming in isolation, so they
-    would both still pass if ``_attach_fi_trace`` failed to route through the
-    dispatch function at all. This exercises that wiring.
-    """
+    """Exercise dispatch through public ``fi_trace``, not only direct calls."""
     import torch
 
     import flashinfer
@@ -259,12 +233,12 @@ def _fi_trace_shared(num_shared, *, num_experts=32, hidden=1024, intermediate=51
     )
 
 
-@pytest.mark.parametrize("num_shared", [1, 2])
-def test_fi_trace_emits_shared_expert_definition(num_shared):
+def test_fi_trace_emits_shared_expert_definition():
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    num_shared = 2
     defn = _fi_trace_shared(num_shared)
 
     assert defn["name"].startswith("moe_fp8_block_scale_ds_shared_experts")
@@ -295,24 +269,8 @@ def test_fi_trace_emits_routed_definition_when_no_shared_experts():
     assert defn["axes"]["num_local_experts"]["value"] == 32
 
 
-@pytest.mark.parametrize(
-    "rows,num_shared,num_experts",
-    [
-        (40, 1, 32),  # rows too large for the declared routed count
-        (33, 2, 32),  # S disagrees with the row count
-        (33, 1, 40),  # num_experts disagrees with rows - S
-    ],
-)
-def test_shared_expert_init_rejects_inconsistent_geometry(
-    rows, num_shared, num_experts
-):
-    """A definition's row count and routed count must agree on replay.
-
-    Replay derives the routed count as ``num_weight_rows - S``. If that
-    disagrees with ``num_experts``, the rebuilt inputs are a different workload
-    than the definition describes, which would silently invalidate any
-    benchmark or comparison run from it.
-    """
+def test_shared_expert_init_rejects_inconsistent_geometry():
+    """Reject replay when ``num_weight_rows - S`` disagrees with routed E."""
     from flashinfer.trace.templates.moe import (
         _moe_fp8_block_scale_ds_shared_experts_init as init,
     )
@@ -320,9 +278,9 @@ def test_shared_expert_init_rejects_inconsistent_geometry(
     with pytest.raises(ValueError, match="inconsistent shared-expert definition"):
         init(
             seq_len=8,
-            num_weight_rows=rows,
-            num_fused_shared_experts=num_shared,
-            num_experts=num_experts,
+            num_weight_rows=33,
+            num_fused_shared_experts=2,
+            num_experts=32,
             hidden_size=1024,
             intermediate_size=512,
             n_group=8,

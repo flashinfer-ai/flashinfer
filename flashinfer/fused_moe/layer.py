@@ -132,11 +132,8 @@ class MoELayer:
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
-            # Explain when shared-expert support filtered every candidate.
-            # Deliberately a *global* capability list, not one filtered by the
-            # configured backends or this arch: the common case is that the
-            # caller configured a backend that does not implement S at all, so
-            # filtering would leave the list empty and say nothing useful.
+            # Show all shared-expert runners so a mismatched config or arch
+            # does not produce an empty hint.
             hint = ""
             if config.experts.num_fused_shared_experts > 0:
                 supporting = ", ".join(

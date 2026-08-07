@@ -223,7 +223,7 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
-    # Backends must opt in so unsupported runners cannot silently ignore S.
+    # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
 
     config: MoEConfig
@@ -247,7 +247,7 @@ class MoERunner(TunableRunner):
         self._assert_shared_experts_supported()
 
     def _assert_shared_experts_supported(self) -> None:
-        """Reject S>0 on unsupported backends, including direct runner use."""
+        """Reject S > 0 for backends that have not opted in."""
         s = self.config.experts.num_fused_shared_experts
         if s > 0 and not self.supports_fused_shared_experts:
             raise NotImplementedError(
@@ -279,7 +279,7 @@ class MoERunner(TunableRunner):
     # which excludes runner_hash. Shapes already in the profile are omitted.
 
     def _cache_key_extras(self) -> tuple:
-        """Tactic-relevant configuration, as a hashable, str()-stable tuple."""
+        """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
         experts = self.config.experts
         local_num_experts = (
@@ -310,12 +310,7 @@ class MoERunner(TunableRunner):
         ) + tuple(self._backend_cache_key_parts())
 
     def _backend_cache_key_parts(self) -> tuple:
-        """Backend-specific tactic-relevant values; override as needed.
-
-        Only for values not already implied by the shared tuple (e.g. a layout
-        flag that is not derivable from the quant variant). Must be hashable
-        and have a stable ``str()`` across processes.
-        """
+        """Return backend-specific tactic inputs not covered by the shared key."""
         return ()
 
     def __hash__(self) -> int:
