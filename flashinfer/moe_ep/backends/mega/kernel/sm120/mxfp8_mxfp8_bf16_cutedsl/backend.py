@@ -141,6 +141,19 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
+        knobs = k.knobs
+        if self.ep_world_size <= 2 and (
+            knobs is None or "mma_tiler_mnk" not in knobs
+        ):
+            # The drop's shim-default tiler N=128 produces silently wrong
+            # output cells at world_size 1 (verified 2026-08-06) AND
+            # world_size 2 (verified 2026-08-07: dense-data rel-L2 vs the
+            # bf16 dense reference grows from the ~6.35% MXFP8 band to >20%
+            # once tokens fill past an N=64 tile; N=64 stays in band).
+            # world_size 4 with N=128 remains bit-exact upstream, so only
+            # ws<=2 is pinned. See VENDOR.md; an explicit mma_tiler_mnk knob
+            # overrides this pin.
+            knobs = {**(knobs or {}), "mma_tiler_mnk": (64, 64, 128)}
         return get_symm_buffer_for_sm120_mxfp8_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
@@ -154,7 +167,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_mode=k.token_back_mode,
-            knobs=k.knobs,
+            knobs=knobs,
         )
 
     def validate_forward(
