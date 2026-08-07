@@ -41,6 +41,23 @@ _V_DTYPE_MAP = {
 
 
 @functools.cache
+def _dsl_supports_expected_tx() -> bool:
+    """True if the installed DSL supports per-acquire TMA byte-count
+    overrides (``PipelineTmaUmma.producer_acquire(expected_tx=...)``,
+    added in nvidia-cutlass-dsl 4.6).  Mixed K/V dtypes need it to
+    re-arm each V slot of the shared K/V ring with V's byte count.
+    """
+    import inspect
+
+    from cutlass import pipeline
+
+    return (
+        "expected_tx"
+        in inspect.signature(pipeline.PipelineTmaUmma.producer_acquire).parameters
+    )
+
+
+@functools.cache
 def _get_compiled_prefill_kernel(
     in_dtype,
     out_dtype,
@@ -802,6 +819,14 @@ class BatchPrefillCuteDSLWrapper:
             lse = None
 
         v_in_dtype = _V_DTYPE_MAP[v.dtype] if v.dtype != self._q_data_type else None
+        if v_in_dtype is not None and not _dsl_supports_expected_tx():
+            raise NotImplementedError(
+                f"mixed K/V dtypes (V={v.dtype} with planned "
+                f"{self._q_data_type}) require nvidia-cutlass-dsl>=4.6 "
+                "(producer_acquire lacks per-acquire expected_tx on the "
+                "installed version); upgrade nvidia-cutlass-dsl or use a "
+                "uniform KV dtype"
+            )
         kernel_key = (return_lse, v_in_dtype)
         kernel_fn = self._kernel_cache.get(kernel_key)
         if kernel_fn is None:

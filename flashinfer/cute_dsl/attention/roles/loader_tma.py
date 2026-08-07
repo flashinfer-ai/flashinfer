@@ -428,10 +428,16 @@ class LoaderRole:
                 )
                 # V0.  With mixed K/V widths, expected_tx re-arms the slot
                 # with V's byte count (the ring's barriers are init-armed
-                # with K's); expected_tx=None is the plain acquire.
-                v_handle = load_kv_producer.acquire_and_advance(
-                    expected_tx=self.v_tx_bytes
-                )
+                # with K's).  The kwarg is passed only on the mixed path:
+                # it requires nvidia-cutlass-dsl >= 4.6 (the wrapper gates
+                # mixed plans), while the plain acquire keeps uniform
+                # builds working on the 4.5 floor.
+                if cutlass.const_expr(self.v_tx_bytes is None):
+                    v_handle = load_kv_producer.acquire_and_advance()
+                else:
+                    v_handle = load_kv_producer.acquire_and_advance(
+                        expected_tx=self.v_tx_bytes
+                    )
                 if cutlass.const_expr(self.page_size is not None):
                     self._load_paged_tile(
                         tma_atom_v,
@@ -483,9 +489,12 @@ class LoaderRole:
                             tma_bar_ptr=k_handle_producer.barrier,
                         )
                     # Vi (see V0 for the expected_tx contract)
-                    v_handle = load_kv_producer.acquire_and_advance(
-                        expected_tx=self.v_tx_bytes
-                    )
+                    if cutlass.const_expr(self.v_tx_bytes is None):
+                        v_handle = load_kv_producer.acquire_and_advance()
+                    else:
+                        v_handle = load_kv_producer.acquire_and_advance(
+                            expected_tx=self.v_tx_bytes
+                        )
                     if cutlass.const_expr(self.page_size is not None):
                         self._load_paged_tile(
                             tma_atom_v,
