@@ -3857,9 +3857,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         # For NVFP4 KV (uint8 packed), v last dim is head_dim//2; use q head_dim for output
         out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+        # Preserve the existing BF16 default for FP8 while honoring an
+        # explicitly planned FP16/BF16 output dtype.
+        out_dtype = self._cached_o_data_type
+        if q.dtype.itemsize == 1 and out_dtype == q.dtype:
+            out_dtype = torch.bfloat16
         if out is None:
-            # when input dtype is fp8, we need to use bf16 output
-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
@@ -3869,7 +3872,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             check_shape_dtype_device(
                 out,
                 q.shape[:-1] + (out_head_dim,),
-                self._cached_o_data_type,
+                out_dtype,
                 q.device,
                 "out",
             )
@@ -4018,6 +4021,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 is_cuda_graph_compatible=self._use_cuda_graph,
                 out=out,
                 lse=lse,
+                o_data_type=out_dtype,
             )
 
             return (out, lse) if return_lse else out
