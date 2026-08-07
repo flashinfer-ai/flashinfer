@@ -43,8 +43,7 @@ _FP8_MOE_PLAIN_TACTICS = (
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
 )
 _FP8_MOE_GATED_TACTICS = (
-    # TODO(exp-next-fp8-gated-m32): add (schema, 32, 128) only after the
-    # pre-existing gated NaN bug is fixed and independently revalidated.
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128),
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),

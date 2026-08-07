@@ -33,12 +33,10 @@ static void CutlassFP8GroupwiseMoeGEMMSM120Impl(
       << scale_granularity_n << ", " << scale_granularity_k << ")";
   bool gated = is_gated != 0;
   bool fallback_tactic = tactic_tile_m == -1 && tactic_tile_n == -1;
-  bool common_tactic = (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+  bool common_tactic = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                       (tactic_tile_m == 64 && tactic_tile_n == 128) ||
                        (tactic_tile_m == 128 && tactic_tile_n == 8);
-  bool plain_only_tactic = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
-                           (tactic_tile_m == 128 && tactic_tile_n == 128);
-  // TODO(exp-next-fp8-gated-m32): move (32,128) into the gated set only after
-  // the pre-existing gated NaN bug is fixed and independently revalidated.
+  bool plain_only_tactic = tactic_tile_m == 128 && tactic_tile_n == 128;
   bool gated_only_tactic = tactic_tile_m == 128 && tactic_tile_n == 64;
   TVM_FFI_ICHECK(fallback_tactic || common_tactic || (!gated && plain_only_tactic) ||
                  (gated && gated_only_tactic))

@@ -47,7 +47,7 @@ def test_runner_hash_and_tactics_are_mode_specific():
     assert not gated.is_valid_tactic(
         (fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128)
     )
-    assert not gated.is_valid_tactic(
+    assert gated.is_valid_tactic(
         (fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128)
     )
     assert not plain.is_valid_tactic(

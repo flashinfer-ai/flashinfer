@@ -196,8 +196,7 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
         int total_rows, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
         float const* SFB, int tactic_tile_m, int tactic_tile_n) {
   using KT_SWAPAB = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<128, 8, 128, 2, true>;
-  // TODO(exp-next-fp8-gated-m32): add the existing M32 builder/branch here only
-  // after its NaN root cause is fixed and independently revalidated.
+  using KT_M32 = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<32, 128, 128, 2>;
   using KT_M64 = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<64, 128, 128, 2>;
   using KT_M128 = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<128, 64, 128, 2>;
 
@@ -213,6 +212,10 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
     sm120_blockscaling::launch_fused_moe<KT_SWAPAB>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                     total_rows, out_n, shape_k, num_experts,
                                                     token_offset, num_sms, stream);
+  } else if (tactic_tile_m == 32) {
+    sm120_blockscaling::launch_fused_moe<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                 out_n, shape_k, num_experts, token_offset,
+                                                 num_sms, stream);
   } else if (tactic_tile_m == 64) {
     sm120_blockscaling::launch_fused_moe<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
                                                  out_n, shape_k, num_experts, token_offset,
@@ -401,9 +404,8 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                      (tactic_tile_m == 64 && tactic_tile_n == 128) ||
                      (tactic_tile_m == 128 && tactic_tile_n == 128) ||
                      (tactic_tile_m == 128 && tactic_tile_n == 8);
-  // TODO(exp-next-fp8-gated-m32): add (32,128) only after the pre-existing
-  // gated NaN bug is fixed and independently revalidated.
-  bool valid_gated = (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+  bool valid_gated = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 64 && tactic_tile_n == 128) ||
                      (tactic_tile_m == 128 && tactic_tile_n == 64) ||
                      (tactic_tile_m == 128 && tactic_tile_n == 8);
   TVM_FFI_ICHECK(is_gated ? valid_gated : valid_plain)
