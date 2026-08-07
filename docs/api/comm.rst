@@ -143,6 +143,46 @@ vLLM AllReduce
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
 
+PCIe IPC AllReduce
+------------------
+
+Custom all-reduce for intra-node PCIe machines without NVLink. The launch
+configuration comes from a tuning table keyed on the interconnect, so shapes
+outside the table report unsupported and the caller falls back.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    # Collective: every rank builds the workspace with identical arguments.
+    # Size max_numel to the real workload -- an oversized one costs latency.
+    ws = comm.PcieIpcAllReduceWorkspace(group=group, max_numel=128 * 6144)
+
+    for x in activations:                     # same shapes, same order, all ranks
+        if ws.supports(x):
+            y = ws.all_reduce(x)              # out-of-place
+        else:
+            y = x.clone()
+            dist.all_reduce(y, group=group)   # untuned shape: fall back
+
+    ws.destroy()                              # collective; all ranks together
+
+``supports()`` is a pure function of shape and dtype, so every rank reaches the
+same answer without agreeing on one at runtime. The kernels spin on peer flags
+with no timeout, so ranks that disagree on shape, dtype or call order hang
+rather than raise. One workspace serves one CUDA stream; use
+:meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after ordering the two if a
+move is genuinely needed.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllReduceWorkspace
+    PcieIpcLaunchConfig
+    get_pcie_ipc_launch_config
+    probe_pcie_ipc_rank_topology
+    resolve_pcie_ipc_profile
+
 Ulysses Context-Parallel All-to-All
 -----------------------------------
 
