@@ -231,6 +231,13 @@ def test_fd_ancillary_extract_roundtrip() -> None:
     assert _extract_fd([(socket.SOL_SOCKET, socket.SCM_RIGHTS, buf.tobytes())]) == 7
 
 
+def test_fd_ancillary_annotation_is_not_evaluated() -> None:
+    """``array.array[int]`` is only subscriptable on Python 3.12+, so evaluating
+    this annotation would break ``import flashinfer.comm`` on 3.10/3.11.
+    """
+    assert isinstance(_fd_ancillary.__annotations__["return"], str)
+
+
 def test_extract_fd_ignores_unrelated_control_messages() -> None:
     assert _extract_fd([]) is None
     wrong = array.array("i", [123]).tobytes()
