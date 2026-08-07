@@ -1163,10 +1163,15 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
-    gemm1_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
-                                hidden_states.device());
-    gemm2_output = alloc_tensor({max_num_padded_tokens, args->hidden_size}, dl_bfloat16,
-                                hidden_states.device());
+    // Generated grouped BF16 cubins may issue predicated accesses through the
+    // final M tile. Keep one full maximum supported tile addressable for both
+    // intermediate outputs when an allocation ends at a CUDA virtual-memory
+    // boundary; the launcher's logical padded-token limit remains unchanged.
+    constexpr int32_t kGuardRows = mSupportedTileNums.back();
+    gemm1_output = alloc_tensor({max_num_padded_tokens + kGuardRows, args->intermediate_size},
+                                dl_bfloat16, hidden_states.device());
+    gemm2_output = alloc_tensor({max_num_padded_tokens + kGuardRows, args->hidden_size},
+                                dl_bfloat16, hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();

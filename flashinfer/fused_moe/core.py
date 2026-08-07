@@ -1377,15 +1377,20 @@ def _alloc_trtllm_moe_output(
     do_finalize: bool,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    allocation_guard_rows: int = 0,
 ) -> torch.Tensor:
     """Allocate the finalized-output buffer for a trtllm-gen MoE op.
     When `do_finalize` is false, return a zero-width `(num_tokens, 0)`
     placeholder instead: the leading `num_tokens` dim is preserved for
-    shape checks and the autotuner's token bucketing.
+    shape checks and the autotuner's token bucketing. ``allocation_guard_rows``
+    enlarges only the backing storage; the returned logical shape is unchanged.
     """
-    return torch.empty(
-        num_tokens, hidden_size if do_finalize else 0, dtype=dtype, device=device
+    if not do_finalize:
+        return torch.empty(num_tokens, 0, dtype=dtype, device=device)
+    storage = torch.empty(
+        num_tokens + allocation_guard_rows, hidden_size, dtype=dtype, device=device
     )
+    return storage[:num_tokens]
 
 
 def _unpack_trtllm_moe_output(
@@ -2093,8 +2098,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         hidden_size = hidden_states.shape[-1]
 
         if output is None:
+            # Generated grouped-BF16 finalize cubins can issue predicated
+            # accesses through the final output tile. Keep a full maximum
+            # tile addressable while exposing only the logical output view.
             output = _alloc_trtllm_moe_output(
-                num_tokens, hidden_size, do_finalize, hidden_states.device
+                num_tokens,
+                hidden_size,
+                do_finalize,
+                hidden_states.device,
+                allocation_guard_rows=128,
             )
         elif do_finalize:
             check_shape_dtype_device(
