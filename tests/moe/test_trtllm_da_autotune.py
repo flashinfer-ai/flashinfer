@@ -84,6 +84,24 @@ DA_DISTRIBUTION_NAMES = ("uniform", "exp:2", "single")
 DA_ROUTING_METHODS = (RoutingMethodType.DeepSeekV3, RoutingMethodType.Renormalize)
 
 
+def test_trtllm_moe_runner_preparation_does_not_execute_a_body():
+    """The autotuner preparation hook must not launch on its synthetic shape."""
+    _require_sm100()
+    module = moe_core.get_trtllm_moe_sm100_module()
+    runner = module.MoERunner(
+        top_k=1,
+        num_local_experts=1,
+        dtype_act=DtypeTrtllmGen.Bfloat16,
+        dtype_weights=DtypeTrtllmGen.Bfloat16,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+
+    # Empty inputs prove the hook returns before parsing inputs or invoking FFI.
+    assert runner.forward([], tactic=-1, do_preparation=True) is None
+
+
 @pytest.mark.parametrize("pack_topk_ids", [False, True])
 def test_future_default_profile_uses_valid_representative_routing(pack_topk_ids):
     invocation = SimpleNamespace(top_k=8, num_experts=128)

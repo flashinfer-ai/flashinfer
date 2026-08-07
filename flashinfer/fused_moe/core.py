@@ -1754,6 +1754,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             do_preparation: bool = False,
             **kwargs,
         ):
+            if do_preparation:
+                # MoERunner has no persistent setup. In particular, do not
+                # execute the fallback cubin on the tuner's synthetic minimum
+                # shape before profiling the real tactic candidates.
+                return
             moe_inputs = MoeRunnerInputs.from_list(inputs)
             output = moe_inputs.output
             routing_logits = moe_inputs.routing_logits
