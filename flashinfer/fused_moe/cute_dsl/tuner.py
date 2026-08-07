@@ -21,7 +21,7 @@ This module provides a TunableRunner implementation for the CuteDSL NVFP4 MoE
 kernels, enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style:
-- GEMM1 (Gather + SwiGLU): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+- GEMM1 (Gather + FC1 activation): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 - GEMM2 (Finalize): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -31,7 +31,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -52,13 +52,16 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
-from .moe_utils import normalize_cute_dsl_moe_activation_type
+from .moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# GEMM1 Tactics (Gather + SwiGLU Fusion)
+# GEMM1 Tactics (Gather + FC1 Activation Fusion)
 # =============================================================================
 # Reference: TRT-LLM cute_dsl_custom_ops.py line 1867-1897
 # Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.get_valid_tactics
@@ -265,6 +268,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
     """
 
     def __init__(
@@ -281,9 +286,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -297,6 +305,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
 
         # Helper that builds a deterministic balanced approx-max-load
@@ -322,63 +332,92 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     # `gemm/gemm_base.py`).
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-                    tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed). Seeded
-                        # for cross-process determinism of autotune picks
-                        # (matches trt-llm's seed=515 convention).
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            256,
+                ),
+            ),
+            # Per-input initializer closures, keyed by input index. Indices
+            # match input_idx above: 11 is per_token_scale when per-token
+            # activation is enabled (else moe_output), 12 is moe_output.
+            tensor_initializers=(
+                # 0: x — FP4 quantized input (uint8 packed). Seeded
+                # for cross-process determinism of autotune picks
+                # (matches trt-llm's seed=515 convention).
+                (
+                    0,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        256,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 1: x_sf — FP8 scale factors (uint8). Seeded.
+                (
+                    1,
+                    lambda shapes, dtype, device: torch.randint(
+                        1,
+                        128,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 2: token_selected_experts — output is overwritten
+                # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                # seed the initializer too in case the hook is ever
+                # disabled.
+                (
+                    2,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        max(num_experts, 1),
+                        shapes,
+                        dtype=torch.int32,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 3: token_final_scales — softmax-normalized. Seeded.
+                (
+                    3,
+                    lambda shapes, dtype, device: torch.softmax(
+                        torch.randn(
                             shapes,
-                            dtype=torch.uint8,
                             device=device,
                             generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
-                        lambda shapes, dtype, device: torch.randint(
-                            1,
-                            128,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 2: token_selected_experts — output is overwritten
-                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
-                        # seed the initializer too in case the hook is ever
-                        # disabled.
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            max(num_experts, 1),
-                            shapes,
-                            dtype=torch.int32,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 3: token_final_scales — softmax-normalized. Seeded.
-                        lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(
-                                shapes,
-                                device=device,
-                                generator=torch.Generator(device=device).manual_seed(
-                                    515
-                                ),
+                        dim=-1,
+                    ).to(torch.float32),
+                ),
+                *(
+                    [
+                        # 11: per_token_scale — ones.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.ones(
+                                shapes, dtype=torch.float32, device=device
                             ),
-                            dim=-1,
-                        ).to(torch.float32),
-                        *(
-                            [
-                                lambda shapes, dtype, device: torch.ones(
-                                    shapes, dtype=torch.float32, device=device
-                                )
-                            ]
-                            if use_per_token_activation
-                            else []
                         ),
-                        lambda shapes, dtype, device: torch.empty(
-                            shapes, dtype=dtype, device=device
+                        # 12: moe_output — empty.
+                        (
+                            12,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
                         ),
-                    ],
+                    ]
+                    if use_per_token_activation
+                    else [
+                        # 11: moe_output — empty.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
+                        )
+                    ]
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
@@ -402,6 +441,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.situ_beta,
+                self.situ_linear_beta,
                 self.use_per_token_activation,
             )
         )
@@ -412,6 +453,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.situ_beta,
+            self.situ_linear_beta,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -638,6 +681,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             **kwargs,
         )
 
