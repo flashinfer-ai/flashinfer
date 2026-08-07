@@ -61,9 +61,6 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
-#if defined(ENABLE_FP4)
-using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
-#endif
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
@@ -75,7 +72,7 @@ auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilog
     auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t) {
 #if defined(ENABLE_FP4)
       constexpr bool is_block_scaled =
-          IsMXFPX || std::is_same_v<T, Fp4Type> || std::is_same_v<WeightType, Fp4Type>;
+          IsMXFPX || std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
       constexpr bool is_block_scaled = IsMXFPX;
 #endif
@@ -165,7 +162,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
   else {
 #if defined(ENABLE_FP4)
     constexpr static bool is_wfp4afp8 =
-        std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, Fp4Type>;
+        std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
 #else
     constexpr static bool is_wfp4afp8 = false;
 #endif
@@ -246,7 +243,7 @@ constexpr bool are_tile_shapes_supported_sm100() {
 
   if constexpr (Arch::kMinComputeCapability == 103) {
 #if defined(ENABLE_FP4)
-    return std::is_same_v<DataType, Fp4Type> && std::is_same_v<WeightType, Fp4Type> &&
+    return std::is_same_v<DataType, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1> &&
            TileM == 128 && (TileN == 128 || TileN == 256);
 #else
     return false;
@@ -258,7 +255,8 @@ constexpr bool are_tile_shapes_supported_sm100() {
   }
 
 #ifdef ENABLE_FP4
-  if constexpr (std::is_same_v<DataType, Fp4Type> || std::is_same_v<WeightType, Fp4Type>) {
+  if constexpr (std::is_same_v<DataType, __nv_fp4_e2m1> ||
+                std::is_same_v<WeightType, __nv_fp4_e2m1>) {
     // if (TileN % 64 != 0 || TileN < 128)
     // {
     //     return false;
@@ -457,8 +455,8 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     }
 #if defined(ENABLE_FP4) && defined(COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     // Check this before SM100 because we fall back to SM100 if not NVFP4
-    else if (gemm_config.sm_version == 103 && std::is_same_v<T, Fp4Type> &&
-             std::is_same_v<WeightType, Fp4Type>) {
+    else if (gemm_config.sm_version == 103 && std::is_same_v<T, __nv_fp4_e2m1> &&
+             std::is_same_v<WeightType, __nv_fp4_e2m1>) {
       if constexpr (kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm100) {
