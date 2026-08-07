@@ -330,10 +330,20 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std:
   std::uint32_t dst_addr = cvta_to_shared_u32(dst_smem);
   std::uint32_t bar_addr = cvta_to_shared_u32(bar_smem);
   std::uint64_t desc_addr = reinterpret_cast<std::uint64_t>(&desc);
-  // `.shared::cluster` without `.tile` works from PTX ISA 8.0 / CUDA 12.0+.
-  // `.shared::cta` and the `.tile` qualifier both require PTX ISA 8.6 /
-  // CUDA 12.8+.  This matches the fallback form in CUTLASS
-  // cute/arch/copy_sm90_tma.hpp (which also omits `.tile` for SM90).
+  // Use `.shared::cluster` without `.tile` — the PTX ISA 8.0 / CUDA 12.0+ form
+  // that CUTLASS emits for SM90 (cute/arch/copy_sm90_tma.hpp).
+  //
+  // `.shared::cta` and the `.tile` qualifier were both introduced in PTX ISA
+  // 8.6 / CUDA 12.8 alongside the new `.im2col` mode; `.tile` exists only to
+  // disambiguate tile from im2col, so it is redundant (and illegal) on the
+  // older `.shared::cluster` form.
+  //
+  // `.shared::cluster` vs `.shared::cta` semantics: the cluster form allows
+  // TMA to write into any CTA's shared memory within the cluster; the cta form
+  // restricts the destination to the issuing CTA's own shared memory.  This
+  // kernel is always launched with cluster size 1 (plain <<<grid, block>>>
+  // triple-chevron, no cudaLaunchKernelEx / __cluster_dims__), so both forms
+  // address the same physical bytes — no semantic difference here.
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global"
       ".mbarrier::complete_tx::bytes"
