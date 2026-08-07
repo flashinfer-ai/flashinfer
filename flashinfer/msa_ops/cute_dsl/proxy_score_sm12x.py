@@ -1260,10 +1260,11 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
     @cute.jit
     def _gather_packed_q(self, mQ, sQ, q_start, kv_head, seqlen_q, tidx):
         """Gather the packed Q tile into swizzled smem, column-permuted to
-        match the converted K fragments (the K convert moves column
-        ``16g + 4m + 2h + j`` of each 32-wide block into the slot that
-        canonically holds ``16g + 8h + 2m + j``). Rows past seqlen_q are
-        zero-filled; the epilogue masks them."""
+        match the converted K fragments: within each 32-wide block, column
+        ``16g + 4m + 2h + j`` (two-bit ``m``, one-bit rest) moves to slot
+        ``16g + 8h + 2m + j``, where ``g = (c8 % 4) // 2``,
+        ``m = 2 * (c8 % 2) + i // 2``, and ``h = i % 2`` below. Rows past
+        seqlen_q are zero-filled; the epilogue masks them."""
         elems = 128 // self._dtype.width
         chunks = self._head_dim // elems
         total = self._m_block_size * chunks
@@ -1298,6 +1299,8 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                 sQ_chunk0.fill(0)
 
 
+# `createpolicy.fractional.L2::evict_first.b64` at fraction 1.0: K tiles
+# are read once per CTA, so they should not evict resident lines.
 _TMA_EVICT_FIRST = cutlass.Int64(0x12F0000000000000)
 
 

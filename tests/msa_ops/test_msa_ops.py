@@ -1479,6 +1479,9 @@ def test_msa_proxy_score_paged_fp8():
             torch.cuda.synchronize()
             assert torch.equal(out_q8, out8)
             assert torch.equal(pg_q8, pg8)
+            # fp8 q without fp8 k has no kernel; the dispatch must reject it.
+            with pytest.raises(ValueError, match="fp8 q requires fp8 k"):
+                msa_proxy_score(qd8, k8.to(qdt), cu_qd, cu_k, causal=True)
     # Prefill-shape fp8 q takes the internal upconvert fallback; identical to
     # upconverting at the call site.
     q8_pre = q.to(torch.float8_e4m3fn)
