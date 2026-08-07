@@ -21,7 +21,7 @@ This module provides a TunableRunner implementation for the CuteDSL NVFP4 MoE
 kernels, enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style:
-- GEMM1 (Gather + SwiGLU): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+- GEMM1 (Gather + FC1 activation): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 - GEMM2 (Finalize): (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -31,7 +31,7 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -52,13 +52,18 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
-from .moe_utils import normalize_cute_dsl_moe_activation_type
+from .blackwell.moe_w4a16 import launch_w4a16_moe
+from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
+from .moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# GEMM1 Tactics (Gather + SwiGLU Fusion)
+# GEMM1 Tactics (Gather + FC1 Activation Fusion)
 # =============================================================================
 # Reference: TRT-LLM cute_dsl_custom_ops.py line 1867-1897
 # Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner.get_valid_tactics
@@ -265,6 +270,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
     """
 
     def __init__(
@@ -281,9 +288,12 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -297,6 +307,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
 
         # Helper that builds a deterministic balanced approx-max-load
@@ -322,63 +334,92 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     # `gemm/gemm_base.py`).
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-                    tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed). Seeded
-                        # for cross-process determinism of autotune picks
-                        # (matches trt-llm's seed=515 convention).
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            256,
+                ),
+            ),
+            # Per-input initializer closures, keyed by input index. Indices
+            # match input_idx above: 11 is per_token_scale when per-token
+            # activation is enabled (else moe_output), 12 is moe_output.
+            tensor_initializers=(
+                # 0: x — FP4 quantized input (uint8 packed). Seeded
+                # for cross-process determinism of autotune picks
+                # (matches trt-llm's seed=515 convention).
+                (
+                    0,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        256,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 1: x_sf — FP8 scale factors (uint8). Seeded.
+                (
+                    1,
+                    lambda shapes, dtype, device: torch.randint(
+                        1,
+                        128,
+                        shapes,
+                        dtype=torch.uint8,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 2: token_selected_experts — output is overwritten
+                # by inputs_pre_hook (CuteDslMoEInputsHelper), but
+                # seed the initializer too in case the hook is ever
+                # disabled.
+                (
+                    2,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        max(num_experts, 1),
+                        shapes,
+                        dtype=torch.int32,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                # 3: token_final_scales — softmax-normalized. Seeded.
+                (
+                    3,
+                    lambda shapes, dtype, device: torch.softmax(
+                        torch.randn(
                             shapes,
-                            dtype=torch.uint8,
                             device=device,
                             generator=torch.Generator(device=device).manual_seed(515),
                         ),
-                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
-                        lambda shapes, dtype, device: torch.randint(
-                            1,
-                            128,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 2: token_selected_experts — output is overwritten
-                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
-                        # seed the initializer too in case the hook is ever
-                        # disabled.
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            max(num_experts, 1),
-                            shapes,
-                            dtype=torch.int32,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 3: token_final_scales — softmax-normalized. Seeded.
-                        lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(
-                                shapes,
-                                device=device,
-                                generator=torch.Generator(device=device).manual_seed(
-                                    515
-                                ),
+                        dim=-1,
+                    ).to(torch.float32),
+                ),
+                *(
+                    [
+                        # 11: per_token_scale — ones.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.ones(
+                                shapes, dtype=torch.float32, device=device
                             ),
-                            dim=-1,
-                        ).to(torch.float32),
-                        *(
-                            [
-                                lambda shapes, dtype, device: torch.ones(
-                                    shapes, dtype=torch.float32, device=device
-                                )
-                            ]
-                            if use_per_token_activation
-                            else []
                         ),
-                        lambda shapes, dtype, device: torch.empty(
-                            shapes, dtype=dtype, device=device
+                        # 12: moe_output — empty.
+                        (
+                            12,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
                         ),
-                    ],
+                    ]
+                    if use_per_token_activation
+                    else [
+                        # 11: moe_output — empty.
+                        (
+                            11,
+                            lambda shapes, dtype, device: torch.empty(
+                                shapes, dtype=dtype, device=device
+                            ),
+                        )
+                    ]
                 ),
             ),
             inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
@@ -402,6 +443,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.situ_beta,
+                self.situ_linear_beta,
                 self.use_per_token_activation,
             )
         )
@@ -412,6 +455,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.situ_beta,
+            self.situ_linear_beta,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -481,8 +526,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         else:
             final_scale_dtype = cutlass.Float16
 
-        valid_tactics = []
-        for tactic in ALL_MOE_TACTICS:
+        def _tactic_ok(tactic):
             tile_size, gemm1_tactic, gemm2_tactic = tactic
             gemm1_mma_tiler_mn = gemm1_tactic[0]
             gemm1_cluster_shape_mn = gemm1_tactic[1]
@@ -528,10 +572,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 )
             )
 
-            if gemm1_ok and gemm2_ok:
-                valid_tactics.append(tactic)
+            return gemm1_ok and gemm2_ok
+
+        valid_tactics = [t for t in ALL_MOE_TACTICS if _tactic_ok(t)]
 
         if not valid_tactics:
+            # DEFAULT_MOE_TACTIC is a member of ALL_MOE_TACTICS, so an empty
+            # list means even the default fails can_implement -- do not fall
+            # back to it unvalidated (gh #3957). This early refusal is
+            # diagnostics/defense-in-depth: the kernel wrappers re-validate
+            # can_implement at launch and raise, so an unvalidated tactic
+            # cannot reach the device -- but refusing here avoids pointless
+            # profiling of a tactic that can only throw, and says why.
             logger.warning(
                 "No valid tactics found for problem dims "
                 "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d). "
@@ -542,7 +594,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 num_local_experts,
                 self.top_k,
             )
-            valid_tactics = [DEFAULT_MOE_TACTIC]
 
         return valid_tactics
 
@@ -632,7 +683,293 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             **kwargs,
+        )
+
+
+_W4A16_ROUTE_TILES = (8, 16, 32, 64, 128, 192)
+_W4A16_K_TILE = 256
+# W4A16 maps output channels to M and routed rows to N. Preserve the current
+# M-major static scheduler order; CLC scheduling owns its traversal order.
+_W4A16_RASTER_ALONG_M = True
+# Grouped expert scheduling requires cluster N=1 when multiple routed rows
+# target the same expert.
+_W4A16_GEMM_TOPOLOGY_PAIRS = (
+    ((128, (1, 1)), (128, (1, 1))),
+    ((128, (2, 1)), (128, (2, 1))),
+    ((256, (2, 1)), (256, (2, 1))),
+    ((128, (2, 1)), (256, (2, 1))),
+    ((256, (2, 1)), (128, (2, 1))),
+)
+
+
+def get_w4a16_moe_valid_tactics() -> List[Tuple]:
+    """Get valid W4A16 GEMM1/GEMM2 tactic pairs."""
+    tactics: List[Tuple] = []
+    for route_tile in _W4A16_ROUTE_TILES:
+        for gemm1_topology, gemm2_topology in _W4A16_GEMM_TOPOLOGY_PAIRS:
+            gemm1_m, gemm1_cluster_shape = gemm1_topology
+            gemm2_m, gemm2_cluster_shape = gemm2_topology
+            if route_tile < 16 and (gemm1_m == 256 or gemm2_m == 256):
+                continue
+            # A 128x192x256 tile cannot retain the two load and transform
+            # stages required by the warp-specialized pipeline.
+            if route_tile == 192 and (gemm1_m == 128 or gemm2_m == 128):
+                continue
+            gemm1_tactic = (
+                (gemm1_m, route_tile, _W4A16_K_TILE),
+                gemm1_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
+            )
+            gemm2_tactic = (
+                (gemm2_m, route_tile, _W4A16_K_TILE),
+                gemm2_cluster_shape,
+                _W4A16_RASTER_ALONG_M,
+            )
+            tactics.append((gemm1_tactic, gemm2_tactic))
+    return tactics
+
+
+W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
+
+
+class CuteDslFusedMoEW4A16Runner(TunableRunner):
+    """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline.
+
+    Inputs:
+        [x, token_selected_experts, token_final_scales,
+         w1_weight, w1_weight_sf, w1_alpha,
+         w2_weight, w2_weight_sf, w2_alpha, moe_output]
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+        use_fused_finalize: bool = True,
+        output_dtype: torch.dtype = torch.bfloat16,
+        enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    ):
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        if output_dtype != torch.bfloat16:
+            raise ValueError("W4A16 only supports BF16 output")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.use_fused_finalize = use_fused_finalize
+        self.output_dtype = output_dtype
+        self.enable_pdl = enable_pdl
+        self.activation_type = activation_type
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
+        self._workspace_cache: Dict[Tuple, Any] = {}
+
+        # Match production EP routing density while retaining seeded load
+        # variance around route-tile boundaries.
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 9),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+                ),
+            ),
+            tensor_initializers=(
+                (
+                    0,
+                    lambda shapes, dtype, device: torch.randn(
+                        shapes,
+                        dtype=dtype,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                (
+                    1,
+                    lambda shapes, dtype, device: torch.randint(
+                        0,
+                        max(num_experts, 1),
+                        shapes,
+                        dtype=torch.int32,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(515),
+                    ),
+                ),
+                (
+                    2,
+                    lambda shapes, dtype, device: torch.softmax(
+                        torch.randn(
+                            shapes,
+                            device=device,
+                            generator=torch.Generator(device=device).manual_seed(515),
+                        ),
+                        dim=-1,
+                    ).to(torch.float32),
+                ),
+                (
+                    9,
+                    lambda shapes, dtype, device: torch.empty(
+                        shapes, dtype=dtype, device=device
+                    ),
+                ),
+            ),
+            use_cold_l2_cache=True,
+        )
+
+    def __hash__(self):
+        return hash(
+            (
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                self.use_fused_finalize,
+                self.output_dtype,
+                self.enable_pdl,
+                int(self.activation_type),
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
+            )
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[Tuple[Any, ...]]:
+        import cutlass
+
+        from .moe_utils import get_max_num_permuted_tokens
+
+        w1_weight = inputs[3]
+        w2_weight = inputs[6]
+        num_tokens = inputs[0].shape[0]
+
+        def can_implement(
+            weight: torch.Tensor,
+            route_slots: int,
+            gemm_tactic: Tuple,
+        ) -> bool:
+            m = weight.shape[1]
+            k = weight.shape[2] * 2
+            mma_tiler_mnk, cluster_shape_mn, _ = gemm_tactic
+            mma_tiler_m = mma_tiler_mnk[0]
+            return Sm100W4A16GroupedGemmKernel.can_implement(
+                mnkl=(m, route_slots, k, self.num_local_experts),
+                a_dtype=cutlass.Float4E2M1FN,
+                b_dtype=cutlass.BFloat16,
+                c_dtype=cutlass.BFloat16,
+                a_major="k",
+                b_major="k",
+                c_major="m",
+                mma_tiler=mma_tiler_mnk,
+                cluster_shape_mn=cluster_shape_mn,
+                use_2cta_instrs=mma_tiler_m == 256,
+            )
+
+        valid_tactics = []
+        for tactic in W4A16_MOE_TACTICS:
+            gemm1_tactic, gemm2_tactic = tactic
+            route_tile = gemm1_tactic[0][1]
+            route_slots = get_max_num_permuted_tokens(
+                num_tokens,
+                self.top_k,
+                self.num_local_experts,
+                route_tile,
+            )
+            if can_implement(w1_weight, route_slots, gemm1_tactic) and can_implement(
+                w2_weight, route_slots, gemm2_tactic
+            ):
+                valid_tactics.append(tactic)
+        return valid_tactics
+
+    def forward(  # type: ignore[override]
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Optional[Tuple] = None,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        (
+            x,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            moe_output,
+        ) = inputs
+        if x.dtype != torch.bfloat16:
+            raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
+        if token_final_scales.dtype != torch.float32:
+            raise TypeError(
+                "W4A16 requires token_final_scales.dtype=torch.float32, "
+                f"got {token_final_scales.dtype}"
+            )
+        num_tokens = int(token_selected_experts.size(0))
+        hidden_size = int(w2_weight.size(1))
+        if tuple(x.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                f"x must have shape {(num_tokens, hidden_size)} for W4A16, "
+                f"got {tuple(x.shape)}"
+            )
+        if tuple(moe_output.shape) != (num_tokens, hidden_size):
+            raise ValueError(
+                f"moe_output must have shape {(num_tokens, hidden_size)}, "
+                f"got {tuple(moe_output.shape)}"
+            )
+        return launch_w4a16_moe(
+            x=x,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=self.local_expert_offset,
+            use_fused_finalize=self.use_fused_finalize,
+            moe_output=moe_output,
+            enable_pdl=self.enable_pdl,
+            activation_type=self.activation_type,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            tactic=None if tactic is None or tactic == -1 else tactic,
+            workspace_cache=self._workspace_cache,
         )
 
 

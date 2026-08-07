@@ -12,6 +12,7 @@ CP_DEFAULT_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_NUMERATOR = 1
 CP_SM120_SHORT_FIXUP_TO_PREFILL_WORKLOAD_RATIO_DENOMINATOR = 2
 CP_SM120_SHORT_HEURISTIC_MAX_HEADS = 16
+CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR = 4
 CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
 CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
@@ -86,13 +87,21 @@ def cp_short_workload_ratio_host(
     )
 
 
-def should_use_cp_host(num_parallel_work: int, num_sms: int, device_name: str) -> bool:
+def should_use_cp_host(
+    num_parallel_work: int,
+    num_sms: int,
+    device_name: str,
+    device_capability: tuple[int, int] | None = None,
+) -> bool:
     """Return whether a public wrapper should dispatch to the CP path.
 
     `num_parallel_work` is the non-CP kernel parallelism, typically batch times
     output/state heads. CP is selected only when that parallelism is strictly
     below the card-specific threshold.
     """
+    if device_capability is not None and device_capability[0] == 10:
+        return num_parallel_work * CP_SM100_PARALLELISM_THRESHOLD_DENOMINATOR < num_sms
+
     threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
@@ -104,13 +113,14 @@ def choose_cp_chunk_len_host(
     chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
     device_capability: tuple[int, int] | None = None,
     total_seqlen: int | None = None,
+    num_seqs: int = 1,
     device_name: str = "",
 ) -> int:
     """Choose a CP chunk length for the CP workspace kernels.
 
-    The TTFT path is usually one long sequence. For that case, MN precompute
-    launches `ceil_div(max_seqlen, chunk_len) * num_heads` CTAs. Pick the
-    smallest granularity-aligned chunk length whose CTA count is at most one wave.
+    MN precompute launches one CTA per sequence chunk and state head. Pick the
+    smallest granularity-aligned chunk length whose safely bounded CTA count is
+    at most one wave.
     """
     assert chunk_len_granularity % 64 == 0
     if total_seqlen is None:
@@ -137,10 +147,26 @@ def choose_cp_chunk_len_host(
                 balanced_chunk_len += 1
             return max(BLK, _round_up(balanced_chunk_len, BLK))
 
-    # target for one wave of CTAs
+    # Target one wave of MN CTAs. Account for the known longest sequence, then
+    # safely bound the chunks contributed by all remaining uneven sequences.
     target_chunks = max(1, num_sms // num_heads)
-    min_chunk_len = _ceil_div(max_seqlen, target_chunks)
-    return _round_up(min_chunk_len, chunk_len_granularity)
+    remaining_seqlen = max(0, total_seqlen - max_seqlen)
+    remaining_seqs = max(0, num_seqs - 1)
+
+    def chunk_bound_for_len(chunk_len: int) -> int:
+        return _ceil_div(max_seqlen, chunk_len) + chunk_bound_host(
+            remaining_seqs, remaining_seqlen, chunk_len
+        )
+
+    lo = 1
+    hi = max(1, _ceil_div(max_seqlen, chunk_len_granularity))
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if chunk_bound_for_len(mid * chunk_len_granularity) <= target_chunks:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo * chunk_len_granularity
 
 
 @cute.jit
