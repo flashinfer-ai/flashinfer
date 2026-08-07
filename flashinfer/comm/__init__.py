@@ -38,6 +38,21 @@ from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
 from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
+from .pcie_ipc_ar import (
+    PcieIpcAllReduceWorkspace as PcieIpcAllReduceWorkspace,
+)
+from .pcie_ipc_ar import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
+from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
+from .pcie_ipc_policy import IpcLaunchConfig as PcieIpcLaunchConfig
+from .pcie_ipc_policy import (
+    get_pcie_ipc_launch_config as get_pcie_ipc_launch_config,
+)
+from .pcie_ipc_topology import (
+    probe_pcie_ipc_rank_topology as probe_pcie_ipc_rank_topology,
+)
+from .pcie_ipc_topology import (
+    resolve_pcie_ipc_profile as resolve_pcie_ipc_profile,
+)
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
 from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module

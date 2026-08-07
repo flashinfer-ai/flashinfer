@@ -282,3 +282,81 @@ decode_cp_a2a_alltoall_trace = TraceTemplate(
     reference=_decode_cp_a2a_alltoall_reference,
     init=_decode_cp_a2a_alltoall_init,
 )
+
+
+# ── PCIe IPC all-reduce (intra-node, no NVLink) ──────────────────────────────
+
+
+@torch.no_grad()
+def _pcie_ipc_all_reduce_reference(
+    inp: torch.Tensor,
+    *,
+    out: torch.Tensor = None,
+    config=None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Single-rank reference: an all-reduce over one rank is the identity.
+
+    Same modelling choice as ``allreduce_fusion`` above -- the trace runs in a
+    single process, so the cross-rank reduction cannot be exercised here.
+    Multi-rank correctness is covered by
+    ``tests/comm/test_pcie_ipc_all_reduce.py``, which compares against NCCL at
+    zero tolerance.
+    """
+    return inp.clone() if out is None else out.copy_(inp)
+
+
+def _pcie_ipc_all_reduce_init(
+    *,
+    num_tokens: int,
+    hidden_dim: int = 6144,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build this rank's input for ``PcieIpcAllReduceWorkspace.all_reduce``.
+
+    The workspace itself is an opaque multi-rank IPC handle bound to ``self``
+    and is not built here; see ``tests/comm/test_pcie_ipc_all_reduce.py``.
+    """
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return {
+        "inp": torch.randn(
+            num_tokens,
+            hidden_dim,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+    }
+
+
+pcie_ipc_all_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="pcie_ipc_all_reduce",
+    description=(
+        "Custom all-reduce for intra-node PCIe machines without NVLink. The "
+        "launch configuration comes from a tuning table keyed on the "
+        "interconnect rather than from a runtime threshold, so the traced "
+        "axes are the ones that select it."
+    ),
+    axes={
+        "num_tokens": Var(description="Token count along dim 0."),
+        "hidden_dim": Const(abbrev="h"),
+    },
+    inputs={
+        "inp": Tensor(
+            ["num_tokens", "hidden_dim"],
+            description="Pre-reduction token activations (this rank's shard).",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_dim"],
+            dtype_from="inp",
+            description="Reduced activations.",
+        ),
+    },
+    tags=["status:verified", "stage:comm"],
+    reference=_pcie_ipc_all_reduce_reference,
+    init=_pcie_ipc_all_reduce_init,
+)
