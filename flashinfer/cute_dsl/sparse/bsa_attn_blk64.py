@@ -75,10 +75,8 @@ def bsa_attn_blk64_fwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # Make inputs contiguous in BSHD layout.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    # The launch template consumes strided BSHD directly (it permutes anyway),
+    # so forcing contiguity here would be a wasted full-tensor copy.
 
     has_variable_block_nums = q2k_block_nums is not None
 
