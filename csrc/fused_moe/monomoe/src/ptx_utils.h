@@ -330,8 +330,12 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std:
   std::uint32_t dst_addr = cvta_to_shared_u32(dst_smem);
   std::uint32_t bar_addr = cvta_to_shared_u32(bar_smem);
   std::uint64_t desc_addr = reinterpret_cast<std::uint64_t>(&desc);
+  // `.shared::cluster` without `.tile` works from PTX ISA 8.0 / CUDA 12.0+.
+  // `.shared::cta` and the `.tile` qualifier both require PTX ISA 8.6 /
+  // CUDA 12.8+.  This matches the fallback form in CUTLASS
+  // cute/arch/copy_sm90_tma.hpp (which also omits `.tile` for SM90).
   asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+      "cp.async.bulk.tensor.2d.shared::cluster.global"
       ".mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];\n"
       :

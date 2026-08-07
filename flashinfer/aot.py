@@ -602,10 +602,7 @@ def gen_all_modules(
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).
-            # ptxas 12.6.0 has a known state-space bug on cp.async.bulk.tensor
-            # that aborts compilation; CUDA 12.8 is the confirmed minimum.
-            if get_cuda_version() >= Version("12.8"):
-                jit_specs.append(gen_monomoe_module())
+            jit_specs.append(gen_monomoe_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())

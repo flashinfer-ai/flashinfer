@@ -19,11 +19,8 @@ import os
 import shutil
 from pathlib import Path
 
-from packaging.version import Version
-
 from . import env as jit_env
 from .core import gen_jit_spec, logger, sm90a_nvcc_flags
-from .cpp_ext import get_cuda_version
 
 
 def _get_monomoe_csrc_dir() -> Path:
@@ -157,11 +154,6 @@ def load_monomoe_module():
 
     Returns the loaded module exposing `monomoe_topk`.
     """
-    if get_cuda_version() < Version("12.8"):
-        raise RuntimeError(
-            "monomoe kernel requires CUDA >= 12.8: ptxas < 12.8 rejects "
-            "cp.async.bulk.tensor with the required state-space qualifier."
-        )
     spec = gen_monomoe_module()
     module = spec.build_and_load()
     logger.info("monomoe module loaded successfully")
