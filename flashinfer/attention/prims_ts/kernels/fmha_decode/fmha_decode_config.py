@@ -541,7 +541,7 @@ class FmhaDecodeConfig:
     # SMEM pipeline depth for the prefetched page-offset table.
     page_offsets_stages: int = 6
     # PaddingTask (non-paged): warps 14–15 fill otherwise-idle WG3 task slots
-    # so every warp is covered by the same TS register budget.
+    # in the fixed 16-warp task-scheduling layout.
     padding_warp_idx: int = 14  # WG3: warps 14-15
     padding_num_warps: int = 2
     # SchedulerTask: under persistent scheduling, warp 13 runs the CLC tile
@@ -561,15 +561,27 @@ class FmhaDecodeConfig:
     clc_tail_padding_num_warps: int = 0
 
     # ------------------------------------------------------------------
-    # Per-task register budgets for setmaxnreg / warp-group reallocation
+    # Task-local register allocation
     # ------------------------------------------------------------------
-    # Softmax warp groups: largest budget — they hold S/P/stats live in regs.
-    softmax_regs: int = 184
-    # CorrectionTask: moderate budget for the O rescale + epilogue.
-    correction_regs: int = 88
-    # Shared per-task budget for MMA, Load, and Padding tasks in WG3; these
-    # tasks hold mostly descriptors and pointers.
-    mma_load_regs: int = 56
+    # The full TileQ128 Keeps graph has the largest live softmax/correction
+    # fragments and needs registers moved from its descriptor-only task group.
+    # Other graph topologies fit the compiler's common task budget and avoid
+    # the extra warp-group register reallocation instructions.
+    @property
+    def uses_task_register_reallocation(self) -> bool:
+        return self.use_keeps_mma_ab and self.tile_size_q == 128
+
+    @property
+    def softmax_task_num_registers(self) -> int | None:
+        return 184 if self.uses_task_register_reallocation else None
+
+    @property
+    def correction_task_num_registers(self) -> int | None:
+        return 88 if self.uses_task_register_reallocation else None
+
+    @property
+    def mma_load_task_num_registers(self) -> int | None:
+        return 56 if self.uses_task_register_reallocation else None
 
     # ------------------------------------------------------------------
     # SMEM allocation alignment
@@ -1768,14 +1780,6 @@ def _finalize_static_decode_config(
     """Fill dtype-dependent, profile-dependent, and SMEM-derived defaults."""
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
-
-    if cfg.headdim == 64:
-        # H64's shared-KV path is more sensitive to Load/MMA descriptor
-        # register pressure. Paying for a larger Load/MMA/Padding budget from
-        # Softmax keeps the total under the SM register file limit and avoids
-        # the long-sequence scoreboard regression.
-        _set_if_implicit(cfg, "softmax_regs", 168, explicit_fields)
-        _set_if_implicit(cfg, "mma_load_regs", 72, explicit_fields)
 
     use_keeps_mma_ab = cfg.use_keeps_mma_ab
     if not use_keeps_mma_ab and cfg.headdim > 128:

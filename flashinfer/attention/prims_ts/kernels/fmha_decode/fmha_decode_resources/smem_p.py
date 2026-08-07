@@ -55,6 +55,7 @@ from .helpers_common import (
     _TASK_CACHE_WARP_IDX,
     _decode_gen_task_cache,
     _fp8_log2_quant_scale,
+    _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
     _keeps_tcgen05_st,
@@ -747,6 +748,37 @@ class SmemPResource(DecodeGenResourceBase):
                 space=cutlass.AddressSpace.rmem,
             )
             if cutlass.const_expr(
+                not self.use_variable_seqlens_kv
+                and not cfg.uses_runtime_q_kv_union
+                and not cfg.use_split_kv
+                and cfg.has_odd_kv_tail
+                and self.inst_id == 1
+            ):
+                # In the static nonsplit profile the final inst1 wave is only
+                # structural padding. Publish an exact zero contribution so
+                # the paired instance cannot perturb final normalization.
+                if _is_last_loop_iteration(stage_info):
+                    packed_p[0] = Int32(0)
+                    packed_p[1] = Int32(0)
+                    local_sum[0] = Float32(0.0)
+                    local_sum[1] = Float32(0.0)
+                else:
+                    packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
+                        _compute_fp8_p_regs_and_local_sums(
+                            self.scale_softmax_log2,
+                            new_max_arr[0],
+                            new_max_arr[1],
+                            s_arr[0],
+                            s_arr[1],
+                            s_arr[2],
+                            s_arr[3],
+                            s_arr[4],
+                            s_arr[5],
+                            s_arr[6],
+                            s_arr[7],
+                        )
+                    )
+            elif cutlass.const_expr(
                 not self.use_variable_seqlens_kv
                 and cfg.total_kv_tiles > 0
                 and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0

@@ -3266,8 +3266,8 @@ class TmemSPResource(MemoryResource):
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
         scaled_sum = row_sum * acc_scale
         if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-            # Match TRT-LLM-gen's four independent float2 accumulation chains
-            # for D256. A single 64-pair chain serializes every FADD behind the
+            # Use four independent float2 accumulation chains for D256. A
+            # single 64-pair chain serializes every FADD behind the
             # preceding result and leaves no row-sum ILP after P publication.
             local_sum_0 = (scaled_sum, scaled_sum)
             local_sum_1 = (Float32(0.0), Float32(0.0))

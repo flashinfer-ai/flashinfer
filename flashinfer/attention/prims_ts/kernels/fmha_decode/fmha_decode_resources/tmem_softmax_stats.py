@@ -257,8 +257,8 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
     ) -> ResourceVars:
         """Initialize loop and tail-visible softmax stat arrays."""
         num_sg = self.cfg.num_softmax_scale_groups
-        # Also store final per-instance stats as instance attributes so
-        # TmemCorrResource can combine inst0 and inst1 in the tail.
+        # Retain final per-instance stats alongside the loop-carried values;
+        # the correction task receives them explicitly for the tail merge.
         self._inst_new_max_arr = cutlass.Array(
             Float32, num_sg, space=cutlass.AddressSpace.rmem
         )

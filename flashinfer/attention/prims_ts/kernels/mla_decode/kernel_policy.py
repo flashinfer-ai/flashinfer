@@ -298,17 +298,11 @@ def select_mla_ts_kernel(
         "e4m3",
     )
     throughput_latency_candidate = supported_dtype_pair and bool(profiles)
-    explicit_split_requested = (
-        throughput_latency_split_kv is not None and throughput_latency_split_kv > 0
-    )
     default_profile = None
     if throughput_latency_candidate:
-        if explicit_split_requested:
+        default_profile = throughput_latency_profile
+        if default_profile is None and profile_names:
             default_profile = profile_names[0]
-        else:
-            default_profile = throughput_latency_profile
-            if default_profile is None and profile_names:
-                default_profile = profile_names[0]
 
     if requested_policy == "throughput_2cta":
         reason = (

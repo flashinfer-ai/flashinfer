@@ -140,7 +140,8 @@ class SmemPResource(MlaResource):
         super().initialize_runtime_state_internal(context, captured_schedule)
         self._init_smem_state_from_context(context)
         if cutlass.const_expr(
-            self.cfg.use_clc_dynamic_persistent_scheduler == 1
+            self.owns_order_p01_alloc
+            and self.cfg.use_clc_dynamic_persistent_scheduler == 1
             and self._order_p01_barrier_ptr is not None
         ):
             self._init_order_p01_barriers()

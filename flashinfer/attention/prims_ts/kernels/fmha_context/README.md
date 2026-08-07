@@ -28,6 +28,9 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchPrefillPagedTSWrapper` | Reusable packed-Q, paged-K/V plan. |
 | `batch_prefill_with_paged_kv_cache` | One-shot packed-Q, paged-K/V attention. |
 
+These experimental context entry points are not currently registered with
+`fi_trace`; tracing support is limited to the PrimTS decode APIs.
+
 Planning validates static geometry, reads cumulative metadata when needed, and
 may compile. The `run()` host path does not copy metadata values to the host or
 synchronize. Packed contiguous plans retain `qo_indptr` and `kv_indptr` as
@@ -254,5 +257,4 @@ output state.
 ```bash
 pytest -q tests/attention/test_attention_ts_context.py
 pytest -q tests/attention/test_attention_ts_mask.py
-pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```

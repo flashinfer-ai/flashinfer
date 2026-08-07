@@ -46,6 +46,8 @@ from flashinfer.attention.prims_ts.decode import (
     _DECODE_MAX_KV_LEN,
     _DECODE_MAX_KV_TILE_SIZE,
     _DecodeRuntime,
+    _make_decode_workspace_layout,
+    _planned_kv_domain_has_unpaired_tail,
     _validate_decode_query_head_extent,
     _validate_decode_output_aliasing,
     _validate_decode_policy_kv_tile_size,
@@ -84,6 +86,12 @@ _FP8 = torch.float8_e4m3fn
 _FP8_PROBABILITY_SCALE = 448.0
 _FP8_KV_TILE_SIZE = 128
 _FP8_NUM_KV_INSTANCES = 2
+
+
+def _single_cta_wave_capacity(device: torch.device | str = "cuda") -> int:
+    """Return the runtime SM count used by direct-versus-persistent policy."""
+
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 @cute.kernel
@@ -1028,7 +1036,10 @@ def _assert_auto_policy(
     if use_cluster or use_separate:
         assert use_split_kv
 
-    if torch.cuda.get_device_capability(device) == (10, 0):
+    if (
+        torch.cuda.get_device_capability(device) == (10, 0)
+        and _single_cta_wave_capacity(device) == 148
+    ):
         for key, expected in expected_b200.items():
             assert policy[key] == expected, (key, policy, expected_b200)
 
@@ -1235,6 +1246,7 @@ def _exercise_auto_case(
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    exercise_all_paths: bool = False,
 ) -> dict[str, object]:
     """Plan automatically and validate one eager public-interface launch."""
 
@@ -1258,7 +1270,7 @@ def _exercise_auto_case(
         case,
         seq_lens,
         max_kv_len=max_kv_len,
-        exercise_all_paths=False,
+        exercise_all_paths=exercise_all_paths,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
@@ -1457,6 +1469,70 @@ def test_attention_ts_decode_workspace_rejects_unsafe_int32_kv_bound() -> None:
             max_seq_len=_DECODE_MAX_KV_LEN + 1,
             device="cuda:0",
         )
+
+
+def test_attention_ts_decode_workspace_layout_uses_explicit_reducer_mode() -> None:
+    """FP8 partial-O storage follows the selected reducer, not shape inference."""
+
+    scratch_shapes = (
+        (2, 3, 4, 5, 128),
+        (2, 3, 4, 5),
+        (2, 3, 5),
+    )
+    separate = _make_decode_workspace_layout(
+        scratch_shapes,
+        torch.float8_e4m3fn,
+        use_separate_reduction_kernel=True,
+    )
+    inline = _make_decode_workspace_layout(
+        scratch_shapes,
+        torch.float8_e4m3fn,
+        use_separate_reduction_kernel=False,
+    )
+
+    assert separate.partial_o.dtype == torch.bfloat16
+    assert inline.partial_o.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    ("max_kv_len", "expected"),
+    ((128, True), (256, False), (257, True), (384, True), (385, False)),
+)
+def test_attention_ts_decode_planned_kv_domain_detects_unpaired_tail(
+    max_kv_len: int,
+    expected: bool,
+) -> None:
+    """Classify paired K128 instructions from the immutable plan bound."""
+
+    config = FmhaDecodeConfig(tile_size_kv=128, num_insts_kv=2)
+    assert _planned_kv_domain_has_unpaired_tail(config, max_kv_len) is expected
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "use_keeps_mma_ab", "expected"),
+    ((64, True, False), (128, False, False), (128, True, True)),
+)
+def test_attention_ts_decode_register_reallocation_follows_task_graph(
+    tile_size_q: int,
+    use_keeps_mma_ab: bool,
+    expected: bool,
+) -> None:
+    """Only the full TileQ128 Keeps graph redistributes task registers."""
+
+    config = FmhaDecodeConfig(
+        tile_size_q=tile_size_q,
+        use_keeps_mma_ab=use_keeps_mma_ab,
+    )
+    budgets = (
+        config.softmax_task_num_registers,
+        config.correction_task_num_registers,
+        config.mma_load_task_num_registers,
+    )
+    assert config.uses_task_register_reallocation is expected
+    if expected:
+        assert all(value is not None and value % 8 == 0 for value in budgets)
+    else:
+        assert budgets == (None, None, None)
 
 
 @pytest.mark.arch_blackwell
@@ -2303,12 +2379,18 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
 def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
     """Persistence must cover a partial second wave and reload page IDs."""
 
+    num_kv_heads = 4
+    service_capacity = _single_cta_wave_capacity()
+    batch_size = service_capacity // num_kv_heads + 1
+    logical_work = batch_size * num_kv_heads
+    assert (batch_size - 1) * num_kv_heads <= service_capacity < logical_work
+
     case = _make_decode_case(
-        # 38 * 4 = 152 logical CTAs: four tiles occupy a partial second wave
-        # on B200's 148 SMs.
-        kv_lens=(257,) * 38,
+        # Use the smallest whole batch that occupies a partial second CTA wave
+        # on the GPU running this test.
+        kv_lens=(257,) * batch_size,
         num_qo_heads=32,
-        num_kv_heads=4,
+        num_kv_heads=num_kv_heads,
         head_dim=256,
         seq_len_q=1,
         page_size=32,
@@ -2328,7 +2410,7 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
     wrapper = _plan_case(case, max_kv_len=257)
     policy = dict(wrapper._policy)
     assert policy["use_persistent_scheduler"] is True
-    assert policy["kv_lengths_mode"] == "planned_uniform_max"
+    assert policy["kv_lengths_mode"] == "dynamic"
 
     eager = _run_case(wrapper, case).clone()
     _assert_case_correct(eager, case)
@@ -2364,6 +2446,50 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
 
     _assert_case_correct(graph_out, remapped_case)
     assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("kv_len", "expected_kv_lengths_mode"),
+    ((256, "planned_uniform_max"), (257, "dynamic")),
+)
+def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
+    kv_len: int,
+    expected_kv_lengths_mode: str,
+):
+    """Static grouped Q8 specializes paired tails and guards unpaired tails."""
+
+    case = _make_decode_case(
+        kv_lens=(kv_len,),
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=31103,
+    )
+    wrapper = _plan_case(case, max_kv_len=kv_len)
+    policy = dict(wrapper._policy)
+    assert policy["tile_size_q"] == 8
+    assert policy["groups_tokens_heads_q"] is True
+    assert policy["use_persistent_scheduler"] is False
+    assert policy["use_split_kv"] is False
+    assert policy["kv_lengths_mode"] == expected_kv_lengths_mode
+
+    first_output = None
+    for _ in range(3):
+        output = _run_case(wrapper, case).clone()
+        _assert_case_correct(output, case)
+        if first_output is None:
+            first_output = output
+        else:
+            torch.testing.assert_close(output, first_output, rtol=0, atol=0)
 
 
 @pytest.mark.arch_blackwell
@@ -2585,15 +2711,21 @@ def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
 
 
 @pytest.mark.parametrize(
-    ("qkv_dtype", "output_dtype", "head_dim", "seq_len_q", "batch_size"),
     (
-        pytest.param(_FP8, _FP8, 128, 1, 38, id="fp8-d128-fixed"),
+        "qkv_dtype",
+        "output_dtype",
+        "head_dim",
+        "seq_len_q",
+        "work_tiles_per_batch",
+    ),
+    (
+        pytest.param(_FP8, _FP8, 128, 1, 4, id="fp8-d128-fixed"),
         pytest.param(
             torch.bfloat16,
             torch.bfloat16,
             256,
             2,
-            75,
+            2,
             id="bf16-d256-sliding",
         ),
     ),
@@ -2605,10 +2737,14 @@ def test_attention_ts_decode_clc_persistent_dtype_head_dim_product(
     output_dtype: torch.dtype,
     head_dim: int,
     seq_len_q: int,
-    batch_size: int,
+    work_tiles_per_batch: int,
 ):
     """Cover fixed and sliding CLC across FP8/BF16 and D128/D256."""
 
+    service_capacity = _single_cta_wave_capacity()
+    batch_size = service_capacity // work_tiles_per_batch + 1
+    logical_work = batch_size * work_tiles_per_batch
+    assert (batch_size - 1) * work_tiles_per_batch <= service_capacity < logical_work
     num_kv_heads = 4 if seq_len_q == 1 else 1
     case = _make_decode_case(
         kv_lens=(257,) * batch_size,
@@ -2628,6 +2764,87 @@ def test_attention_ts_decode_clc_persistent_dtype_head_dim_product(
     policy = _exercise_auto_case(case)
     assert policy["use_persistent_scheduler"] is True
     assert policy["use_split_kv"] is False
+    assert policy["kv_lengths_mode"] == "dynamic"
+
+
+@pytest.mark.parametrize(
+    (
+        "qkv_dtype",
+        "seq_len_q",
+        "kv_len",
+        "batch_work_tiles",
+        "window_left",
+    ),
+    (
+        pytest.param(_FP8, 1, 256, 4, 127, id="sq1-sliding-parity-inversion"),
+        pytest.param(
+            torch.bfloat16,
+            145,
+            512,
+            40,
+            -1,
+            id="multi-q-causal-parity-inversion",
+        ),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_persistent_effective_k_domain_parity(
+    qkv_dtype: torch.dtype,
+    seq_len_q: int,
+    kv_len: int,
+    batch_work_tiles: int,
+    window_left: int,
+):
+    """Keep Q/window-dependent odd K tails on runtime-safe resources."""
+
+    service_capacity = _single_cta_wave_capacity()
+    batch_size = service_capacity // batch_work_tiles + 1
+    case = _make_decode_case(
+        kv_lens=(kv_len,) * batch_size,
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=32,
+        qkv_dtype=qkv_dtype,
+        output_dtype=qkv_dtype,
+        cache_form="combined",
+        mask_type="causal",
+        window_left=window_left,
+        device="cuda",
+        seed=31300 + seq_len_q,
+    )
+    policy = _exercise_auto_case(case, exercise_all_paths=True)
+    assert policy["use_persistent_scheduler"] is True
+    assert policy["use_split_kv"] is False
+    assert policy["kv_lengths_mode"] == "dynamic"
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_static_sliding_domain_uses_runtime_lengths():
+    """A direct sliding plan guards the effective domain after leading skips."""
+
+    case = _make_decode_case(
+        kv_lens=(256,),
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type="causal",
+        window_left=127,
+        device="cuda",
+        seed=31301,
+    )
+    policy = _exercise_auto_case(case, exercise_all_paths=True)
+    assert policy["use_persistent_scheduler"] is False
+    assert policy["use_split_kv"] is False
+    assert policy["kv_lengths_mode"] == "dynamic"
 
 
 @pytest.mark.parametrize(

@@ -1037,7 +1037,7 @@ def _make_keeps_mma_ab_task_graph(
     use_static_persistent_scheduler: bool = False,
     verbose: bool = False,
     exhaustive_deadlock_race_check: bool = False,
-) -> TaskManager:
+) -> tuple[TaskManager, object]:
     """Build the keeps-MMA-AB 1CTA task graph for the generic builder.
 
     This variant uses one score/P pipe with P stored in TMEM. The swaps path
