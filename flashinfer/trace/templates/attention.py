@@ -906,6 +906,10 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
         "batch_size": Var(description="Number of plan-owned MLA requests."),
         "num_heads": Const(abbrev="h"),
         "head_dim_qk": Const(abbrev="d_qk"),
+        # ``run()`` receives no scalar from which a literal value could be
+        # extracted.  The wrapper plan fixes this dimension to 512, and the
+        # constraint below records that contract; keep the axis variable so a
+        # direct trace never emits an unresolved Const.
         "kv_lora_rank": Var(description="Fixed MLA output dimension (512)."),
         "num_pages": Var(description="Physical MLA cache page capacity."),
         "page_size": Const(abbrev="ps"),

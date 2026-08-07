@@ -14,7 +14,7 @@
 
 """Throughput 2CTA MLA decode TS kernel implementation.
 
-Warp-specialized MLA decode kernel using the Resource-Task Scheduler.
+Warp-specialized MLA decode kernel using the CUTLASS task-scheduling framework.
 
 The graph depends on dtype and scheduler policy. BF16 uses 12 warps and a
 combined TMA/MMA schedule; CLC adds a scheduler task to that graph. FP8 uses
@@ -802,6 +802,8 @@ class MlaDecodeTs:
         self.reduction_split_capacity = (
             static_split_kv if static_split_kv is not None else MAX_SPLITS
         )
+        if not 1 <= self.reduction_split_capacity <= MAX_SPLITS:
+            raise ValueError(f"static_split_kv must be in [1, {MAX_SPLITS}]")
         self.static_seq_len_k = static_seq_len_k
         self.qkv_dtype = qkv_dtype
         self.out_dtype = out_dtype
@@ -1719,7 +1721,7 @@ class MlaDecodeTs:
                 name="mla_work_queue",
             )
 
-            task_manager, tmem_resources, named_res = build_mla_decode_task_manager(
+            task_manager, _tmem_resources, named_res = build_mla_decode_task_manager(
                 cfg=cfg,
                 smem_q_latent_arr=smem_q_latent_arr,
                 smem_q_rope_arr=smem_q_rope_arr,

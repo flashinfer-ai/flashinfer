@@ -29,9 +29,9 @@ from ..helpers.mask import MaskType, normalize_mask_type
 # Softmax converts natural-scale scores to exp2 with log2(e).
 LOG2_E = 1.4426950408889634074
 
-# Split-KV reduction allocates one LSE slot per possible split.  Keep the bound
-# high enough for long K sequences while keeping workspace allocation bounded.
-MAX_SPLITS = 256
+# Split-KV reduction allocates one LSE slot per possible split.  Match the
+# standalone reducer's qualified workspace and launch capacity.
+MAX_SPLITS = 128
 
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One

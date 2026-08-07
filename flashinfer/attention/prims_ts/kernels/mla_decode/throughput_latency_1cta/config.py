@@ -138,8 +138,8 @@ class MlaConfig:
     num_insts_kv: int = 2
     q_stages: int = 2
     kv_stages: int = 4
-    # TODO(perf): recover multi-tile page-ID reuse without periodic loop
-    # scheduling. Consider a pipeline-stride or straight-line grouped schedule.
+    # Keep page-ID stages aligned with the straight-line K/V pipeline so each
+    # stage has an explicit, reusable metadata window.
     page_offsets_stages: int = 6
     # Each pipeline stage describes one KV tile. The 32-entry capacity covers
     # the smallest supported page size: 128 tokens / 16 tokens per page = 8.

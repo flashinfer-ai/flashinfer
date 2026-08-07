@@ -36,7 +36,11 @@ Prefer the reusable wrapper when a cache geometry is used repeatedly. Planning
 always snapshots and host-validates the derived K/V lengths once; `run()`
 performs no device-to-host metadata read. An explicit `max_kv_len` is a bound
 that must cover every planned row. Fixed-length scheduling is selected
-automatically only when every row equals that bound; it is not a public knob.
+automatically only when every row equals that bound and the resolved K-tile
+domain consists of complete instruction groups. Sliding-window plans retain
+runtime K/V lengths because leading-tile skips change the effective domain;
+persistent Q-dependent causal plans do the same while recycling the task
+graph. This is not a public knob.
 
 ## Supported contract
 
@@ -226,7 +230,9 @@ For the standalone workflow, call
 `get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
 window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
-tensor. Zero it before first use, and do not share it between concurrent
+tensor. Zero it before first use and re-zero it whenever an argument that
+contributes to the semantic JIT key changes, because the internal workspace
+section offsets can change with that key. Do not share it between concurrent
 launches or captured graphs. It must not overlap Q, K/V cache, metadata, or
 output storage. The standalone hot path trusts CSR, `seq_lens`, and packed-Q
 values: keep lengths positive and within their static bounds, keep enough page

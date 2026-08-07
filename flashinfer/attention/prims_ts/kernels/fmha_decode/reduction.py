@@ -843,7 +843,12 @@ def fmha_decode_separate_reduction_launch(
     # Multiple CTAs cover wide dimensions or grouped SQ rows without changing
     # the producer workspace layout.
     num_reduction_slices = max(
-        (grid_q_output_rows * cfg.headdim * 2 + bytes_per_slice - 1) // bytes_per_slice,
+        (
+            grid_q_output_rows * cfg.headdim * PARTIAL_O_ELEMENT_BYTES
+            + bytes_per_slice
+            - 1
+        )
+        // bytes_per_slice,
         1,
     )
     if cutlass.const_expr(cfg.use_parallel_separate_reduction):

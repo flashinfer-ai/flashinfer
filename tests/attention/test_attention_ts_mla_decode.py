@@ -45,13 +45,18 @@ from flashinfer.attention.prims_ts import (
     batch_decode_mla_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+    MAX_SPLITS,
     make_mla_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+    MlaDecodeTs,
     build_mla_decode_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
     MlaWorkQueue,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.kernel_policy import (
+    select_mla_ts_kernel,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_decode_mla_workspace_size,
@@ -559,6 +564,7 @@ _MLA_CASES = (
         _policy("throughput_2cta", 128, 17, 256, cluster=False),
         "identity",
         False,
+        exercise_all_paths=True,
         id="M7-bf16-sq8-grouped-2cta-q128-v256-s17",
     ),
     _param(
@@ -915,14 +921,41 @@ def _apply_mla_correction_pattern(case, pattern: str):
     magnitude = 128 if query.dtype == torch.float8_e4m3fn else 1
     query[..., 0] = (magnitude * signs).to(query.dtype).unsqueeze(0)
 
-    page_size = case.kv_cache.shape[2]
+    page_size = case.page_size
+    cache_pages = case.kv_cache[:, 0] if case.kv_cache.ndim == 4 else case.kv_cache
     for batch_idx, seq_len in enumerate(case.seq_lens.tolist()):
         page_count = (int(seq_len) + page_size - 1) // page_size
         page_ids = case.block_tables[batch_idx, :page_count].to(torch.long)
         logical_tokens = torch.arange(page_count * page_size, device=query.device)
         stored_k = (32 - logical_tokens // 128).clamp_min(0).to(case.kv_cache.dtype)
-        case.kv_cache[page_ids, 0, :, 0] = stored_k.view(page_count, page_size)
+        cache_pages[page_ids, :, 0] = stored_k.view(page_count, page_size)
     return case
+
+
+@pytest.mark.parametrize("compact_cache", (False, True), ids=("rank4", "rank3"))
+def test_attention_ts_mla_correction_pattern_uses_planned_page_size(compact_cache):
+    """Correction stress data addresses both accepted paged-cache layouts."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=8,
+        max_seq_len=257,
+        qkv_dtype=torch.bfloat16,
+        page_size=16,
+        device="cpu",
+        seed=20260806,
+    )
+    if compact_cache:
+        case = replace(case, kv_cache=case.kv_cache[:, 0])
+    _apply_mla_correction_pattern(case, "identity")
+
+    page_count = (case.max_seq_len + case.page_size - 1) // case.page_size
+    page_ids = case.block_tables[0, :page_count].long()
+    cache_pages = case.kv_cache[:, 0] if case.kv_cache.ndim == 4 else case.kv_cache
+    actual = cache_pages[page_ids, :, 0].reshape(-1)
+    logical_tokens = torch.arange(page_count * case.page_size)
+    expected = (32 - logical_tokens // 128).clamp_min(0).to(actual.dtype)
+    torch.testing.assert_close(actual, expected)
 
 
 @torch.no_grad()
@@ -1066,6 +1099,7 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
         "num_heads",
         "kv_lora_rank",
     ]
+    assert defn["axes"]["kv_lora_rank"]["type"] == "var"
 
 
 def test_attention_ts_mla_output_guard_covers_every_live_allocation():
@@ -1153,6 +1187,40 @@ def test_attention_ts_mla_run_requires_plan():
         wrapper.run(None, None)
 
 
+def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
+    """Resolve compatible explicit profile/split pairs and reject mismatches."""
+
+    select_kwargs = {
+        "requested_policy": "throughput_latency_1cta",
+        "batch_size": 1,
+        "num_heads": 8,
+        "seq_len_q": 1,
+        "seq_len_k": 4096,
+        "latent_dim": _LATENT_DIM,
+        "rope_dim": _ROPE_DIM,
+        "page_size": _DEFAULT_PAGE_SIZE,
+        "dtype": "bf16",
+        "out_dtype": "bf16",
+        "throughput_latency_tile_size_q": 8,
+        "max_active_clusters": 148,
+        "throughput_latency_split_kv": 4,
+    }
+    profile_name = "h8_splitkv4_hdim128"
+    decision = select_mla_ts_kernel(
+        **select_kwargs,
+        throughput_latency_profile=profile_name,
+    )
+    assert decision.profile_name == profile_name
+    assert decision.config is not None
+    assert decision.config.num_ctas_per_seq_kv == 4
+
+    with pytest.raises(ValueError, match=r"profile 'h8_static' is not valid"):
+        select_mla_ts_kernel(
+            **select_kwargs,
+            throughput_latency_profile="h8_static",
+        )
+
+
 def test_attention_ts_mla_int32_kv_coordinate_bound():
     """The public K/V bound reserves the largest padded split-KV span."""
 
@@ -1214,6 +1282,18 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
         mla_decode_module._validate_mla_policy_coordinate_span(
             (*maximal_policy[:-1], ("split_kv", 129))
         )
+
+
+def test_attention_ts_mla_2cta_reduction_capacity_bound():
+    """The producer and standalone reducer expose the same split capacity."""
+
+    assert MAX_SPLITS == 128
+    assert MlaDecodeTs().reduction_split_capacity == MAX_SPLITS
+    assert (
+        MlaDecodeTs(static_split_kv=MAX_SPLITS).reduction_split_capacity == MAX_SPLITS
+    )
+    with pytest.raises(ValueError, match=r"static_split_kv must be in \[1, 128\]"):
+        MlaDecodeTs(static_split_kv=MAX_SPLITS + 1)
 
 
 def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
@@ -1383,13 +1463,15 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
         )
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_fp8_reference_uses_p448():
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=8,
         max_seq_len=128,
         qkv_dtype=torch.float8_e4m3fn,
-        device="cpu",
+        device="cuda",
         seed=20260706,
     )
     output = _mla_reference(
