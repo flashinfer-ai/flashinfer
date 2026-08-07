@@ -1551,7 +1551,22 @@ class _ValueAwareInputArena:
                 )
                 clone = cloned_views.get(view_key)
                 if clone is None:
-                    clone = tensor.clone()
+                    # ``Tensor.clone()`` copies only the logical view and drops
+                    # addressable padding in its backing storage. Some output
+                    # initializers intentionally return a logical view backed
+                    # by guard elements required by predicated kernel accesses.
+                    # Recreate the full typed storage before restoring the view
+                    # so every cold-L2 lane preserves that allocation contract.
+                    storage_numel = (
+                        tensor.untyped_storage().nbytes() + tensor.element_size() - 1
+                    ) // tensor.element_size()
+                    storage = torch.empty(
+                        storage_numel, dtype=tensor.dtype, device=tensor.device
+                    )
+                    clone = storage.as_strided(
+                        tensor.shape, tensor.stride(), tensor.storage_offset()
+                    )
+                    clone.copy_(tensor)
                     cloned_views[view_key] = clone
                 return clone
 

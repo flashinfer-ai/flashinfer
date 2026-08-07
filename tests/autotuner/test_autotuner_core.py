@@ -121,6 +121,35 @@ def test_value_aware_input_arena_reuses_lane_storage_across_token_profiles():
     assert arena.diagnostics()["cold_l2_lane_count"] == 2
 
 
+def test_value_aware_input_arena_preserves_initializer_backing_storage():
+    """Every cold-L2 lane retains addressable initializer guard storage."""
+    tuner = AutoTuner.get()
+    guard_rows = 8
+
+    def guarded_output(shape, dtype, device):
+        storage = torch.empty(
+            shape[0] + guard_rows, shape[1], dtype=dtype, device=device
+        )
+        return storage[: shape[0]]
+
+    profile = OptimizationProfile(
+        shapes=[
+            [autotuner_module.DynamicDim(2, 2, 2), StaticDim(4)],
+        ],
+        tensor_initializers=[guarded_output],
+    )
+    arena = _ValueAwareInputArena.create(
+        tuner, [profile], [torch.empty(2, 4)], lane_count=3
+    )
+
+    expected_bytes = (
+        (2 + guard_rows) * 4 * torch.empty((), dtype=torch.float32).element_size()
+    )
+    for (output,) in arena.batches_for(profile):
+        assert output.shape == (2, 4)
+        assert output.untyped_storage().nbytes() >= expected_bytes
+
+
 def test_value_aware_tuning_reuses_arena_lanes_for_each_profile(monkeypatch):
     """Value-aware graph profiling binds every profile to one reusable lane ring."""
     monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
