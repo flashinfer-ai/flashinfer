@@ -957,7 +957,7 @@ def _create_build_metadata():
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer package."""\n')
         f.write(f'__version__ = "{version}"\n')
-        f.write(f'__git_version__ = "{git_version}"\n')
+        f.write(f'__git_commit__ = "{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
     return version

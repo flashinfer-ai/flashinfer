@@ -1544,7 +1544,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 return MoeRunnerInputs._DYNAMIC_DIM[name]
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
-            initializers = [init for _, _, init in sorted_inputs]
+            tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
 
             return TuningConfig(
                 dynamic_tensor_specs=(
@@ -1553,9 +1553,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
-                        initializers,
                     ),
                 ),
+                tensor_initializers=tensor_initializers,
                 **kwargs,
             )
 
@@ -1668,6 +1668,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
                 # BF16 operations
                 moe_op.trtllm_bf16_moe(
+                    kwargs["routing_input_mode"],
                     routing_logits,
                     kwargs["routing_bias"],
                     topk_ids,
@@ -1712,6 +1713,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 ):
                     # FP8 block scale
                     moe_op.trtllm_fp8_block_scale_moe(
+                        kwargs["routing_input_mode"],
                         routing_logits,
                         topk_ids,
                         topk_weights,
@@ -1886,6 +1888,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         mutates_args=("routing_replay_out",),
     )
     def trtllm_bf16_moe_op(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
@@ -1995,6 +1998,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -2005,6 +2009,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             tuning_config,
             moe_inputs.to_list(),
             routing_bias=routing_bias,
+            routing_input_mode=routing_input_mode,
             gemm1_weights=gemm1_weights,
             gemm2_weights=gemm2_weights,
             gemm1_alpha=gemm1_alpha,
@@ -2026,6 +2031,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
         # Call the C++ function with the selected tactic
         intermediate_output = moe_op.trtllm_bf16_moe(
+            routing_input_mode,
             routing_logits,
             routing_bias,
             topk_ids,
@@ -2063,6 +2069,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
     def _fake_trtllm_bf16_moe(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
@@ -2473,6 +2480,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_block_scale_moe_op(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
         expert_weights: Optional[torch.Tensor],
@@ -2603,6 +2611,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -2612,6 +2621,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
+            routing_input_mode=routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -2636,6 +2646,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         _nfse = num_fused_shared_experts if num_fused_shared_experts is not None else 0
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
+            routing_input_mode,
             routing_logits,
             topk_ids,
             expert_weights,
@@ -2677,6 +2688,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
         expert_weights: Optional[torch.Tensor],
@@ -2864,6 +2876,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cold_l2_cache=True,
             use_cuda_graph=True,
         )
@@ -3448,6 +3461,7 @@ def trtllm_bf16_moe(
         hidden_states.device,
     )
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+        RoutingInputMode.FromLogits,
         routing_logits,
         routing_bias,
         None,  # topk_ids
@@ -3488,9 +3502,19 @@ def trtllm_bf16_moe(
         return result
 
 
+def _split_precomputed_routing(
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], "RoutingInputMode"]:
+    """Split a routed-MoE ``topk_ids`` argument into its kernel-level inputs."""
+    if isinstance(topk_ids, tuple):
+        topk_ids_tensor, topk_weights = topk_ids
+        return topk_ids_tensor, topk_weights, RoutingInputMode.UnpackedPrecomputed
+    return topk_ids, None, RoutingInputMode.PackedPrecomputed
+
+
 @flashinfer_api(trace=trtllm_bf16_routed_moe_trace)
 def trtllm_bf16_routed_moe(
-    topk_ids: torch.Tensor,
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
@@ -3518,15 +3542,17 @@ def trtllm_bf16_routed_moe(
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     r"""Pre-routed BF16 MoE operation with autotuning support.
 
-    Like :func:`trtllm_bf16_moe`, but takes a pre-computed ``topk_ids`` tensor
-    (the packed ``(expert_id, weight)`` representation produced by an upstream
-    routing kernel) instead of routing logits.
+    Like :func:`trtllm_bf16_moe`, but takes pre-computed routing instead of
+    routing logits, either as a packed ``topk_ids`` tensor or as a
+    ``(topk_ids, topk_weights)`` pair.
 
     Parameters
     ----------
-    topk_ids : torch.Tensor
+    topk_ids : torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
         ``[seq_len, top_k]`` int32 tensor of packed expert indices and
         weights.  Format ``(expert_id << 16) | (weight_bf16.view(int16))``.
+        Alternatively a ``(topk_ids, topk_weights)`` pair of plain ``int32``
+        indices and ``bfloat16`` or ``float32`` weights.
     hidden_states : torch.Tensor
         ``[seq_len, hidden_size]`` tensor of input hidden states, ``bfloat16``.
     gemm1_weights : torch.Tensor
@@ -3650,11 +3676,14 @@ def trtllm_bf16_routed_moe(
         local_num_experts,
         hidden_states.device,
     )
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+        routing_mode,
         None,
         None,
-        topk_ids,
-        None,
+        topk_ids_tensor,
+        topk_weights,
         hidden_states,
         gemm1_weights,
         gemm2_weights,
@@ -4174,6 +4203,7 @@ def trtllm_fp8_block_scale_moe(
         gemm1_clamp_limit,
     )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+        RoutingInputMode.FromLogits,
         routing_logits,
         None,  # topk_ids - will be computed from routing_logits
         None,  # expert_weights - will be computed from routing_logits
@@ -4221,7 +4251,7 @@ def trtllm_fp8_block_scale_moe(
 
 @flashinfer_api(trace=trtllm_fp8_block_scale_routed_moe_trace)
 def trtllm_fp8_block_scale_routed_moe(
-    topk_ids: torch.Tensor,
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -4253,16 +4283,19 @@ def trtllm_fp8_block_scale_routed_moe(
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 block-scaled MoE operation.
 
-    Like :func:`trtllm_fp8_block_scale_moe`, but consumes a pre-computed packed
-    ``(expert_id, weight)`` tensor instead of routing logits.  Use this entry
+    Like :func:`trtllm_fp8_block_scale_moe`, but consumes pre-computed routing
+    instead of routing logits, either as a packed ``(expert_id, weight)``
+    tensor or as a ``(topk_ids, topk_weights)`` pair.  Use this entry
     point for CUDA-graph capture (avoids the CPU-GPU sync from logits
     processing) or distributed MoE where routing happens elsewhere.
 
     Parameters
     ----------
-    topk_ids : torch.Tensor
+    topk_ids : torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
         ``[seq_len, top_k]`` int32 tensor of packed expert indices and weights
         with format ``(expert_id << 16) | (weight_bf16.view(int16))``.
+        Alternatively a ``(topk_ids, topk_weights)`` pair of plain ``int32``
+        indices and ``bfloat16`` or ``float32`` weights.
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
         ``float32``.  May be ``None``.
@@ -4391,10 +4424,13 @@ def trtllm_fp8_block_scale_routed_moe(
         gemm1_beta,
         gemm1_clamp_limit,
     )
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+        routing_mode,
         None,  # routing_logits
-        topk_ids,
-        None,  # expert_weights
+        topk_ids_tensor,
+        topk_weights,
         routing_bias,
         hidden_states,
         hidden_states_scale,
@@ -4832,16 +4868,7 @@ def trtllm_fp4_block_scale_routed_moe(
         Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``;
         see :func:`trtllm_bf16_routed_moe` for the table.
     """
-    # Determine routing mode based on input format
-    if isinstance(topk_ids, tuple):
-        # Unpacked format: (topk_ids, topk_weights)
-        topk_ids_tensor, topk_weights = topk_ids
-        routing_mode = RoutingInputMode.UnpackedPrecomputed
-    else:
-        # Packed format: single tensor with ``(expert_id << 16) | weight``
-        topk_ids_tensor = topk_ids
-        topk_weights = None
-        routing_mode = RoutingInputMode.PackedPrecomputed
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
     # when the input is Fp8 or NvFp4 and DeepSeekFp8 is not used (see trtllm-gen
