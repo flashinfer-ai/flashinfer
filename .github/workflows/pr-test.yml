@@ -5,10 +5,8 @@
 # Permission Control:
 # - Push to main: Always runs
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
-#   Applying the label is itself the trigger, so pushing more commits does not
-#   start a new run - re-trigger with @flashinfer-bot run when the PR is ready.
-#   Only users with write access can apply a label, which is what makes this a
-#   safe authorization signal on PRs from forks.
+#   Applying the label is the trigger, so new commits need a new trigger:
+#   @flashinfer-bot run. Only users with write access can apply labels.
 #
 # Rerun Strategy:
 # - Spot jobs run with fail-fast: true
@@ -38,10 +36,8 @@ on:
         default: false
 
 concurrency:
-  # Runs that can start tests share one group per PR, so a newer commit
-  # supersedes an older run. Events that can never start tests - a label other
-  # than run-ci being added - get their own group and do not cancel, otherwise
-  # unrelated label churn would throw away GPU work that is already in flight.
+  # A label other than run-ci can never start tests, so it gets its own group and
+  # does not cancel - otherwise label churn would discard running GPU jobs.
   group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
   cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
 
@@ -67,8 +63,7 @@ jobs:
       - name: Check authorization
         id: check
         env:
-          # Read through env rather than inlining: this is the authorization
-          # gate, and a label name is caller-supplied text.
+          # Read via env, not inlined: a label name is caller-supplied text.
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
         run: |
@@ -79,16 +74,10 @@ jobs:
             exit 0
           fi
 
-          # Draft PRs need no special case: nothing runs without run-ci anyway,
-          # and a maintainer who applies it to a draft is asking for CI on
-          # purpose.
-          #
-          # Authorize on the run-ci label being applied, not on it being present.
-          # Reading the presence of the label would re-authorize every later push
-          # for as long as the label stays on the PR, which is the auto-trigger
-          # behaviour this gate is meant to stop. Applying a label requires write
-          # access, so this also holds for PRs opened from forks, where secrets
-          # are unavailable and no API lookup would be possible.
+          # Authorize on run-ci being applied, not on it being present: presence
+          # would re-authorize every later push, which is the auto-trigger this
+          # gate removes. Applying a label needs write access, so this also holds
+          # on fork PRs, where secrets are unavailable.
           if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "run-ci label applied, authorized"
@@ -649,13 +638,10 @@ jobs:
             exit 0
           fi
 
-          # This workflow also wakes up on events that change nothing about the
-          # code, such as a label being added. Those must not turn a commit that
-          # already passed red, because recovering the green would mean paying
-          # for the same GPU tests twice. Report the result this exact commit
-          # already earned. Anything that does change the code produces a new
-          # SHA with no prior run, so this cannot pass off untested code, and a
-          # failed lookup just falls through to the usual "needs CI" failure.
+          # Don't turn an already-passing commit red for an event that changed no
+          # code - re-earning that green costs another full GPU run. A code change
+          # produces a new SHA with no prior run, so this cannot report untested
+          # code as passing.
           PASSED=$(gh run list \
             --repo "${{ github.repository }}" \
             --workflow "${{ github.workflow }}" \

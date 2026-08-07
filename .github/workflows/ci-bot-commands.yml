@@ -87,11 +87,18 @@ jobs:
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
 
-          # pr-test triggers on run-ci being applied, and re-applying a label the
-          # PR already carries emits no event, so drop any leftover copy first.
-          gh pr edit ${{ github.event.issue.number }} \
+          # Re-applying a label the PR already has emits no event, so remove it
+          # first. Removing an absent label errors, hence the check - and a failed
+          # removal must not be ignored, or the add below silently does nothing.
+          HAS_RUN_CI=$(gh pr view ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
-            --remove-label "run-ci" || true
+            --json labels -q '[.labels[].name] | index("run-ci") != null')
+
+          if [ "$HAS_RUN_CI" = "true" ]; then
+            gh pr edit ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --remove-label "run-ci"
+          fi
 
           # Add run-ci label
           gh pr edit ${{ github.event.issue.number }} \
