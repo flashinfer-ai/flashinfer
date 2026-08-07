@@ -2495,11 +2495,16 @@ def _launch_sm120_w4a16_moe(
     )
     if int(prepared.num_experts) != int(num_local_experts):
         raise ValueError("num_local_experts must match w1_weight.shape[0] for W4A16.")
-    if expert_map is not None and int(expert_map.numel()) != int(num_experts):
-        raise ValueError(
-            f"expert_map must have num_experts={int(num_experts)} entries, "
-            f"got {int(expert_map.numel())}"
-        )
+    if expert_map is not None:
+        if int(expert_map.numel()) != int(num_experts):
+            raise ValueError(
+                f"expert_map must have num_experts={int(num_experts)} entries, "
+                f"got {int(expert_map.numel())}"
+            )
+        if expert_map.device != a.device:
+            raise ValueError(
+                f"expert_map must be on {a.device}, got {expert_map.device}"
+            )
     num_tokens = int(topk_ids.size(0))
     routed_rows = num_tokens * int(top_k)
     k = int(a.size(1))

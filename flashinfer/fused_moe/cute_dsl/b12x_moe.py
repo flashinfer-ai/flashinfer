@@ -268,6 +268,12 @@ def b12x_fused_moe(
                 f"map would silently assume this rank holds global experts "
                 f"[0, {num_local_experts})."
             )
+        if expert_map.dtype != torch.int32:
+            raise TypeError(
+                f"expert_map must have dtype torch.int32, got {expert_map.dtype}"
+            )
+        if expert_map.ndim != 1 or not expert_map.is_contiguous():
+            raise ValueError("expert_map must be a contiguous rank-1 tensor")
         if expert_map.numel() != num_experts:
             raise ValueError(
                 f"expert_map must have num_experts={num_experts} entries, "
