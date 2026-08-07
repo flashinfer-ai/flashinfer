@@ -1,5 +1,9 @@
 # MoE-EP implementation & usage — `MoEEpLayer` call stack + correctness walkthrough
 
+**Scope**: `flashinfer/moe_ep/` (call stack and layout contracts) and `tests/moe_ep/`. The
+normative architecture is [`moe_ep_architecture.md`](./moe_ep_architecture.md); this document is
+the implementation walkthrough.
+
 How the FlashInfer **MoE expert-parallel** API is put together and how to use it, walked
 through the multi-GPU correctness test `tests/moe_ep/test_moe_ep_compute_correctness.py`.
 For container/build/run and benchmark numbers see `benchmarks/MoE_benchmarks.md`.

@@ -196,6 +196,89 @@ kernel logic and report bugs, labeling findings by confidence.
 
 → **For the complete review rule set, see [`docs/code_review_guidance.md`](docs/code_review_guidance.md)**
 
+## Design Docs
+
+`docs/design_docs/` holds the normative design for the subsystems that have one — the invariants,
+the rationale behind them, and the alternatives already tried and rejected. A doc that has drifted
+from the code is worse than no doc, because the next contributor will trust it.
+
+Only normative designs belong there. How-tos live in `docs/runbooks/`, and integration reports or
+validation records live at `docs/` top level; neither is a contract, so neither carries a
+`**Scope**:` line and neither is covered by the rules below.
+
+**Before changing a subsystem, find out whether it has a design doc.** There is deliberately no
+index to maintain here; discovery is local, two ways:
+
+1. **The file tells you.** Files covered by a design doc cite it near the top —
+   `// Design doc: docs/design_docs/<name>.md §N`, as `csrc/fused_moe/monomoe/` does throughout.
+   If the file you are about to edit carries such a pointer, read the doc first.
+2. **The directory tells you.** Every doc carries a `**Scope**:` line — immediately after its
+   title — naming the paths it governs, so one command answers "is what I'm touching covered?":
+
+   ```bash
+   grep -H '^\*\*Scope\*\*:' docs/design_docs/*.md
+   ```
+
+### The workflow, when a design doc covers what you are changing
+
+1. **Read the doc before writing code.** It states invariants, constraints, and rejected
+   alternatives that the implementation alone does not express.
+2. **Propose your change as a delta from the documented design** — what the doc says today, what
+   you are changing, and why — rather than as a standalone edit judged only against the code.
+3. **Flag design ambiguities as you hit them, and explore the options.** If the doc is silent,
+   internally inconsistent, or the code has already drifted from it, say so and lay out the
+   candidate resolutions with their tradeoffs instead of silently picking one. An ambiguity
+   surfaced during the change is cheap; the same ambiguity rediscovered by the next contributor
+   is not.
+4. **Reconcile doc and code before you finish, in the same PR.** The doc must describe what the
+   code now does. If the change invalidates an invariant or revives a rejected alternative,
+   rewrite that section rather than appending to it. Silently contradicting a design doc is a
+   defect, not a style nit.
+
+**Why this workflow.** A design doc exists to prevent **design drift**. Without one, every change
+is made by inferring intent from the current implementation — and inference compounds: a few
+changes later the subsystem embodies a design nobody actually chose. The doc also carries what
+code cannot. An implementation shows *what* happens; it does not show why, which constraints are
+load-bearing, or which alternatives were already tried and rejected. Those are far better inputs
+for the next change than anything reverse-engineered from the code, and they are exactly what is
+lost when a doc goes stale. This matters most for AI agents, which are fluent at pattern-matching
+existing code and therefore especially prone to confidently extending a design they inferred
+rather than the one that was chosen — following this loop improves generated-code quality and
+keeps the product coherent across many contributors.
+
+### What a design doc contains
+
+[`flashinfer_moe_api.md`](docs/design_docs/flashinfer_moe_api.md) is the worked example of the
+full shape — treat it as the template. Not every doc needs every section, but the order is
+deliberate: intent before mechanism, mechanism before follow-ups.
+
+| Section | Required | Purpose |
+|---|---|---|
+| `**Scope**:` line | yes | the paths this doc governs (see above) |
+| Objectives / motivation | yes | what the subsystem is for and what it must guarantee — stated **before** any mechanism, so a reader can judge the design against its goals |
+| Design | yes | the mechanisms, with the **options considered** and why the chosen one won; prefer short code sketches and worked examples over prose |
+| Alternatives considered | recommended | what was proposed or tried and rejected, with the reason — this is what stops the next change from re-litigating a settled question |
+| Tracked items | as needed | status tables for follow-ups, release gates, and carryover: `\| Status \| Task \| Notes \|` with `[ ]` / `[x]` |
+| Review comments | as needed | transcribed review threads with stable ids (`C0`, `C1`, …) plus the anchor text, so code and later sections can cite a specific objection — `flashinfer/fused_moe/api.py` cites `C4-C5/C39` |
+| Decision log | as needed | dated entries recording what was decided, and why, during a work session |
+| Non-goals | recommended | scope boundaries stated positively, so "why doesn't it do X" has a written answer |
+
+**Record decisions as they are made — including during autonomous agent sessions.** When an agent
+resolves a design question mid-session (chose between options, discovered a binding constraint,
+abandoned an approach), that belongs in the decision log with its reasoning and a date. Otherwise
+the reasoning survives only in a session transcript nobody will reread, and the next session
+re-derives it — usually differently.
+
+**Why this belongs in the doc and not only in the PR description.** A design change written into
+the doc arrives at review **verbalized**: the diff states, in words, what the design now is and
+why it changed. Reviewers can argue with the decision itself instead of reverse-engineering it
+from an implementation diff, and the outcome is recorded where the next contributor will look —
+not in a review thread that scrolls out of sight.
+
+Adding a design doc? Two obligations, and they are what keep it discoverable with no central list:
+give it a `**Scope**:` line listing the paths it governs, and cite it from at least one of them.
+A doc that is reachable only by browsing `docs/` will not be read.
+
 ## Architecture: JIT Compilation System
 
 FlashInfer's JIT system has three layers:
@@ -692,8 +775,9 @@ These dependencies are included in FlashInfer's `3rdparty/` directory or `requir
 
 > Because practical engineering involves the accumulated experience of trial and error, match the coding style, efficiency, complexity, verbosity, and defensiveness by learning from existing code as much as possible—this document contains many pointers on where to find examples. Document intentional departures with rationale. Mentioning "AI-assisted" in the git commit message is good transparency. For performance-critical hot paths, leave justification for the special algorithmic choices and other potential alternatives in a comment for review.
 
-**Keep documentation in sync with code changes:** When modifying code that is referenced in this document or in `.claude/skills/`, update the corresponding documentation immediately. This includes:
+**Keep documentation in sync with code changes:** When modifying code that is referenced in this document, in `.claude/skills/`, or in `docs/design_docs/`, update the corresponding documentation immediately. This includes:
 - Important infrastructure changes (e.g., `@flashinfer_api`, `@backend_requirement`, TVM-FFI macros) → Update examples in `CLAUDE.md` and relevant skill files
 - New patterns or conventions → Document them for future reference
 - Deprecated approaches → Remove or mark as deprecated in docs
 - New error handling patterns, macros, or utilities → Add to relevant skill tutorials
+- Subsystem invariants or rationale (see [Design Docs](#design-docs)) → Update the subsystem's design doc in the same PR

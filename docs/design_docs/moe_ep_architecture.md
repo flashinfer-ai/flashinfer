@@ -1,7 +1,10 @@
 # moe_ep Design
 
+**Scope**: `flashinfer/moe_ep/` — expert-parallel MoE: core types, backend plugins, runtime,
+lifetimes, and the forward flow for the split and mega paths.
+
 > For build/test/how-to-extend instructions, see the
-> [moe_ep runbook](./moe_ep_runbook.md).
+> [moe_ep runbook](../runbooks/moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
 > [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
@@ -162,7 +165,7 @@ Raw megakernel or split-kernel configs cannot be passed as `backend=`; wrap in `
 
 ## Extending
 
-See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-mega-kernel-backend) for a step-by-step example (frontend contract, config, registration).
+See the [runbook's mega-kernel walkthrough](../runbooks/moe_ep_runbook.md#adding-a-new-mega-kernel-backend) for a step-by-step example (frontend contract, config, registration).
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
 2. **Mega kernel** — `backends/mega/kernel/<name>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
@@ -170,7 +173,7 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 ## Tests
 
-See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
+See the [runbook's build & test section](../runbooks/moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
 `tests/moe_ep/run_tests.sh [unit|multirank|split_path_correctness_bf16|mega|smoke|all]`:
 

@@ -1,5 +1,9 @@
 # MoE Monokernel — Design
 
+**Scope**: `csrc/fused_moe/monomoe/` — the phase pipeline and its handoffs, the grid carve,
+per-phase up/down-projection and routing mechanics, and the shared-memory layout for the SM90a
+FP8 block-wise MoE monokernel.
+
 A single persistent CUDA kernel that executes an entire FP8 block-wise MoE
 layer for small decode batches (BS ≤ 8) on Hopper (sm_90a): routing → up
 projection (+SiLU+re-quant) → down projection → weighted combine.  One launch,

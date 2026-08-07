@@ -1,5 +1,9 @@
 # CuTe-DSL Kernel Disk Cache
 
+**Scope**: `flashinfer/jit/core.py` (the `JitSpec` ABC), `flashinfer/jit/cute_dsl_core.py`, and any
+kernel module that calls `build_and_load_cute_dsl_kernel()` (today
+`flashinfer/quantization/kernels/nvfp4_quantize.py`).
+
 ## 1. Motivation
 
 FlashInfer's nvcc-compiled kernels are cached on disk: `JitSpec` compiles a module once into `~/.cache/flashinfer/<version>/<archs>/cached_ops/<name>/<name>.so`, and later processes just `dlopen` it. CuTe-DSL kernels had no disk cache: `cute.compile(..., options="--enable-tvm-ffi")` results were memoized only with `@functools.cache`, so every new process (each benchmark run, test invocation, serving restart) pays the full compilation cost again.

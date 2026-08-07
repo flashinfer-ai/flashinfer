@@ -1,8 +1,11 @@
 # moe_ep Runbook
 
+> A **runbook**, not a design doc: changing `flashinfer/moe_ep/` does not require updating it,
+> but changing the *workflow* does. The normative design is
+> [`moe_ep_architecture.md`](../design_docs/moe_ep_architecture.md).
+
 Practical how-to for building, testing, and extending the Expert-Parallel MoE
-stack. For the design/architecture, see
-[`moe_ep_architecture.md`](./moe_ep_architecture.md).
+stack.
 
 ---
 

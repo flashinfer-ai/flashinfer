@@ -2,6 +2,9 @@
 
 *Design Document  ·  v0.1  ·  March 2026*
 
+**Scope**: `flashinfer/fused_moe/` — the unified MoE API surface: config hierarchy, backend
+selection, and the eager / autotuned / production call paths.
+
 ## 1. Motivation
 
 FlashInfer currently exposes MoE functionality through a family of flat, positional-argument functions:
@@ -283,6 +286,23 @@ def from_repr(cls, s: str) -> MoEConfig:
 ```
 
 ## 7. File Layout
+
+The layout below was the design-time proposal. **As implemented, the unified API landed in the
+existing `flashinfer/fused_moe/` package rather than a new `flashinfer/moe_layer/` one**, and the
+per-backend `backends/` split collapsed into a single `runners.py`:
+
+```
+flashinfer/
+  fused_moe/
+    __init__.py       # public exports
+    api.py            # config dataclasses/enums, MoEActivationPack, MoEWeightPack
+    layer.py          # MoELayer
+    runners.py        # TunableRunner adapters (CuteDslNvfp4Runner, TrtllmFp4RoutedRunner, ...)
+    prepare.py        # weight preparation / shuffling
+    core.py           # legacy flat entry points (trtllm_*_moe, cutlass_fused_moe)
+```
+
+Original proposal, kept for the review threads in §9 that refer to it:
 
 ```
 flashinfer/
