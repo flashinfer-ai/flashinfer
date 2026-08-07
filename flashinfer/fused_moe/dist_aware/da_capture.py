@@ -588,6 +588,8 @@ def try_trtllm_capture_aware_da(
     _verbose = config.verbose
 
     def _skip(reason: str) -> Optional[List[torch.Tensor]]:
+        skip_counts = globals().setdefault("_TRTLLM_DA_SKIP_COUNTS", {})
+        skip_counts[reason] = int(skip_counts.get(reason, 0)) + 1
         debug_log(f"capture-aware SKIP {reason}")
         if _verbose:
             print(f"[DA capture-aware SKIP] {reason}", flush=True)
@@ -706,6 +708,41 @@ def try_trtllm_capture_aware_da(
             candidate_tile_sizes = (int(static_knn_tile),)
 
         per_tile_tactics = list(per_body_knn)
+
+        # Eager warmup may call the same shape repeatedly before capture.  An
+        # exact prepared generation is already sufficient; rebuilding it would
+        # retain another full metadata generation until the framework's
+        # explicit release boundary.  Unpacked mode aliases caller storage, so
+        # only reuse it when those graph-stable pointers are unchanged.
+        prepared = CAPTURE_RESOURCES.get(
+            _capture_resource_key(
+                da_context,
+                bucket,
+                num_tokens,
+                routing_method_type,
+                routing_input_mode,
+            )
+        )
+        same_unpacked_storage = True
+        if prepared is not None and int(routing_input_mode) == _routing_input_mode(
+            "UnpackedPrecomputed"
+        ):
+            same_unpacked_storage = (
+                topk_ids is not None
+                and expert_weights is not None
+                and prepared.topk_ids.data_ptr() == topk_ids.data_ptr()
+                and prepared.topk_weights.data_ptr() == expert_weights.data_ptr()
+            )
+        if (
+            prepared is not None
+            and prepared.internal_routing_mode == int(internal_routing_mode)
+            and prepared.candidate_tile_sizes
+            == tuple(int(tile) for tile in candidate_tile_sizes)
+            and prepared.per_body_tactics
+            == tuple((int(t[0]), int(t[1])) for t in per_tile_tactics)
+            and same_unpacked_storage
+        ):
+            return _skip("DA capture resources already prepared")
     if _verbose:
         print(
             f"[DA capture-aware FIRE] num_tokens={num_tokens} bucket={bucket} "
@@ -893,13 +930,9 @@ def try_trtllm_capture_aware_da(
                 if int(tile) != first_tile
             )
         else:
-            # TODO(DA-MoE): BF16, FP8-family, and MXINT4 routed wrappers
-            # currently normalize routing metadata to PackedPrecomputed. This
-            # path therefore passes allow_packed_multi_cluster=False below and
-            # launches one routingIndicesClusterKernel per SWITCH body. Once
-            # those wrappers guarantee graph-stable packed IDs and weights,
-            # opt them into one all-tile kernel and require zero per-tile
-            # kernels/copies while preserving the independent selector branch.
+            # Routed wrappers retain their normalized packed buffer in the
+            # capture resources, so it is graph-stable for the lifetime of the
+            # metadata branch.
             remaining_tiles = tuple(int(tile) for tile in candidate_tile_sizes)
         if remaining_tiles:
             deferred_tiles = tuple(remaining_tiles)
@@ -924,7 +957,7 @@ def try_trtllm_capture_aware_da(
                     ],
                     metadata_routing_input_mode,
                     metadata_topk_weights,
-                    False,
+                    True,
                 )
 
             if (
@@ -1090,6 +1123,9 @@ def try_trtllm_capture_aware_da(
         globals()["_TRTLLM_DA_PRECOMPUTED_ROUTE_COUNT"] += 1
         globals().setdefault("_TRTLLM_DA_CAPTURE_DISPATCH_COUNT", 0)
         globals()["_TRTLLM_DA_CAPTURE_DISPATCH_COUNT"] += 1
+        globals()["_TRTLLM_DA_FIRE_SINGLE"] = (
+            int(globals().get("_TRTLLM_DA_FIRE_SINGLE", 0)) + 1
+        )
         return [output]
 
     # Multi-tile SWITCH path. The router must populate packed top-k IDs before
@@ -1239,11 +1275,20 @@ def try_trtllm_capture_aware_da(
     # the capture-aware path actually fired rather than silently falling back.
     globals().setdefault("_TRTLLM_DA_CAPTURE_DISPATCH_COUNT", 0)
     globals()["_TRTLLM_DA_CAPTURE_DISPATCH_COUNT"] += 1
+    fire_key = (
+        "_TRTLLM_DA_FIRE_MULTI"
+        if len(per_tile_tactics) > 1
+        else "_TRTLLM_DA_FIRE_SINGLE"
+    )
+    globals()[fire_key] = int(globals().get(fire_key, 0)) + 1
     return [output]
 
 
 def reset_fast_path_stats() -> None:
     globals()["_TRTLLM_DA_CAPTURE_DISPATCH_COUNT"] = 0
+    globals()["_TRTLLM_DA_FIRE_MULTI"] = 0
+    globals()["_TRTLLM_DA_FIRE_SINGLE"] = 0
+    globals()["_TRTLLM_DA_SKIP_COUNTS"] = {}
 
 
 def capture_dispatch_count() -> int:
@@ -1254,8 +1299,8 @@ def fast_path_stats() -> Dict[str, Any]:
     """Return the stable DA capture observability surface."""
 
     return {
-        "fire_multi": 0,
-        "fire_single": 0,
-        "skip": {},
+        "fire_multi": int(globals().get("_TRTLLM_DA_FIRE_MULTI", 0)),
+        "fire_single": int(globals().get("_TRTLLM_DA_FIRE_SINGLE", 0)),
+        "skip": dict(globals().get("_TRTLLM_DA_SKIP_COUNTS", {})),
         "capture_dispatch_count": capture_dispatch_count(),
     }

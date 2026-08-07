@@ -154,9 +154,12 @@ def test_routing_input_mode_defaults_to_routed_and_accepts_logits():
     with pytest.raises(SystemExit):
         parser.parse_args(["--routing-input-mode", "packed"])
 
+    assert parser.parse_args([]).routing_method == "deepseek_v3"
+    assert parser.parse_args(["--routing-method", "top_k"]).routing_method == "top_k"
+
 
 def test_routed_mode_rejects_precisions_without_a_public_routed_api():
-    """Routed mode covers every existing routed wrapper, but invents none."""
+    """Routed mode includes only wrappers with DA capture integration."""
     supported = [
         "bf16",
         "fp8_block",
@@ -173,8 +176,36 @@ def test_routed_mode_rejects_precisions_without_a_public_routed_api():
         == all_precisions
     )
 
-    with pytest.raises(ValueError, match="public routed MoE API"):
-        benchmark._validate_routing_input_mode("routed", ["nvfp4", "fp8_per_tensor"])
+    with pytest.raises(ValueError, match="DA capture integration"):
+        benchmark._validate_routing_input_mode("routed", all_precisions)
+
+
+def test_routing_method_capability_matrix_rejects_incompatible_precisions(
+    monkeypatch,
+):
+    """Method validation rejects incompatibility instead of changing methods."""
+    assert benchmark._validate_routing_method("top_k", ["nvfp4"]) == ["nvfp4"]
+    monkeypatch.setitem(
+        benchmark.ROUTING_METHOD_PRECISION_MODES,
+        "top_k",
+        frozenset({"nvfp4"}),
+    )
+    with pytest.raises(ValueError, match="routing-method top_k"):
+        benchmark._validate_routing_method("top_k", ["nvfp4", "bf16"])
+
+
+def test_bundle_identity_is_scoped_by_routing_method():
+    """TopK and DeepSeek tuning artifacts cannot silently reuse each other."""
+    base = "/tmp/da.pkl"
+    assert benchmark._bundle_path_for_precision(base, "nvfp4", False) == base
+    assert (
+        benchmark._bundle_path_for_precision(base, "nvfp4", False, "top_k")
+        == "/tmp/da_top_k.pkl"
+    )
+    assert (
+        benchmark._bundle_path_for_precision(base, "bf16", True, "deepseek_v3")
+        == "/tmp/da_bf16_deepseek_v3.pkl"
+    )
 
 
 def test_routed_inputs_follow_each_public_api_contract_and_report_routed():

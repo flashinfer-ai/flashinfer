@@ -42,7 +42,6 @@ from flashinfer.autotuner import (
     TuningConfig,
 )
 from flashinfer.autotuner.initializers import (
-    autotuner_initializer_empty,
     autotuner_initializer_ones,
     autotuner_initializer_rand,
     autotuner_initializer_randn,
@@ -1371,6 +1370,35 @@ class MoeRunnerInputs:
 MoEInputs = MoeRunnerInputs
 
 
+# Generated TRTLLM MoE finalize cubins may issue predicated accesses through a
+# complete 128-row output tile.  Keep that tile addressable while exposing the
+# requested logical token shape to callers and the autotuner.
+_TRTLLM_MOE_OUTPUT_GUARD_ROWS = 128
+
+
+@dataclass(frozen=True)
+class _FactorizedMoeTactic:
+    """One row returned by ``trtllm_get_valid_moe_factorized_configs``."""
+
+    tile: int
+    combined_config: int
+    fc1_config: int
+    fc2_config: int
+    is_default: bool
+
+    @classmethod
+    def from_ffi_row(cls, row: Sequence[int]) -> "_FactorizedMoeTactic":
+        if len(row) != 5 or int(row[4]) not in (0, 1):
+            raise ValueError(f"invalid factorized tactic row: {row!r}")
+        return cls(
+            tile=int(row[0]),
+            combined_config=int(row[1]),
+            fc1_config=int(row[2]),
+            fc2_config=int(row[3]),
+            is_default=bool(row[4]),
+        )
+
+
 def _alloc_trtllm_moe_output(
     num_tokens: int,
     hidden_size: int,
@@ -1391,6 +1419,21 @@ def _alloc_trtllm_moe_output(
         num_tokens + allocation_guard_rows, hidden_size, dtype=dtype, device=device
     )
     return storage[:num_tokens]
+
+
+def _autotuner_initializer_trtllm_moe_output(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Allocate a logical MoE output with finalize-tile backing storage."""
+    if len(shape) != 2:
+        raise ValueError(f"TRTLLM MoE output must be rank 2, got shape {shape}")
+    storage = torch.empty(
+        shape[0] + _TRTLLM_MOE_OUTPUT_GUARD_ROWS,
+        shape[1],
+        dtype=dtype,
+        device=device,
+    )
+    return storage[: shape[0]]
 
 
 def _unpack_trtllm_moe_output(
@@ -1535,7 +1578,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             """
 
             spec = {
-                "output": autotuner_initializer_empty,
+                "output": _autotuner_initializer_trtllm_moe_output,
                 "hidden_states": autotuner_initializer_randn,
             }
             if moe_inputs.routing_logits is not None:
@@ -1600,6 +1643,20 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 **kwargs,
             )
 
+        def _da_profile_is_too_sparse(
+            self, moe_inputs: MoeRunnerInputs, profile: OptimizationProfile
+        ) -> bool:
+            """Apply the SM100 small-workload admission rule to every DA tuner."""
+            num_tokens = int(
+                profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
+            )
+            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
+            return (
+                num_tokens * (self.top_k + self.num_fused_shared_experts)
+                < 2 * (self.num_local_experts + self.num_fused_shared_experts)
+                and major == 10
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -1611,17 +1668,10 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 and int(profile.value_buckets[0])
                 != da_core.DEFAULT_PROFILE_VALUE_BUCKET
             )
-            if is_da_tactic_profile:
-                num_tokens = int(
-                    profile.get_opt_shapes()[MoeRunnerInputs.idx("hidden_states")][0]
-                )
-                major, _ = get_compute_capability(moe_inputs.hidden_states.device)
-                if (
-                    num_tokens * (self.top_k + self.num_fused_shared_experts)
-                    < 2 * (self.num_local_experts + self.num_fused_shared_experts)
-                    and major == 10
-                ):
-                    return []
+            if is_da_tactic_profile and self._da_profile_is_too_sparse(
+                moe_inputs, profile
+            ):
+                return []
             instance_key = self._tactics_instance_key(moe_inputs, profile)
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
@@ -1654,14 +1704,18 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 return None
 
             moe_inputs = MoEInputs.from_list(inputs)
+            if self._da_profile_is_too_sparse(moe_inputs, profile):
+                return None
             instance_key = self._tactics_instance_key(moe_inputs, profile)
             if instance_key not in MoERunner.factorized_tactics_dict:
                 try:
-                    rows = moe_op.trtllm_get_valid_moe_factorized_configs(*instance_key)
                     normalized_rows = tuple(
-                        tuple(int(value) for value in row) for row in rows
+                        _FactorizedMoeTactic.from_ffi_row(row)
+                        for row in moe_op.trtllm_get_valid_moe_factorized_configs(
+                            *instance_key
+                        )
                     )
-                except Exception as e:
+                except (RuntimeError, ValueError) as e:
                     logger.debug(
                         "[Autotuner]: Failed to get factorized TRT-LLM MoE "
                         f"tactics for {instance_key}: {e}"
@@ -1671,14 +1725,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
             target_tile = int(profile.value_buckets[0])
             all_rows = MoERunner.factorized_tactics_dict[instance_key]
-            if any(len(row) != 5 or row[4] not in (0, 1) for row in all_rows):
-                logger.debug(
-                    "[Autotuner]: Invalid factorized TRT-LLM MoE metadata for "
-                    f"{instance_key}"
-                )
-                return None
-            rows = [row for row in all_rows if row[0] == target_tile]
-            default_rows = [row for row in rows if row[4] == 1]
+            rows = [row for row in all_rows if row.tile == target_tile]
+            default_rows = [row for row in rows if row.is_default]
             if len(default_rows) != 1:
                 logger.debug(
                     "[Autotuner]: Expected one default factorized tactic for "
@@ -1686,9 +1734,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 )
                 return None
 
-            default_fc1, default_fc2 = default_rows[0][2:4]
-            combined_configs = {(row[0], row[1]) for row in rows}
-            component_configs = {(row[0], row[2], row[3]) for row in rows}
+            default_fc1 = default_rows[0].fc1_config
+            default_fc2 = default_rows[0].fc2_config
+            combined_configs = {(row.tile, row.combined_config) for row in rows}
+            component_configs = {
+                (row.tile, row.fc1_config, row.fc2_config) for row in rows
+            }
             if len(combined_configs) != len(rows) or len(component_configs) != len(
                 rows
             ):
@@ -1697,8 +1748,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     f"for tile {target_tile}"
                 )
                 return None
-            fc1_group = [[row[0], row[1]] for row in rows if row[3] == default_fc2]
-            fc2_group = [[row[0], row[1]] for row in rows if row[2] == default_fc1]
+            fc1_group = [
+                [row.tile, row.combined_config]
+                for row in rows
+                if row.fc2_config == default_fc2
+            ]
+            fc2_group = [
+                [row.tile, row.combined_config]
+                for row in rows
+                if row.fc1_config == default_fc1
+            ]
             if not fc1_group or not fc2_group:
                 return None
             return [fc1_group, fc2_group]
@@ -1716,7 +1775,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs = MoEInputs.from_list(inputs)
             instance_key = self._tactics_instance_key(moe_inputs, profile)
             rows = MoERunner.factorized_tactics_dict[instance_key]
-            by_combined = {(row[0], row[1]): row for row in rows}
+            by_combined = {(row.tile, row.combined_config): row for row in rows}
             fc1_tile, fc1_combined = group_winners[0]
             fc2_tile, fc2_combined = group_winners[1]
             fc1_winner = (int(fc1_tile), int(fc1_combined))
@@ -1724,9 +1783,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             if fc1_winner[0] != fc2_winner[0]:
                 raise ValueError("FC1 and FC2 winners must use the same tile size")
 
-            fc1_config = by_combined[fc1_winner][2]
-            fc2_config = by_combined[fc2_winner][3]
-            by_components = {(row[0], row[2], row[3]): row[1] for row in rows}
+            fc1_config = by_combined[fc1_winner].fc1_config
+            fc2_config = by_combined[fc2_winner].fc2_config
+            by_components = {
+                (row.tile, row.fc1_config, row.fc2_config): row.combined_config
+                for row in rows
+            }
             tile = fc1_winner[0]
             combined_config = by_components[(tile, fc1_config, fc2_config)]
             return [tile, combined_config]
@@ -2421,7 +2483,13 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
-        output = _prepare_routing_metadata_output(hidden_states, output)
+        # Match the ordinary BF16 wrapper's cubin boundary guard.  The
+        # metadata-replay op is public and may allocate its own output when
+        # ``output=None``; DA normally supplies an already-guarded buffer and
+        # therefore does not cover this allocation path.
+        output = _prepare_routing_metadata_output(
+            hidden_states, output, allocation_guard_rows=128
+        )
         intermediate_output = moe_op.trtllm_bf16_moe_run_from_routing_metadata(
             routing_metadata,
             hidden_states,
@@ -4322,16 +4390,19 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         output: Optional[torch.Tensor],
         *,
         allow_narrow: bool = False,
+        allocation_guard_rows: int = 0,
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[1]
         if hidden_states.dtype == torch.uint8:
             hidden_size *= 2
         expected_shape = (hidden_states.shape[0], hidden_size)
         if output is None:
-            return torch.empty(
-                expected_shape,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            return _alloc_trtllm_moe_output(
+                expected_shape[0],
+                expected_shape[1],
+                True,
+                hidden_states.device,
+                allocation_guard_rows=allocation_guard_rows,
             )
         check_shape_dtype_device(
             output,

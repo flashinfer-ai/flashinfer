@@ -89,10 +89,18 @@ BENCHMARK_MODES = {
     "mxint4": 0.925,
 }
 # Keep these capability sets synchronized with the routed wrapper contracts in
-# flashinfer/fused_moe/core.py. FP8 per-tensor has no public routed wrapper;
-# only the FP4 wrapper accepts separate raw IDs and BF16 weights.
+# flashinfer/fused_moe/core.py. FP8 per-tensor has a public routed wrapper, but
+# that separate custom op does not yet construct a DA execution. Only the FP4
+# wrapper accepts separate raw IDs and BF16 weights; the other DA-routed
+# wrappers accept packed int32 assignments.
 ROUTED_API_PRECISION_MODES = frozenset(BENCHMARK_MODES) - {"fp8_per_tensor"}
 UNPACKED_PRECOMPUTED_PRECISION_MODES = frozenset({"nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"})
+ROUTING_METHOD_PRECISION_MODES = {
+    # Keep this matrix explicit so adding a parser choice cannot silently route
+    # an incompatible public wrapper through another method.
+    "deepseek_v3": ROUTED_API_PRECISION_MODES,
+    "top_k": ROUTED_API_PRECISION_MODES,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -538,14 +546,8 @@ def _make_precision_case(
     w1: torch.Tensor,
     w2: torch.Tensor,
     routing_input_mode: str,
+    routing_method: RoutingMethodType,
 ) -> PrecisionCase:
-    routing_method = RoutingMethodType(
-        int(
-            os.environ.get(
-                "FLASHINFER_TEST_ROUTING_METHOD", RoutingMethodType.DeepSeekV3
-            )
-        )
-    )
     common = dict(
         num_experts=cfg.num_experts,
         top_k=cfg.top_k,
@@ -623,11 +625,11 @@ def _make_precision_case(
         scale1_gate = (scale1_gate * hidden_deq).contiguous()
         scale2 = scale2.contiguous()
 
-        def call(routing_logits):
+        def call(routing_input):
             with autotune(False):
                 return _as_tensor(
                     trtllm_fp8_per_tensor_scale_moe(
-                        routing_logits,
+                        routing_input,
                         None,
                         hidden_fp8,
                         gemm1,
@@ -1416,9 +1418,21 @@ def _validate_routing_input_mode(mode: str, precisions: list[str]) -> list[str]:
         unsupported = sorted(set(precisions) - ROUTED_API_PRECISION_MODES)
         if unsupported:
             raise ValueError(
-                "--routing-input-mode routed requires a public routed MoE API; "
+                "--routing-input-mode routed requires a routed MoE API with "
+                "DA capture integration; "
                 "unsupported precision mode(s): " + ", ".join(unsupported)
             )
+    return precisions
+
+
+def _validate_routing_method(method: str, precisions: list[str]) -> list[str]:
+    supported = ROUTING_METHOD_PRECISION_MODES.get(method, frozenset())
+    unsupported = sorted(set(precisions) - supported)
+    if unsupported:
+        raise ValueError(
+            f"--routing-method {method} does not support precision mode(s): "
+            + ", ".join(unsupported)
+        )
     return precisions
 
 
@@ -1459,8 +1473,7 @@ def _row_status(row: dict) -> str:
 
 def _release_benchmark_capture_memory() -> None:
     """Drop graph-lifetime tensors after a completed benchmark configuration."""
-    da_capture.CAPTURE_RESOURCES.clear()
-    da_state.CAPTURE_KEEPALIVE.clear()
+    da_capture.release_capture_resources()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -1473,6 +1486,10 @@ def _run_precision_sweep(
 ) -> list[dict]:
     distributions = _parse_distributions(args.distributions)
     tuning_cfg = configs[0]
+    routing_method = {
+        "deepseek_v3": RoutingMethodType.DeepSeekV3,
+        "top_k": RoutingMethodType.TopK,
+    }[args.routing_method]
 
     rows = []
     for precision in precisions:
@@ -1486,9 +1503,13 @@ def _run_precision_sweep(
                 w1,
                 w2,
                 args.routing_input_mode,
+                routing_method,
             )
             bundle_path = _bundle_path_for_precision(
-                args.bundle_output, precision, len(precisions) > 1
+                args.bundle_output,
+                precision,
+                len(precisions) > 1,
+                args.routing_method,
             )
             os.environ["FLASHINFER_DA_BUNDLE"] = bundle_path
             if args.skip_autotune:
@@ -1517,6 +1538,7 @@ def _run_precision_sweep(
             rows.append(
                 {
                     "precision": precision,
+                    "routing_method": args.routing_method,
                     "distribution": "setup",
                     "status": "FAIL_SETUP",
                     "error": repr(exc),
@@ -1530,6 +1552,7 @@ def _run_precision_sweep(
             rows.append(
                 {
                     "precision": precision,
+                    "routing_method": args.routing_method,
                     "distribution": "setup",
                     "status": "PASS_BUILD_ONLY",
                     "bundle_output": bundle_path,
@@ -1559,7 +1582,13 @@ def _run_precision_sweep(
             try:
                 hidden, w1, w2 = _make_base_tensors(cfg, device, args.seed)
                 case = _make_precision_case(
-                    precision, cfg, hidden, w1, w2, args.routing_input_mode
+                    precision,
+                    cfg,
+                    hidden,
+                    w1,
+                    w2,
+                    args.routing_input_mode,
+                    routing_method,
                 )
                 tactics = _runtime_tactics(case, cfg, device)
                 guard_decision = _runtime_guard_decision(case, cfg, device)
@@ -1574,6 +1603,7 @@ def _run_precision_sweep(
                 rows.append(
                     {
                         "precision": precision,
+                        "routing_method": args.routing_method,
                         "distribution": "setup",
                         "num_tokens": cfg.num_tokens,
                         "status": "FAIL_SETUP",
@@ -1592,6 +1622,7 @@ def _run_precision_sweep(
                     "internal_routing_mode": _reported_internal_routing_mode(
                         args.routing_input_mode
                     ),
+                    "routing_method": args.routing_method,
                     "num_tokens": cfg.num_tokens,
                     "num_experts": cfg.num_experts,
                     "local_num_experts": cfg.local_num_experts,
@@ -1645,9 +1676,15 @@ def _run_precision_sweep(
                     noda_tactic, noda_tactic_source = _last_runtime_tactic(case.op_name)
 
                     os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
-                    with nvtx_range(
-                        f"tokens={cfg.num_tokens}, precision={precision}, "
-                        f"distribution={distribution}, method=DA"
+                    # The stable outer name gives Nsight capture-range users a
+                    # comma-free replay trigger; the nested range retains the
+                    # full row identity for report inspection.
+                    with (
+                        nvtx_range("da-replay"),
+                        nvtx_range(
+                            f"tokens={cfg.num_tokens}, precision={precision}, "
+                            f"distribution={distribution}, method=DA"
+                        ),
                     ):
                         da_out, da_ms, da_count = time_call(
                             lambda: case.call(routing_input),
@@ -1715,12 +1752,16 @@ def _bundle_path_for_precision(
     bundle_path: str,
     precision: str,
     multiple_precisions: bool,
+    routing_method: str = "deepseek_v3",
 ) -> str:
-    """Keep the legacy NVFP4 artifact name while isolating multi-mode bundles."""
-    if not multiple_precisions:
+    """Isolate bundles by precision and routing-selection contract."""
+    if not multiple_precisions and routing_method == "deepseek_v3":
         return bundle_path
     path = Path(bundle_path)
-    return str(path.with_name(f"{path.stem}_{precision}{path.suffix}"))
+    precision_suffix = f"_{precision}" if multiple_precisions else ""
+    return str(
+        path.with_name(f"{path.stem}{precision_suffix}_{routing_method}{path.suffix}")
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1745,6 +1786,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Public API routing input: the precision's established routed format "
             "(default), or routing logits. FP4 routed APIs receive raw IDs plus "
             "BF16 weights; other routed APIs receive packed int32 routing."
+        ),
+    )
+    parser.add_argument(
+        "--routing-method",
+        choices=("deepseek_v3", "top_k"),
+        default="deepseek_v3",
+        help=(
+            "Routing selection contract. deepseek_v3 uses grouped sigmoid "
+            "routing; top_k uses ordinary ungrouped TopK."
         ),
     )
     parser.add_argument(
@@ -1814,8 +1864,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         token_counts = [int(value) for value in args.num_tokens.split(",") if value]
-        precisions = _validate_routing_input_mode(
-            args.routing_input_mode, _parse_precision_modes(args.precision)
+        precisions = _validate_routing_method(
+            args.routing_method,
+            _validate_routing_input_mode(
+                args.routing_input_mode, _parse_precision_modes(args.precision)
+            ),
         )
     except ValueError as error:
         parser.error(str(error))

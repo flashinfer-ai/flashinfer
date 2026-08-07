@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from benchmarks import bench_trtllm_moe_da as da_benchmark
 import flashinfer.fused_moe as fused_moe_api
 from flashinfer.autotuner import AutoTuner, ValueGenerationContext, autotune
 from flashinfer.autotuner import autotuner as autotuner_module
@@ -32,9 +33,12 @@ from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
 from flashinfer.fused_moe import (
     ActivationType,
     RoutingMethodType,
+    trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe import core as moe_core
 from flashinfer.fused_moe import utils as moe_utils
@@ -81,7 +85,10 @@ SF_VEC_SIZE = 16
 TUNE_MAX_NUM_TOKENS = NUM_TOKENS
 DA_DISTRIBUTIONS = get_da_distribution_specs("uniform,exp:2,single")
 DA_DISTRIBUTION_NAMES = ("uniform", "exp:2", "single")
-DA_ROUTING_METHODS = (RoutingMethodType.DeepSeekV3, RoutingMethodType.Renormalize)
+DA_ROUTING_METHODS = (
+    RoutingMethodType.DeepSeekV3,
+    RoutingMethodType.Renormalize,
+)
 
 
 def test_trtllm_moe_runner_preparation_does_not_execute_a_body():
@@ -1632,7 +1639,8 @@ def _run_matrix_fp4_routed(
 
 def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
     moe_impl, static_data, hidden_states_orig, hidden_scale_global, kwargs = execution
-    module = _load_moe_ffi_op()
+    public_module = moe_core.get_trtllm_moe_sm100_module()
+    module = public_module.ffi_moe_op
 
     if isinstance(moe_impl, FP4Moe):
         inputs = moe_impl.quantize_inputs(
@@ -1744,6 +1752,29 @@ def _run_matrix_same_tactic(precision, execution, replay: bool = False) -> None:
             True,
             None,
         )
+        auto_output = public_module.trtllm_bf16_moe_from_routing_metadata(
+            metadata,
+            hidden_states,
+            static_data["gemm1_weights"],
+            static_data["gemm2_weights"],
+            num_experts,
+            top_k,
+            intermediate_size,
+            0,
+            num_experts,
+            use_shuffled_weight,
+            weight_layout,
+            tactic,
+            True,
+            False,
+            activation_type,
+            None,
+        )[0]
+        expected_backing_bytes = (
+            (num_tokens + 128) * hidden_size * auto_output.element_size()
+        )
+        assert auto_output.untyped_storage().nbytes() >= expected_backing_bytes
+        _assert_bit_exact(monolithic, auto_output)
 
         def run_split():
             module.trtllm_bf16_moe_run_from_routing_metadata(
@@ -2158,6 +2189,18 @@ def test_fp4_unpacked_public_wrapper_da_graph_is_numerically_stable(
         graph_output = torch.empty_like(tuned)
         _run_matrix_fp4_routed(execution[0], expert_ids, expert_weights, graph_output)
         torch.cuda.synchronize()
+        prepared_generation = {
+            key: tuple(id(bundle) for _, bundle in resources.routing_metadata_by_tile)
+            for key, resources in da_capture.CAPTURE_RESOURCES.items()
+        }
+        keepalive_size = len(da_state.CAPTURE_KEEPALIVE)
+        _run_matrix_fp4_routed(execution[0], expert_ids, expert_weights, graph_output)
+        torch.cuda.synchronize()
+        assert {
+            key: tuple(id(bundle) for _, bundle in resources.routing_metadata_by_tile)
+            for key, resources in da_capture.CAPTURE_RESOURCES.items()
+        } == prepared_generation
+        assert len(da_state.CAPTURE_KEEPALIVE) == keepalive_size
         before = fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -2166,6 +2209,8 @@ def test_fp4_unpacked_public_wrapper_da_graph_is_numerically_stable(
             )
         after = fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"]
         assert after == before + 1
+        stats = fused_moe_api.get_da_fast_path_stats()
+        assert stats["fire_multi"] + stats["fire_single"] == 1
         resources = next(
             item
             for item in da_capture.CAPTURE_RESOURCES.values()
@@ -2388,6 +2433,8 @@ def test_fp4_logits_da_graph_replays_packed_metadata(monkeypatch, precision):
             _run_matrix_fp4_logits(execution[0], output)
         after = fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"]
         assert after == before + 1
+        stats = fused_moe_api.get_da_fast_path_stats()
+        assert stats["fire_multi"] + stats["fire_single"] == 1
         profile_replay = os.environ.get("FLASHINFER_DA_TEST_PROFILE_REPLAY") == "1"
         if profile_replay:
             torch.cuda.profiler.start()
@@ -2688,11 +2735,22 @@ def test_precomputed_all_expert_route_prepares_multi_tile_metadata():
         assert torch.all(metadata[1] >= 0)
 
 
-@pytest.mark.parametrize("tile_tokens_dims", ([96, 192], [64, 96]))
+@pytest.mark.parametrize(
+    "routing_method,tile_tokens_dims",
+    (
+        (RoutingMethodType.DeepSeekV3, [64, 128]),
+        (RoutingMethodType.DeepSeekV3, [96, 192]),
+        (RoutingMethodType.DeepSeekV3, [64, 96]),
+        (RoutingMethodType.TopK, [64, 128]),
+        (RoutingMethodType.TopK, [96, 192]),
+        (RoutingMethodType.TopK, [64, 96]),
+    ),
+)
 def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
+    routing_method,
     tile_tokens_dims,
 ):
-    """Arbitrary and mixed tile arithmetic matches independent routing launches."""
+    """Shared permutation matches per-tile routing for DeepSeek and TopK."""
     _require_sm100()
     # Use each expert exactly once so the opaque permutation metadata has a
     # unique order. Repeated assignments may be ordered differently by
@@ -2713,6 +2771,9 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
         device=expert_ids.device,
     ).reshape(num_tokens, top_k)
 
+    n_group = 8 if routing_method == RoutingMethodType.DeepSeekV3 else None
+    topk_group = 4 if routing_method == RoutingMethodType.DeepSeekV3 else None
+
     def allocate_single_tile_references():
         return [
             fused_moe_api.trtllm_moe_allocate_routing_metadata(
@@ -2720,12 +2781,12 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
                 None,
                 num_experts,
                 top_k,
-                8,
-                4,
+                n_group,
+                topk_group,
                 0,
                 num_experts,
                 None,
-                int(RoutingMethodType.DeepSeekV3),
+                int(routing_method),
                 tile_tokens_dim,
                 int(moe_core.RoutingInputMode.UnpackedPrecomputed),
                 expert_weights,
@@ -2738,12 +2799,12 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
         None,
         num_experts,
         top_k,
-        8,
-        4,
+        n_group,
+        topk_group,
         0,
         num_experts,
         None,
-        int(RoutingMethodType.DeepSeekV3),
+        int(routing_method),
         tile_tokens_dims,
         int(moe_core.RoutingInputMode.UnpackedPrecomputed),
         expert_weights,
@@ -2758,12 +2819,12 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
             None,
             num_experts,
             top_k,
-            8,
-            4,
+            n_group,
+            topk_group,
             0,
             num_experts,
             None,
-            int(RoutingMethodType.DeepSeekV3),
+            int(routing_method),
             tile_tokens_dims,
             flat_metadata,
             int(moe_core.RoutingInputMode.UnpackedPrecomputed),
@@ -2823,8 +2884,11 @@ def test_arbitrary_multi_tile_routing_matches_single_tile_graph_replay(
     torch.cuda.synchronize()
 
 
-def test_fp32_unpacked_multi_tile_routing_uses_supported_fallback():
-    """FP32 routing weights fall back to independent single-tile launchers."""
+@pytest.mark.parametrize(
+    "routing_method", (RoutingMethodType.DeepSeekV3, RoutingMethodType.TopK)
+)
+def test_fp32_unpacked_multi_tile_routing_matches_single_tile(routing_method):
+    """The shared FP32 permutation matches independent routing launches."""
     _require_sm100()
     num_tokens = 16
     num_experts = 128
@@ -2843,17 +2907,19 @@ def test_fp32_unpacked_multi_tile_routing_uses_supported_fallback():
         device=expert_ids.device,
     ).reshape(num_tokens, top_k)
 
+    n_group = 8 if routing_method == RoutingMethodType.DeepSeekV3 else None
+    topk_group = 4 if routing_method == RoutingMethodType.DeepSeekV3 else None
     metadata_by_tile = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
         expert_ids,
         None,
         num_experts,
         top_k,
-        8,
-        4,
+        n_group,
+        topk_group,
         0,
         num_experts,
         None,
-        int(RoutingMethodType.DeepSeekV3),
+        int(routing_method),
         tile_tokens_dims,
         int(moe_core.RoutingInputMode.UnpackedPrecomputed),
         expert_weights,
@@ -2864,12 +2930,12 @@ def test_fp32_unpacked_multi_tile_routing_uses_supported_fallback():
             None,
             num_experts,
             top_k,
-            8,
-            4,
+            n_group,
+            topk_group,
             0,
             num_experts,
             None,
-            int(RoutingMethodType.DeepSeekV3),
+            int(routing_method),
             tile,
             int(moe_core.RoutingInputMode.UnpackedPrecomputed),
             expert_weights,
@@ -2883,6 +2949,169 @@ def test_fp32_unpacked_multi_tile_routing_uses_supported_fallback():
         assert torch.equal(metadata[1], reference[1])
         assert torch.equal(metadata[3], reference[3])
         assert torch.equal(metadata[8], reference[8])
+
+
+def test_unsupported_expert_count_falls_back_without_multi_tile_warning(capfd):
+    """Eligibility rejects large expert sets before querying the fast path."""
+    _require_sm100()
+    num_tokens, num_experts, top_k = 16, 512, 8
+    ids = (
+        torch.arange(num_tokens * top_k, dtype=torch.int32, device="cuda")
+        .reshape(num_tokens, top_k)
+        .remainder_(num_experts)
+    )
+    weights = torch.ones_like(ids, dtype=torch.bfloat16)
+    metadata = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        ids,
+        None,
+        num_experts,
+        top_k,
+        None,
+        None,
+        0,
+        num_experts,
+        None,
+        int(RoutingMethodType.TopK),
+        [64, 96],
+        int(moe_core.RoutingInputMode.UnpackedPrecomputed),
+        weights,
+    )
+    torch.cuda.synchronize()
+    assert len(metadata) == 2
+    assert (
+        "multi-tile precomputed routing currently supports"
+        not in capfd.readouterr().err
+    )
+
+
+@pytest.mark.parametrize(
+    "routing_method", (RoutingMethodType.DeepSeekV3, RoutingMethodType.TopK)
+)
+def test_packed_multi_tile_routing_tracks_live_assignments(routing_method):
+    """Graph replay reads live packed assignments through one shared runner."""
+    _require_sm100()
+    num_tokens, num_experts, top_k = 16, 128, 8
+    tiles = [64, 96]
+    ids = torch.arange(num_tokens * top_k, dtype=torch.int32, device="cuda").reshape(
+        num_tokens, top_k
+    )
+    weights = torch.linspace(
+        0.125,
+        0.875,
+        num_tokens * top_k,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape_as(ids)
+    packed = (ids << 16) | (weights.view(torch.int16).to(torch.int32) & 0xFFFF)
+    n_group = 8 if routing_method == RoutingMethodType.DeepSeekV3 else None
+    topk_group = 4 if routing_method == RoutingMethodType.DeepSeekV3 else None
+    metadata = fused_moe_api.trtllm_moe_allocate_routing_metadata_multi_tile(
+        packed,
+        None,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        0,
+        num_experts,
+        None,
+        int(routing_method),
+        tiles,
+    )
+    flat = [tensor for bundle in metadata for tensor in bundle]
+    module = _load_moe_ffi_op()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            module.trtllm_moe_populate_routing_metadata_multi_tile(
+                packed,
+                None,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                0,
+                num_experts,
+                None,
+                int(routing_method),
+                tiles,
+                flat,
+                int(moe_core.RoutingInputMode.PackedPrecomputed),
+                None,
+                True,
+            )
+        packed.copy_(torch.flip(packed, dims=(0,)))
+        references = [
+            fused_moe_api.trtllm_moe_allocate_routing_metadata(
+                packed,
+                None,
+                num_experts,
+                top_k,
+                n_group,
+                topk_group,
+                0,
+                num_experts,
+                None,
+                int(routing_method),
+                tile,
+            )
+            for tile in tiles
+        ]
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference in zip(metadata, references, strict=True):
+            assert torch.equal(actual[0], reference[0])
+            assert torch.equal(actual[1], reference[1])
+            assert torch.equal(actual[3], reference[3])
+            assert torch.equal(actual[8], reference[8])
+    finally:
+        graph.reset()
+        del graph
+        torch.cuda.synchronize()
+
+
+def test_benchmark_executes_topk_routed_wrapper(monkeypatch):
+    """The benchmark passes TopK into a real public routed MoE invocation."""
+    _require_sm100()
+    cfg = da_benchmark.BenchConfig(
+        num_tokens=16,
+        num_experts=16,
+        local_num_experts=16,
+        top_k=2,
+        hidden_size=1024,
+        intermediate_size=1024,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        tune_max_num_tokens=16,
+    )
+    hidden, w1, w2 = da_benchmark._make_base_tensors(cfg, torch.device("cuda"), seed=0)
+    seen_methods = []
+    real_wrapper = da_benchmark.trtllm_fp4_block_scale_routed_moe
+
+    def recorded_wrapper(*args, **kwargs):
+        seen_methods.append(kwargs["routing_method_type"])
+        return real_wrapper(*args, **kwargs)
+
+    monkeypatch.setattr(
+        da_benchmark, "trtllm_fp4_block_scale_routed_moe", recorded_wrapper
+    )
+    case = da_benchmark._make_precision_case(
+        "nvfp4",
+        cfg,
+        hidden,
+        w1,
+        w2,
+        "routed",
+        RoutingMethodType.TopK,
+    )
+    routing_input = da_benchmark._make_routing_input(
+        "routed", "nvfp4", "uniform", cfg, torch.device("cuda")
+    )
+    output = case.call(routing_input)
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    assert seen_methods == [RoutingMethodType.TopK]
 
 
 def test_nvfp4_unpacked_public_wrapper_metadata_replay_is_bit_exact():
@@ -3097,99 +3326,6 @@ def _clear_da_test_state(tuner: AutoTuner) -> None:
     assert not da_capture.CAPTURE_RESOURCES
     assert not da_state.CAPTURE_KEEPALIVE
     assert not da_single_graph._DA_INLINE_GRAPH_RESOURCES
-
-
-def _collect_profile_latencies(tuner: AutoTuner) -> dict[int, dict[int, float]]:
-    out: dict[int, dict[int, float]] = {}
-    for cache_key, (tactic, _profile) in tuner.profiling_cache.items():
-        if hasattr(cache_key, "custom_op"):
-            op_name = cache_key.custom_op
-            runner_name = cache_key.runner_class_name
-            profile_key = cache_key.nearest_profile
-        else:
-            op_name, runner_name, _runner_hash, profile_key, *_extras = cache_key
-        if op_name != "flashinfer::trtllm_fp4_block_scale_moe":
-            continue
-        if runner_name != "MoERunner":
-            continue
-        if not isinstance(profile_key, tuple) or len(profile_key) != 2:
-            continue
-        shapes, value_buckets = profile_key
-        if not value_buckets or len(value_buckets) < 2:
-            continue
-        if int(shapes[0][0]) != NUM_TOKENS:
-            continue
-        tile = int(tactic[0])
-        dist_idx = int(value_buckets[1])
-        ms = float(tuner.profiling_time_cache[cache_key])
-        out.setdefault(dist_idx, {})[tile] = ms
-    return out
-
-
-def _da_context_for_state(state: _MoEState):
-    return da_state.make_context(
-        "flashinfer::trtllm_fp4_block_scale_moe",
-        device=state.hidden_states.device,
-        dtype_act=moe_core.deduce_trtllm_gen_tensor_dtype(
-            state.hidden_states, state.hidden_states_scale
-        ),
-        dtype_weights=moe_core.deduce_trtllm_gen_tensor_dtype(
-            state.gemm1_weights, state.gemm1_weights_scale
-        ),
-        quantization_type=Fp8QuantizationType.NoneFp8,
-        top_k=TOP_K,
-        num_experts=NUM_EXPERTS,
-        num_local_experts=NUM_EXPERTS,
-        local_expert_offset=0,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        activation_type=int(ActivationType.Swiglu.value),
-        weight_layout=moe_core.WeightLayout.MajorK,
-        use_shuffled_weight=True,
-    )
-
-
-def _expected_body_tactics_from_profiles(
-    tuner: AutoTuner,
-    state: _MoEState,
-) -> list[tuple[int, int]]:
-    latencies = _collect_profile_latencies(tuner)
-    assert set(latencies) == set(range(len(DA_DISTRIBUTIONS)))
-
-    da_context = _da_context_for_state(state)
-    config_key = da_state.cache_key(da_context, NUM_TOKENS)
-    tile_map = da_state.PER_TILE_TACTICS[config_key]
-    switch_tiles = sorted(
-        moe_core._da_knn_switch_tile_sizes(
-            NUM_TOKENS,
-            top_k=TOP_K,
-            num_local_experts=NUM_EXPERTS,
-            local_expert_offset=0,
-            dtype_act=DtypeTrtllmGen.E2m1,
-            quantization_type=Fp8QuantizationType.NoneFp8,
-            da_context=da_context,
-        )
-    )
-    tie_eps = float(os.environ.get("FLASHINFER_DA_KNN_TIE_EPS", "0.05"))
-
-    expected = []
-    for dist_idx in range(len(DA_DISTRIBUTIONS)):
-        tile_latencies = {
-            tile: latency
-            for tile, latency in latencies[dist_idx].items()
-            if tile in switch_tiles
-        }
-        assert tile_latencies
-        min_latency = min(tile_latencies.values())
-        near_best = {
-            tile: latency
-            for tile, latency in tile_latencies.items()
-            if (latency - min_latency) / min_latency <= tie_eps
-        }
-        best_tile = max(near_best)
-        expected.append(tuple(int(v) for v in tile_map[best_tile]))
-
-    return da_profile.deduplicate_body_tactics(expected)[0]
 
 
 def test_da_fixed_tile_tactic_uses_complete_robust_distribution_timing():
@@ -4048,10 +4184,14 @@ def test_nvfp4_unpacked_da_graph_tracks_live_caller_weights(monkeypatch):
         torch.cuda.synchronize()
         assert torch.isfinite(tuned).all()
 
-        da_context = _da_context_for_state(state)
-        body_tactics = da_state.PER_BODY_TACTICS[
-            da_state.cache_key(da_context, NUM_TOKENS)
+        matching_tactics = [
+            bodies
+            for (bucket, context), bodies in da_state.PER_BODY_TACTICS.items()
+            if bucket == NUM_TOKENS
+            and context.op_name == "flashinfer::trtllm_fp4_block_scale_moe"
         ]
+        assert len(matching_tactics) == 1
+        body_tactics = matching_tactics[0]
         assert len(body_tactics) == 1
         graph, graph_output = _capture_unpacked_da_graph(
             state, expert_ids, expert_weights, body_tactics[0]
@@ -4082,7 +4222,12 @@ def test_nvfp4_unpacked_da_graph_tracks_live_caller_weights(monkeypatch):
         _clear_da_test_state(tuner)
 
 
-def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
+def _run_factorized_public_reference_case(
+    monkeypatch,
+    tmp_path,
+    precision,
+    routing_method=RoutingMethodType.DeepSeekV3,
+):
     """Tune one public precision and return its independent reference and call."""
     _require_sm100()
     monkeypatch.delenv("FLASHINFER_DA_FACTORIZED_AUTOTUNE", raising=False)
@@ -4097,7 +4242,8 @@ def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
     block_major = precision.name in {"bf16", "fp8_block", "mxint4"}
     execution = []
 
-    reference, output, _ = run_moe_test(
+    deepseek = routing_method == RoutingMethodType.DeepSeekV3
+    reference, helper_output, _ = run_moe_test(
         num_tokens=64,
         hidden_size=1024,
         intermediate_size=1024,
@@ -4106,15 +4252,15 @@ def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
             "num_experts": 16,
             "top_k": 2,
             "padding": 8,
-            "n_groups": 4,
-            "top_k_groups": 2,
-            "routed_scaling": 1.0,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "n_groups": 4 if deepseek else None,
+            "top_k_groups": 2 if deepseek else None,
+            "routed_scaling": 1.0 if deepseek else None,
+            "has_routing_bias": deepseek,
+            "routing_method_type": routing_method,
             "compatible_moe_impls": [type(moe_impl)],
             "compatible_intermediate_size": [1024],
             "compatible_activation_types": [ActivationType.Swiglu],
-            "enable_autotune": True,
+            "enable_autotune": deepseek,
         },
         weight_processing={
             "use_shuffled_weight": True,
@@ -4133,13 +4279,130 @@ def _run_factorized_public_reference_case(monkeypatch, tmp_path, precision):
         execution_observer=lambda *args: execution.append(args),
     )
     assert torch.isfinite(reference).all()
-    assert torch.isfinite(output).all()
 
-    with profile_dump.open(newline="") as profile_file:
-        records = list(csv.DictReader(profile_file))
-    assert any(record.get("selection_stage") == "composed" for record in records)
+    if deepseek:
+        assert torch.isfinite(helper_output).all()
+        with profile_dump.open(newline="") as profile_file:
+            records = list(csv.DictReader(profile_file))
+        assert records
+        # The per-tensor runner exposes exhaustive tactics rather than factorized
+        # FC1/FC2 groups; every other production runner must exercise composition.
+        if precision.name != "fp8_per_tensor":
+            assert any(
+                record.get("selection_stage") == "composed" for record in records
+            )
     assert len(execution) == 1
-    return reference, output, execution[0]
+    # TopK coverage deliberately discards the logits-wrapper result. Its only
+    # oracle is run_moe_test's independently dequantized reference below.
+    return reference, helper_output if deepseek else None, execution[0]
+
+
+@dataclass(frozen=True)
+class _RecordedRoutedExecution:
+    """Graph-stable inputs for one test-local public routed-wrapper call."""
+
+    moe_impl: object
+    static_data: dict
+    hidden_states: torch.Tensor
+    hidden_states_scale: torch.Tensor | None
+    kwargs: dict
+    packed_topk: torch.Tensor
+
+
+def _prepare_recorded_routed_execution(execution) -> _RecordedRoutedExecution:
+    """Pack the observer's exact reference assignments outside graph capture."""
+    moe_impl, static_data, hidden_states, hidden_scale, kwargs = execution
+    permute_info = kwargs["permute_info"]
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    topk_weights = permute_info["topKLogits"].to(torch.bfloat16)
+    assert topk_ids.shape == topk_weights.shape
+    packed_topk = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
+
+    # FP8's test fixture records the quantized bytes. Materialize their public
+    # tensor dtype once so graph capture contains only the routed MoE wrapper.
+    routed_hidden_states = (
+        kwargs["hidden_states_quant"].to(torch.float8_e4m3fn)
+        if isinstance(moe_impl, FP8BlockScaleMoe)
+        else hidden_states
+    )
+    return _RecordedRoutedExecution(
+        moe_impl,
+        static_data,
+        routed_hidden_states,
+        kwargs.get("hidden_states_scale", hidden_scale),
+        dict(kwargs),
+        packed_topk,
+    )
+
+
+def _call_recorded_routed_moe(
+    execution: _RecordedRoutedExecution, *, enable_autotune: bool
+) -> torch.Tensor:
+    """Invoke the precision-owned public routed wrapper with recorded inputs."""
+    moe_impl = execution.moe_impl
+    static_data = execution.static_data
+    kwargs = execution.kwargs
+    common = {
+        "num_experts": kwargs["num_experts"],
+        "top_k": kwargs["top_k"],
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": kwargs["intermediate_size"],
+        "local_expert_offset": 0,
+        "local_num_experts": kwargs["num_experts"],
+        "routed_scaling_factor": kwargs.get("routed_scaling"),
+        "routing_method_type": RoutingMethodType.TopK,
+        "tune_max_num_tokens": 64,
+    }
+    with autotune(enable_autotune):
+        if isinstance(moe_impl, BF16Moe):
+            output = trtllm_bf16_routed_moe(
+                execution.packed_topk,
+                execution.hidden_states,
+                static_data["gemm1_weights"],
+                static_data["gemm2_weights"],
+                use_shuffled_weight=static_data["use_shuffled_weight"],
+                weight_layout=static_data["weight_layout"],
+                activation_type=kwargs["activation_type"],
+                **common,
+            )
+        elif isinstance(moe_impl, FP8BlockScaleMoe):
+            quantization_type = (
+                moe_core.Fp8QuantizationType.MxFp8
+                if moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
+                else moe_core.Fp8QuantizationType.DeepSeekFp8
+            )
+            output = trtllm_fp8_block_scale_routed_moe(
+                execution.packed_topk,
+                kwargs["routing_bias"],
+                execution.hidden_states,
+                execution.hidden_states_scale,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                use_shuffled_weight=static_data["use_shuffled_weight"],
+                weight_layout=static_data["weight_layout"],
+                fp8_quantization_type=quantization_type,
+                activation_type=kwargs["activation_type"],
+                **common,
+            )
+        elif isinstance(moe_impl, MxInt4BlockScaleMoe):
+            output = trtllm_mxint4_block_scale_routed_moe(
+                execution.packed_topk,
+                execution.hidden_states,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                kwargs.get("gemm1_alpha"),
+                kwargs.get("gemm1_beta"),
+                kwargs.get("gemm1_clamp_limit"),
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                **common,
+            )
+        else:
+            raise AssertionError(f"unsupported routed test precision: {type(moe_impl)}")
+    return output[0].float() if isinstance(output, list) else output.float()
 
 
 def _call_recorded_public_moe(execution, activation_overrides=None):
@@ -4248,19 +4511,50 @@ def test_factorized_da_public_wrapper_eager_matches_independent_reference(
 
 
 @pytest.mark.parametrize(
-    "precision", NON_FP4_DA_PRECISION_CONTRACTS, ids=lambda item: item.name
+    "precision,routing_method",
+    [
+        (precision, routing_method)
+        for routing_method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.TopK)
+        for precision in NON_FP4_DA_PRECISION_CONTRACTS
+        if not (
+            routing_method == RoutingMethodType.TopK
+            and precision.name == "fp8_per_tensor"
+        )
+    ],
+    ids=[
+        f"{routing_method.name}-{precision.name}"
+        for routing_method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.TopK)
+        for precision in NON_FP4_DA_PRECISION_CONTRACTS
+        if not (
+            routing_method == RoutingMethodType.TopK
+            and precision.name == "fp8_per_tensor"
+        )
+    ],
 )
 def test_factorized_da_public_wrapper_graph_matches_independent_reference(
-    monkeypatch, tmp_path, precision
+    monkeypatch, tmp_path, precision, routing_method
 ):
     """The real public CUDA graph must dispatch DA and match the dequant reference."""
     tuner = _reset_tuner_and_da(monkeypatch)
     graph = None
     try:
         reference, _, execution = _run_factorized_public_reference_case(
-            monkeypatch, tmp_path, precision
+            monkeypatch, tmp_path, precision, routing_method
         )
-        prepared_output = _call_recorded_public_moe(execution)
+        if routing_method == RoutingMethodType.TopK:
+            routed_execution = _prepare_recorded_routed_execution(execution)
+            tuned_output = _call_recorded_routed_moe(
+                routed_execution, enable_autotune=True
+            )
+            torch.cuda.synchronize()
+            _assert_precision_reference(precision, reference, tuned_output)
+            _assert_published_runtime_plan(precision)
+            prepared_output = _call_recorded_routed_moe(
+                routed_execution, enable_autotune=False
+            )
+        else:
+            routed_execution = None
+            prepared_output = _call_recorded_public_moe(execution)
         torch.cuda.synchronize()
         _assert_precision_reference(precision, reference, prepared_output)
         _assert_published_runtime_plan(precision)
@@ -4269,9 +4563,15 @@ def test_factorized_da_public_wrapper_graph_matches_independent_reference(
         before = fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_output = _call_recorded_public_moe(execution)
+            graph_output = (
+                _call_recorded_routed_moe(routed_execution, enable_autotune=False)
+                if routed_execution is not None
+                else _call_recorded_public_moe(execution)
+            )
         after = fused_moe_api.get_da_fast_path_stats()["capture_dispatch_count"]
         assert after == before + 1
+        stats = fused_moe_api.get_da_fast_path_stats()
+        assert stats["fire_multi"] + stats["fire_single"] == 1
 
         graph.replay()
         torch.cuda.synchronize()

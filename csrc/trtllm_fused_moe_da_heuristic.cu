@@ -373,17 +373,6 @@ static bool routing_to_decision_pdl_enabled() {
                  std::strcmp(v, "False") == 0));
 }
 
-// When enabled, routing tails wire directly to the SWITCH node instead of
-// the histogram/decision node.  This places routing and DA-decision on
-// independent graph branches so the graph executor can overlap their
-// execution on different SMs — true concurrency, not just PDL launch
-// overlap.  Both branches must complete before the SWITCH fires.
-static bool routing_concurrent_enabled() {
-  const char* v = std::getenv("FLASHINFER_DA_ROUTING_CONCURRENT");
-  return (v &&
-          (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "True") == 0));
-}
-
 static int split_knn_min_elements() {
   const char* v = std::getenv("FLASHINFER_DA_KNN_SPLIT_MIN_ELEMENTS");
   if (!v || !v[0]) return da_heuristic::kKnnSplitHistogramMinElements;

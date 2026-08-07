@@ -4279,18 +4279,12 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
                    unpacked_weights->dtype() == dl_float32)
         << "unpacked topk_weights must be bfloat16 or float32.";
   }
-  auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
-  auto const mRoutingBiasDtype =
-      routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+  auto const method = static_cast<RoutingMethodType>(routing_method_type);
   bool const can_use_multi_cluster =
-      num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
-      static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
-      tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
-      (input_mode != RoutingInputMode::UnpackedPrecomputed ||
-       unpacked_weights->dtype() == dl_bfloat16) &&
-      mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
-      top_k <= 8;
+      num_experts <= 256 && top_k <= 8 &&
+      num_tokens <= moe::dev::routing::routingPrecomputed::maxTokensMultiTileCluster(num_experts) &&
+      (method == RoutingMethodType::DeepSeekV3 || method == RoutingMethodType::TopK) &&
+      tile_tokens_dims.size() <= da_heuristic::kMaxTiles;
   if (!can_use_multi_cluster) {
     Array<Tensor> flat_metadata;
     for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
@@ -4306,7 +4300,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
 
   int64_t const size_of_expert_count_histogram = std::max<int64_t>(num_experts * 2, 256 * 2);
 
-  std::vector<moe::dev::routing::routingDeepSeek::Data> routing_data;
+  std::vector<moe::dev::routing::routingPrecomputed::Data> routing_data;
   routing_data.reserve(tile_tokens_dims.size());
   Array<Tensor> flat_metadata;
 
@@ -4336,11 +4330,9 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, topk_ids.device());
     Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, topk_ids.device());
 
-    moe::dev::routing::routingDeepSeek::Data data;
+    moe::dev::routing::routingPrecomputed::Data data;
     data.mDtypeOutput =
         expert_weights_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
-    data.mDtypeBias = mRoutingBiasDtype;
-    data.mDtypeInput = btg::Dtype::Fp32;
     // This multi-tile path consumes top-k assignments that have already been
     // packed by the capture-aware DA pre-routing branch. Graph dependencies
     // order it after that pack kernel, so the routing metadata kernel should
@@ -4363,20 +4355,15 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     data.mPtrCtaIdxXyToBatchIdx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     data.mPtrCtaIdxXyToMnLimit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     data.mPtrNumNonExitingCtas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
-    data.mPtrRoutingBias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
     data.mPtrScores = nullptr;
     data.mNumTokens = num_tokens;
     data.mNumExperts = num_experts;
-    data.mNumExpertGroups = n_group.value_or(0);
-    data.mNumLimitedGroups = topk_group.value_or(0);
     data.mTopK = top_k;
     data.mPaddingLog2 = computeRoutingLog2(tile_tokens_dim);
     data.mTileTokensDim = tile_tokens_dim;
     data.mLocalExpertsStartIdx = local_expert_offset;
     data.mLocalExpertsStrideLog2 = 0;
     data.mNumLocalExperts = local_num_experts;
-    data.mRouteScale = routed_scaling_factor.value_or(1.0);
-    data.mUseRoutingSoftmax = false;
     routing_data.push_back(data);
 
     flat_metadata.push_back(total_num_padded_tokens);
@@ -4391,7 +4378,7 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
   }
 
   cudaStream_t routing_stream = get_stream(topk_ids.device());
-  moe::dev::routing::routingDeepSeek::runMultiTileCluster(
+  moe::dev::routing::routingPrecomputed::runMultiTileCluster(
       routing_data.data(), static_cast<int32_t>(routing_data.size()), routing_stream);
   return flat_metadata;
 }
@@ -4439,27 +4426,21 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
   auto const mRoutingBiasDtype =
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
   cudaStream_t routing_stream = get_stream(topk_ids.device());
+  auto const method = static_cast<RoutingMethodType>(routing_method_type);
 
   bool const can_use_multi_cluster =
       // A post-deduplication DA singleton has no metadata sharing to exploit;
       // use the lower-overhead ordinary routingIndicesClusterKernel instead.
       tile_tokens_dims.size() > 1 &&
-      // TODO(DA-MoE): Allow graph-stable packed routed inputs here after the
-      // BF16, FP8-family, and MXINT4 wrappers provide the same lifetime and
-      // no-copy contract as packed logits replay. Until then,
-      // allow_packed_multi_cluster is intentionally false for those wrappers.
       (input_mode == RoutingInputMode::UnpackedPrecomputed ||
        (allow_packed_multi_cluster && input_mode == RoutingInputMode::PackedPrecomputed)) &&
-      (input_mode != RoutingInputMode::UnpackedPrecomputed ||
-       topk_weights.value().dtype() == dl_bfloat16) &&
-      num_tokens <= moe::dev::routing::routingDeepSeek::maxTokensMultiTileCluster(num_experts) &&
-      static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
-      tile_tokens_dims.size() <= da_heuristic::kMaxTiles &&
-      mRoutingBiasDtype == btg::Dtype::Bfloat16 && n_group.value_or(0) > 1 && num_experts <= 256 &&
-      top_k <= 8;
+      num_experts <= 256 && top_k <= 8 &&
+      num_tokens <= moe::dev::routing::routingPrecomputed::maxTokensMultiTileCluster(num_experts) &&
+      (method == RoutingMethodType::DeepSeekV3 || method == RoutingMethodType::TopK) &&
+      tile_tokens_dims.size() <= da_heuristic::kMaxTiles;
 
   if (can_use_multi_cluster) {
-    std::vector<moe::dev::routing::routingDeepSeek::Data> routing_data;
+    std::vector<moe::dev::routing::routingPrecomputed::Data> routing_data;
     routing_data.reserve(tile_tokens_dims.size());
     for (int64_t i = 0; i < tile_tokens_dims.size(); ++i) {
       int64_t const tile_tokens_dim = tile_tokens_dims[i];
@@ -4483,11 +4464,9 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
         }
       }
 
-      moe::dev::routing::routingDeepSeek::Data data;
+      moe::dev::routing::routingPrecomputed::Data data;
       data.mDtypeOutput =
           metadata[kExpertWeights].dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
-      data.mDtypeBias = mRoutingBiasDtype;
-      data.mDtypeInput = btg::Dtype::Fp32;
       data.mUsePdl = false;
       data.mPtrTopKPacked = input_mode == RoutingInputMode::PackedPrecomputed
                                 ? const_cast<void*>(topk_ids.data_ptr())
@@ -4506,13 +4485,10 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
       data.mPtrCtaIdxXyToBatchIdx = static_cast<int*>(metadata[kCtaIdxXyToBatchIdx].data_ptr());
       data.mPtrCtaIdxXyToMnLimit = static_cast<int*>(metadata[kCtaIdxXyToMnLimit].data_ptr());
       data.mPtrNumNonExitingCtas = static_cast<int*>(metadata[kNumNonExitingCtas].data_ptr());
-      data.mPtrRoutingBias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
       data.mPtrScores = nullptr;
       data.mNumTokens = num_tokens;
       data.mNumExperts = num_experts;
       data.mNumFusedSharedExperts = 0;
-      data.mNumExpertGroups = n_group.value_or(0);
-      data.mNumLimitedGroups = topk_group.value_or(0);
       data.mTopK = top_k;
       data.mTotalExpertsPerToken = top_k;
       data.mPaddingLog2 = computeRoutingLog2(tile_tokens_dim);
@@ -4520,12 +4496,10 @@ void trtllm_moe_populate_routing_metadata_multi_tile(
       data.mLocalExpertsStartIdx = local_expert_offset;
       data.mLocalExpertsStrideLog2 = 0;
       data.mNumLocalExperts = local_num_experts;
-      data.mRouteScale = routed_scaling_factor.value_or(1.0);
-      data.mUseRoutingSoftmax = false;
       routing_data.push_back(data);
     }
 
-    moe::dev::routing::routingDeepSeek::runMultiTileCluster(
+    moe::dev::routing::routingPrecomputed::runMultiTileCluster(
         routing_data.data(), static_cast<int32_t>(routing_data.size()), routing_stream);
     return;
   }

@@ -464,8 +464,8 @@ __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelP
 }
 #endif
 
-template <typename KernelParams>
-static void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlocks,
+template <typename KernelParams, typename DataType>
+static void launchMultiTileClusterKernel(DataType* data, int32_t numTiles, int32_t numBlocks,
                                          int32_t numThreads, int32_t smemSize, void* stream) {
   MultiTileKernelArgs<KernelParams> args{};
   args.numTiles = numTiles;
@@ -495,35 +495,45 @@ static void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t n
   CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, args));
 }
 
-static void launchRoutingDeepSeekMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks,
-                                                  int32_t numThreads, int32_t smemSize,
-                                                  void* stream) {
-  // This path is used by FlashInfer's overlapped DA graph for DeepSeek-V3 with
-  // already-computed top-k IDs. Keep the instantiation narrow to avoid a large
-  // JIT compile-time footprint for model combinations the Python guard does not expose.
+static void launchRoutingPrecomputedMultiTileCluster(routingPrecomputed::Data* data,
+                                                     int32_t numTiles, int32_t numBlocks,
+                                                     int32_t numThreads, int32_t smemSize,
+                                                     void* stream) {
+  // Keep this routing-method-neutral stage narrow: DA currently admits at
+  // most 256 experts and top-k 8. Supporting both BF16 packed weights and FP32
+  // unpacked weights adds four total instantiations (two expert-count tiers),
+  // only two more than the previous DeepSeek/BF16-only implementation.
   FLASHINFER_CHECK(data[0].mNumExperts <= NumDeepseekExperts,
-                   "multi-tile DeepSeek routing currently supports numExperts <= ",
+                   "multi-tile precomputed routing currently supports numExperts <= ",
                    NumDeepseekExperts, ", got ", data[0].mNumExperts);
   FLASHINFER_CHECK(data[0].mTopK <= NumTop8Experts,
-                   "multi-tile DeepSeek routing currently supports topK <= ", NumTop8Experts,
+                   "multi-tile precomputed routing currently supports topK <= ", NumTop8Experts,
                    ", got ", data[0].mTopK);
-  FLASHINFER_CHECK(data[0].mDtypeInput == tg::Dtype::Fp32 &&
-                       data[0].mDtypeBias == tg::Dtype::Bfloat16 &&
-                       data[0].mDtypeOutput == tg::Dtype::Bfloat16,
-                   "multi-tile DeepSeek routing currently supports "
-                   "score=fp32, bias=bf16, expert_weight=bf16 only");
-  FLASHINFER_CHECK(data[0].mNumExpertGroups > 1,
-                   "multi-tile DeepSeek routing currently requires grouped routing");
+  FLASHINFER_CHECK(
+      data[0].mDtypeOutput == tg::Dtype::Bfloat16 || data[0].mDtypeOutput == tg::Dtype::Fp32,
+      "multi-tile precomputed routing supports BF16 or FP32 weights");
   FLASHINFER_CHECK(!data[0].mUsePdl,
-                   "multi-tile DeepSeek routing currently captures as a normal graph node");
+                   "multi-tile precomputed routing captures as a normal graph node");
 
   if (data[0].mNumExperts <= topk::MaxNumExpertsUnit) {
-    using Params =
-        KernelParams<float, __nv_bfloat16, topk::MaxNumExpertsUnit, NumTop8Experts, true>;
-    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    if (data[0].mDtypeOutput == tg::Dtype::Bfloat16) {
+      using Params =
+          routingPrecomputed::KernelParams<__nv_bfloat16, topk::MaxNumExpertsUnit, NumTop8Experts>;
+      launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    } else {
+      using Params =
+          routingPrecomputed::KernelParams<float, topk::MaxNumExpertsUnit, NumTop8Experts>;
+      launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    }
   } else {
-    using Params = KernelParams<float, __nv_bfloat16, NumDeepseekExperts, NumTop8Experts, true>;
-    launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    if (data[0].mDtypeOutput == tg::Dtype::Bfloat16) {
+      using Params =
+          routingPrecomputed::KernelParams<__nv_bfloat16, NumDeepseekExperts, NumTop8Experts>;
+      launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    } else {
+      using Params = routingPrecomputed::KernelParams<float, NumDeepseekExperts, NumTop8Experts>;
+      launchMultiTileClusterKernel<Params>(data, numTiles, numBlocks, numThreads, smemSize, stream);
+    }
   }
 }
 
@@ -724,11 +734,13 @@ void run(Data& data, void* stream) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int32_t maxTokensMultiTileCluster(int32_t numExperts) {
-  return NumBlocksPerCluster * getMaxNumExperts(numExperts);
-}
+}  // namespace routingDeepSeek
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace routingPrecomputed {
+
+int32_t maxTokensMultiTileCluster(int32_t numExperts) {
+  return NumBlocksPerCluster * routingDeepSeek::getMaxNumExperts(numExperts);
+}
 
 void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
   FLASHINFER_CHECK(data != nullptr, "runMultiTileCluster requires non-null data");
@@ -756,10 +768,8 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
                      "all multi-tile routing entries must have the same num_experts");
     FLASHINFER_CHECK(data[i].mTopK == first.mTopK,
                      "all multi-tile routing entries must have the same top_k");
-    FLASHINFER_CHECK(data[i].mNumExpertGroups == first.mNumExpertGroups,
-                     "all multi-tile routing entries must have the same num_expert_groups");
-    FLASHINFER_CHECK(data[i].mNumLimitedGroups == first.mNumLimitedGroups,
-                     "all multi-tile routing entries must have the same num_limited_groups");
+    FLASHINFER_CHECK(data[i].mDtypeOutput == first.mDtypeOutput,
+                     "all multi-tile routing entries must have the same weight dtype");
     FLASHINFER_CHECK(data[i].mLocalExpertsStartIdx == first.mLocalExpertsStartIdx,
                      "all multi-tile routing entries must have the same local expert offset");
     FLASHINFER_CHECK(data[i].mLocalExpertsStrideLog2 == first.mLocalExpertsStrideLog2,
@@ -768,10 +778,10 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
                      "all multi-tile routing entries must have the same local expert count");
   }
 
-  int32_t const numThreadsHist = getMaxNumExperts(first.mNumExperts);
+  int32_t const numThreadsHist = routingDeepSeek::getMaxNumExperts(first.mNumExperts);
   int32_t const numBlocks = NumBlocksPerCluster * numTiles;
-  launchRoutingDeepSeekMultiTileCluster(data, numTiles, numBlocks, numThreadsHist,
-                                        /*smemSize=*/0, stream);
+  routingDeepSeek::launchRoutingPrecomputedMultiTileCluster(data, numTiles, numBlocks,
+                                                            numThreadsHist, /*smemSize=*/0, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -779,5 +789,5 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
 #undef LAUNCH_DEEPSEEK_WITH_TOPK
 #undef LAUNCH_ROUTING_DEEPSEEK
 
-}  // namespace routingDeepSeek
+}  // namespace routingPrecomputed
 }  // namespace moe::dev::routing

@@ -192,6 +192,36 @@ struct KernelParamsBase {
   }
 };
 
+namespace routingPrecomputed {
+
+// Routing-method-neutral permutation input.  Expert selection and weight
+// normalization happen before this stage; this runner only materializes the
+// per-tile permutation metadata from graph-stable top-k assignments.
+struct Data : public DataBase {
+  tg::Dtype mDtypeOutput{tg::Dtype::Bfloat16};
+};
+
+template <typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
+struct KernelParams : public KernelParamsBase<float, OutputT_, MaxNumExperts_, MaxNumTopExperts_> {
+  using OutputT = OutputT_;
+
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
+  trtllm::dev::IntFastDiv mTopK;
+
+  static KernelParams setKernelParams(Data const& data) {
+    KernelParams params;
+    params.setBaseParams(data);
+    params.mPtrTopKPacked = static_cast<PackedScoreIdx<OutputT>*>(data.mPtrTopKPacked);
+    params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
+    return params;
+  }
+};
+
+void runMultiTileCluster(Data* data, int32_t numTiles, void* stream);
+int32_t maxTokensMultiTileCluster(int32_t numExperts);
+
+}  // namespace routingPrecomputed
+
 namespace routingDeepSeek {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -263,8 +293,6 @@ struct KernelParams
 };
 
 void run(Data& data, void* stream);
-void runMultiTileCluster(Data* data, int32_t numTiles, void* stream);
-int32_t maxTokensMultiTileCluster(int32_t numExperts);
 
 }  // namespace routingDeepSeek
 
