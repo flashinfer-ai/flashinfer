@@ -55,6 +55,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk_ragged_transform, radix_topk_ragged_tra
 // Check if GPU supports FilteredTopK algorithm
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(can_implement_filtered_topk, can_implement_filtered_topk);
 
-// CUB DeviceBatchedTopK-backed Top-K (NVIDIA/cccl PR #9224) and its temp-storage size query
+// CUB DeviceBatchedTopK-backed Top-K and its workspace size query
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);
