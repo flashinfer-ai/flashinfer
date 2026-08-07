@@ -7,6 +7,110 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
+@pytest.fixture
+def bmm_fp8_inputs():
+    input_fp8 = torch.randn((1, 16, 64), device="cuda", dtype=torch.float16).to(
+        torch.float8_e4m3fn
+    )
+    mat2_fp8 = (
+        torch.randn((1, 64, 64), device="cuda", dtype=torch.float16)
+        .to(torch.float8_e4m3fn)
+        .transpose(-2, -1)
+    )
+    scale = torch.ones((), device="cuda", dtype=torch.float32)
+    return input_fp8, mat2_fp8, scale
+
+
+@pytest.mark.parametrize("scale_name", ["A_scale", "B_scale"])
+@pytest.mark.parametrize(
+    ("invalid_scale", "error"),
+    [
+        (
+            lambda: torch.ones((1, 2, 1), device="cuda", dtype=torch.float32),
+            "must contain exactly one tensorwide scale value",
+        ),
+        (
+            lambda: torch.ones((), device="cuda", dtype=torch.float16),
+            "must be a float32 tensor",
+        ),
+        (
+            lambda: torch.ones((), device="cpu", dtype=torch.float32),
+            "must be on the same device",
+        ),
+    ],
+)
+def test_bmm_fp8_rejects_invalid_tensorwide_scale(
+    bmm_fp8_inputs, scale_name, invalid_scale, error
+):
+    input_fp8, mat2_fp8, valid_scale = bmm_fp8_inputs
+    scales = {"A_scale": valid_scale, "B_scale": valid_scale}
+    scales[scale_name] = invalid_scale()
+
+    with pytest.raises(ValueError, match=error):
+        bmm_fp8(
+            input_fp8,
+            mat2_fp8,
+            scales["A_scale"],
+            scales["B_scale"],
+            torch.bfloat16,
+            backend="cublas",
+        )
+
+
+@pytest.mark.parametrize("scale_name", ["A_scale", "B_scale"])
+@pytest.mark.parametrize(
+    ("invalid_scale", "error"),
+    [
+        (
+            lambda: torch.ones((2,), device="cuda", dtype=torch.float32),
+            "must contain exactly one tensorwide scale value",
+        ),
+        (
+            lambda: torch.ones((), device="cuda", dtype=torch.float16),
+            "must be float32",
+        ),
+        (
+            lambda: torch.ones((), device="cpu", dtype=torch.float32),
+            "must be a CUDA tensor",
+        ),
+    ],
+)
+def test_bmm_fp8_cublas_ffi_rejects_invalid_tensorwide_scale(
+    bmm_fp8_inputs, scale_name, invalid_scale, error
+):
+    input_fp8, mat2_fp8, valid_scale = bmm_fp8_inputs
+    scales = {"A_scale": valid_scale, "B_scale": valid_scale}
+    scales[scale_name] = invalid_scale()
+
+    with pytest.raises(RuntimeError, match=error):
+        bmm_fp8(
+            input_fp8,
+            mat2_fp8,
+            scales["A_scale"],
+            scales["B_scale"],
+            torch.bfloat16,
+            backend="cublas",
+            skip_check=True,
+        )
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 1, 1)])
+def test_bmm_fp8_accepts_single_value_scale_shapes(bmm_fp8_inputs, shape):
+    input_fp8, mat2_fp8, _ = bmm_fp8_inputs
+    scale = torch.ones(shape, device="cuda", dtype=torch.float32)
+
+    result = bmm_fp8(
+        input_fp8,
+        mat2_fp8,
+        scale,
+        scale,
+        torch.bfloat16,
+        backend="cublas",
+    )
+
+    assert result.shape == (1, 16, 64)
+
+
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("m", [1, 48, 128])
 @pytest.mark.parametrize("n", [64, 80, 10304])

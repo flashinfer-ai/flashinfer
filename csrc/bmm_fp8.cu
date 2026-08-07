@@ -20,11 +20,29 @@
 
 #include "tvm_ffi_utils.h"
 
+namespace {
+
+void check_tensorwide_scale(TensorView scale, TensorView operand, char const* scale_name,
+                            char const* operand_name) {
+  CHECK_CUDA(scale);
+  TVM_FFI_ICHECK_EQ(scale.dtype(), dl_float32) << scale_name << " must be float32";
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1)
+      << scale_name << " must contain exactly one tensorwide scale value";
+  TVM_FFI_ICHECK_EQ(scale.device().device_type, operand.device().device_type)
+      << scale_name << " and " << operand_name << " must be on the same device";
+  TVM_FFI_ICHECK_EQ(scale.device().device_id, operand.device().device_id)
+      << scale_name << " and " << operand_name << " must be on the same device";
+}
+
+}  // namespace
+
 void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
              TensorView workspace_buffer, int64_t cublas_handle) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
+  check_tensorwide_scale(A_scale, A, "A_scale", "A");
+  check_tensorwide_scale(B_scale, B, "B_scale", "B");
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
@@ -69,6 +87,8 @@ int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
+  check_tensorwide_scale(A_scale, A, "A_scale", "A");
+  check_tensorwide_scale(B_scale, B, "B_scale", "B");
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
@@ -110,6 +130,8 @@ void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView 
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
+  check_tensorwide_scale(A_scale, A, "A_scale", "A");
+  check_tensorwide_scale(B_scale, B, "B_scale", "B");
   CHECK_DIM(3, A);
   CHECK_DIM(3, B);
   CHECK_DIM(3, D);
