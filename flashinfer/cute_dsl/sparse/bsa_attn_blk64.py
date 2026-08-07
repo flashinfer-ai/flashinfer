@@ -80,11 +80,14 @@ def bsa_attn_blk64_fwd(
 
     has_variable_block_nums = q2k_block_nums is not None
 
-    # Phantom block masking: when using variable block nums, the kernel pads each row's KV count
-    # to a multiple of 8 and fills phantom slots with the last real block.  Phantom blocks are
-    # only masked correctly when HasBlockSizes=True.  Passing a full-block sizes tensor (all 64)
-    # activates that path and ensures phantom blocks are zeroed in softmax.
-    if block_sizes is None and has_variable_block_nums:
+    # Phantom block masking: the kernel pads each row's KV count to a multiple of 8 and fills
+    # phantom slots with the last real block.  Phantom blocks are only masked correctly when
+    # HasBlockSizes=True.  Passing a full-block sizes tensor (all 64) activates that path and
+    # ensures phantom blocks are zeroed in softmax.  This applies to the fixed block_sparse_num
+    # path too whenever the count is not already a multiple of 8 -- without it the phantom slots
+    # are attended to and the result is silently wrong.
+    needs_phantom_masking = has_variable_block_nums or block_sparse_num % 8 != 0
+    if block_sizes is None and needs_phantom_masking:
         num_kv_blocks = (seqlen_k + 63) // 64
         block_sizes = torch.full(
             (num_kv_blocks,), 64, dtype=torch.int32, device=q.device
