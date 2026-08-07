@@ -592,11 +592,9 @@ class TunableRunner(ABC):
         on dtype, is-None flags, or scalar-argument values -- not on
         per-tensor content).
 
-        Elements must also have a stable ``str()`` across processes because
-        ``ProfilingCacheKey.file_key`` serializes this tuple with ``str()``.
-        Prefer scalar values and enums over objects with address-dependent
-        representations. Since ``file_key`` excludes ``runner_hash``, persisted
-        distinctions must appear here rather than only in ``__hash__``.
+        Persisted keys use ``str(extras)`` and omit ``runner_hash``. Extras must
+        therefore have stable cross-process string representations and include
+        every configuration the persisted cache must distinguish.
         """
         return ()
 

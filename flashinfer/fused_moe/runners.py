@@ -201,9 +201,9 @@ class MoERunner(TunableRunner):
                 f"(num_fused_shared_experts={s})."
             )
 
-    # Values absent from profiled tensor shapes must be explicit cache-key
-    # extras. The persistent key excludes runner_hash, so both keys share this
-    # stable tuple. Tensor-derived hidden_size and num_tokens are omitted.
+    # Anything the profiled tensor shapes cannot reveal has to be listed here.
+    # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
+    # which excludes runner_hash. Shapes already in the profile are omitted.
 
     def _cache_key_extras(self) -> tuple:
         """Tactic-relevant configuration, as a hashable, str()-stable tuple."""
