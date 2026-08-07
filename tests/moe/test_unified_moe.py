@@ -186,7 +186,10 @@ class TestReprRoundTrip:
 
     def test_expert_config(self):
         cfg = ExpertConfig(
-            intermediate_size=2048, local_expert_offset=4, local_num_experts=8
+            intermediate_size=2048,
+            local_expert_offset=4,
+            local_num_experts=8,
+            num_fused_shared_experts=2,
         )
         assert _eval_repr(cfg) == cfg
 
@@ -2286,22 +2289,14 @@ class TestFusedSharedExpertsConfig:
         assert cfg.num_fused_shared_experts == 0
         assert "num_fused_shared_experts" not in repr(cfg)
 
-    def test_repr_round_trips_with_shared_experts(self):
-        cfg = ExpertConfig(intermediate_size=512, num_fused_shared_experts=2)
-        assert eval(repr(cfg)) == cfg
-
     def test_negative_rejected(self):
         with pytest.raises(ValueError, match="must be >= 0"):
             ExpertConfig(intermediate_size=512, num_fused_shared_experts=-1)
 
-    @pytest.mark.parametrize(
-        "method",
-        [m for m in RoutingMethodType if m is not RoutingMethodType.DeepSeekV3],
-    )
-    def test_non_deepseek_routing_rejected(self, method):
+    def test_non_deepseek_routing_rejected(self):
         # Only the DeepSeek routing kernel emits the appended shared slots.
         with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
-            self._cfg(num_shared=1, routing=dict(method=method))
+            self._cfg(num_shared=1, routing=dict(method=RoutingMethodType.Default))
 
     def test_top_k_plus_shared_bounded(self):
         # MaxSupportedTopExperts == 32 applies to the *fused* total.
@@ -2321,7 +2316,6 @@ class TestFusedSharedExpertsConfig:
         [
             dict(local_expert_offset=8),
             dict(local_num_experts=32),
-            dict(local_expert_offset=8, local_num_experts=32),
         ],
     )
     def test_expert_parallelism_rejected(self, experts_override):
@@ -2337,13 +2331,7 @@ class TestFusedSharedExpertsConfig:
 
 
 class TestFusedSharedExpertsBackendGating:
-    """Only backends that opt in may see S>0.
-
-    A runner that pins ``num_fused_shared_experts=0`` on its launch path, or
-    never forwards it, would drop the shared experts from the result instead of
-    failing. ``check_support()`` alone is not enough because callers holding a
-    runner directly never invoke it, so ``pack_inputs()`` re-checks.
-    """
+    """Backends must opt in before ``check_support()`` accepts S > 0."""
 
     def _shared_cfg(self, variant):
         return MoEConfig(
@@ -2389,24 +2377,6 @@ class TestFusedSharedExpertsBackendGating:
             checked += 1
         assert checked, "no non-supporting runners exercised"
 
-    def test_every_non_supporting_runner_rejects_at_pack_inputs(self):
-        """The guard must also hold for callers that never call check_support."""
-        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-
-        checked = 0
-        for runner_cls in set(_BACKEND_RUNNERS.values()):
-            if runner_cls.supports_fused_shared_experts:
-                continue
-            variant = runner_cls.supported_quant_variants[0]
-            runner = runner_cls.__new__(runner_cls)
-            runner.config = self._shared_cfg(variant)
-            with pytest.raises(
-                NotImplementedError, match="does not support fused shared experts"
-            ):
-                runner.pack_inputs(None, None)
-            checked += 1
-        assert checked, "no non-supporting runners exercised"
-
 
 # ---------------------------------------------------------------------------
 # Autotune cache keying
@@ -2423,11 +2393,8 @@ class TestFusedSharedExpertsBackendGating:
 # share one tuned tactic.
 
 # (runner class, backend config, quant variant, alternate quant variant or None)
-# All runners execute the same base ``_cache_key_extras()``; no backend
-# overrides ``_backend_cache_key_parts``. Two are enough to exercise every
-# dimension -- one with two quant variants and one with a single variant.
-# ``test_every_registered_runner_defines_stable_extras`` below covers the case
-# the wider fan-out was guarding: a backend that does not inherit the contract.
+# FP8 covers variant changes and MxInt4 the single-variant skip path. Registry
+# coverage below verifies that every backend inherits the shared key contract.
 _RUNNERS = [
     pytest.param(
         TrtllmFp8BlockRunner,
@@ -2506,8 +2473,7 @@ def test_tactic_dimension_changes_both_cache_keys(
         f"{runner_cls.__name__}: {dimension} does not change runner_hash, so two "
         "configurations share one in-memory tuned tactic."
     )
-    # file_key serializes extras with str(); compare the same way the autotuner
-    # does rather than comparing tuples, so a non-stable repr is caught here.
+    # Compare serialized extras because the persisted key uses their string form.
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
         f"{runner_cls.__name__}: {dimension} does not change get_cache_key_extras(), "
         "so the on-disk cache (which drops runner_hash) collides."

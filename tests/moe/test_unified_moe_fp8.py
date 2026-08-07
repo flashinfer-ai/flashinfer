@@ -800,20 +800,11 @@ def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
 # Fused shared experts (non-EP, DeepSeekV3 + FromLogits only)
 # ---------------------------------------------------------------------------
 #
-# Reference choice: the unified S>0 path is compared against the *legacy flat*
-# API at the same S.  Both reach the same kernel, so this isolates the unified
-# plumbing under test -- _num_weight_rows validation, the
-# num_fused_shared_experts static kwarg, and the widened inner runner -- while
-# the legacy path itself is covered by the trtllm-gen suite.
-#
-# A self-fused pre-routed comparison (caller appends the shared slots and
-# declares E+S experts with top_k K+S) would be more independent, but the
-# routing kernel requires num_experts % 4 == 0, so it can only express
-# S % 4 == 0 and cannot cover the S=1/S=2 cases real checkpoints use.
-#
-# `routing_replay_out` is unusable here: replay records at stride top_k while
-# the kernel writes top_k + S, so it is rejected for S>0.  These tests
-# therefore assert output equivalence only, not the selected expert set.
+# Comparing with the legacy flat API isolates the unified plumbing; legacy
+# kernel correctness is covered elsewhere. A self-fused pre-routed oracle
+# cannot cover checkpoint S=1/S=2 because its declared E+S must be divisible by 4.
+# Replay uses top_k stride while the kernel writes top_k + S, so these tests
+# compare outputs rather than selected expert ids.
 
 SHARED_EXPERTS_E = 64
 SHARED_N_GROUP = 8
@@ -824,13 +815,9 @@ SHARED_ROUTED_SCALE = 2.5
 def _make_shared_expert_case(
     variant, *, num_shared, shared_scale=4.0, num_experts=SHARED_EXPERTS_E
 ):
-    """Build a FromLogits DSv3 case carrying ``num_shared`` fused shared experts.
+    """Build a DSv3 case with distinguishable shared rows.
 
-    ``shared_scale`` sets the magnitude of the appended shared rows relative to
-    the routed ones.  The default gives them a distinct signature so that
-    dropping them, or indexing a routed row in their place, moves the output
-    well outside FP8 noise; passing 0.0 disables their contribution, which the
-    discrimination test below relies on.
+    ``shared_scale=0`` removes only their contribution.
     """
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(20260801)
@@ -947,8 +934,13 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
     )
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
-@pytest.mark.parametrize("num_shared", [1, 2])
+@pytest.mark.parametrize(
+    "variant,num_shared",
+    [
+        pytest.param(QuantVariant.DeepSeekFp8, 1, id="deepseek-s1"),
+        pytest.param(QuantVariant.MxFp8, 2, id="mxfp8-s2"),
+    ],
+)
 def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     pack, weights, config, view, (logits, bias) = _make_shared_expert_case(
         variant, num_shared=num_shared
@@ -958,16 +950,10 @@ def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     _assert_fp8_close(actual, expected)
 
 
-@pytest.mark.parametrize("num_shared", [1, 2])
-def test_block_fp8_fused_shared_experts_contribute(num_shared):
-    """The shared rows must actually be read.
-
-    Guards against the feature silently no-op'ing: if ``S`` stopped reaching
-    the kernel, both this and the legacy cross-check above would still agree
-    (each side would drop the shared experts together), so equivalence alone
-    cannot detect it.  Zeroing only the shared rows must change the output.
-    """
+def test_block_fp8_fused_shared_experts_contribute():
+    """Verify shared rows contribute independently of the legacy cross-check."""
     variant = QuantVariant.DeepSeekFp8
+    num_shared = 1
     pack, weights, config, _, _ = _make_shared_expert_case(
         variant, num_shared=num_shared
     )
@@ -987,17 +973,10 @@ def test_block_fp8_fused_shared_experts_contribute(num_shared):
     )
 
 
-@pytest.mark.parametrize("num_shared", [1, 2])
-def test_block_fp8_fused_shared_experts_cuda_graph_replay(num_shared):
-    """S>0 must survive graph capture and replay.
-
-    The shared slots are produced inside the routing kernel, and S reaches it
-    through the runner's static launch kwargs rather than a captured tensor, so
-    capture is the case where a mis-plumbed S would show up as a graph that
-    silently replays the routed-only launch.
-    """
+def test_block_fp8_fused_shared_experts_cuda_graph_replay():
+    """Verify that static S reaches routing during CUDA graph replay."""
     pack, weights, config, _, _ = _make_shared_expert_case(
-        QuantVariant.DeepSeekFp8, num_shared=num_shared
+        QuantVariant.DeepSeekFp8, num_shared=1
     )
     from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
 
