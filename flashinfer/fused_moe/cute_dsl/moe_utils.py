@@ -248,6 +248,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
