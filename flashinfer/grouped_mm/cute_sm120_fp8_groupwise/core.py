@@ -23,10 +23,36 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ...api_logging import flashinfer_api
+from ...autotuner import AutoTuner
 from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
-from ...utils import supported_compute_capability
+from ...utils import get_device_sm_count, supported_compute_capability
 
+from .._sm120_moe_autotune import (
+    SM120_MOE_TUNING_CONFIG,
+    Sm120MoeTunableRunner,
+    prepare_uniform_m_indptr,
+)
 from ..cute_sm120_mxfp8_groupwise import _check_m_indptr
+
+
+_FP8_MOE_TACTIC_SCHEMA_VERSION = 3
+_FP8_MOE_PLAIN_TACTICS = (
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128),
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
+)
+_FP8_MOE_GATED_TACTICS = (
+    # TODO(exp-next-fp8-gated-m32): add (schema, 32, 128) only after the
+    # pre-existing gated NaN bug is fixed and independently revalidated.
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
+    (_FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
+)
+
+
+_prepare_uniform_m_indptr = prepare_uniform_m_indptr
+_FP8_MOE_TUNING_CONFIG = SM120_MOE_TUNING_CONFIG
 
 
 @functools.cache
@@ -70,6 +96,100 @@ def _check_scale_major_mode_fp8(scale_major_mode: str) -> None:
             f'scale_major_mode must be "MN" (kernel currently only supports the '
             f'MN-major float32 scale layout); got "{scale_major_mode}"'
         )
+
+
+class _CuteSm120Fp8MoeRunner(Sm120MoeTunableRunner):
+    def __init__(
+        self,
+        out: torch.Tensor,
+        is_gated: bool,
+        scale_granularity_mnk: Tuple[int, int, int],
+        scale_major_mode: str,
+    ) -> None:
+        tactics = _FP8_MOE_GATED_TACTICS if is_gated else _FP8_MOE_PLAIN_TACTICS
+        super().__init__(
+            out,
+            is_gated,
+            scale_granularity_mnk,
+            scale_major_mode,
+            tactics,
+            _FP8_MOE_TACTIC_SCHEMA_VERSION,
+            "fp8_scale_1x128x128",
+        )
+
+    def _launch(
+        self,
+        inputs: list[torch.Tensor],
+        out: torch.Tensor,
+        is_gated: bool,
+        tactic,
+    ) -> None:
+        a, b, a_scale, b_scale, m_indptr = inputs
+        module = get_gemm_sm120_module_cute_fp8()
+        if tactic in self._tactics:
+            _, tile_m, tile_n = tactic
+            module.moe_gemm_fp8_nt_groupwise_tuned(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                m_indptr,
+                out,
+                self._scale_major_mode,
+                self._scale_granularity_mnk[0],
+                self._scale_granularity_mnk[1],
+                self._scale_granularity_mnk[2],
+                is_gated,
+                tile_m,
+                tile_n,
+            )
+        else:
+            _launch_fp8_moe_fallback(
+                inputs,
+                out,
+                self._scale_granularity_mnk,
+                self._scale_major_mode,
+                is_gated,
+            )
+
+
+def _should_autotune_fp8_moe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    num_experts = b.shape[0]
+    m_per_expert = a.shape[0] // num_experts if num_experts > 0 else 0
+    if b.shape[2] <= 2048 or m_per_expert <= 0 or b.shape[1] % 128 != 0:
+        return False
+
+    num_sms = get_device_sm_count(a.device)
+
+    def tile_count(tile_m: int) -> int:
+        num_m = (m_per_expert + tile_m - 1) // tile_m
+        num_n = (b.shape[1] + 127) // 128
+        return num_experts * num_m * num_n
+
+    return not (tile_count(32) < num_sms // 2 and tile_count(8) <= num_sms)
+
+
+def _launch_fp8_moe_fallback(
+    inputs: list[torch.Tensor],
+    out: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int],
+    scale_major_mode: str,
+    is_gated: bool,
+) -> None:
+    a, b, a_scale, b_scale, m_indptr = inputs
+    get_gemm_sm120_module_cute_fp8().moe_gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indptr,
+        out,
+        scale_major_mode,
+        scale_granularity_mnk[0],
+        scale_granularity_mnk[1],
+        scale_granularity_mnk[2],
+        is_gated,
+    )
 
 
 @supported_compute_capability([120, 121])
@@ -185,17 +305,21 @@ def moe_gemm_fp8_nt_groupwise(
     if out is None:
         out = torch.empty((a.shape[0], out_n), dtype=out_dtype, device=a.device)
 
-    get_gemm_sm120_module_cute_fp8().moe_gemm_fp8_nt_groupwise(
-        a,
-        b,
-        a_scale,
-        b_scale,
-        m_indptr,
-        out,
-        scale_major_mode,
-        scale_granularity_mnk[0],
-        scale_granularity_mnk[1],
-        scale_granularity_mnk[2],
-        is_gated,
+    inputs = [a, b, a_scale, b_scale, m_indptr]
+    if not _should_autotune_fp8_moe(a, b):
+        _launch_fp8_moe_fallback(
+            inputs, out, scale_granularity_mnk, scale_major_mode, is_gated
+        )
+        return out
+
+    runner = _CuteSm120Fp8MoeRunner(
+        out, is_gated, scale_granularity_mnk, scale_major_mode
     )
+    runner, tactic = AutoTuner.get().choose_one(
+        "cute_sm120_fp8_groupwise_moe",
+        [runner],
+        _FP8_MOE_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs, tactic=tactic)
     return out

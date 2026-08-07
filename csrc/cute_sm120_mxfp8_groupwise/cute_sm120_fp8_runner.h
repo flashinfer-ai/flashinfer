@@ -57,7 +57,15 @@ class CuteSm120Fp8GemmRunnerInterface {
                                          int max_shape_m, int shape_n, int shape_k,
                                          cudaStream_t stream, float const* SFA, float const* SFB,
                                          int scale_granularity_m = 1, int scale_granularity_n = 128,
-                                         int scale_granularity_k = 128, bool is_gated = false) = 0;
+                                         int scale_granularity_k = 128,
+                                         bool is_gated = false) = 0;
+
+  virtual void moe_gemm_fp8_nt_groupwise_tuned(
+      void* D, void const* A, void const* B, int32_t const* token_offset, int num_groups,
+      int max_shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
+      float const* SFB, int tactic_tile_m, int tactic_tile_n, int scale_granularity_m = 1,
+      int scale_granularity_n = 128, int scale_granularity_k = 128,
+      bool is_gated = false) = 0;
 
   virtual void group_gemm_fp8_nt_groupwise_contiguous(
       void* D, void const* A, void const* B, int32_t const* m_indices, int num_groups, int m,
@@ -95,7 +103,15 @@ class CuteSm120Fp8GemmRunner : public CuteSm120Fp8GemmRunnerInterface {
                                  int num_groups, int max_shape_m, int shape_n, int shape_k,
                                  cudaStream_t stream, float const* SFA, float const* SFB,
                                  int scale_granularity_m = 1, int scale_granularity_n = 128,
-                                 int scale_granularity_k = 128, bool is_gated = false) override;
+                                 int scale_granularity_k = 128,
+                                 bool is_gated = false) override;
+
+  void moe_gemm_fp8_nt_groupwise_tuned(
+      void* D, void const* A, void const* B, int32_t const* token_offset, int num_groups,
+      int max_shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
+      float const* SFB, int tactic_tile_m, int tactic_tile_n, int scale_granularity_m = 1,
+      int scale_granularity_n = 128, int scale_granularity_k = 128,
+      bool is_gated = false) override;
 
   void group_gemm_fp8_nt_groupwise_contiguous(
       void* D, void const* A, void const* B, int32_t const* m_indices, int num_groups, int m,
@@ -122,10 +138,20 @@ class CuteSm120Fp8GemmRunner : public CuteSm120Fp8GemmRunnerInterface {
                                       int shape_n, int shape_k, cudaStream_t stream,
                                       float const* SFA, float const* SFB);
 
+  void moe_gemm_fp8_nt_groupwise_tuned_impl(
+      void* D, void const* A, void const* B, int32_t const* token_offset, int num_groups,
+      int max_shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
+      float const* SFB, int tactic_tile_m, int tactic_tile_n);
+
   void fused_moe_fp8_nt_groupwise_impl(void* D, void const* A, void const* B,
                                        int32_t const* token_offset, int num_groups, int max_shape_m,
                                        int shape_n, int shape_k, cudaStream_t stream,
                                        float const* SFA, float const* SFB);
+
+  void fused_moe_fp8_nt_groupwise_tuned_impl(
+      void* D, void const* A, void const* B, int32_t const* token_offset, int num_groups,
+      int max_shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
+      float const* SFB, int tactic_tile_m, int tactic_tile_n);
 
   void group_gemm_fp8_nt_groupwise_contiguous_impl(void* D, void const* A, void const* B,
                                                    int32_t const* m_indices, int num_groups, int m,

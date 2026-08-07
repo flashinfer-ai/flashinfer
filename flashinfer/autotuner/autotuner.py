@@ -594,6 +594,17 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def is_valid_tactic(
+        self, tactic: Any, inputs: list[torch.Tensor] | None = None
+    ) -> bool:
+        """Return whether a cached tactic is valid for this runner.
+
+        Runners with versioned or compound tactics can override this hook so
+        retired or malformed in-memory, JSON, or bundled-cache entries are
+        treated as cache misses. The default preserves existing runner behavior.
+        """
+        return True
+
     def __call__(self, inputs, **kwargs):
         return self.forward(inputs, **kwargs)
 
@@ -1319,7 +1330,8 @@ class AutoTuner:
                 runner_keys.append((r_id, cache_key))
                 if cache_key in self.profiling_cache:
                     tactic, stored_profile = self.profiling_cache[cache_key]
-                    return True, r_id, tactic, stored_profile
+                    if r.is_valid_tactic(tactic, inputs):
+                        return True, r_id, tactic, stored_profile
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
             for r_id, cache_key in runner_keys:
@@ -1327,6 +1339,8 @@ class AutoTuner:
                 if file_key in self._file_configs:
                     runner_name, tactic = self._file_configs[file_key]
                     if runner_name != runners[r_id].__class__.__name__:
+                        continue
+                    if not runners[r_id].is_valid_tactic(tactic, inputs):
                         continue
                     log_key = (custom_op, runner_name)
                     if log_key not in self._logged_file_hits:
@@ -1344,7 +1358,7 @@ class AutoTuner:
             ):
                 for r_id, cache_key in runner_keys:
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
-                    if is_hit:
+                    if is_hit and runners[r_id].is_valid_tactic(file_tactic, inputs):
                         return True, r_id, file_tactic, None
 
             # 4. Fallback
