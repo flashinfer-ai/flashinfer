@@ -53,6 +53,8 @@ from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
+    interleave_moe_scales_for_sm90_mixed_gemm,
+    interleave_moe_weights_for_sm90_mixed_gemm,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -69,12 +71,6 @@ from .core import (
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
     trtllm_mxint4_block_scale_routed_moe,
-)
-
-from .prepare import (
-    interleave_moe_scales_for_sm90_mixed_gemm,
-    interleave_moe_weights_for_sm90_mixed_gemm,
-    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
 )
 
 from ..tllm_enums import (
@@ -164,7 +160,6 @@ __all__ = [
     "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_moe_weights_for_sm90_mixed_gemm",
-    "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm103_module",
     "gen_cutlass_fused_moe_sm100_module",
