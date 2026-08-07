@@ -38,7 +38,7 @@ namespace {
 
 // cub::DeviceBatchedTopK requires a compile-time upper bound on the segment size, so the
 // runtime max_len is dispatched over a small ladder of bounds (see
-// CubBatchedTopKDispatchBound). Every tier multiplies kernel instantiations (tiers x dtypes x
+// CUBBatchedTopKDispatchBound). Every tier multiplies kernel instantiations (tiers x dtypes x
 // requirement configs x segment-size argument forms), so the ladder is kept minimal: one tier
 // per capability class.
 //
@@ -51,7 +51,7 @@ constexpr int64_t CUB_TOPK_MAX_LEN = int64_t{1} << 21;
 // When query_bytes_out is non-null, only the temp-storage size query runs (nothing is
 // launched); the result is written there and the outputs/workspace are not touched.
 template <int64_t MAX_LEN_BOUND, typename DType, typename RequirementsT>
-cudaError_t CubBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* output_indices,
+cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* output_indices,
                               DType* output_values, const int32_t* lengths,
                               Optional<TensorView>& maybe_temp_storage, int64_t num_rows,
                               int64_t max_len, int64_t top_k, const RequirementsT& requirements,
@@ -134,7 +134,7 @@ cudaError_t CubBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* o
 }
 
 template <typename DType, typename RequirementsT>
-cudaError_t CubBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
+cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
                                         int32_t* output_indices, DType* output_values,
                                         const int32_t* lengths,
                                         Optional<TensorView>& maybe_temp_storage,
@@ -146,7 +146,7 @@ cudaError_t CubBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
   // therefore SM90+, so without this tier pre-SM90 GPUs couldn't run cub_topk at all. 8192 is
   // the largest bound the single-block backend accepts for our key/value types.
   if (max_len <= 8192) {
-    return CubBatchedTopKRun<int64_t{8192}>(input, row_stride, output_indices, output_values,
+    return CUBBatchedTopKRun<int64_t{8192}>(input, row_stride, output_indices, output_values,
                                             lengths, maybe_temp_storage, num_rows, max_len,
                                             top_k, requirements, query_bytes_out, stream);
   } else {
@@ -156,14 +156,14 @@ cudaError_t CubBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
     // cub_topk() turns into an exception. The Python dispatcher is expected to route these
     // calls to the radix backend instead, so reaching this branch pre-SM90 means someone
     // forced the CUB backend explicitly.
-    return CubBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, output_indices, output_values,
+    return CUBBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, output_indices, output_values,
                                                lengths, maybe_temp_storage, num_rows, max_len,
                                                top_k, requirements, query_bytes_out, stream);
   }
 }
 
 template <typename DType>
-cudaError_t CubBatchedTopKDispatch(const DType* input, int64_t row_stride,
+cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
                                    int32_t* output_indices, DType* output_values,
                                    const int32_t* lengths,
                                    Optional<TensorView>& maybe_temp_storage, int64_t num_rows,
@@ -174,7 +174,7 @@ cudaError_t CubBatchedTopKDispatch(const DType* input, int64_t row_stride,
   // the runtime flag must fan out into separate branches; the generic lambda factors out the
   // otherwise-identical call.
   auto run = [&](auto requirements) {
-    return CubBatchedTopKDispatchBound(input, row_stride, output_indices, output_values,
+    return CUBBatchedTopKDispatchBound(input, row_stride, output_indices, output_values,
                                        lengths, maybe_temp_storage, num_rows, max_len, top_k,
                                        requirements, query_bytes_out, stream);
   };
@@ -195,7 +195,7 @@ cudaError_t CubBatchedTopKDispatch(const DType* input, int64_t row_stride,
 
 // Validation shared by cub_topk and cub_topk_workspace_size. Returns the lengths pointer
 // (nullptr when absent).
-const int32_t* CheckCubTopKArgs(const TensorView& input, const Optional<TensorView>& maybe_lengths,
+const int32_t* CheckCUBTopKArgs(const TensorView& input, const Optional<TensorView>& maybe_lengths,
                                 int64_t top_k, int64_t tie_break) {
   // Rows only need to be individually contiguous: the row pitch is threaded through as
   // input.stride(0), so strided views (e.g. scores[:, :cur_len] of a wider buffer) work
@@ -237,7 +237,7 @@ const int32_t* CheckCubTopKArgs(const TensorView& input, const Optional<TensorVi
 void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
               Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_temp_storage,
               int64_t top_k, int64_t tie_break) {
-  const int32_t* lengths_ptr = CheckCubTopKArgs(input, maybe_lengths, top_k, tie_break);
+  const int32_t* lengths_ptr = CheckCUBTopKArgs(input, maybe_lengths, top_k, tie_break);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(output_values);
   CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
@@ -269,7 +269,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
     auto* input_ptr = static_cast<c_type*>(input.data_ptr());
     auto* indices_ptr = static_cast<int32_t*>(output_indices.data_ptr());
     auto* values_ptr = static_cast<c_type*>(output_values.data_ptr());
-    status = CubBatchedTopKDispatch(input_ptr, input.stride(0), indices_ptr, values_ptr,
+    status = CUBBatchedTopKDispatch(input_ptr, input.stride(0), indices_ptr, values_ptr,
                                     lengths_ptr, maybe_temp_storage, num_rows, max_len, top_k,
                                     tie_break, /*query_bytes_out=*/nullptr, stream);
     return true;
@@ -284,7 +284,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
 // capture) and pass it to every cub_topk call. Launches nothing.
 int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_lengths,
                                 int64_t top_k, int64_t tie_break) {
-  const int32_t* lengths_ptr = CheckCubTopKArgs(input, maybe_lengths, top_k, tie_break);
+  const int32_t* lengths_ptr = CheckCUBTopKArgs(input, maybe_lengths, top_k, tie_break);
 
   const int64_t num_rows = input.size(0);
   const int64_t max_len = input.size(1);
@@ -300,7 +300,7 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
   cudaError_t status;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     // The size query only inspects types and bounds; output pointers are never dereferenced.
-    status = CubBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()),
+    status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()),
                                     input.stride(0), static_cast<int32_t*>(nullptr),
                                     static_cast<c_type*>(nullptr), lengths_ptr, no_workspace,
                                     num_rows, max_len, top_k, tie_break, &temp_storage_bytes,
