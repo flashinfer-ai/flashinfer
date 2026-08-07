@@ -1032,6 +1032,10 @@ def _get_compiled_context(
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         causal_single_kv_tile=causal_single_kv_tile,
+        has_q_offset=has_q_offset,
+        has_uniform_varlen=uniform_packed_lengths,
+        uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+        uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
     )
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
@@ -1073,6 +1077,10 @@ def _get_compiled_context(
             h_r=num_qo_heads // num_kv_heads,
             enable_skip_correction=True,
             causal_single_kv_tile=causal_single_kv_tile,
+            has_q_offset=has_q_offset,
+            has_uniform_varlen=uniform_packed_lengths,
+            uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+            uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
         )
     elif not is_persistent:
         fmha = FmhaTs(
@@ -1089,13 +1097,13 @@ def _get_compiled_context(
             h_r=num_qo_heads // num_kv_heads,
             enable_skip_correction=True,
             causal_single_kv_tile=causal_single_kv_tile,
+            has_q_offset=has_q_offset,
+            has_uniform_varlen=uniform_packed_lengths,
+            uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+            uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
         )
     fmha.cfg.has_varlen = packed
-    fmha.cfg.has_uniform_varlen = uniform_packed_lengths
-    if uniform_packed_lengths:
-        fmha.cfg.uniform_seq_len_q = max_seq_len_q
-        fmha.cfg.uniform_seq_len_k = max_seq_len_k
-    fmha.cfg.has_q_offset = has_q_offset
+    # Passed into FmhaTs(...) above (before schedule selection); do not re-assign.
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -1289,6 +1297,10 @@ def _get_compiled_paged_context(
         # The fixed one-tile shortcut assumes contiguous fixed-shape K/V and
         # is intentionally disabled for the page-table path.
         causal_single_kv_tile=False,
+        has_q_offset=has_q_offset,
+        has_uniform_varlen=uniform_packed_lengths,
+        uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+        uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
     )
     num_seq_tiles = (max_seq_len_q + fmha.cfg.cta_tiler[0] - 1) // fmha.cfg.cta_tiler[0]
     num_head_tiles = num_qo_heads // fmha.cfg.work_tile_q_heads
@@ -1329,6 +1341,10 @@ def _get_compiled_paged_context(
             num_tokens_per_page=page_size,
             max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
             causal_single_kv_tile=False,
+            has_q_offset=has_q_offset,
+            has_uniform_varlen=uniform_packed_lengths,
+            uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+            uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
         )
     elif not paged_is_persistent:
         fmha = FmhaTs(
@@ -1348,13 +1364,13 @@ def _get_compiled_paged_context(
             num_tokens_per_page=page_size,
             max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
             causal_single_kv_tile=False,
+            has_q_offset=has_q_offset,
+            has_uniform_varlen=uniform_packed_lengths,
+            uniform_seq_len_q=max_seq_len_q if uniform_packed_lengths else 0,
+            uniform_seq_len_k=max_seq_len_k if uniform_packed_lengths else 0,
         )
     fmha.cfg.has_varlen = True
-    fmha.cfg.has_uniform_varlen = uniform_packed_lengths
-    if uniform_packed_lengths:
-        fmha.cfg.uniform_seq_len_q = max_seq_len_q
-        fmha.cfg.uniform_seq_len_k = max_seq_len_k
-    fmha.cfg.has_q_offset = has_q_offset
+    # Passed into FmhaTs(...) above (before schedule selection); do not re-assign.
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="

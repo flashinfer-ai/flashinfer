@@ -4047,15 +4047,22 @@ class TmemOResource(MemoryResource):
             first_o0_write = False
             first_o1_write_maybe = True
 
-        # In causal mode, check if O0 MMA should skip the last LOOP iteration.
+        # Elide peer0's PV0 over its trailing fully-masked tile. Location differs
+        # by schedule: legacy folds the last PV into the LOOP (skip last LOOP
+        # iter); interleaved pipelines PV one tile behind QK so peer0's only
+        # invalid PV0(V_{N-1}) lands in the TAIL (skip there, not the LOOP, which
+        # still holds valid tiles).
         skip_o0_invalid = False
-        if cutlass.const_expr(
-            self.cfg.skip_causal_invalid_peer0
-            and writes_o0
-            and section == FmhaStage.Loop
-        ):
-            if not is_tail:
-                skip_o0_invalid = stage_info.loop_offset == (stage_info.loop_end - 1)
+        if cutlass.const_expr(self.cfg.skip_causal_invalid_peer0 and writes_o0):
+            if cutlass.const_expr(self.cfg.uses_qk_pv_interleaved_paired_schedule):
+                skip_o0_invalid = cutlass.const_expr(
+                    section == FmhaStage.Tail and is_tail
+                )
+            elif cutlass.const_expr(section == FmhaStage.Loop):
+                if not is_tail:
+                    skip_o0_invalid = stage_info.loop_offset == (
+                        stage_info.loop_end - 1
+                    )
 
         if not skip_o0_invalid:
             tmem_ptr_raw = self.tmem_ptr_raw_cached
@@ -4281,13 +4288,15 @@ class TmemOResource(MemoryResource):
         else:
             tmem_o_offset = self.tmem_o1_offset
 
-        # In causal mode with no Q right offset, skip the invalid O0 correction
-        # in the last LOOP iteration. The task domain pads partial final CTAs so
-        # this slot is always outside peer0's causal reach.
+        # Skip peer0's invalid O0 correction on the last LOOP iter (domain pads
+        # partial CTAs so it is outside peer0's causal reach). Interleaved is
+        # exempt: it pipelines PV behind QK so every LOOP O0 rescale is valid and
+        # the invalid tile carries no PV0 -- nothing to skip here.
         skip_o0_invalid = False
         if cutlass.const_expr(
             self.cfg.skip_causal_invalid_peer0
             and not self.cfg.single_qkv_instance
+            and not self.cfg.uses_qk_pv_interleaved_paired_schedule
             and inst_idx == 0
         ):
             # This is O0 correction; check if this is the last LOOP iteration.

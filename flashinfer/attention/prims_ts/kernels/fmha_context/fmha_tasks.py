@@ -1035,8 +1035,13 @@ def create_mma_task(
                 if cutlass.const_expr(
                     smem_q.cfg.uses_qk_pv_interleaved_causal_paired_schedule
                 ):
+                    # Peer0 empty S slot, kept even when PV0 is elided so sp0
+                    # stays paired with Softmax0's ghost slot.
                     sp0.acquire()
                     sp0.commit()
+                    # Peer0 PV0 over V_{n-1}: math is a constexpr no-op under
+                    # skip_causal_invalid_peer0, but the to/tp0 handshake still
+                    # cycles to stay paired with Softmax0's ghost and Correction.
                     to.acquire()
                     tp0.wait()
                     to.pv_mma(
@@ -1923,12 +1928,13 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.cfg.uses_qk_pv_interleaved_causal_paired_schedule:
-                # Causal TAIL. Peer 0 first drains an extra S slot (matched by
-                # MMA's peer-0 TAIL sp0.acquire/commit) before its masked
-                # row-max; dropping this regresses peer-0 TAIL correction. The
-                # OrderedSequence handshake below orders the cross-alias
-                # STTM(P) write.
-                if index == 0:
+                # Causal TAIL. Non-skip peer0 drains an extra empty S slot here
+                # (matched by MMA's peer0 TAIL sp0.acquire/commit) before its
+                # masked row-max. Under skip_causal_invalid_peer0 that drain
+                # moves AFTER the ghost slot (below) so the ghost's sp.wait binds
+                # to MMA's early LOOP sp0 commit, avoiding the peer0/peer1
+                # OrderedSequence phase deadlock.
+                if index == 0 and not tmem_sp.uses_query_paired_invalid_tail:
                     sp.wait()
                     sp.release()
                 sp.wait()
@@ -1975,6 +1981,42 @@ def create_softmax_task(
                     p_chunk=p_chunk,
                     scale_softmax_log2=scale_softmax_log2,
                 )
+                if tmem_sp.uses_query_paired_invalid_tail:
+                    # Ghost slot for peer0's trailing fully-masked tile: MMA
+                    # elides the QK0/PV0 math but still cycles every barrier, so
+                    # replay the full peer0 handshake (sp/vec/s0s1_seq/
+                    # OrderedSequence/tp0) to stay paired. invalid_exp2_p writes
+                    # no real P; tp0 still fires so MMA's TAIL tp0.wait has a
+                    # producer.
+                    sp.wait()
+                    old_row_max, row_max = sp.invalid_row_max(row_max=row_max)
+                    sp.ordered_sequence_arrive_if_paired()
+                    vec.acquire()
+                    vec.store_vec(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                    )
+                    vec.commit()
+                    if s0s1_seq is not None:
+                        seq.acquire()
+                    if tp is not None:
+                        tp.acquire()
+                    sp.ordered_sequence_wait_if_paired()
+                    sp.invalid_exp2_p(row_max=row_max)
+                    if tp is not None:
+                        tp.commit()
+                    if s0s1_seq is not None:
+                        seq.commit()
+                    sp.release()
+                if tmem_sp.uses_query_paired_invalid_tail:
+                    # Peer0's empty TAIL S slot (consumes MMA's TAIL
+                    # sp0.acquire/commit), no OrderedSequence/tp -- the tile is
+                    # fully elided so there is no P to order. Placed AFTER the
+                    # ghost so the ghost binds to MMA's early LOOP commit; see the
+                    # Causal TAIL note above.
+                    sp.wait()
+                    sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.acquire()
                 vec.store_vec(
@@ -2393,6 +2435,10 @@ def create_correction_task(
                     vd0.wait()
                     vd0.release()
                 v0.release()
+                # Peer0 TAIL O0 store. The MMA TAIL PV0 math is a no-op under
+                # skip_causal_invalid_peer0 but to.acquire/commit still fire, so
+                # keep the normal to.wait/release: the O0 accumulated from the
+                # LOOP's valid PV0 is what gets stored.
                 to.wait()
                 so0.acquire()
                 so0.store_o(

@@ -1572,17 +1572,23 @@ def _current_sm_major_minor() -> tuple[int, int] | None:
 def _should_use_qk_pv_interleaved_paired_schedule(cfg: FmhaConfig) -> bool:
     """True when the paired MMA task should use ``Qk0_Pv0_Qk1_Pv1``.
 
-    Opt-in for SM103a context with ``head_dim_v >= 128``. Excludes
-    head-paired and causal peer0-skip (divergent peer tile counts).
-    Plain causal uses the same order with peer0 empty ``sp0`` + Softmax0 drain.
+    Opt-in for SM103a context with ``head_dim_v >= 128``. Excludes head-paired.
+    Causal (including peer0-skip) uses the same order with peer0-balancing drains.
     """
     if cfg.single_qkv_instance:
         return False
-    if cfg.head_paired or cfg.skip_causal_invalid_peer0:
+    if cfg.head_paired:
         return False
     head_dim_v = cfg.pv_mma_tiler[1]
     if head_dim_v < 128:
         return False
+    if cfg.is_causal:
+        # A non-tile-aligned bottom-right Q offset (k>q not a K/V-tile multiple)
+        # self-disables skip_causal_invalid_peer0 and pushes a right mask into
+        # the LOOP, leaving peer0's drain unbalanced -> deadlock. Defer to the
+        # legacy Pv0Qk0Pv1Qk1 schedule, which masks per LOOP iteration.
+        if cfg.has_q_offset and not cfg.has_tile_aligned_uniform_q_offset:
+            return False
     capability = _current_sm_major_minor()
     return capability == (10, 3)
 
@@ -2364,8 +2370,18 @@ class FmhaTs:
         max_num_pages_per_seq_kv: int = 1,
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool = True,
+        has_q_offset: bool = False,
+        has_uniform_varlen: bool = False,
+        uniform_seq_len_q: int = 0,
+        uniform_seq_len_k: int = 0,
     ) -> None:
-        """Initialize mode-specific tiling, dtype, and schedule configuration."""
+        """Initialize mode-specific tiling, dtype, and schedule configuration.
+
+        ``has_q_offset``/``has_uniform_varlen``/``uniform_seq_len_{q,k}`` describe
+        the causal k>q geometry. They are constructor args (not post-construction
+        ``cfg`` assignments) because paired schedule selection must observe the
+        true geometry when it picks ``mma_order``.
+        """
         head_paired = resolve_head_paired_mode(
             head_paired=head_paired,
             is_causal=is_causal,
@@ -2408,6 +2424,11 @@ class FmhaTs:
 
         cfg = FmhaConfig()
         self.cfg = cfg
+        # Must be set before schedule selection in _configure_pipeline_stages.
+        cfg.has_q_offset = has_q_offset
+        cfg.has_uniform_varlen = has_uniform_varlen
+        cfg.uniform_seq_len_q = uniform_seq_len_q
+        cfg.uniform_seq_len_k = uniform_seq_len_k
         if d > 128:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
