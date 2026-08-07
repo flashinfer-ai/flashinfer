@@ -584,9 +584,7 @@ def _fold_fma_bf16x2(packed_i32, bdec_f32, d0_f32, d1_f32):
             d0_f32.ir_value(),
             d1_f32.ir_value(),
         ],
-        unpack_asm
-        + " fma.rn.f32 $0, _fl, $3, $4;"
-        " fma.rn.f32 $1, _fh, $3, $5; }",
+        unpack_asm + " fma.rn.f32 $0, _fl, $3, $4; fma.rn.f32 $1, _fh, $3, $5; }",
         "=f,=f,r,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
@@ -1473,14 +1471,12 @@ class GdnDecodeUCacheFlushKernel:
             if tidx < Int32(32):
                 _prefetch_l2_bf16(
                     gKC.iterator.toint() + _kc_pool_e64 * 2,
-                    _pf_ring * K_DIM
-                    + _pf_half,
+                    _pf_ring * K_DIM + _pf_half,
                 )
             if tidx >= Int32(32) and tidx < Int32(64):
                 _prefetch_l2_bf16(
                     gUC.iterator.toint() + _uc_pool_e64 * 2,
-                    _pf_ring * V_DIM
-                    + _pf_half,
+                    _pf_ring * V_DIM + _pf_half,
                 )
 
         smem = utils.SmemAllocator()
@@ -1501,7 +1497,9 @@ class GdnDecodeUCacheFlushKernel:
             # single-buffered and reused across the 2 TMA half-loads via the
             # mbarrier ping-pong. Element type = state_ty (the checkpoint
             # dtype; == io except in mixed mode).
-            h_buf: cute.struct.Align[cute.struct.MemRange[state_ty, V_DIM_C * K_HALF], 128]
+            h_buf: cute.struct.Align[
+                cute.struct.MemRange[state_ty, V_DIM_C * K_HALF], 128
+            ]
             tmat_bf: cute.struct.Align[cute.struct.MemRange[io, T * BF_PAD], 128]
             gamma: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
             beta: cute.struct.Align[cute.struct.MemRange[f32, WARP], 128]
@@ -2459,8 +2457,12 @@ class GdnDecodeUCacheFlushKernel:
         wh_acc_3 = cute.make_fragment_like(tCsC)
         wh_acc_3.fill(f32(0.0))
 
-        _sK_base_vl = sK.iterator.toint()  # A operand (packed tile in sK, K_PADDED stride)
-        _sH_base_vl = sH.iterator.toint()  # B operand (state in sH, SW128-swizzled, half-K)
+        _sK_base_vl = (
+            sK.iterator.toint()
+        )  # A operand (packed tile in sK, K_PADDED stride)
+        _sH_base_vl = (
+            sH.iterator.toint()
+        )  # B operand (state in sH, SW128-swizzled, half-K)
         _rs_a = Int32(K_PADDED * 2)  # 272 — sK row stride (padded, full K)
         _rs_b = Int32(K_HALF * 2)  # 128 — sH row stride (half-K, SW128)
 
@@ -2580,9 +2582,7 @@ class GdnDecodeUCacheFlushKernel:
         if P_hist > 0:
             _hc_a0, _hc_a1, _hc_a2, _hc_a3 = _ldmatrix_x4(sWScores, lane_id)
             _hc_b_base = (
-                _sV_base_async_u
-                + _ldm_row * Int32(V_PADDED * 2)
-                + warp_id * Int32(64)
+                _sV_base_async_u + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
             )
             _hcr = _qtv_4mma_rg(_hc_a0, _hc_a1, _hc_a2, _hc_a3, _hc_b_base)
             wh_acc_0.iterator[0] = wh_acc_0.iterator[0] + _hcr[0]
@@ -2671,14 +2671,12 @@ class GdnDecodeUCacheFlushKernel:
             # 4-B aligned. Identical codegen in the default mode.
             _qt_sw_base = sWScores.iterator.toint()
             _sts_bf16x2_f32(
-                _qt_sw_base
-                + (_qt_r0 * BF_PAD + _qt_col_off + _qt_c0) * 2,
+                _qt_sw_base + (_qt_r0 * BF_PAD + _qt_col_off + _qt_c0) * 2,
                 acc.iterator[0],
                 acc.iterator[1],
             )
             _sts_bf16x2_f32(
-                _qt_sw_base
-                + ((_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0) * 2,
+                _qt_sw_base + ((_qt_r0 + 8) * BF_PAD + _qt_col_off + _qt_c0) * 2,
                 acc.iterator[2],
                 acc.iterator[3],
             )
@@ -3028,10 +3026,14 @@ class GdnDecodeUCacheFlushKernel:
             # Pool/head strides from the layout (block-strided paged pools);
             # folded into the i64 byte base — pool offsets can exceed 2^31
             # elements, so the 32-bit path keeps only intra-page offsets.
-            _gH0_st = gH0.iterator.toint() + (
-                cache_idx64 * gH0.layout.stride[0]
-                + Int64(pid_hv) * gH0.layout.stride[1]
-            ) * 2
+            _gH0_st = (
+                gH0.iterator.toint()
+                + (
+                    cache_idx64 * gH0.layout.stride[0]
+                    + Int64(pid_hv) * gH0.layout.stride[1]
+                )
+                * 2
+            )
             _h0_elem_base = Int32(0)
             _fa_row = (lane_id & Int32(7)) + ((lane_id >> Int32(4)) & Int32(1)) * Int32(
                 8
@@ -3113,7 +3115,9 @@ class GdnDecodeUCacheFlushKernel:
                     _f_pos = _f_chunk & Int32(7)
                     _cv0, _cv1, _cv2, _cv3 = _lds_v4_b32(
                         _sw128_xor(
-                            _sH_base_vl + _f_row * Int32(K_HALF * 2) + _f_pos * Int32(16)
+                            _sH_base_vl
+                            + _f_row * Int32(K_HALF * 2)
+                            + _f_pos * Int32(16)
                         )
                     )
                     _st_global_v4_b32(
@@ -3432,12 +3436,12 @@ def gated_delta_rule_mtp_ucache_flush(
         # restart_hist_on_flush=False and owns these invariants.
         if not torch.cuda.is_current_stream_capturing():
             _hl_min, _hl_max = (int(x.item()) for x in hist_len.aminmax())
-            assert 0 <= _hl_min and _hl_max <= W_RING, (
+            assert _hl_min >= 0 and _hl_max <= W_RING, (
                 f"hist_len out of legal range [0, {W_RING}]: "
                 f"min={_hl_min} max={_hl_max}"
             )
             _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
-            assert 0 <= _cb_min and _cb_max < RING_SLOTS, (
+            assert _cb_min >= 0 and _cb_max < RING_SLOTS, (
                 f"cache_base out of legal range [0, {RING_SLOTS}): "
                 f"min={_cb_min} max={_cb_max}"
             )
@@ -3726,9 +3730,7 @@ def gated_delta_rule_mtp_ucache_flush(
     # the caller folds it into its own per-step commit bookkeeping.
     if restart_hist_on_flush:
         _flushed = hist_len >= flush_min
-        cache_base.copy_(
-            (cache_base + hist_len * _flushed) & (RING_SLOTS - 1)
-        )
+        cache_base.copy_((cache_base + hist_len * _flushed) & (RING_SLOTS - 1))
         hist_len.masked_fill_(_flushed, 0)
 
     if output is None:

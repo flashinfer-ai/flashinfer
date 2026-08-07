@@ -16,6 +16,10 @@ Exported Kernels:
 - run_nontranspose_decode: Nontranspose (K-major) decode kernel
 - run_mtp_decode: Multi-token processing decode kernel
 - get_mtp_config, get_tile_v_mtp, get_vec_size_mtp: MTP hyperparameter helpers
+- gated_delta_rule_mtp_ucache: u/d-cache spec-decode verify kernel (ring append,
+  read-only state; legacy 16-deep flat ring)
+- gated_delta_rule_mtp_ucache_flush: fused verify+flush ucache kernel (32-slot
+  rotating ring; folds the window into the checkpoint state)
 """
 
 try:
@@ -46,6 +50,20 @@ try:
 except (ImportError, RuntimeError):
     _GDN_DECODE_BF16_WY_OUTPUT_ONLY_AVAILABLE = False
     gated_delta_rule_mtp_wy_output_only = None  # type: ignore
+
+# ReplaySSM u/d-cache spec-decode kernels. NOTE: the two ring formats are NOT
+# compatible — verify-only uses the legacy 16-deep flat ring (no cache_base),
+# the flush kernel a 32-slot rotating ring. Storage dtypes for the flush kernel
+# are chosen at import time via GDN_UCACHE_{IO,STATE,RING}_DTYPE.
+try:
+    from .gdn_decode_bf16_wy_ucache import gated_delta_rule_mtp_ucache
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache = None  # type: ignore
+
+try:
+    from .gdn_decode_bf16_wy_ucache_flush import gated_delta_rule_mtp_ucache_flush
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush = None  # type: ignore
 
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
@@ -91,6 +109,8 @@ except (ImportError, RuntimeError):
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
+    "gated_delta_rule_mtp_ucache",
+    "gated_delta_rule_mtp_ucache_flush",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",

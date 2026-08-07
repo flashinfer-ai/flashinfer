@@ -45,8 +45,8 @@ from flashinfer.testing import bench_gpu_time
 
 DEV = "cuda"
 H, HV, K, V = 16, 64, 128, 128  # Qwen3.5-122B GDN @ TP1
-T, W = 4, 16   # W = max history window (kernel W_RING)
-RING = 32      # physical ring depth (kernel RING_SLOTS)
+T, W = 4, 16  # W = max history window (kernel W_RING)
+RING = 32  # physical ring depth (kernel RING_SLOTS)
 FLUSH_MIN = 13
 SCALE = 1.0 / math.sqrt(K)
 
@@ -63,18 +63,31 @@ ARMS = {
     "fp16_state": (None, "fp16", None, torch.bfloat16, torch.float16, torch.bfloat16),
     "fp16_io": ("fp16", None, None, torch.float16, torch.float16, torch.float16),
     "ring_fp16": (None, None, "fp16", torch.bfloat16, torch.bfloat16, torch.float16),
-    "fp16_state_cache": (None, "fp16", "fp16",
-                         torch.bfloat16, torch.float16, torch.float16),
+    "fp16_state_cache": (
+        None,
+        "fp16",
+        "fp16",
+        torch.bfloat16,
+        torch.float16,
+        torch.float16,
+    ),
 }
-_FLUSH_PATH = str(Path(__file__).resolve().parents[1]
-                  / "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py")
+_FLUSH_PATH = str(
+    Path(__file__).resolve().parents[1]
+    / "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py"
+)
 
 
 def load_flush(arm):
     io_env, state_env, ring_env, io_dtype, state_dtype, ring_dtype = ARMS[arm]
-    old = {k: os.environ.pop(k, None)
-           for k in ("GDN_UCACHE_IO_DTYPE", "GDN_UCACHE_STATE_DTYPE",
-                     "GDN_UCACHE_RING_DTYPE")}
+    old = {
+        k: os.environ.pop(k, None)
+        for k in (
+            "GDN_UCACHE_IO_DTYPE",
+            "GDN_UCACHE_STATE_DTYPE",
+            "GDN_UCACHE_RING_DTYPE",
+        )
+    }
     if io_env:
         os.environ["GDN_UCACHE_IO_DTYPE"] = io_env
     if state_env:
@@ -107,8 +120,13 @@ def graphed(fn):
     return lambda: g.replay()
 
 
-def make_case(B, seed, io_dtype=torch.bfloat16, state_dtype=torch.bfloat16,
-              ring_dtype=torch.bfloat16):
+def make_case(
+    B,
+    seed,
+    io_dtype=torch.bfloat16,
+    state_dtype=torch.bfloat16,
+    ring_dtype=torch.bfloat16,
+):
     g = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
@@ -116,8 +134,10 @@ def make_case(B, seed, io_dtype=torch.bfloat16, state_dtype=torch.bfloat16,
 
     q, k = rn(B, T, H, K), rn(B, T, H, K)
     v, a, b = rn(B, T, HV, V, sc=0.5), rn(B, T, HV, sc=0.5), rn(B, T, HV)
-    A_log = (torch.full((HV,), -3.0, device=DEV)
-             + torch.rand(HV, generator=g, device=DEV) * 0.3).to(io_dtype)
+    A_log = (
+        torch.full((HV,), -3.0, device=DEV)
+        + torch.rand(HV, generator=g, device=DEV) * 0.3
+    ).to(io_dtype)
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
     # 32-deep physical rings, fully populated (rows outside the live window
@@ -131,77 +151,130 @@ def make_case(B, seed, io_dtype=torch.bfloat16, state_dtype=torch.bfloat16,
     return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx
 
 
-def bench_point(uc_flush, B, rate_pct, iters, seed, io_dtype, state_dtype,
-                ring_dtype=torch.bfloat16, base=0, no_commit=False):
+def bench_point(
+    uc_flush,
+    B,
+    rate_pct,
+    iters,
+    seed,
+    io_dtype,
+    state_dtype,
+    ring_dtype=torch.bfloat16,
+    base=0,
+    no_commit=False,
+):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
-        B, seed, io_dtype, state_dtype, ring_dtype)
+        B, seed, io_dtype, state_dtype, ring_dtype
+    )
     nf = 0 if rate_pct == 0 else max(1, round(B * rate_pct / 100))
     mask = torch.zeros(B, dtype=torch.bool, device=DEV)
     if nf:
         g_cpu = torch.Generator().manual_seed(seed + 3)
         mask[torch.randperm(B, generator=g_cpu)[:nf].to(DEV)] = True
-    hl_src = torch.where(mask,
-                         torch.tensor(13, dtype=torch.int32, device=DEV),
-                         torch.tensor(12, dtype=torch.int32, device=DEV))
+    hl_src = torch.where(
+        mask,
+        torch.tensor(13, dtype=torch.int32, device=DEV),
+        torch.tensor(12, dtype=torch.int32, device=DEV),
+    )
     hl = hl_src.clone()
     cb_src = torch.full((B,), base, dtype=torch.int32, device=DEV)
     cb = cb_src.clone()
 
     def fn():
-        uc_flush(A_log, a, dt_bias, q=q, k=k, v=v, b=b,
-                 initial_state_source=pool, initial_state_indices=idx,
-                 k_cache=kc, u_cache=uc, g_cache=gc, hist_len=hl,
-                 cache_base=cb,
-                 scale=SCALE, flush_min=FLUSH_MIN,
-                 restart_hist_on_flush=not no_commit)
+        uc_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=FLUSH_MIN,
+            restart_hist_on_flush=not no_commit,
+        )
         if not no_commit:
             # wrapper committed cursors for flushed rows; restore them
             hl.copy_(hl_src)
             cb.copy_(cb_src)
 
-    times = bench_gpu_time(graphed(fn), enable_cupti=True, cold_l2_cache=True,
-                           dry_run_iters=10, repeat_iters=iters)
+    times = bench_gpu_time(
+        graphed(fn),
+        enable_cupti=True,
+        cold_l2_cache=True,
+        dry_run_iters=10,
+        repeat_iters=iters,
+    )
     return float(np.median(times)) * 1000.0  # us
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=200)
-    ap.add_argument("--batches", type=int, nargs="+",
-                    default=[8, 32, 64, 128, 256])
-    ap.add_argument("--rates", type=int, nargs="+",
-                    default=[0, 20, 40, 80])
-    ap.add_argument("--arm", choices=list(ARMS), default="bf16",
-                    help="dtype config: bf16 | fp16_state | fp16_io")
-    ap.add_argument("--no-commit", action="store_true",
-                    help="pure-kernel timing: disable the wrapper's standalone "
-                         "cursor commit AND the per-iter cursor restores (the "
-                         "kernel never mutates cursors, so iterations are "
-                         "identical). Without this flag the timed graph also "
-                         "contains ~4-6us of commit/restore elementwise ops — "
-                         "fine for wrapper-level A/Bs, misleading for "
-                         "kernel-level ones.")
-    ap.add_argument("--base", type=int, default=0,
-                    help="ring window origin for all rows (28 exercises the "
-                         "wrapped-window path: base+P crosses RING_SLOTS)")
+    ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
+    ap.add_argument("--rates", type=int, nargs="+", default=[0, 20, 40, 80])
+    ap.add_argument(
+        "--arm",
+        choices=list(ARMS),
+        default="bf16",
+        help="dtype config: bf16 | fp16_state | fp16_io",
+    )
+    ap.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="pure-kernel timing: disable the wrapper's standalone "
+        "cursor commit AND the per-iter cursor restores (the "
+        "kernel never mutates cursors, so iterations are "
+        "identical). Without this flag the timed graph also "
+        "contains ~4-6us of commit/restore elementwise ops — "
+        "fine for wrapper-level A/Bs, misleading for "
+        "kernel-level ones.",
+    )
+    ap.add_argument(
+        "--base",
+        type=int,
+        default=0,
+        help="ring window origin for all rows (28 exercises the "
+        "wrapped-window path: base+P crosses RING_SLOTS)",
+    )
     args = ap.parse_args()
 
     uc_flush, io_dtype, state_dtype, ring_dtype = load_flush(args.arm)
-    print(f"GPU: {torch.cuda.get_device_name(0)} | fused verify+flush, "
-          f"arm={args.arm} (io={io_dtype}, state={state_dtype}, "
-          f"ring={ring_dtype}), "
-          f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} "
-          f"H={H} HV={HV} K=V={K} | "
-          f"CUDA-graph replay, CUPTI cold-L2, median of {args.iters}",
-          flush=True)
+    print(
+        f"GPU: {torch.cuda.get_device_name(0)} | fused verify+flush, "
+        f"arm={args.arm} (io={io_dtype}, state={state_dtype}, "
+        f"ring={ring_dtype}), "
+        f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} "
+        f"H={H} HV={HV} K=V={K} | "
+        f"CUDA-graph replay, CUPTI cold-L2, median of {args.iters}",
+        flush=True,
+    )
     hdr = "   B | " + " | ".join(f"{r:3d}% (us)" for r in args.rates)
     print(hdr)
     print("-" * len(hdr))
     for B in args.batches:
-        row = [bench_point(uc_flush, B, r, args.iters, 1000 + B + r,
-                           io_dtype, state_dtype, ring_dtype, base=args.base,
-                           no_commit=args.no_commit)
-               for r in args.rates]
+        row = [
+            bench_point(
+                uc_flush,
+                B,
+                r,
+                args.iters,
+                1000 + B + r,
+                io_dtype,
+                state_dtype,
+                ring_dtype,
+                base=args.base,
+                no_commit=args.no_commit,
+            )
+            for r in args.rates
+        ]
         print(f"{B:4d} | " + " | ".join(f"{t:9.2f}" for t in row), flush=True)
 
 

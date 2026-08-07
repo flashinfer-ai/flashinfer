@@ -1337,9 +1337,7 @@ class GdnDecodeUCacheKernel:
                 _kc_row = tidx // Int32(K_DIM // 8)
                 _kc_pos = tidx % Int32(K_DIM // 8)
                 _kv0, _kv1, _kv2, _kv3 = _lds_v4_b32(
-                    _sK_base_async
-                    + _kc_row * Int32(K_PADDED * 2)
-                    + _kc_pos * Int32(16)
+                    _sK_base_async + _kc_row * Int32(K_PADDED * 2) + _kc_pos * Int32(16)
                 )
                 _st_global_v4_b32(
                     _gKC_base_st,
@@ -1835,8 +1833,12 @@ class GdnDecodeUCacheKernel:
         wh_acc_3 = cute.make_fragment_like(tCsC)
         wh_acc_3.fill(f32(0.0))
 
-        _sK_base_vl = sK.iterator.toint()  # A operand (packed tile in sK, K_PADDED stride)
-        _sH_base_vl = sH.iterator.toint()  # B operand (state in sH, SW128-swizzled, half-K)
+        _sK_base_vl = (
+            sK.iterator.toint()
+        )  # A operand (packed tile in sK, K_PADDED stride)
+        _sH_base_vl = (
+            sH.iterator.toint()
+        )  # B operand (state in sH, SW128-swizzled, half-K)
         _rs_a = Int32(K_PADDED * 2)  # 272 — sK row stride (padded, full K)
         _rs_b = Int32(K_HALF * 2)  # 128 — sH row stride (half-K, SW128)
 
@@ -1956,9 +1958,7 @@ class GdnDecodeUCacheKernel:
         if P_hist > 0:
             _hc_a0, _hc_a1, _hc_a2, _hc_a3 = _ldmatrix_x4(sWScores, lane_id)
             _hc_b_base = (
-                _sV_base_async_u
-                + _ldm_row * Int32(V_PADDED * 2)
-                + warp_id * Int32(64)
+                _sV_base_async_u + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
             )
             _hcr = _qtv_4mma(_hc_a0, _hc_a1, _hc_a2, _hc_a3, _hc_b_base)
             wh_acc_0.iterator[0] = wh_acc_0.iterator[0] + _hcr[0]
@@ -2488,6 +2488,15 @@ def gated_delta_rule_mtp_ucache(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
+    # GDN-C1/C3 guard (#4214): the kernel body is bf16-only (module-level
+    # io=cutlass.BFloat16) and from_dlpack bakes operand dtypes into the
+    # compiled signature, so non-bf16 activations would either throw on a
+    # cache hit or be silently reinterpreted by a fresh compile. Fail loudly.
+    for _n, _t in (("q", q), ("k", k), ("v", v), ("a", a), ("b", b)):
+        assert _t.dtype == torch.bfloat16, (
+            f"gated_delta_rule_mtp_ucache: {_n}.dtype={_t.dtype} unsupported — "
+            "this kernel is bf16-only; cast activations to torch.bfloat16."
+        )
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2496,6 +2505,7 @@ def gated_delta_rule_mtp_ucache(
     # captured graph). Falls back to a plain cast if already bf16-contiguous.
     A_log = _cached_bf16(A_log)
     dt_bias = _cached_bf16(dt_bias)
+
     def _inner_dense(t: torch.Tensor, name: str) -> bool:
         """Pools may be block-strided views (paged serving layouts, e.g. vLLM:
         dim-0 stride spans the whole multi-component page). Inner dims must be
@@ -2697,6 +2707,9 @@ def gated_delta_rule_mtp_ucache(
     cache_key: tuple = (
         "ucache-v1",
         str(device),
+        # io dtype: constant bf16 today (asserted at entry), keyed so a future
+        # dtype-specialized body can never alias cubins across dtypes (GDN-C3).
+        str(_io_dtype),
         mbp,
         t_disc,
         n_valid,
