@@ -30,6 +30,7 @@ from flashinfer.api_logging import (
     require_experimental,
 )
 
+
 def _make_add():
     @flashinfer_experimental_api
     def sample_add(x, y):
