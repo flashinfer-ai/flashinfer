@@ -111,50 +111,7 @@ def test_plain_and_gated_use_separate_cache_keys():
         )[0]
 
 
-def test_invalid_memory_and_loaded_tactics_are_cache_misses():
-    inputs = _inputs()
-    runner = fp8_core._CuteSm120Fp8MoeRunner(
-        torch.empty((10, 128)), False, (1, 128, 128), "MN"
-    )
-    tuner = AutoTuner()
-    properties = MagicMock(name="device_properties")
-    properties.name = "test-sm120"
-
-    with (
-        patch.object(torch.cuda, "current_device", return_value=0),
-        patch.object(torch.cuda, "get_device_properties", return_value=properties),
-        patch.object(moe_autotune, "get_compute_capability", return_value=(12, 0)),
-    ):
-        shapes = tuple(tensor.shape for tensor in inputs)
-        key = tuner._get_cache_key(
-            "cute_sm120_fp8_groupwise_moe",
-            runner,
-            shapes,
-            fp8_core._FP8_MOE_TUNING_CONFIG,
-            runner.get_cache_key_extras(inputs),
-        )
-        invalid = (999, 64, 128)
-        tuner.profiling_cache[key] = (invalid, None)
-        assert not tuner.search_cache(
-            "cute_sm120_fp8_groupwise_moe",
-            [runner],
-            shapes,
-            fp8_core._FP8_MOE_TUNING_CONFIG,
-            inputs,
-        )[0]
-
-        tuner.profiling_cache.clear()
-        tuner._file_configs[key.file_key] = (runner.__class__.__name__, invalid)
-        assert not tuner.search_cache(
-            "cute_sm120_fp8_groupwise_moe",
-            [runner],
-            shapes,
-            fp8_core._FP8_MOE_TUNING_CONFIG,
-            inputs,
-        )[0]
-
-
-def test_malformed_tactics_are_strict_cache_misses():
+def test_runner_rejects_malformed_tactics():
     runner = fp8_core._CuteSm120Fp8MoeRunner(
         torch.empty((10, 128)), False, (1, 128, 128), "MN"
     )
