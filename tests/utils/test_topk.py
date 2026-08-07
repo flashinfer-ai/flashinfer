@@ -3156,112 +3156,30 @@ def test_top_k_cub_edge_cases():
     assert values.shape == (0, 64) and indices.shape == (0, 64)
 
 
-def test_top_k_cub_cuda_graph_workspace_growth_sm90():
-    """Cluster-path growing-workspace hazard probe (needs SM90+).
-
-    On the cluster backend the CUB workspace scales with the number of rows,
-    so warming a larger problem after capturing a smaller one makes
-    _get_cache_buf replace the cached workspace while the captured graph still
-    holds the old pointer. This test asserts the discipline that makes that
-    safe: holding a reference to the capture-time workspace keeps replays
-    correct. The final section then drops the reference and replays again --
-    a failure THERE demonstrates the dangling-workspace hazard and means
-    capture-largest-first must become a documented requirement.
-
-    The baseline backend (pre-SM90) is immune by construction: its workspace
-    is a constant-size dummy, so the premise is not constructible and the
-    test skips.
-    """
-    if get_compute_capability(torch.device("cuda"))[0] < 9:
-        pytest.skip("cluster backend (SM90+) required; baseline workspace is constant")
-    import flashinfer.utils as flashinfer_utils_mod
-
-    torch.manual_seed(21)
-    small = torch.randn(8, 65536, device="cuda")
-    big = torch.randn(512, 65536, device="cuda")
-    k = 1024
-
-    # Fresh workspace cache so this test controls the growth sequence.
-    ws_keys = [
-        key for key in flashinfer_utils_mod._cache_buf if "cub_topk_workspace" in key[0]
-    ]
-    for key in ws_keys:
-        del flashinfer_utils_mod._cache_buf[key]
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            flashinfer.top_k_cub(small, k)
-    torch.cuda.current_stream().wait_stream(stream)
-
-    ws_key = [
-        key for key in flashinfer_utils_mod._cache_buf if "cub_topk_workspace" in key[0]
-    ][0]
-    capture_time_workspace = flashinfer_utils_mod._cache_buf[ws_key]
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        cap_vals, cap_idx = flashinfer.top_k_cub(small, k)
-
-    # Warm the larger problem; on the cluster path this should grow (and thus
-    # replace) the cached workspace. If it does not, the hazard premise is not
-    # constructible for these shapes -- report that instead of failing.
-    flashinfer.top_k_cub(big, k)
-    replaced = (
-        flashinfer_utils_mod._cache_buf[ws_key].data_ptr()
-        != capture_time_workspace.data_ptr()
-    )
-    if not replaced:
-        pytest.skip(
-            "workspace did not grow between shapes; hazard not constructible here"
-        )
-
-    def check_replay():
-        fresh = torch.randn_like(small)
-        small.copy_(fresh)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(torch.gather(fresh, -1, cap_idx.long()), cap_vals), (
-            "replayed output inconsistent with replay-time input"
-        )
-        eager_vals, _ = flashinfer.top_k_cub(fresh, k)
-        assert torch.equal(
-            torch.sort(cap_vals, dim=-1, descending=True).values,
-            torch.sort(eager_vals, dim=-1, descending=True).values,
-        )
-
-    # With the capture-time workspace kept alive (we hold a reference above),
-    # replay must be correct.
-    check_replay()
-
-    # Drop the reference and encourage the allocator to reuse the freed block.
-    # A failure below demonstrates the dangling-workspace hazard.
-    del capture_time_workspace
-    scribble = [
-        torch.full((1 << 20,), 0x7F, dtype=torch.uint8, device="cuda") for _ in range(8)
-    ]
-    check_replay()
-    del scribble
-
-
 def _canonicalize_topk(values, indices):
     """Sort an unordered top-k result by value (descending) for comparison."""
     sorted_values, order = torch.sort(values, dim=-1, descending=True, stable=True)
     return sorted_values, torch.gather(indices, -1, order)
 
 
-def test_top_k_cub_cuda_graph_replay():
+@pytest.mark.parametrize("d", [8192, 65536])
+@pytest.mark.parametrize(
+    "tie_break", [flashinfer.TopKTieBreak.NONE, flashinfer.TopKTieBreak.SMALL]
+)
+def test_top_k_cub_cuda_graph_replay(d, tie_break):
     """top_k_cub must be capturable into a CUDA graph and correct on replay.
 
     Captures once with a static input buffer, then replays with fresh data and
     compares against an eager call on identical data. fp32 randn makes ties
     measure-zero, so the top-k set is unique and canonicalized comparison is
-    exact. Shapes stay within the pre-SM90 envelope (d <= 8192) so this runs
-    on every supported architecture.
+    exact (tie_break then never changes the set; the parametrization exercises
+    the gpu_to_gpu kernel configurations under capture). d = 8192 runs on every
+    architecture; d = 65536 and the tie modes exercise the cluster backend's
+    capture surface (cudaLaunchKernelEx with cluster dimensions) on SM90+.
     """
+    _require_cub_support(d, tie_break)
     torch.manual_seed(0)
-    num_rows, d, k = 32, 8192, 1024
+    num_rows, k = 32, 1024
     static_input = torch.randn(num_rows, d, device="cuda")
 
     # Warmup on a side stream (required before capture; also populates the
@@ -3270,12 +3188,14 @@ def test_top_k_cub_cuda_graph_replay():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            flashinfer.top_k_cub(static_input, k)
+            flashinfer.top_k_cub(static_input, k, tie_break=tie_break)
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_values, captured_indices = flashinfer.top_k_cub(static_input, k)
+        captured_values, captured_indices = flashinfer.top_k_cub(
+            static_input, k, tie_break=tie_break
+        )
 
     for _ in range(5):
         fresh = torch.randn(num_rows, d, device="cuda")
@@ -3288,7 +3208,9 @@ def test_top_k_cub_cuda_graph_replay():
             torch.gather(fresh, -1, captured_indices.long()), captured_values
         )
         # And matches an eager call on the same data (set + values).
-        eager_values, eager_indices = flashinfer.top_k_cub(fresh, k)
+        eager_values, eager_indices = flashinfer.top_k_cub(
+            fresh, k, tie_break=tie_break
+        )
         graph_v, graph_i = _canonicalize_topk(captured_values, captured_indices)
         eager_v, eager_i = _canonicalize_topk(eager_values, eager_indices)
         assert torch.equal(graph_v, eager_v)
@@ -3297,19 +3219,22 @@ def test_top_k_cub_cuda_graph_replay():
         )
 
 
-def test_cub_topk_varlen_cuda_graph_replay():
+@pytest.mark.parametrize("max_len", [4096, 65536])
+def test_cub_topk_varlen_cuda_graph_replay(max_len):
     """The CUB binding's variable-length path must be replay-correct.
 
     Fixed physical shape, dynamism through data (the FlashInfer graph idiom):
     capture with a static lengths tensor, replay with mutated length values --
     including rows with lengths[i] < k -- and check the selected sets and the
-    -1 tail padding against a torch reference.
+    -1 tail padding against a torch reference. max_len = 65536 exercises the
+    cluster backend's deferred path under capture on SM90+.
     """
+    _require_cub_support(max_len)
     from flashinfer.jit.topk import gen_topk_module
 
     module = gen_topk_module().build_and_load()
     torch.manual_seed(1)
-    num_rows, max_len, k = 16, 4096, 512
+    num_rows, k = 16, 512
     static_scores = torch.randn(num_rows, max_len, device="cuda")
     static_lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device="cuda")
     out_indices = torch.empty(num_rows, k, dtype=torch.int32, device="cuda")

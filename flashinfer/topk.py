@@ -1030,6 +1030,9 @@ def top_k_cub(
       capability below 9.0, ``d`` must additionally be at most 8192 and
       ``tie_break`` is unavailable. Violations raise a ``RuntimeError`` from
       the kernel launcher at call time.
+    - The CUB workspace is cached per device and reused across calls. For CUDA
+      graph capture, warm up at the target shape before capturing, so that the
+      workspace is allocated outside of graph capture.
 
     Examples
     --------
