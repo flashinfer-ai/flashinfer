@@ -44,6 +44,12 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
   const int seq_q = static_cast<int>(q.size(1));
   const int heads = static_cast<int>(q.size(2));
   const int seq_k = static_cast<int>(k.size(1));
+  // MQA (a single KV head shared by every query head) is expressed by leaving
+  // the head dimension at 1 and letting the fill below broadcast it.
+  const int heads_kv = static_cast<int>(k.size(2));
+  TORCH_CHECK(heads_kv == heads || heads_kv == 1, "k/v must have either ", heads,
+              " heads or 1 (MQA), got ", heads_kv);
+  TORCH_CHECK(v.size(2) == heads_kv, "k and v must have the same number of heads");
 
   // Phantom block padding: round up to multiple of 8 (kSparseBlocksPerKV*2) for even kv_iters.
   constexpr int kAlign = kSparseBlocksPerKV * 2;  // 8
@@ -75,32 +81,61 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
   }
 
   // ======== Prepare Q ========
-  auto q_bhsd = q.permute({0, 2, 1, 3}).contiguous();
-  auto q_padded = torch::zeros({batch, heads, rows_padded, kQkK}, q.options());
-  q_padded.narrow(2, 0, seq_q).copy_(q_bhsd);
-  auto q_tiled = q_padded.view({batch * heads * num_row_tiles, kRows, kQkK}).contiguous();
+  // One strided copy into the padded buffer; only the pad rows need zeroing.
+  auto q_padded = torch::empty({batch, heads, rows_padded, kQkK}, q.options());
+  if (rows_padded > seq_q) {
+    q_padded.narrow(2, seq_q, rows_padded - seq_q).zero_();
+  }
+  q_padded.narrow(2, 0, seq_q).copy_(q.permute({0, 2, 1, 3}));
+  auto q_tiled = q_padded.view({batch * heads * num_row_tiles, kRows, kQkK});
 
   // ======== Prepare K ========
-  auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
   int const total_k_padded = ((seq_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
   int const total_sparse_blocks = total_k_padded / kSparseBlockSize;
-  auto k_padded = torch::zeros({batch, heads, total_k_padded, kQkK}, k.options());
-  k_padded.narrow(2, 0, seq_k).copy_(k_bhsd);
-  auto k_blocks =
-      k_padded.view({batch, heads, total_sparse_blocks, kSparseBlockSize, 2, kDimHalf})
-          .permute({0, 1, 2, 4, 3, 5})
-          .reshape({batch * heads * total_sparse_blocks * 2, kSparseBlockSize, kDimHalf})
-          .contiguous();
+  int const whole_blocks = seq_k / kSparseBlockSize;
+  // (B,H,blocks,2,64,half) is a permutation of (B,S,H,D), so fill it directly.
+  auto k_dst =
+      torch::empty({batch, heads, total_sparse_blocks, 2, kSparseBlockSize, kDimHalf}, k.options());
+  if (whole_blocks > 0) {
+    k_dst.narrow(2, 0, whole_blocks)
+        .copy_(k.narrow(1, 0, whole_blocks * kSparseBlockSize)
+                   .view({batch, whole_blocks, kSparseBlockSize, heads_kv, 2, kDimHalf})
+                   .permute({0, 3, 1, 4, 2, 5}));
+  }
+  if (whole_blocks < total_sparse_blocks) {
+    auto k_tail = k_dst.narrow(2, whole_blocks, total_sparse_blocks - whole_blocks);
+    k_tail.zero_();
+    int const k_rest = seq_k - whole_blocks * kSparseBlockSize;
+    if (k_rest > 0) {
+      k_tail.narrow(4, 0, k_rest)
+          .copy_(k.narrow(1, whole_blocks * kSparseBlockSize, k_rest)
+                     .view({batch, 1, k_rest, heads_kv, 2, kDimHalf})
+                     .permute({0, 3, 1, 4, 2, 5}));
+    }
+  }
+  auto k_blocks = k_dst.view({batch * heads * total_sparse_blocks * 2, kSparseBlockSize, kDimHalf});
 
   // ======== Prepare V ========
-  auto v_bhds = v.permute({0, 2, 3, 1}).contiguous();
-  auto v_padded = torch::zeros({batch, heads, kOutputCols, total_k_padded}, v.options());
-  v_padded.narrow(3, 0, seq_k).copy_(v_bhds);
-  auto v_blocks =
-      v_padded.view({batch, heads, 2, kDimHalf, total_sparse_blocks, kSparseBlockSize})
-          .permute({0, 1, 4, 2, 3, 5})
-          .reshape({batch * heads * total_sparse_blocks * 2, kDimHalf, kSparseBlockSize})
-          .contiguous();
+  auto v_dst =
+      torch::empty({batch, heads, total_sparse_blocks, 2, kDimHalf, kSparseBlockSize}, v.options());
+  if (whole_blocks > 0) {
+    v_dst.narrow(2, 0, whole_blocks)
+        .copy_(v.narrow(1, 0, whole_blocks * kSparseBlockSize)
+                   .view({batch, whole_blocks, kSparseBlockSize, heads_kv, 2, kDimHalf})
+                   .permute({0, 3, 1, 4, 5, 2}));
+  }
+  if (whole_blocks < total_sparse_blocks) {
+    auto v_tail = v_dst.narrow(2, whole_blocks, total_sparse_blocks - whole_blocks);
+    v_tail.zero_();
+    int const v_rest = seq_k - whole_blocks * kSparseBlockSize;
+    if (v_rest > 0) {
+      v_tail.narrow(5, 0, v_rest)
+          .copy_(v.narrow(1, whole_blocks * kSparseBlockSize, v_rest)
+                     .view({batch, 1, v_rest, heads_kv, 2, kDimHalf})
+                     .permute({0, 3, 1, 4, 5, 2}));
+    }
+  }
+  auto v_blocks = v_dst.view({batch * heads * total_sparse_blocks * 2, kDimHalf, kSparseBlockSize});
 
   auto out_flat = torch::zeros({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
   auto lse_flat =
