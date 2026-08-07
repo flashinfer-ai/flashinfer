@@ -70,6 +70,10 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 # consumes multiple records per MMA tile. The current attention core consumes
 # one record per KV128 compute tile.
 _BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE = 128
+# CLC work stealing needs roughly two waves of independent sparse rows to
+# amortize its request/response path.  Below that point, a direct static grid
+# avoids scheduler overhead without sacrificing useful device parallelism.
+_BLOCK_SPARSE_CLC_MIN_WAVES = 2
 # CLC task dequeue overhead is visible for short sparse causal launches. In a
 # B200 FP16 Q128/KV64 probe, fixed-top-7 latency CLC/static is 1.522 at 2.6
 # waves and 0.879 at 5.2, while short rows with at most three routes remain
@@ -480,7 +484,9 @@ def _resolve_block_sparse_launch_spec(
                 num_q_tiles=ceil_div(seq_len_q, q_tile_size),
                 tile_size_kv=_BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE,
                 persistent_min_waves=(
-                    _CAUSAL_CLC_WAVE_THRESHOLD if mask_type == "causal" else 1
+                    _CAUSAL_CLC_WAVE_THRESHOLD
+                    if mask_type == "causal"
+                    else _BLOCK_SPARSE_CLC_MIN_WAVES
                 ),
                 persistent_min_tiles_per_cta=(
                     _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1

@@ -1654,10 +1654,10 @@ def _build_decode_gen_schedule(
         if use_one_inst_qkv:
             tmem_allocator.add_resource(tmem_s0)
         else:
-            # Build each instruction-local phase from resources that really
-            # use TMEM. P may overlay S or live in SMEM, while stats may use
-            # standalone TMEM or an SMEM handoff. Empty resources must not
-            # become scheduler aliases.
+            # Build the two instruction-local phases from the resources that
+            # actually use TMEM.  Depending on the profile, P can overlay S
+            # or live in SMEM, and stats can be standalone TMEM or an SMEM
+            # handoff.  Empty resources must not become scheduler aliases.
             for tmem_s, p in (
                 (tmem_s0, smem_p0),
                 (tmem_s1, smem_p1),

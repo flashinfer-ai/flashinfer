@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import inspect
 import math
+import warnings
 
 import pytest
 import torch
@@ -1125,6 +1126,78 @@ def test_block_sparse_parallel_kv_load_policy(
     )
 
 
+@pytest.mark.parametrize(
+    ("use_persistent_scheduler", "expected_load_warps", "expected_tail_task"),
+    (
+        pytest.param(False, (13, 14), ("PaddingTask", 15), id="static"),
+        pytest.param(True, (15, 14), ("SchedulerTask", 13), id="clc"),
+    ),
+)
+def test_q8_b8_parallel_load_tasks_partition_resources(
+    use_persistent_scheduler: bool,
+    expected_load_warps: tuple[int, int],
+    expected_tail_task: tuple[str, int],
+) -> None:
+    """Q8/B8 dual issuers keep their warp roles and inst-local resources."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _build_decode_gen_schedule,
+    )
+
+    cfg = block_sparse_module._make_block_sparse_config(
+        batch_size=1,
+        seq_len_q=128,
+        seq_len_kv=1024,
+        num_heads=8,
+        head_dim=_HEAD_DIM,
+        q_block_size=8,
+        kv_block_size=8,
+        dtype_key="bfloat16",
+        mask_type="dense",
+        use_kv_valid_bits=False,
+        use_persistent_scheduler=use_persistent_scheduler,
+        use_parallel_sparse_kv_loads=True,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        tasks, *_ = _build_decode_gen_schedule(
+            cfg,
+            total_kv_tiles=8,
+            num_heads_kv=8,
+        )
+
+    tasks_by_name = {task.name: task for task in tasks}
+    load0 = tasks_by_name["LoadTask0"]
+    load1 = tasks_by_name["LoadTask1"]
+    assert (load0.warp_idx, load1.warp_idx) == expected_load_warps
+    assert load0.num_warps == load1.num_warps == 1
+
+    src0 = {resource.name for resource in load0.src_resources}
+    src1 = {resource.name for resource in load1.src_resources}
+    dst0 = {resource.name for resource in load0.dst_resources}
+    dst1 = {resource.name for resource in load1.dst_resources}
+    shared_sources = {"work_queue"} if use_persistent_scheduler else set()
+    assert src0 & src1 == shared_sources
+    assert dst0.isdisjoint(dst1)
+    assert dst0 == {
+        "smemQ",
+        "smemK0",
+        "smemV0",
+        "smemBlockSparseKvMetadata0",
+        "smemBlockSparseSoftmaxMetadata0",
+    } | ({"schedule_token_throttle"} if use_persistent_scheduler else set())
+    assert dst1 == {
+        "smemK1",
+        "smemV1",
+        "smemBlockSparseKvMetadata1",
+        "smemBlockSparseSoftmaxMetadata1",
+    }
+
+    tail_task_name, tail_warp_idx = expected_tail_task
+    tail_task = tasks_by_name[tail_task_name]
+    assert (tail_task.warp_idx, tail_task.num_warps) == (tail_warp_idx, 1)
+
+
 def test_swaps_sparse_mask_profile_policy() -> None:
     """Each selected SWAP profile has one explicit mask strategy."""
 
@@ -1234,6 +1307,63 @@ def test_parallel_sparse_kv_load_capability_is_independent_of_q_tile_size() -> N
         use_parallel_sparse_kv_loads=True,
     )
     cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+
+
+def test_block_sparse_clc_requires_about_two_sm_waves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial second wave stays static; CLC starts beyond two waves."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    class _FourSmHardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 4
+
+    monkeypatch.setattr(
+        fmha_decode_config.utils,
+        "HardwareInfo",
+        _FourSmHardware,
+    )
+    monkeypatch.setattr(
+        block_sparse_module,
+        "_make_block_sparse_config",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+
+    common_arguments = dict(
+        device_index=0,
+        batch_size=1,
+        seq_len_kv=4096,
+        num_heads=5,
+        head_dim=_HEAD_DIM,
+        q_block_size=64,
+        kv_block_size=64,
+        dtype_key="bf16",
+        mask_type="dense",
+        use_kv_valid_bits=True,
+        max_row_route_capacity=8,
+    )
+    block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        launch_specs = tuple(
+            dict(
+                block_sparse_module._resolve_block_sparse_launch_spec(
+                    **common_arguments,
+                    seq_len_q=seq_len_q,
+                ).policy
+            )
+            for seq_len_q in (64, 128)
+        )
+    finally:
+        block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
+
+    # Five CTAs are only 1.25 waves on this synthetic device; ten CTAs provide
+    # enough work for CLC to steal after its request/response overhead.
+    assert tuple(
+        spec["use_persistent_scheduler"] for spec in launch_specs
+    ) == (False, True)
 
 
 def test_clc_capacity_gates_control_launch_resolution(
