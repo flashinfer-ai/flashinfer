@@ -229,6 +229,25 @@ def validate_mega_arch() -> None:
         )
 
 
+def validate_mega_arch_sm90() -> None:
+    """Arch gate for the SM90 (Hopper) mega kernels.
+
+    The Hopper FP8 CuTeDSL mega kernel is compiled for sm_90 exactly (WGMMA
+    warp specialization; the fork is 1-CTA-only and does not target Blackwell
+    — Blackwell hosts use the sm_100 tree's kernels instead).
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc != (9, 0):
+        raise MoEEpArchError(
+            f"sm90_pull_fp8 mega kernel requires sm_90 (Hopper); host has "
+            f"sm_{cc[0]}{cc[1]}"
+        )
+
+
 def validate_fleet_weights(
     weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:

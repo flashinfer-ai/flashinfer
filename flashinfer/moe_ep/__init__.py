@@ -50,6 +50,14 @@ from .backends.mega.kernel.nvfp4_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm90_pull_fp8 import (
+    Sm90PullFp8MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm90_push_fp8 import (
+    Sm90PushFp8MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -156,8 +164,10 @@ __all__ = [
     "NCCLEPConfig",
     "NcclEpConfig",
     "Nvfp4CutedslMegaMoeConfig",
+    "Sm90PushFp8MegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm90PullFp8MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
@@ -176,6 +186,8 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm90_pull_fp8_mega_weights",
+    "preprocess_sm90_push_fp8_mega_weights",
     "run_split_kernel",
     "supports_fault_tolerance",
     "validate_arch_for_backend",
