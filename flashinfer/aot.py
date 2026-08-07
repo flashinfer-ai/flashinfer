@@ -602,7 +602,11 @@ def gen_all_modules(
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).
-            jit_specs.append(gen_monomoe_module())
+            # Requires CUDA 12.8+: ptxas 12.6 rejects the TMA instruction
+            # used in tma_load_2d().  A proper PTX fix (shared::cluster form)
+            # is pending in a separate PR.
+            if get_cuda_version() >= Version("12.8"):
+                jit_specs.append(gen_monomoe_module())
         if has_sm100:
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
