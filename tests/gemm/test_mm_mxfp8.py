@@ -11,6 +11,7 @@ from flashinfer import (
 )
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.gemm import gemm_base
+from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
 
@@ -54,11 +55,8 @@ def _skip_if_unsupported(backend: str = "cutlass"):
     if backend == "b12x":
         if torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x mm_mxfp8 requires CUDA 13+")
-        try:
-            import cutlass.cute as cute
-        except ImportError:
-            pytest.skip("nvidia-cutlass-dsl not installed")
-        if not hasattr(cute.nvgpu.warp, "MmaMXF8Op"):
+        # Not a hasattr(MmaMXF8Op) probe: the op exists on versions the gate rejects.
+        if not _b12x_mxfp8_dsl_supported():
             pytest.skip("b12x mm_mxfp8 requires nvidia-cutlass-dsl >= 4.6.0")
 
 
