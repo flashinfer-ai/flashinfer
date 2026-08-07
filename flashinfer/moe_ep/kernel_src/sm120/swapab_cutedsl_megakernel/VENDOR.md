@@ -52,18 +52,22 @@ replace, what to audit) lives in `SKILL.md`.
   dense data; the drop's ±0.5-sparse test data never reaches any clamp, so
   its own runner cannot see this). The FI backend rejects a set clamp; the
   shim keeps passing it to the ctor for a fixed drop.
-- **world_size<=2 numerics with `mma_tiler` N=128**: silently wrong outputs.
+- **`mma_tiler` N=128 numerics (every world size)**: silently wrong outputs.
   world_size=1 (`MEGA_NO_DIST`): 5–20% of cells off (worst-hit tokens
   scattered per expert), reproduced with the drop's own `mega_runner` at
   `MEGA_NO_DIST=1 --mma_tiler_mnk 64,128,128` on both its standard geometry
-  and ours. world_size=2 (verified 2026-08-07 on RTX PRO 6000 and RTX 6000D,
-  rank-sharing, dense data): rel-L2 vs the bf16 dense reference sits in the
-  ~6.35% MXFP8 band while tokens/rank <= 8 and degrades once tokens fill
-  past an N=64 tile (10–28% across 16..8192 tokens/rank, magnitude varying
-  run-to-run — consistent with a race). N=64 stays in band at every ws2
-  point tested; the same N=128 tile is bit-exact at world_size=4. The FI
-  backend pins `mma_tiler_mnk=(64, 64, 128)` for world_size<=2 unless the
-  caller passes an explicit tiler knob; avoid N=128 below world_size=4
+  and ours. world_size=2 and 4 (verified 2026-08-07 on RTX PRO 6000 and RTX
+  6000D, rank-sharing, dense data, deepseek_v3 geometry): rel-L2 vs the
+  bf16 dense reference sits in the ~6.35% MXFP8 band at small tokens/rank
+  and degrades once tokens fill past an N=64 tile — ws2: 10–28% across
+  16..8192 tokens/rank; ws4: 8–25% across 8..4096 — with run-to-run
+  magnitude variation (consistent with a race). N=64 stays in band at every
+  point tested (ws1/ws2/ws4, up to 8192 tokens/rank), at ~23% lower
+  large-batch throughput. NOTE: the earlier "bit-exact at world_size=4 with
+  N=128" observation came from the drop's 1%-sparse ±0.5 test data, which
+  cannot see this failure; dense activations expose it at every world size.
+  The FI backend pins `mma_tiler_mnk=(64, 64, 128)` at all world sizes
+  unless the caller passes an explicit tiler knob; avoid N=128 entirely
   until a fixed drop.
 
 ## Pending local diffs vs upstream

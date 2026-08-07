@@ -142,17 +142,17 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         fp = fleet_params
         knobs = k.knobs
-        if self.ep_world_size <= 2 and (
-            knobs is None or "mma_tiler_mnk" not in knobs
-        ):
+        if knobs is None or "mma_tiler_mnk" not in knobs:
             # The drop's shim-default tiler N=128 produces silently wrong
-            # output cells at world_size 1 (verified 2026-08-06) AND
-            # world_size 2 (verified 2026-08-07: dense-data rel-L2 vs the
-            # bf16 dense reference grows from the ~6.35% MXFP8 band to >20%
-            # once tokens fill past an N=64 tile; N=64 stays in band).
-            # world_size 4 with N=128 remains bit-exact upstream, so only
-            # ws<=2 is pinned. See VENDOR.md; an explicit mma_tiler_mnk knob
-            # overrides this pin.
+            # output cells at EVERY world size on dense data (verified
+            # 2026-08-06 at ws1, 2026-08-07 at ws2 and ws4 on RTX PRO 6000 /
+            # RTX 6000D): rel-L2 vs the bf16 dense reference degrades from
+            # the ~6.35% MXFP8 band to 8-28% once tokens fill past an N=64
+            # tile, with run-to-run magnitude variation (race-like). The
+            # drop's own ws4 "bit-exact" check used 1%-sparse test data,
+            # which cannot see it. N=64 stays in band everywhere (~23%
+            # slower at large batch). See VENDOR.md; an explicit
+            # mma_tiler_mnk knob overrides this pin.
             knobs = {**(knobs or {}), "mma_tiler_mnk": (64, 64, 128)}
         return get_symm_buffer_for_sm120_mxfp8_mega_moe(
             fp.num_experts,
