@@ -14,12 +14,14 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+bmm_mxfp8_N128_K128.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -73,6 +75,7 @@ top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
+trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -403,11 +406,36 @@ with contextlib.suppress(Exception):
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
 try:
     M, K, N = 128, 4096, 4096
+    scale_cols = (K // 32 + 3) // 4 * 4
+    a_scale_size = ((M + 127) // 128 * 128) * scale_cols
+    b_scale_size = ((N + 127) // 128 * 128) * scale_cols
     a_mxfp8 = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
-    b_mxfp8 = torch.zeros(K, N, dtype=torch.float8_e4m3fn, device=device)
-    a_ds = torch.ones(M, K // 32, dtype=torch.uint8, device=device)
-    b_ds = torch.ones(K // 32, N, dtype=torch.uint8, device=device)
-    flashinfer.gemm.mm_mxfp8(a_mxfp8, b_mxfp8, a_ds, b_ds)
+    weight_mxfp8 = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    a_ds = torch.full((a_scale_size,), 127, dtype=torch.uint8, device=device)
+    b_ds = torch.full((b_scale_size,), 127, dtype=torch.uint8, device=device)
+    flashinfer.gemm.mm_mxfp8(a_mxfp8, weight_mxfp8.T, a_ds, b_ds)
+except Exception:
+    pass  # Requires Blackwell (SM100+)
+
+# ── BMM mxfp8 (Blackwell SM100+: 2×128×128, block=32) ────────────────────────
+try:
+    batch_size, M, K, N = 2, 128, 128, 128
+    scale_cols = (K // 32 + 3) // 4 * 4
+    a_scale_size = batch_size * ((M + 127) // 128 * 128) * scale_cols
+    b_scale_size = batch_size * ((N + 127) // 128 * 128) * scale_cols
+    a_mxfp8 = torch.zeros(batch_size, M, K, dtype=torch.float8_e4m3fn, device=device)
+    weight_mxfp8 = torch.zeros(
+        batch_size, N, K, dtype=torch.float8_e4m3fn, device=device
+    )
+    a_ds = torch.full((a_scale_size,), 127, dtype=torch.uint8, device=device)
+    b_ds = torch.full((b_scale_size,), 127, dtype=torch.uint8, device=device)
+    flashinfer.gemm.bmm_mxfp8(
+        a_mxfp8,
+        weight_mxfp8.transpose(-2, -1),
+        a_ds,
+        b_ds,
+        torch.bfloat16,
+    )
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
@@ -676,6 +704,37 @@ flashinfer.kda_decode.recurrent_kda(
     beta_is_logit=True,
 )
 
+# ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
+fk_N, fk_H, fk_D = 4, 12, 128
+fk_hidden = fk_H * fk_D
+fk_x = torch.randn(fk_N, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+fk_weight = torch.randn(3, 4, fk_hidden, dtype=torch.float32, device=device)
+fk_conv_storage = torch.zeros(
+    fk_N + 1, 3 * fk_hidden, 3, dtype=torch.bfloat16, device=device
+)
+fk_conv_state = fk_conv_storage.transpose(1, 2).contiguous().transpose(1, 2)
+fk_raw_gate = torch.randn(1, fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_raw_beta = torch.randn(1, fk_N, fk_H, dtype=torch.bfloat16, device=device)
+fk_A_log = torch.randn(fk_H, dtype=torch.float32, device=device)
+fk_dt_bias = torch.randn(fk_hidden, dtype=torch.float32, device=device)
+fk_indices = torch.arange(fk_N, 0, -1, dtype=torch.int32, device=device)
+fk_state = torch.zeros(fk_N + 1, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
+fk_output_gate = torch.randn(fk_N, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fk_norm_weight = torch.randn(fk_D, dtype=torch.float32, device=device)
+flashinfer.kda_decode.fused_kda_decode(
+    fk_x,
+    fk_weight,
+    fk_conv_state,
+    fk_raw_gate,
+    fk_raw_beta,
+    fk_A_log,
+    fk_dt_bias,
+    fk_indices,
+    fk_state,
+    fk_output_gate,
+    fk_norm_weight,
+)
+
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
 # Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.
 # Routing is fused in-kernel from router_logits.  SM90a-only and JIT-built,
@@ -807,6 +866,41 @@ with contextlib.suppress(Exception):
         routing_method_type=5,
         **_moe_common,
     )
+
+
+# ── Routed MoE FP8 per-tensor scale (packed expert ids + weights) ────────────
+_routed_topk_ids = (
+    torch.arange(T_moe * 8, dtype=torch.int32, device=device).reshape(T_moe, 8) % E_loc
+)
+_routed_topk_weights = torch.full(
+    (T_moe, 8), 1.0 / 8.0, dtype=torch.bfloat16, device=device
+)
+_routed_packed_topk = (_routed_topk_ids << 16) | _routed_topk_weights.view(
+    torch.int16
+).to(torch.int32)
+_routed_scales = torch.ones(E_loc, dtype=torch.float32, device=device)
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_routed_moe(
+        topk_ids=_routed_packed_topk,
+        routing_bias=None,
+        hidden_states=hs,
+        gemm1_weights=w1,
+        output1_scales_scalar=_routed_scales,
+        output1_scales_gate_scalar=_routed_scales,
+        gemm2_weights=w2,
+        output2_scales_scalar=_routed_scales,
+        num_experts=E_tot,
+        top_k=8,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=I_moe,
+        local_expert_offset=0,
+        local_num_experts=E_loc,
+        routed_scaling_factor=None,
+        use_routing_scales_on_input=False,
+        routing_method_type=1,
+    )
+
 
 # ── MoE FP4 (NvFP4, 256 experts, 32 local, h=7168, i=2048) ──────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,

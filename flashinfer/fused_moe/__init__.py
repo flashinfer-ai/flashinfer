@@ -44,6 +44,7 @@ from .runners import (  # noqa: F401
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
@@ -63,6 +64,7 @@ from .core import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -143,6 +145,7 @@ __all__ = [
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",
+    "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
@@ -175,6 +178,7 @@ __all__ = [
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
+    "trtllm_fp8_per_tensor_scale_routed_moe",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",

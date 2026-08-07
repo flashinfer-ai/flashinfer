@@ -4,6 +4,7 @@ from flashinfer.artifacts import (
     get_subdir_file_list,
 )
 
+import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
@@ -224,6 +225,27 @@ def _mock_file_index_responses():
     responses.add(
         responses.GET, deepgemm_source, body=success_deepgemm_response, status=200
     )
+    # The Rubin pins list the *same* sm100f kernel filenames as their non-Rubin
+    # counterparts (built from different sources), so reuse the same directory
+    # index bodies. This is what makes bare-filename checksum keys collide.
+    bmm_rubin_source = safe_urljoin(
+        test_cubin_repository, artifact_paths.TRTLLM_GEN_BMM_RUBIN
+    )
+    responses.add(
+        responses.GET, bmm_rubin_source, body=success_bmm_response, status=200
+    )
+    gemm_rubin_source = safe_urljoin(
+        test_cubin_repository, artifact_paths.TRTLLM_GEN_GEMM_RUBIN
+    )
+    responses.add(
+        responses.GET, gemm_rubin_source, body=success_gemm_response, status=200
+    )
+    deepgemm_rubin_source = safe_urljoin(
+        test_cubin_repository, artifact_paths.DEEPGEMM_RUBIN
+    )
+    responses.add(
+        responses.GET, deepgemm_rubin_source, body=success_deepgemm_response, status=200
+    )
 
 
 @responses.activate
@@ -278,6 +300,50 @@ def test_get_available_cubin_files_non_200_response():
     assert available_cubin_files == ()
 
 
+def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
+    """An artifact pin whose checksums.txt cannot be fetched must fail loudly.
+
+    Guards the diagnosis path exercised by #4280: a pin added to `cubin_dirs`
+    without a published (or, in tests, mocked) manifest used to surface as a bare
+    FileNotFoundError on a local cache path, which reads like a corrupt cache
+    rather than an unreachable pin. `download_file` is stubbed rather than mocked
+    over HTTP so the test does not pay its 4 retries of exponential backoff.
+    """
+    from flashinfer import artifacts
+
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    # The pin must be named -- that is the whole point of the error.
+    assert artifact_paths.DEEPGEMM_RUBIN in str(excinfo.value)
+
+
+def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
+    """A failed refresh must not invalidate an already-cached manifest.
+
+    Offline / FLASHINFER_NO_DOWNLOAD setups rely on the on-disk copy.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
+    cached.parent.mkdir(parents=True)
+    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+
+    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    assert checksums == {
+        safe_urljoin(
+            artifact_paths.DEEPGEMM_RUBIN,
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+        ): "abc123"
+    }
+
+
 @responses.activate
 def test_get_subdir_file_list(monkeypatch, tmp_path):
     _mock_file_index_responses()
@@ -311,11 +377,34 @@ b5c6d7e8f9a0 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x
 c6d7e8f9a0b1 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
 """
 
+    # Rubin pins: identical kernel filenames to the non-Rubin pins above, but
+    # every hash differs (they are built from different sources). Keying the
+    # checksum map by bare filename would let whichever pin is processed last
+    # overwrite the other's hashes.
+    checksums_bmm_rubin = """1111111111111111111111111111111111111111111111111111111111111111 include/flashinferMetaInfo.h
+aaaa111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
+bbbb111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_clmp_dynBatch_sm100f.cubin
+cccc111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
+"""
+
+    checksums_gemm_rubin = """2222222222222222222222222222222222222222222222222222222222222222 include/flashinferMetaInfo.h
+dddd111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+eeee111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+ffff111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+"""
+
     checksums_deepgemm = """b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48 kernel_map.json
 a0b1c2d3e4f5 kernel.fp8_m_grouped_gemm.007404769193.cubin
 d7e8f9a0b1c2 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
 e8f9a0b1c2d3 kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
 f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
+"""
+
+    checksums_deepgemm_rubin = """3333333333333333333333333333333333333333333333333333333333333333 kernel_map.json
+1111aaaabbbbcccc kernel.fp8_m_grouped_gemm.007404769193.cubin
+2222aaaabbbbcccc kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
+3333aaaabbbbcccc kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
+4444aaaabbbbcccc kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 """
 
     # Add mock responses for checksums.txt files
@@ -337,11 +426,38 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
     )
     responses.add(responses.GET, bmm_checksums_url, body=checksums_bmm, status=200)
 
+    bmm_rubin_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.TRTLLM_GEN_BMM_RUBIN, "checksums.txt"),
+    )
+    responses.add(
+        responses.GET, bmm_rubin_checksums_url, body=checksums_bmm_rubin, status=200
+    )
+
+    gemm_rubin_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.TRTLLM_GEN_GEMM_RUBIN, "checksums.txt"),
+    )
+    responses.add(
+        responses.GET, gemm_rubin_checksums_url, body=checksums_gemm_rubin, status=200
+    )
+
     deepgemm_checksums_url = safe_urljoin(
         test_cubin_repository, safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
     )
     responses.add(
         responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
+    )
+
+    deepgemm_rubin_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+    )
+    responses.add(
+        responses.GET,
+        deepgemm_rubin_checksums_url,
+        body=checksums_deepgemm_rubin,
+        status=200,
     )
 
     # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
@@ -410,6 +526,40 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
         if "include/flashInferMetaInfo.h" in url
         or "include/flashinferMetaInfo.h" in url
     ]
-    assert len(meta_info_headers) == 3, (
-        f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
+    # FMHA, GEMM, BMM, GEMM_RUBIN, BMM_RUBIN.
+    assert len(meta_info_headers) == 5, (
+        f"Meta info headers count mismatch. Expected 5, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
     )
+
+    # Regression: per-arch pins share kernel filenames but not hashes, so each
+    # entry must carry the checksum from its own pin. Keying the checksum map
+    # by bare filename let the pin processed last overwrite the earlier one,
+    # which failed verification for every shared name.
+    by_path = dict(cubin_files)
+    assert len(by_path) == len(cubin_files), "duplicate paths in cubin file list"
+
+    for shared_name, plain_dir, rubin_dir in (
+        (
+            "Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_clmp_dynBatch_sm100f.cubin",
+            artifact_paths.TRTLLM_GEN_BMM,
+            artifact_paths.TRTLLM_GEN_BMM_RUBIN,
+        ),
+        (
+            "Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin",
+            artifact_paths.TRTLLM_GEN_GEMM,
+            artifact_paths.TRTLLM_GEN_GEMM_RUBIN,
+        ),
+        (
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+            artifact_paths.DEEPGEMM,
+            artifact_paths.DEEPGEMM_RUBIN,
+        ),
+    ):
+        plain_path = safe_urljoin(plain_dir, shared_name)
+        rubin_path = safe_urljoin(rubin_dir, shared_name)
+        assert plain_path in by_path, f"{plain_path} missing from cubin file list"
+        assert rubin_path in by_path, f"{rubin_path} missing from cubin file list"
+        assert by_path[plain_path] != by_path[rubin_path], (
+            f"{shared_name} resolved to the same checksum for both pins "
+            f"({by_path[plain_path]}) -- the per-pin hashes collided"
+        )

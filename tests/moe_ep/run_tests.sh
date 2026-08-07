@@ -11,17 +11,18 @@
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
+#   bash tests/moe_ep/run_tests.sh ft            # 4-GPU fault tolerance (kills a rank)
 #
-# Install (split NCCL-EP + mega runtime deps):
-#   bash fast_install.sh
-#   # equivalent: BUILD_NCCL_EP=1 pip install -e ".[nvep]" --no-build-isolation
+# Install (transport libs build by default, best-effort):
+#   pip install --no-build-isolation -e .
+#   # strict (missing NIXL-EP build deps become hard errors): BUILD_NIXL_EP=1
 #
 # Requires:
 #   - FLASHINFER repo root on PYTHONPATH (handled below)
-#   - multirank/smoke/correctness: nccl.ep + staged libnccl_ep.so (fast_install.sh)
+#   - multirank/smoke/correctness: nccl.ep importable (built by the install above)
 #   - multirank/smoke/correctness: >=4 GPUs
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
-#   - optional NIXL smoke: FI_BUILD_NIXL_EP=1 / BUILD_NIXL_EP=1 install
+#   - optional NIXL smoke: BUILD_NIXL_EP=1 install
 
 set -uo pipefail
 
@@ -58,7 +59,7 @@ require_nccl_ep() {
     return 0
   fi
   echo "nccl_ep backend not available." >&2
-  echo "Install with: bash fast_install.sh  (or BUILD_NCCL_EP=1 pip install -e \".[nvep]\")" >&2
+  echo "Install with: pip install --no-build-isolation -e .  (transport libs build by default)" >&2
   return 1
 }
 
@@ -94,6 +95,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
+    --ignore=tests/moe_ep/test_mega_cuda_graph.py \
     -k "not multirank_roundtrip"
 }
 
@@ -123,7 +125,7 @@ run_multirank() {
       tests/moe_ep/test_split_kernels.py -v \
       -m "nvep and gpu_4" --backend=nixl_ep || rc=1
   else
-    echo "nixl_ep not built; skipping NIXL multirank (set FI_BUILD_NIXL_EP=1 in fast_install.sh)"
+    echo "nixl_ep not built; skipping NIXL multirank (rebuild with BUILD_NIXL_EP=1 pip install -e .)"
   fi
 
   return "${rc}"
@@ -179,8 +181,15 @@ run_oracle() {
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
 
+  # CUDA graph capture/replay for the cutedsl mega layer paths (1 GPU).
+  MEGA_NO_DIST=1 "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph.py -v \
+    -m arch_blackwell || rc=1
+
   # deep_gemm's symm buffer needs an initialized process group (no
-  # MEGA_NO_DIST equivalent), hence the 1-proc torchrun.
+  # MEGA_NO_DIST equivalent). The test self-bootstraps a 1-rank group under
+  # plain pytest; the 1-proc torchrun here also exercises its env:// path.
   "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \
@@ -204,6 +213,41 @@ run_mega() {
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
+
+  return "${rc}"
+}
+
+# Fault tolerance. Split into a pytest half (a STALLED rank -- every process
+# survives, so it runs under torchrun -m pytest) and a smoke half (a rank that
+# really dies). The smoke half cannot be a pytest test: torchrun reports the
+# victim's non-zero exit, which would fail the survivors' session even when
+# they behaved correctly. Judge it by counting SMOKE_RESULT lines instead.
+run_ft() {
+  local rc=0
+  local expected_ok=$(( NPROC_SMOKE - 1 ))
+
+  for backend in nccl_ep nixl_ep; do
+    if ! "${PY}" -c "from flashinfer.moe_ep import supports_fault_tolerance as s; raise SystemExit(0 if s('${backend}') else 1)"; then
+      echo "${backend} cannot serve the FT API here; skipping its FT tests"
+      continue
+    fi
+
+    "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" \
+      tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py -v \
+      -m "nvep and gpu_4" --backend="${backend}" || rc=1
+
+    local out
+    out="$("${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" --max-restarts=0 \
+      tests/moe_ep/smoke_ft_ep.py --backend "${backend}" 2>&1)" || true
+    echo "${out}"
+    local ok
+    ok="$(printf '%s' "${out}" | grep -c 'SMOKE_RESULT:' || true)"
+    if [ "${ok}" -ne "${expected_ok}" ]; then
+      echo "FT smoke (${backend}): expected ${expected_ok} SMOKE_RESULT lines, got ${ok}" >&2
+      rc=1
+    fi
+  done
 
   return "${rc}"
 }
@@ -269,9 +313,10 @@ case "${1:-all}" in
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
+  ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|all]" >&2
+    echo "Usage: $0 [unit|oracle|multirank|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

@@ -96,6 +96,19 @@ __device__ __forceinline__ float ieee_div(float a, float b) {
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
+// On SM107 (Rubin), ptxas can allocate >64 regs/thread for these 1024-thread
+// sampling kernels, which exceeds the 65536-register SM budget and fails with
+// "too many resources requested for launch" (internal MR !611 / feat_sm107).
+// Gate __launch_bounds__ to native sm_107* compiles only so other arches keep
+// unconstrained register allocation (avoids the B300/H100 spill regression in
+// NVBug 6517769). When SM107 is mapped to sm_100f at JIT time, this gate is
+// inactive; that path inherits sm_100 register counts which already fit.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
+#define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
+#else
+#define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads)
+#endif
+
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
 #define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
 #endif
@@ -290,7 +303,7 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, bool CACHE_INPUT>
-__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
     DType* logits, DType* output, DType* temperature_arr, DType temperature_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
@@ -407,7 +420,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxFusedKernel(
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
     DType* logits, PartialSoftmaxResult* partial_results, DType* temperature_arr,
     float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
@@ -492,7 +505,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ __launch_bounds__(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
     DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
     float temperature_val, uint32_t d, uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
@@ -720,7 +733,7 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromLogitsKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLogitsKernel(
     DType* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
     uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -769,7 +782,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromLogitsKernel(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromProbKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, uint32_t d, uint64_t* seed_arr,
     uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   curandStatePhilox4_32_10_t state;
@@ -833,7 +846,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void SamplingFromProbKernel(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void TopKSamplingFromProbKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
     uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
     uint64_t offset_val) {
@@ -966,7 +979,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void TopKSamplingFromProbKernel(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void TopPSamplingFromProbKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, float* top_p_arr, float top_p_val,
     uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
@@ -1092,7 +1105,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void TopPSamplingFromProbKernel(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void MinPSamplingFromProbKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFromProbKernel(
     DType* probs, float* min_p_arr, IdType* output, bool* valid, IdType* indices, float min_p_val,
     uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -1186,7 +1199,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void MinPSamplingFromProbKernel(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
     DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
     IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
     uint64_t* offset_arr, uint64_t offset_val) {
@@ -1656,10 +1669,8 @@ struct RenormTempStorage {
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType>
-__global__ __launch_bounds__(BLOCK_THREADS) void TopPRenormProbKernel(DType* probs,
-                                                                      DType* renormed_prob,
-                                                                      float* top_p_arr,
-                                                                      float top_p_val, uint32_t d) {
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbKernel(
+    DType* probs, DType* renormed_prob, float* top_p_arr, float top_p_val, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
@@ -1855,7 +1866,7 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ __launch_bounds__(BLOCK_THREADS) void ChainSpeculativeSampling(
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativeSampling(
     DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num,
     uint32_t num_speculative_tokens, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,

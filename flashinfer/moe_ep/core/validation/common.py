@@ -10,7 +10,7 @@ from ...weights import MoEWeightPack
 if TYPE_CHECKING:
     import torch
 
-    from ...algo_knobs import FleetAlgoKnobQuantization
+    from ...algo_knobs import FleetAlgoKnobFaultTolerance, FleetAlgoKnobQuantization
 
 
 _NIXL_EP_SUPPORTED_HIDDEN_SIZES = frozenset(
@@ -278,7 +278,14 @@ def validate_mega_fleet_params(
     *,
     intermediate_size: int,
     top_k: int,
+    alignment: int = 128,
 ) -> None:
+    # ``alignment`` is backend-specific: deep_gemm's wire format stores scale
+    # factors 4-per-int32 word (hidden/128 columns, static-asserted host and
+    # device side), so it needs 128. The cutedsl kernels tile with ceil-div +
+    # TMA zero-fill and predicated epilogue tails; their true bound is the
+    # 16B TMA row alignment and SF-word packing, i.e. 64 (verified 2026-07-21
+    # against gpt-oss-120b geometry, hidden=inter=2880).
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
     if params.num_experts % world_size != 0:
@@ -286,13 +293,14 @@ def validate_mega_fleet_params(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
         )
-    if params.token_hidden_size % 128 != 0:
+    if params.token_hidden_size % alignment != 0:
         raise MoEEpConfigError(
-            f"token_hidden_size ({params.token_hidden_size}) must be a multiple of 128"
+            f"token_hidden_size ({params.token_hidden_size}) must be a "
+            f"multiple of {alignment}"
         )
-    if intermediate_size % 128 != 0:
+    if intermediate_size % alignment != 0:
         raise MoEEpConfigError(
-            f"intermediate_size ({intermediate_size}) must be a multiple of 128"
+            f"intermediate_size ({intermediate_size}) must be a multiple of {alignment}"
         )
     if top_k <= 0:
         raise MoEEpConfigError(f"top_k must be positive, got {top_k}")
@@ -348,8 +356,18 @@ def validate_fleet_params(
     world_size: int,
     quant: "FleetAlgoKnobQuantization | None" = None,
     topology_capacity: int | None = None,
+    fault_tolerance: "FleetAlgoKnobFaultTolerance | None" = None,
 ) -> None:
     import torch
+
+    if fault_tolerance is not None and fault_tolerance.enabled:
+        if params.algorithm is not EpAlgorithm.LOW_LATENCY:
+            raise MoEEpConfigError(
+                f"{backend}: fault tolerance (FleetAlgoKnobFaultTolerance) requires "
+                "algorithm=LOW_LATENCY. nccl_ep leaves the mask buffer NULL under "
+                "HIGH_THROUGHPUT and the mask APIs then abort the process; nixl_ep "
+                "has no HT mask support at all."
+            )
 
     if backend == "nixl_ep":
         if params.algorithm is not EpAlgorithm.LOW_LATENCY:
@@ -366,6 +384,14 @@ def validate_fleet_params(
         if cap <= 0:
             raise MoEEpConfigError(
                 f"nixl_ep: topology capacity ({cap}) must be positive"
+            )
+        if cap < world_size:
+            # Buffer.update_memory_buffers sizes every per-rank array (RDMA,
+            # mask, sync) to the capacity, so a capacity below the live world
+            # indexes out of bounds inside the transport rather than here.
+            raise MoEEpConfigError(
+                f"nixl_ep: topology capacity ({cap}) must be >= world_size "
+                f"({world_size})"
             )
         if params.num_experts % cap != 0:
             raise MoEEpConfigError(

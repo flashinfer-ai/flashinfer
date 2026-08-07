@@ -415,6 +415,7 @@ def reference_page_table_transform(
     k: int,
     row_to_batch: torch.Tensor = None,
     row_starts: torch.Tensor = None,
+    page_table_row_starts: torch.Tensor = None,
 ) -> torch.Tensor:
     """Reference implementation for page table transform using torch.topk."""
     num_rows = scores.size(0)
@@ -426,19 +427,26 @@ def reference_page_table_transform(
     for i in range(num_rows):
         length = lengths[i].item()
         row_start = row_starts[i].item() if row_starts is not None else 0
+        page_table_row_start = (
+            page_table_row_starts[i].item()
+            if page_table_row_starts is not None
+            else row_start
+        )
         batch_idx = row_to_batch[i].item() if row_to_batch is not None else i
 
         if length <= k:
             # Trivial case: just copy first `length` entries
             output[i, :length] = src_page_table[
-                batch_idx, row_start : row_start + length
+                batch_idx, page_table_row_start : page_table_row_start + length
             ]
         else:
             # Get top-k indices
             row_scores = scores[i, row_start : row_start + length]
             _, topk_indices = torch.topk(row_scores.float(), k)
             # Gather from page table
-            output[i] = src_page_table[batch_idx, row_start + topk_indices.long()]
+            output[i] = src_page_table[
+                batch_idx, page_table_row_start + topk_indices.long()
+            ]
 
     return output
 
@@ -581,6 +589,8 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
 
 @pytest.mark.parametrize("algo", ["multi_cta", "filtered"])
 @pytest.mark.parametrize("dsa_graph_safe", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("separate_page_table_row_starts", [False, True])
 @pytest.mark.parametrize(
     "num_rows,max_len,k",
     [
@@ -590,9 +600,16 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
     ],
 )
 def test_top_k_transform_with_row_starts(
-    algo, dsa_graph_safe, num_rows, max_len, k, set_topk_algo
+    algo,
+    dsa_graph_safe,
+    deterministic,
+    separate_page_table_row_starts,
+    num_rows,
+    max_len,
+    k,
+    set_topk_algo,
 ):
-    """Transform APIs should honor row_starts windowing with local-index semantics."""
+    """Transform APIs should honor independent score and page-table row starts."""
     if (algo == "filtered" or dsa_graph_safe) and not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
@@ -602,17 +619,25 @@ def test_top_k_transform_with_row_starts(
     base = -torch.arange(max_len, device=device, dtype=torch.float32)
     scores = base.unsqueeze(0).repeat(num_rows, 1).contiguous()
 
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
     max_start = max_len - (k + 1)
     start_stride = max(1, max_start // max(1, num_rows - 1))
-    row_starts = (
-        torch.arange(num_rows, device=device, dtype=torch.int32) * start_stride
-    ).clamp(max=max_start)
+    row_starts = (row_ids * start_stride).clamp(max=max_start)
     max_windows = max_len - row_starts
     lengths = torch.minimum(
         max_windows,
-        k + 1 + (torch.arange(num_rows, device=device, dtype=torch.int32) % 4),
+        k + 1 + (row_ids % 4),
     )
-    offsets = torch.arange(num_rows, device=device, dtype=torch.int32) * 100
+    page_table_row_starts = None
+    if separate_page_table_row_starts:
+        lengths = torch.where(
+            row_ids % 2 == 0,
+            torch.full_like(lengths, k - 1),
+            lengths,
+        )
+        candidate_starts = 7 + 17 * row_ids
+        page_table_row_starts = torch.minimum(candidate_starts, max_len - lengths)
+    offsets = row_ids * 100
     row_to_batch = torch.arange(num_rows - 1, -1, -1, device=device, dtype=torch.int32)
 
     src_page_table = (
@@ -632,7 +657,8 @@ def test_top_k_transform_with_row_starts(
         k,
         row_to_batch=row_to_batch,
         row_starts=row_starts,
-        deterministic=True,
+        page_table_row_starts=page_table_row_starts,
+        deterministic=deterministic,
         dsa_graph_safe=dsa_graph_safe,
     )
     output_ragged = flashinfer.top_k_ragged_transform(
@@ -641,7 +667,7 @@ def test_top_k_transform_with_row_starts(
         lengths,
         k,
         row_starts=row_starts,
-        deterministic=True,
+        deterministic=deterministic,
         dsa_graph_safe=dsa_graph_safe,
     )
     ref_page = reference_page_table_transform(
@@ -651,6 +677,20 @@ def test_top_k_transform_with_row_starts(
         k,
         row_to_batch=row_to_batch,
         row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+    )
+    from flashinfer.trace.templates.sampling import (
+        top_k_page_table_transform_trace,
+    )
+
+    trace_ref_page = top_k_page_table_transform_trace.reference(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
     )
 
     ref_ragged = reference_ragged_transform(
@@ -658,7 +698,9 @@ def test_top_k_transform_with_row_starts(
     )
     output_page_sorted, _ = torch.sort(output_page, dim=-1)
     ref_page_sorted, _ = torch.sort(ref_page, dim=-1)
+    trace_ref_page_sorted, _ = torch.sort(trace_ref_page, dim=-1)
     assert torch.equal(output_page_sorted, ref_page_sorted)
+    assert torch.equal(trace_ref_page_sorted, ref_page_sorted)
 
     output_ragged_sorted, _ = torch.sort(output_ragged, dim=-1)
     ref_ragged_sorted, _ = torch.sort(ref_ragged, dim=-1)
@@ -2031,11 +2073,13 @@ def test_top_k_deterministic_sorted_repeatable_valid_selection_under_ties(
 @pytest.mark.parametrize(
     ("algo", "batch_size", "vocab_size", "k"),
     [
+        ("clusters", 2, 128 * 1024, 2048),
         ("filtered", 2, 128 * 1024, 2048),
         ("filtered", 1, 1024 * 1024, 1024),
         ("filtered", 74, 16 * 1024, 512),
     ],
     ids=[
+        "clusters_override_b2_l128k_k2048",
         "filtered_b2_l128k_k2048",
         "filtered_b1_l1m_k1024",
         "filtered_b74_l16k_k512",
@@ -2043,7 +2087,7 @@ def test_top_k_deterministic_sorted_repeatable_valid_selection_under_ties(
 )
 def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, set_topk_algo):
     """tie_break=1|2 should select row-global smallest/largest pivot indices."""
-    if algo == "filtered" and not can_implement_filtered_topk():
+    if not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
     set_topk_algo(algo)
@@ -2080,23 +2124,25 @@ def test_top_k_tie_break_modes(algo, batch_size, vocab_size, k, set_topk_algo):
 
 
 @pytest.mark.parametrize(
-    ("algo", "num_rows", "max_len", "k"),
+    ("algo", "num_rows", "max_len", "k", "dtype"),
     [
-        ("filtered", 2, 128 * 1024, 2048),
-        ("filtered", 1, 1024 * 1024, 1024),
-        ("filtered", 74, 16 * 1024, 512),
+        ("clusters", 2, 128 * 1024, 2048, torch.bfloat16),
+        ("filtered", 2, 128 * 1024, 2048, torch.bfloat16),
+        ("filtered", 1, 1024 * 1024, 1024, torch.float32),
+        ("filtered", 74, 16 * 1024, 512, torch.float32),
     ],
     ids=[
+        "clusters_override_rows2_l128k_k2048",
         "filtered_rows2_l128k_k2048",
         "filtered_rows1_l1m_k1024",
         "filtered_rows74_l16k_k512",
     ],
 )
 def test_top_k_tie_break_modes_transform_apis(
-    algo, num_rows, max_len, k, set_topk_algo
+    algo, num_rows, max_len, k, dtype, set_topk_algo
 ):
     """Transform APIs should honor tie_break selection before remapping outputs."""
-    if algo == "filtered" and not can_implement_filtered_topk():
+    if not can_implement_filtered_topk():
         pytest.skip("Filtered top-k not supported on this device")
 
     set_topk_algo(algo)
@@ -2105,20 +2151,19 @@ def test_top_k_tie_break_modes_transform_apis(
     generator = torch.Generator(device=device)
     generator.manual_seed(0)
     scores = (
-        torch.randn(
-            (num_rows, 1), device=device, dtype=torch.float32, generator=generator
-        )
+        torch.randn((num_rows, 1), device=device, dtype=dtype, generator=generator)
         .expand(num_rows, max_len)
         .contiguous()
     )
     lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
-    src_page_table = (
-        torch.arange(max_len, device=device, dtype=torch.int32)
-        .unsqueeze(0)
-        .expand(num_rows, -1)
-        .contiguous()
+    row_bases = (torch.arange(num_rows, device=device, dtype=torch.int32) + 1) * (
+        max_len + 17
     )
-    offsets = torch.zeros((num_rows,), device=device, dtype=torch.int32)
+    src_page_table = (
+        row_bases.unsqueeze(1)
+        + torch.arange(max_len, device=device, dtype=torch.int32).unsqueeze(0)
+    ).contiguous()
+    offsets = row_bases
 
     page_small = flashinfer.top_k_page_table_transform(
         scores, src_page_table, lengths, k, tie_break=1
@@ -2133,21 +2178,146 @@ def test_top_k_tie_break_modes_transform_apis(
         scores, offsets, lengths, k, tie_break=2
     )
 
-    expected_small = (
+    local_small = (
         torch.arange(k, device=device, dtype=torch.int32)
         .unsqueeze(0)
         .expand(num_rows, -1)
     )
-    expected_large = (
+    local_large = (
         torch.arange(max_len - k, max_len, device=device, dtype=torch.int32)
         .unsqueeze(0)
         .expand(num_rows, -1)
     )
+    expected_small = row_bases.unsqueeze(1) + local_small
+    expected_large = row_bases.unsqueeze(1) + local_large
 
-    assert torch.equal(page_small, expected_small)
-    assert torch.equal(page_large, expected_large)
-    assert torch.equal(ragged_small, expected_small)
-    assert torch.equal(ragged_large, expected_large)
+    _assert_unordered_indices_match(page_small, expected_small)
+    _assert_unordered_indices_match(page_large, expected_large)
+    _assert_unordered_indices_match(ragged_small, expected_small)
+    _assert_unordered_indices_match(ragged_large, expected_large)
+
+
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+)
+@pytest.mark.parametrize(
+    ("algo", "batch_size", "vocab_size", "k"),
+    [
+        ("filtered", 2, 128 * 1024, 2048),
+        ("filtered", 1, 1024 * 1024, 1024),
+        ("filtered", 74, 16 * 1024, 512),
+    ],
+    ids=[
+        "filtered_b2_l128k_k2048",
+        "filtered_b1_l1m_k1024",
+        "filtered_b74_l16k_k512",
+    ],
+)
+def test_top_k_tie_break_explicit_deterministic_order(
+    tie_break, algo, batch_size, vocab_size, k, set_topk_algo
+):
+    """Explicit deterministic mode should retain canonical tie-break output order."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    scores = torch.ones((batch_size, vocab_size), device=device, dtype=torch.float32)
+
+    values_a, indices_a = flashinfer.top_k(
+        scores, k, deterministic=True, tie_break=tie_break
+    )
+    values_b, indices_b = flashinfer.top_k(
+        scores, k, deterministic=True, tie_break=tie_break
+    )
+
+    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else vocab_size - k
+    expected_indices = (
+        torch.arange(start, start + k, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    torch.testing.assert_close(values_a, torch.ones_like(values_a))
+    assert torch.equal(values_a, values_b)
+    assert torch.equal(indices_a, expected_indices)
+    assert torch.equal(indices_a, indices_b)
+
+
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+)
+@pytest.mark.parametrize(
+    ("algo", "num_rows", "max_len", "k"),
+    [
+        ("filtered", 2, 128 * 1024, 2048),
+        ("filtered", 1, 1024 * 1024, 1024),
+        ("filtered", 74, 16 * 1024, 512),
+    ],
+    ids=[
+        "filtered_rows2_l128k_k2048",
+        "filtered_rows1_l1m_k1024",
+        "filtered_rows74_l16k_k512",
+    ],
+)
+def test_top_k_tie_break_explicit_deterministic_transform_order(
+    tie_break, algo, num_rows, max_len, k, set_topk_algo
+):
+    """Deterministic transform APIs should sort local indices before remapping."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    scores = torch.ones((num_rows, max_len), device=device, dtype=torch.float32)
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    row_starts = 7 + 13 * row_ids
+    page_table_row_starts = 23 + 17 * row_ids
+    length = max_len - (23 + 17 * (num_rows - 1))
+    lengths = torch.full((num_rows,), length, device=device, dtype=torch.int32)
+    row_to_batch = torch.arange(num_rows - 1, -1, -1, device=device, dtype=torch.int32)
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32).unsqueeze(0)
+        + 100_000 * (row_ids + 1).unsqueeze(1)
+    ).contiguous()
+    offsets = 300_000 + 100_000 * row_ids
+
+    page_output = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        deterministic=True,
+        tie_break=tie_break,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+    )
+    ragged_output = flashinfer.top_k_ragged_transform(
+        scores,
+        offsets,
+        lengths,
+        k,
+        deterministic=True,
+        tie_break=tie_break,
+        row_starts=row_starts,
+    )
+
+    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else length - k
+    local_indices = (
+        torch.arange(start, start + k, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(num_rows, -1)
+    )
+    expected_page = torch.gather(
+        src_page_table[row_to_batch],
+        1,
+        page_table_row_starts.unsqueeze(1) + local_indices,
+    )
+    expected_ragged = offsets.unsqueeze(1) + local_indices
+    assert torch.equal(page_output, expected_page)
+    assert torch.equal(ragged_output, expected_ragged)
 
 
 @pytest.mark.parametrize(
