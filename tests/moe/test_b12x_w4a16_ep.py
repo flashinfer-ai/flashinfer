@@ -176,7 +176,7 @@ def test_prepare_ep_expert_map_rejects_unsafe_values(values, local_experts, matc
 def test_prepare_ep_expert_map_rejects_bad_tensor_forms():
     from flashinfer.fused_moe.cute_dsl.b12x_moe import _prepare_ep_expert_map
 
-    with pytest.raises(TypeError, match="torch.int32"):
+    with pytest.raises(TypeError, match=r"torch\.int32"):
         _prepare_ep_expert_map(
             torch.tensor([0, -1], dtype=torch.int64),
             num_local_experts=1,
@@ -261,6 +261,27 @@ class TestEPGuards:
                 quant_mode="w4a16",
                 num_local_experts=2,
                 expert_map=expert_map,
+            )
+
+    def test_w4a16_ep_rejects_bad_map_forms(self):
+        tensors = self._tensors()
+        with pytest.raises(TypeError, match=r"torch\.int32"):
+            self._call(
+                tensors,
+                quant_mode="w4a16",
+                expert_map=torch.arange(8, dtype=torch.int64, device="cuda"),
+            )
+        with pytest.raises(ValueError, match="contiguous rank-1"):
+            self._call(
+                tensors,
+                quant_mode="w4a16",
+                expert_map=torch.arange(16, dtype=torch.int32, device="cuda")[::2],
+            )
+        with pytest.raises(ValueError, match="must be on"):
+            self._call(
+                tensors,
+                quant_mode="w4a16",
+                expert_map=torch.arange(8, dtype=torch.int32),
             )
 
     def test_wrapper_nvfp4_rejects_ep(self):
