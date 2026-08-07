@@ -115,7 +115,9 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
 
 def test_resolve_falls_back_to_heuristic(monkeypatch, tmp_path):
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import default_knobs
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+        default_knobs,
+    )
 
     _cache_env(monkeypatch, tmp_path)  # empty cache
     knobs, source = resolve_knobs(max_tokens=2048, **_KEY)
@@ -166,12 +168,12 @@ def test_corrupt_cache_file_warns_and_misses(monkeypatch, tmp_path):
 
 
 def test_backend_warns_on_auto_knobs():
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     with pytest.warns(UserWarning, match="offline"):
         create_mega_kernel(
-            Nvfp4CutedslMegaMoeConfig(intermediate_size=128, top_k=2, knobs="auto")
+            Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2, knobs="auto")
         )
 
 

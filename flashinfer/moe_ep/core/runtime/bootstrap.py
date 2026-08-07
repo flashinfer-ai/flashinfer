@@ -124,9 +124,11 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     if _mega_no_dist() or _nvshmem_initialized():
         return False
 
-    from ...kernel_src.cutedsl_megamoe import bootstrap_paths
-
-    bootstrap_paths()
+    # No kernel-tree path bootstrap here: nvshmem.core is a pip package, and
+    # each kernel tree's shim bootstraps its own src/ paths at import. Pulling
+    # a specific tree's package in from core would eagerly import that tree's
+    # kernel modules and trip the sm90/sm100 process-exclusivity guard for the
+    # other tree's sessions.
     import numpy as np
     import nvshmem.core
     import torch
@@ -256,15 +258,33 @@ def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
     return frozenset()
 
 
-def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
-    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+def cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL mega kernels."""
     if _mega_no_dist():
         return frozenset()
     return frozenset({TORCH_DIST, NVSHMEM})
 
 
+def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL NVFP4 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
 def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
     """Runtime needs for the CuTeDSL MXFP8 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
+def bf16_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL BF16 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
+def sm90_pull_fp8_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the SM90 (Hopper) FP8 pull-style mega kernel.
+
+    Same NVSHMEM symmetric-heap model as the SM100 cutedsl kernels.
+    """
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
@@ -275,7 +295,9 @@ __all__ = [
     "bootstrap_moe_ep_runtime",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
+    "bf16_cutedsl_runtime_requirements",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
+    "sm90_pull_fp8_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
