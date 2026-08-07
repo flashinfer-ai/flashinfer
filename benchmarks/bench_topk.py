@@ -258,13 +258,17 @@ def _cub_column_width(selection_only: bool) -> int:
     return 34 if selection_only else 12
 
 
-def append_cub_columns(line: str, result: dict, tie_break_enabled: bool) -> str:
+def append_cub_columns(
+    line: str, result: dict, tie_break_enabled: bool, selection_only: bool = False
+) -> str:
+    width = _cub_column_width(selection_only)
     if "cub_us" in result:
         line += (
-            f" {result['cub_us']:>10.2f}us {result['speedup_cub_vs_flashinfer']:>9.2f}x"
+            f" {result['cub_us']:>{width - 2}.2f}us "
+            f"{result['speedup_cub_vs_flashinfer']:>9.2f}x"
         )
     else:
-        line += f" {'n/a':>12} {'n/a':>10}"
+        line += f" {'n/a':>{width}} {'n/a':>10}"
 
     if tie_break_enabled:
         for suffix in ("small", "large"):
