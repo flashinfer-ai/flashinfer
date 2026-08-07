@@ -184,12 +184,11 @@ _PARAM_HEADER_NO_TYPE_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*$"
 )
 
-# Google-style ``name: description`` — the colon is *flush* against the
+# Google-style ``name: description`` or a bare ``name:`` followed by an
+# indented description on subsequent lines. The colon is *flush* against the
 # identifier (no space on the left), distinguishing it from the NumPy form.
-# The description is then any non-empty content (lets us pick up
-# ``name: \`\`Constant\`\`...``, ``name: see :class:\`X\``` etc.). Used at the
-# section base-indent only — see ``doc_param_names`` below.
-_PARAM_HEADER_GOOGLE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s+\S")
+# Used at the section base-indent only — see ``doc_param_names`` below.
+_PARAM_HEADER_GOOGLE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):(?:\s+\S.*)?$")
 
 # Google-style dash bullet for one parameter: "- name: description".
 # Used by flashinfer/comm/trtllm_ar.py and friends.
@@ -203,7 +202,8 @@ def doc_param_names(params_section: str) -> list[str]:
 
     * NumPy single-name : ``name : type``
     * NumPy multi-name  : ``a, b, c : type``  → expanded to ``[a, b, c]``
-    * Google flush-colon: ``name: description``  (no space before ``:``)
+    * Google flush-colon: ``name: description`` or ``name:`` followed by an
+      indented description (no space before ``:``)
     * Google dash bullet at any indent: ``- name: description``
 
     Heuristic to avoid false positives:
