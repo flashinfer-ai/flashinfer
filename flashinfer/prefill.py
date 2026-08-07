@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
-from collections import OrderedDict
+import weakref
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -66,6 +66,7 @@ from .utils import (
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
+    _get_range_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     _unpack_paged_kv_cache,
@@ -5302,10 +5303,10 @@ def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
 
 
-_FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE = 256
-_fmha_v2_sm120_cum_seq_lens_cache: OrderedDict[Tuple[int, int, int], torch.Tensor] = (
-    OrderedDict()
-)
+_fmha_v2_sm120_cum_seq_lens_initialized: set[Tuple[int, int, int]] = set()
+_fmha_v2_sm120_validated_cum_seq_lens: Dict[
+    int, Tuple[weakref.ReferenceType[torch.Tensor], Tuple[int, int, int, int]]
+] = {}
 
 
 def _get_fmha_v2_sm120_cum_seq_lens(
@@ -5315,27 +5316,67 @@ def _get_fmha_v2_sm120_cum_seq_lens(
         device.index if device.index is not None else torch.cuda.current_device()
     )
     cache_key = (device_index, batch_size, seq_len)
-    cum_seq_lens = _fmha_v2_sm120_cum_seq_lens_cache.get(cache_key)
-    if cum_seq_lens is not None:
-        _fmha_v2_sm120_cum_seq_lens_cache.move_to_end(cache_key)
-        return cum_seq_lens
-    if torch.cuda.is_current_stream_capturing():
+    if (
+        cache_key not in _fmha_v2_sm120_cum_seq_lens_initialized
+        and torch.cuda.is_current_stream_capturing()
+    ):
         raise RuntimeError(
             "fmha_v2_prefill_sm120 metadata must be initialized before CUDA "
             "Graph capture; warm up once or pass cum_seq_lens explicitly."
         )
-    cum_seq_lens = (
-        torch.arange(
-            batch_size + 1,
-            dtype=torch.int32,
-            device=torch.device("cuda", device_index),
-        )
-        * seq_len
-    )
-    _fmha_v2_sm120_cum_seq_lens_cache[cache_key] = cum_seq_lens
-    if len(_fmha_v2_sm120_cum_seq_lens_cache) > _FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE:
-        _fmha_v2_sm120_cum_seq_lens_cache.popitem(last=False)
+    cache_device = torch.device("cuda", device_index)
+    cum_seq_lens = _get_cache_buf(
+        f"fmha_v2_sm120_cum_seq_lens_{batch_size}_{seq_len}",
+        (batch_size + 1) * torch.int32.itemsize,
+        cache_device,
+    ).view(torch.int32)[: batch_size + 1]
+    if cache_key not in _fmha_v2_sm120_cum_seq_lens_initialized:
+        cum_seq_lens.copy_(_get_range_buf(batch_size + 1, cache_device)).mul_(seq_len)
+        _fmha_v2_sm120_cum_seq_lens_initialized.add(cache_key)
     return cum_seq_lens
+
+
+def _is_validated_fmha_v2_sm120_cum_seq_lens(
+    cum_seq_lens: torch.Tensor, batch_size: int, seq_len: int
+) -> bool:
+    device_index = (
+        cum_seq_lens.device.index
+        if cum_seq_lens.device.index is not None
+        else torch.cuda.current_device()
+    )
+    entry = _fmha_v2_sm120_validated_cum_seq_lens.get(id(cum_seq_lens))
+    return (
+        entry is not None
+        and entry[0]() is cum_seq_lens
+        and entry[1]
+        == (
+            device_index,
+            batch_size,
+            seq_len,
+            cum_seq_lens.data_ptr(),
+        )
+    )
+
+
+def _mark_fmha_v2_sm120_cum_seq_lens_validated(
+    cum_seq_lens: torch.Tensor, batch_size: int, seq_len: int
+) -> None:
+    tensor_id = id(cum_seq_lens)
+    device_index = (
+        cum_seq_lens.device.index
+        if cum_seq_lens.device.index is not None
+        else torch.cuda.current_device()
+    )
+
+    def remove_entry(ref: weakref.ReferenceType[torch.Tensor]) -> None:
+        entry = _fmha_v2_sm120_validated_cum_seq_lens.get(tensor_id)
+        if entry is not None and entry[0] is ref:
+            del _fmha_v2_sm120_validated_cum_seq_lens[tensor_id]
+
+    _fmha_v2_sm120_validated_cum_seq_lens[tensor_id] = (
+        weakref.ref(cum_seq_lens, remove_entry),
+        (device_index, batch_size, seq_len, cum_seq_lens.data_ptr()),
+    )
 
 
 def _fmha_v2_prefill_sm120_run(
@@ -5376,6 +5417,25 @@ def _fmha_v2_prefill_sm120_run(
     ):
         raise ValueError(
             "cum_seq_lens must be a contiguous INT32 CUDA tensor with shape [B + 1]."
+        )
+    elif not _is_validated_fmha_v2_sm120_cum_seq_lens(
+        cum_seq_lens, query.shape[0], seq_len
+    ):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "cum_seq_lens must be validated before CUDA Graph capture; "
+                "warm up once with the same tensor."
+            )
+        expected_cum_seq_lens = _get_fmha_v2_sm120_cum_seq_lens(
+            query.device, query.shape[0], seq_len
+        )
+        if not torch.equal(cum_seq_lens, expected_cum_seq_lens):
+            raise ValueError(
+                "cum_seq_lens must contain uniform offsets "
+                "[0, seq_len, ..., batch_size * seq_len]."
+            )
+        _mark_fmha_v2_sm120_cum_seq_lens_validated(
+            cum_seq_lens, query.shape[0], seq_len
         )
     for name, device_scale in (
         ("scale_bmm1_d", scale_bmm1_d),
@@ -5438,17 +5498,23 @@ def fmha_v2_prefill_sm120(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run SM120 FMHA v2 with contiguous, separate Q/K/V tensors.
 
-    Supports FP8 E4M3 standard self-attention with equal Q/K/V head dimensions
-    of 64 or 128 and BF16 output. ``scale_bmm1`` combines the Q and K
+    Supports FP8 E4M3 standard MHA self-attention with equal Q/K/V head counts
+    and head dimensions of 64 or 128, and BF16 output. GQA and MQA are not
+    supported by this entry point. ``scale_bmm1`` combines the Q and K
     dequantization scales with the attention scale; ``scale_bmm2`` is the V
     dequantization scale. Set ``causal=False`` for dense / bidirectional
     attention. ``cum_seq_lens`` may provide persistent INT32 CUDA metadata
     with values ``[0, seq_len, ..., batch_size * seq_len]``.
-    If omitted, the metadata is cached after the first eager call. Warm up once
-    before CUDA Graph capture, or pass a preallocated tensor explicitly.
+    If omitted, the metadata is cached after the first eager call. Before CUDA
+    Graph capture, warm up once with either the internal metadata or the same
+    preallocated tensor that will be captured. Caller-provided metadata must
+    remain unchanged after this validation.
     FP8 calls may pass ``scale_bmm1_d`` and ``scale_bmm2_d`` as persistent
-    one-element FP32 CUDA model weights. If either is omitted, the kernel uses
-    the corresponding host-encoded scale.
+    one-element FP32 CUDA model weights. ``scale_bmm1_d`` replaces
+    ``scale_bmm1`` and must contain the full fused
+    ``q_scale * k_scale / sqrt(head_dim)`` value; ``scale_bmm2_d`` replaces
+    ``scale_bmm2`` and contains the V dequantization scale. If either is
+    omitted, the kernel uses the corresponding host-encoded scale.
 
     This entry point is validated for SM120. SM121 support is not enabled.
     """

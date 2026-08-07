@@ -16,6 +16,7 @@ FI_TRACE_OUT = Path(__file__).parent / "fi_trace_out"
 BLOCK_SPARSE_JSON = (
     FI_TRACE_OUT / "trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json"
 )
+SM120_FMHA_JSON = FI_TRACE_OUT / "fmha_v2_prefill_sm120_h4_d128.json"
 
 _INIT_KWARGS = dict(
     num_tokens=4,
@@ -52,6 +53,24 @@ def test_block_sparse_json_init_and_reference_standalone():
     assert output.shape == inputs["query"].shape
     assert output.dtype == inputs["query"].dtype
     assert torch.isfinite(output.float()).all()
+
+
+def test_sm120_fmha_json_init_renders_cum_seq_lens_standalone():
+    """The committed SM120 FMHA init must render its metadata standalone."""
+    doc = json.loads(SM120_FMHA_JSON.read_text())
+    namespace = _exec_in_fresh_namespace(doc["init"])
+    inputs = namespace["_fmha_v2_prefill_sm120_init"](
+        batch_size=1,
+        seq_len=8,
+        len_indptr=2,
+        scale_size=1,
+        num_heads=4,
+        head_dim=128,
+        device="cpu",
+    )
+
+    assert inputs["cum_seq_lens"].dtype == torch.int32
+    assert inputs["cum_seq_lens"].tolist() == [0, 8]
 
 
 def test_dense_trtllm_decode_reference_renders_standalone():

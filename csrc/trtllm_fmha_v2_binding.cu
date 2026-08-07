@@ -335,8 +335,8 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   const int num_kv_heads = k.shape()[2];
 
   // head_dim_qk
-  assert(head_dim == q.shape()[3] &&
-         "head_dim must be equal to the head dimension in the query tensor");
+  TVM_FFI_ICHECK_EQ(head_dim, q.shape()[3])
+      << "head_dim must be equal to the head dimension in the query tensor";
   // head_dim_v
   const int head_dim_v = v.shape()[3];  // Matches Q/K for standard paths; 128 for 192x128.
 
@@ -421,7 +421,7 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
              false,          // is_s_padded
              false);         // has_alibi
 
-  // cu_seqlens is built above as i * q_seqlen, so the batch is uniform by construction.
+  // Python validates cum_seq_lens as [0, q_seqlen, ..., batch_size * q_seqlen].
   params.is_uniform_q = batch_size > 0;
 
   if (head_dim == 64 && head_dim_v == 64 && data_type == DATA_TYPE_E4M3 &&

@@ -662,6 +662,44 @@ def test_gqa_ragged_prefill_fi_trace():
 
 
 # ---------------------------------------------------------------------------
+# SM120 FMHA v2 prefill
+# ---------------------------------------------------------------------------
+
+
+def test_fmha_v2_prefill_sm120_fi_trace_includes_cum_seq_lens():
+    from flashinfer.prefill import fmha_v2_prefill_sm120
+
+    batch_size, seq_len, num_heads, head_dim = 1, 8, 4, 128
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q = torch.empty(shape, dtype=torch.float8_e4m3fn)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    out = torch.empty(shape, dtype=torch.bfloat16)
+    cum_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32)
+
+    defn = fmha_v2_prefill_sm120.fi_trace(
+        query=q,
+        key=k,
+        value=v,
+        out=out,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        scale_softmax=1.0,
+        cum_seq_lens=cum_seq_lens,
+    )
+
+    _check_defn(defn, "trtllm_paged", "fmha_v2_prefill_sm120")
+    assert defn["inputs"]["cum_seq_lens"] == {
+        "shape": ["len_indptr"],
+        "dtype": "int32",
+        "optional": True,
+        "description": "Uniform cumulative sequence lengths.",
+    }
+    assert defn["constraints"] == ["len_indptr == batch_size + 1"]
+
+
+# ---------------------------------------------------------------------------
 # MLA paged
 # ---------------------------------------------------------------------------
 
