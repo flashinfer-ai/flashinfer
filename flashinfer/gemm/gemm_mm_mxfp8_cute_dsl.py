@@ -41,7 +41,7 @@ def _b12x_mxfp8_dsl_supported() -> bool:
     from packaging import version as pkg_version
 
     try:
-        return pkg_version.Version(dsl_version).release[:2] >= (4, 6)
+        return pkg_version.Version(dsl_version) >= pkg_version.Version("4.6.0")
     except pkg_version.InvalidVersion:
         return False
 

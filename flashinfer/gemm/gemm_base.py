@@ -5405,7 +5405,8 @@ def mm_mxfp8(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
-        into it (supported by the CUTLASS and cuDNN backends). Defaults to ``None``.
+        into it (supported by the CUTLASS, cuDNN, and b12x backends). Defaults to
+        ``None``.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
