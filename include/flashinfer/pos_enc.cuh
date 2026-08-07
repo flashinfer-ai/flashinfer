@@ -1394,6 +1394,15 @@ cudaError_t BatchQKApplyRotaryPosIds(
     size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+  // Fail fast on rotary_dim > head_dim: the RoPE kernel reads x + rotary_dim/2,
+  // which would land past this head's data in the next head/token — silent
+  // cross-head corruption (no crash/NaN, just wrong attention output downstream).
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1467,6 +1476,15 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                                size_t q_rope_stride_n, size_t q_rope_stride_h,
                                size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
                                float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+  // Fail fast on rotary_dim > head_dim: the RoPE kernel reads x + rotary_dim/2,
+  // which would land past this head's data in the next head/token — silent
+  // cross-head corruption (no crash/NaN, just wrong attention output downstream).
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1518,6 +1536,15 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                                       size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
                                       size_t k_stride_h, bool interleave, float rope_scale,
                                       float rope_theta, cudaStream_t stream = nullptr) {
+  // Fail fast on rotary_dim > head_dim: the RoPE kernel reads x + rotary_dim/2,
+  // which would land past this head's data in the next head/token — silent
+  // cross-head corruption (no crash/NaN, just wrong attention output downstream).
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   return BatchQKApplyRotary<DType, IdType>(
       q, k, q, k, indptr, offsets, batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim,
       q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_stride_n, q_stride_h, k_stride_n,
@@ -1533,6 +1560,15 @@ cudaError_t BatchQKApplyLlama31Rotary(
     size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
     float low_freq_factor, float high_freq_factor, float old_context_length,
     cudaStream_t stream = nullptr) {
+  // Fail fast on rotary_dim > head_dim: the RoPE kernel reads x + rotary_dim/2,
+  // which would land past this head's data in the next head/token — silent
+  // cross-head corruption (no crash/NaN, just wrong attention output downstream).
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
@@ -1584,6 +1620,15 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
     size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
     bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
     float high_freq_factor, float old_context_length, cudaStream_t stream = nullptr) {
+  // Fail fast on rotary_dim > head_dim: the RoPE kernel reads x + rotary_dim/2,
+  // which would land past this head's data in the next head/token — silent
+  // cross-head corruption (no crash/NaN, just wrong attention output downstream).
+  if (head_dim < rotary_dim) {
+    std::ostringstream err_msg;
+    err_msg << "head_dim (" << head_dim << ") must be >= rotary_dim (" << rotary_dim << ")";
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
