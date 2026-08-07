@@ -11,7 +11,7 @@ unsafe growth behavior without needing a GPU fault.
 import pytest
 import torch
 
-from flashinfer.utils import _cache_buf, _get_cache_buf
+from flashinfer.utils import _cache_buf, _get_cache_buf, get_compute_capability
 
 SMALL = 8 * 1024 * 1024
 LARGE = 16 * 1024 * 1024
@@ -47,9 +47,7 @@ def test_cache_buf_growth_keeps_graph_referenced_storage_alive():
     assert grown.size(0) >= LARGE
     del buf
 
-    probes = [
-        torch.zeros(SMALL, dtype=torch.uint8, device=device) for _ in range(3)
-    ]
+    probes = [torch.zeros(SMALL, dtype=torch.uint8, device=device) for _ in range(3)]
     graph.replay()
     torch.cuda.synchronize()
     for probe in probes:
@@ -70,6 +68,7 @@ def test_cudnn_fp8_gemm_workspace_growth_preserves_baked_pointer():
     the GEMM result must still be correct.
     """
     cudnn = pytest.importorskip("cudnn")
+    from flashinfer import bmm_fp8
     from flashinfer.gemm.gemm_base import (
         _cudnn_gemm_fp8,
         _get_cudnn_workspace_size,
@@ -78,6 +77,11 @@ def test_cudnn_fp8_gemm_workspace_growth_preserves_baked_pointer():
     )
 
     device = torch.device("cuda:0")
+    major, minor = get_compute_capability(device)
+    if not bmm_fp8.is_backend_supported("cudnn", major * 10 + minor):
+        pytest.skip(
+            f"cuDNN fp8 GEMM not supported on sm{major}{minor}; skipping fp8 graph test"
+        )
     b, m, n, k = 1, 48, 80, 64
     a = (torch.randn(b, m, k, device=device) * 0.1).to(torch.float8_e4m3fn)
     mat2 = (
@@ -118,9 +122,9 @@ def test_cudnn_fp8_gemm_workspace_growth_preserves_baked_pointer():
     _cudnn_gemm_fp8(workspace, a, mat2, a_scale, b_scale, out, out.dtype, tactic)
     torch.cuda.synchronize()
 
-    assert (
-        workspace.data_ptr() == ptr_before and workspace.numel() == 1024
-    ), "workspace growth invalidated the storage captured graphs reference"
+    assert workspace.data_ptr() == ptr_before and workspace.numel() == 1024, (
+        "workspace growth invalidated the storage captured graphs reference"
+    )
 
     graph.replay()
     torch.cuda.synchronize()
