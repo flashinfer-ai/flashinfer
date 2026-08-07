@@ -632,8 +632,6 @@ class CuteDslMoEWrapper:
                 self._main_event = torch.cuda.Event()
                 self._memset_event = torch.cuda.Event()
         elif quant_mode == "w4a16":
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU is not supported when quant_mode='w4a16'")
             self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
                 num_experts=num_experts,
                 top_k=top_k,
@@ -646,6 +644,8 @@ class CuteDslMoEWrapper:
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         else:
             raise ValueError(
@@ -847,7 +847,10 @@ class CuteDslMoEWrapper:
                 w2_alpha,
                 moe_output,
             ]
-            op_name = f"CuteDslMoEWrapper::run::W4A16::{self.activation_type.name}"
+            activation_name = (
+                "Situ" if self.situ_beta is not None else self.activation_type.name
+            )
+            op_name = f"CuteDslMoEWrapper::run::W4A16::{activation_name}"
 
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
@@ -1128,8 +1131,6 @@ def cute_dsl_fused_moe_nvfp4(
         activation_name = "Situ" if situ_beta is not None else activation.name
         op_name = f"CuteDslFusedMoE::run_moe_nvfp4::{activation_name}"
     elif quant_mode == "w4a16":
-        if situ_beta is not None or situ_linear_beta is not None:
-            raise ValueError("SiTU is not supported when quant_mode='w4a16'")
         if (
             x_sf is not None
             or fc2_input_scale is not None
@@ -1151,6 +1152,8 @@ def cute_dsl_fused_moe_nvfp4(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         inputs = [
             x,
@@ -1164,7 +1167,8 @@ def cute_dsl_fused_moe_nvfp4(
             w2_alpha,
             moe_output,
         ]
-        op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation.name}"
+        activation_name = "Situ" if situ_beta is not None else activation.name
+        op_name = f"CuteDslFusedMoE::run_moe_w4a16::{activation_name}"
     else:
         raise ValueError(
             f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
