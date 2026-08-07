@@ -206,21 +206,20 @@ class MoEFinalizeConfig:
         partial results into the output.  ``False`` returns the unreduced
         per-expert partials, leaving the combine to the caller — only the
         backends that advertise it support this.
-    use_fused_finalize : bool or None
-        Whether to fold the finalize into the GEMM2 epilogue (atomic
-        accumulation) instead of running a separate reduction kernel.
-        ``None`` → backend default.  Only honored by the CuteDSL NVFP4
-        backend today; other backends ignore it.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue
+        (atomic accumulation) instead of running a separate reduction kernel.
+        Backends that do not support it ignore the flag.
     """
 
     do_finalize: bool = True
-    use_fused_finalize: Optional[bool] = None
+    use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
         if not self.do_finalize:
             parts.append(f"do_finalize={self.do_finalize!r}")
-        if self.use_fused_finalize is not None:
+        if not self.use_fused_finalize:
             parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"MoEFinalizeConfig({', '.join(parts)})"
 
@@ -839,8 +838,8 @@ class MoEActivationPack:
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
-    positional construction of pre-routed packs is unchanged.  The in-kernel routing fields
-    are keyword-only.
+    positional construction of pre-routed packs is unchanged. Additional activation metadata
+    and the in-kernel routing fields are keyword-only.
     """
 
     # Backend-native activation payload; layouts documented above.
@@ -852,6 +851,8 @@ class MoEActivationPack:
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM FP4 UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
+    # Per-token NVFP4 row scale, shape [M].
+    per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -954,6 +955,7 @@ class MoEActivationPack:
             "hidden_states_scale",
             "topk_ids",
             "topk_weights",
+            "per_token_scale",
             "routing_logits",
             "routing_bias",
         ):
