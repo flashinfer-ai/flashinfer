@@ -58,8 +58,10 @@ enum class RoutingMethodType : int64_t {
   MiniMax2 = 7,
   // Sigmoid: Sigmoid -> TopK (no renormalization)
   Sigmoid = 8,
+  // TopKSigmoid: TopK -> Sigmoid (no renormalization)
+  TopKSigmoid = 9,
   // Unspecified
-  Unspecified = 9,
+  Unspecified = 10,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -89,6 +91,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "MiniMax2";
     case RoutingMethodType::Sigmoid:
       return "Sigmoid";
+    case RoutingMethodType::TopKSigmoid:
+      return "TopKSigmoid";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };

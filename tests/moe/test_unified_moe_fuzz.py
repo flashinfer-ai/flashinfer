@@ -933,6 +933,7 @@ _ROUTING_METHODS = [
     RoutingMethodType.TopK,
     RoutingMethodType.Sigmoid,
     RoutingMethodType.SigmoidRenorm,
+    RoutingMethodType.TopKSigmoid,  # top_k(raw) -> sigmoid
     RoutingMethodType.DeepSeekV3,  # sigmoid+bias -> group-topk -> top_k (#2575 lives here)
     RoutingMethodType.MiniMax2,  # sigmoid+bias -> top_k -> scaled sum-norm
     RoutingMethodType.Llama4,  # top1 -> sigmoid (top_k forced to 1)
@@ -1431,6 +1432,9 @@ def _route(
         w, sel = torch.topk(lf, top_k, dim=-1)
     elif method == M.Sigmoid:  # sigmoid -> top_k (no renorm)
         w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
+    elif method == M.TopKSigmoid:  # top_k(raw) -> sigmoid over selected
+        raw, sel = torch.topk(lf, top_k, dim=-1)
+        w = torch.sigmoid(raw)
     elif (
         method == M.SigmoidRenorm
     ):  # sigmoid -> top_k -> renorm (divide by sum of selected)
