@@ -208,12 +208,20 @@ class CuteDslNvfp4Runner(MoERunner):
         routing = config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
 
+        # use_fused_finalize=None means "backend default", which for the inner
+        # runner is True; only forward an explicit override.
+        use_fused_finalize = config.finalize.use_fused_finalize
         self._inner = CuteDslFusedMoENvfp4Runner(
             forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
             num_experts=routing.num_experts,
             top_k=routing.top_k,
             num_local_experts=num_local_experts,
             local_expert_offset=experts.local_expert_offset,
+            **(
+                {}
+                if use_fused_finalize is None
+                else {"use_fused_finalize": use_fused_finalize}
+            ),
         )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
@@ -711,7 +719,7 @@ class TrtllmFp4RoutedRunner(MoERunner):
             local_expert_offset=self._local_expert_offset,
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
-            do_finalize=self.config.execution.do_finalize,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
         )
 
@@ -763,7 +771,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only do_finalize=True."
             )
@@ -1056,7 +1064,7 @@ class TrtllmFp8PerTensorRunner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only do_finalize=True."
             )
@@ -1434,7 +1442,7 @@ class TrtllmBf16RoutedRunner(MoERunner):
             routing_method_type=int(routing.method),
             use_shuffled_weight=True,
             weight_layout=int(WeightLayout.BlockMajorK),
-            do_finalize=self.config.execution.do_finalize,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             norm_topk_prob=False,
         )
@@ -1488,7 +1496,7 @@ class _B12xRunner(MoERunner):
             raise NotImplementedError(
                 "b12x unified MoE does not support expert parallelism."
             )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
     def __init__(self, config: MoEConfig, device: torch.device):

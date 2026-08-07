@@ -191,27 +191,57 @@ class ExpertConfig:
 
 
 @dataclass(frozen=True)
+class MoEFinalizeConfig:
+    """How the finalize (combine) step behaves.
+
+    Split out of ``ExecutionConfig`` for the same reason ``RoutingConfig`` is
+    its own config: finalize is a distinct architectural concern (how the
+    per-expert partials are reduced back into one row per token), not a
+    runtime knob like PDL or the autotuner token budget.
+
+    Parameters
+    ----------
+    do_finalize : bool
+        Whether to apply routing-weight scaling and accumulate the per-expert
+        partial results into the output.  ``False`` returns the unreduced
+        per-expert partials, leaving the combine to the caller — only the
+        backends that advertise it support this.
+    use_fused_finalize : bool or None
+        Whether to fold the finalize into the GEMM2 epilogue (atomic
+        accumulation) instead of running a separate reduction kernel.
+        ``None`` → backend default.  Only honored by the CuteDSL NVFP4
+        backend today; other backends ignore it.
+    """
+
+    do_finalize: bool = True
+    use_fused_finalize: Optional[bool] = None
+
+    def __repr__(self) -> str:
+        parts = []
+        if not self.do_finalize:
+            parts.append(f"do_finalize={self.do_finalize!r}")
+        if self.use_fused_finalize is not None:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        return f"MoEFinalizeConfig({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
 class ExecutionConfig:
     """Runtime execution parameters.
 
     Parameters
     ----------
-    do_finalize : bool
-        Whether to apply routing-weight scaling and accumulate into output.
     enable_pdl : bool or None
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
     """
 
-    do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
 
     def __repr__(self) -> str:
         parts = []
-        if not self.do_finalize:
-            parts.append(f"do_finalize={self.do_finalize!r}")
         if self.enable_pdl is not None:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
@@ -680,6 +710,8 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Appended last so existing positional construction keeps working.
+    finalize: MoEFinalizeConfig = field(default_factory=MoEFinalizeConfig)
 
     # --- Dict-unpacking protocol: enables ``**config`` at call sites ---
 

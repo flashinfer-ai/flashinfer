@@ -248,6 +248,7 @@ def test_validate_compute_consistency_requires_do_finalize():
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
+        MoEFinalizeConfig,
         QuantConfig,
         QuantVariant,
         RoutingConfig,
@@ -268,14 +269,15 @@ def test_validate_compute_consistency_requires_do_finalize():
             local_num_experts=2,
         ),
         backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
-        execution=ExecutionConfig(tune_max_num_tokens=128, do_finalize=False),
+        execution=ExecutionConfig(tune_max_num_tokens=128),
+        finalize=MoEFinalizeConfig(do_finalize=False),
     )
     with pytest.raises(MoEEpConfigError, match="do_finalize"):
         validate_compute_consistency(fleet, bootstrap, moe_config)
 
     ok_config = dataclasses.replace(
         moe_config,
-        execution=dataclasses.replace(moe_config.execution, do_finalize=True),
+        finalize=dataclasses.replace(moe_config.finalize, do_finalize=True),
     )
     validate_compute_consistency(fleet, bootstrap, ok_config)
 
