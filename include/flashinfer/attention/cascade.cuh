@@ -53,6 +53,15 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   float s_a_val = s_a[pos * num_heads + head_idx];
   float s_b_val = s_b[pos * num_heads + head_idx];
   float s_max = max(s_a_val, s_b_val);
+  if (s_max == -math::inf) {
+    vec_t<DTypeO, vec_size> v_empty;
+    v_empty.fill(DTypeO(0.f));
+    v_empty.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = -math::inf;
+    }
+    return;
+  }
   s_a_val = math::ptx_exp2(s_a_val - s_max);
   s_b_val = math::ptx_exp2(s_b_val - s_max);
   float a_scale = s_a_val / (s_a_val + s_b_val);
@@ -98,6 +107,13 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
   float s_val = s[pos * num_heads + head_idx];
   float s_other_val = s_other[pos * num_heads + head_idx];
   float s_max = max(s_val, s_other_val);
+  if (s_max == -math::inf) {
+    vec_t<DType, vec_size> v_empty;
+    v_empty.fill(DType(0.f));
+    v_empty.store(v + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    s[pos * num_heads + head_idx] = -math::inf;
+    return;
+  }
   s_val = math::ptx_exp2(s_val - s_max);
   s_other_val = math::ptx_exp2(s_other_val - s_max);
   float scale = s_val / (s_val + s_other_val);
