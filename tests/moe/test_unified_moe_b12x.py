@@ -43,6 +43,7 @@ from flashinfer.fused_moe.api import (
     ActivationType,
     BackendOptions,
     ExecutionConfig,
+    MoEFinalizeConfig,
     ExpertConfig,
     MoEConfig,
     QuantConfig,
@@ -216,7 +217,7 @@ class TestB12xUnifiedValidation:
         config = self._config(
             B12xNvfp4Config(),
             QuantVariant.NVFP4,
-            execution=ExecutionConfig(do_finalize=False),
+            finalize=MoEFinalizeConfig(do_finalize=False),
         )
         self._mock_environment(monkeypatch)
         runner = self._runner(config)
