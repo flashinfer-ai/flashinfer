@@ -200,7 +200,10 @@ def bench_cub_top_k_ms(
     if lengths is not None and lengths.dtype != torch.int32:
         lengths = lengths.to(torch.int32)
 
-    out_idx = torch.empty(num_rows, k, dtype=torch.int32, device=scores.device)
+    # The binding leaves short rows' output tails untouched (sentinel padding is the
+    # caller's responsibility), so pre-fill once outside the timed region: lengths are
+    # fixed across iterations, so the -1 tails never need re-establishing.
+    out_idx = torch.full((num_rows, k), -1, dtype=torch.int32, device=scores.device)
     out_vals = torch.empty(num_rows, k, dtype=scores.dtype, device=scores.device)
     ws_bytes = mod.cub_topk_workspace_size(scores, lengths, k, tie)
     workspace = torch.empty(

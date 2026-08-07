@@ -3116,8 +3116,7 @@ def test_cub_topk_workspace_paths():
     scores = torch.randn(num_rows, seq_len, device="cuda")
 
     # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
-    vals = torch.empty(num_rows, k, device="cuda")
-    idx = module.cub_topk(scores, k, 0, None, None, vals)
+    vals, idx = module.cub_topk(scores, k, 0, None, None)
     torch.testing.assert_close(vals, torch.gather(scores, -1, idx.long()))
 
     # A too-small workspace must raise, not corrupt.
@@ -3125,7 +3124,7 @@ def test_cub_topk_workspace_paths():
     if needed > 1:
         tiny = torch.empty(1, dtype=torch.uint8, device="cuda")
         with pytest.raises(RuntimeError, match="workspace too small"):
-            module.cub_topk(scores, k, 0, None, tiny, vals)
+            module.cub_topk(scores, k, 0, None, tiny)
 
 
 def test_top_k_cub_edge_cases():

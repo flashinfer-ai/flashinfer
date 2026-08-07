@@ -344,21 +344,30 @@ def get_topk_module():
     ) -> None:
         pass
 
-    @register_custom_op(
-        "flashinfer::cub_topk", mutates_args=("workspace_buffer", "output_values")
-    )
+    @register_custom_op("flashinfer::cub_topk", mutates_args=("workspace_buffer",))
     def cub_topk(
         input: torch.Tensor,
         top_k: int,
         tie_break: int,
         lengths: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = input.size(0)
-        output_indices = torch.empty(
-            batch_size, top_k, dtype=torch.int32, device=input.device
+        output_values = torch.empty(
+            batch_size, top_k, dtype=input.dtype, device=input.device
         )
+
+        if lengths is not None:
+            # The binding leaves output positions past a short row's valid count
+            # untouched; pre-fill with -1 so the padding contract holds.
+            output_indices = torch.full(
+                (batch_size, top_k), -1, dtype=torch.int32, device=input.device
+            )
+        else:
+            output_indices = torch.empty(
+                batch_size, top_k, dtype=torch.int32, device=input.device
+            )
+
         module.cub_topk(
             input,
             output_indices,
@@ -368,7 +377,8 @@ def get_topk_module():
             top_k,
             tie_break,
         )
-        return output_indices
+
+        return output_values, output_indices
 
     @register_fake_op("flashinfer::cub_topk")
     def _fake_cub_topk(
@@ -377,10 +387,12 @@ def get_topk_module():
         tie_break: int,
         lengths: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = input.size(0)
-        return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
+        return (
+            torch.empty(batch_size, top_k, dtype=input.dtype, device=input.device),
+            torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device),
+        )
 
     return SimpleNamespace(
         radix_topk=radix_topk,
@@ -1096,7 +1108,6 @@ def top_k_cub(
         raise NotImplementedError(
             "top_k_cub does not support deterministic=True. Future support is planned"
         )
-    batch_size = input.size(0)
     device = input.device
 
     topk_module = get_topk_module()
@@ -1109,9 +1120,4 @@ def top_k_cub(
         f"cub_topk_workspace_{device}", workspace_bytes, device
     )
 
-    output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
-    indices = topk_module.cub_topk(
-        input, k, int(tie_break), lengths, workspace_buffer, output_values
-    )
-
-    return output_values, indices
+    return topk_module.cub_topk(input, k, int(tie_break), lengths, workspace_buffer)
