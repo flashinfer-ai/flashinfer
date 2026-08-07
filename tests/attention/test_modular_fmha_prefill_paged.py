@@ -528,8 +528,18 @@ def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
         kv_data_type=torch.bfloat16,
     )
 
+    from flashinfer.cute_dsl.attention.wrappers.batch_prefill import (
+        _dsl_supports_expected_tx,
+    )
+
     w = _paged_wrapper()
     w.plan(qo, kv_pg, ids, lpl, page_size=16, **plan_kw)
+    if not _dsl_supports_expected_tx():
+        # Pre-4.6 DSL: mixed V must be rejected with an actionable error
+        # (this asserts the version gate itself).
+        with pytest.raises(NotImplementedError, match="nvidia-cutlass-dsl"):
+            w.run(q, (cache[:, 0], cache[:, 1].to(torch.float8_e4m3fn)))
+        return
     out_paged = w.run(q, (cache[:, 0], cache[:, 1].to(torch.float8_e4m3fn)))
 
     # Reference via the INTERNAL wrapper: it always runs the modular
