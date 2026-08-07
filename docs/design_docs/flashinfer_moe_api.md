@@ -94,7 +94,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
 | BackendOptions | ordered candidate set via \| operator |
-| ExecutionConfig | enable_pdl, tune_max_num_tokens, output tensor |
+| ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
 | MoEConfig | assembles all above; supports \*\*unpacking protocol |
 
