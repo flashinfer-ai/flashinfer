@@ -459,6 +459,7 @@ class TestEPExecution:
         )
         torch.cuda.synchronize()
         assert int(torch.count_nonzero(result).item()) == 0
+        assert int(torch.count_nonzero(output).item()) == 0
 
     def test_ep_wrapper_cuda_graph_replays_changed_routes(self):
         from flashinfer import B12xMoEWrapper
