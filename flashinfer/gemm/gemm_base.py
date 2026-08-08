@@ -2636,6 +2636,10 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
 def _finalize_cudnn_graph_for_tactic(
     graph, tactic, heur_modes, deselect_eng0: bool = False
 ) -> None:
+    # Only get_valid_tactics passes an integer tactic >= 0, to read back the
+    # available (engine_id, knobs) via _cudnn_graph_engine_knob_tactics.
+    enumeration_only = not _is_cudnn_engine_knob_tactic(tactic) and tactic >= 0
+
     graph.validate()
     graph.build_operation_graph()
 
@@ -2656,6 +2660,12 @@ def _finalize_cudnn_graph_for_tactic(
             graph.deselect_engines(["eng0"])
 
     graph.check_support()
+
+    # check_support() already populates the metadata enumeration reads.  Only the
+    # override-shape path reuses this graph to execute (see _tactic_for_graph_cache).
+    if enumeration_only and not _is_cudnn_override_shape_available():
+        return
+
     if policy is None:
         graph.build_plans()
     else:
