@@ -28,9 +28,9 @@ Output:  o [B,T,HV,V]
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and
 compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 
-The host wrapper makes one architecture decision. Single-token workloads with
-at least 128 sequence-heads use the latency-efficient one-warp kernel. Smaller
-single-token grids and all multi-token workloads use the grouped-CTA kernel,
+The host wrapper makes one architecture decision. Single-token workloads below a
+head-dimension-specific sequence-head cutoff use the latency-efficient one-warp
+kernel; larger grids use grouped-CTA. All multi-token workloads use grouped-CTA,
 which amortizes token preprocessing across its V-column tile.
 """
 
@@ -75,9 +75,32 @@ _FLASH_KDA_DECODE_ARCH_BY_COMPUTE_CAPABILITY: dict[
 DOT_REDUCTION_TREE = 0
 DOT_REDUCTION_DUAL_ACCUM = 1
 
-# This threshold applies to both D64 and D128. Sequence-heads express available
-# one-warp grid parallelism without a head-dimension or benchmark-row table.
-ONE_WARP_MIN_SEQUENCE_HEADS = 128
+# Conservative fallback for architectures without a tuned dispatch heuristic.
+GROUPED_MIN_SEQUENCE_HEADS = {64: 7680, 128: 1920}
+TUNED_DISPATCH_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+
+
+def _use_one_warp(
+    head_dim: int,
+    num_tokens: int,
+    sequence_heads: int,
+    query_heads: int,
+    value_heads: int,
+    use_gate: bool,
+    compute_capability: tuple[int, int],
+) -> bool:
+    """Select the measured kernel architecture for the active GPU."""
+    if compute_capability not in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
+        return num_tokens == 1 and sequence_heads < GROUPED_MIN_SEQUENCE_HEADS[head_dim]
+
+    if num_tokens == 1:
+        grouped_max = 256 if head_dim == 64 else 128
+        return sequence_heads > grouped_max
+    if num_tokens == 4 and query_heads == value_heads and not use_gate:
+        return sequence_heads < 4096
+    if num_tokens == 3 and query_heads == value_heads and use_gate:
+        return sequence_heads >= 256
+    return False
 
 
 # ==============================================================================
@@ -254,22 +277,18 @@ def recurrent_kda_decode_kernel(
         padded_o_head = gO[(0, batch_idx, value_head_idx, None)]
         padded_o_head[v_offset + tidx] = cutlass.BFloat16(0.0)
 
-    init_seq_idx = batch_idx
-    if USE_CU_SEQLENS == 1:
-        init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS].to(cutlass.Int32)
-        if NUM_TOKENS > 1 and HAS_NUM_ACCEPTED_TOKENS == 1:
-            nat_raw = gNumAcceptedTokens[batch_idx].to(cutlass.Int32)
-            nat_offset = nat_raw - 1
-            nat_offset = cutlass.Int32(0) if nat_offset < 0 else nat_offset
-            nat_offset = (
-                cutlass.Int32(NUM_TOKENS - 1)
-                if nat_offset >= NUM_TOKENS
-                else nat_offset
-            )
-            init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + nat_offset].to(
-                cutlass.Int32
-            )
-        init_seq_idx = cutlass.Int32(0) if init_raw_slot < 0 else init_raw_slot
+    init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS].to(cutlass.Int32)
+    if NUM_TOKENS > 1 and HAS_NUM_ACCEPTED_TOKENS == 1:
+        nat_raw = gNumAcceptedTokens[batch_idx].to(cutlass.Int32)
+        nat_offset = nat_raw - 1
+        nat_offset = cutlass.Int32(0) if nat_offset < 0 else nat_offset
+        nat_offset = (
+            cutlass.Int32(NUM_TOKENS - 1) if nat_offset >= NUM_TOKENS else nat_offset
+        )
+        init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + nat_offset].to(
+            cutlass.Int32
+        )
+    init_seq_idx = cutlass.Int32(0) if init_raw_slot < 0 else init_raw_slot
 
     h_read = gH[(init_seq_idx, value_head_idx, None, None)]
     if HAS_INITIAL_STATE_SOURCE == 1:
@@ -304,9 +323,6 @@ def recurrent_kda_decode_kernel(
     if USE_GATE_IN_KERNEL == 1:
         A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
 
-    seq_idx = batch_idx
-    is_active = seq_len > 0
-    raw_slot = cutlass.Int32(0)
     token_offset = token_base_offset
     beta = cutlass.Float32(0.0)
     v_loaded = cutlass.Float32(0.0)
@@ -319,17 +335,13 @@ def recurrent_kda_decode_kernel(
 
     for token_t in cutlass.range(NUM_TOKENS):
         token_offset = token_base_offset + token_t
+        raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + token_t].to(cutlass.Int32)
+        is_active = raw_slot >= 0
+        seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
         if USE_CU_SEQLENS == 1:
-            raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + token_t].to(
-                cutlass.Int32
-            )
             has_token = token_t < seq_len
-            is_active = raw_slot >= 0 and has_token
+            is_active = is_active and has_token
             token_offset = token_offset if has_token else cutlass.Int32(0)
-            seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
-        else:
-            seq_idx = batch_idx
-            is_active = seq_len > 0
         if USE_CU_SEQLENS == 1:
             q_head = gQ[(0, token_offset, query_head_idx, None)]
             k_head = gK[(0, token_offset, query_head_idx, None)]
@@ -855,9 +867,7 @@ def _get_grouped_compiled(
 ):
     fn = _grouped_compiled_cache.get(key)
     if fn is None:
-        D, T, H, HV, gm, hdb, bl, ul2, us = key
-        KS = 4 if T == 1 else 2
-        VSPLIT = 4
+        D, T, H, HV, gm, hdb, bl, ul2, us, KS, VSPLIT = key
 
         def dyn(t, ld):
             return from_dlpack(
@@ -1110,8 +1120,26 @@ def _select_kernel_schedule(
     num_tokens,
     use_gate,
     sequence_heads,
+    compute_capability,
 ):
     """Select tile rows and dot-product reduction for the active kernel."""
+    if compute_capability in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
+        if num_tokens > 1:
+            return 16, DOT_REDUCTION_DUAL_ACCUM
+        if head_dim == 64:
+            return 32, DOT_REDUCTION_DUAL_ACCUM
+        if use_gate:
+            if sequence_heads <= 256:
+                return 16, DOT_REDUCTION_TREE
+            if sequence_heads <= 512:
+                return 32, DOT_REDUCTION_DUAL_ACCUM
+            if sequence_heads <= 1536:
+                return 8, DOT_REDUCTION_TREE
+            return 16, DOT_REDUCTION_DUAL_ACCUM
+        if sequence_heads <= 256:
+            return 16, DOT_REDUCTION_TREE
+        return 8, DOT_REDUCTION_DUAL_ACCUM
+
     if head_dim == 64:
         if not use_gate and sequence_heads <= 256:
             tile_rows = 8
@@ -1146,6 +1174,26 @@ def _select_kernel_schedule(
         else DOT_REDUCTION_TREE
     )
     return tile_rows, reduction_schedule
+
+
+def _select_grouped_schedule(
+    num_tokens: int,
+    use_gate: bool,
+    sequence_heads: int,
+    compute_capability: tuple[int, int],
+) -> tuple[int, int]:
+    """Select grouped key slices and value splits for the active GPU."""
+    if compute_capability not in TUNED_DISPATCH_COMPUTE_CAPABILITIES:
+        return (4 if num_tokens == 1 else 2), 4
+    if num_tokens == 1:
+        return (8, 8) if use_gate and sequence_heads <= 96 else (4, 4)
+    if num_tokens == 3:
+        return 4, 4
+    if num_tokens == 5:
+        return 2, 8
+    if num_tokens == 6:
+        return 2, 2
+    return 2, 4
 
 
 def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -1580,9 +1628,8 @@ def run_recurrent_kda(
             Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If None, zero-initialized. Updated in-place. For batched spec decode
-            without ``cu_seqlens``, ``N`` is the packed checkpoint-slot count
-            ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is omitted.
+            If None, zero-initialized. Updated in-place. ``N`` is the writable
+            cache-slot count and may exceed the active batch size.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -1600,8 +1647,9 @@ def run_recurrent_kda(
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also be
-            set). The wrapper flattens 2D indices to ``[N*(1+S)]`` before
-            passing to the kernel.
+            set). Indexed standard decode pages the selected caller-owned slots
+            directly; when omitted, standard decode uses a dense identity
+            mapping. The wrapper flattens 2D speculative indices before launch.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in a single
             fused kernel launch. If ``cu_seqlens`` is provided, requires 2D
@@ -1645,10 +1693,11 @@ def run_recurrent_kda(
               ``[B, 1+S, HV, V]`` (batched spec decode without
               ``cu_seqlens``). Padded sequence positions are zero-filled
               in spec mode.
-            - state: Updated state of shape ``[N, HV, V, K]`` if
-              ``output_final_state=True``, else ``None``. For batched spec
-              decode without ``cu_seqlens``, this is the packed checkpoint
-              state pool used by the shim.
+            - state: Updated state if ``output_final_state=True``, else
+              ``None``. Indexed standard decode returns the compact
+              ``[B, HV, V, K]`` view while updating the full caller-owned pool
+              in place. For batched spec decode without ``cu_seqlens``, this is
+              the packed checkpoint state pool used by the shim.
 
     Note:
         - Requires SM100 (Blackwell) architecture
@@ -1666,6 +1715,7 @@ def run_recurrent_kda(
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
     device = q.device
+    compute_capability = get_compute_capability(device)
     if K != V:
         raise ValueError(f"K must equal V, got K={K}, V={V}")
     if K not in (64, 128):
@@ -1710,6 +1760,9 @@ def run_recurrent_kda(
                 f"[{HV}, {V}, {K}], got {list(initial_state_source.shape)}"
             )
 
+    indexed_standard_decode = (
+        cu_seqlens is None and num_spec_tokens is None and ssm_state_indices is not None
+    )
     if (
         num_spec_tokens is not None
         and cu_seqlens is not None
@@ -1724,6 +1777,17 @@ def run_recurrent_kda(
             "backend='cake' does not support explicit T=1 cu_seqlens; "
             "use standard decode without explicit cu_seqlens"
         )
+
+    # Cache identity metadata and FFI placeholders outside graph capture. Dense
+    # standard decode uses an identity state mapping through the same directly
+    # paged kernels as indexed decode.
+    global _dummy_cache
+    if device not in _dummy_cache:
+        _dummy_cache[device] = {
+            "f32_1": torch.zeros(1, device=device, dtype=torch.float32),
+            "i32_1": torch.zeros(1, device=device, dtype=torch.int32),
+        }
+    dc = _dummy_cache[device]
 
     # Batched spec-decode shim: auto-converts [B,T,...] to packed [1,B*T,...] format.
     _batched_spec_B = None
@@ -1754,7 +1818,6 @@ def run_recurrent_kda(
         cu_seqlens = torch.arange(
             0, B * T_spec + 1, step=T_spec, dtype=torch.int32, device=device
         )
-        # Auto-build ssm_state_indices [B, T] if not provided
         if ssm_state_indices is None:
             ssm_state_indices = torch.arange(
                 B * T_spec, dtype=torch.int32, device=device
@@ -1795,18 +1858,30 @@ def run_recurrent_kda(
         N = cu_seqlens.shape[0] - 1
         grid_seqs = N
         sequence_heads = grid_seqs * HV
-        use_one_warp = NUM_TOKENS == 1 and sequence_heads >= ONE_WARP_MIN_SEQUENCE_HEADS
+        use_one_warp = _use_one_warp(
+            K,
+            NUM_TOKENS,
+            sequence_heads,
+            H,
+            HV,
+            use_gate_in_kernel,
+            compute_capability,
+        )
         if initial_state_indices is not None and initial_state_indices.shape[0] < N:
             raise ValueError(
                 "initial_state_indices must contain one entry per sequence, "
                 f"got {initial_state_indices.shape[0]} entries for N={N}"
             )
         cu_seqlens_i32 = cu_seqlens.to(torch.int32)
-        ssi = (
-            ssm_state_indices.to(torch.int32).contiguous().view(-1)
-            if ssm_state_indices is not None
-            else torch.arange(N, dtype=torch.int32, device=device)
-        )
+        if ssm_state_indices is None:
+            state_indices_key = f"packed_state_indices_{N}_{NUM_TOKENS}"
+            if state_indices_key not in dc:
+                dc[state_indices_key] = torch.arange(
+                    N * NUM_TOKENS, dtype=torch.int32, device=device
+                )
+            ssi = dc[state_indices_key]
+        else:
+            ssi = ssm_state_indices.to(torch.int32).contiguous().view(-1)
         if initial_state is None:
             max_idx = (
                 max(0, int(ssi[ssi >= 0].max().item())) + 1 if (ssi >= 0).any() else 1
@@ -1852,30 +1927,47 @@ def run_recurrent_kda(
                 f"Decode only supports T=1 without cu_seqlens, got T={T}. "
                 f"For multi-token decode, use cu_seqlens or num_spec_tokens."
             )
-        if initial_state is not None and not initial_state.is_contiguous():
-            raise ValueError(
-                "non-contiguous initial_state requires cu_seqlens: without cu_seqlens "
-                "the wrapper calls .contiguous() which copies the state, so in-place "
-                "updates would be silently lost on the original tensor"
-            )
         grid_seqs = B
         sequence_heads = grid_seqs * HV
-        use_one_warp = sequence_heads >= ONE_WARP_MIN_SEQUENCE_HEADS
+        use_one_warp = _use_one_warp(
+            K,
+            NUM_TOKENS,
+            sequence_heads,
+            H,
+            HV,
+            use_gate_in_kernel,
+            compute_capability,
+        )
         cu_seqlens_i32 = None
-        ssi = None
-        copy_back_indices = None
         if initial_state_indices is not None and initial_state_indices.shape[0] < B:
             raise ValueError(
                 "initial_state_indices must contain one entry per batch row, "
                 f"got {initial_state_indices.shape[0]} entries for B={B}"
             )
-        if initial_state is None:
-            state = torch.zeros(B, HV, V, K, device=device, dtype=torch.bfloat16)
-        elif ssm_state_indices is not None:
-            state = initial_state[ssm_state_indices].contiguous()
-            copy_back_indices = ssm_state_indices
+        if ssm_state_indices is None:
+            state_indices_key = f"dense_state_indices_{B}"
+            if state_indices_key not in dc:
+                dc[state_indices_key] = torch.arange(
+                    B, dtype=torch.int32, device=device
+                )
+            ssi = dc[state_indices_key]
         else:
-            state = initial_state.contiguous()
+            if ssm_state_indices.ndim != 1 or ssm_state_indices.numel() != B:
+                raise ValueError(
+                    f"ssm_state_indices must have shape [{B}] for standard decode, "
+                    f"got {list(ssm_state_indices.shape)}"
+                )
+            ssi = ssm_state_indices.to(torch.int32).contiguous()
+        if initial_state is None:
+            max_idx = int(ssi.max().item()) + 1
+            state = torch.zeros(
+                max(B, max_idx), HV, V, K, device=device, dtype=torch.bfloat16
+            )
+        else:
+            # Standard decode pages the caller-owned state pool directly in
+            # both kernel architectures. Keeping the indices on device avoids
+            # full-state gather and scatter launches around the recurrence.
+            state = initial_state
         if (
             output is not None
             and output.shape == (B, 1, HV, V)
@@ -1902,15 +1994,6 @@ def run_recurrent_kda(
     USE_LB = 1 if lower_bound is not None else 0
     HAS_SOURCE = 1 if initial_state_source is not None else 0
     BETA_LOGIT = 1 if beta_is_logit else 0
-
-    # Dummy tensors for unused optional args (TVM FFI requires all args present)
-    global _dummy_cache
-    if device not in _dummy_cache:
-        _dummy_cache[device] = {
-            "f32_1": torch.zeros(1, device=device, dtype=torch.float32),
-            "i32_1": torch.zeros(1, device=device, dtype=torch.int32),
-        }
-    dc = _dummy_cache[device]
 
     if num_accepted_tokens is not None:
         num_accepted_tokens_i32 = (
@@ -1947,7 +2030,7 @@ def run_recurrent_kda(
         and NUM_TOKENS == 1
         and cu_seqlens_i32 is None
         and initial_state_indices is None
-        and copy_back_indices is None
+        and not indexed_standard_decode
     ):
         try:
             frozen_q = q.view(1, grid_seqs, H, K)
@@ -2050,6 +2133,7 @@ def run_recurrent_kda(
             NUM_TOKENS,
             use_gate_in_kernel,
             sequence_heads,
+            compute_capability,
         )
         compiled = _get_compiled_kernel(
             K,
@@ -2081,15 +2165,15 @@ def run_recurrent_kda(
             A_log if A_log is not None else dc["f32_1"],
             dt_bias if dt_bias is not None else dc["f32_1"],
             cu_seqlens_i32 if cu_seqlens_i32 is not None else dc["i32_1"],
-            ssi if ssi is not None else dc["i32_1"],
+            ssi,
             num_accepted_tokens_i32,
             scale if scale is not None else 1.0 / math.sqrt(K),
             1e-6,
             lower_bound if lower_bound is not None else 0.0,
         )
     else:
-        # Normalize both dense and indexed calls to the grouped kernel's packed
-        # token axis. Only a non-contiguous gate requires materialization.
+        # Normalize calls to the grouped kernel's packed token axis. Only a
+        # non-contiguous gate requires materialization.
         q_grouped = q.reshape(1, -1, H, K)
         k_grouped = k.reshape(1, -1, H, K)
         v_grouped = v.reshape(1, -1, HV, V)
@@ -2099,19 +2183,7 @@ def run_recurrent_kda(
         beta_grouped = beta.reshape(1, -1, HV)
         out_grouped = out_buf.reshape(1, -1, HV, V)
 
-        # The grouped kernel always uses packed sequence metadata. Cache the
-        # identity forms needed by dense standard decode and optional sources.
-        if ssi is None:
-            state_indices_key = f"grouped_state_indices_{grid_seqs}_{NUM_TOKENS}"
-            if state_indices_key not in dc:
-                dc[state_indices_key] = torch.arange(
-                    grid_seqs * NUM_TOKENS,
-                    dtype=torch.int32,
-                    device=device,
-                ).reshape(grid_seqs, NUM_TOKENS)
-            state_indices_grouped = dc[state_indices_key]
-        else:
-            state_indices_grouped = ssi.reshape(grid_seqs, NUM_TOKENS)
+        state_indices_grouped = ssi.reshape(grid_seqs, NUM_TOKENS)
 
         row_indices_key = f"grouped_row_indices_{grid_seqs}"
         if row_indices_key not in dc:
@@ -2138,6 +2210,12 @@ def run_recurrent_kda(
         if a_log_key not in dc:
             dc[a_log_key] = torch.empty(H, dtype=torch.float32, device=device)
         gate_mode = 0 if not use_gate_in_kernel else (2 if USE_LB else 1)
+        key_slices, value_splits = _select_grouped_schedule(
+            NUM_TOKENS,
+            use_gate_in_kernel,
+            sequence_heads,
+            compute_capability,
+        )
         a_log_grouped = A_log if A_log is not None else dc[a_log_key]
         dt_bias_grouped = dt_bias if dt_bias is not None else dc["f32_1"]
         source_grouped = (
@@ -2153,6 +2231,8 @@ def run_recurrent_kda(
             BETA_LOGIT,
             USE_QK_NORM,
             HAS_SOURCE,
+            key_slices,
+            value_splits,
         )
         compiled_grouped = _get_grouped_compiled(
             grouped_key,
@@ -2197,12 +2277,14 @@ def run_recurrent_kda(
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
 
-    if cu_seqlens_i32 is None and copy_back_indices is not None:
-        initial_state[copy_back_indices] = state
-
     # Reshape output back to [B, T, HV, V] for batched spec decode
     if _batched_spec_B is not None:
         T_spec = 1 + num_spec_tokens
         out_buf = out_buf.reshape(_batched_spec_B, T_spec, HV, V)
 
-    return (out_buf, state if output_final_state else None)
+    final_state = state if output_final_state else None
+    if output_final_state and indexed_standard_decode:
+        # Preserve the existing return contract: indexed standard decode
+        # returns the compact batch view while mutating the full pool in place.
+        final_state = state[ssi]
+    return (out_buf, final_state)
