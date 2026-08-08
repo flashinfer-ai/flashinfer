@@ -114,9 +114,10 @@ run_sm90_push() {
 }
 
 run_multirank() {
-  require_nccl_ep || return 1
-
   local rc=0
+
+  run_sm90_push || rc=1
+  require_nccl_ep || return "${rc}"
 
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -127,8 +128,6 @@ run_multirank() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_kernels.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep || rc=1
-
-  run_sm90_push || rc=1
 
   if have_nixl_ep; then
     "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \

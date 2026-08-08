@@ -42,6 +42,7 @@ def test_sm90_push_backend_import_defers_kernel_package():
         text=True,
         env=env,
         check=False,
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
 
