@@ -173,6 +173,38 @@ def _validate_logits_inputs(
             raise ValueError(f"{runner}: routing_bias must be contiguous.")
 
 
+def _validate_optional_gemm1_activation_params(
+    view: dict,
+    num_local_experts: int,
+    device: torch.device,
+    runner: str,
+) -> None:
+    """Runner-boundary validation for the optional SwiGLU OA weight-side params.
+
+    ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are independent: any
+    subset may be absent, and absent means the neutral value (alpha=1, beta=0, no
+    clamp).  The launcher re-checks all of this, but failing here names the runner
+    and the offending key instead of surfacing a bare TVM-FFI ICHECK.
+    """
+    for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+        tensor = view.get(key)
+        if tensor is None:
+            continue
+        if tensor.device != device:
+            raise ValueError(
+                f"{runner}: {key} is on {tensor.device}, expected {device}."
+            )
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"{runner}: {key} must be float32, got {tensor.dtype}.")
+        if tuple(tensor.shape) != (num_local_experts,):
+            raise ValueError(
+                f"{runner}: {key} shape {tuple(tensor.shape)} "
+                f"!= expected ({num_local_experts},)."
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{runner}: {key} must be contiguous.")
+
+
 class MoERunner(TunableRunner):
     """Base class for unified MoE backend runners."""
 
@@ -1042,6 +1074,12 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{name} must be {scale_dtype} with shape {expected}, got "
                     f"{tensor.dtype} {tuple(tensor.shape)}."
                 )
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            "TrtllmFp8BlockRunner",
+        )
         return scale
 
     def pack_inputs(
@@ -1102,9 +1140,12 @@ class TrtllmFp8BlockRunner(MoERunner):
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            # Optional SwiGLU OA controls; absent keys mean alpha=1 / beta=0 / no clamp.
+            # Both block-scale variants consume them: MxFp8 in the fused FC1 epilogue,
+            # DeepSeekFp8 in its separate activation kernel.
+            gemm1_alpha=view.get("gemm1_alpha"),
+            gemm1_beta=view.get("gemm1_beta"),
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
             gemm2_weights=view["gemm2_weights"],
             gemm2_weights_scale=view["gemm2_weights_scale"],
             num_experts=routing.num_experts,
@@ -1850,26 +1891,12 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
                     f"{type(self).__name__}: {key} shape "
                     f"{tuple(view[key].shape)} != expected {expected}."
                 )
-        for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
-            tensor = view.get(key)
-            if tensor is None:
-                continue
-            if tensor.device != hidden_states.device:
-                raise ValueError(
-                    f"{type(self).__name__}: {key} is on {tensor.device}, "
-                    f"expected {hidden_states.device}."
-                )
-            if tensor.dtype != torch.float32:
-                raise TypeError(
-                    f"{type(self).__name__}: {key} must be float32, got {tensor.dtype}."
-                )
-            if tuple(tensor.shape) != (self._num_local_experts,):
-                raise ValueError(
-                    f"{type(self).__name__}: {key} shape {tuple(tensor.shape)} "
-                    f"!= expected ({self._num_local_experts},)."
-                )
-            if not tensor.is_contiguous():
-                raise ValueError(f"{type(self).__name__}: {key} must be contiguous.")
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            hidden_states.device,
+            type(self).__name__,
+        )
 
         output = hidden_states.new_empty((num_tokens, hidden_size))
         moe_inputs = MoeRunnerInputs(
