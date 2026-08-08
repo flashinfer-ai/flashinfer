@@ -30,7 +30,7 @@
 # and adapted for the current Blackwell GeForce target.
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import logging
-from cutlass import Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -266,6 +266,8 @@ class DenseGemmKernel:
         self.epi_stage = None
         self.a_smem_layout_staged = None
         self.b_smem_layout_staged = None
+        self.svdquant_a_smem_layout = None
+        self.svdquant_b_smem_layout = None
         self.epi_smem_layout_staged = None
 
         self.buffer_align_bytes = 1024
@@ -304,6 +306,41 @@ class DenseGemmKernel:
         )
         # Bare atom for manual unroll workaround (avoids hasAuxTensor address space bug)
         self.mma_atom = cute.make_mma_atom(mma_op)
+        if cutlass.const_expr(self.svdquant_enabled):
+            svdquant_mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+                BFloat16,
+                self.acc_dtype,
+                (16, 8, 16),
+            )
+            self.svdquant_tiled_mma = cute.make_tiled_mma(
+                svdquant_mma_op,
+                atom_layout,
+                permutation_mnk=(
+                    permutation_mnk[0],
+                    permutation_mnk[1],
+                    16,
+                ),
+            )
+            self.svdquant_a_smem_layout = sm90_utils.make_smem_layout_a(
+                utils.LayoutEnum.ROW_MAJOR,
+                (
+                    self.mma_tile_shape_mnk[0],
+                    self.mma_tile_shape_mnk[1],
+                    16,
+                ),
+                BFloat16,
+                1,
+            )
+            self.svdquant_b_smem_layout = sm90_utils.make_smem_layout_b(
+                utils.LayoutEnum.ROW_MAJOR,
+                (
+                    self.mma_tile_shape_mnk[0],
+                    self.mma_tile_shape_mnk[1],
+                    16,
+                ),
+                BFloat16,
+                1,
+            )
         # Compute atom loop bounds from tile shape and atom/layout shape
         # MMA atom: m16n8k64 for FP4.
         mma_m, mma_n, mma_k = 16, 8, self.mma_k
@@ -339,6 +376,9 @@ class DenseGemmKernel:
             self.c_dtype,
             self.smem_capacity,
             self.occupancy,
+            (self.mma_tile_shape_mnk[0] + self.mma_tile_shape_mnk[1]) * 16 * 2
+            if self.svdquant_enabled
+            else 0,
         )
 
         assert self.epi_stage > 0, (
@@ -365,6 +405,9 @@ class DenseGemmKernel:
             self.sf_vec_size,
             self.tiled_mma,
         )
+        if cutlass.const_expr(not self.svdquant_enabled):
+            self.svdquant_a_smem_layout = self.a_smem_layout_staged
+            self.svdquant_b_smem_layout = self.b_smem_layout_staged
 
     @cute.jit
     def __call__(
@@ -407,6 +450,7 @@ class DenseGemmKernel:
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.svdquant_enabled = svdquant_d is not None
 
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
@@ -469,7 +513,7 @@ class DenseGemmKernel:
         )
 
         @cute.struct
-        class SharedStorage:
+        class DenseSharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
             ]
@@ -504,7 +548,53 @@ class DenseGemmKernel:
                 self.buffer_align_bytes,
             ]
 
-        self.shared_storage = SharedStorage
+        @cute.struct
+        class SvdquantSharedStorage:
+            dense: DenseSharedStorage
+            sSvdquantA: cute.struct.Align[
+                cute.struct.MemRange[
+                    BFloat16,
+                    cute.cosize(self.svdquant_a_smem_layout),
+                ],
+                128,
+            ]
+            sSvdquantB: cute.struct.Align[
+                cute.struct.MemRange[
+                    BFloat16,
+                    cute.cosize(self.svdquant_b_smem_layout),
+                ],
+                128,
+            ]
+
+            @property
+            def mainloop_pipeline_array_ptr(self):
+                return self.dense.mainloop_pipeline_array_ptr
+
+            @property
+            def sA(self):
+                return self.dense.sA
+
+            @property
+            def sB(self):
+                return self.dense.sB
+
+            @property
+            def sSFA(self):
+                return self.dense.sSFA
+
+            @property
+            def sSFB(self):
+                return self.dense.sSFB
+
+            @property
+            def sC(self):
+                return self.dense.sC
+
+        shared_storage: Any = DenseSharedStorage
+        if cutlass.const_expr(self.svdquant_enabled):
+            shared_storage = SvdquantSharedStorage
+
+        self.shared_storage = shared_storage
 
         self.kernel(
             tma_atom_a,
@@ -530,6 +620,9 @@ class DenseGemmKernel:
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
+            self.svdquant_tiled_mma if self.svdquant_enabled else None,
+            self.svdquant_a_smem_layout if self.svdquant_enabled else None,
+            self.svdquant_b_smem_layout if self.svdquant_enabled else None,
             tile_sched_params,
             epilogue_op,
             alpha,
@@ -750,7 +843,31 @@ class DenseGemmKernel:
         )
 
     @cute.jit
-    def _predicate_cpasync_rows(
+    def _make_svdquant_gmem_tiled_copy(
+        self,
+        tile_rows: cutlass.Constexpr[int],
+    ) -> cute.TiledCopy:
+        copy_bits = 128
+        copy_elems = copy_bits // BFloat16.width
+        threads_per_row = 16 // copy_elems
+        copy_rows = min(
+            tile_rows,
+            self.num_mma_warps * self.num_threads_per_warp // threads_per_row,
+        )
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            BFloat16,
+            num_bits_per_copy=copy_bits,
+        )
+        thread_layout = cute.make_ordered_layout(
+            (copy_rows, threads_per_row),
+            order=(1, 0),
+        )
+        value_layout = cute.make_layout((1, copy_elems))
+        return cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
+
+    @cute.jit
+    def _predicate_tiled_copy_rows(
         self,
         tCc: cute.Tensor,
         row_limit: Int32,
@@ -772,6 +889,25 @@ class DenseGemmKernel:
         return tPred
 
     @cute.jit
+    def _svdquant_tiled_copy_2d(
+        self,
+        tiled_copy: cute.TiledCopy,
+        gmem_tensor: cute.Tensor,
+        smem_tensor: cute.Tensor,
+        coord_tensor: cute.Tensor,
+        tidx: Int32,
+        copy_threads: cutlass.Constexpr[int],
+        row_limit: Int32,
+    ) -> None:
+        thr_copy = tiled_copy.get_slice(tidx)
+        tG = thr_copy.partition_S(gmem_tensor)
+        tS = thr_copy.partition_D(smem_tensor)
+        tC = thr_copy.partition_S(coord_tensor)
+        tP = self._predicate_tiled_copy_rows(tC, row_limit)
+        if tidx < copy_threads:
+            cute.copy(tiled_copy, tG, tS, pred=tP)
+
+    @cute.jit
     def _cpasync_copy_2d(
         self,
         tiled_copy: cute.TiledCopy,
@@ -782,7 +918,7 @@ class DenseGemmKernel:
         predicate_rows: cutlass.Constexpr[bool],
     ) -> None:
         if cutlass.const_expr(predicate_rows):
-            tP = self._predicate_cpasync_rows(tC, row_limit)
+            tP = self._predicate_tiled_copy_rows(tC, row_limit)
         for rest_m in cutlass.range_constexpr(cute.size(tS.shape[1])):
             if cutlass.const_expr(predicate_rows):
                 cute.copy(
@@ -845,6 +981,9 @@ class DenseGemmKernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         epi_smem_layout_staged: cute.ComposedLayout,
+        svdquant_tiled_mma: Optional[cute.TiledMma],
+        svdquant_a_smem_layout: Optional[cute.ComposedLayout],
+        svdquant_b_smem_layout: Optional[cute.ComposedLayout],
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
@@ -953,6 +1092,13 @@ class DenseGemmKernel:
         )
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        if cutlass.const_expr(svdquant_d is not None):
+            sSvdquantA = storage.sSvdquantA.get_tensor(
+                svdquant_a_smem_layout.outer, swizzle=svdquant_a_smem_layout.inner
+            )
+            sSvdquantB = storage.sSvdquantB.get_tensor(
+                svdquant_b_smem_layout.outer, swizzle=svdquant_b_smem_layout.inner
+            )
 
         # Local_tile partition global tensors
         gA_mkl = cute.local_tile(
@@ -1251,6 +1397,41 @@ class DenseGemmKernel:
             )
             tCrSFB_copy_view_full = thr_copy_ldmatrix_SFB.retile(tCrSFB_full)
 
+            if cutlass.const_expr(svdquant_d is not None):
+                svdquant_thr_mma = svdquant_tiled_mma.get_slice(tidx)
+                tCsSvdquantA = svdquant_thr_mma.partition_A(sSvdquantA)
+                tCsSvdquantB = svdquant_thr_mma.partition_B(sSvdquantB)
+                tCrSvdquantA = svdquant_tiled_mma.make_fragment_A(
+                    tCsSvdquantA[None, None, None, 0]
+                )
+                tCrSvdquantB = svdquant_tiled_mma.make_fragment_B(
+                    tCsSvdquantB[None, None, None, 0]
+                )
+                svdquant_copy_atom_a = cute.make_copy_atom(
+                    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), BFloat16
+                )
+                svdquant_copy_atom_b = cute.make_copy_atom(
+                    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), BFloat16
+                )
+                svdquant_smem_copy_a = cute.make_tiled_copy_A(
+                    svdquant_copy_atom_a, svdquant_tiled_mma
+                )
+                svdquant_smem_copy_b = cute.make_tiled_copy_B(
+                    svdquant_copy_atom_b, svdquant_tiled_mma
+                )
+                svdquant_thr_copy_a = svdquant_smem_copy_a.get_slice(tidx)
+                svdquant_thr_copy_b = svdquant_smem_copy_b.get_slice(tidx)
+                tCsSvdquantA_copy = svdquant_thr_copy_a.partition_S(sSvdquantA)
+                tCsSvdquantB_copy = svdquant_thr_copy_b.partition_S(sSvdquantB)
+                tCrSvdquantA_copy = svdquant_thr_copy_a.retile(tCrSvdquantA)
+                tCrSvdquantB_copy = svdquant_thr_copy_b.retile(tCrSvdquantB)
+                svdquant_gmem_tiled_copy_a = self._make_svdquant_gmem_tiled_copy(
+                    self.mma_tile_shape_mnk[0]
+                )
+                svdquant_gmem_tiled_copy_b = self._make_svdquant_gmem_tiled_copy(
+                    self.mma_tile_shape_mnk[1]
+                )
+
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
@@ -1507,68 +1688,126 @@ class DenseGemmKernel:
                                 accumulators[None, _mt, _nt],
                             )
 
-                # SVDQuant fusion: accumulate the rank-r BF16 correction into the
-                # same FP32 registers as the NVFP4 residual before the epilogue.
-                # The first SM120 implementation uses scalar BF16 dot products;
-                # this keeps one device launch and the exact public contract while
-                # leaving BF16 warp-MMA staging as a transparent optimization.
+                # SVDQuant fusion: stage rank-16 BF16 chunks cooperatively, then
+                # accumulate them with warp MMA directly into the FP32 NVFP4
+                # accumulator fragment.  swap_ab also swaps the correction's A/B
+                # operands, so both MMA paths retain identical C-fragment ownership.
+                # Match the SM100 CUTLASS contract: svdquant_l1 is supplied as
+                # L1 / alpha.  The common epilogue's alpha multiply therefore
+                # restores the unscaled correction:
+                #   alpha * (residual + D @ (L1 / alpha).T)
+                #     = alpha * residual + D @ L1.T.
                 if cutlass.const_expr(svdquant_d is not None):
-                    acc_mn = _reshape_acc_to_mn(
-                        accumulators,
-                        transpose=self.swap_ab,
-                    )
-                    c_identity = cute.make_identity_tensor(
-                        (
-                            self.tile_shape_mnk[1],
-                            self.tile_shape_mnk[0],
-                        )
-                        if cutlass.const_expr(self.swap_ab)
-                        else (
-                            self.tile_shape_mnk[0],
-                            self.tile_shape_mnk[1],
-                        )
-                    )
-                    coord_mn = _reshape_acc_to_mn(
-                        thr_mma.partition_C(c_identity),
-                        transpose=self.swap_ab,
-                    )
                     rank = cute.size(svdquant_d, mode=[1])
-                    for acc_m in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
-                        for acc_n in cutlass.range_constexpr(
-                            cute.size(acc_mn.shape[1])
-                        ):
-                            coord = coord_mn[acc_m, acc_n]
-                            if cutlass.const_expr(self.swap_ab):
-                                m_local = coord[1]
-                                n_local = coord[0]
-                            else:
-                                m_local = coord[0]
-                                n_local = coord[1]
-                            m_coord = (
-                                tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
-                                + m_local
-                            )
-                            n_coord = (
-                                tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
-                                + n_local
-                            )
-                            if m_coord < Int32(
-                                directC_mnl.shape[0]
-                            ) and n_coord < Int32(directC_mnl.shape[1]):
-                                correction = Float32(0.0)
-                                for rank_idx in cutlass.range(rank, unroll=1):
-                                    correction += svdquant_d[(m_coord, rank_idx)].to(
-                                        Float32
-                                    ) * svdquant_l1[(n_coord, rank_idx)].to(Float32)
-                                if cutlass.const_expr(svdquant_bias is not None):
-                                    # The common epilogue multiplies the whole FP32
-                                    # accumulator by alpha. Pre-dividing bias here
-                                    # retains out = alpha*(residual+correction)+bias.
-                                    correction += (
-                                        svdquant_bias[(n_coord,)].to(Float32)
-                                        / alpha_value
-                                    )
-                                acc_mn[acc_m, acc_n] += correction
+                    svdquant_a_rows = self.mma_tile_shape_mnk[0]
+                    svdquant_b_rows = self.mma_tile_shape_mnk[1]
+                    svdquant_threads_per_row = 2
+                    svdquant_copy_row_capacity = (
+                        self.num_mma_warps
+                        * self.num_threads_per_warp
+                        // svdquant_threads_per_row
+                    )
+                    svdquant_a_copy_threads = (
+                        min(svdquant_a_rows, svdquant_copy_row_capacity)
+                        * svdquant_threads_per_row
+                    )
+                    svdquant_b_copy_threads = (
+                        min(svdquant_b_rows, svdquant_copy_row_capacity)
+                        * svdquant_threads_per_row
+                    )
+                    tile_m, tile_n, _ = tile_coord_mnl
+                    tile_rows_m, tile_rows_n, _ = self.tile_shape_mnk
+                    svdquant_a_plan = (
+                        svdquant_d,
+                        tile_m,
+                        tile_rows_m,
+                    )
+                    svdquant_b_plan = (
+                        svdquant_l1,
+                        tile_n,
+                        tile_rows_n,
+                    )
+                    if cutlass.const_expr(self.swap_ab):
+                        svdquant_a_plan, svdquant_b_plan = (
+                            svdquant_b_plan,
+                            svdquant_a_plan,
+                        )
+                    (
+                        svdquant_a_source,
+                        svdquant_a_tile_coord,
+                        svdquant_a_tile_rows,
+                    ) = svdquant_a_plan
+                    (
+                        svdquant_b_source,
+                        svdquant_b_tile_coord,
+                        svdquant_b_tile_rows,
+                    ) = svdquant_b_plan
+                    svdquant_a_tiler = (svdquant_a_tile_rows, 16)
+                    svdquant_b_tiler = (svdquant_b_tile_rows, 16)
+                    gSvdquantA = cute.local_tile(
+                        svdquant_a_source,
+                        svdquant_a_tiler,
+                        (svdquant_a_tile_coord, None),
+                    )
+                    gSvdquantB = cute.local_tile(
+                        svdquant_b_source,
+                        svdquant_b_tiler,
+                        (svdquant_b_tile_coord, None),
+                    )
+                    cSvdquantA = cute.local_tile(
+                        cute.make_identity_tensor(cute.shape(svdquant_a_source)),
+                        svdquant_a_tiler,
+                        (svdquant_a_tile_coord, None),
+                    )
+                    cSvdquantB = cute.local_tile(
+                        cute.make_identity_tensor(cute.shape(svdquant_b_source)),
+                        svdquant_b_tiler,
+                        (svdquant_b_tile_coord, None),
+                    )
+                    for rank_tile in cutlass.range_constexpr(rank // 16):
+                        self._svdquant_tiled_copy_2d(
+                            svdquant_gmem_tiled_copy_a,
+                            gSvdquantA[(None, None, rank_tile)],
+                            sSvdquantA[(None, None, 0)],
+                            cSvdquantA[(None, None, rank_tile)],
+                            tidx,
+                            svdquant_a_copy_threads,
+                            Int32(cute.size(svdquant_a_source, mode=[0])),
+                        )
+                        self._svdquant_tiled_copy_2d(
+                            svdquant_gmem_tiled_copy_b,
+                            gSvdquantB[(None, None, rank_tile)],
+                            sSvdquantB[(None, None, 0)],
+                            cSvdquantB[(None, None, rank_tile)],
+                            tidx,
+                            svdquant_b_copy_threads,
+                            Int32(cute.size(svdquant_b_source, mode=[0])),
+                        )
+
+                        # All MMA warps must see the cooperatively staged rank tile.
+                        self.mma_sync_barrier.arrive_and_wait()
+                        cute.copy(
+                            svdquant_smem_copy_a,
+                            tCsSvdquantA_copy[None, None, None, 0],
+                            tCrSvdquantA_copy,
+                        )
+                        cute.copy(
+                            svdquant_smem_copy_b,
+                            tCsSvdquantB_copy[None, None, None, 0],
+                            tCrSvdquantB_copy,
+                        )
+                        cute.gemm(
+                            svdquant_tiled_mma,
+                            accumulators,
+                            tCrSvdquantA,
+                            tCrSvdquantB,
+                            accumulators,
+                        )
+                        # Keep early warps from overwriting SMEM still read by peers.
+                        self.mma_sync_barrier.arrive_and_wait()
+
+                    # Bias remains an elementwise output-epilogue contribution.
+                    # The low-rank matrix product above is exclusively BF16 MMA.
 
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
@@ -1595,17 +1834,16 @@ class DenseGemmKernel:
                             if m_coord < Int32(
                                 directC_mnl.shape[0]
                             ) and n_coord < Int32(directC_mnl.shape[1]):
+                                acc_value = alpha_value * acc_mn[acc_m, acc_n]
+                                if cutlass.const_expr(svdquant_bias is not None):
+                                    acc_value += svdquant_bias[(n_coord,)].to(Float32)
                                 directC_mnl[
                                     (
                                         m_coord,
                                         n_coord,
                                         tile_coord_mnl[2],
                                     )
-                                ] = epilogue_op(
-                                    (alpha_value * acc_mn[acc_m, acc_n]).to(
-                                        self.c_dtype
-                                    )
-                                )
+                                ] = epilogue_op(acc_value.to(self.c_dtype))
                     if cutlass.const_expr(self.single_work_tile_per_cta):
                         work_tile = WorkTileInfo(
                             work_tile.tile_idx,
@@ -1654,6 +1892,11 @@ class DenseGemmKernel:
                     thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
                     tRS_sD = thr_copy_r2s.partition_D(sC)
                     tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+                    if cutlass.const_expr(svdquant_bias is not None):
+                        c_identity = cute.make_identity_tensor(
+                            cute.slice_(self.tile_shape_mnk, (None, None, 0))
+                        )
+                        tRS_cD = tiled_copy_r2s.retile(thr_mma.partition_C(c_identity))
 
                     rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
                     tRS_rD_layout = cute.make_layout(rD_shape[:3])
@@ -1706,12 +1949,29 @@ class DenseGemmKernel:
                                         (None, mma_m_in_epi, mma_n_in_epi)
                                     ]
                                     tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
+                                    if cutlass.const_expr(svdquant_bias is not None):
+                                        tRS_cD_slice = tRS_cD[(None, mma_m, mma_n)]
                                     for elem_idx in cutlass.range_constexpr(
                                         cute.size(tRS_rD_slice)
                                     ):
-                                        tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
-                                            elem_idx
-                                        ]
+                                        acc_value = tRS_rAcc_slice[elem_idx]
+                                        if cutlass.const_expr(
+                                            svdquant_bias is not None
+                                        ):
+                                            coord = tRS_cD_slice[elem_idx]
+                                            n_coord = (
+                                                tile_coord_mnl[1]
+                                                * Int32(self.tile_shape_mnk[1])
+                                                + coord[1]
+                                            )
+                                            if n_coord < Int32(directC_mnl.shape[1]):
+                                                acc_value = (
+                                                    alpha_value * acc_value
+                                                    + svdquant_bias[(n_coord,)].to(
+                                                        Float32
+                                                    )
+                                                )
+                                        tRS_rD_slice[elem_idx] = acc_value
 
                             gmem_coord = (epi_m, epi_n)
                             if cutlass.const_expr(self.split_k_slices > 1):
@@ -1844,9 +2104,12 @@ class DenseGemmKernel:
                                 acc_vec = tRS_rD.load()
                                 # Multiply alpha in FP32 before converting to c_dtype
                                 # to avoid overflow when c_dtype is FP16
-                                acc_vec = epilogue_op(
-                                    (alpha_value * acc_vec).to(self.c_dtype)
-                                )
+                                if cutlass.const_expr(svdquant_bias is not None):
+                                    acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                                else:
+                                    acc_vec = epilogue_op(
+                                        (alpha_value * acc_vec).to(self.c_dtype)
+                                    )
                                 tRS_rD_out.store(acc_vec)
 
                                 # Register to shared memory
@@ -2247,6 +2510,7 @@ class DenseGemmKernel:
         c_dtype,
         smem_capacity: int,
         occupancy: int,
+        svdquant_bytes: int,
     ) -> tuple:
         epi_stage_max = (tile_shape_mnk[1] // epi_tile[1]) * (
             tile_shape_mnk[0] // epi_tile[0]
@@ -2271,6 +2535,7 @@ class DenseGemmKernel:
             (smem_capacity - occupancy * 1024) // occupancy
             - mbar_helpers_bytes
             - epi_bytes
+            - svdquant_bytes
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
         ab_stage = max(1, min(raw_ab_stage, 4))
         if tile_shape_mnk[0] in (16, 64) and tile_shape_mnk[1] == 128:
@@ -2444,6 +2709,7 @@ class DenseGemmKernel:
         *,
         load_path: str = "tma",
         swap_ab: bool = False,
+        svdquant_rank: Optional[int] = None,
     ) -> bool:
         # The current target only supports cluster (1,1)
         if cluster_shape_mn != (1, 1):
@@ -2459,6 +2725,8 @@ class DenseGemmKernel:
             if sf_vec_size != 16:
                 return False
         if load_path == "cpasync" and (sf_vec_size != 16 or l != 1):
+            return False
+        if svdquant_rank is not None and svdquant_rank % 16 != 0:
             return False
         # FP4 experiments allow narrow N tiles. The scale-factor smem paths
         # still allocate full 128-element SF blocks, but the live MMA tile may

@@ -2135,8 +2135,8 @@ nvfp4_quantize_smooth_trace = TraceTemplate(
     op_type="quantize_nvfp4_smooth",
     description=(
         "Smooth + NVFP4 quantize: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
-        "SM100/SM103 fuse the operations; SM120/SM121 materialize the BF16 "
-        "smoothed input before CuTe DSL quantization. Both use ue4m3 block "
+        "SM100/SM103 and SM120/SM121 fuse smoothing into quantization; the "
+        "SM120/SM121 path uses CuTe DSL. Both use ue4m3 block "
         "scales, 128x4 swizzled layout, and SF vector size 16."
     ),
     axes={
