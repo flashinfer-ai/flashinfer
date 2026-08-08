@@ -73,6 +73,7 @@ silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
+top_k_varlen_page_table_transform_n8192_k1024_ps64.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
@@ -174,6 +175,35 @@ top_p = torch.full((64,), 0.9, dtype=torch.float32, device=device)
 flashinfer.top_k_sampling_from_probs(probs, top_k)
 flashinfer.top_p_sampling_from_probs(probs, top_p)
 flashinfer.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+
+# ── varlen top-K + compact page transform (DeepSeek sparse decode) ─────────
+_topk_pt_B, _topk_pt_N, _topk_pt_K, _topk_pt_PS = 32, 8192, 1024, 64
+_topk_pt_logits = torch.randn(
+    _topk_pt_B, _topk_pt_N, dtype=torch.float32, device=device
+)
+_topk_pt_seq_lens = torch.randint(
+    _topk_pt_K + 1,
+    _topk_pt_N + 1,
+    (_topk_pt_B,),
+    dtype=torch.int32,
+    device=device,
+)
+_topk_pt_pages_per_seq = (_topk_pt_N + _topk_pt_PS - 1) // _topk_pt_PS
+_topk_pt_page_table = torch.randperm(
+    _topk_pt_B * _topk_pt_pages_per_seq,
+    dtype=torch.int32,
+    device=device,
+).reshape(_topk_pt_B, _topk_pt_pages_per_seq)
+flashinfer.top_k_varlen_page_table_transform(
+    _topk_pt_logits,
+    _topk_pt_page_table,
+    _topk_pt_seq_lens,
+    _topk_pt_K,
+    compress_ratio=1,
+    next_n=1,
+    page_size=_topk_pt_PS,
+    backend="radix_cutlass",
+)
 
 # ── sampling (Qwen3 vocab=151936) ─────────────────────────────────────────────
 probs = torch.rand(64, 151936, dtype=torch.float32, device=device)

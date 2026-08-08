@@ -15,7 +15,8 @@
 """Top-K decode kernels for FlashInfer.
 
 The CuTe-DSL kernel source (GVR and radix Top-K for Blackwell sm_100+) lives in
-``flashinfer.topk_varlen.kernels``.  The public ``top_k_varlen`` API is defined in
+``flashinfer.topk_varlen.kernels``.  The public ``top_k_varlen`` and
+``top_k_varlen_page_table_transform`` APIs are defined in
 ``flashinfer.topk_varlen.topk_varlen`` and re-exported from the top-level
 ``flashinfer`` namespace.
 """

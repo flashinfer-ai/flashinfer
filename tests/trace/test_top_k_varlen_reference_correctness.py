@@ -38,3 +38,30 @@ def test_top_k_varlen_reference_correctness(shape_kwargs):
         top_k=inputs["top_k"],
     )
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_top_k_varlen_page_table_transform_reference_correctness(page_size):
+    """Compact physical indices match the varlen page-table reference."""
+    import flashinfer
+    from flashinfer.trace.templates.topk import (
+        top_k_varlen_page_table_transform_trace,
+    )
+
+    inputs = top_k_varlen_page_table_transform_trace.init(
+        num_rows=8,
+        max_seq_len=4096,
+        top_k=512,
+        page_size=page_size,
+    )
+    physical_indices, values = flashinfer.top_k_varlen_page_table_transform(**inputs)
+    reference = top_k_varlen_page_table_transform_trace.reference(**inputs)
+    assert values is None
+    _check(
+        top_k_varlen_page_table_transform_trace,
+        reference,
+        physical_indices,
+        **inputs,
+    )
+    torch.cuda.synchronize()

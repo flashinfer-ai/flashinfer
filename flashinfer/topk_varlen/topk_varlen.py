@@ -16,9 +16,11 @@ limitations under the License.
 
 """Top-K decode: GVR (Blackwell), CuTe DSL radix, and masked-radix backends.
 
-Public API
-----------
+Public APIs
+-----------
 :func:`top_k_varlen` — selects top-K per row of decode-step logits.
+:func:`top_k_varlen_page_table_transform` — selects top-K and translates the
+                                             local indices through a page table.
 
 Backend choices
 ---------------
@@ -42,8 +44,11 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.topk import top_k_varlen_trace
-from ..topk import get_topk_module
+from ..trace.templates.topk import (
+    top_k_varlen_page_table_transform_trace_dispatch,
+    top_k_varlen_trace,
+)
+from ..topk import TopKTieBreak, get_topk_module
 
 # Check for the Python CuTe DSL package without importing it (and without
 # importing cute_dsl/utils.py, which has top-level `import cutlass`).
@@ -56,6 +61,7 @@ _CUTE_DSL_AVAILABLE = (
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
+    check_shape_dtype_device,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
     supported_compute_capability,
@@ -84,6 +90,20 @@ _GVR_CCS = [100, 103]
 # ---------------------------------------------------------------------------
 
 
+def _radix_cutlass_required_filtered_supported(
+    logits: torch.Tensor,
+    top_k: int,
+    tie_break: int,
+    dsa_graph_safe: bool,
+) -> bool:
+    """Check the hard limits of options that force FilteredTopK."""
+    if not dsa_graph_safe and tie_break == TopKTieBreak.NONE:
+        return True
+    return (
+        top_k <= 2048 and get_shared_bytes_per_block_optin(logits.device) >= 128 * 1024
+    )
+
+
 @supported_compute_capability(_ALL_CCS)
 def _radix_cutlass_top_k_varlen_check(
     logits,
@@ -98,9 +118,16 @@ def _radix_cutlass_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    *,
+    deterministic=False,
+    tie_break=TopKTieBreak.NONE,
+    dsa_graph_safe=False,
+    row_starts=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
-    return True
+    return _radix_cutlass_required_filtered_supported(
+        logits, top_k, tie_break, dsa_graph_safe
+    )
 
 
 @supported_compute_capability(_GVR_CCS)
@@ -117,12 +144,22 @@ def _gvr_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    *,
+    deterministic=False,
+    tie_break=TopKTieBreak.NONE,
+    dsa_graph_safe=False,
+    row_starts=None,
 ):
     """Return True only when GVR can run on this exact configuration.
 
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
+    # GVR does not yet implement the existing radix transform's canonical
+    # output ordering, boundary-index tie-break, or score-window start.  Auto
+    # routing must therefore use radix_cutlass whenever one is requested.
+    if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
+        return False
     if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
         return False
     # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
@@ -158,6 +195,11 @@ def _top_k_varlen_heuristic(
     backend: str = "auto",
     load_balance: bool = True,
     workspace=None,
+    *,
+    deterministic: bool = False,
+    tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
+    row_starts=None,
 ):
     """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs).
 
@@ -788,6 +830,40 @@ def _run_gvr(
 # ---------------------------------------------------------------------------
 
 
+def _get_effective_row_lengths(
+    seq_lens: torch.Tensor,
+    num_rows: int,
+    max_seq_len: int,
+    next_n: int,
+    compress_ratio: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Expand request lengths to score-row lengths without a host sync."""
+    if next_n <= 0:
+        raise ValueError(f"next_n must be positive, got {next_n}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if num_rows != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            "logits.shape[0] must equal seq_lens.shape[0] * next_n, got "
+            f"{num_rows} and {seq_lens.shape[0]} * {next_n}"
+        )
+
+    if next_n > 1:
+        row_seq_lens = seq_lens.repeat_interleave(next_n)
+        row_offsets = torch.arange(
+            next_n, device=seq_lens.device, dtype=torch.int32
+        ).repeat(seq_lens.shape[0])
+        row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
+    else:
+        row_seq_lens = seq_lens // compress_ratio
+    lengths = row_seq_lens.clamp(min=0, max=max_seq_len).to(torch.int32)
+    if row_starts is not None:
+        max_window_lengths = (max_seq_len - row_starts).clamp(min=0, max=max_seq_len)
+        lengths = torch.minimum(lengths, max_window_lengths)
+    return lengths
+
+
 def _run_radix_cutlass(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -797,21 +873,19 @@ def _run_radix_cutlass(
     return_output_values: bool,
     out_indices: Optional[torch.Tensor],
     out_values: Optional[torch.Tensor],
+    deterministic: bool,
+    tie_break: int,
+    dsa_graph_safe: bool,
+    row_starts: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Masked-radix fallback: uses radix_topk_ragged_transform to pass per-row
     lengths directly into the kernel, avoiding a full (num_rows, N) masked copy
     and a double-allocation for indices.
     """
     num_rows, N = logits.shape
-    if next_n > 1:
-        row_seq_lens = seq_lens.repeat_interleave(next_n)
-        row_offsets = torch.arange(
-            next_n, device=logits.device, dtype=torch.int32
-        ).repeat(seq_lens.shape[0])
-        row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
-    else:
-        row_seq_lens = seq_lens // compress_ratio
-    lengths = row_seq_lens.clamp(max=N).to(torch.int32)
+    lengths = _get_effective_row_lengths(
+        seq_lens, num_rows, N, next_n, compress_ratio, row_starts
+    )
 
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
@@ -830,9 +904,10 @@ def _run_radix_cutlass(
         lengths,
         row_states_buffer,
         top_k,
-        False,  # deterministic
-        0,  # tie_break = TopKTieBreak.NONE
-        False,  # dsa_graph_safe
+        deterministic,
+        tie_break,
+        dsa_graph_safe,
+        row_starts=row_starts,
     )
 
     if return_output_values:
@@ -843,7 +918,10 @@ def _run_radix_cutlass(
         # then zero those sentinel slots so they don't carry column-0 values.
         # No-op for rows with seq_len >= top_k (no sentinels).
         sentinel = out_indices < 0
-        gather_idx = out_indices.long().clamp_(min=0)
+        gather_idx = out_indices.long()
+        if row_starts is not None:
+            gather_idx.add_(row_starts[:, None])
+        gather_idx.masked_fill_(sentinel, 0)
         out_values.copy_(torch.gather(logits, 1, gather_idx))
         out_values.masked_fill_(sentinel, 0)
 
@@ -869,9 +947,19 @@ def _radix_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    *,
+    deterministic=False,
+    tie_break=TopKTieBreak.NONE,
+    dsa_graph_safe=False,
+    row_starts=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE
+    return (
+        _CUTE_DSL_AVAILABLE
+        and not deterministic
+        and tie_break == TopKTieBreak.NONE
+        and row_starts is None
+    )
 
 
 def _run_radix(
@@ -983,6 +1071,11 @@ def top_k_varlen(
     backend: Literal["radix", "gvr", "radix_cutlass", "auto"] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
+    *,
+    deterministic: bool = False,
+    tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1081,6 +1174,27 @@ def top_k_varlen(
             on the device tensors.  When ``workspace`` is ``None`` (default)
             buffers are allocated locally and are safe for any concurrency.
 
+    deterministic : bool, optional
+        If True, return selected local indices in a deterministic canonical
+        order. This currently routes ``"auto"`` to ``"radix_cutlass"``.
+    tie_break : int, optional
+        Boundary tie-breaking mode. ``TopKTieBreak.SMALL`` prefers smaller
+        local indices and ``TopKTieBreak.LARGE`` prefers larger local indices
+        when values equal the K-th value. Tie-breaking controls the selected
+        set, not output ordering; combine it with ``deterministic=True`` for
+        canonical ordering. Non-default modes currently route ``"auto"`` to
+        ``"radix_cutlass"``.
+    dsa_graph_safe : bool, optional
+        For ``"radix_cutlass"``, force the FilteredTopK graph-safe path and
+        scalar vectorization. The CuTe DSL backends are already CUDA-graph
+        safe. Default ``False``.
+    row_starts : torch.Tensor, optional
+        Per-row score-window starts, as contiguous ``int32[num_rows]``. Top-K
+        is computed over ``logits[i, row_starts[i]:row_starts[i]+length]`` and
+        returned indices remain local to that window. Effective lengths are
+        clipped to the remaining row width. Supplying this currently routes
+        ``"auto"`` to ``"radix_cutlass"``.
+
     Returns
     -------
     (indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -1128,18 +1242,49 @@ def top_k_varlen(
     assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
 
+    tie_break = TopKTieBreak(tie_break)
+
     if backend == "auto":
-        backend = top_k_varlen.suitable_auto_backends[0]
+        if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
+            # These semantics are CUTLASS-only today. Resolve them directly so
+            # skip_check=True cannot reuse stale auto-routing state.
+            backend = "radix_cutlass"
+        else:
+            backend = top_k_varlen.suitable_auto_backends[0]
+
+    if backend in ("radix", "gvr") and (
+        deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None
+    ):
+        raise ValueError(
+            f"backend={backend!r} does not yet support deterministic output, "
+            "index tie-breaking, or row_starts; use backend='auto' or "
+            "backend='radix_cutlass'"
+        )
 
     num_rows = logits.shape[0]
+    device = logits.device
+    if row_starts is not None:
+        check_shape_dtype_device(
+            row_starts, (num_rows,), torch.int32, device, "row_starts"
+        )
+        if not row_starts.is_contiguous():
+            raise ValueError("row_starts must be contiguous")
     if out_indices is None:
-        out_indices = torch.empty(
-            (num_rows, top_k), dtype=torch.int32, device=logits.device
+        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    else:
+        check_shape_dtype_device(
+            out_indices, (num_rows, top_k), torch.int32, device, "out_indices"
         )
+        if not out_indices.is_contiguous():
+            raise ValueError("out_indices must be contiguous")
     if return_values and out_values is None:
-        out_values = torch.empty(
-            (num_rows, top_k), dtype=logits.dtype, device=logits.device
+        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=device)
+    elif return_values:
+        check_shape_dtype_device(
+            out_values, (num_rows, top_k), logits.dtype, device, "out_values"
         )
+        if not out_values.is_contiguous():
+            raise ValueError("out_values must be contiguous")
 
     if backend == "radix":
         out_i, out_v = _run_radix(
@@ -1190,6 +1335,10 @@ def top_k_varlen(
             return_values,
             out_indices,
             out_values,
+            deterministic,
+            tie_break,
+            dsa_graph_safe,
+            row_starts,
         )
     else:
         raise ValueError(
@@ -1198,3 +1347,288 @@ def top_k_varlen(
         )
 
     return out_i, out_v
+
+
+# ---------------------------------------------------------------------------
+# Public API: top_k_varlen_page_table_transform
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability(_ALL_CCS)
+def _radix_cutlass_top_k_varlen_page_table_check(
+    logits,
+    src_page_table,
+    seq_lens,
+    top_k,
+    row_to_batch=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out=None,
+    out_values=None,
+    deterministic=False,
+    tie_break=TopKTieBreak.NONE,
+    dsa_graph_safe=False,
+    row_starts=None,
+    page_table_row_starts=None,
+    *,
+    page_size=1,
+    out_raw_indices=None,
+    backend="auto",
+):
+    """The parity-first page-table API uses the existing CUTLASS transform."""
+    return _radix_cutlass_required_filtered_supported(
+        logits, top_k, tie_break, dsa_graph_safe
+    )
+
+
+def _top_k_varlen_page_table_heuristic(
+    suitable_backends,
+    logits,
+    src_page_table,
+    seq_lens,
+    top_k,
+    row_to_batch=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out=None,
+    out_values=None,
+    deterministic=False,
+    tie_break=TopKTieBreak.NONE,
+    dsa_graph_safe=False,
+    row_starts=None,
+    page_table_row_starts=None,
+    *,
+    page_size=1,
+    out_raw_indices=None,
+    backend="auto",
+):
+    return [b for b in ("radix_cutlass",) if b in suitable_backends]
+
+
+@backend_requirement(
+    {"radix_cutlass": _radix_cutlass_top_k_varlen_page_table_check},
+    heuristic_func=_top_k_varlen_page_table_heuristic,
+)
+@flashinfer_api(trace=top_k_varlen_page_table_transform_trace_dispatch)
+def top_k_varlen_page_table_transform(
+    logits: torch.Tensor,
+    src_page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    row_to_batch: Optional[torch.Tensor] = None,
+    compress_ratio: int = 1,
+    next_n: int = 1,
+    return_values: bool = False,
+    out: Optional[torch.Tensor] = None,
+    out_values: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    tie_break: int = TopKTieBreak.NONE,
+    dsa_graph_safe: bool = False,
+    row_starts: Optional[torch.Tensor] = None,
+    page_table_row_starts: Optional[torch.Tensor] = None,
+    *,
+    page_size: int = 1,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    backend: Literal["radix_cutlass", "auto"] = "auto",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""Varlen Top-K selection followed by compact page-table translation.
+
+    This sibling API preserves :func:`top_k_varlen`'s raw-index return
+    contract. It selects row-local indices using the same effective decode
+    lengths, then maps every selected local index ``idx`` as::
+
+        physical_page = src_page_table[
+            batch_idx, page_table_row_starts[row] + idx // page_size
+        ]
+        physical_idx = physical_page * page_size + idx % page_size
+
+    ``batch_idx`` is ``row_to_batch[row]`` when supplied. Otherwise it is
+    ``row // next_n``, which is identity when ``next_n == 1``.
+
+    The initial implementation intentionally uses the existing fused
+    ``radix_cutlass`` page-table transform for exact tie-breaking, canonical
+    ordering, and score/page-window semantics. Native GVR and CuTe radix page
+    translation can be added later without changing the result contract.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        CUDA score tensor of shape ``(num_rows, max_seq_len)`` and dtype
+        ``float32``, ``float16``, or ``bfloat16``.
+    src_page_table : torch.Tensor
+        Contiguous ``int32[batch_size, max_num_pages]`` source page table.
+    seq_lens : torch.Tensor
+        Contiguous request-level ``int32[num_rows // next_n]`` lengths.
+    top_k : int
+        Number of elements selected per score row.
+    row_to_batch : torch.Tensor, optional
+        Contiguous ``int32[num_rows]`` mapping from score rows to page-table
+        rows. If omitted, row ``i`` maps to request ``i // next_n``.
+    compress_ratio : int, optional
+        KV-index compression factor. Default ``1``.
+    next_n : int, optional
+        Number of speculative score rows per request. Default ``1``.
+    return_values : bool, optional
+        Return selected score-domain values when True.
+    out : torch.Tensor, optional
+        Contiguous ``int32[num_rows, top_k]`` physical-index output buffer.
+    out_values : torch.Tensor, optional
+        Contiguous selected-value output buffer matching ``logits.dtype``.
+    deterministic : bool, optional
+        Canonically order selected raw local indices before translation.
+    tie_break : int, optional
+        Boundary tie mode: ``TopKTieBreak.NONE``, ``SMALL``, or ``LARGE``.
+        Tie mode controls the selected set independently of ordering.
+    dsa_graph_safe : bool, optional
+        Force the FilteredTopK graph-safe path and scalar vectorization.
+    row_starts : torch.Tensor, optional
+        Contiguous ``int32[num_rows]`` score-window starts. Selected raw
+        indices remain local to these windows; effective lengths are clipped
+        to the remaining score-row width.
+    page_table_row_starts : torch.Tensor, optional
+        Contiguous ``int32[num_rows]`` page-table starts measured in page
+        entries. With ``page_size > 1`` this must be supplied whenever
+        ``row_starts`` is supplied because the two starts use different units.
+    page_size : int, optional
+        Positive power-of-two number of score positions represented by one
+        page-table entry. Default ``1``.
+    out_raw_indices : torch.Tensor, optional
+        Contiguous ``int32[num_rows, top_k]`` side output containing selected
+        window-local indices, positionally aligned with ``out``. Padding is
+        ``-1``. It must not overlap ``out``. Only raw indices are in the right
+        index domain for a later GVR decode step, but the caller must still
+        select the relevant speculative row and ensure column zero is the
+        argmax; deterministic local-index ordering does not preserve that GVR
+        precondition.
+    backend : {"radix_cutlass", "auto"}, optional
+        ``"auto"`` currently selects ``"radix_cutlass"``.
+
+    Returns
+    -------
+    (physical_indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]
+        Physical indices and, when requested, values gathered from ``logits``
+        using the positionally aligned raw local indices.
+    """
+    assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
+    assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    tie_break = TopKTieBreak(tie_break)
+
+    if backend == "auto":
+        backend = "radix_cutlass"
+    if backend != "radix_cutlass":
+        raise ValueError(
+            f"Unknown backend: {backend!r}. Expected 'radix_cutlass' or 'auto'."
+        )
+
+    num_rows, max_seq_len = logits.shape
+    device = logits.device
+    if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
+        raise ValueError(
+            "page_size must be a positive power of two no greater than 2**30, "
+            f"got {page_size}"
+        )
+    if page_size > 1 and row_starts is not None and page_table_row_starts is None:
+        raise ValueError(
+            "page_table_row_starts is required with page_size > 1 and row_starts"
+        )
+
+    check_shape_dtype_device(
+        src_page_table,
+        None,
+        torch.int32,
+        device,
+        "src_page_table",
+    )
+    if src_page_table.dim() != 2:
+        raise ValueError("src_page_table must be 2-D")
+    if not src_page_table.is_contiguous():
+        raise ValueError("src_page_table must be contiguous")
+
+    if row_to_batch is None and next_n > 1:
+        row_to_batch = torch.arange(num_rows, dtype=torch.int32, device=device)
+        row_to_batch.div_(next_n, rounding_mode="floor")
+    for tensor, name in (
+        (row_to_batch, "row_to_batch"),
+        (row_starts, "row_starts"),
+        (page_table_row_starts, "page_table_row_starts"),
+    ):
+        if tensor is not None:
+            check_shape_dtype_device(tensor, (num_rows,), torch.int32, device, name)
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+
+    lengths = _get_effective_row_lengths(
+        seq_lens,
+        num_rows,
+        max_seq_len,
+        next_n,
+        compress_ratio,
+        row_starts,
+    )
+
+    if out is None:
+        out = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    else:
+        check_shape_dtype_device(out, (num_rows, top_k), torch.int32, device, "out")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    if out_raw_indices is not None:
+        check_shape_dtype_device(
+            out_raw_indices,
+            (num_rows, top_k),
+            torch.int32,
+            device,
+            "out_raw_indices",
+        )
+        if not out_raw_indices.is_contiguous():
+            raise ValueError("out_raw_indices must be contiguous")
+
+    raw_indices = out_raw_indices
+    if return_values and raw_indices is None:
+        raw_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    if return_values and out_values is None:
+        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=device)
+    elif return_values:
+        check_shape_dtype_device(
+            out_values, (num_rows, top_k), logits.dtype, device, "out_values"
+        )
+        if not out_values.is_contiguous():
+            raise ValueError("out_values must be contiguous")
+
+    row_states_buffer = _get_cache_buf(
+        f"radix_topk_row_states_{device}",
+        1024 * 1024,
+        device,
+        zero_init=True,
+    )
+    get_topk_module().radix_topk_page_table_transform(
+        logits,
+        out,
+        src_page_table,
+        row_to_batch,
+        lengths,
+        row_states_buffer,
+        top_k,
+        deterministic,
+        tie_break,
+        page_size,
+        dsa_graph_safe,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+        output_raw_indices=raw_indices,
+    )
+
+    if return_values:
+        assert raw_indices is not None and out_values is not None
+        sentinel = raw_indices < 0
+        gather_idx = raw_indices.long()
+        if row_starts is not None:
+            gather_idx.add_(row_starts[:, None])
+        gather_idx.masked_fill_(sentinel, 0)
+        out_values.copy_(torch.gather(logits, 1, gather_idx))
+        out_values.masked_fill_(sentinel, 0)
+
+    return out, (out_values if return_values else None)
