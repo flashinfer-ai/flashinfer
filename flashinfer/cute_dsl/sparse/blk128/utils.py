@@ -222,10 +222,13 @@ def fmax(
     loc=None,
     ip=None,
 ) -> Float32:
+    import cutlass as _cutlass
     from cutlass import CUDA_VERSION
 
+    _cutlass_ver = tuple(int(x) for x in _cutlass.__version__.split(".")[:2])
     # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+    # Old API (cutlass < 4.6, cu12/CUDA 12.9): explicit result type as first positional argument
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9 and _cutlass_ver < (4, 6):
         # Old API: requires explicit result type as first positional argument
         return Float32(
             nvvm.fmax(
