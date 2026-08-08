@@ -42,6 +42,8 @@ def _resolve_gate_up_clamp(config: Mxfp8CutedslMegaMoeConfig) -> float | None:
 
 @register_mega_kernel("mxfp8_cutedsl")
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     def __init__(self, config: Mxfp8CutedslMegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Mxfp8CutedslMegaMoeConfig = config
