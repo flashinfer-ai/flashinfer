@@ -212,7 +212,9 @@ v_cache = torch.randn_like(k_cache)
 qo_indptr = torch.tensor((0, 32, 80), device=device, dtype=torch.int32)
 paged_kv_indptr = torch.tensor((0, 2, 5), device=device, dtype=torch.int32)
 paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
-last_page_len = torch.tensor((32, 16), device=device, dtype=torch.int32)
+paged_kv_last_page_len = torch.tensor(
+    (32, 16), device=device, dtype=torch.int32
+)
 
 out = batch_prefill_with_paged_kv_cache(
     q,
@@ -221,7 +223,7 @@ out = batch_prefill_with_paged_kv_cache(
     qo_indptr,
     paged_kv_indptr,
     paged_kv_indices,
-    last_page_len,
+    paged_kv_last_page_len=paged_kv_last_page_len,
     page_size=page_size,
     mask_type="causal",
 )

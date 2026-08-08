@@ -136,6 +136,9 @@ def _publish_neutral_standalone_partial(
     publishes one neutral LSE per covered Q/head row.
     """
 
+    if cutlass.const_expr(cfg.partial_o_dtype_bytes != cutlass.BFloat16.width // 8):
+        raise ValueError("neutral split-KV partials require BF16 workspace storage")
+
     thread_idx, _, _ = cute.arch.thread_idx()
     vectors_per_row = cfg.head_dim_per_cta_v // 8
     vectors_per_tile = cfg.tile_size_q * vectors_per_row
@@ -2207,7 +2210,7 @@ class ThroughputLatencyMlaDecodeTs:
             prims.prefetch_tensormap(tma_desc_v.get_ptr())
 
         clc_response_ptr = None
-        if cutlass.const_expr(tile_sched_params is not None):
+        if cutlass.const_expr(use_clc_dynamic):
             clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, 2)
 
         task_manager, cluster_corr_resource = build_throughput_latency_mla_task_manager(

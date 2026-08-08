@@ -194,7 +194,7 @@ class SmemQResource(DecodeGenResourceBase):
                 space=cutlass.AddressSpace.rmem,
                 alignment=8,
             )
-            stage_elems = self.cfg.smem_q_tile_bytes // self.cfg.q_dtype_bytes
+            stage_elems = self.cfg.smem_q_tile_elements
             q_head_dim_partition = min(self.cfg.headdim, 64)
             # 16-bit Q uses two 64-column TMA loads for headDim=128. FP8 Q
             # uses a descriptor stride based on the actual MMA K-major swizzle.
@@ -348,7 +348,7 @@ class SmemQResource(DecodeGenResourceBase):
         logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         # Select the SMEM stage owned by this producer fire. The TS pipeline
         # barrier attached to stage_info protects this stage until QK consumes it.
-        stage_elems = cfg.smem_q_tile_bytes // cfg.q_dtype_bytes
+        stage_elems = cfg.smem_q_tile_elements
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
         if cutlass.const_expr(cfg.use_fp8_qkv):
             if prims.elect_sync():
@@ -453,8 +453,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
         ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
-    tma_desc_k: cutlass.Array = None
-    tma_desc_v: cutlass.Array = None
+    tma_desc_k: cutlass.Pointer | None = None
+    tma_desc_v: cutlass.Pointer | None = None
     page_offsets_kv: "SmemPageOffsetsKvResource | None" = None
     seqlens_kv: cute.Pointer | None = None
     max_seq_len_kv: Int32 = None

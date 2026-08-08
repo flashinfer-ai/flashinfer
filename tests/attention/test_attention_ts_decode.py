@@ -73,12 +73,17 @@ from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
     prims_ts_batch_decode_with_kv_cache,
 )
+from flashinfer.utils import is_sm100a_supported
 
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="PrimTS FMHA decode requires SM100 or SM103",
+    or torch.cuda.get_device_capability() != (10, 0)
+    or not is_sm100a_supported(torch.device("cuda")),
+    reason=(
+        "PrimTS FMHA decode is signoff-qualified on SM100; "
+        "SM103/B300 and GB300 qualification is pending"
+    ),
 )
 
 

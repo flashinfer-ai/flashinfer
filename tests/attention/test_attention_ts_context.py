@@ -50,11 +50,11 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
     build_fmha_task_manager,
 )
+from flashinfer.utils import is_sm100a_supported
 
 
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="PrimTS context attention requires SM100 or SM103",
 )
 
@@ -2793,6 +2793,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 
     worker_stream = torch.cuda.Stream()
     complete = torch.cuda.Event()
+    worker_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(worker_stream):
         shared_out.fill_(float("nan"))
         returned = wrapper.run(second.q, second.k, second.v, out=shared_out)

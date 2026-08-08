@@ -35,6 +35,7 @@ register trace templates.
 
 from dataclasses import dataclass
 import functools
+import itertools
 import math
 import numbers
 import struct
@@ -323,9 +324,7 @@ def _read_indptr(
             f"the final {name} offset must equal the packed tensor extent; "
             f"expected {expected_total}, got {values[-1]}"
         )
-    lengths = tuple(
-        curr - prev for prev, curr in zip(values[:-1], values[1:], strict=True)
-    )
+    lengths = tuple(curr - prev for prev, curr in itertools.pairwise(values))
     if any(length <= 0 for length in lengths):
         raise ValueError(f"{name} offsets must be strictly increasing")
     return values, lengths
@@ -1960,8 +1959,8 @@ def batch_prefill_with_paged_kv_cache(
 
 
 __all__ = [
-    "BatchPrefillTSWrapper",
     "BatchPrefillPagedTSWrapper",
+    "BatchPrefillTSWrapper",
     "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
 ]

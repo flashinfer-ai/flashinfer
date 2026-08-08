@@ -97,6 +97,12 @@ from .parallel_reduction import (
     run_parallel_reduction_kernel,
 )
 from .reduction import run_reduction_kernel
+from ..helpers.tile_scheduler import (
+    MLAStaticTileSchedulerParams,
+    MLAStaticTileScheduler,
+    create_mla_static_tile_scheduler_params,
+    divmod_constexpr_power_of_two_or_fdd,
+)
 from .tasks import (
     MlaClcTask,
     MlaInterleavedTask,
@@ -684,15 +690,6 @@ def build_mla_decode_task_manager(
         "gmem_o": gmem_o,
     }
     return task_manager, tmem_resources, named_resources
-
-
-# =====================================================================
-from ..helpers.tile_scheduler import (
-    MLAStaticTileSchedulerParams,
-    MLAStaticTileScheduler,
-    create_mla_static_tile_scheduler_params,
-    divmod_constexpr_power_of_two_or_fdd,
-)
 
 
 # GPU Kernel Class
@@ -1767,6 +1764,7 @@ class MlaDecodeTs:
                 prims.tcgen05_alloc(
                     tmem_holding_buf_arr, cfg.num_tmem_cols, group="cta_2"
                 )
+                prims.tcgen05_relinquish_alloc_permit(group="cta_2")
 
             # tcgen05.alloc.cta_group::2 is itself cluster-synchronous; the
             # pre-allocation cluster barrier above protects lifecycle-mbarrier

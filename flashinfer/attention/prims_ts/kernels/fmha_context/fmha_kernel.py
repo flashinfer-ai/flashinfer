@@ -2238,10 +2238,10 @@ class FmhaTs:
 
     def __init__(
         self,
-        qk_acc_dtype: type = None,
-        pv_acc_dtype: type = None,
-        in_dtype: type = None,
-        out_dtype: type = None,
+        qk_acc_dtype: type | None = None,
+        pv_acc_dtype: type | None = None,
+        in_dtype: type | None = None,
+        out_dtype: type | None = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         d: int = 128,
         is_persistent: bool = True,

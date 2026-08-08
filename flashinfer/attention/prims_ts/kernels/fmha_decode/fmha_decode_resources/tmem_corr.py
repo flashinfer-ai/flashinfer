@@ -1195,27 +1195,25 @@ class TmemCorrResource(DecodeGenResourceBase):
                             split_idx, reduction_splits_kv - Int32(1)
                         )
                 if valid_split_idx and valid_reduce_row:
-                    stats_offset = (
-                        (logical_kv_idx * Int32(cfg.max_splits_kv) + split_idx)
-                        * self.h_r
-                        + reduce_row_idx
-                    ) * Int32(2)
+                    workspace_row = self._gmem_partial_row_offset(
+                        logical_kv_idx,
+                        split_idx,
+                        reduce_row_idx,
+                    )
+                    stats_offset = workspace_row * Int64(2 * 4)
                     stats_src = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint()
-                        + cutlass.Int64(stats_offset * Int32(4)),
+                        self.partial_stats_ptr.toint() + stats_offset,
                         mem_space=1,
                         dtype=Float32,
                     )
                     stats_pair = stats_src.load(count=2, alignment=8)
                     partial_max[jj] = stats_pair[0]
                     partial_sum[jj] = stats_pair[1]
-                    partial_o_offset = (
-                        (logical_kv_idx * Int32(cfg.max_splits_kv) + split_idx)
-                        * self.h_r
-                        + reduce_row_idx
-                    ) * Int32(cfg.headdim * 2) + (reduce_col_idx << Int32(1))
+                    partial_o_offset = workspace_row * Int64(cfg.headdim * 2) + Int64(
+                        reduce_col_idx
+                    ) * Int64(2)
                     partial_o_src = cutlass.inttoptr(
-                        self.partial_o_ptr.toint() + cutlass.Int64(partial_o_offset),
+                        self.partial_o_ptr.toint() + partial_o_offset,
                         mem_space=1,
                         dtype=Int32,
                     )
@@ -2028,14 +2026,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                         ),
                     )
                 else:
-                    stats_base = (
-                        (logical_kv_idx * Int32(cfg.max_splits_kv) + cta_idx_kv)
-                        * self.h_r
-                        + stats_row_idx
-                    ) * Int32(2)
+                    stats_row = self._gmem_partial_row_offset(
+                        logical_kv_idx,
+                        cta_idx_kv,
+                        stats_row_idx,
+                    )
                     stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint()
-                        + cutlass.Int64(stats_base * Int32(4)),
+                        self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
                         mem_space=1,
                         dtype=Float32,
                     )
@@ -2431,12 +2428,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                         alignment=4,
                     )
                 else:
-                    stats_row = (
-                        logical_kv_idx * Int32(cfg.max_splits_kv) + cta_idx_kv
-                    ) * self.h_r + logical_output_row_idx
+                    stats_row = self._gmem_partial_row_offset(
+                        logical_kv_idx,
+                        cta_idx_kv,
+                        logical_output_row_idx,
+                    )
                     stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint()
-                        + cutlass.Int64(stats_row * Int32(8)),
+                        self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
                         mem_space=1,
                         dtype=Float32,
                     )

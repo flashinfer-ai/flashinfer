@@ -358,8 +358,6 @@ def make_grouped_q_launch_candidate(
 
 def select_grouped_q_launch_candidate(
     candidates: Sequence[GroupedQLaunchCandidate],
-    *,
-    headdim: int,
 ) -> GroupedQLaunchCandidate:
     """Select the lowest-cost legal grouped-Q launch recipe.
 
@@ -384,17 +382,12 @@ def select_grouped_q_launch_candidate(
 
 def select_grouped_q_direct_wave_candidate(
     candidates: Sequence[GroupedQLaunchCandidate],
-    *,
-    headdim: int,
 ) -> GroupedQLaunchCandidate:
     """Select a direct recipe using the same mainloop-aware launch score."""
     direct = tuple(recipe for recipe in candidates if recipe.splits_kv == 1)
     if not direct:
         raise ValueError("at least one direct grouped-Q candidate is required")
-    return select_grouped_q_launch_candidate(
-        direct,
-        headdim=headdim,
-    )
+    return select_grouped_q_launch_candidate(direct)
 
 
 def make_q_tile_geometry(
@@ -767,6 +760,7 @@ class FmhaDecodeConfig:
             warp_ranges.extend(
                 (
                     self.scheduler_warp_idx + self.scheduler_num_warps,
+                    # ClcLoadTask reuses LoadTask's loader-warp contract.
                     self.clc_load_warp_idx + self.load_num_warps,
                     self.clc_padding_warp_idx + self.clc_padding_num_warps,
                     self.clc_tail_padding_warp_idx + self.clc_tail_padding_num_warps,
@@ -1101,7 +1095,7 @@ class FmhaDecodeConfig:
         """Require every boolean config field to carry a real Python bool."""
         for name, config_field in self.__dataclass_fields__.items():
             value = getattr(self, name)
-            if config_field.type is bool and not isinstance(value, bool):
+            if config_field.type in (bool, "bool") and not isinstance(value, bool):
                 raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
 
     @property
@@ -2462,10 +2456,7 @@ def _apply_auto_grouped_q_mma_config(
         for recipe in supported
     )
     if has_underfilled_q_grid:
-        selected = select_grouped_q_launch_candidate(
-            supported,
-            headdim=cfg.headdim,
-        )
+        selected = select_grouped_q_launch_candidate(supported)
     else:
         # Every legal Q grid already fills the machine, so splitting cannot
         # expose otherwise-idle SMs. Compare direct recipes with the same
@@ -2475,10 +2466,7 @@ def _apply_auto_grouped_q_mma_config(
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
         if not direct:
             return None
-        selected = select_grouped_q_direct_wave_candidate(
-            direct,
-            headdim=cfg.headdim,
-        )
+        selected = select_grouped_q_direct_wave_candidate(direct)
     _apply_grouped_q_mma_candidate(cfg, selected.mma)
     if selected.splits_kv == 1 and selected.base_ctas > service_capacity:
         # CLC persistence pays for work discovery by reusing one resident CTA

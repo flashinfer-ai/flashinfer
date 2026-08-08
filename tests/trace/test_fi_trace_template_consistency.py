@@ -430,10 +430,19 @@ def test_attention_ts_trace_constraints_match_cache_axes():
     for dispatch in (*fmha_dispatches, *mla_dispatches):
         for template in dispatch.templates:
             for constraint in template.constraints:
-                ast.parse(constraint, mode="eval")
+                tree = ast.parse(constraint, mode="eval")
+                referenced_names = {
+                    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+                }
+                allowed_names = set(template.axes) | set(template.inputs) | {"max"}
+                assert referenced_names <= allowed_names, (
+                    f"{template.name_prefix}: constraint {constraint!r} references "
+                    f"undeclared names {sorted(referenced_names - allowed_names)}"
+                )
 
     for dispatch in fmha_dispatches:
         for template in dispatch.templates:
+            assert "kv_layout == 'HND'" in template.constraints
             assert ("kv_planes == 2" in template.constraints) == (
                 "kv_planes" in template.axes
             )

@@ -564,12 +564,13 @@ def _resolve_mla_decode_launch_spec(
     )
     from .kernels.mla_decode.throughput_2cta.config import (
         compute_split_kv,
-        compute_workspace_size,
+        compute_workspace_size as compute_2cta_workspace_size,
     )
     from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
     from .kernels.mla_decode.throughput_latency_1cta.config import (
         GroupsTokensHeadsLaunchShape,
         auto_tile_size_q_for_mla_gen,
+        compute_workspace_size as compute_1cta_workspace_size,
         fp8_q16_extended_family_probe_split_kv,
         resolve_auto_mla_gen_groups_tokens_heads_q_shape,
         resolve_runtime_cluster_reduction_mode,
@@ -840,8 +841,11 @@ def _resolve_mla_decode_launch_spec(
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
-            workspace_heads = int(launch_shape.num_heads_q)
-            workspace_seq_len_q = int(launch_shape.seq_len_q)
+            workspace_size = compute_1cta_workspace_size(
+                cfg=final_cfg,
+                partial_o_dtype=cutlass.BFloat16,
+                lse_dtype=cutlass.Float32,
+            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -917,8 +921,15 @@ def _resolve_mla_decode_launch_spec(
                 batch_size=batch_size,
                 mask_type=mask_type,
             )
-            workspace_heads = int(launch_shape.num_heads_q)
-            workspace_seq_len_q = int(launch_shape.seq_len_q)
+            workspace_size = compute_2cta_workspace_size(
+                num_heads=int(launch_shape.num_heads_q),
+                seq_len_q=int(launch_shape.seq_len_q),
+                latent_dim=kv_lora_rank,
+                batch_size=batch_size,
+                split_kv=split_kv,
+                partial_o_dtype=cutlass.BFloat16,
+                lse_dtype=cutlass.Float32,
+            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -943,17 +954,7 @@ def _resolve_mla_decode_launch_spec(
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
             )
-
         _validate_mla_policy_coordinate_span(policy)
-        workspace_size = compute_workspace_size(
-            num_heads=workspace_heads,
-            seq_len_q=workspace_seq_len_q,
-            latent_dim=kv_lora_rank,
-            batch_size=batch_size,
-            split_kv=split_kv,
-            partial_o_dtype=cutlass.BFloat16,
-            lse_dtype=cutlass.Float32,
-        )
 
     return _MLADecodeLaunchSpec(
         kernel=kernel,

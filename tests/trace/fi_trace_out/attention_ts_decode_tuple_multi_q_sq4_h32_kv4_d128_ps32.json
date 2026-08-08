@@ -58,6 +58,7 @@
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
     "window_left == -1 or mask_type == 'causal'",
+    "kv_layout == 'HND'",
     "seq_len_q >= 2"
   ],
   "inputs": {
