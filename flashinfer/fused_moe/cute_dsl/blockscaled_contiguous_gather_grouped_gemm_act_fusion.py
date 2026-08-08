@@ -538,6 +538,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             )
         if token_final_scales.device.type != "cuda":
             raise ValueError("token_final_scales must be on CUDA device")
+        if token_final_scales.device != a.device:
+            raise ValueError("token_final_scales must be on the same device as a")
         if token_final_scales.dtype != torch.float32:
             raise ValueError("token_final_scales must have dtype torch.float32")
         if not token_final_scales.is_contiguous():

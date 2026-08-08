@@ -1231,6 +1231,7 @@ class TestCuteDslMoeW4A16:
             swiglu_beta=DEFAULT_SWIGLU_BETA,
             swiglu_limit=DEFAULT_SWIGLU_LIMIT,
             use_fused_finalize=False,
+            apply_router_weight_on_input=False,
             permuted_idx_to_expanded_idx=None,
             token_final_scales=None,
             enable_pdl=False,
@@ -1398,6 +1399,7 @@ class TestCuteDslFusedMoeFunctional:
             quant_mode,
             use_per_token_activation,
             use_fused_finalize=True,
+            apply_router_weight_on_input=True,
         )
 
     @pytest.mark.parametrize(
@@ -1470,6 +1472,7 @@ class TestCuteDslFusedMoeFunctional:
             quant_mode,
             use_per_token_activation,
             use_fused_finalize=False,
+            apply_router_weight_on_input=True,
         )
 
     @pytest.mark.parametrize(

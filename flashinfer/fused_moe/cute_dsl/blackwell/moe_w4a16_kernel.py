@@ -235,6 +235,7 @@ class Sm100W4A16GroupedGemmKernel:
             self.transform_a_source,
             self.smem_buffer_align_bytes,
             self.use_fused_finalize,
+            self.load_router_weight,
             self.use_clc_scheduler,
         )
 
@@ -2173,6 +2174,8 @@ class Sm100W4A16GroupedGemmKernel:
                             finalize_scale = cutlass.Float32(
                                 alpha_val
                             ) * cutlass.Float32(finalize_scale_is_valid)
+                            # Input-side mode already routed the activation before
+                            # its BF16 FC2-input store; output-side folds it in here.
                             if cutlass.const_expr(
                                 not self.apply_router_weight_on_input
                             ):
@@ -2348,6 +2351,7 @@ class Sm100W4A16GroupedGemmKernel:
         transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
         use_fused_finalize: bool,
+        load_router_weight: bool,
         use_clc_scheduler: bool,
     ) -> tuple[int, int, int, int, int, int, int]:
         """Fit the load, transform, accumulator, and epilogue pipelines."""
@@ -2391,12 +2395,12 @@ class Sm100W4A16GroupedGemmKernel:
         )
         c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
         c_bytes = c_bytes_per_stage * c_stage_count
-        finalize_metadata_bytes = (
+        route_scale_bytes = (
             cute.size_in_bytes(
                 cutlass.Float32,
                 cute.make_layout((cute.size(epi_tile[1]),)),
             )
-            if use_fused_finalize
+            if use_fused_finalize or load_router_weight
             else 0
         )
 
@@ -2413,7 +2417,7 @@ class Sm100W4A16GroupedGemmKernel:
         carveout_smem_bytes = (
             bytes_per_pipeline_stage * accumulator_stage_count
             + c_bytes
-            + finalize_metadata_bytes
+            + route_scale_bytes
             + tile_info_bytes
         )
 

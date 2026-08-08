@@ -380,6 +380,8 @@ def _moe_core_impl(
             device=x.device,
         )
 
+    # Input-side mode scales the activated FC2 input in GEMM1; otherwise
+    # finalize/unpermute applies the routing weight after FC2, exactly once.
     # Step 3: GEMM2 with optional atomic finalize
     blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         a=intermediate,
