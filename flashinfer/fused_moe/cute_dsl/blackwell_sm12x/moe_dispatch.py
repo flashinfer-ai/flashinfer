@@ -32,7 +32,11 @@ from .moe_direct_micro_kernel import (
     compile_direct_micro_kernel,
     compiled_direct_micro_accepts_block_dim,
 )
-from .moe_dynamic_kernel import _TASK_SLICE_CHUNK, MoEDynamicKernel
+from .moe_dynamic_kernel import (
+    _MAX_SHARED_INPUT_TOPK,
+    _TASK_SLICE_CHUNK,
+    MoEDynamicKernel,
+)
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
 from .moe_w4a16_fp4_helpers import swizzle_block_scale
@@ -2048,8 +2052,13 @@ def _get_dynamic_kernel(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic compiler"
         )
+    # Both dynamic implementations reserve 32 route slots per token for the
+    # shared-input fast path. Larger top-k values remain correct by using the
+    # generic per-route producer instead.
     share_input_across_experts = bool(
-        share_input_across_experts and activation_precision == "fp4"
+        share_input_across_experts
+        and activation_precision == "fp4"
+        and num_topk <= _MAX_SHARED_INPUT_TOPK
     )
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
@@ -2100,6 +2109,9 @@ def _get_dynamic_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
+        hidden_size=k,
+        intermediate_size=n,
+        num_topk=num_topk,
     )
     launch = _DynamicMoELaunch(
         kernel,

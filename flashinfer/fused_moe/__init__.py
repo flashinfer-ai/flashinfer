@@ -44,6 +44,7 @@ from .runners import (  # noqa: F401
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
@@ -144,6 +145,7 @@ __all__ = [
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",
+    "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",

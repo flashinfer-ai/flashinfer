@@ -499,8 +499,8 @@ def topk_clusters_ragged_transform(logits, seq_lens, offsets, top_k, pdl=False):
     return indices
 
 
-def can_use_clusters_topk(device, deterministic, dsa_graph_safe):
-    if dsa_graph_safe:
+def can_use_clusters_topk(device, deterministic, tie_break, dsa_graph_safe):
+    if dsa_graph_safe or tie_break != TopKTieBreak.NONE:
         return False
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     cap = get_compute_capability(device)
@@ -550,6 +550,9 @@ def top_k(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+        Tie-breaking controls which boundary elements are selected; it does not
+        imply deterministic output ordering. Set ``deterministic=True`` when
+        repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
         If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
         Default is False.
@@ -602,11 +605,7 @@ def top_k(
     batch_size = input.size(0)
     device = input.device
 
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
-
-    if can_use_clusters_topk(input.device, deterministic, dsa_graph_safe):
+    if can_use_clusters_topk(input.device, deterministic, tie_break, dsa_graph_safe):
         indices, output_values = topk_clusters_exact(
             input, k, output_values=True, out_dtype=torch.int64
         )
@@ -717,6 +716,9 @@ def top_k_page_table_transform(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+        Tie-breaking controls which boundary elements are selected; it does not
+        imply deterministic output ordering. Set ``deterministic=True`` when
+        repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
         If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
         Default is False.
@@ -760,12 +762,13 @@ def top_k_page_table_transform(
     device = input.device
     num_rows = input.size(0)
 
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
-
     if (
-        can_use_clusters_topk(input.device, deterministic, dsa_graph_safe)
+        can_use_clusters_topk(
+            input.device,
+            deterministic,
+            tie_break,
+            dsa_graph_safe,
+        )
         and row_to_batch is None
         and row_starts is None
         and page_table_row_starts is None
@@ -844,6 +847,9 @@ def top_k_ragged_transform(
         - ``2``: prefer larger indices
 
         Default is ``0``.
+        Tie-breaking controls which boundary elements are selected; it does not
+        imply deterministic output ordering. Set ``deterministic=True`` when
+        repeatable output ordering is also required.
     dsa_graph_safe : bool, optional
         If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
         Default is False.
@@ -885,12 +891,13 @@ def top_k_ragged_transform(
     device = input.device
     num_rows = input.size(0)
 
-    # tie_break modes 1/2 imply deterministic mode.
-    if tie_break != TopKTieBreak.NONE:
-        deterministic = True
-
     if (
-        can_use_clusters_topk(input.device, deterministic, dsa_graph_safe)
+        can_use_clusters_topk(
+            input.device,
+            deterministic,
+            tie_break,
+            dsa_graph_safe,
+        )
         and row_starts is None
     ):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)

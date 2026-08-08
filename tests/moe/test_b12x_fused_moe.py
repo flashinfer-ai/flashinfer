@@ -105,6 +105,95 @@ def _clear_static_cutover_env(monkeypatch):
 
 
 @cute_dsl_available
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, True),
+        ({"activation": "relu2"}, False),
+        ({"sf_vec_size": 8}, False),
+        ({"mma_tiler_mn": (64, 128)}, False),
+        ({"hidden_size": 16384}, True),
+        ({"hidden_size": 16385}, False),
+        ({"intermediate_size": 512}, True),
+        ({"intermediate_size": 640}, False),
+        ({"num_topk": 16}, True),
+        ({"num_topk": 17}, False),
+        ({"num_topk": 32, "share_input_across_experts": True}, True),
+        ({"num_topk": 33, "share_input_across_experts": True}, False),
+    ],
+)
+def test_gated_dynamic_optimized_capability_bounds(overrides, expected):
+    """Unsafe Q0/Q1 and route-cache shapes must use the generic fallback."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+        _can_use_gated_optimized_kernel,
+    )
+
+    kwargs = dict(
+        activation="silu",
+        sf_vec_size=16,
+        mma_tiler_mn=(128, 128),
+        hidden_size=4096,
+        intermediate_size=512,
+        num_topk=10,
+        share_input_across_experts=False,
+    )
+    kwargs.update(overrides)
+
+    assert _can_use_gated_optimized_kernel(**kwargs) is expected
+
+
+@cute_dsl_available
+def test_gated_dynamic_constructor_rejects_unsupported_geometry():
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
+        MoEGatedDynamicKernel,
+    )
+
+    with pytest.raises(ValueError, match="16-element scale blocks"):
+        MoEGatedDynamicKernel(sf_vec_size=8, mma_tiler_mn=(128, 128))
+    with pytest.raises(ValueError, match="M128xN128"):
+        MoEGatedDynamicKernel(sf_vec_size=16, mma_tiler_mn=(256, 128))
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "overrides,expected_gated",
+    [
+        ({}, True),
+        ({"hidden_size": 16512}, False),
+        ({"intermediate_size": 640}, False),
+        ({"num_topk": 17}, False),
+        ({"num_topk": 32, "share_input_across_experts": True}, True),
+        ({"num_topk": 33, "share_input_across_experts": True}, False),
+    ],
+)
+def test_dynamic_kernel_factory_falls_back_for_unsupported_gated_shapes(
+    overrides, expected_gated
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_dynamic.gated import (
+        MoEGatedDynamicKernel,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dynamic_kernel import (
+        MoEDynamicKernel,
+    )
+
+    kwargs = dict(
+        sf_vec_size=16,
+        mma_tiler_mn=(128, 128),
+        activation="silu",
+        hidden_size=4096,
+        intermediate_size=512,
+        num_topk=10,
+        share_input_across_experts=False,
+    )
+    kwargs.update(overrides)
+
+    kernel = MoEDynamicKernel(**kwargs)
+    assert isinstance(kernel, MoEGatedDynamicKernel) is expected_gated
+    if kwargs["num_topk"] > 32:
+        assert kernel.share_input_across_experts is False
+
+
+@cute_dsl_available
 def test_w4a16_static_tiler_uses_64_when_intermediate_not_128_aligned():
     """The W4A16 backend must not use a 128-wide N tile for n=64 mod 128."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
