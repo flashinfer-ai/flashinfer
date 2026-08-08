@@ -112,6 +112,7 @@ def test_pipe_ep_size_validation_uses_guarded_handshake_with_a_comm() -> None:
 class _FakePipe:
     def __init__(self, log):
         self.log = log
+        self.E = 1
         self.H = 128
         self.K = 2
         self.token_capacity = 64
@@ -177,6 +178,8 @@ def _runner():
     runner._caller_ready_event = _FakeEvent(log)
     runner._round_event = _FakeEvent(log)
     runner._round_stream_id = None
+    runner._bound_weights = None
+    runner._validated_weights = {}
     runner.record_stages = False
     runner._test_current_stream = _FakeStream(17, log)
     runner._current_stream = lambda: (runner._test_current_stream, True)
@@ -204,6 +207,63 @@ def _runner():
     runner.w2_sf = object()
     runner._workspace = object()
     return runner, pipe, log
+
+
+def _weight_bundle(*, num_experts: int = 1):
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushWeights
+
+    return Sm90PushWeights(
+        w13_fp8=torch.empty(num_experts, 256, 128, dtype=torch.float8_e4m3fn),
+        w13_sf=torch.empty(num_experts, 2, 1, dtype=torch.float32),
+        w2_fp8=torch.empty(num_experts, 128, 128, dtype=torch.float8_e4m3fn),
+        w2_sf=torch.empty(num_experts, 1, 1, dtype=torch.float32),
+    )
+
+
+def test_runner_rebinds_same_geometry_weights_without_reallocating_scratch():
+    import torch
+
+    runner, pipe, _log = _runner()
+    pipe.device = torch.device("cpu")
+    first = _weight_bundle()
+    second = _weight_bundle()
+    scratch = (runner.a1, runner.a2, runner.y, runner._workspace, runner.runner)
+
+    runner.bind_weights(first)
+    runner.bind_weights(second)
+
+    assert runner._bound_weights is second
+    assert runner.w13_fp8 is second.w13_fp8
+    assert runner.w13_sf is second.w13_sf
+    assert runner.w2_fp8 is second.w2_fp8
+    assert runner.w2_sf is second.w2_sf
+    assert (runner.a1, runner.a2, runner.y, runner._workspace, runner.runner) == scratch
+
+
+def test_runner_weight_rebind_is_idle_only_and_transactional():
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
+        runner as module,
+    )
+
+    runner, pipe, _log = _runner()
+    pipe.device = torch.device("cpu")
+    first = _weight_bundle()
+    runner.bind_weights(first)
+
+    runner._state = module._RunnerState.STAGED
+    with pytest.raises(RuntimeError, match="only be rebound while idle"):
+        runner.bind_weights(_weight_bundle())
+    assert runner._bound_weights is first
+
+    runner._state = module._RunnerState.IDLE
+    with pytest.raises(ValueError, match="w13_fp8 must have shape"):
+        runner.bind_weights(_weight_bundle(num_experts=2))
+    assert runner._bound_weights is first
+    assert runner.w13_fp8 is first.w13_fp8
 
 
 @pytest.mark.parametrize(

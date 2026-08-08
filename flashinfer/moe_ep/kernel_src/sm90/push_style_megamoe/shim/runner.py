@@ -20,6 +20,7 @@ import contextlib
 import os
 import shutil
 import socket
+import weakref
 from enum import Enum
 
 import torch
@@ -65,6 +66,8 @@ class Sm90PushMoERunner:
         self._caller_ready_event: torch.cuda.Event | None = None
         self._round_event: torch.cuda.Event | None = None
         self._round_stream_id: int | None = None
+        self._bound_weights: Sm90PushWeights | None = None
+        self._validated_weights: dict[int, weakref.ReferenceType[Sm90PushWeights]] = {}
         self.record_stages = False  # per-stage profiler ranges (see _record_stage)
 
         # weights are per-rank state: form AND content checks run guarded
@@ -83,6 +86,7 @@ class Sm90PushMoERunner:
                     "the four raw tensors (w13_fp8, w13_sf, w2_fp8, w2_sf)"
                 )
             if isinstance(weights, Sm90PushWeights):
+                weight_bundle = weights
                 if w13_sf is not None or w2_fp8 is not None or w2_sf is not None:
                     raise ValueError(
                         "pass EITHER an Sm90PushWeights bundle OR the four raw "
@@ -101,6 +105,7 @@ class Sm90PushMoERunner:
                 w2_fp8, w2_sf = weights.w2_fp8, weights.w2_sf
                 w13_interleaved = weights.w13_interleaved
             else:
+                weight_bundle = None
                 w13_fp8 = weights
                 if w13_sf is None or w2_fp8 is None or w2_sf is None:
                     raise ValueError(
@@ -159,6 +164,9 @@ class Sm90PushMoERunner:
             self.I = i_size
             self.w13_fp8, self.w13_sf = w13_fp8, w13_sf
             self.w2_fp8, self.w2_sf = w2_fp8, w2_sf
+            self._bound_weights = weight_bundle
+            if weight_bundle is not None:
+                self._validated_weights[id(weight_bundle)] = weakref.ref(weight_bundle)
             self._init_gemm_resources()
             return None
 
@@ -391,6 +399,62 @@ class Sm90PushMoERunner:
                 self.a2.shape[0], self.I, dtype=torch.bfloat16, device=self.pipe.device
             )
         return self._g
+
+    def bind_weights(self, weights: Sm90PushWeights) -> None:
+        """Bind a same-geometry weight bundle while the runner is idle."""
+        self._require_usable()
+        if self._state != _RunnerState.IDLE:
+            raise RuntimeError("sm90_push weights can only be rebound while idle")
+        if weights is self._bound_weights:
+            return
+        if not isinstance(weights, Sm90PushWeights):
+            raise TypeError(
+                "sm90_push weights must be an Sm90PushWeights bundle, got "
+                f"{type(weights).__name__}"
+            )
+
+        cached = self._validated_weights.get(id(weights))
+        if cached is None or cached() is not weights:
+            pipe = self.pipe
+            if weights.w13_interleaved != pipe.config.fuse_fc1_epilogue:
+                raise ValueError(
+                    f"fuse_fc1_epilogue={pipe.config.fuse_fc1_epilogue} requires "
+                    f"w13_interleaved={pipe.config.fuse_fc1_epilogue}; got "
+                    f"w13_interleaved={weights.w13_interleaved}"
+                )
+            expected = (
+                ("w13_fp8", weights.w13_fp8, (pipe.E, 2 * self.I, pipe.H)),
+                (
+                    "w13_sf",
+                    weights.w13_sf,
+                    (pipe.E, 2 * self.I // 128, pipe.H // 128),
+                ),
+                ("w2_fp8", weights.w2_fp8, (pipe.E, pipe.H, self.I)),
+                (
+                    "w2_sf",
+                    weights.w2_sf,
+                    (pipe.E, pipe.H // 128, self.I // 128),
+                ),
+            )
+            for name, tensor, shape in expected:
+                if tuple(tensor.shape) != shape:
+                    raise ValueError(
+                        f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+                    )
+                if tensor.device != pipe.device:
+                    raise ValueError(
+                        f"{name} must be on {pipe.device}, got {tensor.device}"
+                    )
+                if not tensor.is_contiguous():
+                    raise ValueError(f"{name} must be contiguous")
+            self._validated_weights[id(weights)] = weakref.ref(weights)
+
+        self.w13_interleaved = weights.w13_interleaved
+        self.w13_fp8 = weights.w13_fp8
+        self.w13_sf = weights.w13_sf
+        self.w2_fp8 = weights.w2_fp8
+        self.w2_sf = weights.w2_sf
+        self._bound_weights = weights
 
     @property
     def state(self) -> str:
@@ -666,6 +730,8 @@ class Sm90PushMoERunner:
         self._staged_stream_capturing = False
         self._caller_ready_event = None
         self._round_event = None
+        self._bound_weights = None
+        self._validated_weights.clear()
         self._workspace = None
         self.runner = None
 

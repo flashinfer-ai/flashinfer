@@ -34,10 +34,20 @@ if TYPE_CHECKING:
 class _Sm90PushFp8Workspace:
     pipe: Any
     runner: Any
-    transformed_weights: Any
+    active_weights: Any | None = None
+    staged_weights: Any | None = None
     staged_tokens: int | None = None
     poisoned: bool = False
     destroyed: bool = False
+
+    def destroy(self) -> None:
+        if self.destroyed:
+            return
+        self.runner.destroy()
+        self.active_weights = None
+        self.staged_weights = None
+        self.staged_tokens = None
+        self.destroyed = True
 
 
 def _validate_sm90_arch() -> None:
@@ -257,7 +267,30 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         return _Sm90PushFp8Workspace(
             pipe=pipe,
             runner=runner,
-            transformed_weights=transformed_weights,
+            active_weights=transformed_weights,
+        )
+
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        kcfg = self._kernel_config
+        return (
+            "sm90_push_fp8",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self.ep_comm_group),
+            fleet_params.num_experts,
+            fleet_params.max_tokens_per_rank,
+            fleet_params.token_hidden_size,
+            kcfg.intermediate_size,
+            kcfg.top_k,
+            kcfg.payload_dtype,
+            kcfg.combine_dtype,
+            float(kcfg.capacity_factor),
+            kcfg.dedup_dispatch,
+            kcfg.grouped_combine,
+            kcfg.fuse_fc1_epilogue,
+            kcfg.allow_unverified_p2p,
+            float(kcfg.init_timeout_s),
         )
 
     def validate_forward(
@@ -304,12 +337,15 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
                 "sm90_push_fp8 requires MegaConfig.quantize_input=True"
             )
         ws = self._live_workspace(workspace)
-        if ws.transformed_weights is not self._transformed_weights:
+        transformed_weights = self._transformed_weights
+        if transformed_weights is None:
             raise RuntimeError(
-                "sm90_push_fp8 backend weights differ from the workspace bundle; "
-                "rebuild the layer after replacing transformed weights"
+                "sm90_push_fp8 weights must be preprocessed or validated before staging"
             )
         try:
+            if ws.active_weights is not transformed_weights:
+                ws.runner.bind_weights(transformed_weights)
+                ws.active_weights = transformed_weights
             ws.runner.stage_inputs(
                 t.hidden_states,
                 t.topk_ids,
@@ -319,6 +355,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
             if ws.runner.state == "poisoned":
                 ws.poisoned = True
             raise
+        ws.staged_weights = transformed_weights
         ws.staged_tokens = t.num_tokens
 
     def compute(
@@ -329,15 +366,16 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         output: torch.Tensor,
     ) -> torch.Tensor:
         ws = self._live_workspace(workspace)
-        weights_mismatch = (
-            transformed_weights is not ws.transformed_weights
-            or transformed_weights is not self._transformed_weights
-        )
+        staged_weights = ws.staged_weights
         num_tokens = ws.staged_tokens
-        if num_tokens is None:
+        if num_tokens is None or staged_weights is None:
             raise RuntimeError(
                 "sm90_push_fp8 compute() requires a successful stage_inputs()"
             )
+        weights_mismatch = (
+            transformed_weights is not staged_weights
+            or self._transformed_weights is not staged_weights
+        )
         try:
             result = ws.runner.compute(output=output)
         except Exception:
@@ -345,6 +383,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
                 ws.poisoned = True
             raise
         finally:
+            ws.staged_weights = None
             ws.staged_tokens = None
         if result is not output:
             raise RuntimeError(
@@ -353,7 +392,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         if weights_mismatch:
             raise RuntimeError(
                 "sm90_push_fp8 compute received a different weight bundle; the "
-                "staged round completed with the weights bound to its workspace"
+                "staged round completed with its bound weights"
             )
         return output
 
@@ -365,11 +404,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
                 "sm90_push_fp8 workspace must be created by this backend, got "
                 f"{type(workspace).__name__}"
             )
-        if workspace.destroyed:
-            return
-        workspace.runner.destroy()
-        workspace.destroyed = True
-        workspace.staged_tokens = None
+        super().destroy(workspace)
 
 
 __all__ = ["Sm90PushFp8MegaKernelBackend"]

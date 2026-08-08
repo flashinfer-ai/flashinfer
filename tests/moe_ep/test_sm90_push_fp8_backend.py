@@ -381,6 +381,50 @@ def test_public_ep1_graph_replay() -> None:
         assert torch.equal(replayed[index], eager[index])
 
 
+@requires_sm90
+def test_public_ep1_two_layers_share_workspace_and_graph_replay() -> None:
+    device = torch.device("cuda", 0)
+    first, _, _ = _build_layer(1, 0, device, seed=71)
+    second, _, _ = _build_layer(1, 0, device, seed=72)
+    inputs = [
+        _make_inputs(TOKEN_CAPACITY, LOCAL_EXPERTS, 73 + index, device)
+        for index in range(2)
+    ]
+    eager = []
+    for x, ids, weights in inputs:
+        first_output = _forward(first, x, ids, weights).clone()
+        second_output = _forward(second, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert not torch.equal(first_output, second_output)
+        eager.append((first_output, second_output))
+
+    assert first._workspace is second._workspace
+    static_x = torch.empty_like(inputs[0][0]).copy_(inputs[0][0])
+    static_ids = torch.empty_like(inputs[0][1]).copy_(inputs[0][1])
+    static_weights = torch.empty_like(inputs[0][2]).copy_(inputs[0][2])
+    side_stream = torch.cuda.Stream()
+    for _ in range(2):
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            _forward(first, static_x, static_ids, static_weights)
+            _forward(second, static_x, static_ids, static_weights)
+        torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        first_static_output = _forward(first, static_x, static_ids, static_weights)
+        second_static_output = _forward(second, static_x, static_ids, static_weights)
+    for index, (x, ids, weights) in enumerate(inputs):
+        static_x.copy_(x)
+        static_ids.copy_(ids)
+        static_weights.copy_(weights)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(first_static_output, eager[index][0])
+        assert torch.equal(second_static_output, eager[index][1])
+
+
 def _dist_setup() -> tuple[int, int]:
     import torch.distributed as dist
 
