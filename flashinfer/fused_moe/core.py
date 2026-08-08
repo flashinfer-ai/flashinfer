@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -2826,8 +2827,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     dtype=routing_dtype,
                     device=hidden_states.device,
                 )
+        # Allow disabling PDL via env var for debugging/workaround
+        _pdl_override = os.environ.get("FLASHINFER_DISABLE_PDL_MOE", "0")
+        if _pdl_override == "1":
+            enable_pdl = False
         if enable_pdl is None:
-            enable_pdl = device_support_pdl(hidden_states.device)
+            # PDL (CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION) can
+            # cause kernel hangs when interprocess CUDA events are recorded on
+            # the same stream. Disable by default for FP4 MoE to avoid
+            # trtllm_fp4_block_scale_moe deadlock under LMCache/vLLM MP mode.
+            enable_pdl = False
         if output is None:
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
