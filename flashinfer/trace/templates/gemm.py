@@ -1099,6 +1099,57 @@ tinygemm_bf16_trace = TraceTemplate(
 )
 
 
+# ── bf16_gemv (SM12x small-N bf16 GEMV) ──────────────────────────────────────
+
+
+@torch.no_grad()
+def _bf16_gemv_reference(x, weight, **_unused) -> torch.Tensor:
+    """Reference for bf16_gemv: y = x @ weight.T, f32 accumulation."""
+    return (x.to(torch.float32) @ weight.to(torch.float32).T).to(x.dtype)
+
+
+def _bf16_gemv_init(
+    *,
+    M: int,
+    N: int = 96,
+    K: int = 5120,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``bf16_gemv``: ``y = x @ weight.T``."""
+    torch.manual_seed(seed)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    return {"x": x, "weight": w}
+
+
+bf16_gemv_trace = TraceTemplate(
+    op_type="gemm_bf16",
+    name_prefix="bf16_gemv",
+    description=(
+        "SM120/SM121 small-N bf16 GEMV (F.linear-equivalent): y = x @ weight.T. "
+        "One CTA per output column, for decode-size m on narrow unquantized "
+        "projections. Shapes outside the kernel window fall back to cuBLAS "
+        "inside the op."
+    ),
+    axes={
+        "M": Var(description="Number of input rows (kernel path covers m <= 8)."),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+    },
+    inputs={
+        "x": Tensor(["M", "K"]),
+        "weight": Tensor(["N", "K"]),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="x"),
+    },
+    tags=["status:verified"],
+    reference=_bf16_gemv_reference,
+    init=_bf16_gemv_init,
+)
+
+
 # ── fmha_v2_prefill_deepseek (separate Q/K/V variant of FMHA v2 prefill) ─────
 
 

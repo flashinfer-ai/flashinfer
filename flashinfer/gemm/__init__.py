@@ -73,6 +73,19 @@ try:
 except ImportError:
     pass
 
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .gemm_bf16_gemv import (
+            bf16_gemv as bf16_gemv,
+            precompile_bf16_gemv as precompile_bf16_gemv,
+        )
+
+        _cute_dsl_kernels.extend(["bf16_gemv", "precompile_bf16_gemv"])
+except ImportError:
+    pass
+
 # is_cuda_tile_available is always importable: flashinfer.cutile.cutile_common
 # has no cuda.tile imports by design, so this never fails even when cuda-tile is
 # absent. Mirrors how is_cute_dsl_available is exported unconditionally
