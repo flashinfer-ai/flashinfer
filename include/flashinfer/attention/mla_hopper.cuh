@@ -153,7 +153,8 @@ struct HopperKernelTraits
   static constexpr uint32_t CKV_B128_PER_ROW = HEAD_DIM_CKV_ * sizeof(DTypeKV_) / 16;
   static constexpr uint32_t KPE_B128_PER_ROW = HEAD_DIM_KPE_ * sizeof(DTypeKV_) / 16;
   static constexpr uint32_t LANES_PER_ROW_CKV = (CKV_B128_PER_ROW >= 8) ? 8 : CKV_B128_PER_ROW;
-  static constexpr uint32_t LANES_PER_ROW_KPE = (KPE_B128_PER_ROW >= 8) ? 8 : KPE_B128_PER_ROW;
+  static constexpr uint32_t LANES_PER_ROW_KPE =
+      KPE_B128_PER_ROW == 0 ? 1 : ((KPE_B128_PER_ROW >= 8) ? 8 : KPE_B128_PER_ROW);
   static constexpr uint32_t INNER_LOADS_CKV = CKV_B128_PER_ROW / LANES_PER_ROW_CKV;
   static constexpr uint32_t INNER_LOADS_KPE = KPE_B128_PER_ROW / LANES_PER_ROW_KPE;
   // Swizzle for the FP8 *raw* KPE shmem storage. When KPE_B128_PER_ROW < 8 (FP8
@@ -465,8 +466,14 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
       make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, KVDescType>(ckv_smem_ptr);
 
+  if constexpr (KTraits::NUM_MMA_D_KPE == 0) {
+    wgmma::op</*init=*/true>(desc_q_nope, desc_ckv, s_frag);
+    desc_q_nope += 2;
+    desc_ckv += 2;
+  }
 #pragma unroll
-  for (uint32_t mma_d_ckv = 0; mma_d_ckv < KTraits::NUM_MMA_D_CKV; ++mma_d_ckv) {
+  for (uint32_t mma_d_ckv = KTraits::NUM_MMA_D_KPE == 0 ? 1 : 0; mma_d_ckv < KTraits::NUM_MMA_D_CKV;
+       ++mma_d_ckv) {
     wgmma::op</*init=*/false>(desc_q_nope, desc_ckv, s_frag);
     if ((mma_d_ckv + 1) % 4 == 0) {
       desc_q_nope += 64 - 6;

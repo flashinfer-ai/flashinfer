@@ -2188,6 +2188,9 @@ class BatchMLAPagedAttentionWrapper:
                 f"MLA kv_data_type {kv_data_type} is not supported. "
                 f"Supported dtypes: {list(_SUPPORTED_MLA_KV_DTYPES)}."
             )
+        if head_dim_kpe < 0:
+            raise ValueError(f"head_dim_kpe must be >= 0, got {head_dim_kpe}.")
+
         if kv_data_type == torch.float8_e4m3fn:
             if self._backend != "fa3":
                 raise ValueError(

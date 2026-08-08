@@ -277,6 +277,74 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
     return k, v
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_without_kpe(backend):
+    device = torch.device("cuda:0")
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("FA3 is not supported on this device")
+
+    torch.manual_seed(42)
+    batch_size = 2
+    qo_len = 3
+    kv_len = 97
+    num_heads = 16
+    head_dim_ckv = 512
+    head_dim_kpe = 0
+    page_size = 16
+    dtype = torch.float16
+    pages_num = math.ceil(kv_len / page_size)
+    q_nope = torch.randn(
+        batch_size * qo_len, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.empty(
+        batch_size * qo_len, num_heads, head_dim_kpe, dtype=dtype, device=device
+    )
+    ckv = torch.randn(
+        batch_size * pages_num,
+        page_size,
+        head_dim_ckv,
+        dtype=dtype,
+        device=device,
+    )
+    kpe = torch.empty(
+        batch_size * pages_num,
+        page_size,
+        head_dim_kpe,
+        dtype=dtype,
+        device=device,
+    )
+    sm_scale = 1.0 / math.sqrt(128)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+    q_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * qo_len
+    kv_indptr = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * pages_num
+    )
+    kv_indices = torch.arange(batch_size * pages_num, device=device, dtype=torch.int32)
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_lens,
+        num_heads,
+        head_dim_ckv,
+        head_dim_kpe,
+        page_size,
+        False,
+        sm_scale,
+        dtype,
+        dtype,
+    )
+    output, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+
+    key, value = generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads)
+    output_ref, lse_ref = attention_ref(batch_size, q_nope, key, value, False, sm_scale)
+    torch.testing.assert_close(output, output_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7])
 @pytest.mark.parametrize("kv_len_0", [0, 1, 3, 11])
 @pytest.mark.parametrize("kv_len_1", [17, 33, 79, 114])
