@@ -2207,6 +2207,7 @@ def _moe_bf16_run_experts(
     activation_type=ActivationType.Swiglu.value,
     situ_beta=None,
     situ_linear_beta=None,
+    apply_router_weight_on_input=False,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
@@ -2245,6 +2246,9 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
+        w_tok = weights.index_select(0, token_idx)
+        match = (topk_idx.index_select(0, token_idx) == ge).float()
+        w_e = (w_tok * match).sum(dim=1)
         if activation_type == ActivationType.Relu2:
             act = torch.relu(G1) ** 2
         else:
@@ -2268,11 +2272,12 @@ def _moe_bf16_run_experts(
                 up = torch.clamp(X1, min=-limit, max=limit)
                 gate = torch.clamp(X2, max=limit)
                 act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+        if apply_router_weight_on_input:
+            act = act * w_e.unsqueeze(1)
         expert_out = act.matmul(W2[le].t())
-        w_tok = weights.index_select(0, token_idx)
-        match = (topk_idx.index_select(0, token_idx) == ge).float()
-        w_e = (w_tok * match).sum(dim=1)
-        output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))
+        if not apply_router_weight_on_input:
+            expert_out = expert_out * w_e.unsqueeze(1)
+        output.index_add_(0, token_idx, expert_out)
     return output.to(torch.bfloat16)
 
 
@@ -3407,6 +3412,11 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             optional=True,
             description="Compute mode: 'nvfp4'/'w4a4' or 'w4a16'.",
         ),
+        "apply_router_weight_on_input": Scalar(
+            "bool",
+            optional=True,
+            description="Apply routing weights to the expert activation output.",
+        ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
         "local_expert_offset": Scalar(
@@ -3506,6 +3516,11 @@ _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
 )
 _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["apply_router_weight_on_input"] = Scalar(
+    "bool",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
@@ -3711,6 +3726,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     situ_beta=None,
     situ_linear_beta=None,
     per_token_scale=None,
+    apply_router_weight_on_input=False,
     **_unused,
 ):
     """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
@@ -3749,6 +3765,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         gemm1_clamp_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
 

@@ -343,6 +343,7 @@ def compute_reference_moe_fp4(
     situ_linear_beta: float | None = None,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -374,6 +375,8 @@ def compute_reference_moe_fp4(
         situ_linear_beta: Optional SiTU tanh clamp for the linear branch.
         gemm1_alpha: GEMM1 per-expert scalar scales [num_local_experts]
         gemm2_alpha: GEMM2 per-expert scalar scales [num_local_experts]
+        apply_router_weight_on_input: Apply the routing weight to the expert
+            activation output, on the FC2 input, instead of the FC2 output.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
@@ -483,6 +486,9 @@ def compute_reference_moe_fp4(
             else:
                 act_out = torch.relu(gemm1_out) ** 2
 
+            if apply_router_weight_on_input:
+                act_out = scale * act_out
+
             if fc2_input_scale is not None:
                 if use_per_token_activation:
                     act_out, per_token_scale = quant_dequant_fp4_per_token_reference(
@@ -496,7 +502,9 @@ def compute_reference_moe_fp4(
             w2 = gemm2_weights[local_idx]
             gemm2_out = act_out @ w2.T
 
-            output_scale = scale * gemm2_alpha[local_idx]
+            output_scale = gemm2_alpha[local_idx]
+            if not apply_router_weight_on_input:
+                output_scale = scale * output_scale
             if per_token_scale is not None:
                 output_scale = output_scale * per_token_scale[0]
             output[token_idx] += output_scale * gemm2_out.squeeze(0)

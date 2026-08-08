@@ -270,6 +270,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
+        apply_router_weight_on_input: Whether routing weights are applied to
+            the expert activation output before FC2.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
     """
@@ -291,6 +293,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
+        apply_router_weight_on_input: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -310,6 +313,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -446,6 +450,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
                 self.use_per_token_activation,
+                self.apply_router_weight_on_input,
             )
         )
 
@@ -457,6 +462,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.apply_router_weight_on_input,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -685,6 +691,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
             **kwargs,
         )
 
@@ -757,6 +764,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        apply_router_weight_on_input: bool = False,
     ):
         activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
         if output_dtype != torch.bfloat16:
@@ -772,6 +780,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.apply_router_weight_on_input = apply_router_weight_on_input
         self._workspace_cache: Dict[Tuple, Any] = {}
 
         # Match production EP routing density while retaining seeded load
@@ -841,6 +850,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.apply_router_weight_on_input,
             )
         )
 
@@ -857,6 +867,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.apply_router_weight_on_input,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -962,6 +973,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             num_local_experts=self.num_local_experts,
             local_expert_offset=self.local_expert_offset,
             use_fused_finalize=self.use_fused_finalize,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
             activation_type=self.activation_type,

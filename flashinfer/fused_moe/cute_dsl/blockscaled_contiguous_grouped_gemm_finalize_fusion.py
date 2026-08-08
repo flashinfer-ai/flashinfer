@@ -190,6 +190,7 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    apply_router_weight_on_input: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -212,6 +213,7 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        apply_router_weight_on_input,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -224,6 +226,7 @@ def _get_compiled_finalize_kernel(
             enable_pdl=enable_pdl,
             use_a_per_token_scale=use_a_per_token_scale,
             use_fused_finalize=use_fused_finalize,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -289,6 +292,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -324,6 +328,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         sm_count: Number of SMs to use. Default: max available.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        apply_router_weight_on_input: Routing weights were applied to the FC2
+             input, so GEMM2 must not apply them again. Default: False.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -549,6 +555,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
     # Execute kernel with runtime parameters
