@@ -30,6 +30,7 @@
 # and adapted for the current Blackwell GeForce target.
 
 from dataclasses import dataclass
+import importlib
 from typing import Literal, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -48,6 +49,32 @@ from cutlass.cute.nvgpu.warp.mma import Field as WarpField
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from cutlass._mlir.dialects import llvm
+
+
+class _IketShim:
+    """No-op IKET markers for CuTe DSL builds without IKET support."""
+
+    @staticmethod
+    def range_push(_name):
+        return None
+
+    @staticmethod
+    def range_pop():
+        return None
+
+
+def _load_iket():
+    # Keep the optional experimental import out of CuTe's AST import replay:
+    # normal CUDA 13.0 builds raise NotImplementedError while importing it.
+    for module_name in ("cutlass.cute.experimental", "cutlass.cute"):
+        try:
+            return importlib.import_module(module_name).iket
+        except Exception:  # pragma: no cover - availability is environment-specific
+            pass
+    return _IketShim()
+
+
+iket = _load_iket()
 
 from flashinfer.cute_dsl.utils import (
     sm120_make_smem_layout_sfa,
@@ -209,6 +236,7 @@ class DenseGemmKernel:
         use_m1_non_tma_sfa: bool = False,
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
+        enable_iket: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -238,6 +266,9 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
+        # IKET is a compile-time diagnostic. Every marker is guarded with
+        # const_expr so the default specialization contains no tracing ops.
+        self.enable_iket = enable_iket
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
             self.atom_shape = (1, 2, 1)
@@ -1514,6 +1545,8 @@ class DenseGemmKernel:
                 accumulators.fill(0.0)
 
                 # Pipelined MAINLOOP
+                if cutlass.const_expr(self.enable_iket):
+                    iket.range_push("mma_main")
                 mainloop_consumer_state.reset_count()
 
                 peek_ab_full_status = cutlass.Boolean(1)
@@ -1683,6 +1716,8 @@ class DenseGemmKernel:
                                 tCrB[None, _nt, k_block_idx],
                                 accumulators[None, _mt, _nt],
                             )
+                if cutlass.const_expr(self.enable_iket):
+                    iket.range_pop()
 
                 # SVDQuant fusion: the load warp stages one
                 # mainloop-byte-equivalent BF16 rank tile at a time into the
@@ -1696,6 +1731,8 @@ class DenseGemmKernel:
                 #   alpha * (residual + D @ (L1 / alpha).T)
                 #     = alpha * residual + D @ L1.T.
                 if cutlass.const_expr(svdquant_d is not None):
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_push("mma_lora")
                     rank = cute.size(svdquant_d, mode=[1])
                     for _rank_tile in cutlass.range_constexpr(
                         rank // self.svdquant_tile_k
@@ -1724,9 +1761,13 @@ class DenseGemmKernel:
                         )
                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
                         mainloop_consumer_state.advance()
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_pop()
 
                     # Bias remains an elementwise output-epilogue contribution.
                     # The low-rank matrix product above is exclusively BF16 MMA.
+                if cutlass.const_expr(self.enable_iket):
+                    iket.range_push("epilogue")
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
                     c_identity = cute.make_identity_tensor(
@@ -1762,6 +1803,8 @@ class DenseGemmKernel:
                                         tile_coord_mnl[2],
                                     )
                                 ] = epilogue_op(acc_value.to(self.c_dtype))
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_pop()
                     if cutlass.const_expr(self.single_work_tile_per_cta):
                         work_tile = WorkTileInfo(
                             work_tile.tile_idx,
@@ -2093,6 +2136,8 @@ class DenseGemmKernel:
                                             tma_store_pipeline.producer_commit()
                                             tma_store_pipeline.producer_acquire()
 
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_pop()
                     # Advance to the next work tile
                     if cutlass.const_expr(self.single_work_tile_per_cta):
                         work_tile = WorkTileInfo(
@@ -2111,6 +2156,8 @@ class DenseGemmKernel:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
+                if cutlass.const_expr(self.enable_iket):
+                    iket.range_push("load_warp_main")
                 if cutlass.const_expr(
                     self.load_path == "tma" and not self.use_m1_non_tma_a
                 ):
@@ -2398,8 +2445,12 @@ class DenseGemmKernel:
                         cute.arch.cp_async_wait_group(0)
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
                     mainloop_producer_state.advance()
+                if cutlass.const_expr(self.enable_iket):
+                    iket.range_pop()
 
                 if cutlass.const_expr(svdquant_d is not None):
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_push("load_warp_lora")
                     tile_m, tile_n, _ = tile_coord_mnl
                     if cutlass.const_expr(self.swap_ab):
                         tile_m, tile_n = tile_n, tile_m
@@ -2450,6 +2501,8 @@ class DenseGemmKernel:
                         )
                         mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
+                    if cutlass.const_expr(self.enable_iket):
+                        iket.range_pop()
 
                 if cutlass.const_expr(self.single_work_tile_per_cta):
                     work_tile = WorkTileInfo(
@@ -2676,7 +2729,7 @@ class DenseGemmKernel:
         load_path: str = "tma",
         swap_ab: bool = False,
         svdquant_rank: Optional[int] = None,
-        mainloop_tile_k: Optional[int] = None,
+        tile_k: Optional[int] = None,
     ) -> bool:
         # The current target only supports cluster (1,1)
         if cluster_shape_mn != (1, 1):
@@ -2696,9 +2749,9 @@ class DenseGemmKernel:
         if svdquant_rank is not None:
             if load_path != "tma":
                 return False
-            if mainloop_tile_k is None:
+            if tile_k is None:
                 return False
-            rank_elements_per_stage = mainloop_tile_k // (
+            rank_elements_per_stage = tile_k // (
                 cutlass.BFloat16.width // ab_dtype.width
             )
             if (

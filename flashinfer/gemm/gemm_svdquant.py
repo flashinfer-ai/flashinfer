@@ -86,6 +86,7 @@ def _compile_sm120_nvfp4_svdquant(
     sf_n: int,
     sf_k: int,
     enable_pdl: bool,
+    enable_iket: bool = False,
 ):
     """Compile one fused SM120 NVFP4 + rank-r BF16 epilogue specialization."""
     device_index = device.index
@@ -105,6 +106,7 @@ def _compile_sm120_nvfp4_svdquant(
         use_prefetch,
         max_active_clusters,
         enable_pdl,
+        enable_iket,
     )
     if cache_key in _SM120_SVDQUANT_KERNEL_CACHE:
         return _SM120_SVDQUANT_KERNEL_CACHE[cache_key]
@@ -128,6 +130,7 @@ def _compile_sm120_nvfp4_svdquant(
         use_prefetch=use_prefetch,
         enable_pdl=enable_pdl,
         swap_ab=swap_ab,
+        enable_iket=enable_iket,
     )
 
     def compile_kernel():
@@ -201,7 +204,7 @@ def _compile_sm120_nvfp4_svdquant(
     kernel_name = (
         f"r{rank}_bias{int(with_bias)}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         f"x{tile_k}_swap{int(swap_ab)}_pf{int(use_prefetch)}_mac{max_active_clusters}"
-        f"_pdl{int(enable_pdl)}"
+        f"_pdl{int(enable_pdl)}_iket{int(enable_iket)}"
     )
     compiled = build_and_load_cute_dsl_kernel(
         "mm_nvfp4_svdquant_sm120",
@@ -225,6 +228,7 @@ def _mm_nvfp4_svdquant_sm120_fused(
     out: torch.Tensor,
     enable_pdl: bool,
     tactic=None,
+    enable_iket: bool = False,
 ) -> torch.Tensor:
     from .kernels.dense_blockscaled_gemm_sm120_b12x import (
         _select_default_dense_gemm_plan,
@@ -254,6 +258,7 @@ def _mm_nvfp4_svdquant_sm120_fused(
         sf_n=sf_n,
         sf_k=sf_k,
         enable_pdl=enable_pdl,
+        enable_iket=enable_iket,
     )
     args = [
         a,
@@ -357,7 +362,7 @@ def _sm120_nvfp4_svdquant_runner(enable_pdl: bool):
                     "n",
                     swap_ab=swap_ab,
                     svdquant_rank=d.shape[1],
-                    mainloop_tile_k=tile_k,
+                    tile_k=tile_k,
                 ):
                     return
                 for use_prefetch in prefetch_candidates:

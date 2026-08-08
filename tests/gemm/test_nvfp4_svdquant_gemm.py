@@ -52,6 +52,11 @@ def test_sm120_svdquant_can_implement_rejects_ragged_rank():
         Sm120B12xBlockScaledDenseGemmKernel,
     )
 
+    assert not Sm120B12xBlockScaledDenseGemmKernel(16, (64, 64), (1, 1)).enable_iket
+    assert Sm120B12xBlockScaledDenseGemmKernel(
+        16, (64, 64), (1, 1), enable_iket=True
+    ).enable_iket
+
     common_args = (
         cutlass.Float4E2M1FN,
         cutlass.Float8E4M3FN,
@@ -67,16 +72,16 @@ def test_sm120_svdquant_can_implement_rejects_ragged_rank():
         "n",
     )
     assert Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=32, mainloop_tile_k=128
+        *common_args, svdquant_rank=32, tile_k=128
     )
     assert not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=18, mainloop_tile_k=128
+        *common_args, svdquant_rank=18, tile_k=128
     )
     assert not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=32, mainloop_tile_k=256
+        *common_args, svdquant_rank=32, tile_k=256
     )
     assert Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=64, mainloop_tile_k=256
+        *common_args, svdquant_rank=64, tile_k=256
     )
 
 
