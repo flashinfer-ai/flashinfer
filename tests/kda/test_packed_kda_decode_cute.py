@@ -184,8 +184,8 @@ def _reference_step(
     )
     beta = torch.sigmoid(raw_beta.to(work_dtype))
 
-    active = state_indices >= 0
-    safe_indices = state_indices.clamp_min(0).to(torch.long)
+    active = (state_indices >= 0) & (state_indices < state.shape[0])
+    safe_indices = state_indices.clamp(0, state.shape[0] - 1).to(torch.long)
     selected = state.index_select(0, safe_indices).to(work_dtype)
     decayed = selected * decay[:, :, None, :]
     prediction = torch.einsum("bhvk,bhk->bhv", decayed, k)
@@ -215,7 +215,7 @@ def _assert_close(actual, expected):
 
 
 def _assert_mutation_contract(case, before_storage):
-    selected = {slot for slot in case["indices_host"] if slot >= 0}
+    selected = {slot for slot in case["indices_host"] if 0 <= slot < case["slots"]}
     before_state = _state_view(before_storage, case["slots"], case["state_slot_stride"])
     state_bits = case["state"].contiguous().view(torch.int16)
     before_bits = before_state.contiguous().view(torch.int16)
@@ -240,7 +240,11 @@ def _assert_mutation_contract(case, before_storage):
         before_rows[:, _LOGICAL_STATE_SLOT:].contiguous().view(torch.int16),
     )
 
-    inactive_rows = [row for row, slot in enumerate(case["indices_host"]) if slot < 0]
+    inactive_rows = [
+        row
+        for row, slot in enumerate(case["indices_host"])
+        if slot < 0 or slot >= case["slots"]
+    ]
     if inactive_rows:
         inactive = case["output"][inactive_rows]
         assert torch.equal(
@@ -345,20 +349,39 @@ def test_packed_kda_cute_sanitizer_schedules(
     torch.cuda.synchronize(packed_kda_cute_device)
 
 
+def _shifted_contiguous(tensor):
+    storage = torch.empty(
+        tensor.numel() + 1,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    shifted = storage[1:].view(tensor.shape)
+    shifted.copy_(tensor)
+    assert shifted.is_contiguous()
+    assert shifted.data_ptr() % 16 != 0
+    return shifted
+
+
 @pytest.mark.arch_blackwell
-def test_packed_kda_cute_unaligned_dt_bias_matches_reference(
-    packed_kda_cute_device,
+@pytest.mark.parametrize(
+    "target",
+    [
+        "mixed_qkv",
+        "raw_gate",
+        "raw_beta",
+        "A_log",
+        "dt_bias",
+        "state",
+        "state_indices",
+        "output",
+    ],
+)
+def test_packed_kda_cute_shifted_tensors_match_reference(
+    packed_kda_cute_device, target
 ):
     case = _make_case(8, packed_kda_cute_device, seed=20261191, inactive=False)
-    dt_bias_storage = torch.randn(
-        _GATE_WIDTH + 1,
-        dtype=torch.float32,
-        device=packed_kda_cute_device,
-    )
-    case["dt_bias"] = dt_bias_storage[1:]
-    assert case["dt_bias"].is_contiguous()
-    assert case["dt_bias"].data_ptr() % 16 != 0
-    _, reference_state = _clone_padded_state(case)
+    case[target] = _shifted_contiguous(case[target])
+    reference_state = case["state"].clone()
     reference_output = _reference_step(
         case["mixed_qkv"],
         case["raw_gate"],
@@ -374,6 +397,38 @@ def test_packed_kda_cute_unaligned_dt_bias_matches_reference(
 
     _assert_close(result, reference_output)
     _assert_close(case["state"], reference_state)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("tile_v", [8, 64])
+def test_packed_kda_cute_out_of_range_slots_are_inactive(
+    packed_kda_cute_device, tile_v
+):
+    case = _make_case(8, packed_kda_cute_device, seed=20261192, inactive=False)
+    case["indices_host"][-2:] = [case["slots"], case["slots"] + 7]
+    case["state_indices"].copy_(
+        torch.tensor(
+            case["indices_host"], dtype=torch.int32, device=packed_kda_cute_device
+        )
+    )
+    before_storage = case["state_storage"].clone()
+    _, reference_state = _clone_padded_state(case)
+    reference_output = _reference_step(
+        case["mixed_qkv"],
+        case["raw_gate"],
+        case["raw_beta"],
+        case["A_log"],
+        case["dt_bias"],
+        reference_state,
+        case["state_indices"],
+    )
+
+    result = _call_cute(case, tile_v=tile_v)
+    torch.cuda.synchronize(packed_kda_cute_device)
+
+    _assert_close(result, reference_output)
+    _assert_close(case["state"], reference_state)
+    _assert_mutation_contract(case, before_storage)
 
 
 @pytest.mark.arch_blackwell

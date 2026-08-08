@@ -89,7 +89,7 @@ def _packed_kda_decode_warp_kernel(
     value_tile_base = value_tile_idx * tile_v
 
     requested_slot = state_indices[row_idx]
-    is_live = requested_slot >= 0
+    is_live = (requested_slot >= 0) & (cutlass.Int64(requested_slot) < state.shape[0])
     if is_live:
         source_width: cutlass.Constexpr = _HEAD_DIM // 32
         source_start = lane_idx * source_width
@@ -442,7 +442,7 @@ def _packed_kda_decode_kernel(
     )
 
     requested_slot = state_indices[row_idx]
-    is_live = requested_slot >= 0
+    is_live = (requested_slot >= 0) & (cutlass.Int64(requested_slot) < state.shape[0])
 
     if is_live:
         # The two 16-lane halves of warp zero redundantly load the vectors.
@@ -763,37 +763,38 @@ def _packed_kda_decode_launch(
 def _make_compile_inputs(use_aligned_io: bool):
     batch = cute.sym_int()
     slots = cute.sym_int()
+    bf16_io_align = 16 if use_aligned_io else 2
 
     mixed_qkv = cute.runtime.make_fake_tensor(
         BF16,
         shape=(batch, _MIXED_WIDTH),
         stride=(cute.sym_int64(), 1),
-        assumed_align=16,
+        assumed_align=bf16_io_align,
     )
     raw_gate = cute.runtime.make_fake_tensor(
         BF16,
         shape=(batch, _GATE_WIDTH),
         stride=(cute.sym_int64(), 1),
-        assumed_align=16,
+        assumed_align=bf16_io_align,
     )
     raw_beta = cute.runtime.make_fake_tensor(
         BF16,
         shape=(batch, _HEADS),
         stride=(cute.sym_int64(), 1),
-        assumed_align=16,
+        assumed_align=2,
     )
     state = cute.runtime.make_fake_tensor(
         BF16,
         shape=(slots, _HEADS, _HEAD_DIM, _HEAD_DIM),
         stride=(cute.sym_int64(), _HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1),
-        assumed_align=16,
+        assumed_align=bf16_io_align,
     )
     compact = cute.runtime.make_fake_compact_tensor
     return (
         mixed_qkv,
         raw_gate,
         raw_beta,
-        compact(F32, (_HEADS,), assumed_align=16, stride_order=(0,)),
+        compact(F32, (_HEADS,), assumed_align=4, stride_order=(0,)),
         compact(
             F32,
             (_GATE_WIDTH,),
@@ -801,11 +802,11 @@ def _make_compile_inputs(use_aligned_io: bool):
             stride_order=(0,),
         ),
         state,
-        compact(cutlass.Int32, (batch,), assumed_align=16, stride_order=(0,)),
+        compact(cutlass.Int32, (batch,), assumed_align=4, stride_order=(0,)),
         compact(
             BF16,
             (batch, 1, _HEADS, _HEAD_DIM),
-            assumed_align=16,
+            assumed_align=2,
             stride_order=(3, 2, 1, 0),
         ),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -875,6 +876,8 @@ def run_packed_kda_decode_cute(
     The tensor and numerical contract is identical to
     :func:`flashinfer.packed_kda_decode`.  ``tile_v`` is an experimental
     benchmark override; production-style calls should leave it as ``None``.
+    Active ``state_indices`` must be unique. Values outside the state pool
+    are treated as inactive rows and produce zero output.
     """
     _check_cuda_tensor("mixed_qkv", mixed_qkv, torch.bfloat16)
     _check_cuda_tensor("raw_gate", raw_gate, torch.bfloat16)
