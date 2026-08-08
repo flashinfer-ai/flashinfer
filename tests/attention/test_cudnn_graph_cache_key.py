@@ -1,4 +1,5 @@
-"""Regression tests: the cuDNN graph-cache keys must include attn scale.
+"""Regression tests: the cuDNN graph-cache keys must include every value the
+built graph bakes in -- attn scale, tensor strides and tensor data types.
 
 The cuDNN SDPA graph bakes ``attn_scale`` in as a compile-time constant, but
 ``_sdpa_prefill_key_fn`` did not include it in the process-global graph-cache
@@ -24,6 +25,7 @@ from flashinfer.cudnn import (
     cudnn_batch_decode_with_kv_cache,
     cudnn_batch_prefill_with_kv_cache,
 )
+from flashinfer.cudnn import decode as cudnn_decode
 from flashinfer.cudnn import prefill as cudnn_prefill
 from flashinfer.utils import get_compute_capability
 
@@ -180,3 +182,85 @@ def test_cudnn_decode_scale_in_graph_cache_key():
                 f"decode scale={s} (mult {sm}): stale-scale graph replay?\n{m}"
             ),
         )
+
+
+# The key-axis tests below do not need a GPU: they call the key functions
+# directly and only assert that two configs differing in exactly one baked-in
+# graph property produce different keys.
+
+
+def _prefill_key(q, k, v, **overrides):
+    kwargs = dict(
+        max_token_seq_q=32,
+        max_sequence_kv=48,
+        actual_seq_lens_q=torch.zeros(2, 1, 1, 1, dtype=torch.int32),
+        actual_seq_lens_kv=torch.zeros(2, 1, 1, 1, dtype=torch.int32),
+        bottom_right_causal_mask=True,
+        return_lse=True,
+    )
+    kwargs.update(overrides)
+    return cudnn_prefill._sdpa_prefill_key_fn(q, k, v, 0.5, **kwargs)
+
+
+def _decode_key(q, k_cache, v_cache, **overrides):
+    kwargs = dict(max_sequence_kv=48, block_size=16)
+    kwargs.update(overrides)
+    return cudnn_decode._sdpa_decode_key_fn(q, k_cache, v_cache, 0.5, **kwargs)
+
+
+def test_cudnn_prefill_key_includes_strides():
+    """_build_prefill_graph bakes every tensor's strides in via set_stride(),
+    so two same-shape same-dtype calls with different layouts must not share a
+    graph."""
+    h, d = 4, 128
+    q = torch.zeros(64, h, d, dtype=torch.bfloat16)
+    k_contiguous = torch.zeros(96, h, d, dtype=torch.bfloat16)
+    v_contiguous = torch.zeros(96, h, d, dtype=torch.bfloat16)
+
+    # K and V as views into one interleaved KV buffer: same shape and dtype,
+    # token stride 2 * h * d instead of h * d.
+    kv = torch.zeros(96, 2, h, d, dtype=torch.bfloat16)
+    k_view, v_view = kv[:, 0], kv[:, 1]
+    assert k_view.shape == k_contiguous.shape
+    assert k_view.stride() != k_contiguous.stride()
+
+    assert _prefill_key(q, k_contiguous, v_contiguous) != _prefill_key(
+        q, k_view, v_view
+    )
+
+
+def test_cudnn_prefill_key_includes_kv_dtype():
+    """K/V may carry a dtype of their own (e.g. an FP8 KV cache); the graph's
+    data types come from those tensors, not from q alone."""
+    h, d = 4, 128
+    q = torch.zeros(64, h, d, dtype=torch.bfloat16)
+    k_bf16 = torch.zeros(96, h, d, dtype=torch.bfloat16)
+    k_fp8 = torch.zeros(96, h, d, dtype=torch.float8_e4m3fn)
+
+    assert _prefill_key(q, k_bf16, k_bf16) != _prefill_key(q, k_fp8, k_fp8)
+
+
+def test_cudnn_decode_key_includes_dtype():
+    """A bf16 call and an fp16 call at the same shapes must not share a graph:
+    sharing also bypasses cuDNN's own support check, so a dtype cuDNN rejects
+    on a cold cache would execute anyway against the other dtype's graph."""
+    b, h, d, page_size = 2, 4, 128, 16
+    q_bf16 = torch.zeros(b, h, d, dtype=torch.bfloat16)
+    kv_bf16 = torch.zeros(6, h, page_size, d, dtype=torch.bfloat16)
+    q_fp16 = q_bf16.to(torch.float16)
+    kv_fp16 = kv_bf16.to(torch.float16)
+
+    assert _decode_key(q_bf16, kv_bf16, kv_bf16) != _decode_key(
+        q_fp16, kv_fp16, kv_fp16
+    )
+
+
+def test_cudnn_decode_key_includes_strides():
+    b, h, d, page_size = 2, 4, 128, 16
+    q = torch.zeros(b, h, d, dtype=torch.bfloat16)
+    kv = torch.zeros(6, 2, h, page_size, d, dtype=torch.bfloat16)
+    k_contiguous = torch.zeros(6, h, page_size, d, dtype=torch.bfloat16)
+    k_view = kv[:, 0]
+    assert k_view.shape == k_contiguous.shape
+
+    assert _decode_key(q, k_contiguous, k_contiguous) != _decode_key(q, k_view, k_view)
