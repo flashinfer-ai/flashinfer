@@ -44,6 +44,36 @@ def test_nvfp4_svdquant_backend_arch_support():
     assert not mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 100)
 
 
+def test_sm120_svdquant_can_implement_rejects_ragged_rank():
+    _skip_unless_sm120()
+    import cutlass
+
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
+        Sm120B12xBlockScaledDenseGemmKernel,
+    )
+
+    common_args = (
+        cutlass.Float4E2M1FN,
+        cutlass.Float8E4M3FN,
+        16,
+        cutlass.BFloat16,
+        (64, 64),
+        (1, 1),
+        128,
+        128,
+        1,
+        "k",
+        "k",
+        "n",
+    )
+    assert Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+        *common_args, svdquant_rank=32
+    )
+    assert not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+        *common_args, svdquant_rank=18
+    )
+
+
 def _skip_unless_sm100():
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -501,9 +531,51 @@ def test_mm_nvfp4_svdquant_sm120_fused(use_bias):
     # single BF16 store, whereas the oracle rounds the residual and correction
     # in separate launches. Compare numerically, not bitwise.
     assert _sqnr_db(expected.float(), out.float()) > 35.0
-    assert torch.equal(out_auto, out)
+    assert _sqnr_db(expected.float(), out_auto.float()) > 35.0
     fp32_ref = p["ref_bias"] if use_bias else p["ref"]
     assert _sqnr_db(fp32_ref, out.float()) > 35.0
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
+def test_mm_nvfp4_svdquant_sm120_autotuned_replay(backend):
+    _skip_unless_sm120()
+    torch.manual_seed(0)
+    p = _make_gemm_problem(
+        129,
+        256,
+        256,
+        rank=32,
+        quant_backend="cute-dsl",
+        residual_backend="b12x",
+    )
+
+    with autotune(True):
+        out = mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"],
+            backend=backend,
+        )
+    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+
+    # Replay outside the tuning context must reuse the selected tactic.
+    out_replay = mm_nvfp4_svdquant(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        bias=p["bias"],
+        backend=backend,
+    )
+    assert torch.equal(out_replay, out)
 
 
 def test_mm_nvfp4_svdquant_sm120_unfused_oracle():
@@ -690,8 +762,18 @@ def test_mm_nvfp4_svdquant_sm120_fused_does_not_call_torch_mm(monkeypatch):
 
 
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_svdquant_linear_sm120_fused(use_bias):
+def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
     _skip_unless_sm120()
+    import flashinfer.gemm.gemm_base as gemm_base
+
+    mm_bf16_backends = []
+    original_mm_bf16 = gemm_base.mm_bf16
+
+    def recording_mm_bf16(*args, **kwargs):
+        mm_bf16_backends.append(kwargs.get("backend"))
+        return original_mm_bf16(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_base, "mm_bf16", recording_mm_bf16)
     torch.manual_seed(0)
     m, n, k, rank = 129, 256, 256, 32
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") / (k**0.25)
@@ -753,6 +835,10 @@ def test_svdquant_linear_sm120_fused(use_bias):
 
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
     assert _sqnr_db(ref, out.float()) > 35.0
+    if gemm_base.CUDNN_AVAILABLE:
+        assert mm_bf16_backends == ["cudnn"]
+    else:
+        assert mm_bf16_backends == []
 
 
 @pytest.mark.parametrize("rank", [32, 128])

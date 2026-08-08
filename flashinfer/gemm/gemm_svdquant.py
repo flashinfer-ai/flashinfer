@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+from dataclasses import replace
 from typing import List, Literal, Optional, Tuple
 
 import torch
@@ -79,6 +80,7 @@ def _compile_sm120_nvfp4_svdquant(
     with_bias: bool,
     mma_tiler_mn: Tuple[int, int],
     swap_ab: bool,
+    use_prefetch: bool,
     sf_m: int,
     sf_n: int,
     sf_k: int,
@@ -98,6 +100,7 @@ def _compile_sm120_nvfp4_svdquant(
         with_bias,
         mma_tiler_mn,
         swap_ab,
+        use_prefetch,
         max_active_clusters,
         enable_pdl,
     )
@@ -119,7 +122,7 @@ def _compile_sm120_nvfp4_svdquant(
         16,
         mma_tiler_mn,
         (1, 1),
-        use_prefetch=False,
+        use_prefetch=use_prefetch,
         enable_pdl=enable_pdl,
         swap_ab=swap_ab,
     )
@@ -194,7 +197,8 @@ def _compile_sm120_nvfp4_svdquant(
 
     kernel_name = (
         f"r{rank}_bias{int(with_bias)}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
-        f"_swap{int(swap_ab)}_mac{max_active_clusters}_pdl{int(enable_pdl)}"
+        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_mac{max_active_clusters}"
+        f"_pdl{int(enable_pdl)}"
     )
     compiled = build_and_load_cute_dsl_kernel(
         "mm_nvfp4_svdquant_sm120",
@@ -217,6 +221,7 @@ def _mm_nvfp4_svdquant_sm120_fused(
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
     enable_pdl: bool,
+    tactic=None,
 ) -> torch.Tensor:
     from .kernels.dense_blockscaled_gemm_sm120_b12x import (
         _select_default_dense_gemm_plan,
@@ -228,15 +233,19 @@ def _mm_nvfp4_svdquant_sm120_fused(
     sf_m = (m + 127) // 128
     sf_n = (n + 127) // 128
     sf_k = (real_k // 16 + 3) // 4
-    plan = _select_default_dense_gemm_plan(
-        m, n, real_k, get_device_sm_count(a.device), expected_m=m
-    )
+    if tactic is None or tactic == -1:
+        plan = _select_default_dense_gemm_plan(
+            m, n, real_k, get_device_sm_count(a.device), expected_m=m
+        )
+        tactic = (plan.mma_tiler_mn, plan.swap_ab, False)
+    mma_tiler_mn, swap_ab, use_prefetch = tactic
     compiled = _compile_sm120_nvfp4_svdquant(
         device=a.device,
         rank=d.shape[1],
         with_bias=bias is not None,
-        mma_tiler_mn=plan.mma_tiler_mn,
-        swap_ab=plan.swap_ab,
+        mma_tiler_mn=mma_tiler_mn,
+        swap_ab=swap_ab,
+        use_prefetch=use_prefetch,
         sf_m=sf_m,
         sf_n=sf_n,
         sf_k=sf_k,
@@ -258,6 +267,227 @@ def _mm_nvfp4_svdquant_sm120_fused(
     ]
     compiled(*args)
     return out
+
+
+def _mm_nvfp4_svdquant_sm120_unfused(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    d: torch.Tensor,
+    l1: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    from .gemm_base import mm_fp4
+
+    m, k_packed = a.shape
+    n = b.shape[0]
+    sf_cols = k_packed * 2 // 16
+    a_sf_2d = _view_128x4_sf(a_sf, m, sf_cols)
+    b_sf_2d = _view_128x4_sf(b_sf, n, sf_cols)
+    mm_fp4(
+        a,
+        b.T,
+        a_sf_2d,
+        b_sf_2d.T,
+        alpha,
+        torch.bfloat16,
+        out,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="b12x",
+        use_nvfp4=True,
+        enable_pdl=enable_pdl,
+    )
+    correction = torch.mm(d, l1.T)
+    correction.mul_(alpha)
+    out.add_(correction)
+    if bias is not None:
+        out.add_(bias)
+    return out
+
+
+def _sm120_nvfp4_svdquant_runner(enable_pdl: bool):
+    class Sm120Nvfp4SvdquantRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            import cutlass
+
+            from ..cute_dsl.utils import torch_to_cutlass_dtype
+            from .kernels.dense_blockscaled_gemm_sm120_b12x import (
+                Sm120B12xBlockScaledDenseGemmKernel,
+                _select_default_dense_gemm_plan,
+            )
+
+            a, b, _, _, _, d, _, _, out = inputs
+            m, k_packed = a.shape
+            n = b.shape[0]
+            real_k = k_packed * 2
+            c_dtype = torch_to_cutlass_dtype(out.dtype)
+            tactics = []
+
+            def _add(mma_tiler_mn, swap_ab):
+                if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+                    cutlass.Float4E2M1FN,
+                    cutlass.Float8E4M3FN,
+                    16,
+                    c_dtype,
+                    mma_tiler_mn,
+                    (1, 1),
+                    n,
+                    real_k,
+                    1,
+                    "k",
+                    "k",
+                    "n",
+                    swap_ab=swap_ab,
+                    svdquant_rank=d.shape[1],
+                ):
+                    return
+                for use_prefetch in (False, True):
+                    tactic = (mma_tiler_mn, swap_ab, use_prefetch)
+                    if tactic not in tactics:
+                        tactics.append(tactic)
+
+            for mma_tiler_mn in [(64, 64), (64, 128), (128, 64), (128, 128)]:
+                _add(mma_tiler_mn, swap_ab=False)
+
+            plan = _select_default_dense_gemm_plan(
+                m, n, real_k, get_device_sm_count(a.device), expected_m=m
+            )
+            _add(plan.mma_tiler_mn, plan.swap_ab)
+            return tactics
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            a, b, a_sf, b_sf, alpha, d, l1, bias, out = inputs
+            return _mm_nvfp4_svdquant_sm120_fused(
+                a,
+                b,
+                a_sf,
+                b_sf,
+                alpha,
+                d,
+                l1,
+                bias,
+                out,
+                enable_pdl,
+                tactic,
+            )
+
+    return Sm120Nvfp4SvdquantRunner()
+
+
+def _sm120_nvfp4_svdquant_unfused_runner(enable_pdl: bool):
+    # Flatten the b12x runner into the outer fused-vs-unfused tuner. Calling
+    # mm_fp4 here would start a nested AutoTuner while the outer runner is under
+    # CUDA Graph capture; on a cold cache that leaves tensor initialization in
+    # the capture and fails before the unfused candidate can be profiled.
+    from .gemm_base import _b12x_gemm_fp4_runner
+
+    fp4_runner = _b12x_gemm_fp4_runner(
+        12,
+        0,
+        enable_pdl,
+        torch.bfloat16,
+        True,
+    )
+    workspace_buffers: dict[torch.device, torch.Tensor] = {}
+
+    class Sm120Nvfp4SvdquantUnfusedRunner(TunableRunner):
+        def _fp4_inputs(self, inputs: List[torch.Tensor]) -> list:
+            a, b, a_sf, b_sf, alpha, _, _, _, out = inputs
+            m, k_packed = a.shape
+            n = b.shape[0]
+            sf_cols = k_packed * 2 // 16
+            workspace_buffer = workspace_buffers.get(a.device)
+            if workspace_buffer is None:
+                workspace_buffer = _get_cache_buf(
+                    "mm_fp4_workspace",
+                    DEFAULT_WORKSPACE_SIZE,
+                    a.device,
+                )
+                workspace_buffers[a.device] = workspace_buffer
+            return [
+                a,
+                b.T,
+                _view_128x4_sf(a_sf, m, sf_cols),
+                _view_128x4_sf(b_sf, n, sf_cols).T,
+                alpha,
+                torch.bfloat16,
+                out,
+                16,
+                True,
+                workspace_buffer,
+            ]
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> list:
+            return fp4_runner.get_valid_tactics(self._fp4_inputs(inputs), profile)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            _, _, _, _, alpha, d, l1, bias, out = inputs
+            fp4_runner(inputs=self._fp4_inputs(inputs), tactic=tactic)
+            correction = torch.mm(d, l1.T)
+            correction.mul_(alpha)
+            out.add_(correction)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
+    return Sm120Nvfp4SvdquantUnfusedRunner()
+
+
+_SM120_NVFP4_SVDQUANT_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (0,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,
+            0,
+            lambda shapes: _swizzled_sf_size(shapes[0][0], shapes[0][1] * 2 // 16),
+        ),
+        ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),
+        ConstraintSpec(8, 0, lambda shapes: shapes[0][0]),
+    ),
+)
+
+# The unfused candidate is a composition of FP4 GEMM, BF16 GEMM, and pointwise
+# kernels. Profiling it inside the same CUDA Graph tuner as the single fused
+# kernel can leave capture active after a failed tactic. Keep graph profiling
+# for fused tactic selection, but compare fused versus unfused in eager mode.
+_SM120_NVFP4_SVDQUANT_IMPLEMENTATION_TUNING_CONFIG = replace(
+    _SM120_NVFP4_SVDQUANT_TUNING_CONFIG,
+    use_cuda_graph=False,
+)
 
 
 @functools.cache
@@ -508,7 +738,8 @@ def mm_nvfp4_svdquant(
         ``"cutlass"`` selects the fused SM100/SM103 implementation;
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
-        ``"auto"`` (default) selects by compute capability.
+        ``"auto"`` (default) selects by compute capability and, on SM120/SM121,
+        autotunes across both the fused and unfused implementations.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
 
@@ -522,42 +753,45 @@ def mm_nvfp4_svdquant(
     if out is None:
         out = torch.empty(a.shape[0], b.shape[0], dtype=torch.bfloat16, device=a.device)
 
+    tune_sm120_implementations = False
     if backend == "auto":
         backend = mm_nvfp4_svdquant.suitable_auto_backends[0]
+        tune_sm120_implementations = backend == "cute-dsl"
 
     if backend == "cute-dsl":
-        return _mm_nvfp4_svdquant_sm120_fused(
-            a, b, a_sf, b_sf, alpha, d, l1, bias, out, enable_pdl
+        inputs = [a, b, a_sf, b_sf, alpha, d, l1, bias, out]
+        runners = [_sm120_nvfp4_svdquant_runner(enable_pdl)]
+        custom_op = "nvfp4_svdquant_gemm_sm120"
+        if tune_sm120_implementations:
+            runners.append(_sm120_nvfp4_svdquant_unfused_runner(enable_pdl))
+            custom_op = "nvfp4_svdquant_gemm_sm120_auto"
+        tuning_config = (
+            _SM120_NVFP4_SVDQUANT_IMPLEMENTATION_TUNING_CONFIG
+            if tune_sm120_implementations
+            else _SM120_NVFP4_SVDQUANT_TUNING_CONFIG
         )
+        runner, tactic = AutoTuner.get().choose_one(
+            custom_op,
+            runners,
+            tuning_config,
+            inputs,
+        )
+        runner(inputs=inputs, tactic=tactic)
+        return out
 
     if backend == "cute-dsl-unfused":
-        from .gemm_base import mm_fp4
-
-        m, k_packed = a.shape
-        n = b.shape[0]
-        sf_cols = k_packed * 2 // 16
-        a_sf_2d = _view_128x4_sf(a_sf, m, sf_cols)
-        b_sf_2d = _view_128x4_sf(b_sf, n, sf_cols)
-        mm_fp4(
+        return _mm_nvfp4_svdquant_sm120_unfused(
             a,
-            b.T,
-            a_sf_2d,
-            b_sf_2d.T,
+            b,
+            a_sf,
+            b_sf,
             alpha,
-            torch.bfloat16,
+            d,
+            l1,
+            bias,
             out,
-            block_size=16,
-            use_8x4_sf_layout=False,
-            backend="b12x",
-            use_nvfp4=True,
-            enable_pdl=enable_pdl,
+            enable_pdl,
         )
-        correction = torch.mm(d, l1.T)
-        correction.mul_(alpha)
-        out.add_(correction)
-        if bias is not None:
-            out.add_(bias)
-        return out
 
     workspace_buffer = _get_cache_buf(
         "nvfp4_svdquant_gemm_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -617,8 +851,8 @@ def nvfp4_quantize_smooth(
     r"""Smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
     The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
-    and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL compatibility backend first
-    materializes the BF16 smoothed input and then invokes the CuTe DSL NVFP4 quantizer.
+    and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL backend also
+    applies smoothing inside the NVFP4 quantizer, avoiding a BF16 intermediate.
     Both use ue4m3 block scales, the 128x4 swizzled layout, and SF vector size 16.
 
     Parameters
@@ -633,7 +867,7 @@ def nvfp4_quantize_smooth(
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
     backend: Literal["cutlass", "cute-dsl", "auto"]
         ``"cutlass"`` selects fused smoothing and quantization on SM100/SM103;
-        ``"cute-dsl"`` selects unfused smoothing plus CuTe DSL quantization on
+        ``"cute-dsl"`` selects fused smoothing plus CuTe DSL quantization on
         SM120/SM121; ``"auto"`` (default) selects by compute capability.
 
     Returns
@@ -649,17 +883,15 @@ def nvfp4_quantize_smooth(
     if backend == "auto":
         backend = nvfp4_quantize_smooth.suitable_auto_backends[0]
     if backend == "cute-dsl":
-        from ..quantization.fp4_quantization import nvfp4_quantize
-        from ..tllm_enums import SfLayout
+        from ..quantization.kernels.nvfp4_quantize import (
+            nvfp4_quantize_smooth_cute_dsl,
+        )
 
-        xq, sf = nvfp4_quantize(
-            (x * pre_quant_scale).to(torch.bfloat16),
+        xq, sf = nvfp4_quantize_smooth_cute_dsl(
+            x,
+            pre_quant_scale,
             global_scale,
-            sfLayout=SfLayout.layout_128x4,
-            do_shuffle=False,
-            sf_vec_size=16,
             enable_pdl=enable_pdl,
-            backend="cute-dsl",
         )
         return xq.view(torch.uint8), sf.view(torch.uint8).reshape(-1)
 
@@ -691,7 +923,8 @@ def svdquant_linear(
     Runs the three-step chain this library's kernels are designed for:
 
     1. ``xq, x_sf = nvfp4_quantize_smooth(x, pre_quant_scale, global_scale)``
-    2. ``down = x @ l2t_smoothed``  (plain BF16 GEMM; ``l2t_smoothed = pre_quant_scale[:, None] * L2ᵀ``)
+    2. ``down = x @ l2t_smoothed``  (BF16 tensor-core GEMM;
+       ``l2t_smoothed = pre_quant_scale[:, None] * L2ᵀ``)
     3. ``mm_nvfp4_svdquant(xq, weight_fp4, x_sf, weight_sf, alpha, down, l1_scaled, bias)``
 
     The invariant per-layer transforms must be prepared offline by the caller:
@@ -738,7 +971,25 @@ def svdquant_linear(
         enable_pdl=enable_pdl,
         backend=quantize_backend,
     )
-    down = torch.mm(x, l2t_smoothed)
+    use_sm120_cute_dsl = quantize_backend == "cute-dsl" or (
+        quantize_backend == "auto"
+        and nvfp4_quantize_smooth.suitable_auto_backends[0] == "cute-dsl"
+    )
+    if use_sm120_cute_dsl:
+        # The rank-r projection is small enough that PyTorch's generic BF16
+        # dispatch leaves substantial launch/selection overhead on SM120.
+        # FlashInfer's cuDNN runner selects and caches the BF16 tensor-core
+        # engine for this exact MxKxR problem.  Keep torch.mm as the optional-
+        # dependency fallback; it also preserves the existing SM100 path.
+        from .gemm_base import CUDNN_AVAILABLE, mm_bf16
+
+        down = (
+            mm_bf16(x, l2t_smoothed, backend="cudnn")
+            if CUDNN_AVAILABLE
+            else torch.mm(x, l2t_smoothed)
+        )
+    else:
+        down = torch.mm(x, l2t_smoothed)
     return mm_nvfp4_svdquant(
         xq,
         weight_fp4,
