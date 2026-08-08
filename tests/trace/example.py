@@ -23,11 +23,13 @@ gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
+gemm_bf16_N32_K3072.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 gemm_mxfp8_N4096_K4096.json
+gemm_nvfp4_svdquant_N3072_K_packed1536_SF_A24576_SF_B589824_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
@@ -38,6 +40,7 @@ gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
 layernorm_quant_h768.json
+linear_nvfp4_svdquant_N3072_K3072_K_packed1536_SF_B589824_rank32.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -65,6 +68,7 @@ msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -450,7 +454,7 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
-# ── SVDQuant fused NVFP4 GEMM (Blackwell SM100: M×3072@3072×3072, rank 32) ──
+# ── SVDQuant fused NVFP4 GEMM (Blackwell: M×3072@3072×3072, rank 32) ─────────
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
     a_svdq = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
@@ -466,9 +470,9 @@ try:
         a_svdq, b_svdq, a_sf_svdq, b_sf_svdq, alpha_svdq, d_svdq, l1_svdq
     )
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
-# ── SVDQuant smooth-quantize + composed linear (Blackwell SM100) ─────────────
+# ── SVDQuant smooth-quantize + composed linear (Blackwell) ──────────────────
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
     x_sq = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
@@ -476,7 +480,7 @@ try:
     gs_sq = torch.ones(1, dtype=torch.float32, device=device)
     flashinfer.gemm.nvfp4_quantize_smooth(x_sq, pqs_sq, gs_sq)
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
@@ -494,7 +498,7 @@ try:
         x_sl, w_sl, wsf_sl, alpha_sl, pqs_sl, l2t_sl, l1_sl, gs_sl
     )
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
 # ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
 # Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
