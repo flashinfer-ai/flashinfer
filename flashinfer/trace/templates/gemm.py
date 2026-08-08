@@ -1209,7 +1209,6 @@ def _fmha_v2_prefill_sm120_init(
     *,
     batch_size: int,
     seq_len: int = 128,
-    len_indptr: int = 0,
     scale_size: int = 1,
     num_heads: int = 32,
     head_dim: int = 128,
@@ -1217,8 +1216,6 @@ def _fmha_v2_prefill_sm120_init(
     seed: int = 0,
 ):
     """Build independently scaled E4M3 inputs for ``fmha_v2_prefill_sm120``."""
-    if len_indptr not in (0, batch_size + 1):
-        raise ValueError("len_indptr must equal batch_size + 1")
     torch.manual_seed(seed)
 
     def quantize(x):
@@ -1233,9 +1230,6 @@ def _fmha_v2_prefill_sm120_init(
     k, k_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
     v, v_scale = quantize(torch.randn(shape, dtype=torch.bfloat16, device=device))
     out = torch.empty(shape, dtype=torch.bfloat16, device=device)
-    cum_seq_lens = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len
-    )
     return {
         "query": q,
         "key": k,
@@ -1255,7 +1249,6 @@ def _fmha_v2_prefill_sm120_init(
         "scale_bmm2_d": torch.tensor(
             [v_scale] * scale_size, dtype=torch.float32, device=device
         ),
-        "cum_seq_lens": cum_seq_lens,
         "causal": True,
     }
 
@@ -1321,7 +1314,6 @@ fmha_v2_prefill_sm120_trace = TraceTemplate(
         "seq_len": Var(),
         "num_heads": Const(abbrev="h"),
         "head_dim": Const(abbrev="d"),
-        "len_indptr": Var(description="Length of cum_seq_lens (batch_size + 1)."),
         "scale_size": Var(),
     },
     inputs={
@@ -1351,12 +1343,6 @@ fmha_v2_prefill_sm120_trace = TraceTemplate(
             optional=True,
             description="Persistent FP32 CUDA V dequantization model weight.",
         ),
-        "cum_seq_lens": Tensor(
-            ["len_indptr"],
-            optional=True,
-            dtype="int32",
-            description="Uniform cumulative sequence lengths.",
-        ),
         "causal": Scalar("bool"),
     },
     outputs={
@@ -1365,7 +1351,6 @@ fmha_v2_prefill_sm120_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
-    constraints=["len_indptr == batch_size + 1"],
     reference=_fmha_v2_prefill_sm120_reference,
     init=_fmha_v2_prefill_sm120_init,
 )

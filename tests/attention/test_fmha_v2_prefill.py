@@ -5,7 +5,6 @@ import time
 from typing import Optional, Tuple, Union
 
 import flashinfer
-import flashinfer.prefill as flashinfer_prefill
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
 from tests.utils_fp8 import to_float8
@@ -725,32 +724,6 @@ def test_fmha_v2_prefill_sm120_validation():
         fmha_v2_prefill_sm120(q_noncontiguous, k, v, out, **kwargs)
     with pytest.raises(ValueError, match="lse must be provided"):
         fmha_v2_prefill_sm120(q, k, v, out, return_lse=True, **kwargs)
-    with pytest.raises(ValueError, match="cum_seq_lens must be"):
-        fmha_v2_prefill_sm120(
-            q,
-            k,
-            v,
-            out,
-            cum_seq_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
-            **kwargs,
-        )
-    with pytest.raises(ValueError, match="must contain uniform offsets"):
-        fmha_v2_prefill_sm120(
-            q,
-            k,
-            v,
-            out,
-            cum_seq_lens=torch.tensor([0, 7], dtype=torch.int32, device="cuda"),
-            **kwargs,
-        )
-    fmha_v2_prefill_sm120(
-        q,
-        k,
-        v,
-        out,
-        cum_seq_lens=torch.tensor([0, 8], dtype=torch.int32, device="cuda"),
-        **kwargs,
-    )
     fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
     for device_scale_name in ("scale_bmm1_d", "scale_bmm2_d"):
         with pytest.raises(ValueError, match=r"FP32 CUDA tensor with shape \[1\]"):
@@ -798,41 +771,9 @@ def test_fmha_v2_prefill_deepseek_validates_seq_len():
         )
 
 
-def test_fmha_v2_prefill_sm120_metadata_cache_is_persistent():
-    if not is_sm12x_supported(torch.device("cuda")):
-        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
-
-    initialized = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_initialized
-    initialized.clear()
-    device = torch.device("cuda", torch.cuda.current_device())
-    first = flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
-        device, batch_size=2, seq_len=17
-    )
-    first_ptr = first.data_ptr()
-    flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(device, batch_size=1, seq_len=31)
-    again = flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
-        device, batch_size=2, seq_len=17
-    )
-    assert again.data_ptr() == first_ptr
-    assert again.dtype == torch.int32
-    assert again.cpu().tolist() == [0, 17, 34]
-
-
-def test_fmha_v2_prefill_sm120_metadata_cache_capture_miss(monkeypatch):
-    initialized = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_initialized
-    initialized.clear()
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="must be initialized before CUDA Graph"):
-        flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
-            torch.device("cuda", 0), batch_size=1, seq_len=17
-        )
-    assert not initialized
-
-
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("explicit_metadata", [False, True])
-def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim, explicit_metadata):
+def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
 
@@ -868,11 +809,6 @@ def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim, explicit_metadata):
         "return_lse": True,
         "lse": lse,
     }
-    if explicit_metadata:
-        kwargs["cum_seq_lens"] = torch.tensor(
-            [0, seq_len], dtype=torch.int32, device="cuda"
-        )
-
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -906,7 +842,6 @@ def test_fmha_v2_prefill_sm120_async_enqueue():
     k = torch.zeros_like(q)
     v = torch.zeros_like(q)
     out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
-    cum_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
     kwargs = {
         "num_heads": num_heads,
         "head_dim": head_dim,
@@ -919,7 +854,6 @@ def test_fmha_v2_prefill_sm120_async_enqueue():
         ),
         "scale_bmm2_d": torch.tensor([1.0], dtype=torch.float32, device="cuda"),
         "causal": True,
-        "cum_seq_lens": cum_seq_lens,
     }
 
     fmha_v2_prefill_sm120(q, k, v, out, **kwargs)

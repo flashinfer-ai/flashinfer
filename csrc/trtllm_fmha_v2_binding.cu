@@ -301,12 +301,13 @@ static inline void determine_launch_params(
  * - Output type: BF16 for standard paths; BF16 or FP16 for the 192x128 path
  * - Target architecture: SM120/SM121 (Blackwell)
  *
+ * This entry point accepts fixed-shape BSHD tensors with a uniform sequence length.
+ *
  * @param q Query tensor [batch, q_seqlen, num_heads, head_dim]
  * @param k Key tensor [batch, kv_seqlen, num_kv_heads, head_dim]
  * @param v Value tensor [batch, kv_seqlen, num_kv_heads, head_dim_v]
  * @param o Output tensor [batch, q_seqlen, num_heads, head_dim_v]
  * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
- * @param cum_seq_lens Persistent device tensor [batch + 1] with uniform sequence offsets
  * @param scale_bmm1_d Optional persistent device tensor containing the FP8 QK scale
  * @param scale_bmm2_d Optional persistent device tensor containing the FP8 V scale
  * @param num_heads Number of query heads
@@ -320,11 +321,10 @@ static inline void determine_launch_params(
  * @param is_bf16_output Whether the output is BF16
  */
 void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
-                     Optional<TensorView> maybe_lse, TensorView cum_seq_lens,
-                     Optional<TensorView> scale_bmm1_d, Optional<TensorView> scale_bmm2_d,
-                     int64_t num_heads, int64_t head_dim, int64_t seq_len,
-                     const float scale_softmax, const float scale_bmm1, const float scale_bmm2,
-                     bool causal, bool is_e4m3, bool is_bf16_output) {
+                     Optional<TensorView> maybe_lse, Optional<TensorView> scale_bmm1_d,
+                     Optional<TensorView> scale_bmm2_d, int64_t num_heads, int64_t head_dim,
+                     int64_t seq_len, const float scale_softmax, const float scale_bmm1,
+                     const float scale_bmm2, bool causal, bool is_e4m3, bool is_bf16_output) {
   const int batch_size = q.shape()[0];
   // q,k,v seqlen all equal
   const int q_seqlen = q.shape()[1];
@@ -382,33 +382,33 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   // model weights. Passing them through avoids allocation or host-to-device
   // copies during CUDA Graph capture; null preserves each encoded fallback.
   set_params(params, launch_params, data_type, acc_type, output_dtype, input_layout,
-             batch_size,               // b
-             q_seqlen,                 // s_q
-             kv_seqlen,                // s_kv
-             num_heads,                // h
-             num_kv_heads,             // h_kv
-             head_dim,                 // d
-             head_dim_v,               // dv
-             total_seqlen,             // total tokens
-             1,                        // num_grouped_heads (not used for regular attention)
-             INT_MAX,                  // sliding_window_size (disabled)
-             0,                        // chunked_attention_size (disabled)
-             64,                       // tokens_per_block (not used with SEPARATE_Q_K_V)
-             nullptr,                  // qkv_packed_d (not used)
-             q.data_ptr(),             // q_d
-             k.data_ptr(),             // k_d
-             v.data_ptr(),             // v_d
-             nullptr,                  // kv_d (not used)
-             nullptr,                  // paged_kv_pool_ptr (not used)
-             nullptr,                  // paged_block_offsets (not used)
-             nullptr,                  // packed_mask_d (not used for causal)
-             nullptr,                  // cu_mask_rows_d (not used)
-             nullptr,                  // attention_sinks_d (not used)
-             cum_seq_lens.data_ptr(),  // cu_kv_seqlens_d
-             cum_seq_lens.data_ptr(),  // cu_q_seqlens_d (same as kv for equal lengths)
-             o.data_ptr(),             // o_packed_d
-             nullptr,                  // p_d (not storing)
-             nullptr,                  // s_d (not storing)
+             batch_size,    // b
+             q_seqlen,      // s_q
+             kv_seqlen,     // s_kv
+             num_heads,     // h
+             num_kv_heads,  // h_kv
+             head_dim,      // d
+             head_dim_v,    // dv
+             total_seqlen,  // total tokens
+             1,             // num_grouped_heads (not used for regular attention)
+             INT_MAX,       // sliding_window_size (disabled)
+             0,             // chunked_attention_size (disabled)
+             64,            // tokens_per_block (not used with SEPARATE_Q_K_V)
+             nullptr,       // qkv_packed_d (not used)
+             q.data_ptr(),  // q_d
+             k.data_ptr(),  // k_d
+             v.data_ptr(),  // v_d
+             nullptr,       // kv_d (not used)
+             nullptr,       // paged_kv_pool_ptr (not used)
+             nullptr,       // paged_block_offsets (not used)
+             nullptr,       // packed_mask_d (not used for causal)
+             nullptr,       // cu_mask_rows_d (not used)
+             nullptr,       // attention_sinks_d (not used)
+             nullptr,       // cu_kv_seqlens_d (uniform BSHD input)
+             nullptr,       // cu_q_seqlens_d (uniform BSHD input)
+             o.data_ptr(),  // o_packed_d
+             nullptr,       // p_d (not storing)
+             nullptr,       // s_d (not storing)
              maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr,
              scale_bmm1_d.has_value() ? scale_bmm1_d.value().data_ptr() : nullptr,
              scale_bmm2_d.has_value() ? scale_bmm2_d.value().data_ptr() : nullptr,
@@ -418,10 +418,10 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
              0.0f,           // softcapping_scale_bmm1 (disabled)
              false,          // use_int8_scale_max
              false,          // interleaved
-             false,          // is_s_padded
+             true,           // is_s_padded: Q/K/V use fixed-stride BSHD storage
              false);         // has_alibi
 
-  // Python validates cum_seq_lens as [0, q_seqlen, ..., batch_size * q_seqlen].
+  // The fixed-shape BSHD API represents a uniform batch by construction.
   params.is_uniform_q = batch_size > 0;
 
   if (head_dim == 64 && head_dim_v == 64 && data_type == DATA_TYPE_E4M3 &&

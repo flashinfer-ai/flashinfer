@@ -1885,9 +1885,6 @@ if torch.cuda.get_device_capability() == (12, 0):
         dtype=torch.float32,
         device=device,
     )
-    _fmha_cum_seq_lens = (
-        torch.arange(_fmha_B + 1, dtype=torch.int32, device=device) * _fmha_S
-    )
     fmha_v2_prefill_sm120(
         _fmha_q,
         _fmha_k,
@@ -1901,7 +1898,6 @@ if torch.cuda.get_device_capability() == (12, 0):
         scale_bmm2=_fmha_v_scale,
         scale_bmm1_d=_fmha_scale_bmm1_d,
         scale_bmm2_d=_fmha_scale_bmm2_d,
-        cum_seq_lens=_fmha_cum_seq_lens,
         causal=True,
     )
 
