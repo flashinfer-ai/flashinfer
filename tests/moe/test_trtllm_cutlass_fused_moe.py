@@ -3815,5 +3815,40 @@ def test_workspace_cuda_graph_capture_replay():
     torch.testing.assert_close(out_t, out_e, rtol=0, atol=0)
 
 
+def _small_moe_inputs(m, hidden, inter, e, top_k, dtype=torch.bfloat16):
+    w31 = torch.randn(e, 2 * inter, hidden, dtype=dtype, device="cuda") / 10
+    w2 = torch.randn(e, hidden, inter, dtype=dtype, device="cuda") / 10
+    logits = torch.randn(m, e, dtype=torch.float32, device="cuda")
+    weights, ids = torch.topk(torch.softmax(logits, -1), top_k)
+    return w31, w2, weights.float().contiguous(), ids.to(torch.int)
+
+
+@_WS_CUTLASS_MOE_SKIP
+def test_vectorized_kernel_rejects_misaligned_input():
+    """The vectorized expand/activation kernels need 16B-aligned rows; a
+    misaligned input base must fail fast on the host with a clear diagnostic
+    instead of an IMA (device asserts are compiled out in release builds)."""
+    torch.manual_seed(42)
+    m, hidden, inter, e, top_k = 4, 128, 128, 8, 2
+    w31, w2, weights, ids = _small_moe_inputs(m, hidden, inter, e, top_k)
+
+    # Contiguous view whose base is 2B- but not 16B-aligned.
+    buf = torch.randn(m * hidden + 8, dtype=torch.bfloat16, device="cuda")
+    x = buf[1 : 1 + m * hidden].view(m, hidden)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+
+    with pytest.raises(Exception, match="16B-aligned"):
+        fused_moe.cutlass_fused_moe(
+            x,
+            ids,
+            weights,
+            w31,
+            w2,
+            torch.bfloat16,
+            quant_scales=None,
+            output=torch.empty_like(x),
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
