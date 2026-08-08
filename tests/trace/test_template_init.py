@@ -62,6 +62,7 @@ def _collect_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
         "flashinfer.cascade",
         "flashinfer.comm.allreduce",
         "flashinfer.comm.dcp_alltoall",
+        "flashinfer.concat_ops",
         "flashinfer.decode",
         "flashinfer.fused_moe",
         "flashinfer.gdn_decode",

@@ -37,7 +37,10 @@ See the docstring in ``flashinfer/trace/templates/__init__.py`` for the full
 how-to guide.
 """
 
+import contextlib
+import importlib
 import inspect
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
@@ -336,6 +339,20 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
     import flashinfer.sampling  # noqa: F401  # top_k_sampling_from_probs, etc.
 
+    # The modules below decorate trace templates but require optional
+    # dependencies (cuda-python, cutlass, ...) that may be missing in minimal
+    # environments; skip the ones that cannot import so the structural tests
+    # still run for whatever is available.
+    for mod in (
+        "flashinfer.comm.allreduce",  # allreduce_fusion
+        "flashinfer.comm.dcp_alltoall",  # decode_cp_a2a_alltoall
+        "flashinfer.concat_ops",  # concat_mla_k
+        "flashinfer.cute_dsl.attention.wrappers.batch_mla",  # cute_dsl_batch_mla_run
+        "flashinfer.cute_dsl.attention.wrappers.batch_prefill",  # cute_dsl_batch_prefill_run
+    ):
+        with contextlib.suppress(ImportError):
+            importlib.import_module(mod)
+
     from flashinfer.api_logging import _TRACE_REGISTRY
 
     return list(_TRACE_REGISTRY)
@@ -343,6 +360,38 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
 
 _ALL_PAIRS = _collect_template_func_pairs()
 _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
+
+
+def test_formerly_gap_templates_are_discovered():
+    """Regression: every importable trace-decorated module's templates must be
+    discovered by the consistency test (see issue #4367).
+
+    The templates of ``flashinfer.concat_ops`` (``concat_mla_k``),
+    ``flashinfer.comm.allreduce`` (``allreduce_fusion``),
+    ``flashinfer.comm.dcp_alltoall`` (``decode_cp_a2a_alltoall``) and the two
+    ``flashinfer.cute_dsl.attention.wrappers.*`` modules were silently absent
+    from ``_collect_template_func_pairs``. ``concat_mla_k`` is always required
+    in practice because ``flashinfer.concat_ops`` imports only torch; the
+    other labels are required only when their defining module imports
+    (optional deps such as cuda-python/cutlass may be missing in minimal
+    environments).
+    """
+    labels = {label for _, _, label in _ALL_PAIRS}
+    expected: Dict[str, str] = {
+        "flashinfer.concat_ops": "concat_mla_k",
+        "flashinfer.comm.allreduce": "allreduce_fusion",
+        "flashinfer.comm.dcp_alltoall": "decode_cp_a2a_alltoall",
+        "flashinfer.cute_dsl.attention.wrappers.batch_mla": "cute_dsl_batch_mla_run",
+        "flashinfer.cute_dsl.attention.wrappers.batch_prefill": "cute_dsl_batch_prefill_run",
+    }
+    required = set()
+    for module_name, label in expected.items():
+        with contextlib.suppress(ImportError):
+            importlib.import_module(module_name)
+        if module_name in sys.modules:
+            required.add(label)
+    missing = sorted(required - labels)
+    assert not missing, f"missing labels: {missing}"
 
 
 # ---------------------------------------------------------------------------
