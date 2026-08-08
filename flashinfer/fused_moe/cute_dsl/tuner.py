@@ -757,8 +757,11 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         if output_dtype != torch.bfloat16:
             raise ValueError("W4A16 only supports BF16 output")
         self.num_experts = num_experts
@@ -772,6 +775,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self._workspace_cache: Dict[Tuple, Any] = {}
 
         # Match production EP routing density while retaining seeded load
@@ -841,6 +846,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.situ_beta,
+                self.situ_linear_beta,
             )
         )
 
@@ -857,6 +864,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.swiglu_alpha,
             self.swiglu_beta,
             self.swiglu_limit,
+            self.situ_beta,
+            self.situ_linear_beta,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -968,6 +977,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             tactic=None if tactic is None or tactic == -1 else tactic,
             workspace_cache=self._workspace_cache,
         )
