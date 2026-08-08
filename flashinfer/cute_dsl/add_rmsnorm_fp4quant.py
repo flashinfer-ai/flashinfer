@@ -194,6 +194,14 @@ class AddRMSNormFP4QuantKernel:
     Supports both NVFP4 (block_size=16) and MXFP4 (block_size=32) formats.
     """
 
+    # Offline sweep-tuned launch overrides.  Unlisted configurations use the
+    # general scale-block heuristic below.
+    # (sm_version, H, block_size, is_fp16):
+    #     (cluster_n, threads_per_row, num_threads)
+    _KNOB_LUT = {
+        (103, 1024, 16, False): (1, 64, 256),
+    }
+
     def __init__(
         self,
         dtype: cutlass.Numeric,
@@ -225,11 +233,19 @@ class AddRMSNormFP4QuantKernel:
             "scale_format must be 'e4m3' or 'ue8m0'"
         )
 
-        self.cluster_n = self._compute_cluster_n(H, dtype, self.sm_version, block_size)
-        self.H_per_cta = H // self.cluster_n
-
-        self.threads_per_row = self._compute_threads_per_row(self.H_per_cta, block_size)
-        self.num_threads = self._compute_num_threads(self.threads_per_row)
+        knobs = self._select_knobs(H, block_size, is_fp16, self.sm_version)
+        if knobs is None:
+            self.cluster_n = self._compute_cluster_n(
+                H, dtype, self.sm_version, block_size
+            )
+            self.H_per_cta = H // self.cluster_n
+            self.threads_per_row = self._compute_threads_per_row(
+                self.H_per_cta, block_size
+            )
+            self.num_threads = self._compute_num_threads(self.threads_per_row)
+        else:
+            self.cluster_n, self.threads_per_row, self.num_threads = knobs
+            self.H_per_cta = H // self.cluster_n
 
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
@@ -290,6 +306,18 @@ class AddRMSNormFP4QuantKernel:
         """Use multiple rows per block while keeping a 128-thread target."""
         rows_per_block = max(1, 128 // threads_per_row)
         return rows_per_block * threads_per_row
+
+    @staticmethod
+    def _select_knobs(
+        H: int,
+        block_size: int,
+        is_fp16: bool,
+        sm_version: int,
+    ) -> tuple[int, int, int] | None:
+        """Return an offline-tuned launch, if one is available."""
+        return AddRMSNormFP4QuantKernel._KNOB_LUT.get(
+            (sm_version, H, block_size, is_fp16)
+        )
 
     @staticmethod
     def _estimate_smem_bytes(
