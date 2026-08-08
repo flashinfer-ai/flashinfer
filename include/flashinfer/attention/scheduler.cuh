@@ -772,7 +772,6 @@ inline cudaError_t PrefillPlanImpl(
                                  // splits by #colocated decode CTAs
     int64_t uniform_q_len, cudaStream_t stream) {
   (void)head_dim_qk;
-  (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -858,7 +857,7 @@ inline cudaError_t PrefillPlanImpl(
       float_allocator = AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
     }
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
+        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof_dtype_o, 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");

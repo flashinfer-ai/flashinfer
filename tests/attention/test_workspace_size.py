@@ -189,6 +189,12 @@ def _run_batch_prefill_workspace_size_plan(
         **plan_kwargs,
     )
     assert wrapper._plan_info is not None
+    if fixed_split_size is not None:
+        plan_info = wrapper._plan_info
+        assert plan_info[14]
+        assert plan_info[11] - plan_info[10] == (
+            num_qo_heads * plan_info[0] * plan_info[3] * head_dim * 2
+        )
 
 
 def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
