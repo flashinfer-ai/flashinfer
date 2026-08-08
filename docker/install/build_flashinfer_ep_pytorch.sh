@@ -27,6 +27,10 @@ set -euo pipefail
 CUDA_MAJOR="${CUDA_MAJOR:-$(python -c 'import torch; v = torch.version.cuda or ""; print(v.split(".")[0])' 2>/dev/null || true)}"
 : "${CUDA_MAJOR:?could not detect CUDA major from torch.version.cuda; set CUDA_MAJOR explicitly}"
 CU="cu${CUDA_MAJOR}"
+CUTLASS_DSL_SPEC="nvidia-cutlass-dsl>=4.6.0"
+if [[ "${CUDA_MAJOR}" == "13" ]]; then
+    CUTLASS_DSL_SPEC="nvidia-cutlass-dsl[cu13]>=4.6.0"
+fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
@@ -61,7 +65,7 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
     pytest \
     "nvidia-nvshmem-${CU}" \
     filelock \
-    "nvidia-cutlass-dsl[${CU}]>=4.5.2"
+    "${CUTLASS_DSL_SPEC}"
 (
     if [ ! -d "${DEEPGEMM_SRC}/.git" ]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "${DEEPGEMM_SRC}"
