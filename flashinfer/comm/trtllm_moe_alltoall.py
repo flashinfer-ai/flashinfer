@@ -105,6 +105,7 @@ def get_moe_alltoall_module():
         eplb_local_stats: Optional[torch.Tensor] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        invalid_expert_id: Optional[int] = None,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -130,6 +131,8 @@ def get_moe_alltoall_module():
                 (see :func:`moe_a2a_active_rank_mask`). Bit i set means rank i is alive and
                 participates in this collective; tokens routed to a masked-off rank are
                 dropped. Requires enable_rank_mask=True.
+            invalid_expert_id: If set, entries whose expert id equals
+                this value are treated as padding and skipped during dispatched.
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -154,6 +157,7 @@ def get_moe_alltoall_module():
             eplb_local_stats,
             enable_rank_mask,
             active_rank_mask,
+            invalid_expert_id,
         )
 
     @register_custom_op(
@@ -463,6 +467,7 @@ def moe_a2a_dispatch(
     eplb_local_stats: Optional[torch.Tensor] = None,
     enable_rank_mask: bool = False,
     active_rank_mask: Optional[torch.Tensor] = None,
+    invalid_expert_id: Optional[int] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -506,6 +511,9 @@ def moe_a2a_dispatch(
         participates in this collective; tokens routed to a masked-off rank are dropped
         instead of hanging the collective.  Requires ``enable_rank_mask=True``; the local
         ``ep_rank``'s own bit must always be set.
+    invalid_expert_id : int, optional
+        If set, entries whose expert id equals
+        this value are treated as padding and skipped during dispatched.
 
     Returns
     -------
@@ -541,6 +549,7 @@ def moe_a2a_dispatch(
         eplb_local_stats,
         enable_rank_mask,
         active_rank_mask,
+        invalid_expert_id,
     )
 
     output_payloads = []
@@ -1207,6 +1216,11 @@ class MoeAlltoAll:
                 "with enable_rank_mask=True"
             )
 
+        if invalid_token_expert_id is not None:
+            assert expert_id_payload_index is not None, (
+                "expert_id_payload_index required when invalid_token_expert_id is set"
+            )
+
         recv_tensors, combine_payload_offset, eplb_gathered_stats = moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -1220,6 +1234,7 @@ class MoeAlltoAll:
             eplb_local_stats=eplb_local_stats,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
+            invalid_expert_id=invalid_token_expert_id,
         )
 
         # Update state
@@ -1230,9 +1245,6 @@ class MoeAlltoAll:
 
         # Sanitize invalid tokens if requested
         if invalid_token_expert_id is not None:
-            assert expert_id_payload_index is not None, (
-                "expert_id_payload_index required when invalid_token_expert_id is set"
-            )
             recv_expert_ids = recv_tensors[expert_id_payload_index]
             moe_a2a_sanitize_expert_ids(
                 recv_expert_ids,

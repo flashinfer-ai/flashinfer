@@ -230,7 +230,14 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 //
 // base and remainder are precomputed by the caller once outside the per-token TOP_K loop
 // so the hot path performs at most one integer divide.
-__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder) {
+__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder, int invalid_expert_id) {
+
+  // Padding slots: a token whose expert id matches the invalid sentinel
+  // (default -1) has no owning rank; return -1 so the caller skips it.
+  if (expert_id == invalid_expert_id) {
+    return -1;
+  }
+
   // Fast path for the uniform (num_experts % ep_size == 0) case: identical to the
   // pre-ceil/floor implementation, so existing divisible deployments incur no overhead.
   if (remainder == 0) {
@@ -384,7 +391,7 @@ __global__ void moeA2ADispatchKernel(
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts,
-    bool enable_pdl) {
+    bool enable_pdl, int32_t invalid_expert_id) {
   static_assert(!COMPACT_EP4 || TOP_K > kEp4Size);
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
@@ -434,7 +441,7 @@ __global__ void moeA2ADispatchKernel(
         int k = lane_id;
         int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
         // Use contiguous ceil/floor partitioning (supports non-divisible num_experts % ep_size).
-        int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
+        int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder, invalid_expert_id);
 
         // Elect the first top-k lane for each destination rank; duplicate targets within a
         // token collapse to a single send (replaces the old serial already_copied bitmask).
@@ -451,7 +458,7 @@ __global__ void moeA2ADispatchKernel(
         }
 
         int dst_token_idx = -1;
-        if (is_valid) {
+        if (is_valid && target_rank >= 0) {
           dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
           if constexpr (COMPACT_EP4) {
             smem_compact_send_indices[target_rank] = dst_token_idx;
@@ -710,7 +717,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                   shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
                   params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
                   params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
-                  params.enable_pdl);
+                  params.enable_pdl, params.invalid_expert_id);
             })
       } else {
         int shared_bytes = 2 * params.top_k * (int)sizeof(int);
@@ -721,7 +728,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                                    params.token_selected_experts, kernel_ptrs, params.num_payloads,
                                    params.max_tokens_per_rank, params.local_num_tokens,
                                    params.ep_rank, params.ep_size, params.num_experts,
-                                   params.eplb_stats_num_experts, params.enable_pdl);
+                                   params.eplb_stats_num_experts, params.enable_pdl, params.invalid_expert_id);
         });
       }
     });
