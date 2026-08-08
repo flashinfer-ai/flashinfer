@@ -23,8 +23,23 @@ from typing import Literal, Optional, Tuple
 import torch
 
 from ...api_logging import flashinfer_api
+from ...autotuner import AutoTuner
 from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from ...utils import supported_compute_capability
+from .._sm120_moe_autotune import SM120_MOE_TUNING_CONFIG, Sm120MoeTunableRunner
+
+
+_MXFP8_MOE_TACTIC_SCHEMA_VERSION = 2
+_MXFP8_MOE_TACTICS = (
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128),
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 64, 64),
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 64),
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 8),
+)
+_MXFP8_MOE_TACTICS_GRANK128 = _MXFP8_MOE_TACTICS + (
+    (_MXFP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128),
+)
 
 
 @functools.cache
@@ -89,6 +104,99 @@ def _check_scale_major_mode_mxfp8(scale_major_mode: str) -> None:
             f'scale_major_mode must be "MN" (kernel currently only supports the '
             f'per-token MN-major TMA-aligned UE8M0 scale layout); got "{scale_major_mode}"'
         )
+
+
+class _CuteSm120Mxfp8MoeRunner(Sm120MoeTunableRunner):
+    def __init__(
+        self,
+        out: torch.Tensor,
+        is_gated: bool,
+        scale_granularity_mnk: Tuple[int, int, int],
+        scale_major_mode: str,
+    ) -> None:
+        tactics = (
+            _MXFP8_MOE_TACTICS_GRANK128
+            if scale_granularity_mnk[2] == 128
+            else _MXFP8_MOE_TACTICS
+        )
+        super().__init__(
+            out,
+            is_gated,
+            scale_granularity_mnk,
+            scale_major_mode,
+            tactics,
+            _MXFP8_MOE_TACTIC_SCHEMA_VERSION,
+            "mxfp8_per_token_grank",
+        )
+
+    def _launch(
+        self,
+        inputs: list[torch.Tensor],
+        out: torch.Tensor,
+        is_gated: bool,
+        tactic,
+    ) -> None:
+        a, b, a_scale, b_scale, m_indptr = inputs
+        module = get_gemm_sm120_module_cute_mxfp8()
+        if tactic in self._tactics:
+            _, tile_m, tile_n = tactic
+            module.moe_gemm_mxfp8_nt_groupwise_tuned(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                m_indptr,
+                out,
+                self._scale_major_mode,
+                self._scale_granularity_mnk[0],
+                self._scale_granularity_mnk[1],
+                self._scale_granularity_mnk[2],
+                is_gated,
+                tile_m,
+                tile_n,
+            )
+        else:
+            _launch_mxfp8_moe_fallback(
+                inputs,
+                out,
+                self._scale_granularity_mnk,
+                self._scale_major_mode,
+                is_gated,
+            )
+
+
+def _should_autotune_mxfp8_moe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    num_experts, physical_n, k = b.shape
+    m_per_expert = a.shape[0] // num_experts if num_experts > 0 else 0
+    return (
+        num_experts > 0
+        and m_per_expert > 0
+        and k > 2048
+        and physical_n % 32 == 0
+    )
+
+
+def _launch_mxfp8_moe_fallback(
+    inputs: list[torch.Tensor],
+    out: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int],
+    scale_major_mode: str,
+    is_gated: bool,
+) -> None:
+    a, b, a_scale, b_scale, m_indptr = inputs
+    get_gemm_sm120_module_cute_mxfp8().moe_gemm_mxfp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indptr,
+        out,
+        scale_major_mode,
+        scale_granularity_mnk[0],
+        scale_granularity_mnk[1],
+        scale_granularity_mnk[2],
+        is_gated,
+    )
 
 
 @supported_compute_capability([120, 121])
@@ -205,17 +313,21 @@ def moe_gemm_mxfp8_nt_groupwise(
     if out is None:
         out = torch.empty((a.shape[0], out_n), dtype=out_dtype, device=a.device)
 
-    get_gemm_sm120_module_cute_mxfp8().moe_gemm_mxfp8_nt_groupwise(
-        a,
-        b,
-        a_scale,
-        b_scale,
-        m_indptr,
-        out,
-        scale_major_mode,
-        scale_granularity_mnk[0],
-        scale_granularity_mnk[1],
-        scale_granularity_mnk[2],
-        is_gated,
+    inputs = [a, b, a_scale, b_scale, m_indptr]
+    if not _should_autotune_mxfp8_moe(a, b):
+        _launch_mxfp8_moe_fallback(
+            inputs, out, scale_granularity_mnk, scale_major_mode, is_gated
+        )
+        return out
+
+    runner = _CuteSm120Mxfp8MoeRunner(
+        out, is_gated, scale_granularity_mnk, scale_major_mode
     )
+    runner, tactic = AutoTuner.get().choose_one(
+        "cute_sm120_mxfp8_groupwise_moe",
+        [runner],
+        SM120_MOE_TUNING_CONFIG,
+        inputs,
+    )
+    runner(inputs, tactic=tactic)
     return out

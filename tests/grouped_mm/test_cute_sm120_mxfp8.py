@@ -23,6 +23,11 @@ import torch.nn.functional as F
 
 from flashinfer.deep_gemm import get_col_major_tma_aligned_packed_tensor
 from flashinfer.grouped_mm import moe_gemm_mxfp8_nt_groupwise
+from flashinfer.grouped_mm.cute_sm120_mxfp8_groupwise.core import (
+    _CuteSm120Mxfp8MoeRunner,
+    _MXFP8_MOE_TACTICS,
+    _MXFP8_MOE_TACTICS_GRANK128,
+)
 from flashinfer.utils import is_sm120a_supported
 
 COS_SIM_THRESHOLD = 0.99
@@ -202,9 +207,12 @@ def per_token_dequant_from_fp8(
     """Dequant per-token MXFP8: fp8 (m, k) + sf_ue8m0 (m, k_blocks) → bf16 (m, k)."""
     assert fp8.dim() == 2
     m, k = fp8.shape
+    padded_k = align(k, gran_k)
+    fp8_padded = torch.zeros((m, padded_k), dtype=torch.float32, device=fp8.device)
+    fp8_padded[:, :k] = fp8.to(torch.float32)
     return (
-        (fp8.view(m, -1, gran_k).to(torch.float32) * sf_ue8m0.unsqueeze(-1))
-        .view(m, k)
+        (fp8_padded.view(m, -1, gran_k) * sf_ue8m0.unsqueeze(-1))
+        .view(m, padded_k)[:, :k]
         .to(dtype)
     )
 
@@ -218,12 +226,21 @@ def per_block_dequant_from_fp8(
     """Dequant per-block MXFP8: fp8 (g, n, k) + sf_ue8m0 (g, n_blocks, k_blocks) → bf16 (g, n, k)."""
     assert fp8.dim() == 3
     g, n, k = fp8.shape
+    padded_n, padded_k = align(n, gran_k), align(k, gran_k)
+    fp8_padded = torch.zeros(
+        (g, padded_n, padded_k), dtype=torch.float32, device=fp8.device
+    )
+    fp8_padded[:, :n, :k] = fp8.to(torch.float32)
     return (
         (
-            fp8.view(g, n // gran_k, gran_k, k // gran_k, gran_k).to(torch.float32)
-            * sf_ue8m0.view(g, n // gran_k, 1, k // gran_k, 1)
+            fp8_padded.view(
+                g, padded_n // gran_k, gran_k, padded_k // gran_k, gran_k
+            )
+            * sf_ue8m0.view(
+                g, padded_n // gran_k, 1, padded_k // gran_k, 1
+            )
         )
-        .view(g, n, k)
+        .view(g, padded_n, padded_k)[:, :n, :k]
         .to(dtype)
     )
 
@@ -417,6 +434,87 @@ def test_moe_gemm_mxfp8_nt_groupwise_gated(
     ).item()
     assert cos_sim > COS_SIM_THRESHOLD, (
         f"gated cos_sim={cos_sim:.4f} < {COS_SIM_THRESHOLD}"
+    )
+
+
+@pytest.mark.parametrize("is_gated", [False, True])
+@pytest.mark.parametrize(
+    "k_gran,tactic",
+    [(32, tactic) for tactic in _MXFP8_MOE_TACTICS]
+    + [(128, tactic) for tactic in _MXFP8_MOE_TACTICS_GRANK128],
+)
+@pytest.mark.parametrize(
+    "expert_rows,physical_n,k",
+    [((mpe,) * 4, 256, 2176) for mpe in [1, 8, 12, 15, 16, 32, 64, 376]]
+    + [((16,) * 4, 3008, 2960), ((0, 16, 0, 32), 256, 2176)],
+)
+def test_moe_gemm_mxfp8_nt_groupwise_forced_tactic(
+    tactic, is_gated, k_gran, expert_rows, physical_n, k
+):
+    skip_if_not_sm120()
+    torch.random.manual_seed(0)
+    num_groups = 4
+    token_num = sum(expert_rows)
+    out_n = physical_n // 2 if is_gated else physical_n
+    offsets = [0]
+    for rows in expert_rows:
+        offsets.append(offsets[-1] + rows)
+    m_indptr = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    a = torch.randn((token_num, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(
+        (num_groups, physical_n, k), dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(k)
+
+    a_fp8, a_sf = per_token_cast_to_mxfp8_for_moe_gemm(a, m_indptr, gran_k=k_gran)
+    a_deq = torch.empty_like(a)
+    for group_idx in range(num_groups):
+        start, end = offsets[group_idx], offsets[group_idx + 1]
+        if start == end:
+            continue
+        a_group_fp8, a_group_sf = per_token_cast_to_fp8(
+            a[start:end], use_ue8m0=True, gran_k=k_gran
+        )
+        a_deq[start:end] = per_token_dequant_from_fp8(
+            a_group_fp8, a_group_sf, gran_k=k_gran, dtype=a.dtype
+        )
+
+    b_fp8_and_sf = [
+        per_block_cast_to_fp8(b[group_idx], use_ue8m0=True, gran_k=k_gran)
+        for group_idx in range(num_groups)
+    ]
+    b_fp8 = torch.stack([item[0] for item in b_fp8_and_sf], dim=0)
+    b_sf_ue8m0 = torch.stack([item[1] for item in b_fp8_and_sf], dim=0)
+    b_sf = transform_sf_into_required_layout(
+        b_sf_ue8m0,
+        mn=physical_n,
+        k=k,
+        recipe=(k_gran, k_gran),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+    b_deq = per_block_dequant_from_fp8(
+        b_fp8, b_sf_ue8m0, gran_k=k_gran, dtype=b.dtype
+    )
+
+    ref = torch.empty((token_num, out_n), dtype=torch.bfloat16, device="cuda")
+    for group_idx in range(num_groups):
+        start, end = offsets[group_idx], offsets[group_idx + 1]
+        if start == end:
+            continue
+        group_out = a_deq[start:end] @ b_deq[group_idx].t()
+        if is_gated:
+            up, gate = group_out.chunk(2, dim=1)
+            group_out = up * F.silu(gate)
+        ref[start:end] = group_out.to(ref.dtype)
+
+    out = torch.empty_like(ref)
+    runner = _CuteSm120Mxfp8MoeRunner(out, is_gated, (1, 1, k_gran), "MN")
+    runner([a_fp8, b_fp8, a_sf, b_sf, m_indptr], tactic=tactic)
+    cos_sim = F.cosine_similarity(
+        out.reshape(-1).float(), ref.reshape(-1).float(), dim=0
+    ).item()
+    assert cos_sim > COS_SIM_THRESHOLD, (
+        f"forced tactic cos_sim={cos_sim:.4f} < {COS_SIM_THRESHOLD}"
     )
 
 
