@@ -75,7 +75,7 @@ def get_topk_module():
         deterministic: bool,
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
+        output_values: Optional[torch.Tensor],
         dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         device = input.device
@@ -108,7 +108,7 @@ def get_topk_module():
         deterministic: bool,
         tie_break: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: torch.Tensor,
+        output_values: Optional[torch.Tensor],
         dsa_graph_safe: bool = False,
     ) -> torch.Tensor:
         batch_size = input.size(0)
