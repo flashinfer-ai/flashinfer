@@ -1285,11 +1285,13 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        apply_router_weight_on_input: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
@@ -1333,6 +1335,7 @@ class TestCuteDslMoeW4A16:
             use_fused_finalize=False,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             tactic=tactic,
         )
         ref_output = compute_reference_moe_fp4(
@@ -1344,6 +1347,7 @@ class TestCuteDslMoeW4A16:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=ActivationType.Swiglu,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             **reference_inputs,
         )
 
