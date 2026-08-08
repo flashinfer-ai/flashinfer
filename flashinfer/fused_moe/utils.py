@@ -6,11 +6,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Tuple
 
+import numpy as np
 import torch
 
 from flashinfer.utils import ceil_div, next_positive_power_of_2, round_up
 
 from ..tllm_enums import ActivationType
+from .dist_aware.da_utils import (
+    DADistributionSpec,
+    da_distribution_target_effective_experts,
+    exp_floor_probs_for_target_eff,
+    sparse_probs,
+    symmetric_dirichlet_probs_for_target_eff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +297,228 @@ def map_to_hybrid_bucket_uncapped(x: int) -> int:
     if x <= _PHASE3_END:
         return _ceil_to_step(x, _PHASE3_STEP)
     return next_positive_power_of_2(x)
+
+
+_EFF_EXPERTS_STREAMS: Dict[int, "torch.cuda.Stream"] = {}
+
+
+def _get_eff_experts_stream(device: "torch.device") -> "torch.cuda.Stream":
+    """Return the dedicated effective-experts stream for one CUDA device.
+
+    Using a separate stream avoids blocking the main stream's pending work
+    (routing kernels, previous MoE iteration) when we need to copy data
+    from GPU to CPU.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"effective-experts stream requires CUDA, got {device}")
+    device_idx = (
+        torch.cuda.current_device() if device.index is None else int(device.index)
+    )
+    stream = _EFF_EXPERTS_STREAMS.get(device_idx)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device_idx)
+        _EFF_EXPERTS_STREAMS[device_idx] = stream
+    return stream
+
+
+def _copy_flat_tensor_to_cpu_numpy(flat: "torch.Tensor") -> np.ndarray:
+    """Copy a 1D tensor to CPU with minimal default-stream blocking."""
+    if flat.is_cuda:
+        with torch.cuda.device(flat.device):
+            stream = _get_eff_experts_stream(flat.device)
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(flat.device))
+            stream.wait_event(event)
+            with torch.cuda.stream(stream):
+                flat_cpu = flat.to("cpu")
+            stream.synchronize()
+    else:
+        flat_cpu = flat
+    return flat_cpu.numpy().astype(np.int64, copy=False)
+
+
+def _local_expert_counts_from_ids(
+    expert_ids: np.ndarray,
+    num_local_experts: int,
+    local_expert_offset: int,
+) -> np.ndarray:
+    if expert_ids.size == 0:
+        return np.zeros(num_local_experts, dtype=np.int64)
+
+    local_end = local_expert_offset + num_local_experts
+    local_mask = (expert_ids >= local_expert_offset) & (expert_ids < local_end)
+    local_ids = expert_ids[local_mask] - local_expert_offset
+    if local_ids.size == 0:
+        return np.zeros(num_local_experts, dtype=np.int64)
+    return np.bincount(
+        local_ids.astype(np.int64, copy=False),
+        minlength=num_local_experts,
+    )[:num_local_experts].astype(np.int64, copy=False)
+
+
+def compute_local_expert_counts_from_plain_ids(
+    token_selected_experts: "torch.Tensor",
+    num_local_experts: int,
+    local_expert_offset: int = 0,
+) -> np.ndarray:
+    """Count local assignments from plain global expert-id tensors."""
+    flat = token_selected_experts.reshape(-1)
+    expert_ids = _copy_flat_tensor_to_cpu_numpy(flat)
+    return _local_expert_counts_from_ids(
+        expert_ids,
+        num_local_experts,
+        local_expert_offset,
+    )
+
+
+def _shuffle_probs(probs: np.ndarray, seed: int = 42) -> np.ndarray:
+    """Deterministically shuffle probability mass across expert ids."""
+
+    rng = np.random.default_rng(seed)
+    shuffled = np.zeros_like(probs)
+    shuffled[rng.permutation(probs.size)] = probs
+    return shuffled
+
+
+def _sample_expert_assignments_from_probs(
+    probs: np.ndarray,
+    original_tensor: "torch.Tensor",
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    num_tokens = int(original_tensor.shape[0])
+    dtype = original_tensor.dtype
+    probs_t = torch.from_numpy(probs).float().to(device=original_tensor.device)
+    support = int(np.count_nonzero(probs > 0.0))
+
+    if top_k <= support:
+        indices = torch.multinomial(
+            probs_t.expand(num_tokens, -1),
+            top_k,
+            replacement=False,
+        )
+    else:
+        indices = torch.multinomial(
+            probs_t,
+            num_tokens * top_k,
+            replacement=True,
+        ).reshape(num_tokens, top_k)
+    return indices.to(dtype=dtype) + int(local_expert_offset)
+
+
+def generate_skewed_expert_assignments(
+    target_eff_experts: float,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert assignments with exp+floor distribution.
+
+    Uses P(expert_i) ∝ (1-f)*exp(-λi) + f/N and binary-searches on λ to hit
+    target_eff_experts. The uniform floor better matches real routing tails
+    than pure exponential (validated on DeepSeek-V3 MMLU).
+
+    Used during autotuner profiling only (not inference).
+    """
+    del num_experts
+
+    target_eff_experts = float(target_eff_experts)
+    if target_eff_experts >= float(num_local_experts):
+        probs = np.full(num_local_experts, 1.0 / float(num_local_experts))
+    else:
+        probs = _shuffle_probs(
+            exp_floor_probs_for_target_eff(target_eff_experts, num_local_experts)
+        )
+    return _sample_expert_assignments_from_probs(
+        probs,
+        original_tensor,
+        top_k,
+        local_expert_offset,
+    )
+
+
+def generate_dirichlet_expert_assignments(
+    distribution: DADistributionSpec,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert ids from a symmetric Dirichlet probability law."""
+
+    del num_experts
+    probs = _shuffle_probs(
+        symmetric_dirichlet_probs_for_target_eff(
+            da_distribution_target_effective_experts(distribution, num_local_experts),
+            num_local_experts,
+        )
+    )
+    return _sample_expert_assignments_from_probs(
+        probs,
+        original_tensor,
+        top_k,
+        local_expert_offset,
+    )
+
+
+def generate_da_distribution_assignments(
+    distribution: DADistributionSpec,
+    original_tensor: "torch.Tensor",
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+    local_expert_offset: int = 0,
+) -> "torch.Tensor":
+    """Generate expert ids for one DA synthetic distribution."""
+
+    label, kind, param = distribution
+    del label
+    if kind == "uniform":
+        return generate_skewed_expert_assignments(
+            float(num_local_experts),
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind == "single":
+        return torch.full(
+            (original_tensor.shape[0], top_k),
+            int(local_expert_offset),
+            dtype=original_tensor.dtype,
+            device=original_tensor.device,
+        )
+    if kind == "exp_factor":
+        return generate_skewed_expert_assignments(
+            da_distribution_target_effective_experts(distribution, num_local_experts),
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind == "ddist_factor":
+        return generate_dirichlet_expert_assignments(
+            distribution,
+            original_tensor,
+            num_local_experts,
+            num_experts,
+            top_k,
+            local_expert_offset,
+        )
+    if kind in ("sparse_eff", "sparse_factor"):
+        return _sample_expert_assignments_from_probs(
+            sparse_probs(kind, param, num_local_experts),
+            original_tensor,
+            top_k,
+            local_expert_offset,
+        )
+    raise ValueError(f"Unknown DA distribution kind: {kind!r}")
 
 
 def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):

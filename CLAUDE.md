@@ -573,6 +573,22 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_AUTOTUNE_DIR` | unset | `flashinfer/mla/_sparse_mla_sm120.py` | Override the disk path for MLA AutoTuner cache files. Falls back to `FLASHINFER_WORKSPACE_DIR` when unset. |
 | `FLASHINFER_AUTOTUNE_TIMER` | unset (auto) | `flashinfer/autotuner/autotuner.py` | Selects the autotuner's per-tactic timer: `globaltimer` forces the GPU `%globaltimer` register, `cuda_event` forces `cudaEvent`, unset/anything-else auto-detects (uses `%globaltimer` only when Confidential Computing is detected). Under CC `cudaEventElapsedTime` is unreliable (can go negative), so the globaltimer path keeps tactic ranking stable. |
+| `FLASHINFER_AUTOTUNE_WARMUP` | `3` | `flashinfer/autotuner/autotuner.py` | Number of unmeasured warmup iterations for each autotuner candidate. |
+| `FLASHINFER_AUTOTUNE_REPEAT` | `10` | `flashinfer/autotuner/autotuner.py` | Number of measured iterations for each autotuner candidate. |
+| `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/autotuner/autotuner.py`, `flashinfer/fused_moe/dist_aware/da_config.py` | `1` enables value-aware distribution autotuning and DA dispatch for TRTLLM MoE. Eager autotuning and resource preparation must complete before CUDA graph capture. |
+| `FLASHINFER_DA_DISTRIBUTIONS` | unset | `flashinfer/fused_moe/dist_aware/da_config.py` | Comma-separated synthetic routing profiles used by DA value-aware autotuning. |
+| `FLASHINFER_DA_DISTRIBUTION_SAMPLES` | `1` | `flashinfer/fused_moe/dist_aware/da_config.py` | Positive number of independently generated routing realizations profiled for each non-single DA distribution. Increase it to trade longer tuning time for more robust sampling of each distribution. |
+| `FLASHINFER_DA_BASELINE_GUARD` | `1` | `flashinfer/fused_moe/dist_aware/da_config.py` | Admit a DA plan only when its profiled result is competitive with the recorded shape-only baseline. |
+| `FLASHINFER_DA_CONTROL_OVERHEAD_US` | `12.0` | `flashinfer/fused_moe/dist_aware/da_config.py` | Calibrated combined routing-metadata, selector, and conditional-SWITCH critical-path overhead used by the baseline-guard admission policy. |
+| `FLASHINFER_DA_BUNDLE` | unset | `flashinfer/fused_moe/dist_aware/da_config.py` | Path to a locally generated DA profile bundle. Bundles use pickle and are trusted local inputs; never load one from an untrusted or shared-writable source. |
+| `FLASHINFER_DA_VERBOSE` | `0` | `flashinfer/fused_moe/dist_aware/da_config.py` | `1` emits DA plan, capture, and fallback diagnostics. |
+| `FLASHINFER_DA_FACTORIZED_AUTOTUNE` | `1` | `flashinfer/fused_moe/dist_aware/da_config.py` | Factorize supported TRTLLM MoE tactic searches into FC1 and FC2 groups. |
+| `FLASHINFER_DA_KNN_AUTO_WARMUP` | `3` | `flashinfer/fused_moe/dist_aware/da_config.py` | Warmup replays used while calibrating the DA selector. |
+| `FLASHINFER_DA_KNN_AUTO_ITERS` | `10` | `flashinfer/fused_moe/dist_aware/da_config.py` | Measured replays used while calibrating the DA selector; use `1` only for quick validation. |
+| `FLASHINFER_DA_BASELINE_GUARD_MARGIN` | `0.0` | `flashinfer/fused_moe/dist_aware/da_config.py` | Additional fractional admission margin applied by the DA baseline guard. |
+| `FLASHINFER_DA_KNN_SELECT_FROM_ROUTING_COUNTS` | `0` | `flashinfer/fused_moe/dist_aware/da_config.py` | Diagnostic alternative that makes selection consume routing metadata counts, serializing the otherwise independent branches. |
+| `FLASHINFER_DA_KNN_MAX_TILE` | unset | `flashinfer/fused_moe/dist_aware/da_config.py` | Optional maximum candidate routing tile used during DA k-NN profiling. |
+| `FLASHINFER_DA_KNN_TIE_EPS` | `0.05` | `flashinfer/fused_moe/dist_aware/da_config.py` | Relative tolerance for preferring the larger tile among near-equal profile results. |
 | `FLASHINFER_CONFIDENTIAL_COMPUTE` | unset | `flashinfer/utils.py` | Override NVIDIA Confidential Computing (CC) auto-detection used by `is_confidential_compute()` (which drives the autotuner timer above): `1` forces CC, `0` forces non-CC. Useful for CI or hosts without `pynvml`. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k algorithm (otherwise the dispatcher chooses based on shape). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
@@ -580,6 +596,9 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
 | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | When set (any non-empty value), forces the SM12x MoE dispatcher onto the W4A16 kernel path regardless of weight dtype. Internal/experimental — used to reproduce W4A16-specific issues. |
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
+
+Use `benchmarks/bench_trtllm_moe_da.py` for matched NoDA/DA numerical and
+performance validation of TRTLLM MoE.
 
 ## Development Workflow
 
