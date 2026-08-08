@@ -71,16 +71,17 @@ struct VLoader {
                                                              SharedStorage& shared_storage,
                                                              int bidh, int bidb,
                                                              uint2 cluster_local_block_id) {
+    int const bidkv = bidh / mainloop_params.h_h_k_ratio;
     auto sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.begin()), SmemLayoutV{});
     auto sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFV{});
 
     auto mVt = mainloop_params.tma_load_Vt.get_tma_tensor(mainloop_params.shape_Vt);
     auto mSFVt = mainloop_params.tma_load_SFVt.get_tma_tensor(shape(mainloop_params.layout_SFVt));
 
-    auto gVt = local_tile(mVt(_, _, bidh, bidb),
+    auto gVt = local_tile(mVt(_, _, bidkv, bidb),
                           make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                           make_coord(_0{}, _));
-    auto gSFVt = local_tile(mSFVt(_, _, bidh, bidb),
+    auto gSFVt = local_tile(mSFVt(_, _, bidkv, bidb),
                             make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                             make_coord(_0{}, _));
 
