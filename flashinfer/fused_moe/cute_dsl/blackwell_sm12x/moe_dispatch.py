@@ -2256,6 +2256,11 @@ def _make_w4a16_expert_map(
     weight_E: int,
     device: torch.device,
 ) -> torch.Tensor | None:
+    """Fallback map that assumes this rank holds global experts [0, state_E).
+
+    Only correct for rank 0 of a contiguous expert layout. EP callers pass
+    their own expert_map per call instead.
+    """
     if int(state_E) == int(weight_E):
         return None
     if int(state_E) > int(weight_E):
@@ -2466,6 +2471,7 @@ def _launch_sm120_w4a16_moe(
     top_k: int,
     num_local_experts: int,
     scatter_output: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
     fast_math: bool = True,
     activation: str = "silu",
     source_format: str = "modelopt",
@@ -2489,6 +2495,16 @@ def _launch_sm120_w4a16_moe(
     )
     if int(prepared.num_experts) != int(num_local_experts):
         raise ValueError("num_local_experts must match w1_weight.shape[0] for W4A16.")
+    if expert_map is not None:
+        if int(expert_map.numel()) != int(num_experts):
+            raise ValueError(
+                f"expert_map must have num_experts={int(num_experts)} entries, "
+                f"got {int(expert_map.numel())}"
+            )
+        if expert_map.device != a.device:
+            raise ValueError(
+                f"expert_map must be on {a.device}, got {expert_map.device}"
+            )
     num_tokens = int(topk_ids.size(0))
     routed_rows = num_tokens * int(top_k)
     k = int(a.size(1))
@@ -2538,7 +2554,7 @@ def _launch_sm120_w4a16_moe(
         block_expert_ids=workspace.block_expert_ids,
         packed_route_count=workspace.packed_route_count,
         expert_offsets=workspace.expert_offsets,
-        expert_map=workspace.expert_map,
+        expert_map=expert_map if expert_map is not None else workspace.expert_map,
         fast_math=fast_math,
     )
 
@@ -2555,6 +2571,8 @@ _Sm120Workspace = Union[
 
 # Stores the workspace with the largest capacity seen per key and never
 # shrinks within a process. clear_sm120_moe_caches() releases everything.
+# The key holds expert counts only, not placement: buffer geometry
+# depends only on the counts, and EP callers pass expert_map per call.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
 
 
@@ -2848,6 +2866,7 @@ def launch_sm120_moe(
     top_k: int,
     num_local_experts: int,
     scatter_output: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
@@ -2875,6 +2894,14 @@ def launch_sm120_moe(
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
+
+    # The NVFP4 dynamic backend indexes per-expert buffers by global topk
+    # ids, so expert parallelism stays W4A16-only.
+    if expert_map is not None and quant_mode != "w4a16":
+        raise NotImplementedError(
+            "expert_map-based expert parallelism is only supported for "
+            f"quant_mode='w4a16', got quant_mode={quant_mode!r}."
+        )
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
@@ -2922,6 +2949,7 @@ def launch_sm120_moe(
             top_k=top_k,
             num_local_experts=num_local_experts,
             scatter_output=scatter_output,
+            expert_map=expert_map,
             fast_math=fast_math,
             activation=activation,
             source_format=source_format,
