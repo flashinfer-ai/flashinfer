@@ -1956,7 +1956,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     }
     per_expert = torch.ones((1,), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+    with pytest.raises(ValueError, match=r"Fp8QuantizationType\.MxFp8"):
         trtllm_fp8_block_scale_moe(
             **kwargs,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
@@ -1964,7 +1964,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
             gemm1_alpha=per_expert,
         )
 
-    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_fp8_block_scale_moe(
             **kwargs,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
@@ -1977,7 +1977,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     }
     routed_kwargs["topk_ids"] = torch.empty((1, 1), dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+    with pytest.raises(ValueError, match=r"Fp8QuantizationType\.MxFp8"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
@@ -1985,7 +1985,7 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
             gemm1_beta=per_expert,
         )
 
-    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
             fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
