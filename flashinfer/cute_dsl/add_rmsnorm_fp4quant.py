@@ -54,6 +54,8 @@ from .fp4_common import (
     # PTX intrinsics - basic ops
     st_global_u64,
     get_ptr_as_int64,
+    get_smem_ptr_as_int32,
+    ld_shared_v4_u32,
     rcp_approx_ftz,
     fmin_f32,
     fmax_f32,
@@ -86,6 +88,31 @@ from .fp4_common import (
     load_f32_16_from_smem,
     compute_y_and_max_abs_f32,
 )
+
+
+@cute.jit
+def _load_8_half2_from_smem(
+    sX: cute.Tensor,
+    sW: cute.Tensor,
+    row_idx: Int32,
+    col_offset: Int32,
+    row_stride: int,
+):
+    """Load 16 packed fp16/bf16 values from each shared-memory tile."""
+    x_h2 = cute.make_rmem_tensor((8,), Uint32)
+    w_h2 = cute.make_rmem_tensor((8,), Uint32)
+    base = row_idx * row_stride + col_offset
+
+    x_addr0 = get_smem_ptr_as_int32(sX, base)
+    x_addr1 = get_smem_ptr_as_int32(sX, base + Int32(8))
+    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = ld_shared_v4_u32(x_addr0)
+    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = ld_shared_v4_u32(x_addr1)
+
+    w_addr0 = get_smem_ptr_as_int32(sW, base)
+    w_addr1 = get_smem_ptr_as_int32(sW, base + Int32(8))
+    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_shared_v4_u32(w_addr0)
+    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_shared_v4_u32(w_addr1)
+    return x_h2, w_h2
 
 
 # =============================================================================
@@ -167,6 +194,14 @@ class AddRMSNormFP4QuantKernel:
     Supports both NVFP4 (block_size=16) and MXFP4 (block_size=32) formats.
     """
 
+    # Offline sweep-tuned launch overrides.  Unlisted configurations use the
+    # general scale-block heuristic below.
+    # (sm_version, H, block_size, is_fp16):
+    #     (cluster_n, threads_per_row, num_threads)
+    _KNOB_LUT = {
+        (103, 1024, 16, False): (1, 64, 256),
+    }
+
     def __init__(
         self,
         dtype: cutlass.Numeric,
@@ -198,11 +233,20 @@ class AddRMSNormFP4QuantKernel:
             "scale_format must be 'e4m3' or 'ue8m0'"
         )
 
-        self.cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
-        self.H_per_cta = H // self.cluster_n
+        knobs = self._select_knobs(H, block_size, is_fp16, self.sm_version)
+        if knobs is None:
+            self.cluster_n = self._compute_cluster_n(
+                H, dtype, self.sm_version, block_size
+            )
+            self.H_per_cta = H // self.cluster_n
+            self.threads_per_row = self._compute_threads_per_row(
+                self.H_per_cta, block_size
+            )
+            self.num_threads = self._compute_num_threads(self.threads_per_row)
+        else:
+            self.cluster_n, self.threads_per_row, self.num_threads = knobs
+            self.H_per_cta = H // self.cluster_n
 
-        self.threads_per_row = self._compute_threads_per_row(self.H_per_cta)
-        self.num_threads = self._compute_num_threads(self.H_per_cta)
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
 
@@ -224,7 +268,9 @@ class AddRMSNormFP4QuantKernel:
             self.k_tile_stride = 512
 
     @staticmethod
-    def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
+    def _compute_cluster_n(
+        H: int, dtype: cutlass.Numeric, sm_version: int, block_size: int
+    ) -> int:
         """Compute optimal cluster size based on H and device shared memory.
 
         Dynamically determines the minimum cluster_n that fits within the
@@ -242,7 +288,7 @@ class AddRMSNormFP4QuantKernel:
             if H % cluster_n != 0:
                 continue
             smem_needed = AddRMSNormFP4QuantKernel._estimate_smem_bytes(
-                H, cluster_n, elem_size
+                H, cluster_n, elem_size, block_size
             )
             if smem_needed <= max_smem_bytes:
                 return cluster_n
@@ -250,36 +296,43 @@ class AddRMSNormFP4QuantKernel:
         return 16
 
     @staticmethod
-    def _compute_threads_per_row(H_per_cta: int) -> int:
-        """Compute optimal threads per row."""
-        if H_per_cta <= 64:
-            return 8
-        elif H_per_cta <= 128:
-            return 16
-        elif H_per_cta <= 3072:
-            return 32
-        elif H_per_cta <= 6144:
-            return 64
-        elif H_per_cta <= 16384:
-            return 128
-        else:
-            return 256
+    def _compute_threads_per_row(H_per_cta: int, block_size: int) -> int:
+        """Assign one warp per 32 scale-factor blocks, capped at 8 warps."""
+        num_sf_blocks = H_per_cta // block_size
+        return min(((num_sf_blocks + 31) // 32) * 32, 256)
 
     @staticmethod
-    def _compute_num_threads(H_per_cta: int) -> int:
-        """Compute total threads per block."""
-        return 128 if H_per_cta <= 16384 else 256
+    def _compute_num_threads(threads_per_row: int) -> int:
+        """Use multiple rows per block while keeping a 128-thread target."""
+        rows_per_block = max(1, 128 // threads_per_row)
+        return rows_per_block * threads_per_row
 
     @staticmethod
-    def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
+    def _select_knobs(
+        H: int,
+        block_size: int,
+        is_fp16: bool,
+        sm_version: int,
+    ) -> tuple[int, int, int] | None:
+        """Return an offline-tuned launch, if one is available."""
+        return AddRMSNormFP4QuantKernel._KNOB_LUT.get(
+            (sm_version, H, block_size, is_fp16)
+        )
+
+    @staticmethod
+    def _estimate_smem_bytes(
+        H: int, cluster_n: int, elem_size: int, block_size: int
+    ) -> int:
         """Estimate shared memory bytes needed for given configuration.
 
         This is used to dynamically determine cluster_n based on device
         shared memory limits.
         """
         H_per_cta = H // cluster_n
-        threads_per_row = AddRMSNormFP4QuantKernel._compute_threads_per_row(H_per_cta)
-        num_threads = AddRMSNormFP4QuantKernel._compute_num_threads(H_per_cta)
+        threads_per_row = AddRMSNormFP4QuantKernel._compute_threads_per_row(
+            H_per_cta, block_size
+        )
+        num_threads = AddRMSNormFP4QuantKernel._compute_num_threads(threads_per_row)
         rows_per_block = num_threads // threads_per_row
         warps_per_row = max(threads_per_row // 32, 1)
 
@@ -652,12 +705,23 @@ class AddRMSNormFP4QuantKernel:
 
                     if cutlass.const_expr(block_size == 16):
                         if cutlass.const_expr(cluster_n == 1):
-                            # Shared memory path - use helper functions
-                            h_f32 = load_f32_16_from_smem(sH, row_in_block, block_start)
-                            w_f32 = load_f32_16_from_smem(sW, row_in_block, block_start)
-                            y_f32, max_abs = compute_y_and_max_abs_f32(
-                                h_f32, w_f32, rstd
+                            h_h2, w_h2 = _load_8_half2_from_smem(
+                                sH,
+                                sW,
+                                row_in_block,
+                                block_start,
+                                self.cols_per_tile,
                             )
+                            if cutlass.const_expr(is_fp16):
+                                hw_h2 = half2_mul_8(h_h2, w_h2)
+                                max_abs = hmax_to_f32(half2_max_abs_8(hw_h2)) * rstd
+                                y_f32 = half2_to_float16(hw_h2, rstd)
+                            else:
+                                hw_h2 = bfloat2_mul_8(h_h2, w_h2)
+                                max_abs = (
+                                    bfloat2_hmax_to_f32(bfloat2_max_abs_8(hw_h2)) * rstd
+                                )
+                                y_f32 = bfloat2_to_float16(hw_h2, rstd)
 
                             # E4M3: global_scale is incorporated into block scale
                             scale_float = global_scale_val * max_abs * fp4_max_rcp
