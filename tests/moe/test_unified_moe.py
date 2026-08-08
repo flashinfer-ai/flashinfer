@@ -38,6 +38,8 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
+from flashinfer.autotuner.autotuner import ProfilingCacheKey
+from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
     MoEActivationPack,
     MoELayer,
@@ -51,6 +53,7 @@ from flashinfer.fused_moe.runners import (
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.api import (
     ActivationConfig,
@@ -183,7 +186,10 @@ class TestReprRoundTrip:
 
     def test_expert_config(self):
         cfg = ExpertConfig(
-            intermediate_size=2048, local_expert_offset=4, local_num_experts=8
+            intermediate_size=2048,
+            local_expert_offset=4,
+            local_num_experts=8,
+            num_fused_shared_experts=2,
         )
         assert _eval_repr(cfg) == cfg
 
@@ -2257,3 +2263,429 @@ class TestPrepareTrtllmBf16Weights:
         for view in (nc, cpu):
             for key in ("gemm1_weights", "gemm2_weights"):
                 assert torch.equal(view[key], base[key])
+
+
+# ---------------------------------------------------------------------------
+# Fused shared experts — configuration boundaries and backend gating
+# ---------------------------------------------------------------------------
+
+
+class TestFusedSharedExpertsConfig:
+    """Geometry rejections live on the config, not in ``check_support()``.
+
+    ``MoELayer.__init__`` swallows ``check_support()`` exceptions to filter
+    unusable backends, so a geometry error raised there would surface as
+    "no backend available" rather than naming the offending value.
+    """
+
+    def _cfg(self, *, num_shared, **overrides):
+        routing = dict(
+            num_experts=64,
+            top_k=8,
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=8,
+            topk_group=4,
+            routed_scaling_factor=2.5,
+        )
+        experts = dict(intermediate_size=512, num_fused_shared_experts=num_shared)
+        routing.update(overrides.pop("routing", {}))
+        experts.update(overrides.pop("experts", {}))
+        return MoEConfig(
+            routing=RoutingConfig(**routing),
+            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            experts=ExpertConfig(**experts),
+        )
+
+    def test_zero_is_the_default_and_stays_out_of_repr(self):
+        cfg = ExpertConfig(intermediate_size=512)
+        assert cfg.num_fused_shared_experts == 0
+        assert "num_fused_shared_experts" not in repr(cfg)
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValueError, match="must be >= 0"):
+            ExpertConfig(intermediate_size=512, num_fused_shared_experts=-1)
+
+    def test_non_deepseek_routing_rejected(self):
+        # Only the DeepSeek routing kernel emits the appended shared slots.
+        with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
+            self._cfg(num_shared=1, routing=dict(method=RoutingMethodType.Default))
+
+    def test_top_k_plus_shared_bounded(self):
+        # MaxSupportedTopExperts == 32 applies to the *fused* total.
+        self._cfg(num_shared=24)  # 8 + 24 == 32, allowed
+        with pytest.raises(ValueError, match=r"top_k \+ num_fused_shared_experts"):
+            self._cfg(num_shared=25)
+
+    def test_num_experts_plus_shared_bounded(self):
+        # NumNemotronExperts == 512, likewise on the fused total.
+        with pytest.raises(
+            ValueError, match=r"num_experts \+ num_fused_shared_experts"
+        ):
+            self._cfg(num_shared=1, routing=dict(num_experts=512))
+
+    @pytest.mark.parametrize(
+        "experts_override",
+        [
+            dict(local_expert_offset=8),
+            dict(local_num_experts=32),
+        ],
+    )
+    def test_expert_parallelism_rejected(self, experts_override):
+        # The routing kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), which only lands on the intended
+        # slot when this rank holds the whole routed set.
+        with pytest.raises(ValueError, match="does not support expert"):
+            self._cfg(num_shared=1, experts=experts_override)
+
+    def test_full_local_set_accepted(self):
+        cfg = self._cfg(num_shared=1, experts=dict(local_num_experts=64))
+        assert cfg.experts.num_fused_shared_experts == 1
+
+
+class TestFusedSharedExpertsBackendGating:
+    """Backends must opt in before ``check_support()`` accepts S > 0."""
+
+    def _shared_cfg(self, variant):
+        return MoEConfig(
+            routing=RoutingConfig(
+                num_experts=64,
+                top_k=2,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=8,
+                topk_group=4,
+                routed_scaling_factor=2.5,
+            ),
+            quant=QuantConfig(variant=variant),
+            experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=2),
+        )
+
+    def test_registry_is_split_into_supporting_and_not(self):
+        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+        supporting = {
+            r.__name__
+            for r in _BACKEND_RUNNERS.values()
+            if r.supports_fused_shared_experts
+        }
+        assert supporting == {"TrtllmFp8BlockRunner"}, (
+            "backends claiming fused shared-expert support changed; confirm the "
+            f"new backend forwards num_fused_shared_experts: {supporting}"
+        )
+
+    def test_every_non_supporting_runner_rejects_at_check_support(self):
+        from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+        checked = 0
+        for runner_cls in set(_BACKEND_RUNNERS.values()):
+            if runner_cls.supports_fused_shared_experts:
+                continue
+            variant = runner_cls.supported_quant_variants[0]
+            runner = runner_cls.__new__(runner_cls)
+            runner.config = self._shared_cfg(variant)
+            with pytest.raises(
+                NotImplementedError, match="does not support fused shared experts"
+            ):
+                runner.check_support()
+            checked += 1
+        assert checked, "no non-supporting runners exercised"
+
+
+# ---------------------------------------------------------------------------
+# Autotune cache keying
+# ---------------------------------------------------------------------------
+#
+# The autotuner keys on (custom_op, runner_class_name, runner_hash,
+# nearest_profile, extras). custom_op is constant per backend, and
+# nearest_profile sees only the profiled tensor list -- which carries
+# activations and routing but not the weights, since those travel in
+# _static_kwargs. So expert geometry is invisible to the profile.
+# ProfilingCacheKey.file_key additionally drops runner_hash, leaving the
+# on-disk cache keyed on extras alone. A tactic-relevant dimension must
+# therefore appear in get_cache_key_extras() or two configurations silently
+# share one tuned tactic.
+
+# (runner class, backend config, quant variant, alternate quant variant or None)
+# FP8 covers variant changes and MxInt4 the single-variant skip path. Registry
+# coverage below verifies that every backend inherits the shared key contract.
+_RUNNERS = [
+    pytest.param(
+        TrtllmFp8BlockRunner,
+        TrtllmFp8BlockConfig(),
+        QuantVariant.DeepSeekFp8,
+        QuantVariant.MxFp8,
+        id="fp8_block",
+    ),
+    pytest.param(
+        TrtllmMxInt4RoutedRunner,
+        TrtllmMxInt4Config(),
+        QuantVariant.MxInt4,
+        None,
+        id="mxint4",
+    ),
+]
+
+
+def _cache_key_config(backend_cfg, variant, **overrides):
+    fields = dict(
+        num_experts=64,
+        top_k=2,
+        intermediate_size=256,
+        local_expert_offset=0,
+        local_num_experts=None,
+        activation=ActivationConfig.swiglu,
+    )
+    fields.update(overrides)
+    return MoEConfig(
+        routing=RoutingConfig(
+            num_experts=fields["num_experts"],
+            top_k=fields["top_k"],
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=8,
+            topk_group=4,
+            routed_scaling_factor=2.5,
+        ),
+        quant=QuantConfig(variant=variant),
+        experts=ExpertConfig(
+            intermediate_size=fields["intermediate_size"],
+            local_expert_offset=fields["local_expert_offset"],
+            local_num_experts=fields["local_num_experts"],
+        ),
+        activation=fields["activation"],
+        backend=BackendOptions(candidates=(backend_cfg,)),
+    )
+
+
+# Dimensions that change which tactics are legal but are NOT recoverable from
+# the profiled tensor shapes. Each must move both cache keys.
+_DIMENSIONS = [
+    ("intermediate_size", dict(intermediate_size=512)),
+    ("top_k", dict(top_k=4)),
+    ("num_experts", dict(num_experts=128)),
+    ("local_num_experts", dict(local_num_experts=32)),
+    ("local_expert_offset", dict(local_expert_offset=8)),
+    ("activation", dict(activation=ActivationConfig.geglu)),
+]
+
+
+@pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
+@pytest.mark.parametrize(
+    "dimension,override", _DIMENSIONS, ids=[d[0] for d in _DIMENSIONS]
+)
+def test_tactic_dimension_changes_both_cache_keys(
+    runner_cls, backend_cfg, variant, alt_variant, dimension, override
+):
+    """A tactic-relevant dimension must separate memory *and* file cache keys."""
+    device = torch.device("cuda")
+    base = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    other = runner_cls(
+        _cache_key_config(backend_cfg, variant, **override), device=device
+    )
+
+    assert hash(base) != hash(other), (
+        f"{runner_cls.__name__}: {dimension} does not change runner_hash, so two "
+        "configurations share one in-memory tuned tactic."
+    )
+    # Compare serialized extras because the persisted key uses their string form.
+    assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
+        f"{runner_cls.__name__}: {dimension} does not change get_cache_key_extras(), "
+        "so the on-disk cache (which drops runner_hash) collides."
+    )
+
+
+@pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
+def test_quant_variant_changes_both_cache_keys(
+    runner_cls, backend_cfg, variant, alt_variant
+):
+    if alt_variant is None:
+        pytest.skip(f"{runner_cls.__name__} supports a single quant variant")
+    device = torch.device("cuda")
+    base = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    other = runner_cls(_cache_key_config(backend_cfg, alt_variant), device=device)
+    assert hash(base) != hash(other)
+    assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([]))
+
+
+@pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
+def test_identical_config_shares_cache_key(
+    runner_cls, backend_cfg, variant, alt_variant
+):
+    """Two runners built from the same configuration must still share a key.
+
+    Guards the opposite failure: over-keying (e.g. folding in object identity)
+    would make every layer re-tune from scratch.
+    """
+    device = torch.device("cuda")
+    a = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    b = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    assert hash(a) == hash(b)
+    assert str(a.get_cache_key_extras([])) == str(b.get_cache_key_extras([]))
+
+
+@pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
+def test_cache_key_extras_are_str_stable(runner_cls, backend_cfg, variant, alt_variant):
+    """Every element must survive the str() round trip the file cache performs.
+
+    ``ProfilingCacheKey.file_key`` is ``str((custom_op, class, profile, extras))``
+    and is written to disk, so an element whose repr embeds an address (or
+    otherwise varies per process) would never match on reload.
+    """
+    device = torch.device("cuda")
+    runner = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    extras = runner.get_cache_key_extras([])
+    assert isinstance(extras, tuple)
+    rendered = str(extras)
+    assert "0x" not in rendered, (
+        f"{runner_cls.__name__}: cache-key extras contain what looks like an "
+        f"object address and will not match across processes: {rendered}"
+    )
+    for element in extras:
+        # None is permitted: str(None) == "None" is stable across processes,
+        # and optional config fields (n_group, per_token_scale, ...) are keyed.
+        assert isinstance(element, (int, float, str, bool, tuple, type(None))), (
+            f"{runner_cls.__name__}: cache-key element {element!r} of type "
+            f"{type(element).__name__} has no guaranteed stable repr."
+        )
+
+
+def test_every_registered_runner_defines_stable_extras():
+    """No unified runner may fall back to the empty default.
+
+    A backend that inherits ``get_cache_key_extras() -> ()`` from
+    ``TunableRunner`` keys its on-disk cache on the profile alone, which cannot
+    see the expert geometry.
+    """
+    assert _BACKEND_RUNNERS, "no unified runners registered"
+    for runner_cls in set(_BACKEND_RUNNERS.values()):
+        assert "_cache_key_extras" in dir(runner_cls), (
+            f"{runner_cls.__name__} does not inherit the unified cache-key "
+            "contract from MoERunner."
+        )
+
+
+def test_profiling_cache_key_file_key_separates_configs():
+    """The on-disk key must separate configs that share a profile.
+
+    Builds ``ProfilingCacheKey`` directly with an identical
+    ``nearest_profile`` — the situation the adapters actually hit, since the
+    weights are not in the profiled tensor list — and asserts ``file_key``
+    still differs. ``file_key`` drops ``runner_hash``, so this is the check
+    that the in-memory assertions above cannot make.
+    """
+    device = torch.device("cuda")
+    base = TrtllmFp8BlockRunner(
+        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        device=device,
+    )
+    other = TrtllmFp8BlockRunner(
+        _cache_key_config(
+            TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, intermediate_size=512
+        ),
+        device=device,
+    )
+    shared_profile = ((64, 256), (64, 2))
+
+    def key_for(runner):
+        return ProfilingCacheKey(
+            custom_op="moe_trtllm_fp8_block",
+            runner_class_name=type(runner).__name__,
+            runner_hash=hash(runner),
+            nearest_profile=shared_profile,
+            extras=runner.get_cache_key_extras([]),
+        )
+
+    key_a, key_b = key_for(base), key_for(other)
+    assert key_a != key_b
+    assert key_a.file_key != key_b.file_key, (
+        "identical profiles with different intermediate_size produced the same "
+        "file_key; the persisted tactic would be reused across both."
+    )
+
+
+def test_fused_shared_experts_change_both_cache_keys():
+    """S must separate cache entries.
+
+    S widens the counts the tactic enumeration keys on (top_k + S,
+    num_local_experts + S) but changes no profiled shape, so without it in the
+    extras an S=0 layer and an S>0 layer in the same process would share one
+    tuned tactic -- and the persisted cache would reuse it across runs.
+    """
+    device = torch.device("cuda")
+    base = TrtllmFp8BlockRunner(
+        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        device=device,
+    )
+    keys = {0: (hash(base), str(base.get_cache_key_extras([])))}
+    for num_shared in (1, 2):
+        cfg = _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8)
+        cfg = dataclasses.replace(
+            cfg,
+            experts=dataclasses.replace(
+                cfg.experts, num_fused_shared_experts=num_shared
+            ),
+        )
+        runner = TrtllmFp8BlockRunner(cfg, device=device)
+        keys[num_shared] = (hash(runner), str(runner.get_cache_key_extras([])))
+
+    assert len({h for h, _ in keys.values()}) == 3, (
+        f"S values share a runner_hash: {keys}"
+    )
+    assert len({e for _, e in keys.values()}) == 3, (
+        f"S values share cache-key extras: {keys}"
+    )
+
+
+# Routing shape and declared-but-unconsumed quant flags. Neither changes which
+# tactics are *legal*, so they are not in _DIMENSIONS above; they are keyed
+# because they change how a tactic ranks (routing shape alters the expert-token
+# distribution) or will feed tactic enumeration once honored (quant flags).
+_SOFT_DIMENSIONS = [
+    ("routing_method", dict(method=RoutingMethodType.Renormalize)),
+    ("n_group", dict(n_group=4)),
+    ("topk_group", dict(topk_group=2)),
+    ("per_token_scale", dict(per_token_scale=True)),
+    ("swizzled_scale_factors", dict(swizzled_scale_factors=True)),
+]
+
+
+def _cache_key_config_with(backend_cfg, variant, **overrides):
+    quant_kwargs = {
+        k: overrides.pop(k)
+        for k in ("per_token_scale", "swizzled_scale_factors")
+        if k in overrides
+    }
+    routing_kwargs = {
+        k: overrides.pop(k)
+        for k in ("method", "n_group", "topk_group")
+        if k in overrides
+    }
+    cfg = _cache_key_config(backend_cfg, variant, **overrides)
+    if routing_kwargs:
+        cfg = dataclasses.replace(
+            cfg, routing=dataclasses.replace(cfg.routing, **routing_kwargs)
+        )
+    if quant_kwargs:
+        cfg = dataclasses.replace(
+            cfg, quant=dataclasses.replace(cfg.quant, **quant_kwargs)
+        )
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "dimension,override", _SOFT_DIMENSIONS, ids=[d[0] for d in _SOFT_DIMENSIONS]
+)
+def test_ranking_relevant_dimension_changes_both_cache_keys(dimension, override):
+    device = torch.device("cuda")
+    base = TrtllmFp8BlockRunner(
+        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        device=device,
+    )
+    other = TrtllmFp8BlockRunner(
+        _cache_key_config_with(
+            TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, **override
+        ),
+        device=device,
+    )
+    assert hash(base) != hash(other), f"{dimension} does not change runner_hash"
+    assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
+        f"{dimension} does not change get_cache_key_extras()"
+    )

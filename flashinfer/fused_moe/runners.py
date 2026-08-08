@@ -179,6 +179,8 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+    # Set to True only after S is wired through validation and launch.
+    supports_fused_shared_experts: ClassVar[bool] = False
 
     config: MoEConfig
 
@@ -189,6 +191,58 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
+        self._assert_shared_experts_supported()
+
+    def _assert_shared_experts_supported(self) -> None:
+        """Reject S > 0 for backends that have not opted in."""
+        s = self.config.experts.num_fused_shared_experts
+        if s > 0 and not self.supports_fused_shared_experts:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support fused shared experts "
+                f"(num_fused_shared_experts={s})."
+            )
+
+    def _cache_key_extras(self) -> tuple:
+        """Return stable tactic inputs absent from profiled tensor shapes."""
+        routing = self.config.routing
+        experts = self.config.experts
+        local_num_experts = (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else routing.num_experts
+        )
+        return (
+            self.backend_key,
+            # The persistent key uses str(), so prefer stable scalar values.
+            self.config.quant.variant.name,
+            int(routing.top_k),
+            int(routing.num_experts),
+            int(local_num_experts),
+            int(experts.local_expert_offset),
+            int(experts.intermediate_size),
+            # S changes tactic enumeration but not profiled tensor shapes.
+            int(experts.num_fused_shared_experts),
+            int(self.config.activation.type),
+            bool(self.config.execution.do_finalize),
+            # Routing shape affects expert-token distribution and tactic ranking.
+            int(routing.method),
+            routing.n_group,
+            routing.topk_group,
+            # Declared quant flags are keyed before runners begin consuming them.
+            self.config.quant.per_token_scale,
+            self.config.quant.swizzled_scale_factors,
+        ) + tuple(self._backend_cache_key_parts())
+
+    def _backend_cache_key_parts(self) -> tuple:
+        """Return backend-specific tactic inputs not covered by the shared key."""
+        return ()
+
+    def __hash__(self) -> int:
+        return hash(self._cache_key_extras())
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        # Configuration-only, so synthesized profiling inputs use the same key.
+        return self._cache_key_extras()
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +440,6 @@ class CuteDslNvfp4Runner(MoERunner):
                 "CuteDslNvfp4Runner activation inputs must match W4A4, "
                 "W4A4 per-token, or W4A16"
             )
-
-    def __hash__(self):
-        return hash(("cute_dsl_nvfp4", hash(self._inner)))
 
 
 # ---------------------------------------------------------------------------
@@ -829,9 +880,6 @@ class TrtllmFp4RoutedRunner(MoERunner):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_fp4_routed", self._variant))
-
 
 # ---------------------------------------------------------------------------
 # TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
@@ -855,6 +903,7 @@ class TrtllmFp8BlockRunner(MoERunner):
         QuantVariant.DeepSeekFp8,
         QuantVariant.MxFp8,
     )
+    supports_fused_shared_experts = True
 
     def check_support(self) -> None:
         super().check_support()
@@ -909,6 +958,9 @@ class TrtllmFp8BlockRunner(MoERunner):
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
+        # Weights have local + S rows; the kernel still takes the routed count.
+        self._num_fused_shared_experts = experts.num_fused_shared_experts
+        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
 
         enable_pdl = execution.enable_pdl
         if enable_pdl is None:
@@ -937,6 +989,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             weight_layout=int(WeightLayout.MajorK),
             use_per_token_scaling=False,
             num_experts=self.config.routing.num_experts,
+            num_fused_shared_experts=self._num_fused_shared_experts,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -984,12 +1037,12 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
                 )
             expected_w1_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size // 128,
                 hidden_size // 128,
             )
             expected_w2_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size // 128,
                 self._intermediate_size // 128,
             )
@@ -1002,12 +1055,12 @@ class TrtllmFp8BlockRunner(MoERunner):
                     f"{expected_scale}, got {scale.dtype} {tuple(scale.shape)}."
                 )
             expected_w1_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size,
                 hidden_size // 32,
             )
             expected_w2_scale = (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size,
                 self._intermediate_size // 32,
             )
@@ -1015,12 +1068,12 @@ class TrtllmFp8BlockRunner(MoERunner):
 
         expected_weights = {
             "gemm1_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size,
                 hidden_size,
             ),
             "gemm2_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size,
                 self._intermediate_size,
             ),
@@ -1072,6 +1125,17 @@ class TrtllmFp8BlockRunner(MoERunner):
             topk_ids = act.hidden_states_q.new_empty((0,), dtype=torch.int32)
             expert_weights = act.hidden_states_q.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            # The flat pre-routed API has no shared-expert argument. Callers can
+            # append shared slots themselves and declare the fused totals.
+            if self._num_fused_shared_experts > 0:
+                raise NotImplementedError(
+                    "TrtllmFp8BlockRunner requires FromLogits routing when "
+                    "num_fused_shared_experts > 0. A pre-routed caller can fuse "
+                    "the shared experts itself by appending the slots to "
+                    "topk_ids/topk_weights and declaring num_experts + "
+                    f"{self._num_fused_shared_experts} experts with top_k + "
+                    f"{self._num_fused_shared_experts}."
+                )
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, "TrtllmFp8BlockRunner"
             )
@@ -1108,7 +1172,7 @@ class TrtllmFp8BlockRunner(MoERunner):
             gemm2_weights=view["gemm2_weights"],
             gemm2_weights_scale=view["gemm2_weights_scale"],
             num_experts=routing.num_experts,
-            num_fused_shared_experts=0,
+            num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,
@@ -1132,9 +1196,6 @@ class TrtllmFp8BlockRunner(MoERunner):
             use_cold_l2_cache=True,
         )
         return moe_inputs.to_list()
-
-    def __hash__(self):
-        return hash(("trtllm_fp8_block", self._variant))
 
 
 # ---------------------------------------------------------------------------
@@ -1397,9 +1458,6 @@ class TrtllmFp8PerTensorRunner(MoERunner):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_fp8_per_tensor",))
-
 
 # ---------------------------------------------------------------------------
 # TRTLLM BF16 runner — canonical trtllm-gen MoERunner, bf16 dtypes
@@ -1618,9 +1676,6 @@ class TrtllmBf16RoutedRunner(MoERunner):
             use_cold_l2_cache=True,
         )
         return moe_inputs.to_list()
-
-    def __hash__(self):
-        return hash(("trtllm_bf16_routed",))
 
 
 # ---------------------------------------------------------------------------
@@ -1913,9 +1968,6 @@ class TrtllmMxInt4RoutedRunner(MoERunner):
         )
         return moe_inputs.to_list()
 
-    def __hash__(self):
-        return hash(("trtllm_mxint4_routed",))
-
 
 # ---------------------------------------------------------------------------
 # SM12x b12x runners — fixed tactic, existing wrapper delegation
@@ -2107,9 +2159,6 @@ class _B12xRunner(MoERunner):
             token_selected_experts=inputs[1],
             token_final_scales=inputs[2],
         )
-
-    def __hash__(self):
-        return hash((self.backend_key, self.config))
 
 
 class B12xNvfp4Runner(_B12xRunner):
