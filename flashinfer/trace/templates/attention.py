@@ -387,6 +387,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
+        "kv_layout == 'HND'",
     ]
     if combined:
         constraints.append("kv_planes == 2")

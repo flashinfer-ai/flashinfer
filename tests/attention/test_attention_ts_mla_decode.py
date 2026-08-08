@@ -142,23 +142,24 @@ class _MLACase:
 def _variable_seq_lens(
     batch_size: int, max_seq_len: int, page_size: int
 ) -> tuple[int, ...]:
-    """Return stable, distinct, non-page-aligned runtime KV lengths."""
+    """Return stable, varied runtime KV lengths with non-aligned tails."""
 
-    if batch_size == 1:
-        return (max_seq_len,)
-    lower = max(page_size, max_seq_len // 2)
-    span = max_seq_len - lower
+    if batch_size == 1 or max_seq_len <= 1:
+        return (max_seq_len,) * batch_size
+    lower = max(1, min(max_seq_len - 1, max(page_size, max_seq_len // 2)))
+    candidates = tuple(
+        length for length in range(lower, max_seq_len) if length % page_size != 0
+    )
+    if not candidates:
+        candidates = tuple(
+            length for length in range(1, max_seq_len) if length % page_size != 0
+        )
+    if not candidates:
+        candidates = (max_seq_len - 1,)
     lengths = [max_seq_len]
-    used = {max_seq_len}
     for batch_idx in range(1, batch_size):
-        candidate = lower + ((batch_idx * 104729 + batch_size * 37) % span)
-        candidate = min(candidate, max_seq_len - 1)
-        if candidate % page_size == 0:
-            candidate -= 1
-        while candidate in used and candidate > lower:
-            candidate -= 1
-        used.add(candidate)
-        lengths.append(candidate)
+        candidate_idx = (batch_idx * 104729 + batch_size * 37) % len(candidates)
+        lengths.append(candidates[candidate_idx])
     return tuple(lengths)
 
 
@@ -1482,6 +1483,58 @@ def test_attention_ts_mla_fp8_reference_uses_p448():
     assert _FP8_PROBABILITY_SCALE == 448.0
     assert torch.isfinite(output).all()
     assert bool((output != 0).any())
+
+
+@pytest.mark.parametrize(
+    ("case_kwargs", "expected_policy", "expected_kernel_workspace_bytes"),
+    (
+        pytest.param(
+            {
+                "batch_size": 2,
+                "num_qo_heads": 16,
+                "max_seq_len": 1025,
+                "kv_seq_lens": (1025, 1),
+                "qkv_dtype": torch.float8_e4m3fn,
+                "seed": 20260808,
+            },
+            _policy("throughput_latency_1cta", 16, 3, 128, cluster=True),
+            0,
+            id="smem-p-cluster",
+        ),
+        pytest.param(
+            {
+                "batch_size": 64,
+                "num_qo_heads": 64,
+                "max_seq_len": 257,
+                "kv_seq_lens": (257,) + (1,) * 63,
+                "qkv_dtype": torch.float8_e4m3fn,
+                "seed": 20260809,
+            },
+            _policy("throughput_latency_1cta", 64, 2, 512, cluster=False)
+            | {"separate_reducer_impl": "parallel"},
+            8_421_376,
+            id="tmem-p-separate",
+        ),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_fp8_fully_masked_split_partials(
+    case_kwargs,
+    expected_policy,
+    expected_kernel_workspace_bytes,
+):
+    """Fully masked FP8 split tiles publish zero P and neutral partials."""
+
+    case = _make_mla_case(device="cuda", **case_kwargs)
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(policy, expected_policy, device=case.query.device)
+    assert (
+        wrapper._workspace_layout.kernel_workspace.byte_size
+        == expected_kernel_workspace_bytes
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=False)
 
 
 def test_attention_ts_mla_speculative_mask_oracle_distinguishes_tail_visibility():

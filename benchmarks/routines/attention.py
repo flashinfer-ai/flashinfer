@@ -165,10 +165,13 @@ def _validate_prims_ts_context_samples(
     total_error_sq = 0.0
     total_expected_sq = 0.0
     max_abs_error = 0.0
+    if out.dtype == torch.float8_e4m3fn:
+        rtol, atol, relative_l2_limit = 5e-2, 1.3e-1, 1e-1
+    else:
+        rtol, atol, relative_l2_limit = 1e-1, 3e-2, 5e-2
+    sample_points = _context_reference_sample_points(qo_indptr_host, num_qo_heads)
 
-    for batch_idx, query_idx, query_head in _context_reference_sample_points(
-        qo_indptr_host, num_qo_heads
-    ):
+    for batch_idx, query_idx, query_head in sample_points:
         q_begin, q_end = qo_indptr_host[batch_idx : batch_idx + 2]
         q_len = q_end - q_begin
         kv_head = query_head // head_ratio
@@ -209,10 +212,6 @@ def _validate_prims_ts_context_samples(
         sample_max_abs = float(difference.abs().max().item())
         max_abs_error = max(max_abs_error, sample_max_abs)
 
-        if out.dtype == torch.float8_e4m3fn:
-            rtol, atol, relative_l2_limit = 5e-2, 1.3e-1, 1e-1
-        else:
-            rtol, atol, relative_l2_limit = 1e-1, 3e-2, 5e-2
         allowed = atol + rtol * float(expected.abs().max().item())
         if sample_max_abs > allowed:
             raise AssertionError(
@@ -229,9 +228,7 @@ def _validate_prims_ts_context_samples(
             f"prims-ts sampled context relative L2 {relative_l2:.6g} "
             f"> {relative_l2_limit:.6g}"
         )
-    return len(
-        _context_reference_sample_points(qo_indptr_host, num_qo_heads)
-    ), max_abs_error
+    return len(sample_points), max_abs_error
 
 
 @torch.inference_mode()

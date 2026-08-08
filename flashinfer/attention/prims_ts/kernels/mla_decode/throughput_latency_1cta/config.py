@@ -406,6 +406,28 @@ class MlaConfig:
         return (remaining_kv_tiles + self.num_insts_kv - 1) // self.num_insts_kv
 
 
+def compute_workspace_size(
+    *,
+    cfg: MlaConfig,
+    partial_o_dtype,
+    lse_dtype,
+) -> int:
+    """Return the exact 1CTA split-KV GMEM workspace size in bytes.
+
+    The producer layout is ``[B, SQ, H, split, D]`` for partial O and
+    ``[B, SQ, H, split]`` for LSE. Cluster reduction keeps these partials in
+    shared memory and therefore needs no GMEM workspace.
+    """
+
+    split_kv = cfg.num_ctas_per_seq_kv
+    if split_kv == 1 or cfg.use_cluster_reduction == 1:
+        return 0
+    partial_rows = cfg.batch_size * cfg.seq_len_q * cfg.num_heads_q * split_kv
+    return partial_rows * (
+        cfg.head_dim_v * partial_o_dtype.width // 8 + lse_dtype.width // 8
+    )
+
+
 @dataclass(frozen=True)
 class MlaProfile:
     """Concrete tunable profile for one throughput-latency 1CTA MLA kernel variant.

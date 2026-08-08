@@ -577,7 +577,12 @@ def make_mla_decode_config(
         * cfg.qkv_dtype_bytes
         * num_mma_ctas
     )
-    assert cfg.tma_copy_kc_bytes == cfg.tma_copy_vc_bytes
+    if cfg.tma_copy_kc_bytes != cfg.tma_copy_vc_bytes:
+        raise ValueError(
+            "K and V TMA subtile byte counts must match: "
+            f"tma_copy_kc_bytes={cfg.tma_copy_kc_bytes}, "
+            f"tma_copy_vc_bytes={cfg.tma_copy_vc_bytes}"
+        )
     cfg.tma_kc_subtile_bytes = cfg.tma_copy_kc_bytes * cfg.kv_subtiles_per_stage
     cfg.tma_vc_subtile_bytes = cfg.tma_copy_vc_bytes * cfg.kv_subtiles_per_stage
     cfg.tma_copy_k_tile_bytes = (

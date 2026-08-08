@@ -43,6 +43,9 @@ SMEM resources
                             (MmaTask): build tcgen05 K descriptors (BMM1 B
                             operand) and V descriptors (BMM2 B operand).
 
+- SmemKvTileResource      : Dedicated SMEM tile used by split-head-dimension
+                            profiles for one K or V producer instance.
+
 - SmemPResource           : P operand for BMM2.  The validated one-instance
                             staged-D256 Keeps profile places P in two TMEM views
                             aliased with the matching S stages; other profiles
@@ -75,6 +78,9 @@ TMEM resources
                             the tail-visible per-instance copies.  Consumer
                             (Correction): loads the stats to drive O rescaling
                             (LOOP) and final normalization (TAIL).
+
+- TmemSoftmaxOrderResource : Barrier-only ordering resource for softmax-stat
+                             publication and correction consumption.
 
 - TmemStatsDoneResource   : Barrier-only lifetime credit for TMEM columns
                             shared by S and local stats. MMA acquires it before
@@ -121,13 +127,13 @@ from .tmem_softmax_stats import (
 
 __all__ = [
     "DecodeGenResourceBase",
-    "SmemKvTileResource",
     "SmemKvResource",
+    "SmemKvTileResource",
     "SmemPageOffsetsKvResource",
+    "SmemPResource",
     "SmemQResource",
     "TmemCorrResource",
     "TmemOResource",
-    "SmemPResource",
     "TmemSResource",
     "TmemStatsDoneResource",
     "TmemSoftmaxGlobalResource",
