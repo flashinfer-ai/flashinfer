@@ -20,7 +20,7 @@ We recommend using the `--no-build-isolation` flag to ensure compatibility with 
 flashinfer/
 | --include/  # kernel definitions and common utilities functions
 | --csrc/  # op registration to frameworks (pytorch), and binding codes
-| --python/  # python interface exposed to users
+| --flashinfer/  # python interface exposed to users
 | --docs/  # documentation (using sphinx)
 | --tests/  # unittests in python (using pytest)
 | --benchmarks/  # kernel benchmarks in python
@@ -33,9 +33,9 @@ The operator registration code (i.e., framework-specific components, accepting t
 Code Contribution Procedure
 * Write kernel definitions in `include/`
 * Write kernel registration and pytorch interface under `csrc/`
-* Write python interface under `python/`
+* Write python interface under `flashinfer/`
 * Write unit tests in `tests/`
-* (Optional) Add benchmark suites under `benchmark/`
+* (Optional) Add benchmark suites under `benchmarks/`
 * Update (python) documentation index under `docs/`
 * Update `pyproject.toml` if you created new module in flashinfer
 
