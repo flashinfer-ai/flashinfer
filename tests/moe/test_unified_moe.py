@@ -51,6 +51,7 @@ from flashinfer.fused_moe.runners import (
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.api import (
     ActivationConfig,
@@ -58,6 +59,7 @@ from flashinfer.fused_moe.api import (
     BackendOptions,
     CuteDslConfig,
     CutlassConfig,
+    CutlassBf16Config,
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
@@ -72,6 +74,14 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.utils import get_compute_capability
+
+
+def _build_direct_runner(runner_type, config, device):
+    runner = runner_type(config, device=device)
+    runner.check_support()
+    runner.build()
+    return runner
+
 
 # Reuse the canonical reference implementation + accuracy helpers from the
 # existing CuteDSL test — keeps tolerance bounds consistent across tests.
@@ -258,19 +268,21 @@ class TestBackendOptions:
 
     def test_valid_for_filtering(self):
         opts = BackendOptions(
-            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
-        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
-        valid = opts.valid_for(80)
+        # SM90 is supported by CUTLASS BF16 but not the TRTLLM runners above.
+        valid = opts.valid_for(90)
         assert len(valid) == 1
-        assert isinstance(valid[0], CutlassConfig)
+        assert isinstance(valid[0], CutlassBf16Config)
 
     def test_valid_for_blackwell(self):
         opts = BackendOptions(
-            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert not CutlassConfig.supported(100)
+        assert CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
@@ -403,7 +415,9 @@ class TestHashability:
             routing=RoutingConfig(num_experts=8, top_k=2),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmBf16Config(), CutlassBf16Config())
+            ),
         )
         # Must not raise
         h = hash(cfg)
@@ -505,7 +519,9 @@ class TestExpressiveness:
             ),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmBf16Config(), CutlassBf16Config())
+            ),
         )
         assert cfg.quant.variant == QuantVariant.BF16
 
@@ -520,7 +536,7 @@ class TestExpressiveness:
         assert cfg.quant.variant == QuantVariant.MxInt4
 
     def test_cutlass_modular_fp8(self):
-        """CUTLASS modular (pre-routed) FP8 config."""
+        """Legacy declarative CUTLASS modular FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
@@ -528,8 +544,8 @@ class TestExpressiveness:
             activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions((CutlassConfig(),)),
         )
-        # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
-        # MoEActivationPack (topk_ids/topk_weights), not via config
+        # CutlassConfig preserves the historical quant-neutral declarative form for
+        # compatibility; it is not a registered runnable backend.
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
@@ -747,6 +763,90 @@ class TestMoERunnerSupport:
         runner = Runner()
         runner.config = self._nvfp4_swiglu()
         assert runner.check_support() is None
+
+
+class TestBuiltInRunnerLifecycle:
+    @staticmethod
+    def _config(variant):
+        return MoEConfig(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(variant=variant),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=ActivationConfig.swiglu,
+            execution=ExecutionConfig(enable_pdl=False),
+        )
+
+    @pytest.mark.parametrize(
+        "runner_type,variant",
+        (
+            (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
+            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
+            (TrtllmFp8PerTensorRunner, QuantVariant.FP8PerTensor),
+            (TrtllmBf16RoutedRunner, QuantVariant.BF16),
+            (TrtllmMxInt4RoutedRunner, QuantVariant.MxInt4),
+        ),
+    )
+    def test_trtllm_constructor_defers_idempotent_module_build(
+        self, monkeypatch, runner_type, variant
+    ):
+        from flashinfer.fused_moe import core
+
+        module = object()
+        loads = []
+
+        def load_module():
+            loads.append("module")
+            return module
+
+        monkeypatch.setattr(core, "get_trtllm_moe_sm100_module", load_module)
+        runner = runner_type(self._config(variant), torch.device("cuda:0"))
+        runner._check_support = lambda: None
+
+        assert runner._module is None
+        assert loads == []
+
+        runner.check_support()
+        runner.build()
+        runner.build()
+
+        assert runner._module is module
+        assert runner._built
+        assert loads == ["module"]
+
+    def test_cute_dsl_constructor_defers_idempotent_inner_build(self, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl import fused_moe, tuner
+
+        events = []
+        tuning_config = object()
+
+        class Inner:
+            def __init__(self, **kwargs):
+                events.append(("build", kwargs))
+                self.tuning_config = tuning_config
+
+            def __hash__(self):
+                return 0
+
+        monkeypatch.setattr(tuner, "CuteDslFusedMoENvfp4Runner", Inner)
+        monkeypatch.setattr(
+            fused_moe, "_cute_dsl_fused_moe_nvfp4_impl", object()
+        )
+        runner = CuteDslNvfp4Runner(
+            self._config(QuantVariant.NVFP4), torch.device("cuda:0")
+        )
+        runner._check_support = lambda: None
+
+        assert runner._inner is None
+        assert events == []
+
+        runner.check_support()
+        runner.build()
+        runner.build()
+
+        assert len(events) == 1
+        assert runner._built
+        assert runner.tuning_config is tuning_config
+        assert hash(runner) == hash(("cute_dsl_nvfp4", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -1769,7 +1869,7 @@ class TestTrtllmFp4UnpackedContract:
                 local_num_experts=32,
             ),
         )
-        runner = TrtllmFp4RoutedRunner(config, device=device)
+        runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
         ids = torch.randint(
             32, 64, (num_tokens, top_k), dtype=torch.int32, device=device
         )
@@ -1828,7 +1928,7 @@ class TestTrtllmFp4UnpackedContract:
                 local_num_experts=num_experts,
             ),
         )
-        runner = TrtllmFp4RoutedRunner(config, device=device)
+        runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
         act_pack = MoEActivationPack(
             hidden_states_q=tensors["x"],
             hidden_states_scale=tensors["x_sf"].squeeze(-1),
@@ -1940,7 +2040,7 @@ class TestTrtllmEPOffset:
                 ),
                 routing_input_mode=routing_input_mode,
             )
-            runner = TrtllmFp4RoutedRunner(config, device=device)
+            runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
             inputs = runner.pack_inputs(act_pack, weight_pack)
             return runner.forward(inputs, tactic=-1).clone()
 
@@ -1987,7 +2087,7 @@ class TestTrtllmFromLogitsPackingContract:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
-        runner = TrtllmFp4RoutedRunner(config, device=device)
+        runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
 
         routing_logits = torch.randn(
             num_tokens, num_experts, dtype=logits_dtype, device=device
@@ -2051,7 +2151,9 @@ class TestTrtllmFromLogitsPackingContract:
             routing_input_mode=RoutingInputMode.FromLogits,
             routing_logits=logits,
         )
-        runner = TrtllmBf16RoutedRunner(config, device=logits.device)
+        runner = _build_direct_runner(
+            TrtllmBf16RoutedRunner, config, logits.device
+        )
         inputs = runner.pack_inputs(logits_act, weights)
         return runner, inputs, MoeRunnerInputs.from_list(inputs), logits
 
