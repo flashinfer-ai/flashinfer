@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2011-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are not permit-
  * ted.
@@ -79,6 +79,10 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue fusion
+  float const* ptrDsv4InvRopeCosSinCache;
+  // Dsv4 output block-scaled tensor, only for epilogue fusion
+  float* ptrDsv4OScaleFp32;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -130,6 +134,8 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // Padded token dimension for the DSv4 fused FP32 scale layout.
+  int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
   float mInflateMax;
