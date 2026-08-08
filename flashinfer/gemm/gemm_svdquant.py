@@ -79,6 +79,7 @@ def _compile_sm120_nvfp4_svdquant(
     rank: int,
     with_bias: bool,
     mma_tiler_mn: Tuple[int, int],
+    tile_k: int,
     swap_ab: bool,
     use_prefetch: bool,
     sf_m: int,
@@ -99,6 +100,7 @@ def _compile_sm120_nvfp4_svdquant(
         rank,
         with_bias,
         mma_tiler_mn,
+        tile_k,
         swap_ab,
         use_prefetch,
         max_active_clusters,
@@ -122,6 +124,7 @@ def _compile_sm120_nvfp4_svdquant(
         16,
         mma_tiler_mn,
         (1, 1),
+        tile_k=tile_k,
         use_prefetch=use_prefetch,
         enable_pdl=enable_pdl,
         swap_ab=swap_ab,
@@ -197,7 +200,7 @@ def _compile_sm120_nvfp4_svdquant(
 
     kernel_name = (
         f"r{rank}_bias{int(with_bias)}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
-        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_mac{max_active_clusters}"
+        f"x{tile_k}_swap{int(swap_ab)}_pf{int(use_prefetch)}_mac{max_active_clusters}"
         f"_pdl{int(enable_pdl)}"
     )
     compiled = build_and_load_cute_dsl_kernel(
@@ -237,13 +240,14 @@ def _mm_nvfp4_svdquant_sm120_fused(
         plan = _select_default_dense_gemm_plan(
             m, n, real_k, get_device_sm_count(a.device), expected_m=m
         )
-        tactic = (plan.mma_tiler_mn, plan.swap_ab, False)
-    mma_tiler_mn, swap_ab, use_prefetch = tactic
+        tactic = (plan.mma_tiler_mn, 128, plan.swap_ab, False)
+    mma_tiler_mn, tile_k, swap_ab, use_prefetch = tactic
     compiled = _compile_sm120_nvfp4_svdquant(
         device=a.device,
         rank=d.shape[1],
         with_bias=bias is not None,
         mma_tiler_mn=mma_tiler_mn,
+        tile_k=tile_k,
         swap_ab=swap_ab,
         use_prefetch=use_prefetch,
         sf_m=sf_m,
@@ -332,7 +336,12 @@ def _sm120_nvfp4_svdquant_runner(enable_pdl: bool):
             c_dtype = torch_to_cutlass_dtype(out.dtype)
             tactics = []
 
-            def _add(mma_tiler_mn, swap_ab):
+            def _add(
+                mma_tiler_mn,
+                tile_k,
+                swap_ab,
+                prefetch_candidates=(False, True),
+            ):
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     cutlass.Float4E2M1FN,
                     cutlass.Float8E4M3FN,
@@ -348,20 +357,40 @@ def _sm120_nvfp4_svdquant_runner(enable_pdl: bool):
                     "n",
                     swap_ab=swap_ab,
                     svdquant_rank=d.shape[1],
+                    mainloop_tile_k=tile_k,
                 ):
                     return
-                for use_prefetch in (False, True):
-                    tactic = (mma_tiler_mn, swap_ab, use_prefetch)
+                for use_prefetch in prefetch_candidates:
+                    tactic = (
+                        mma_tiler_mn,
+                        tile_k,
+                        swap_ab,
+                        use_prefetch,
+                    )
                     if tactic not in tactics:
                         tactics.append(tactic)
 
-            for mma_tiler_mn in [(64, 64), (64, 128), (128, 64), (128, 128)]:
-                _add(mma_tiler_mn, swap_ab=False)
+            for mma_tiler_mn in ((64, 64), (64, 128), (128, 64), (128, 128)):
+                _add(mma_tiler_mn, 128, swap_ab=False)
 
             plan = _select_default_dense_gemm_plan(
                 m, n, real_k, get_device_sm_count(a.device), expected_m=m
             )
-            _add(plan.mma_tiler_mn, plan.swap_ab)
+            _add(plan.mma_tiler_mn, 128, plan.swap_ab)
+            for tile_k in (64, 256):
+                _add(
+                    plan.mma_tiler_mn,
+                    tile_k,
+                    plan.swap_ab,
+                    prefetch_candidates=(False,),
+                )
+            if m >= 256 and n >= 64:
+                _add(
+                    (256, 64),
+                    128,
+                    swap_ab=False,
+                    prefetch_candidates=(True,),
+                )
             return tactics
 
         def forward(
@@ -971,25 +1000,7 @@ def svdquant_linear(
         enable_pdl=enable_pdl,
         backend=quantize_backend,
     )
-    use_sm120_cute_dsl = quantize_backend == "cute-dsl" or (
-        quantize_backend == "auto"
-        and nvfp4_quantize_smooth.suitable_auto_backends[0] == "cute-dsl"
-    )
-    if use_sm120_cute_dsl:
-        # The rank-r projection is small enough that PyTorch's generic BF16
-        # dispatch leaves substantial launch/selection overhead on SM120.
-        # FlashInfer's cuDNN runner selects and caches the BF16 tensor-core
-        # engine for this exact MxKxR problem.  Keep torch.mm as the optional-
-        # dependency fallback; it also preserves the existing SM100 path.
-        from .gemm_base import CUDNN_AVAILABLE, mm_bf16
-
-        down = (
-            mm_bf16(x, l2t_smoothed, backend="cudnn")
-            if CUDNN_AVAILABLE
-            else torch.mm(x, l2t_smoothed)
-        )
-    else:
-        down = torch.mm(x, l2t_smoothed)
+    down = torch.mm(x, l2t_smoothed)
     return mm_nvfp4_svdquant(
         xq,
         weight_fp4,

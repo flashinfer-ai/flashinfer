@@ -67,10 +67,16 @@ def test_sm120_svdquant_can_implement_rejects_ragged_rank():
         "n",
     )
     assert Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=32
+        *common_args, svdquant_rank=32, mainloop_tile_k=128
     )
     assert not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
-        *common_args, svdquant_rank=18
+        *common_args, svdquant_rank=18, mainloop_tile_k=128
+    )
+    assert not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+        *common_args, svdquant_rank=32, mainloop_tile_k=256
+    )
+    assert Sm120B12xBlockScaledDenseGemmKernel.can_implement(
+        *common_args, svdquant_rank=64, mainloop_tile_k=256
     )
 
 
@@ -536,6 +542,37 @@ def test_mm_nvfp4_svdquant_sm120_fused(use_bias):
     assert _sqnr_db(fp32_ref, out.float()) > 35.0
 
 
+@pytest.mark.parametrize("tile_k,rank", [(64, 32), (128, 32), (256, 64)])
+def test_mm_nvfp4_svdquant_sm120_large_m_tile(tile_k, rank):
+    _skip_unless_sm120()
+    from flashinfer.gemm.gemm_svdquant import _mm_nvfp4_svdquant_sm120_fused
+
+    torch.manual_seed(tile_k)
+    p = _make_gemm_problem(
+        257,
+        128,
+        512,
+        rank=rank,
+        quant_backend="cute-dsl",
+        residual_backend="b12x",
+    )
+    out = torch.empty(257, 128, dtype=torch.bfloat16, device="cuda")
+    _mm_nvfp4_svdquant_sm120_fused(
+        p["xq"],
+        p["wq"],
+        p["x_sf_flat"],
+        p["w_sf_flat"],
+        p["alpha"],
+        p["d"],
+        p["l1_scaled"],
+        p["bias"],
+        out,
+        device_support_pdl(torch.device("cuda")),
+        tactic=((256, 64), tile_k, False, False),
+    )
+    assert _sqnr_db(p["ref_bias"], out.float()) > 35.0
+
+
 @pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
 def test_mm_nvfp4_svdquant_sm120_autotuned_replay(backend):
     _skip_unless_sm120()
@@ -764,16 +801,15 @@ def test_mm_nvfp4_svdquant_sm120_fused_does_not_call_torch_mm(monkeypatch):
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
     _skip_unless_sm120()
-    import flashinfer.gemm.gemm_base as gemm_base
+    torch_mm_calls = 0
+    original_torch_mm = torch.mm
 
-    mm_bf16_backends = []
-    original_mm_bf16 = gemm_base.mm_bf16
+    def recording_torch_mm(*args, **kwargs):
+        nonlocal torch_mm_calls
+        torch_mm_calls += 1
+        return original_torch_mm(*args, **kwargs)
 
-    def recording_mm_bf16(*args, **kwargs):
-        mm_bf16_backends.append(kwargs.get("backend"))
-        return original_mm_bf16(*args, **kwargs)
-
-    monkeypatch.setattr(gemm_base, "mm_bf16", recording_mm_bf16)
+    monkeypatch.setattr(torch, "mm", recording_torch_mm)
     torch.manual_seed(0)
     m, n, k, rank = 129, 256, 256, 32
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") / (k**0.25)
@@ -812,6 +848,7 @@ def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
         global_sf,
         bias=bias,
     )
+    assert torch_mm_calls == 1
 
     xq, x_sf = nvfp4_quantize(
         smoothed,
@@ -835,10 +872,6 @@ def test_svdquant_linear_sm120_fused(use_bias, monkeypatch):
 
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
     assert _sqnr_db(ref, out.float()) > 35.0
-    if gemm_base.CUDNN_AVAILABLE:
-        assert mm_bf16_backends == ["cudnn"]
-    else:
-        assert mm_bf16_backends == []
 
 
 @pytest.mark.parametrize("rank", [32, 128])

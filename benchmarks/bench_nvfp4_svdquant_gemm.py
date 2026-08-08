@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Benchmark NVFP4 SVDQuant on SM100/SM103 and SM120/SM121 GPUs.
 
-For every (n, k) x m problem this script times five things after autotuning:
-  1. mm_nvfp4_svdquant : selected SVDQuant implementation; auto tunes fused
-                         versus unfused on SM120, or can be explicitly overridden
-  2. unfused oracle    : the same operation composed from separate SM120 kernels
+For every (n, k) x m problem this script times six things after autotuning:
+  1. fused             : the fused residual + LoRA-up SVDQuant kernel
+  2. unfused           : the same operation composed from separate SM120 kernels
   3. svdquant_linear   : the full chain (nvfp4_quantize_smooth -> bf16 LoRA-down
-                         GEMM -> fused GEMM)
-  4. mm_fp4            : the stock NVFP4 GEMM on the same residual operands
+                         GEMM -> selected fused/unfused output implementation)
+  4. residual_fp4      : the stock NVFP4 GEMM on the same residual operands
                          (no LoRA correction), as the lower-bound baseline
-  5. bf16 linear       : conventional dense BF16 linear GEMM + bias on the
-                         unquantized activation and weight
+  5. BF16 GEMM         : dense BF16 residual GEMM + bias; timed but hidden
+  6. FP8 per-tensor    : dense FP8 residual GEMM; timed but hidden
 
 The reported algorithmic TFLOPS/s count matmul operations only:
   * fused GEMM:      2*m*n*k + 2*m*n*rank
   * svdquant_linear: fused GEMM + 2*m*k*rank (LoRA-down)
-  * mm_fp4:          2*m*n*k
-  * bf16 linear:     2*m*n*k
+  * residual_fp4:    2*m*n*k
 
 Quantization, alpha scaling, and bias addition are timed where applicable but
 are not included in the operation count.
@@ -39,6 +37,7 @@ import torch
 from flashinfer import (
     SfLayout,
     autotune,
+    bmm_fp8,
     mm_fp4,
     mm_nvfp4_svdquant,
     nvfp4_quantize,
@@ -51,6 +50,16 @@ from flashinfer.utils import get_compute_capability
 # Qwen-Image DiT linear shapes: (n, k) per layer type, m image-token counts.
 NK_SHAPES = [(3072, 3072), (12288, 3072), (3072, 12288)]
 M_VALUES = [4096, 6889, 9216, 16384]
+
+
+def _to_float8(x, dtype=torch.float8_e4m3fn):
+    """Quantize one tensor with a single scale, outside the timed region."""
+    finfo = torch.finfo(dtype)
+    min_value, max_value = x.aminmax()
+    amax = torch.maximum(min_value.abs(), max_value.abs()).clamp(min=1e-12)
+    scale = finfo.max / amax
+    quantized = (x * scale).clamp(min=finfo.min, max=finfo.max).to(dtype)
+    return quantized, scale.reciprocal().float()
 
 
 def _build_case(m, n, k, rank, device):
@@ -99,6 +108,10 @@ def _build_case(m, n, k, rank, device):
     l1_scaled = (lora_b.float() / alpha).to(torch.bfloat16).contiguous()
     d = torch.mm(x, l2t_smoothed)  # LoRA-down output for the fused-GEMM-only path
     bias = torch.randn(n, dtype=torch.bfloat16, device=device).contiguous()
+    x_fp8, x_fp8_scale = _to_float8(x)
+    # bmm_fp8 expects B as column-major [batch, k, n]. Quantizing W.T retains
+    # its column-major stride, while the singleton batch dimension is a view.
+    w_fp8, w_fp8_scale = _to_float8(w.T)
 
     return {
         "x": x,
@@ -119,6 +132,11 @@ def _build_case(m, n, k, rank, device):
         "out_fused": torch.empty(m, n, dtype=torch.bfloat16, device=device),
         "out_fp4": torch.empty(m, n, dtype=torch.bfloat16, device=device),
         "out_bf16": torch.empty(m, n, dtype=torch.bfloat16, device=device),
+        "x_fp8": x_fp8.unsqueeze(0),
+        "x_fp8_scale": x_fp8_scale,
+        "w_fp8": w_fp8.unsqueeze(0),
+        "w_fp8_scale": w_fp8_scale,
+        "out_fp8": torch.empty(1, m, n, dtype=torch.bfloat16, device=device),
     }
 
 
@@ -154,7 +172,9 @@ def bench_one(
 ):
     c = _build_case(m, n, k, rank, device)
 
-    def run_selected():
+    fused_backend = "cute-dsl" if get_compute_capability(device)[0] == 12 else "cutlass"
+
+    def run_fused():
         mm_nvfp4_svdquant(
             c["xq"],
             c["wq"],
@@ -165,10 +185,10 @@ def bench_one(
             c["l1_scaled"],
             bias=c["bias"],
             out=c["out_fused"],
-            backend=svdquant_backend,
+            backend=fused_backend,
         )
 
-    def run_linear():
+    def run_svdquant_linear():
         svdquant_linear(
             c["x"],
             c["wq"],
@@ -211,7 +231,7 @@ def bench_one(
             use_nvfp4=True,
         )
 
-    def run_bf16_linear():
+    def run_residual_gemm():
         torch.addmm(
             c["bias"],
             c["x"],
@@ -219,15 +239,27 @@ def bench_one(
             out=c["out_bf16"],
         )
 
+    def run_fp8_per_tensor():
+        bmm_fp8(
+            c["x_fp8"],
+            c["w_fp8"],
+            c["x_fp8_scale"],
+            c["w_fp8_scale"],
+            torch.bfloat16,
+            out=c["out_fp8"],
+            backend="auto",
+        )
+
     # Tune once; subsequent calls replay the best tactic from the tuner cache.
     with autotune(True):
         for _ in range(3):
-            run_selected()
+            run_fused()
             if unfused_backend is not None:
                 run_unfused()
-            run_linear()
+            run_svdquant_linear()
             run_mm_fp4()
-            run_bf16_linear()
+            run_residual_gemm()
+            run_fp8_per_tensor()
     torch.cuda.synchronize()
 
     bench_kwargs = dict(
@@ -237,17 +269,25 @@ def bench_one(
         enable_cupti=True,
         cold_l2_cache=cold_l2_cache,
     )
-    selected_us = _median_us(bench_gpu_time(run_selected, **bench_kwargs))
+    fused_us = _median_us(bench_gpu_time(run_fused, **bench_kwargs))
     unfused_us = (
         _median_us(bench_gpu_time(run_unfused, **bench_kwargs))
         if unfused_backend is not None
         else float("nan")
     )
-    linear_us = _median_us(bench_gpu_time(run_linear, **bench_kwargs))
+    svdquant_linear_us = _median_us(bench_gpu_time(run_svdquant_linear, **bench_kwargs))
     mm_fp4_us = _median_us(bench_gpu_time(run_mm_fp4, **bench_kwargs))
-    bf16_linear_us = _median_us(bench_gpu_time(run_bf16_linear, **bench_kwargs))
+    residual_gemm_us = _median_us(bench_gpu_time(run_residual_gemm, **bench_kwargs))
+    fp8_per_tensor_us = _median_us(bench_gpu_time(run_fp8_per_tensor, **bench_kwargs))
 
-    return selected_us, unfused_us, linear_us, mm_fp4_us, bf16_linear_us
+    return (
+        fused_us,
+        unfused_us,
+        svdquant_linear_us,
+        mm_fp4_us,
+        residual_gemm_us,
+        fp8_per_tensor_us,
+    )
 
 
 def main():
@@ -321,7 +361,11 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{major}{minor})")
     print(f"mm_fp4 baseline backend: {mm_fp4_backend}")
     print(f"SVDQuant implementation policy: {args.svdquant_backend}")
-    print("BF16 linear baseline: torch.addmm (PyTorch-selected CUDA backend)")
+    print("BF16 residual_gemm baseline: torch.addmm (PyTorch-selected CUDA backend)")
+    print(
+        "FP8 per-tensor baseline: bmm_fp8 backend=auto "
+        "(scales and quantization excluded)"
+    )
     print(f"unfused oracle backend: {unfused_backend or 'not available'}")
     print(f"execution mode: {'CUDA graph' if args.cuda_graph else 'eager'}")
     print(f"L2 mode: {'cold' if args.cold_l2_cache else 'warm'}")
@@ -329,12 +373,10 @@ def main():
     print("TFLOPS/s: algorithmic matmul operations; see module docstring\n")
 
     header = (
-        f"{'n':>6} {'k':>6} {'m':>6} {'rank':>5} | "
-        f"{'selected us':>11} {'selected TF/s':>13} | "
-        f"{'unfused us':>11} {'unfused TF/s':>13} {'unfused/selected':>17} | "
-        f"{'linear us':>10} {'linear TF/s':>11} | "
-        f"{'mm_fp4 us':>10} {'mm_fp4 TF/s':>11} | {'mm_fp4/selected':>15}"
-        f" | {'bf16 us':>9} {'bf16 TF/s':>10}"
+        f"{'n':>6} {'k':>6} {'m':>6} {'R':>5} | "
+        f"{'svdquant_linear us':>18} {'gain vs BF16':>13} {'gain vs FP8':>12} | "
+        f"{'residual_fp4/fused':>20} {'residual_fp4 TF/s/us':>22} | "
+        f"{'fusion gain':>11} {'fused TF/s/us':>17} {'unfused TF/s/us':>19}"
     )
     print(header)
     print("-" * len(header))
@@ -342,41 +384,56 @@ def main():
     for rank in args.ranks:
         for n, k in args.nk_shapes:
             for m in args.m_values:
-                selected_us, unfused_us, linear_us, mm_fp4_us, bf16_linear_us = (
-                    bench_one(
-                        m,
-                        n,
-                        k,
-                        rank,
-                        device,
-                        mm_fp4_backend,
-                        svdquant_backend,
-                        unfused_backend,
-                        args.cuda_graph,
-                        args.cold_l2_cache,
-                    )
+                (
+                    fused_us,
+                    unfused_us,
+                    svdquant_linear_us,
+                    mm_fp4_us,
+                    residual_gemm_us,
+                    fp8_per_tensor_us,
+                ) = bench_one(
+                    m,
+                    n,
+                    k,
+                    rank,
+                    device,
+                    mm_fp4_backend,
+                    svdquant_backend,
+                    unfused_backend,
+                    args.cuda_graph,
+                    args.cold_l2_cache,
                 )
-                fused_flops, linear_flops, mm_fp4_flops = _matmul_flops(m, n, k, rank)
-                selected_tflops = _tflops_per_sec(fused_flops, selected_us)
+                fused_flops, _, mm_fp4_flops = _matmul_flops(m, n, k, rank)
+                fused_tflops = _tflops_per_sec(fused_flops, fused_us)
                 unfused_tflops = _tflops_per_sec(fused_flops, unfused_us)
-                linear_tflops = _tflops_per_sec(linear_flops, linear_us)
                 mm_fp4_tflops = _tflops_per_sec(mm_fp4_flops, mm_fp4_us)
-                bf16_linear_tflops = _tflops_per_sec(mm_fp4_flops, bf16_linear_us)
-                unfused_to_selected = (
-                    unfused_us / selected_us if selected_us > 0 else float("nan")
+                gain_over_bf16 = (
+                    (residual_gemm_us / svdquant_linear_us - 1.0) * 100.0
+                    if svdquant_linear_us > 0
+                    else float("nan")
                 )
-                mm_fp4_to_selected = (
-                    mm_fp4_us / selected_us if selected_us > 0 else float("nan")
+                gain_over_fp8 = (
+                    (fp8_per_tensor_us / svdquant_linear_us - 1.0) * 100.0
+                    if svdquant_linear_us > 0
+                    else float("nan")
+                )
+                fusion_efficiency = (
+                    mm_fp4_us / fused_us if fused_us > 0 else float("nan")
+                )
+                fusion_gain = (
+                    (unfused_us / fused_us - 1.0) * 100.0
+                    if fused_us > 0
+                    else float("nan")
                 )
                 print(
                     f"{n:>6} {k:>6} {m:>6} {rank:>5} | "
-                    f"{selected_us:>11.2f} {selected_tflops:>13.2f} | "
-                    f"{unfused_us:>11.2f} {unfused_tflops:>13.2f} "
-                    f"{unfused_to_selected:>17.3f} | "
-                    f"{linear_us:>10.2f} {linear_tflops:>11.2f} | "
-                    f"{mm_fp4_us:>10.2f} {mm_fp4_tflops:>11.2f} | "
-                    f"{mm_fp4_to_selected:>15.3f} | "
-                    f"{bf16_linear_us:>9.2f} {bf16_linear_tflops:>10.2f}"
+                    f"{svdquant_linear_us:>18.2f} {gain_over_bf16:>12.1f}% "
+                    f"{gain_over_fp8:>11.1f}% | "
+                    f"{fusion_efficiency:>20.3f} "
+                    f"{mm_fp4_tflops:>10.2f}/{mm_fp4_us:<9.2f} | "
+                    f"{fusion_gain:>10.1f}% "
+                    f"{fused_tflops:>8.2f}/{fused_us:<8.2f} "
+                    f"{unfused_tflops:>9.2f}/{unfused_us:<9.2f}"
                 )
             print("-" * len(header))
 
