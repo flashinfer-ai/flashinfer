@@ -32,6 +32,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_nvfp4_svdquant
 from ..trace.templates.gemm import (
     mm_nvfp4_svdquant_trace,
@@ -42,6 +43,7 @@ from ..utils import (
     _get_cache_buf,
     backend_requirement,
     device_support_pdl,
+    get_device_sm_count,
     supported_compute_capability,
 )
 
@@ -52,6 +54,8 @@ DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 # rank granularity (CollectiveMmaLoRA::LoRaK); ranks 32-128 are validated.
 SVDQUANT_LORA_RANK_GRANULARITY = 32
 
+_SM120_SVDQUANT_KERNEL_CACHE: dict[tuple, object] = {}
+
 
 def _pad_up(x: int, y: int) -> int:
     return (x + y - 1) // y * y
@@ -60,6 +64,200 @@ def _pad_up(x: int, y: int) -> int:
 def _swizzled_sf_size(rows: int, sf_cols: int) -> int:
     """Size of the 128x4-swizzled block-scale layout for a [rows, sf_cols] scale matrix."""
     return _pad_up(rows, 128) * _pad_up(sf_cols, 4)
+
+
+def _view_128x4_sf(sf: torch.Tensor, rows: int, sf_cols: int) -> torch.Tensor:
+    """Restore a flat public scale buffer to its padded 128x4 storage view."""
+    size = _swizzled_sf_size(rows, sf_cols)
+    return sf.reshape(-1)[:size].view(_pad_up(rows, 128), _pad_up(sf_cols, 4))
+
+
+def _compile_sm120_nvfp4_svdquant(
+    *,
+    device: torch.device,
+    rank: int,
+    with_bias: bool,
+    mma_tiler_mn: Tuple[int, int],
+    swap_ab: bool,
+    sf_m: int,
+    sf_n: int,
+    sf_k: int,
+    enable_pdl: bool,
+):
+    """Compile one fused SM120 NVFP4 + rank-r BF16 epilogue specialization."""
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+
+    from ..cute_dsl.utils import get_max_active_clusters
+
+    max_active_clusters = get_max_active_clusters(1)
+    cache_key = (
+        device_index,
+        rank,
+        with_bias,
+        mma_tiler_mn,
+        swap_ab,
+        max_active_clusters,
+        enable_pdl,
+    )
+    if cache_key in _SM120_SVDQUANT_KERNEL_CACHE:
+        return _SM120_SVDQUANT_KERNEL_CACHE[cache_key]
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from cutlass.cute.runtime import make_ptr
+
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from .kernels import dense_blockscaled_gemm_sm120_b12x
+    from .kernels.dense_blockscaled_gemm_sm120_b12x import (
+        Sm120B12xBlockScaledDenseGemmKernel,
+    )
+
+    gemm = Sm120B12xBlockScaledDenseGemmKernel(
+        16,
+        mma_tiler_mn,
+        (1, 1),
+        use_prefetch=False,
+        enable_pdl=enable_pdl,
+        swap_ab=swap_ab,
+    )
+
+    def compile_kernel():
+        sym_m = cute.sym_int()
+        sym_k = cute.sym_int()
+        sym_n = cute.sym_int()
+        a_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (sym_m, sym_k),
+            stride_order=(1, 0),
+            assumed_align=32,
+        )
+        b_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (sym_n, sym_k),
+            stride_order=(1, 0),
+            assumed_align=32,
+        )
+        c_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (sym_m, sym_n),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        d_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (sym_m, rank),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        l1_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (sym_n, rank),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        bias_fake = (
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.BFloat16, (sym_n,), assumed_align=16
+            )
+            if with_bias
+            else None
+        )
+        a_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
+        b_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
+        alpha_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (1,), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            gemm.wrapper,
+            a_fake,
+            b_fake,
+            c_fake,
+            sf_m,
+            sf_n,
+            sf_k,
+            1,
+            a_sf_ptr,
+            b_sf_ptr,
+            alpha_fake,
+            max_active_clusters,
+            stream_fake,
+            False,
+            d_fake,
+            l1_fake,
+            bias_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+    kernel_name = (
+        f"r{rank}_bias{int(with_bias)}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        f"_swap{int(swap_ab)}_mac{max_active_clusters}_pdl{int(enable_pdl)}"
+    )
+    compiled = build_and_load_cute_dsl_kernel(
+        "mm_nvfp4_svdquant_sm120",
+        kernel_name,
+        compile_kernel,
+        extra_key_files=(__file__, dense_blockscaled_gemm_sm120_b12x.__file__),
+    )
+    _SM120_SVDQUANT_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _mm_nvfp4_svdquant_sm120_fused(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_sf: torch.Tensor,
+    b_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    d: torch.Tensor,
+    l1: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    from .kernels.dense_blockscaled_gemm_sm120_b12x import (
+        _select_default_dense_gemm_plan,
+    )
+
+    m, k_packed = a.shape
+    n = b.shape[0]
+    real_k = k_packed * 2
+    sf_m = (m + 127) // 128
+    sf_n = (n + 127) // 128
+    sf_k = (real_k // 16 + 3) // 4
+    plan = _select_default_dense_gemm_plan(
+        m, n, real_k, get_device_sm_count(a.device), expected_m=m
+    )
+    compiled = _compile_sm120_nvfp4_svdquant(
+        device=a.device,
+        rank=d.shape[1],
+        with_bias=bias is not None,
+        mma_tiler_mn=plan.mma_tiler_mn,
+        swap_ab=plan.swap_ab,
+        sf_m=sf_m,
+        sf_n=sf_n,
+        sf_k=sf_k,
+        enable_pdl=enable_pdl,
+    )
+    args = [
+        a,
+        b,
+        out,
+        sf_m,
+        sf_n,
+        sf_k,
+        a_sf.data_ptr(),
+        b_sf.data_ptr(),
+        alpha.reshape(1),
+        d,
+        l1,
+        bias,
+    ]
+    compiled(*args)
+    return out
 
 
 @functools.cache
@@ -147,6 +345,31 @@ def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
     return True
 
 
+@supported_compute_capability([120, 121])
+def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
+    if get_cuda_version().major < 13:
+        raise ValueError(
+            "SM120 SVDQuant CuTe DSL support requires CUDA 13 or later. "
+            f"Current CUDA version: {get_cuda_version()}."
+        )
+    from ..cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise ValueError(
+            "SM120 SVDQuant CuTe DSL support requires CuTe DSL, but it is not "
+            "available in the current environment."
+        )
+    return True
+
+
+def _heuristic_func_nvfp4_svdquant(
+    suitable_backends: List[str], *args, **kwargs
+) -> List[str]:
+    # The backend requirements are architecture-disjoint, so retaining their order
+    # is sufficient and keeps automatic dispatch deterministic.
+    return suitable_backends
+
+
 def _check_mm_nvfp4_svdquant_problem(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -157,13 +380,15 @@ def _check_mm_nvfp4_svdquant_problem(
     l1: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cutlass"] = "cutlass",
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
     enable_pdl: Optional[bool] = None,
 ):
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError("a and b must be 2-D packed-e2m1 (uint8) tensors")
     if a.dtype != torch.uint8 or b.dtype != torch.uint8:
         raise ValueError("a and b must be uint8 (two e2m1 values per byte)")
+    if not a.is_contiguous() or not b.is_contiguous():
+        raise ValueError("a and b must be contiguous")
     m, k_packed = a.shape
     n = b.shape[0]
     if b.shape[1] != k_packed:
@@ -190,12 +415,43 @@ def _check_mm_nvfp4_svdquant_problem(
         )
     if d.dtype != torch.bfloat16 or l1.dtype != torch.bfloat16:
         raise ValueError("d and l1 must be bf16")
+    if not d.is_contiguous() or not l1.is_contiguous():
+        raise ValueError("d and l1 must be contiguous")
+    if a_sf.dtype != torch.uint8 or b_sf.dtype != torch.uint8:
+        raise ValueError("a_sf and b_sf must be uint8 (ue4m3 block scales)")
+    expected_a_sf = _swizzled_sf_size(m, k // 16)
+    expected_b_sf = _swizzled_sf_size(n, k // 16)
+    if a_sf.numel() < expected_a_sf or b_sf.numel() < expected_b_sf:
+        raise ValueError(
+            "128x4 scale buffers are too small: "
+            f"a_sf has {a_sf.numel()} elements (need {expected_a_sf}), "
+            f"b_sf has {b_sf.numel()} elements (need {expected_b_sf})"
+        )
+    if not a_sf.is_contiguous() or not b_sf.is_contiguous():
+        raise ValueError("a_sf and b_sf must be contiguous")
+    if alpha.dtype != torch.float32 or alpha.numel() != 1:
+        raise ValueError("alpha must be a float32 device scalar")
+    if bias is not None and (bias.shape != (n,) or bias.dtype != torch.bfloat16):
+        raise ValueError(f"bias must have shape ({n},) and dtype bf16")
+    if out is not None:
+        if out.shape != (m, n) or out.dtype != torch.bfloat16:
+            raise ValueError(f"out must have shape ({m}, {n}) and dtype bf16")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+    tensors = (b, a_sf, b_sf, alpha, d, l1, bias, out)
+    if any(t is not None and t.device != a.device for t in tensors):
+        raise ValueError("all SVDQuant tensors must be on the same device")
     return True
 
 
 @backend_requirement(
-    {"cutlass": _cutlass_nvfp4_svdquant_requirement},
+    {
+        "cutlass": _cutlass_nvfp4_svdquant_requirement,
+        "cute-dsl": _cute_dsl_nvfp4_svdquant_requirement,
+        "cute-dsl-unfused": _cute_dsl_nvfp4_svdquant_requirement,
+    },
     common_check=_check_mm_nvfp4_svdquant_problem,
+    heuristic_func=_heuristic_func_nvfp4_svdquant,
 )
 @flashinfer_api(trace=mm_nvfp4_svdquant_trace)
 def mm_nvfp4_svdquant(
@@ -208,18 +464,19 @@ def mm_nvfp4_svdquant(
     l1: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cutlass"] = "cutlass",
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    r"""SVDQuant fused NVFP4 GEMM (SM100): ``out = alpha * (a @ bᵀ) + d @ l1ᵀ [+ bias]``.
+    r"""SVDQuant NVFP4 GEMM: ``out = alpha * (a @ bᵀ + d @ l1ᵀ) [+ bias]``.
 
-    The block-scaled NVFP4 residual GEMM is fused with the rank-r BF16 LoRA-up correction
-    ``d @ l1ᵀ``, computed by a second BF16 tcgen05 MMA into the same accumulator after the
-    NVFP4 K-loop, plus an optional fused per-column bias. The LoRA rank ``r`` is inferred
-    from the ``d``/``l1`` shapes and must be a positive multiple of 32 (ranks 32-128 are
-    validated). ``1/alpha`` must be folded into ``l1`` by the caller
-    (``l1 = svdquant_lora_b / alpha``) so the epilogue ``out = alpha * acc + bias`` yields
-    the correction unscaled.
+    On SM100/SM103, CUTLASS fuses the block-scaled NVFP4 residual GEMM with the rank-r
+    BF16 LoRA-up correction and optional bias. On SM120/SM121, ``"cute-dsl"`` fuses the
+    correction and bias into the b12x CuTe DSL kernel's FP32 accumulator epilogue, while
+    ``"cute-dsl-unfused"`` retains the compositional implementation as a differential
+    oracle and fallback. The LoRA rank ``r`` is inferred from the ``d``/``l1`` shapes and must
+    be a positive multiple of 32 (ranks 32-128 are validated). ``1/alpha`` must be folded
+    into ``l1`` by the caller (``l1 = svdquant_lora_b / alpha``), so both backends yield
+    the correction at its original scale.
 
     Parameters
     ----------
@@ -243,11 +500,15 @@ def mm_nvfp4_svdquant(
     l1: torch.Tensor
         LoRA-up weight pre-divided by alpha, shape ``(n, r)`` bf16 (same rank as ``d``).
     bias: Optional[torch.Tensor]
-        Optional per-column bias, shape ``(n,)`` bf16, fused in the epilogue.
+        Optional per-column bias, shape ``(n,)`` bf16. Fused by CUTLASS and the
+        SM120/SM121 CuTe DSL kernel.
     out: Optional[torch.Tensor]
         Output tensor, shape ``(m, n)`` bf16; allocated when ``None``.
-    backend: Literal["cutlass"]
-        Only the CUTLASS backend exists.
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"]
+        ``"cutlass"`` selects the fused SM100/SM103 implementation;
+        ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
+        ``"cute-dsl-unfused"`` selects its compositional reference path;
+        ``"auto"`` (default) selects by compute capability.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
 
@@ -260,6 +521,44 @@ def mm_nvfp4_svdquant(
         enable_pdl = device_support_pdl(a.device)
     if out is None:
         out = torch.empty(a.shape[0], b.shape[0], dtype=torch.bfloat16, device=a.device)
+
+    if backend == "auto":
+        backend = mm_nvfp4_svdquant.suitable_auto_backends[0]
+
+    if backend == "cute-dsl":
+        return _mm_nvfp4_svdquant_sm120_fused(
+            a, b, a_sf, b_sf, alpha, d, l1, bias, out, enable_pdl
+        )
+
+    if backend == "cute-dsl-unfused":
+        from .gemm_base import mm_fp4
+
+        m, k_packed = a.shape
+        n = b.shape[0]
+        sf_cols = k_packed * 2 // 16
+        a_sf_2d = _view_128x4_sf(a_sf, m, sf_cols)
+        b_sf_2d = _view_128x4_sf(b_sf, n, sf_cols)
+        mm_fp4(
+            a,
+            b.T,
+            a_sf_2d,
+            b_sf_2d.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="b12x",
+            use_nvfp4=True,
+            enable_pdl=enable_pdl,
+        )
+        correction = torch.mm(d, l1.T)
+        correction.mul_(alpha)
+        out.add_(correction)
+        if bias is not None:
+            out.add_(bias)
+        return out
+
     workspace_buffer = _get_cache_buf(
         "nvfp4_svdquant_gemm_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
@@ -282,7 +581,7 @@ def _check_nvfp4_quantize_smooth_problem(
     pre_quant_scale: torch.Tensor,
     global_scale: torch.Tensor,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cutlass"] = "cutlass",
+    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ):
     if x.ndim != 2:
         raise ValueError(f"x must be [m, n], got {tuple(x.shape)}")
@@ -300,8 +599,12 @@ def _check_nvfp4_quantize_smooth_problem(
 
 
 @backend_requirement(
-    {"cutlass": _cutlass_nvfp4_svdquant_requirement},
+    {
+        "cutlass": _cutlass_nvfp4_svdquant_requirement,
+        "cute-dsl": _cute_dsl_nvfp4_svdquant_requirement,
+    },
     common_check=_check_nvfp4_quantize_smooth_problem,
+    heuristic_func=_heuristic_func_nvfp4_svdquant,
 )
 @flashinfer_api(trace=nvfp4_quantize_smooth_trace)
 def nvfp4_quantize_smooth(
@@ -309,13 +612,14 @@ def nvfp4_quantize_smooth(
     pre_quant_scale: torch.Tensor,
     global_scale: torch.Tensor,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cutlass"] = "cutlass",
+    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Fused smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
+    r"""Smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
-    Applies the SVDQuant per-input-channel smoothing scale and NVFP4-quantizes in one pass
-    over the input; the result is byte-identical to quantizing ``x * pre_quant_scale`` with
-    the stock NVFP4 quantizer (ue4m3 block scales, 128x4 swizzled layout, SF vector size 16).
+    The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
+    and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL compatibility backend first
+    materializes the BF16 smoothed input and then invokes the CuTe DSL NVFP4 quantizer.
+    Both use ue4m3 block scales, the 128x4 swizzled layout, and SF vector size 16.
 
     Parameters
     ----------
@@ -327,8 +631,10 @@ def nvfp4_quantize_smooth(
         Global scale, float32 device scalar: ``(448 * 6) / (x * pre_quant_scale).abs().max()``.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
-    backend: Literal["cutlass"]
-        Only the CUDA backend exists.
+    backend: Literal["cutlass", "cute-dsl", "auto"]
+        ``"cutlass"`` selects fused smoothing and quantization on SM100/SM103;
+        ``"cute-dsl"`` selects unfused smoothing plus CuTe DSL quantization on
+        SM120/SM121; ``"auto"`` (default) selects by compute capability.
 
     Returns
     -------
@@ -340,6 +646,23 @@ def nvfp4_quantize_smooth(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(x.device)
+    if backend == "auto":
+        backend = nvfp4_quantize_smooth.suitable_auto_backends[0]
+    if backend == "cute-dsl":
+        from ..quantization.fp4_quantization import nvfp4_quantize
+        from ..tllm_enums import SfLayout
+
+        xq, sf = nvfp4_quantize(
+            (x * pre_quant_scale).to(torch.bfloat16),
+            global_scale,
+            sfLayout=SfLayout.layout_128x4,
+            do_shuffle=False,
+            sf_vec_size=16,
+            enable_pdl=enable_pdl,
+            backend="cute-dsl",
+        )
+        return xq.view(torch.uint8), sf.view(torch.uint8).reshape(-1)
+
     m, n = x.shape
     module = get_nvfp4_svdquant_module()
     xq = torch.empty(m, n // 2, dtype=torch.uint8, device=x.device)
@@ -360,6 +683,7 @@ def svdquant_linear(
     global_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""The full SVDQuant linear operator: ``y = x_hat @ (R + L1 @ L2)ᵀ [+ bias]`` where
     ``x_hat = x * pre_quant_scale`` and ``R`` is the NVFP4-quantized residual weight.
@@ -397,14 +721,22 @@ def svdquant_linear(
         Optional per-column bias, shape ``(n,)`` bf16.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"]
+        Backend forwarded to smooth quantization and SVDQuant GEMM. Defaults to
+        architecture-based automatic selection.
 
     Returns
     -------
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
+    quantize_backend = "cute-dsl" if backend == "cute-dsl-unfused" else backend
     xq, x_sf = nvfp4_quantize_smooth(
-        x, pre_quant_scale, global_scale, enable_pdl=enable_pdl
+        x,
+        pre_quant_scale,
+        global_scale,
+        enable_pdl=enable_pdl,
+        backend=quantize_backend,
     )
     down = torch.mm(x, l2t_smoothed)
     return mm_nvfp4_svdquant(
@@ -417,4 +749,5 @@ def svdquant_linear(
         l1_scaled,
         bias=bias,
         enable_pdl=enable_pdl,
+        backend=backend,
     )

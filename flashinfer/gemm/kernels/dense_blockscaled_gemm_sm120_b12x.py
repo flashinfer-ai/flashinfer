@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import logging
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -409,6 +409,9 @@ class DenseGemmKernel:
         alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        svdquant_d: Optional[cute.Tensor] = None,
+        svdquant_l1: Optional[cute.Tensor] = None,
+        svdquant_bias: Optional[cute.Tensor] = None,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation.
@@ -423,6 +426,9 @@ class DenseGemmKernel:
             max_active_clusters: Max active clusters
             stream: CUDA stream
             epilogue_op: Elementwise epilogue function
+            svdquant_d: Optional BF16 LoRA-down output, shape (M, rank)
+            svdquant_l1: Optional BF16 scaled LoRA-up weight, shape (N, rank)
+            svdquant_bias: Optional BF16 per-column bias, shape (N,)
         """
         # Setup static attributes
         self.a_dtype = a.element_type
@@ -560,6 +566,9 @@ class DenseGemmKernel:
             tile_sched_params,
             epilogue_op,
             alpha,
+            svdquant_d,
+            svdquant_l1,
+            svdquant_bias,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -907,6 +916,9 @@ class DenseGemmKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        svdquant_d: Optional[cute.Tensor],
+        svdquant_l1: Optional[cute.Tensor],
+        svdquant_bias: Optional[cute.Tensor],
     ):
         # Keep alpha in FP32 for precision
         alpha_value = alpha[0].to(cutlass.Float32)
@@ -1595,6 +1607,69 @@ class DenseGemmKernel:
                                 tCrB[None, _nt, k_block_idx],
                                 accumulators[None, _mt, _nt],
                             )
+
+                # SVDQuant fusion: accumulate the rank-r BF16 correction into the
+                # same FP32 registers as the NVFP4 residual before the epilogue.
+                # The first SM120 implementation uses scalar BF16 dot products;
+                # this keeps one device launch and the exact public contract while
+                # leaving BF16 warp-MMA staging as a transparent optimization.
+                if cutlass.const_expr(svdquant_d is not None):
+                    acc_mn = _reshape_acc_to_mn(
+                        accumulators,
+                        transpose=self.swap_ab,
+                    )
+                    c_identity = cute.make_identity_tensor(
+                        (
+                            self.tile_shape_mnk[1],
+                            self.tile_shape_mnk[0],
+                        )
+                        if cutlass.const_expr(self.swap_ab)
+                        else (
+                            self.tile_shape_mnk[0],
+                            self.tile_shape_mnk[1],
+                        )
+                    )
+                    coord_mn = _reshape_acc_to_mn(
+                        thr_mma.partition_C(c_identity),
+                        transpose=self.swap_ab,
+                    )
+                    rank = cute.size(svdquant_d, mode=[1])
+                    for acc_m in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
+                        for acc_n in cutlass.range_constexpr(
+                            cute.size(acc_mn.shape[1])
+                        ):
+                            coord = coord_mn[acc_m, acc_n]
+                            if cutlass.const_expr(self.swap_ab):
+                                m_local = coord[1]
+                                n_local = coord[0]
+                            else:
+                                m_local = coord[0]
+                                n_local = coord[1]
+                            m_coord = (
+                                tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                                + m_local
+                            )
+                            n_coord = (
+                                tile_coord_mnl[1] * Int32(self.tile_shape_mnk[1])
+                                + n_local
+                            )
+                            if m_coord < Int32(
+                                directC_mnl.shape[0]
+                            ) and n_coord < Int32(directC_mnl.shape[1]):
+                                correction = Float32(0.0)
+                                for rank_idx in cutlass.range(rank, unroll=1):
+                                    correction += svdquant_d[(m_coord, rank_idx)].to(
+                                        Float32
+                                    ) * svdquant_l1[(n_coord, rank_idx)].to(Float32)
+                                if cutlass.const_expr(svdquant_bias is not None):
+                                    # The common epilogue multiplies the whole FP32
+                                    # accumulator by alpha. Pre-dividing bias here
+                                    # retains out = alpha*(residual+correction)+bias.
+                                    correction += (
+                                        svdquant_bias[(n_coord,)].to(Float32)
+                                        / alpha_value
+                                    )
+                                acc_mn[acc_m, acc_n] += correction
 
                 if cutlass.const_expr(self.swap_ab):
                     acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
@@ -2544,6 +2619,9 @@ class DenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         current_stream,
         swap_ab: cutlass.Constexpr = False,
+        svdquant_d: Optional[cute.Tensor] = None,
+        svdquant_l1: Optional[cute.Tensor] = None,
+        svdquant_bias: Optional[cute.Tensor] = None,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Wrapper matching the SM100 compile interface."""
@@ -2602,6 +2680,9 @@ class DenseGemmKernel:
             alpha_tensor,
             max_active_clusters,
             current_stream,
+            svdquant_d,
+            svdquant_l1,
+            svdquant_bias,
             epilogue_op,
         )
 
