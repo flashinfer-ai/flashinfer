@@ -109,7 +109,7 @@ export VIRTUAL_ENV="${VENV}"
 
 uv pip install --python "${VENV}/bin/python" \
     torch setuptools packaging \
-    "apache-tvm-ffi>=0.1.6,<0.2,!=0.1.8,!=0.1.8.post0" \
+    "apache-tvm-ffi>=0.1.10,<0.2" \
     cython pybind11
 
 # NIXL-EP runtime base library — supplied by this pip wheel; the NIXL-EP

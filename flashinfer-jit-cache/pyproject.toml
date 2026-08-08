@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "wheel", "tqdm", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "apache-tvm-ffi>=0.1,<0.2"]
+# Every .so in this wheel is compiled against apache-tvm-ffi's headers, so the version
+# resolved here is this package's ABI. Release builds pin it exactly via PIP_CONSTRAINT
+# (scripts/build_constraints.txt); the declared range is what consumers must satisfy.
+requires = ["setuptools>=77", "packaging>=24", "wheel", "tqdm", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "apache-tvm-ffi>=0.1.10,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -28,7 +31,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+# This wheel ships prebuilt .so files that link libtvm_ffi, so it carries a real runtime
+# ABI requirement; an empty list let pip pair it with an incompatible apache-tvm-ffi and
+# fail as a segfault at the first kernel call rather than at install time.
+dependencies = ["apache-tvm-ffi>=0.1.10,<0.2"]
 
 [project.urls]
 Homepage = "https://github.com/flashinfer-ai/flashinfer"
