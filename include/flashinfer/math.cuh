@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace flashinfer {
 namespace math {
@@ -30,7 +31,12 @@ constexpr float log2e = 1.44269504088896340736f;
 
 constexpr float loge2 = 0.693147180559945309417f;
 
-constexpr float inf = 5e4;
+// Use true IEEE infinity instead of a finite sentinel value.
+// This allows attention to correctly handle extreme negative logits
+// that legitimately fall below any fixed finite threshold.
+// Masked positions use -inf, and fully-masked rows are detected
+// via equality checks (m == -math::inf) in output normalization.
+constexpr float inf = std::numeric_limits<float>::infinity();
 
 __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&x; }
 
