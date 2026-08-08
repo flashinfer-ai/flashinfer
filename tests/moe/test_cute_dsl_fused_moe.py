@@ -1479,11 +1479,13 @@ class TestCuteDslFusedMoeFunctional:
         "quant_mode, use_per_token_activation",
         _MOE_QUANT_MODE_CASES,
     )
+    @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
     @pytest.mark.parametrize("hidden_size", [256, 384])
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
         use_per_token_activation: bool,
+        apply_router_weight_on_input: bool,
         hidden_size: int,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -1525,6 +1527,7 @@ class TestCuteDslFusedMoeFunctional:
             quant_mode=quant_mode,
             use_per_token_activation=use_per_token_activation,
             use_fused_finalize=True,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
     def _run_numerical_accuracy(
