@@ -197,6 +197,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
       if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Disable FP4 2-CTA kernels due to the random hang tracked in
+        // https://github.com/flashinfer-ai/flashinfer/issues/3971
+        bool const isFp4Kernel =
+            (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeB == tg::Dtype::E2m1) ||
+            (options.mDtypeA == tg::Dtype::MxE2m1 && options.mDtypeB == tg::Dtype::MxE2m1);
+        if (isFp4Kernel && options.mClusterDimX > 1) continue;
         // Skip cubins with clusterZ > 1 due to correctness issues described in
         // https://github.com/flashinfer-ai/flashinfer/issues/3197
         if (options.mClusterDimZ > 1) continue;
