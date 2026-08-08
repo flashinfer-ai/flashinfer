@@ -178,6 +178,9 @@ struct Data {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t const* ctaIdxXyToMnLimit;
+  int32_t const* numNonExitingCtas;
+  int32_t tileTokensDim;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -198,6 +201,9 @@ struct KernelParams {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t const* totalNumPaddedTokens;
+  int32_t const* ctaIdxXyToMnLimit;
+  int32_t const* numNonExitingCtas;
+  int32_t tileTokensDim;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -213,6 +219,9 @@ struct KernelParams {
     params.numTokens = data.numTokens;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+    params.ctaIdxXyToMnLimit = data.ctaIdxXyToMnLimit;
+    params.numNonExitingCtas = data.numNonExitingCtas;
+    params.tileTokensDim = data.tileTokensDim;
 
     return params;
   }
