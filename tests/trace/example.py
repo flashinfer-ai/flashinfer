@@ -21,6 +21,7 @@ gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
@@ -703,6 +704,31 @@ flashinfer.kda_decode.recurrent_kda(
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
 )
+
+# ── serving-native packed Kimi K3 KDA decode ────────────────────────────────
+# The trace is emitted before the exact-SM kernel is loaded, so suppressing an
+# unsupported-device/JIT error still leaves a useful definition JSON.
+with contextlib.suppress(Exception):
+    pk_B, pk_H, pk_D = 4, 12, 128
+    pk_hidden = pk_H * pk_D
+    pk_mixed_qkv = torch.randn(pk_B, 3 * pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_gate = torch.randn(pk_B, pk_hidden, dtype=torch.bfloat16, device=device)
+    pk_raw_beta = torch.randn(pk_B, pk_H, dtype=torch.bfloat16, device=device)
+    pk_A_log = torch.randn(pk_H, dtype=torch.float32, device=device)
+    pk_dt_bias = torch.randn(pk_hidden, dtype=torch.float32, device=device)
+    pk_state = torch.zeros(pk_B, pk_H, pk_D, pk_D, dtype=torch.bfloat16, device=device)
+    pk_indices = torch.arange(pk_B, dtype=torch.int32, device=device)
+    pk_output = torch.empty(pk_B, 1, pk_H, pk_D, dtype=torch.bfloat16, device=device)
+    flashinfer.packed_kda_decode(
+        pk_mixed_qkv,
+        pk_raw_gate,
+        pk_raw_beta,
+        pk_A_log,
+        pk_dt_bias,
+        pk_state,
+        pk_indices,
+        output=pk_output,
+    )
 
 # ── fused Kimi K3 KDA decode (conv + recurrence + gated RMSNorm) ────────────
 fk_N, fk_H, fk_D = 4, 12, 128

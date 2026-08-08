@@ -63,10 +63,37 @@ aliasing pattern, or optional feature raises an error; it never falls back to
 CuTe-DSL. The default ``backend="cute-dsl"`` preserves the existing FlashInfer
 implementation.
 
+Serving-native packed Kimi K3 decode
+------------------------------------
+
+``packed_kda_decode`` is a separate serving adapter for the Kimi K3 ``T=1``,
+``H=12``, ``K=V=128`` contract. It consumes post-convolution packed QKV plus
+raw gate and beta tensors, then fuses Q/K extraction and L2 normalization, the
+fixed ``lower_bound=-5`` gate transform, beta sigmoid, and the recurrent update
+into one exported Cake kernel. It is distinct from ``recurrent_kda`` (whose
+inputs are already split into Q, K, V, gate, and beta tensors) and
+``fused_kda_decode`` (which also performs the convolution and gated RMSNorm).
+
+The operator updates a caller-owned bfloat16 state pool in place. A contiguous
+int32 ``state_indices`` tensor selects one unique active slot per batch row;
+``-1`` is an inactive CUDA-graph padding row that emits zero without touching
+state. By default the operator allocates a contiguous bfloat16 output of shape
+``[B, 1, 12, 128]``. Supplying a caller-owned output with that exact layout
+makes replay allocation-free. All work runs on the caller's current PyTorch
+CUDA stream.
+
+Two frozen schedules are selected from host-visible batch size only: the
+eight-row value tile for ``B < 32`` and the sixteen-row value tile for
+``B >= 32``. Both are built as exact ``sm_100a`` or ``sm_103a`` modules;
+compute capability 10.0 requires CUDA 12.8 or newer, and compute capability
+10.3 requires CUDA 12.9 or newer. Unsupported devices or contracts raise an
+error without falling back to another KDA implementation.
+
 .. currentmodule:: flashinfer.kda_decode
 
 .. autosummary::
     :toctree: ../generated
 
     fused_kda_decode
+    packed_kda_decode
     recurrent_kda

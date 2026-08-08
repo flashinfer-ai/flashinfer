@@ -71,6 +71,10 @@ from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_VARIANTS,
     gen_flash_kda_decode_module,
 )
+from .jit.flash_kda_packed_t1 import (
+    FLASH_KDA_PACKED_T1_VARIANTS,
+    gen_flash_kda_packed_t1_module,
+)
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
@@ -522,6 +526,12 @@ def gen_all_modules(
     has_flash_kda_decode_sm103a_direct = sm_capabilities.get(
         "flash_kda_decode_sm103a_direct", False
     )
+    has_flash_kda_packed_t1_sm100a = sm_capabilities.get(
+        "flash_kda_packed_t1_sm100a", False
+    )
+    has_flash_kda_packed_t1_sm103a = sm_capabilities.get(
+        "flash_kda_packed_t1_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm107 = sm_capabilities.get("sm107", False)
@@ -581,6 +591,20 @@ def gen_all_modules(
         jit_specs.extend(
             gen_flash_kda_decode_module(variant, "sm103a")
             for variant in FLASH_KDA_DECODE_DIRECT_VARIANTS
+        )
+
+    # Serving-native packed Kimi K3 decode is exported as two exact-target
+    # bodies per physical architecture. Unlike the recurrent_kda portfolio,
+    # these modules intentionally do not use the SM100-family target.
+    if has_flash_kda_packed_t1_sm100a:
+        jit_specs.extend(
+            gen_flash_kda_packed_t1_module(variant, "sm100a")
+            for variant in FLASH_KDA_PACKED_T1_VARIANTS
+        )
+    if has_flash_kda_packed_t1_sm103a:
+        jit_specs.extend(
+            gen_flash_kda_packed_t1_module(variant, "sm103a")
+            for variant in FLASH_KDA_PACKED_T1_VARIANTS
         )
 
     if add_act:
@@ -1068,6 +1092,14 @@ def detect_sm_capabilities():
             flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
         )
         and cuda_version >= Version("12.9"),
+        "flash_kda_packed_t1_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "flash_kda_packed_t1_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.9"),
