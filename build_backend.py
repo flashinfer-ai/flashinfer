@@ -1038,6 +1038,36 @@ def _prepare_for_sdist():
     _create_data_dir(use_symlinks=False)
 
 
+# `[build-system] requires` in pyproject.toml pins setuptools>=77, but that pin
+# is only fetched into a *fresh, isolated* build env. `--no-build-isolation`
+# (the flag CONTRIBUTING.md and CLAUDE.md both tell developers to pass) skips
+# that isolated env and hands every hook below straight to whatever setuptools
+# is already on the caller's PATH. An older one chokes on this file's PEP 639
+# short-form `license = "Apache-2.0"` deep inside distutils' own config
+# validation, raising a ValueError that never mentions setuptools at all
+# (flashinfer-ai/flashinfer#2544). Check the version ourselves, at the one
+# point every build hook funnels through, and say what's actually wrong.
+_MIN_SETUPTOOLS = "77"
+
+
+def _check_setuptools_version() -> None:
+    import setuptools
+
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return  # packaging isn't installed; let setuptools raise its own error
+
+    if Version(setuptools.__version__) < Version(_MIN_SETUPTOOLS):
+        raise RuntimeError(
+            f"flashinfer requires setuptools>={_MIN_SETUPTOOLS} to build "
+            f"(found {setuptools.__version__}). This is normally installed "
+            "automatically, but --no-build-isolation uses your already-"
+            "installed setuptools instead of the pinned build dependency. "
+            f"Upgrade it first: python -m pip install -U 'setuptools>={_MIN_SETUPTOOLS}'"
+        )
+
+
 def get_requires_for_build_wheel(config_settings=None):
     _prepare_for_wheel()
     return []
@@ -1054,25 +1084,30 @@ def get_requires_for_build_editable(config_settings=None):
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    _check_setuptools_version()
     _prepare_for_wheel()
     return orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    _check_setuptools_version()
     _prepare_for_editable()
     return orig.prepare_metadata_for_build_editable(metadata_directory, config_settings)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    _check_setuptools_version()
     _prepare_for_editable()
     return orig.build_editable(wheel_directory, config_settings, metadata_directory)
 
 
 def build_sdist(sdist_directory, config_settings=None):
+    _check_setuptools_version()
     _prepare_for_sdist()
     return orig.build_sdist(sdist_directory, config_settings)
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    _check_setuptools_version()
     _prepare_for_wheel()
     return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
