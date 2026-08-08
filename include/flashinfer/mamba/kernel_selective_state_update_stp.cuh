@@ -58,6 +58,33 @@ __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
   return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
 }
 
+// Fast-forward state through buffered tokens (checkpointing).
+// Applies K buffered state recurrences: state = state * exp(A*dt) + B*dt*x
+// Only updates state — no output computation (C dot product skipped).
+template <typename input_t, typename weight_t, int DIM, int DSTATE>
+__device__ __forceinline__ void apply_xab_fast_forward(
+    float& state_value, SelectiveStateUpdateParams const& params, int batch, int head, int group,
+    int d, int i, float A_value, float dt_bias_value) {
+  auto const* __restrict__ xab_x_ptr =
+      reinterpret_cast<input_t const*>(params.xab_x) +
+      batch * params.xab_x_stride_batch + head * DIM + d;
+  auto const* __restrict__ xab_dt_ptr =
+      reinterpret_cast<weight_t const*>(params.xab_dt) +
+      batch * params.xab_dt_stride_batch + head;
+  auto const* __restrict__ xab_B_ptr =
+      reinterpret_cast<input_t const*>(params.xab_B) +
+      batch * params.xab_B_stride_batch + group * DSTATE + i;
+  for (uint32_t t = 0; t < params.xab_length; t++) {
+    float dt_val = toFloat(xab_dt_ptr[t * params.xab_dt_stride_token]);
+    dt_val += dt_bias_value;
+    if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+    float dA = __expf(A_value * dt_val);
+    float x_val = toFloat(xab_x_ptr[t * params.xab_x_stride_token]);
+    float B_val = toFloat(xab_B_ptr[t * params.xab_B_stride_token]);
+    state_value = state_value * dA + (B_val * dt_val) * x_val;
+  }
+}
+
 template <typename input_t, typename state_scale_t, int rows_per_block, int dstate>
 struct SharedStorageSimple {
   static constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
@@ -150,6 +177,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   }
 
   auto const dA = __expf(A_value * dt_value);
+  float const dt_bias_value = dt_bias ? toFloat(dt_bias[head]) : 0.f;
 
   auto d_value = D ? toFloat(D[head]) : 0.f;
 
@@ -225,6 +253,10 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
         }
 
         auto state_value = toFloat(rState.val[ii]) * state_decode_scale;
+
+        apply_xab_fast_forward<input_t, weight_t, DIM, DSTATE>(
+            state_value, params, batch, head, group, d, i + ii, A_value, dt_bias_value);
+
         auto B_value = toFloat(sram.B[i + ii]);
         auto C_value = toFloat(sram.C[i + ii]);
 
@@ -465,7 +497,9 @@ __device__ __forceinline__ void consumer_func_vertical(
     int lane, int warp, float d_value, float dt_value, float dA,
     SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, rowsPerStage, DIM,
                           DSTATE, numStages>& sram,
-    int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
+    int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset,
+    SelectiveStateUpdateParams const& params, float A_value, float dt_bias_value, int batch,
+    int head, int group) {
   constexpr bool scaleState = !std::is_same_v<state_scale_t, void>;
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
@@ -526,6 +560,10 @@ __device__ __forceinline__ void consumer_func_vertical(
                 state_value *= state_decode_scale;
               }
             }
+
+            apply_xab_fast_forward<input_t, weight_t, DIM, DSTATE>(
+                state_value, params, batch, head, group, d, i + e, A_value, dt_bias_value);
+
             auto const B_value = toFloat(rB_ptr[e]);
             auto const C_value = toFloat(rC_ptr[e]);
 
@@ -570,6 +608,10 @@ __device__ __forceinline__ void consumer_func_vertical(
                 state_value *= state_decode_scale;
               }
             }
+
+            apply_xab_fast_forward<input_t, weight_t, DIM, DSTATE>(
+                state_value, params, batch, head, group, d, i + e, A_value, dt_bias_value);
+
             auto const B_value = toFloat(sram.B[i + e]);
             auto const C_value = toFloat(sram.C[i + e]);
             auto const dB = B_value * dt_value;
@@ -755,6 +797,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
     auto const d_value = D ? toFloat(__ldg(&D[head])) : 0.f;
 
+    float const dt_bias_value = dt_bias ? toFloat(__ldg(&dt_bias[head])) : 0.f;
     auto dt_value = toFloat(__ldg(&dt[batch * params.dt_stride_batch + head]));
     if (dt_bias) dt_value += toFloat(__ldg(&dt_bias[head]));
     if (params.dt_softplus) {
@@ -765,11 +808,13 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     if (state_batch != params.pad_slot_id)
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, true, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset, params, A_value,
+          dt_bias_value, batch, head, group);
     else
       consumer_func_vertical<input_t, weight_t, matrixA_t, state_t, state_scale_t, DIM, DSTATE,
                              consumerWarps, rowsPerStage, numStages, false, PHILOX_ROUNDS>(
-          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset);
+          lane, warp, d_value, dt_value, dA, sram, rand_seed, state_ptr_offset, params, A_value,
+          dt_bias_value, batch, head, group);
 
     // Write output — wait for all consumer warps to finish writing sram.out
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
@@ -902,11 +947,12 @@ __device__ __forceinline__ void consumer_func_horizontal(
     int d, int member, float A_value, float dt_value, float x_value,
     SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, colsPerStage,
                             numStages>& sram,
-    float& out_value, int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset) {
+    float& out_value, int64_t rand_seed, [[maybe_unused]] int64_t state_ptr_offset,
+    SelectiveStateUpdateParams const& params, float dt_bias_value, int batch, int head, int group) {
   namespace cde = cuda::device::experimental;
   constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
   constexpr auto itemsPerThread = colsPerStage / lanesPerRow;
-  auto const group = d % (warpSize / lanesPerRow);
+  auto const cf_group = d % (warpSize / lanesPerRow);
 
   // #pragma unroll 1
   for (int iBegin = 0, stage = 0; iBegin < DSTATE;
@@ -927,7 +973,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto const baseCol = item + member * itemsPerThread;
         // If I just use baseCol as the index, a lot of bank conflicts will arise.
         auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(cf_group, baseCol);
 
         auto const i = iBegin + ii;
 
@@ -957,6 +1003,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
             state_value = toFloat(rState_ptr[e]);
           }
 
+          apply_xab_fast_forward<input_t, weight_t, DIM, DSTATE>(
+              state_value, params, batch, head, group, d, i + e, A_value, dt_bias_value);
+
           auto const B_value = toFloat(rB_ptr[e]);
           auto const C_value = toFloat(rC_ptr[e]);
 
@@ -979,7 +1028,7 @@ __device__ __forceinline__ void consumer_func_horizontal(
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
         auto const baseCol = item + member * itemsPerThread;
         auto const ii =
-            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(cf_group, baseCol);
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
@@ -1001,6 +1050,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
           } else {
             state_value = toFloat(rState_ptr[e]);
           }
+
+          apply_xab_fast_forward<input_t, weight_t, DIM, DSTATE>(
+              state_value, params, batch, head, group, d, i + e, A_value, dt_bias_value);
 
           auto const B_value = toFloat(sram.B[i + e]);
           auto const C_value = toFloat(sram.C[i + e]);
@@ -1122,6 +1174,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     auto const d_value = D ? toFloat(D[head]) : 0.f;
 
     // load dt_value
+    float const dt_bias_value = dt_bias ? toFloat(dt_bias[head]) : 0.f;
     auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
     if (dt_bias) dt_value += toFloat(dt_bias[head]);
     if (params.dt_softplus) {
@@ -1142,6 +1195,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
       }
     }
 
+    auto const ngroups_idx = group;  // save before shadowing
     constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
     static_assert(lanesPerRow >= 1);
     constexpr auto rowsPerWarp = warpSize / lanesPerRow;
@@ -1158,11 +1212,13 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     if (state_batch != params.pad_slot_id)
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, true>(
-          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset,
+          params, dt_bias_value, batch, head, ngroups_idx);
     else
       consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, PHILOX_ROUNDS,
                                consumerWarps, colsPerStage, numStages, false>(
-          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset);
+          d, member, A_value, dt_value, x_value, sram, out_value, rand_seed, state_ptr_offset,
+          params, dt_bias_value, batch, head, ngroups_idx);
 
     out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
     if constexpr (lanesPerRow == 4) {
