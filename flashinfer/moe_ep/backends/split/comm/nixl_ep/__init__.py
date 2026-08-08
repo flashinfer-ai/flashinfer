@@ -5,8 +5,7 @@ Two pieces matter for import-time success:
 1. The base NIXL runtime libraries (``libnixl.so``, ``libnixl_capi.so``,
    ``libnixl_common.so``, ``libserdes.so``, etc.) — *not* shipped inside this
    package. They're expected to come from the ``nixl-cu13`` pip wheel,
-   installed automatically by the default ``pip install .`` build (see
-   ``build_backend._ensure_nixl_wheel`` / ``_install_nvep_runtime_wheels``).
+   installed before building FlashInfer.
 
 2. The EP torch extension, ``nixl_ep_cpp*.so`` — built in-tree from
    ``3rdparty/nixl/examples/device/ep`` and staged into ``_libs/`` here.
