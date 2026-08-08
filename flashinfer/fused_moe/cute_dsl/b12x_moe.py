@@ -410,10 +410,8 @@ class B12xMoEWrapper:
         expert_map : Optional[torch.Tensor]
             Global-to-local expert map for expert parallelism.  See
             :func:`b12x_fused_moe`.  Validated on the host once here, which
-            may synchronize.  The tensor's storage must stay unchanged for
-            the wrapper lifetime, since validation happens only here and a
-            captured graph keeps the original pointer.  Only supported with
-            ``quant_mode="w4a16"``.
+            may synchronize, and copied, so later caller mutations have no
+            effect.  Only supported with ``quant_mode="w4a16"``.
         output_dtype : torch.dtype
             Output dtype.  Only ``torch.bfloat16`` is currently supported.
         device : str
@@ -493,12 +491,13 @@ class B12xMoEWrapper:
                     f"would silently assume this rank holds global experts "
                     f"[0, {self.num_local_experts})."
                 )
+            # Clone so caller mutations cannot bypass the validation.
             expert_map = _prepare_ep_expert_map(
                 expert_map,
                 num_local_experts=self.num_local_experts,
                 num_experts=self.num_experts,
                 device=self.device,
-            )
+            ).clone()
         self.expert_map = expert_map
         self._expert_map_data_ptr = (
             expert_map.data_ptr() if expert_map is not None else None

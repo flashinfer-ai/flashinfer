@@ -632,3 +632,46 @@ class TestEPExecution:
                 token_selected_experts=tensors["token_selected_experts"],
                 token_final_scales=tensors["token_final_scales"],
             )
+
+    def test_wrapper_isolated_from_caller_map_mutation(self):
+        from flashinfer import B12xMoEWrapper
+
+        num_experts, top_k = 4, 2
+        tensors = create_moe_tensors(
+            num_tokens=4,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=20260735,
+        )
+        shard = _make_rank_shard(tensors, torch.tensor([0, 2]))
+        caller_map = shard["expert_map"].clone()
+        wrapper = B12xMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=256,
+            intermediate_size=512,
+            num_local_experts=2,
+            expert_map=caller_map,
+            quant_mode="w4a16",
+        )
+        kwargs = dict(
+            x=tensors["x_bf16"],
+            w1_weight=shard["w1_weight"],
+            w1_weight_sf=shard["w1_weight_sf"],
+            w1_alpha=shard["w1_alpha"],
+            w2_weight=shard["w2_weight"],
+            w2_weight_sf=shard["w2_weight_sf"],
+            w2_alpha=shard["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        expected = wrapper.run(**kwargs).clone()
+        torch.cuda.synchronize()
+        assert int(torch.count_nonzero(expected).item()) > 0
+        caller_map.fill_(-1)
+        actual = wrapper.run(**kwargs)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
