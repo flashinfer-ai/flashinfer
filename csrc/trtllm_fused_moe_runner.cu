@@ -409,16 +409,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeAct = dtypeAct,
+        .dtypeWeights = dtypeWeights,
         .dtypeC = dtypeOutput,
         .actType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = !useDeepSeekFp8,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -436,16 +434,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
   } else {
     EltwiseActType actType = activationTypeToEltwiseActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-        .dtypeA = dtypeWeights,
-        .dtypeB = dtypeAct,
+        .dtypeAct = dtypeAct,
+        .dtypeWeights = dtypeWeights,
         .dtypeC = dtypeOutput,
         .eltwiseActType = actType,
         .deepSeekFp8 = useDeepSeekFp8,
         .fusedAct = false,
         .routeAct = true,
         .staticBatch = false,
-        .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = 128,
         .useShuffledMatrix = useShuffledMatrix,
@@ -553,16 +549,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
     bool usePerTokenScaling, bool usePerChannelScaling) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
-      // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-      .dtypeA = dtypeWeights,
-      .dtypeB = dtypeAct,
+      .dtypeAct = dtypeAct,
+      .dtypeWeights = dtypeWeights,
       .dtypeC = dtypeOut,
       .eltwiseActType = EltwiseActType::None,
       .deepSeekFp8 = useDeepSeekFp8,
       .fusedAct = false,
       .routeAct = false,
       .staticBatch = false,
-      .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
       .useShuffledMatrix = useShuffledMatrix,
