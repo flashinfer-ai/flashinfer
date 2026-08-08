@@ -88,6 +88,8 @@ from .quantization.fp8_quantization import (
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
+    sm120_direct_fused_moe,
+    sm120_direct_fused_moe_workspace,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,

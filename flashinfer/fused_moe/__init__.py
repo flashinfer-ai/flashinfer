@@ -92,6 +92,11 @@ from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
 
+from .sm120_direct_fused_moe import (  # noqa: F401
+    sm120_direct_fused_moe as sm120_direct_fused_moe,
+    sm120_direct_fused_moe_workspace as sm120_direct_fused_moe_workspace,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -183,6 +188,8 @@ __all__ = [
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
     "hash_topk",
+    "sm120_direct_fused_moe",
+    "sm120_direct_fused_moe_workspace",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",

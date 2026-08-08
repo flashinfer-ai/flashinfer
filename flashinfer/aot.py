@@ -123,6 +123,7 @@ from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
+from .jit.sm120_direct_fused_moe import gen_sm120_direct_fused_moe_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -593,6 +594,8 @@ def gen_all_modules(
         jit_specs.append(gen_bgmv_moe_module())
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        if has_sm120:
+            jit_specs.append(gen_sm120_direct_fused_moe_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
