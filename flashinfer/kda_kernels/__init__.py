@@ -38,6 +38,11 @@ except (ImportError, RuntimeError):
     fused_kda_decode = None  # type: ignore
 
 try:
+    from .packed_kda_decode_cute import run_packed_kda_decode_cute
+except (ImportError, RuntimeError):
+    run_packed_kda_decode_cute = None  # type: ignore
+
+try:
     if _torch.cuda.is_available():
         from ..cute_dsl.utils import is_cute_dsl_arch_supported as _dsl_arch_ok
 
@@ -59,5 +64,6 @@ __all__ = [
     "fused_kda_decode",
     "recurrent_kda",
     "run_fused_kda_decode",
+    "run_packed_kda_decode_cute",
     "run_recurrent_kda",
 ]
