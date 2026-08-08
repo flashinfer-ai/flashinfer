@@ -1,11 +1,13 @@
 import pytest
 import torch
 import math
+import time
 from typing import Optional, Tuple, Union
 
 import flashinfer
+import flashinfer.prefill as flashinfer_prefill
 
-from flashinfer.prefill import fmha_v2_prefill_deepseek
+from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
 
@@ -413,6 +415,16 @@ def test_fmha_v2_prefill_deepseek(
     )
     scale_bmm1 = q_scale * k_scale * sm_scale
     scale_bmm2 = v_scale
+    scale_bmm1_d = (
+        torch.tensor([scale_bmm1], dtype=torch.float32, device=q.device)
+        if qkv_dtype == torch.float8_e4m3fn
+        else None
+    )
+    scale_bmm2_d = (
+        torch.tensor([scale_bmm2], dtype=torch.float32, device=q.device)
+        if qkv_dtype == torch.float8_e4m3fn
+        else None
+    )
     scale_softmax = 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0
     out, lse = fmha_v2_prefill_deepseek(
         q,
@@ -425,6 +437,8 @@ def test_fmha_v2_prefill_deepseek(
         scale_softmax=scale_softmax,
         scale_bmm1=scale_bmm1,
         scale_bmm2=scale_bmm2,
+        scale_bmm1_d=scale_bmm1_d,
+        scale_bmm2_d=scale_bmm2_d,
         return_lse=True,
         lse=lse,
     )
@@ -449,7 +463,7 @@ def test_fmha_v2_prefill_deepseek(
         )
         out_ref = out_ref.to(o.dtype)
 
-    if q.dtype == torch.float8_e4m3fn and o.dtype == torch.bfloat16:
+    if q.dtype == torch.float8_e4m3fn:
         rtol, atol = 4e-2, 6e-2
         torch.testing.assert_close(out, out_ref.to(o.dtype), rtol=rtol, atol=atol)
     elif q.dtype == torch.bfloat16 and o.dtype == torch.bfloat16:
@@ -459,6 +473,452 @@ def test_fmha_v2_prefill_deepseek(
         rtol, atol = 1e-2, 1e-3
 
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype,o_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+def test_fmha_v2_prefill_deepseek_cuda_graph(qkv_dtype, o_dtype):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    head_dim_qk, head_dim_v = 192, 128
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn_like(q)
+    v = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_v,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_scale = k_scale = v_scale = 1.0
+    if qkv_dtype == torch.float8_e4m3fn:
+        q, q_scale = to_float8(q, dtype=qkv_dtype)
+        k, k_scale = to_float8(k, dtype=qkv_dtype)
+        v, v_scale = to_float8(v, dtype=qkv_dtype)
+        q_scale, k_scale, v_scale = (
+            q_scale.item(),
+            k_scale.item(),
+            v_scale.item(),
+        )
+
+    out = torch.empty(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim_v,
+        dtype=o_dtype,
+        device="cuda",
+    )
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim_qk,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim_qk),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": (
+            torch.tensor(
+                [q_scale * k_scale / math.sqrt(head_dim_qk)],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            if qkv_dtype == torch.float8_e4m3fn
+            else None
+        ),
+        "scale_bmm2_d": (
+            torch.tensor([v_scale], dtype=torch.float32, device="cuda")
+            if qkv_dtype == torch.float8_e4m3fn
+            else None
+        ),
+    }
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    expected_out = out.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_deepseek(q, k, v, out, **kwargs)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    "batch_size,seq_len,num_heads",
+    [(1, 128, 4), (1, 1024, 32), (2, 129, 4)],
+)
+def test_fmha_v2_prefill_sm120_self_attention(
+    causal, head_dim, batch_size, seq_len, num_heads
+):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q, q_scale = to_float8(q, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+
+    out = torch.empty(
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    out, lse = fmha_v2_prefill_sm120(
+        q,
+        k,
+        v,
+        out,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax=1.0,
+        scale_bmm1=q_scale * k_scale * sm_scale,
+        scale_bmm2=v_scale,
+        scale_bmm1_d=torch.tensor(
+            [q_scale * k_scale * sm_scale],
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        scale_bmm2_d=torch.tensor([v_scale], dtype=torch.float32, device="cuda"),
+        causal=causal,
+        return_lse=True,
+        lse=lse,
+    )
+
+    q_ref = q.float() * q_scale
+    k_ref = k.float() * k_scale
+    v_ref = v.float() * v_scale
+    out_ref, lse_ref = attention_mla_ref_torch(
+        batch_size, q_ref, k_ref, v_ref, causal=causal, sm_scale=sm_scale
+    )
+    lse = lse[..., 0] + torch.log(lse[..., 1] / 256)
+    torch.testing.assert_close(out, out_ref.to(out.dtype), rtol=4e-2, atol=6e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("device_scale", ["bmm1", "bmm2"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fmha_v2_prefill_sm120_optional_device_scales(device_scale, causal, head_dim):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    torch.manual_seed(42)
+    q_ref = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k_ref = torch.randn_like(q_ref)
+    v_ref = torch.randn_like(q_ref)
+    q, q_scale = to_float8(q_ref, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k_ref, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v_ref, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+    scale_bmm1 = q_scale * k_scale / math.sqrt(head_dim)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": scale_bmm1 * (0.5 if device_scale == "bmm1" else 1.0),
+        "scale_bmm2": v_scale * (0.5 if device_scale == "bmm2" else 1.0),
+        "scale_bmm1_d": (
+            torch.tensor([scale_bmm1], dtype=torch.float32, device="cuda")
+            if device_scale == "bmm1"
+            else None
+        ),
+        "scale_bmm2_d": (
+            torch.tensor([v_scale], dtype=torch.float32, device="cuda")
+            if device_scale == "bmm2"
+            else None
+        ),
+        "causal": causal,
+    }
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+
+    expected, _ = attention_mla_ref_torch(
+        batch_size,
+        q.float() * q_scale,
+        k.float() * k_scale,
+        v.float() * v_scale,
+        causal=causal,
+        sm_scale=1.0 / math.sqrt(head_dim),
+    )
+    torch.testing.assert_close(out, expected.to(torch.bfloat16), rtol=4e-2, atol=6e-2)
+
+
+def test_fmha_v2_prefill_sm120_validation():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    shape = (1, 8, 4, 128)
+    q_bf16 = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k_bf16 = torch.randn_like(q_bf16)
+    v_bf16 = torch.randn_like(q_bf16)
+    q = q_bf16.to(torch.float8_e4m3fn)
+    k = k_bf16.to(torch.float8_e4m3fn)
+    v = v_bf16.to(torch.float8_e4m3fn)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    kwargs = {
+        "num_heads": 4,
+        "head_dim": 128,
+        "seq_len": 8,
+        "scale_softmax": 0.0,
+        "scale_bmm1": 1.0 / math.sqrt(128),
+        "scale_bmm2": 1.0,
+    }
+
+    with pytest.raises(ValueError, match="requires FP8 E4M3 input"):
+        fmha_v2_prefill_sm120(q_bf16, k_bf16, v_bf16, out, **kwargs)
+    with pytest.raises(ValueError, match="requires BF16 output"):
+        fmha_v2_prefill_sm120(q, k, v, out.half(), **kwargs)
+    with pytest.raises(ValueError, match="requires Q/K head_dim=64 or 128"):
+        fmha_v2_prefill_sm120(q, k, v, out, **{**kwargs, "head_dim": 96})
+    q_noncontiguous = q.transpose(-1, -2).contiguous().transpose(-1, -2)
+    with pytest.raises(ValueError, match="must be contiguous"):
+        fmha_v2_prefill_sm120(q_noncontiguous, k, v, out, **kwargs)
+    with pytest.raises(ValueError, match="lse must be provided"):
+        fmha_v2_prefill_sm120(q, k, v, out, return_lse=True, **kwargs)
+    with pytest.raises(ValueError, match="cum_seq_lens must be"):
+        fmha_v2_prefill_sm120(
+            q,
+            k,
+            v,
+            out,
+            cum_seq_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            **kwargs,
+        )
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    for device_scale_name in ("scale_bmm1_d", "scale_bmm2_d"):
+        with pytest.raises(ValueError, match=r"FP32 CUDA tensor with shape \[1\]"):
+            fmha_v2_prefill_sm120(
+                q,
+                k,
+                v,
+                out,
+                **{device_scale_name: torch.tensor([1.0])},
+                **kwargs,
+            )
+
+
+def test_fmha_v2_prefill_deepseek_validates_seq_len():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
+
+    q = torch.empty((1, 8, 4, 192), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    v = torch.empty((1, 8, 4, 128), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(v)
+
+    with pytest.raises(ValueError, match="sequence length must match seq_len"):
+        fmha_v2_prefill_deepseek(
+            q,
+            k,
+            v,
+            out,
+            num_heads=4,
+            head_dim=192,
+            seq_len=7,
+            scale_softmax=0.0,
+        )
+    with pytest.raises(ValueError, match="lse must be provided"):
+        fmha_v2_prefill_deepseek(
+            q,
+            k,
+            v,
+            out,
+            num_heads=4,
+            head_dim=192,
+            seq_len=8,
+            scale_softmax=0.0,
+            return_lse=True,
+        )
+
+
+def test_fmha_v2_prefill_sm120_metadata_cache_is_bounded():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    cache = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_cache
+    cache.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache_size = flashinfer_prefill._FMHA_V2_SM120_CUM_SEQ_LENS_CACHE_SIZE
+    try:
+        for seq_len in range(1, cache_size + 2):
+            flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
+                device, batch_size=1, seq_len=seq_len
+            )
+        assert len(cache) == cache_size
+        assert (device.index, 1, 1) not in cache
+    finally:
+        cache.clear()
+
+
+def test_fmha_v2_prefill_sm120_metadata_cache_capture_miss(monkeypatch):
+    cache = flashinfer_prefill._fmha_v2_sm120_cum_seq_lens_cache
+    cache.clear()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="must be initialized before CUDA Graph"):
+        flashinfer_prefill._get_fmha_v2_sm120_cum_seq_lens(
+            torch.device("cuda", 0), batch_size=1, seq_len=17
+        )
+    assert not cache
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fmha_v2_prefill_sm120_cuda_graph(causal, head_dim):
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads = 1, 128, 4
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    torch.manual_seed(42)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    q, q_scale = to_float8(q, dtype=torch.float8_e4m3fn)
+    k, k_scale = to_float8(k, dtype=torch.float8_e4m3fn)
+    v, v_scale = to_float8(v, dtype=torch.float8_e4m3fn)
+    q_scale, k_scale, v_scale = q_scale.item(), k_scale.item(), v_scale.item()
+
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty(
+        batch_size, seq_len, num_heads, 2, dtype=torch.float32, device="cuda"
+    )
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": q_scale * k_scale / math.sqrt(head_dim),
+        "scale_bmm2": v_scale,
+        "scale_bmm1_d": torch.tensor(
+            [q_scale * k_scale / math.sqrt(head_dim)],
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        "scale_bmm2_d": torch.tensor([v_scale], dtype=torch.float32, device="cuda"),
+        "causal": causal,
+        "return_lse": True,
+        "lse": lse,
+    }
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    expected_out = out.clone()
+    expected_lse = lse.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    kwargs["scale_bmm2_d"].mul_(2.0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, expected_out * 2.0, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+
+def test_fmha_v2_prefill_sm120_async_enqueue():
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("fmha_v2_prefill_sm120 is only supported on SM12x GPUs.")
+
+    batch_size, seq_len, num_heads, head_dim = 1, 16384, 32, 128
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q = torch.zeros(shape, dtype=torch.float8_e4m3fn, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    out = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
+    cum_seq_lens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+    kwargs = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "scale_softmax": 1.0,
+        "scale_bmm1": 1.0 / math.sqrt(head_dim),
+        "scale_bmm2": 1.0,
+        "scale_bmm1_d": torch.tensor(
+            [1.0 / math.sqrt(head_dim)], dtype=torch.float32, device="cuda"
+        ),
+        "scale_bmm2_d": torch.tensor([1.0], dtype=torch.float32, device="cuda"),
+        "causal": True,
+        "cum_seq_lens": cum_seq_lens,
+    }
+
+    fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+    torch.cuda.synchronize()
+
+    timings = []
+    for _ in range(3):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        host_start = time.perf_counter()
+        fmha_v2_prefill_sm120(q, k, v, out, **kwargs)
+        host_ms = (time.perf_counter() - host_start) * 1e3
+        end_event.record()
+        end_event.synchronize()
+        timings.append((host_ms, start_event.elapsed_time(end_event)))
+
+    best_ratio = min(host_ms / device_ms for host_ms, device_ms in timings)
+    assert best_ratio < 0.5, (
+        f"FMHAv2 enqueue blocked relative to device execution; timings={timings}, "
+        f"best host/device ratio={best_ratio:.3f}"
+    )
 
 
 def run_trtllm_fmha_v2_prefill_case(

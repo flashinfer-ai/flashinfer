@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cstring>
 #include <numeric>
+#include <string>
 
 #include "tvm_ffi_utils.h"
 
@@ -36,7 +37,19 @@ using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
 
+extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
+    const bert::Fused_multihead_attention_params_v2& params,
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 
@@ -83,7 +96,7 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
                               // attention sinks.
                               void* attention_sinks_d, void* cu_kv_seqlens_d, void* cu_q_seqlens_d,
                               void* o_packed_d, void* p_d, void* s_d, void* softmax_stats_d,
-                              void* scale_bmm2_d,
+                              void* scale_bmm1_d, void* scale_bmm2_d,
                               // scale factors
                               float const scale_bmm1, float const scale_softmax,
                               float const scale_bmm2, float const softcapping_scale_bmm1,
@@ -204,13 +217,11 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
   } else {
     set_alpha(params.scale_bmm1, fused_scale_bmm1, scale_type1);
   }
+  params.scale_bmm1_d = reinterpret_cast<uint32_t*>(scale_bmm1_d);
   set_alpha(params.scale_softmax, scale_softmax, scale_softmax_type);
   set_alpha(params.scale_bmm2, scale_bmm2, scale_type2);
   params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
   params.softcapping_scale_bmm1 = softcapping_scale_bmm1;
-
-  FMHA_CHECK_CUDA(cudaMemcpy(params.scale_bmm2_d, &params.scale_bmm2, sizeof(uint32_t),
-                             cudaMemcpyHostToDevice));
 
   // attention type, h_kv < h if MQA or GQA
   params.h_kv = h_kv;
@@ -278,35 +289,42 @@ static inline void determine_launch_params(
 }
 
 /**
- * @brief TVM FFI binding for TRTLLM FMHA V2 kernel for MLA attention
+ * @brief TVM FFI binding for SM120 TRTLLM FMHA V2 separate-Q/K/V attention
  *
  * This function calls a specific TRTLLM kernel variant with:
- * - Input type: E4M3 (8-bit floating point)
+ * - Standard 64x64 and 128x128 input type: E4M3
+ * - Backward-compatible 192x128 input type: E4M3 or BF16
  * - Accumulator type: FP32
- * - Warp configuration: 64x64
  * - Layout: Separate Q, K, V tensors
- * - Q/K dimension: 192, V dimension: 128 (MLA-specific)
- * - Output type: BF16
+ * - Standard Q/K/V dimensions: 64x64 or 128x128
+ * - Backward-compatible Q/K/V dimensions: 192x128
+ * - Output type: BF16 for standard paths; BF16 or FP16 for the 192x128 path
  * - Target architecture: SM120/SM121 (Blackwell)
  *
- * @param q Query tensor [batch, q_seqlen, num_heads, 192] in E4M3
- * @param k Key tensor [batch, kv_seqlen, num_kv_heads, 192] in E4M3
- * @param v Value tensor [batch, kv_seqlen, num_kv_heads, 128] in E4M3
- * @param o Output tensor [batch, q_seqlen, num_heads, 128] in BF16
+ * @param q Query tensor [batch, q_seqlen, num_heads, head_dim]
+ * @param k Key tensor [batch, kv_seqlen, num_kv_heads, head_dim]
+ * @param v Value tensor [batch, kv_seqlen, num_kv_heads, head_dim_v]
+ * @param o Output tensor [batch, q_seqlen, num_heads, head_dim_v]
  * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
+ * @param cum_seq_lens Persistent device tensor [batch + 1] with uniform sequence offsets
+ * @param scale_bmm1_d Optional persistent device tensor containing the FP8 QK scale
+ * @param scale_bmm2_d Optional persistent device tensor containing the FP8 V scale
  * @param num_heads Number of query heads
- * @param head_dim Head dimension (must be 192 for this kernel)
- * @param seq_len Sequence length (not used, extracted from tensor shapes)
+ * @param head_dim Query/key head dimension
+ * @param seq_len Sequence length validated by the Python wrapper
  * @param scale_softmax Softmax scale factor
  * @param scale_bmm1 Scale factor for the first GEMM
  * @param scale_bmm2 Scale factor for the second GEMM
+ * @param causal Whether to apply causal masking
  * @param is_e4m3 Whether the input is E4M3
  * @param is_bf16_output Whether the output is BF16
  */
 void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
-                     Optional<TensorView> maybe_lse, int64_t num_heads, int64_t head_dim,
-                     int64_t seq_len, const float scale_softmax, const float scale_bmm1,
-                     const float scale_bmm2, bool is_e4m3, bool is_bf16_output) {
+                     Optional<TensorView> maybe_lse, TensorView cum_seq_lens,
+                     Optional<TensorView> scale_bmm1_d, Optional<TensorView> scale_bmm2_d,
+                     int64_t num_heads, int64_t head_dim, int64_t seq_len,
+                     const float scale_softmax, const float scale_bmm1, const float scale_bmm2,
+                     bool causal, bool is_e4m3, bool is_bf16_output) {
   const int batch_size = q.shape()[0];
   // q,k,v seqlen all equal
   const int q_seqlen = q.shape()[1];
@@ -320,12 +338,13 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   assert(head_dim == q.shape()[3] &&
          "head_dim must be equal to the head dimension in the query tensor");
   // head_dim_v
-  const int head_dim_v = v.shape()[3];  // Should be 128
+  const int head_dim_v = v.shape()[3];  // Matches Q/K for standard paths; 128 for 192x128.
 
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
   Data_type output_dtype = is_bf16_output ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
-  Attention_mask_type attention_mask_type = Attention_mask_type::CAUSAL;
+  Attention_mask_type attention_mask_type =
+      causal ? Attention_mask_type::CAUSAL : Attention_mask_type::PADDING;
   Attention_input_layout input_layout = Attention_input_layout::SEPARATE_Q_K_V;
 
   CudaDevice device;
@@ -347,59 +366,52 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
                           true,   // force_fp32_acc
                           props);
 
-  launch_params.total_q_seqlen = q_seqlen;
-  launch_params.total_kv_seqlen = kv_seqlen;
+  const int total_seqlen = batch_size * q_seqlen;
+  launch_params.total_q_seqlen = total_seqlen;
+  launch_params.total_kv_seqlen = total_seqlen;
 
-  // device memory for scale_bmm2
-  void* scale_bmm2_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
-
-  // - Cumulative sequence lengths
-  std::vector<uint32_t> cu_seqlens(batch_size + 1);
-  for (int i = 0; i <= batch_size; i++) {
-    cu_seqlens[i] = i * q_seqlen;
-  }
-  void* cu_seqlens_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&cu_seqlens_d, sizeof(uint32_t) * cu_seqlens.size()));
-  FMHA_CHECK_CUDA(cudaMemcpy(cu_seqlens_d, cu_seqlens.data(), sizeof(uint32_t) * cu_seqlens.size(),
-                             cudaMemcpyHostToDevice));
   // LSE buffer has shape [batch_size, seq_len, num_heads, 2] for (max, lse)
   if (maybe_lse.has_value()) {
-    FMHA_CHECK_CUDA(cudaMemset(maybe_lse.value().data_ptr(), 0,
-                               sizeof(float) * batch_size * q_seqlen * num_heads * 2));
+    FMHA_CHECK_CUDA(cudaMemsetAsync(maybe_lse.value().data_ptr(), 0,
+                                    sizeof(float) * batch_size * q_seqlen * num_heads * 2, stream));
   }
 
   bert::Fused_multihead_attention_params_v2 params;
 
+  // When supplied, scale_bmm1_d and scale_bmm2_d point to persistent FP8
+  // model weights. Passing them through avoids allocation or host-to-device
+  // copies during CUDA Graph capture; null preserves each encoded fallback.
   set_params(params, launch_params, data_type, acc_type, output_dtype, input_layout,
-             batch_size,         // b
-             q_seqlen,           // s_q
-             kv_seqlen,          // s_kv
-             num_heads,          // h
-             num_kv_heads,       // h_kv
-             head_dim,           // d
-             head_dim_v,         // dv
-             cu_seqlens.back(),  // total tokens
-             1,                  // num_grouped_heads (not used for regular attention)
-             INT_MAX,            // sliding_window_size (disabled)
-             0,                  // chunked_attention_size (disabled)
-             64,                 // tokens_per_block (not used with SEPARATE_Q_K_V)
-             nullptr,            // qkv_packed_d (not used)
-             q.data_ptr(),       // q_d
-             k.data_ptr(),       // k_d
-             v.data_ptr(),       // v_d
-             nullptr,            // kv_d (not used)
-             nullptr,            // paged_kv_pool_ptr (not used)
-             nullptr,            // paged_block_offsets (not used)
-             nullptr,            // packed_mask_d (not used for causal)
-             nullptr,            // cu_mask_rows_d (not used)
-             nullptr,            // attention_sinks_d (not used)
-             cu_seqlens_d,       // cu_kv_seqlens_d
-             cu_seqlens_d,       // cu_q_seqlens_d (same as kv for equal lengths)
-             o.data_ptr(),       // o_packed_d
-             nullptr,            // p_d (not storing)
-             nullptr,            // s_d (not storing)
-             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, scale_bmm2_d,
+             batch_size,               // b
+             q_seqlen,                 // s_q
+             kv_seqlen,                // s_kv
+             num_heads,                // h
+             num_kv_heads,             // h_kv
+             head_dim,                 // d
+             head_dim_v,               // dv
+             total_seqlen,             // total tokens
+             1,                        // num_grouped_heads (not used for regular attention)
+             INT_MAX,                  // sliding_window_size (disabled)
+             0,                        // chunked_attention_size (disabled)
+             64,                       // tokens_per_block (not used with SEPARATE_Q_K_V)
+             nullptr,                  // qkv_packed_d (not used)
+             q.data_ptr(),             // q_d
+             k.data_ptr(),             // k_d
+             v.data_ptr(),             // v_d
+             nullptr,                  // kv_d (not used)
+             nullptr,                  // paged_kv_pool_ptr (not used)
+             nullptr,                  // paged_block_offsets (not used)
+             nullptr,                  // packed_mask_d (not used for causal)
+             nullptr,                  // cu_mask_rows_d (not used)
+             nullptr,                  // attention_sinks_d (not used)
+             cum_seq_lens.data_ptr(),  // cu_kv_seqlens_d
+             cum_seq_lens.data_ptr(),  // cu_q_seqlens_d (same as kv for equal lengths)
+             o.data_ptr(),             // o_packed_d
+             nullptr,                  // p_d (not storing)
+             nullptr,                  // s_d (not storing)
+             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr,
+             scale_bmm1_d.has_value() ? scale_bmm1_d.value().data_ptr() : nullptr,
+             scale_bmm2_d.has_value() ? scale_bmm2_d.value().data_ptr() : nullptr,
              scale_bmm1,     // scale_bmm1
              scale_softmax,  // scale_softmax
              scale_bmm2,     // scale_bmm2
@@ -412,20 +424,36 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   // cu_seqlens is built above as i * q_seqlen, so the batch is uniform by construction.
   params.is_uniform_q = batch_size > 0;
 
-  if (data_type == DATA_TYPE_E4M3 && output_dtype == DATA_TYPE_BF16) {
+  if (head_dim == 64 && head_dim_v == 64 && data_type == DATA_TYPE_E4M3 &&
+      output_dtype == DATA_TYPE_BF16) {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120_nl_tiled(
+        params, launch_params, stream);
+  } else if (head_dim == 128 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
+             output_dtype == DATA_TYPE_BF16) {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120_nl_tiled(
+        params, launch_params, stream);
+  } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
+             output_dtype == DATA_TYPE_BF16) {
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
         params, launch_params, stream);
-  } else if (data_type == DATA_TYPE_BF16) {
+  } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
+             output_dtype == DATA_TYPE_FP16) {
+    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120_nl_tiled(
+        params, launch_params, stream);
+  } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_BF16) {
     run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_tiled(params, launch_params,
                                                                            stream);
-  } else if (data_type == DATA_TYPE_E4M3 && acc_type == DATA_TYPE_FP32) {
+  } else if (head_dim == 192 && head_dim_v == 128 && data_type == DATA_TYPE_E4M3 &&
+             acc_type == DATA_TYPE_FP32) {
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
         params, launch_params, stream);
   } else {
-    throw std::runtime_error("Unsupported data type");
+    throw std::runtime_error(
+        "Unsupported FMHAv2 configuration: head_dim=" + std::to_string(head_dim) + ", head_dim_v=" +
+        std::to_string(head_dim_v) + ", data_type=" + std::to_string(static_cast<int>(data_type)) +
+        ", output_dtype=" + std::to_string(static_cast<int>(output_dtype)) +
+        ", acc_type=" + std::to_string(static_cast<int>(acc_type)));
   }
-  FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
-  FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
