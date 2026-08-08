@@ -153,8 +153,12 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using IdType = typename Params::IdType;
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+  // Must match the vec_size in BatchDecodeWithPagedKVCacheDispatched.
+  constexpr size_t min_kv_sizeof = std::min(sizeof(DTypeK), sizeof(DTypeV));
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -162,12 +166,13 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
+    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (min_kv_sizeof == 1 ? 2U : 4U) : 1U;
     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
     const uint32_t smem_size =
-        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
+        NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM *
+            (sizeof(DTypeK) + sizeof(DTypeV)) +
+        std::max(tile_size_per_bdx * num_threads * sizeof(size_t), 2 * bdy * bdz * sizeof(float));
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,

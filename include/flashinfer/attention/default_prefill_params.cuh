@@ -25,15 +25,17 @@
 
 namespace flashinfer {
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename DTypeV_ = DTypeKV_>
 struct SinglePrefillParams {
   using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
+  using DTypeKV = DTypeKV_;  // backward-compat name; equal to DTypeK
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using IdType = int32_t;
   DTypeQ* q;
-  DTypeKV* k;
-  DTypeKV* v;
+  DTypeK* k;
+  DTypeV* v;
   uint8_t* maybe_custom_mask;
   DTypeO* o;
   float* lse;
@@ -85,7 +87,7 @@ struct SinglePrefillParams {
         rope_rcp_theta(0.0f),
         partition_kv(false) {}
 
-  __host__ SinglePrefillParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
+  __host__ SinglePrefillParams(DTypeQ* q, DTypeK* k, DTypeV* v, uint8_t* maybe_custom_mask,
                                DTypeO* o, float* lse, float* maybe_alibi_slopes,
                                uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
                                uint32_t kv_len, uint32_t q_stride_n, uint32_t q_stride_h,
@@ -127,16 +129,19 @@ struct SinglePrefillParams {
   }
 };
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
+          typename DTypeV_ = DTypeKV_>
 struct BatchPrefillRaggedParams {
   using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
+  using DTypeKV = DTypeKV_;  // backward-compat name; equal to DTypeK
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using IdType = IdType_;
 
   DTypeQ* q;
-  DTypeKV* k;
-  DTypeKV* v;
+  DTypeK* k;
+  DTypeV* v;
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
   IdType* kv_indptr;
@@ -232,7 +237,7 @@ struct BatchPrefillRaggedParams {
         token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
-  __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
+  __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeK* k, DTypeV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
                                     IdType* maybe_q_rope_offset, IdType* maybe_k_rope_offset,
                                     DTypeO* o, float* lse, float* maybe_alibi_slopes,
@@ -298,15 +303,18 @@ struct BatchPrefillRaggedParams {
   }
 };
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
+          typename DTypeV_ = DTypeKV_>
 struct BatchPrefillPagedParams {
   using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
+  using DTypeKV = DTypeKV_;  // backward-compat name; equal to DTypeK
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using IdType = IdType_;
 
   DTypeQ* q;
-  paged_kv_t<DTypeKV, IdType> paged_kv;
+  paged_kv_t<DTypeK, IdType, DTypeV> paged_kv;
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
   IdType* maybe_mask_indptr;
@@ -387,7 +395,7 @@ struct BatchPrefillPagedParams {
         token_pos_in_items_len(0),
         maybe_max_item_len_ptr(nullptr) {}
 
-  __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
+  __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeK, IdType, DTypeV> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
                                    IdType* maybe_mask_indptr, IdType* maybe_q_rope_offset,
                                    DTypeO* o, float* lse, float* maybe_alibi_slopes,

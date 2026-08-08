@@ -528,6 +528,12 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
+  // Asymmetric K/V plumbing: the SM90 mainloop, TMA descriptors and kernel
+  // traits are parameterized on a single KV dtype. Guard until the Hopper
+  // path splits DTypeK/DTypeV; asymmetric K/V is decode-only today.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 SinglePrefillWithKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; only decode kernels do");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }
@@ -549,6 +555,10 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                     cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
+  // Asymmetric K/V plumbing; see SM90 SinglePrefillWithKVCacheDispatched.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 BatchPrefillWithRaggedKVCacheDispatched does not yet "
+                "support asymmetric K/V dtypes; only decode kernels do");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }
@@ -570,6 +580,10 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                    cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
+  // Asymmetric K/V plumbing; see SM90 SinglePrefillWithKVCacheDispatched.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 BatchPrefillWithPagedKVCacheDispatched does not yet "
+                "support asymmetric K/V dtypes; only decode kernels do");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }

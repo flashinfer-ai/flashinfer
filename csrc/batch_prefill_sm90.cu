@@ -108,8 +108,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
         RaggedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
-        params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
-        params.v_ptr = static_cast<DTypeKV*>(v.data_ptr());
+        params.k_ptr = static_cast<DTypeK*>(k.data_ptr());
+        params.v_ptr = static_cast<DTypeV*>(v.data_ptr());
         params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
         params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.q_stride_n = q.stride(0);
@@ -204,8 +204,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         PagedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
-        params.k_ptr = static_cast<DTypeKV*>(paged_k_cache.data_ptr());
-        params.v_ptr = static_cast<DTypeKV*>(paged_v_cache.data_ptr());
+        params.k_ptr = static_cast<DTypeK*>(paged_k_cache.data_ptr());
+        params.v_ptr = static_cast<DTypeV*>(paged_v_cache.data_ptr());
         params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
         params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.q_stride_n = q.stride(0);

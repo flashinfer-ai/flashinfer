@@ -50,8 +50,8 @@ void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi
                    USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
                      Params params;
                      params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
-                     params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
-                     params.v_ptr = static_cast<DTypeKV*>(v.data_ptr());
+                     params.k_ptr = static_cast<DTypeK*>(k.data_ptr());
+                     params.v_ptr = static_cast<DTypeV*>(v.data_ptr());
                      params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
                      params.lse_ptr = maybe_lse.has_value()
                                           ? (static_cast<float*>(maybe_lse.value().data_ptr()))
