@@ -340,7 +340,7 @@ def _get_compiled_finalize_kernel(
                 scaling_vector_size=sf_vec_size,
                 max_active_clusters=max_active_clusters,
                 stream=stream_fake,
-                options="--opt-level 2 --enable-tvm-ffi",
+                options="--enable-tvm-ffi",
             ),
             extra_key_files=_finalize_kernel_source_files(),
         )

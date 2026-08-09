@@ -119,6 +119,15 @@ def _w4a16_kernel_cache_key(
     )
 
 
+def _aligned_data_ptr(tensor: torch.Tensor, assumed_align: int) -> int:
+    """Return ``tensor.data_ptr()`` after preserving CuTe's alignment check."""
+    pointer = tensor.data_ptr()
+    assert pointer % assumed_align == 0, (
+        f"pointer must be {assumed_align} bytes aligned"
+    )
+    return pointer
+
+
 def _get_workspace(
     x: torch.Tensor,
     top_k: int,
@@ -356,20 +365,24 @@ def _run_grouped_gemm(
     # make_fake_stream(use_tvm_ffi_env_stream=True) binds the caller's current
     # stream from the TVM-FFI environment, including during CUDA graph capture.
     compiled(
-        weight.data_ptr(),
-        weight_sf.data_ptr(),
-        activations.data_ptr(),
-        tile_idx_to_expert_idx.data_ptr(),
-        tile_idx_to_mn_limit.data_ptr(),
-        num_non_exiting_tiles.data_ptr(),
-        alpha.data_ptr(),
-        output.data_ptr(),
+        _aligned_data_ptr(weight, 32),
+        _aligned_data_ptr(weight_sf, 16),
+        _aligned_data_ptr(activations, 32),
+        _aligned_data_ptr(tile_idx_to_expert_idx, 16),
+        _aligned_data_ptr(tile_idx_to_mn_limit, 16),
+        _aligned_data_ptr(num_non_exiting_tiles, 16),
+        _aligned_data_ptr(alpha, 16),
+        _aligned_data_ptr(output, 32),
         (
-            permuted_idx_to_expanded_idx.data_ptr()
+            _aligned_data_ptr(permuted_idx_to_expanded_idx, 16)
             if permuted_idx_to_expanded_idx is not None
             else None
         ),
-        token_final_scales.data_ptr() if token_final_scales is not None else None,
+        (
+            _aligned_data_ptr(token_final_scales, 16)
+            if token_final_scales is not None
+            else None
+        ),
         m,
         n,
         k,
