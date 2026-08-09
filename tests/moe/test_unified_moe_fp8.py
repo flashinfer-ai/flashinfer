@@ -482,7 +482,7 @@ def test_block_fp8_prerouted_cuda_graph(variant):
 
 
 # ---------------------------------------------------------------------------
-# Per-tensor FP8 — calibrated E4M3 activations/weights, FromLogits only
+# Per-tensor FP8 — calibrated E4M3 activations/weights
 # ---------------------------------------------------------------------------
 
 
@@ -514,6 +514,7 @@ def _per_tensor_fp8_reference(
     routing_scales_on_input: bool = False,
 ) -> torch.Tensor:
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    routing_weights = routing_weights.to(torch.bfloat16).float()
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
     x_deq = x_q.to(torch.float8_e4m3fn).float() / input_scale
     w1_deq, _ = _per_tensor_quant_dequant_experts(w1)
@@ -547,6 +548,7 @@ def _per_tensor_fp8_reference(
 
 def _make_per_tensor_fp8_case(
     *,
+    routing_input_mode: RoutingInputMode = RoutingInputMode.FromLogits,
     routing_method: RoutingMethodType = RoutingMethodType.Default,
     top_k: int = TOP_K,
     num_experts: int = NUM_EXPERTS,
@@ -602,12 +604,22 @@ def _make_per_tensor_fp8_case(
         intermediate_size=INTERMEDIATE,
         device=device,
     )
-    act = MoEActivationPack(
-        hidden_states_q=x_q,
-        hidden_states_scale=x_scale,
-        routing_input_mode=RoutingInputMode.FromLogits,
-        routing_logits=logits,
-    )
+    if routing_input_mode is RoutingInputMode.FromLogits:
+        act = MoEActivationPack(
+            hidden_states_q=x_q,
+            hidden_states_scale=x_scale,
+            routing_input_mode=routing_input_mode,
+            routing_logits=logits,
+        )
+    else:
+        assert routing_input_mode is RoutingInputMode.PackedPrecomputed
+        act = MoEActivationPack(
+            hidden_states_q=x_q,
+            hidden_states_scale=x_scale,
+            routing_input_mode=routing_input_mode,
+            topk_ids=selected_experts,
+            topk_weights=routing_weights,
+        )
     weights = MoEWeightPack()
     weights.prepare_for("trtllm_fp8_per_tensor", view)
     config = MoEConfig(
@@ -644,8 +656,15 @@ def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
-def test_fp8_per_tensor_layer_and_direct_runner_match_reference():
-    act, weights, config, ref, _ = _make_per_tensor_fp8_case()
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
+    ids=["from-logits", "packed"],
+)
+def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mode):
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=routing_input_mode
+    )
     layer_out = MoELayer(config)(act, weights)
     _assert_per_tensor_fp8_close(layer_out, ref)
 
@@ -655,8 +674,14 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference():
     _assert_per_tensor_fp8_close(direct_out, ref)
 
 
-def test_fp8_per_tensor_llama4_routes_scale_on_input():
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
+    ids=["from-logits", "packed"],
+)
+def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=routing_input_mode,
         routing_method=RoutingMethodType.Llama4,
         top_k=1,
     )
@@ -675,8 +700,14 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input():
         invalid_runner.check_support()
 
 
-def test_fp8_per_tensor_nonzero_expert_offset():
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
+    ids=["from-logits", "packed"],
+)
+def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=routing_input_mode,
         num_experts=NUM_EXPERTS,
         local_num_experts=NUM_EXPERTS // 2,
         local_expert_offset=NUM_EXPERTS // 2,
@@ -686,6 +717,46 @@ def test_fp8_per_tensor_nonzero_expert_offset():
 
     runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
+
+
+def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, _, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        num_experts=NUM_EXPERTS,
+        local_num_experts=NUM_EXPERTS // 2,
+        local_expert_offset=NUM_EXPERTS // 2,
+    )
+    act.topk_weights[0, 0] = -act.topk_weights[0, 0]
+    expected_ids = act.topk_ids.clone()
+    expected_bits = (
+        act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    )
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
+    packed = moe_inputs.topk_ids
+    assert moe_inputs.expert_weights is None
+    assert torch.equal(packed >> 16, expected_ids)
+    assert torch.equal(packed & 0xFFFF, expected_bits)
+
+
+def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=RoutingInputMode.PackedPrecomputed
+    )
+    act.topk_ids = act.topk_ids.T.contiguous().T
+    act.topk_weights = act.topk_weights.T.contiguous().T
+    assert not act.topk_ids.is_contiguous()
+    assert not act.topk_weights.is_contiguous()
+
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    inputs = runner.pack_inputs(act, weights)
+    assert MoeRunnerInputs.from_list(inputs).topk_ids.is_contiguous()
+    _assert_per_tensor_fp8_close(runner.forward(inputs), ref)
 
 
 def test_fp8_per_tensor_routing_replay_matches_reference():
@@ -705,8 +776,15 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
     )
 
 
-def test_fp8_per_tensor_cuda_graph_replay():
-    act, weights, config, ref, _ = _make_per_tensor_fp8_case()
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
+    ids=["from-logits", "packed"],
+)
+def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        routing_input_mode=routing_input_mode
+    )
     runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
     inputs = runner.pack_inputs(act, weights)
     runner.forward(inputs)
