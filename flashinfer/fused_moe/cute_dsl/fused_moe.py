@@ -113,6 +113,40 @@ def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
     )
 
 
+def _validate_moe_output(
+    moe_output: torch.Tensor,
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    output_dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    expected_shape = (num_tokens, hidden_size)
+    if tuple(moe_output.shape) != expected_shape:
+        raise ValueError(
+            f"moe_output must have shape {expected_shape}, "
+            f"got {tuple(moe_output.shape)}"
+        )
+    if moe_output.dtype != output_dtype:
+        raise TypeError(
+            f"moe_output must have dtype {output_dtype}, got {moe_output.dtype}"
+        )
+    if moe_output.device != device:
+        raise ValueError(
+            f"moe_output must be on device {device}, got {moe_output.device}"
+        )
+    if moe_output.layout != torch.strided:
+        raise ValueError(
+            "moe_output must use torch.strided layout, "
+            f"got layout={moe_output.layout}"
+        )
+    if not moe_output.is_contiguous():
+        raise ValueError(
+            "moe_output must be contiguous, "
+            f"got stride={moe_output.stride()}"
+        )
+
+
 def _get_cuda_graph_resources() -> Dict[str, Any]:
     """Get or create pre-allocated CUDA events and streams.
 
@@ -741,6 +775,7 @@ class CuteDslMoEWrapper:
         tactic: Optional[Tuple] = None,
         *,
         per_token_scale: Optional[torch.Tensor] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
 
@@ -781,6 +816,11 @@ class CuteDslMoEWrapper:
             tuner.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
+        moe_output : Optional[torch.Tensor]
+            Caller-owned output tensor of shape ``[num_tokens, hidden_size]``.
+            It must match the wrapper output dtype and input device and use a
+            contiguous strided layout. Both W4A4 and W4A16 runners write their
+            final output directly into this tensor when provided.
 
         Returns
         -------
@@ -789,11 +829,20 @@ class CuteDslMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
 
-        moe_output = torch.empty(
-            (num_tokens, self.hidden_size),
-            dtype=self.output_dtype,
-            device=x.device,
-        )
+        if moe_output is None:
+            moe_output = torch.empty(
+                (num_tokens, self.hidden_size),
+                dtype=self.output_dtype,
+                device=x.device,
+            )
+        else:
+            _validate_moe_output(
+                moe_output,
+                num_tokens=num_tokens,
+                hidden_size=self.hidden_size,
+                output_dtype=self.output_dtype,
+                device=x.device,
+            )
 
         # Use auto-tuner for tactic selection
         tuner = AutoTuner.get()
