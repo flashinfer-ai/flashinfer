@@ -14,17 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Gated DeltaProduct (arXiv:2502.10297) -- API layer.
-
-DeltaProduct takes ``num_householder`` delta-rule steps per token instead of one:
-
-    A(x_i) = alpha_i * prod_{j=1..n_h} (I - beta_{i,j} k_{i,j} k_{i,j}^T)
-
-Phase 1 implements this as a host-side expansion over the existing GDN kernels:
-GDP is GDN run on a sequence ``n_h`` times longer, with the decay neutralised on
-all but the first micro-step of each token and the query read only from the last.
-No new kernel is required for correctness.
-
-The recurrent state is UNCHANGED in size -- ``n_h`` costs FLOPs, not bytes.
 """
 
 from __future__ import annotations
@@ -82,12 +71,34 @@ def chunk_gated_delta_product(
     initial_state, output_state, state_indices, cu_seqlens, ...
         As in ``chunk_gated_delta_rule``. Note the state shape does NOT depend
         on ``num_householder``.
+    expanded_q : torch.Tensor, optional
+        Scratch for the expanded query,
+        ``[total_seq_len * num_householder, num_q_heads, head_size]``, dtype of
+        ``q``.
+    expanded_g : torch.Tensor, optional
+        Scratch for the expanded gate,
+        ``[total_seq_len * num_householder, num_sab_heads]``. **Must be
+        float32** -- ``g`` and ``beta`` are always fp32 in this API even when
+        ``q``/``k``/``v`` are fp16/bf16, and a strided assignment into a
+        half-precision buffer downcasts silently.
+        Must be pre-filled with ``1.0``: only rows ``[0 :: n_h]`` are written
+        (the per-token gate), and the remaining micro-steps rely on the
+        multiplicative neutral value already being in place.
+    expanded_output : torch.Tensor, optional
+        Scratch for the kernel's output,
+        ``[total_seq_len * num_householder, num_o_heads, head_size]`` where
+        ``num_o_heads = max(num_q_heads, num_v_heads)``. Note this is **not**
+        ``num_q_heads`` -- under GVA the output is wider than the query.
+        Takes ``output``'s dtype when ``output`` is supplied, else ``q``'s, so
+        the final strided copy never silently casts.
 
     Returns
     -------
     Same contract as ``chunk_gated_delta_rule``: ``output`` when
     ``output_final_state`` is False, else ``(output, final_state)``. ``output``
     has one row per REAL token, ``[total_seq_len, num_o_heads, head_size]``.
+    When ``output`` is supplied it is written in place and returned; otherwise
+    a freshly allocated tensor is returned.
     """
     if k.dim() != 4 or v.dim() != 4:
         raise ValueError(
@@ -136,9 +147,22 @@ def chunk_gated_delta_product(
         expanded_q = torch.empty(
             q.size(0) * num_householder, *q.shape[1:], dtype=q.dtype, device=q.device
         )
+    elif expanded_q.shape != (q.size(0) * num_householder, *q.shape[1:]):
+        raise ValueError("expanded_q shape must be [T*n_h, num_q_heads,  D]")
+    elif expanded_q.dtype != q.dtype:
+        raise ValueError(
+            f"expanded_q.dtype and q.dtype must match, got {expanded_q.dtype} != {q.dtype}"
+        )
+
     expanded_q[num_householder - 1 :: num_householder] = q
 
     if g is not None:
+        if g.dtype != torch.float32:
+            raise ValueError(
+                f"g must be float32 (g/beta are always fp32 in this API, "
+                f"unlike q/k/v); got {g.dtype}"
+            )
+
         if expanded_g is None:
             expanded_g = torch.ones(
                 g.size(0) * num_householder,
@@ -146,6 +170,8 @@ def chunk_gated_delta_product(
                 dtype=g.dtype,
                 device=g.device,
             )
+        elif expanded_g.shape != (g.size(0) * num_householder, *g.shape[1:]):
+            raise ValueError("expanded_g shape must be [T*n_h, num_sab_heads]")
         elif expanded_g.dtype != torch.float32:
             raise ValueError(
                 f"expanded_g must be float32 (g/beta are always fp32 in this API, "
@@ -160,11 +186,17 @@ def chunk_gated_delta_product(
             expanded_q.size(0),
             max(q.size(1), v.size(1)),
             q.size(2),
-            dtype=q.dtype,
-            device=q.device,
+            dtype=output.dtype if output is not None else q.dtype,
+            device=output.device if output is not None else q.device,
         )
+    elif expanded_output.shape != (
+        expanded_q.size(0),
+        max(q.size(1), v.size(1)),
+        q.size(2),
+    ):
+        raise ValueError("expanded_output shape must be [T*n_h, num_o_heads,  D]")
 
-    _, output_state = chunk_gated_delta_rule(
+    out = chunk_gated_delta_rule(
         expanded_q,
         k,
         v,
@@ -172,7 +204,7 @@ def chunk_gated_delta_product(
         beta,
         scale,
         initial_state,
-        True,
+        output_final_state,
         cu_seqlens * num_householder,
         use_qk_l2norm_in_kernel,
         output=expanded_output,
@@ -183,9 +215,9 @@ def chunk_gated_delta_product(
     if output is not None:
         output[:] = expanded_output[num_householder - 1 :: num_householder]
     else:
-        output = expanded_output[::num_householder].clone()
+        output = expanded_output[num_householder - 1 :: num_householder].clone()
 
     if output_final_state:
-        return output, output_state
+        return output, out[-1]
     else:
         return output

@@ -398,3 +398,115 @@ def test_prefill_kernel_matches_reference(
 
     torch.testing.assert_close(our_o, ref_o.to(q.dtype), atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
+
+
+# --------------------------------------------------------------------------
+# The four (pass_output x output_final_state) combinations. Every other test
+# passes output= and output_final_state=True, which leaves the wrapper's
+# allocate-and-return path and its no-state path completely unexercised --
+# and those are exactly where a wrong strided gather or a hardcoded
+# output_final_state can hide.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "pass_output", [True, False], ids=["output=buf", "output=None"]
+)
+@pytest.mark.parametrize(
+    "output_final_state", [True, False], ids=["final_state", "no_final_state"]
+)
+@pytest.mark.parametrize(
+    "num_householder", [1, 3], ids=lambda nh: f"num_householder={nh}"
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(8, 8, 8), (8, 8, 16)],
+    ids=lambda qkv: "num_heads={0}/{1}/{2}".format(*qkv),
+)
+def test_prefill_kernel_output_conventions(
+    qkv_factory, pass_output, output_final_state, num_householder, num_heads, seed=0
+):
+    """Return contract and output rows must not depend on how they're requested."""
+    _skip_if_unsupported()
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_q_heads, num_k_heads, num_v_heads = num_heads
+    num_o_heads = num_sab_heads = max(num_q_heads, num_v_heads)
+    seq_lens = [64, 128, 512]
+    head_size, n_h = 128, num_householder
+    num_seqs, total_seqlen = len(seq_lens), sum(seq_lens)
+    device = torch.device("cuda")
+    dtype = torch.float16
+
+    q, k, v, alpha, beta, cu_seqlens = _gen_product_inputs(
+        seq_lens,
+        n_h,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        dtype,
+        qkv_factory,
+        device,
+    )
+
+    our_o = None
+    if pass_output:
+        our_o = torch.full(
+            (total_seqlen, num_o_heads, head_size),
+            float("nan"),
+            dtype=dtype,
+            device=device,
+        )
+
+    result = chunk_gated_delta_product(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        1.0,  # scale
+        None,  # initial_state
+        output_final_state,
+        cu_seqlens,
+        True,  # use_qk_l2norm_in_kernel
+        output=our_o,
+        output_state=None,  # force the wrapper to own the state buffer
+    )
+    torch.cuda.synchronize()
+
+    # --- return contract mirrors chunk_gated_delta_rule ---
+    if output_final_state:
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"output_final_state=True must return (output, final_state); "
+            f"got {type(result)}"
+        )
+        got_o, got_state = result
+        assert got_state is not None, "final_state requested but None returned"
+        assert got_state.shape == (num_seqs, num_sab_heads, head_size, head_size)
+    else:
+        assert not isinstance(result, tuple), (
+            "output_final_state=False must return the output tensor alone, "
+            f"got a {type(result)}"
+        )
+        got_o, got_state = result, None
+
+    if pass_output:
+        assert got_o is our_o, "output= was supplied; the same tensor must come back"
+    assert got_o.shape == (total_seqlen, num_o_heads, head_size)
+    assert not got_o.isnan().any(), "output rows left unwritten"
+
+    ref_o, ref_state = delta_product(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        alpha=alpha,
+        beta=beta,
+        scale_factor=1.0,
+    )
+    torch.testing.assert_close(got_o, ref_o.to(dtype), atol=2e-3, rtol=1e-3)
+    if got_state is not None:
+        torch.testing.assert_close(
+            got_state.transpose(-1, -2), ref_state, atol=1e-3, rtol=1e-4
+        )
