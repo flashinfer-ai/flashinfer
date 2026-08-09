@@ -151,9 +151,17 @@ def test_reference_nh1_equals_delta_rule(
     torch.testing.assert_close(prod_state, rule_state, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("seq_lens", [[64], [256], [64, 128, 512]])
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("num_heads", [(8, 8, 8), (8, 8, 16)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[64], [256], [64, 128, 512]],
+    ids=lambda seqlens: "seq_lens=" + ",".join(map(str, seqlens)),
+)
+@pytest.mark.parametrize("head_size", [128], ids=lambda hs: f"head_size={hs}")
+@pytest.mark.parametrize(
+    "num_heads",
+    [(8, 8, 8), (8, 8, 16)],
+    ids=lambda qkv: "num_heads={0}/{1}/{2}".format(*qkv),
+)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_reference_nh1_matches_kernel(
     qkv_factory, seq_lens, head_size, num_heads, dtype, seed=0
@@ -231,9 +239,19 @@ def test_reference_nh1_matches_kernel(
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
 
-@pytest.mark.parametrize("num_householder", [1, 2, 3, 4])
-@pytest.mark.parametrize("seq_lens", [[128], [64, 128, 512]])
-@pytest.mark.parametrize("num_heads", [(8, 8, 8), (8, 8, 16)])
+@pytest.mark.parametrize(
+    "num_householder", [1, 2, 3, 4], ids=lambda nh: f"num_householder={nh}"
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[128], [64, 128, 512]],
+    ids=lambda seqlens: "seq_lens=" + ",".join(map(str, seqlens)),
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(8, 8, 8), (8, 8, 16)],
+    ids=lambda qkv: "num_heads={0}/{1}/{2}".format(*qkv),
+)
 def test_reference_equals_expanded_delta_rule(
     qkv_factory, num_householder, seq_lens, num_heads, seed=0
 ):
