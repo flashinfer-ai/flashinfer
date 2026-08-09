@@ -18,6 +18,7 @@ import functools
 from dataclasses import replace
 from typing import List, Literal, Optional, Tuple
 
+from packaging.version import Version
 import torch
 
 from ..api_logging import flashinfer_api
@@ -56,6 +57,7 @@ DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 SVDQUANT_LORA_RANK_GRANULARITY = 32
 
 _SM120_SVDQUANT_KERNEL_CACHE: dict[tuple, object] = {}
+_MIN_SM120_SVDQUANT_CUDA_VERSION = Version("12.9")
 
 
 def _pad_up(x: int, y: int) -> int:
@@ -611,10 +613,11 @@ def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
 
 @supported_compute_capability([120, 121])
 def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
-    if get_cuda_version().major < 13:
+    cuda_version = get_cuda_version()
+    if cuda_version < _MIN_SM120_SVDQUANT_CUDA_VERSION:
         raise ValueError(
-            "SM120 SVDQuant CuTe DSL support requires CUDA 13 or later. "
-            f"Current CUDA version: {get_cuda_version()}."
+            "SM120 SVDQuant CuTe DSL support requires CUDA 12.9 or later. "
+            f"Current CUDA version: {cuda_version}."
         )
     from ..cute_dsl import is_cute_dsl_available
 
@@ -629,8 +632,9 @@ def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
 def _heuristic_func_nvfp4_svdquant(
     suitable_backends: List[str], *args, **kwargs
 ) -> List[str]:
-    # The backend requirements are architecture-disjoint, so retaining their order
-    # is sufficient and keeps automatic dispatch deterministic.
+    # Preserve backend_checks order: on SM120/SM121, cute-dsl precedes
+    # cute-dsl-unfused when both are supported, which selects the fused-first
+    # implementation tuning configuration.
     return suitable_backends
 
 
@@ -757,7 +761,8 @@ def mm_nvfp4_svdquant(
     b_sf: torch.Tensor
         Weight block scales, same layout as ``a_sf`` with ``n`` rows.
     alpha: torch.Tensor
-        Per-tensor residual dequantization scale, float32, device scalar (``numel >= 1``).
+        Per-tensor residual dequantization scale, float32 device scalar with
+        exactly one element (``numel == 1``).
     d: torch.Tensor
         LoRA-down output ``x_hat @ L2ᵀ``, shape ``(m, r)`` bf16, contiguous and 16-byte
         aligned (TMA). Compute it as ``x @ (pre_quant_scale[:, None] * L2ᵀ)`` in bf16.

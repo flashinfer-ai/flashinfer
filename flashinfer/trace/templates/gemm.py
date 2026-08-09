@@ -2143,6 +2143,7 @@ def _mm_nvfp4_svdquant_init(
     N: int = 3072,
     K: int = 3072,
     SF_A: int = 0,
+    SF_B: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -2156,7 +2157,7 @@ def _mm_nvfp4_svdquant_init(
     """
     from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
 
-    del SF_A  # output-only / derived axis
+    del SF_A, SF_B  # derived axes
 
     torch.manual_seed(seed)
     rank = 32
@@ -2206,7 +2207,9 @@ mm_nvfp4_svdquant_trace = TraceTemplate(
         "SF_A": Var(
             description="128x4-swizzled activation scale buffer size derived from M and K."
         ),
-        "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
         "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
@@ -2251,6 +2254,7 @@ mm_nvfp4_svdquant_trace = TraceTemplate(
     },
     constraints=[
         "SF_A == ((M + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
+        "SF_B == ((N + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
     ],
     tags=["quantization:fp4"],
     init=_mm_nvfp4_svdquant_init,

@@ -1088,6 +1088,9 @@ class DenseGemmKernel:
             scale_copy_bytes += cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         tma_copy_bytes = ab_copy_bytes + scale_copy_bytes
         if cutlass.const_expr(svdquant_d is not None):
+            assert not self.use_m1_non_tma_a, (
+                "SVDQuant does not support use_m1_non_tma_a=True"
+            )
             svdquant_copy_bytes = cute.size_in_bytes(
                 self.svdquant_dtype,
                 cute.slice_(svdquant_a_smem_layout, (None, None, 0)),
@@ -1095,7 +1098,10 @@ class DenseGemmKernel:
                 self.svdquant_dtype,
                 cute.slice_(svdquant_b_smem_layout, (None, None, 0)),
             )
-            assert svdquant_copy_bytes == ab_copy_bytes
+            assert svdquant_copy_bytes == ab_copy_bytes, (
+                "SVDQuant copy-size mismatch: correction bytes must equal "
+                "the mainloop A/B copy bytes"
+            )
 
         # Allocate shared memory
         smem = cutlass.utils.SmemAllocator()
