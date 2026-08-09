@@ -302,6 +302,16 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         kernel_dtype, _cu_seqlens_dtype(cu_seqlens.dtype)
     )
     compile_options = _blackwell_compile_options(device)
+    tensormap_workspace_size = (
+        num_sab_heads
+        * max_cp_chunks_per_seq
+        * num_seqs
+        * CPDeltaRuleMNPrecomputeUtcmma1Sm100.num_tensormaps
+        * CPDeltaRuleMNPrecomputeUtcmma1Sm100.bytes_per_tensormap
+    )
+    tensormap_workspace = _get_cache_buf(
+        "gdn_cp_sm100_mn_tensormaps", tensormap_workspace_size, device
+    )[:tensormap_workspace_size]
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
@@ -322,6 +332,7 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
             cutlass.Int32(total_cp_chunks),
             cutlass.Int32(max_cp_chunks_per_seq),
             cutlass.Int32(num_seqs),
+            from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic(),
             stream,
         )
         compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
@@ -340,6 +351,7 @@ def cp_delta_rule_mn_precompute_dsl_sm100(
         total_cp_chunks,
         max_cp_chunks_per_seq,
         num_seqs,
+        tensormap_workspace,
         stream,
     )
     return transfer_t, state_t

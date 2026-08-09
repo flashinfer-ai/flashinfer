@@ -993,6 +993,72 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 
 
 @torch.inference_mode()
+def test_sm100_cp_delta_rule_ignores_physical_padding(
+    seed=int(os.environ.get("SEED", "0")),
+):
+    device = torch.device("cuda")
+    if not is_sm100a_supported(device):
+        pytest.skip("physical-padding regression test requires SM100/SM103")
+    _skip_if_cp_unsupported()
+    _seed_all(seed)
+
+    dtype = torch.bfloat16
+    physical_len = 520
+    logical_len = 517
+    num_qk_heads = 4
+    num_v_heads = 32
+    head_size = 128
+    cu_seqlens = torch.tensor([0, logical_len], dtype=torch.int32, device=device)
+
+    q = torch.randn(physical_len, num_qk_heads, head_size, dtype=dtype, device=device)
+    k = torch.randn(physical_len, num_qk_heads, head_size, dtype=dtype, device=device)
+    v = torch.randn(physical_len, num_v_heads, head_size, dtype=dtype, device=device)
+    q = torch.nn.functional.normalize(q.float(), dim=-1).to(dtype).contiguous()
+    k = torch.nn.functional.normalize(k.float(), dim=-1).to(dtype).contiguous()
+    v = v.contiguous()
+    alpha = _make_gates(physical_len, num_v_heads, 0.9, device)
+    beta = _make_gates(physical_len, num_v_heads, 0.9, device)
+
+    neutral = (q.clone(), k.clone(), v.clone())
+    for tensor in neutral:
+        tensor[logical_len:].zero_()
+    poisoned = (q.clone(), k.clone(), v.clone())
+    for tensor in poisoned:
+        tensor[logical_len:].fill_(float("nan"))
+    alpha[logical_len:].fill_(1.0)
+    beta[logical_len:].zero_()
+
+    def run(inputs, use_cp):
+        return chunk_gated_delta_rule(
+            *inputs,
+            alpha,
+            beta,
+            1.0 / math.sqrt(head_size),
+            None,
+            True,
+            cu_seqlens,
+            False,
+            use_cp=use_cp,
+        )
+
+    cp_output, cp_state = run(poisoned, use_cp=True)
+    neutral_output, neutral_state = run(neutral, use_cp=True)
+    non_cp_output, non_cp_state = run(poisoned, use_cp=False)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(cp_output[:logical_len]).all()
+    assert torch.isfinite(cp_state).all()
+    torch.testing.assert_close(
+        cp_output[:logical_len], neutral_output[:logical_len], atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(cp_state, neutral_state, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        cp_output[:logical_len], non_cp_output[:logical_len], atol=4e-2, rtol=4e-2
+    )
+    torch.testing.assert_close(cp_state, non_cp_state, atol=4e-2, rtol=4e-2)
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
 def test_sm100_cp_delta_rule_external_state_dtype(
