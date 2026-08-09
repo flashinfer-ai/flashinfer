@@ -107,6 +107,7 @@ with contextlib.suppress(ImportError):
         B12xMoEWrapper as B12xMoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_product import chunk_gated_delta_product as chunk_gated_delta_product
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
