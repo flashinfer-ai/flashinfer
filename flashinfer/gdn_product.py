@@ -136,7 +136,7 @@ def chunk_gated_delta_product(
         expanded_q = torch.empty(
             q.size(0) * num_householder, *q.shape[1:], dtype=q.dtype, device=q.device
         )
-    expanded_q[::num_householder] = q
+    expanded_q[num_householder - 1 :: num_householder] = q
 
     if g is not None:
         if expanded_g is None:
@@ -146,14 +146,25 @@ def chunk_gated_delta_product(
                 dtype=g.dtype,
                 device=g.device,
             )
+        elif expanded_g.dtype != torch.float32:
+            raise ValueError(
+                f"expanded_g must be float32 (g/beta are always fp32 in this API, "
+                f"unlike q/k/v); got {expanded_g.dtype}"
+            )
         expanded_g[::num_householder] = g
     else:
         expanded_g = None
 
     if expanded_output is None:
-        expanded_output = torch.empty_like(expanded_q)
+        expanded_output = torch.empty(
+            expanded_q.size(0),
+            max(q.size(1), v.size(1)),
+            q.size(2),
+            dtype=q.dtype,
+            device=q.device,
+        )
 
-    chunk_gated_delta_rule(
+    _, output_state = chunk_gated_delta_rule(
         expanded_q,
         k,
         v,
@@ -170,8 +181,8 @@ def chunk_gated_delta_product(
     )
 
     if output is not None:
-        output[:] = expanded_output[::num_householder]
-        return output
+        output[:] = expanded_output[num_householder - 1 :: num_householder]
+        return output, output_state
 
     else:
-        return expanded_output[::num_householder].clone()
+        return expanded_output[::num_householder].clone(), output_state
