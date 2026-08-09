@@ -94,11 +94,8 @@ def _radix_cutlass_required_filtered_supported(
     logits: torch.Tensor,
     top_k: int,
     tie_break: int,
-    dsa_graph_safe: bool,
 ) -> bool:
-    """Check the hard limits of options that force FilteredTopK."""
-    if not dsa_graph_safe and tie_break == TopKTieBreak.NONE:
-        return True
+    """Check the graph-safe FilteredTopK fallback's hard limits."""
     return (
         top_k <= 2048 and get_shared_bytes_per_block_optin(logits.device) >= 128 * 1024
     )
@@ -121,12 +118,11 @@ def _radix_cutlass_top_k_varlen_check(
     *,
     deterministic=False,
     tie_break=TopKTieBreak.NONE,
-    dsa_graph_safe=False,
     row_starts=None,
 ):  # extra kwargs mirror the public signature; unused by the check
-    """Radix masked-fallback: runs on all supported SM tiers."""
-    return _radix_cutlass_required_filtered_supported(
-        logits, top_k, tie_break, dsa_graph_safe
+    """Graph-safe masked fallback for calls without score-window starts."""
+    return row_starts is None and _radix_cutlass_required_filtered_supported(
+        logits, top_k, tie_break
     )
 
 
@@ -147,7 +143,6 @@ def _gvr_top_k_varlen_check(
     *,
     deterministic=False,
     tie_break=TopKTieBreak.NONE,
-    dsa_graph_safe=False,
     row_starts=None,
 ):
     """Return True only when GVR can run on this exact configuration.
@@ -157,7 +152,7 @@ def _gvr_top_k_varlen_check(
     """
     # GVR's capped candidate buffer does not retain enough information to
     # resolve arbitrarily large K-th-value ties exactly.
-    if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
+    if tie_break != TopKTieBreak.NONE or row_starts is not None:
         return False
     if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
         return False
@@ -197,7 +192,6 @@ def _top_k_varlen_heuristic(
     *,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
-    dsa_graph_safe: bool = False,
     row_starts=None,
 ):
     """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs).
@@ -608,6 +602,7 @@ def _compile_radix(
     chunk_size,
     num_sms,
     tie_break,
+    has_row_starts,
 ):
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
@@ -638,7 +633,7 @@ def _compile_radix(
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
-        f"_tie{tie_break}"
+        f"_tie{tie_break}_rs{int(has_row_starts)}"
     )
 
     def _compile_fn():
@@ -653,6 +648,11 @@ def _compile_radix(
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_groups,), stride_order=(0,)
             ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows,), stride_order=(0,)
+            )
+            if has_row_starts
+            else None,
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
             ),
@@ -883,19 +883,14 @@ def _run_radix_cutlass(
     return_output_values: bool,
     out_indices: Optional[torch.Tensor],
     out_values: Optional[torch.Tensor],
-    deterministic: bool,
     tie_break: int,
-    dsa_graph_safe: bool,
-    row_starts: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Masked-radix fallback: uses radix_topk_ragged_transform to pass per-row
     lengths directly into the kernel, avoiding a full (num_rows, N) masked copy
     and a double-allocation for indices.
     """
     num_rows, N = logits.shape
-    lengths = _get_effective_row_lengths(
-        seq_lens, num_rows, N, next_n, compress_ratio, row_starts
-    )
+    lengths = _get_effective_row_lengths(seq_lens, num_rows, N, next_n, compress_ratio)
 
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
@@ -914,10 +909,9 @@ def _run_radix_cutlass(
         lengths,
         row_states_buffer,
         top_k,
-        deterministic,
+        False,  # deterministic is unsupported by the public varlen API
         tie_break,
-        dsa_graph_safe,
-        row_starts=row_starts,
+        True,  # varlen Top-K is always graph safe
     )
 
     if return_output_values:
@@ -929,8 +923,6 @@ def _run_radix_cutlass(
         # No-op for rows with seq_len >= top_k (no sentinels).
         sentinel = out_indices < 0
         gather_idx = out_indices.long()
-        if row_starts is not None:
-            gather_idx.add_(row_starts[:, None])
         gather_idx.masked_fill_(sentinel, 0)
         out_values.copy_(torch.gather(logits, 1, gather_idx))
         out_values.masked_fill_(sentinel, 0)
@@ -960,11 +952,10 @@ def _radix_top_k_varlen_check(
     *,
     deterministic=False,
     tie_break=TopKTieBreak.NONE,
-    dsa_graph_safe=False,
     row_starts=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE and not deterministic and row_starts is None
+    return _CUTE_DSL_AVAILABLE
 
 
 def _run_radix(
@@ -977,6 +968,7 @@ def _run_radix(
     out_indices: torch.Tensor,
     out_values: Optional[torch.Tensor],
     tie_break: int,
+    row_starts: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CuTe DSL multi-CTA radix top-k: native varlen, no logit masking needed."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
@@ -1010,6 +1002,7 @@ def _run_radix(
         chunk_size,
         num_sms,
         tie_break,
+        row_starts is not None,
     )
 
     # row_states holds the global histograms + inter-CTA barrier counters used
@@ -1045,6 +1038,7 @@ def _run_radix(
         logits,
         row_states,
         seq_lens,
+        row_starts,
         out_indices,
         out_values if return_output_values else None,
     )
@@ -1081,7 +1075,6 @@ def top_k_varlen(
     *,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
-    dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
@@ -1182,27 +1175,22 @@ def top_k_varlen(
             buffers are allocated locally and are safe for any concurrency.
 
     deterministic : bool, optional
-        If True, return selected local indices in a deterministic canonical
-        order. This currently routes ``"auto"`` to ``"radix_cutlass"``.
+        Reserved for future support. ``True`` currently raises ``ValueError``;
+        no backend fallback is attempted.
     tie_break : int, optional
         Boundary tie-breaking mode. ``TopKTieBreak.SMALL`` prefers smaller
         local indices and ``TopKTieBreak.LARGE`` prefers larger local indices
         when values equal the K-th value. Tie-breaking controls the selected
-        set, not output ordering; combine it with ``deterministic=True`` for
-        canonical ordering. The CuTe DSL ``radix`` backend handles non-default
+        set, not output ordering. The CuTe DSL ``radix`` backend handles non-default
         modes natively; on Blackwell, ``"auto"`` prefers radix for tie modes.
         GVR's capped candidate buffer cannot resolve arbitrarily large boundary
         ties, so explicit GVR remains limited to ``NONE``.
-    dsa_graph_safe : bool, optional
-        For ``"radix_cutlass"``, force the FilteredTopK graph-safe path and
-        scalar vectorization. The CuTe DSL backends are already CUDA-graph
-        safe. Default ``False``.
     row_starts : torch.Tensor, optional
         Per-row score-window starts, as contiguous ``int32[num_rows]``. Top-K
         is computed over ``logits[i, row_starts[i]:row_starts[i]+length]`` and
         returned indices remain local to that window. Effective lengths are
-        clipped to the remaining row width. Supplying this currently routes
-        ``"auto"`` to ``"radix_cutlass"``.
+        clipped to the remaining row width. Score windows use the native CuTe
+        radix backend and never fall back to CUTLASS.
 
     Returns
     -------
@@ -1251,28 +1239,36 @@ def top_k_varlen(
     assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
 
+    if deterministic:
+        raise ValueError("deterministic=True is not supported by top_k_varlen")
+    if next_n <= 0:
+        raise ValueError(f"next_n must be positive, got {next_n}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if logits.shape[0] != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            "logits.shape[0] must equal seq_lens.shape[0] * next_n, got "
+            f"{logits.shape[0]} and {seq_lens.shape[0]} * {next_n}"
+        )
+
     tie_break = TopKTieBreak(tie_break)
 
     if backend == "auto":
-        if deterministic or row_starts is not None:
-            # These semantics are CUTLASS-only today. Resolve them directly so
+        if row_starts is not None:
+            # Score windows are native-radix-only. Resolve explicitly so
             # skip_check=True cannot reuse stale auto-routing state.
-            backend = "radix_cutlass"
+            backend = "radix"
         else:
             backend = top_k_varlen.suitable_auto_backends[0]
 
     unsupported_options = []
-    if deterministic:
-        unsupported_options.append("deterministic=True")
     if backend == "gvr" and tie_break != TopKTieBreak.NONE:
         unsupported_options.append(f"tie_break={tie_break.name}")
-    if row_starts is not None:
+    if backend in ("gvr", "radix_cutlass") and row_starts is not None:
         unsupported_options.append("row_starts")
-    if backend in ("radix", "gvr") and unsupported_options:
+    if unsupported_options:
         raise ValueError(
-            f"backend={backend!r} does not support "
-            f"{', '.join(unsupported_options)}; use backend='auto' or "
-            "backend='radix_cutlass'"
+            f"backend={backend!r} does not support {', '.join(unsupported_options)}"
         )
 
     num_rows = logits.shape[0]
@@ -1311,6 +1307,7 @@ def top_k_varlen(
             out_indices,
             out_values,
             int(tie_break),
+            row_starts,
         )
     elif backend == "gvr":
         use_lb = bool(load_balance)
@@ -1350,10 +1347,7 @@ def top_k_varlen(
             return_values,
             out_indices,
             out_values,
-            deterministic,
             tie_break,
-            dsa_graph_safe,
-            row_starts,
         )
     else:
         raise ValueError(

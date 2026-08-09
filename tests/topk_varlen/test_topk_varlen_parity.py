@@ -96,64 +96,27 @@ def test_top_k_varlen_exact_kth_boundary_tie_set(tie_break, prefer_large):
     assert torch.equal(indices.sort(dim=-1).values, expected)
 
 
-@pytest.mark.parametrize(
-    ("tie_break", "prefer_large"),
-    [
-        (1, False),
-        (2, True),
-    ],
-    ids=["small", "large"],
-)
-def test_top_k_varlen_deterministic_tie_output_order(tie_break, prefer_large):
-    """Deterministic mode emits the selected local indices canonically ordered."""
-    _require_filtered_topk()
-    logits, seq_lens, top_k, strict_indices = _make_boundary_tie_case()
-
-    indices_a, _ = flashinfer.top_k_varlen(
-        logits,
-        seq_lens,
-        top_k,
-        deterministic=True,
-        tie_break=tie_break,
-        backend="auto",
-    )
-    indices_b, _ = flashinfer.top_k_varlen(
-        logits,
-        seq_lens,
-        top_k,
-        deterministic=True,
-        tie_break=tie_break,
-        backend="auto",
-    )
-
-    expected = _expected_boundary_indices(
-        logits.shape[1], top_k, strict_indices, prefer_large
-    ).expand(logits.shape[0], -1)
-    assert torch.equal(indices_a, expected)
-    assert torch.equal(indices_b, expected)
+@pytest.mark.parametrize("backend", ["auto", "radix", "gvr", "radix_cutlass"])
+@pytest.mark.parametrize("skip_check", [False, True])
+def test_top_k_varlen_deterministic_is_unsupported(backend, skip_check):
+    """Deterministic stays in the API but never triggers a backend fallback."""
+    num_rows, width, top_k = 2, 1024, 512
+    logits = torch.randn((num_rows, width), device="cuda", dtype=torch.bfloat16)
+    seq_lens = torch.full((num_rows,), width, device="cuda", dtype=torch.int32)
+    pre_idx = torch.zeros((num_rows, top_k), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="deterministic=True is not supported"):
+        flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            top_k,
+            pre_idx=pre_idx,
+            deterministic=True,
+            backend=backend,
+            skip_check=skip_check,
+        )
 
 
-def test_top_k_varlen_skip_check_auto_still_routes_tie_semantics():
-    """skip_check bypasses validation, not auto routing for CUTLASS-only modes."""
-    _require_filtered_topk()
-    logits, seq_lens, top_k, strict_indices = _make_boundary_tie_case()
-
-    indices, _ = flashinfer.top_k_varlen(
-        logits,
-        seq_lens,
-        top_k,
-        deterministic=True,
-        tie_break=flashinfer.TopKTieBreak.SMALL,
-        skip_check=True,
-    )
-
-    expected = _expected_boundary_indices(
-        logits.shape[1], top_k, strict_indices, prefer_large=False
-    ).expand(logits.shape[0], -1)
-    assert torch.equal(indices, expected)
-
-
-def test_top_k_varlen_row_starts_values_and_auto_fallback():
+def test_top_k_varlen_native_row_starts_values():
     """Values use score-window starts while returned indices remain window-local."""
     top_k, width = 4, 32
     logits = torch.full((2, width), -100, device="cuda", dtype=torch.float32)
@@ -175,7 +138,7 @@ def test_top_k_varlen_row_starts_values_and_auto_fallback():
         top_k,
         return_values=True,
         row_starts=row_starts,
-        backend="auto",
+        backend="radix",
     )
 
     expected_indices = torch.stack(
@@ -203,7 +166,7 @@ def test_top_k_varlen_row_window_clamp_and_empty_value_padding():
         top_k,
         return_values=True,
         row_starts=row_starts,
-        backend="auto",
+        backend="radix",
     )
 
     assert set(indices[0].cpu().tolist()) == {2, 3}
@@ -226,7 +189,7 @@ def test_top_k_varlen_next_n_negative_effective_lengths_clamp_to_zero():
         2,
         next_n=2,
         return_values=True,
-        backend="radix_cutlass",
+        backend="radix",
     )
 
     assert torch.equal(indices, torch.full_like(indices, -1))
@@ -379,11 +342,9 @@ def _native_backend_available(backend: str) -> bool:
 @pytest.mark.parametrize(
     ("backend", "feature"),
     [
-        ("radix", "deterministic"),
-        ("radix", "row_starts"),
-        ("gvr", "deterministic"),
         ("gvr", "tie_break"),
         ("gvr", "row_starts"),
+        ("radix_cutlass", "row_starts"),
     ],
 )
 def test_top_k_varlen_explicit_native_backend_rejects_cutlass_only_features(
@@ -398,9 +359,7 @@ def test_top_k_varlen_explicit_native_backend_rejects_cutlass_only_features(
     seq_lens = torch.full((num_rows,), width - 1, device="cuda", dtype=torch.int32)
     pre_idx = torch.zeros((num_rows, top_k), device="cuda", dtype=torch.int32)
     kwargs = {"pre_idx": pre_idx}
-    if feature == "deterministic":
-        kwargs["deterministic"] = True
-    elif feature == "tie_break":
+    if feature == "tie_break":
         kwargs["tie_break"] = flashinfer.TopKTieBreak.SMALL
     else:
         kwargs["row_starts"] = torch.ones(num_rows, device="cuda", dtype=torch.int32)

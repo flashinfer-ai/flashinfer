@@ -293,7 +293,13 @@ class SinglePassMultiCTARadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def load_chunk_to_smem(
-        self, input_row, shared_ordered, chunk_start, actual_chunk_size, tidx
+        self,
+        input_row,
+        shared_ordered,
+        row_start,
+        chunk_start,
+        actual_chunk_size,
+        tidx,
     ):
         """Load valid chunk elements into smem as ordered integers.
 
@@ -312,7 +318,8 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # --- Compute prologue / aligned / tail region sizes ---
         # Pointer to chunk[0]; .toint() gives byte address as Int64.
-        row_ptr = input_row.iterator + chunk_start
+        input_start = row_start + chunk_start
+        row_ptr = input_row.iterator + input_start
         row_addr_u64 = row_ptr.toint()
 
         misalign = row_addr_u64 % align_bytes
@@ -376,13 +383,13 @@ class SinglePassMultiCTARadixTopKKernel:
         # --- Part 1: Scalar prologue (before alignment boundary) ---
         for j in range(tidx, prologue_elems, num_threads):
             shared_ordered[aligned_size + j] = self.to_ordered(
-                input_row[chunk_start + j]
+                input_row[input_start + j]
             )
 
         # --- Part 3: Scalar tail (after last aligned vector) ---
         for j in range(tidx, left_size, num_threads):
             k = prologue_elems + aligned_size + j
-            shared_ordered[k] = self.to_ordered(input_row[chunk_start + k])
+            shared_ordered[k] = self.to_ordered(input_row[input_start + k])
 
         cute.arch.barrier()
         return prologue_elems, aligned_size, left_size
@@ -1258,6 +1265,7 @@ class SinglePassMultiCTARadixTopKKernel:
         input_data: cute.Tensor,
         row_states: cute.Tensor,
         seqlen: cute.Tensor,
+        row_starts: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
     ):
@@ -1281,6 +1289,7 @@ class SinglePassMultiCTARadixTopKKernel:
         cta_in_group = bidx % ctas_per_group
         num_groups = grid_size // ctas_per_group
         num_rows = input_data.shape[0]
+        row_width = input_data.shape[1]
 
         griddepcontrol_wait()
 
@@ -1337,10 +1346,22 @@ class SinglePassMultiCTARadixTopKKernel:
         while row_idx < num_rows:
             # Compute effective length from seqlen
             seq_len = seqlen[row_idx // next_n]
+            row_start = cutlass.Int32(0)
+            if cutlass.const_expr(row_starts is not None):
+                row_start = row_starts[row_idx]
+                if row_start < 0:
+                    row_start = cutlass.Int32(0)
+                if row_start > row_width:
+                    row_start = cutlass.Int32(row_width)
             # Compute effective column count in compressed (logit) index space.
             # next_n adjustment is in token units, so it must happen before
             # dividing by compress_ratio; when compress_ratio=1 this is a no-op.
             length = (seq_len - next_n + (row_idx % next_n) + 1) // compress_ratio
+            if length < 0:
+                length = cutlass.Int32(0)
+            max_window_length = cutlass.Int32(row_width) - row_start
+            if length > max_window_length:
+                length = max_window_length
 
             # My chunk boundaries
             chunk_start = cta_in_group * chunk_size
@@ -1368,12 +1389,14 @@ class SinglePassMultiCTARadixTopKKernel:
                         )
                         if cutlass.const_expr(output_values is not None):
                             output_values_row[chunk_start + i] = input_row[
-                                chunk_start + i
+                                row_start + chunk_start + i
                             ]
                 # Fill remaining slots with -1 (only CTA 0 / single-CTA)
                 if cta_in_group == 0:
                     for i in range(tidx + length, top_k, num_threads):
                         output_indices_row[i] = cutlass.Int32(-1)
+                        if cutlass.const_expr(output_values is not None):
+                            output_values_row[i] = self.dtype(0)
                 # Multi-CTA: clear next iter's first histogram buffer.
                 # No inter-CTA barrier needed here (FlashInfer pattern):
                 # early-exit writes no global histogram, so there is nothing
@@ -1400,7 +1423,12 @@ class SinglePassMultiCTARadixTopKKernel:
             else:
                 # Step 1: Load chunk to smem as ordered
                 prologue_elems, aligned_size, left_size = self.load_chunk_to_smem(
-                    input_row, shared_ordered, chunk_start, actual_chunk_size, tidx
+                    input_row,
+                    shared_ordered,
+                    row_start,
+                    chunk_start,
+                    actual_chunk_size,
+                    tidx,
                 )
 
                 # Step 2: Multi-round radix select
@@ -1618,6 +1646,7 @@ class SinglePassMultiCTARadixTopKKernel:
         input_data: cute.Tensor,
         row_states: cute.Tensor,
         seqlen: cute.Tensor,
+        row_starts: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
         stream,
@@ -1631,6 +1660,7 @@ class SinglePassMultiCTARadixTopKKernel:
             input_data,
             row_states,
             seqlen,
+            row_starts,
             output_indices,
             output_values,
         ).launch(

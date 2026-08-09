@@ -293,7 +293,6 @@ top_k_varlen_trace = TraceTemplate(
         "next_n": Scalar("int32", optional=True),
         "deterministic": Scalar("bool", optional=True),
         "tie_break": Scalar("int32", optional=True),
-        "dsa_graph_safe": Scalar("bool", optional=True),
         "row_starts": Tensor(["batch_size"], dtype="int32", optional=True),
     },
     outputs={
