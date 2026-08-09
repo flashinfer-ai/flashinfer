@@ -172,7 +172,7 @@ def chunk_gated_delta_product(
         beta,
         scale,
         initial_state,
-        output_final_state,
+        True,
         cu_seqlens * num_householder,
         use_qk_l2norm_in_kernel,
         output=expanded_output,
@@ -182,7 +182,10 @@ def chunk_gated_delta_product(
 
     if output is not None:
         output[:] = expanded_output[num_householder - 1 :: num_householder]
-        return output, output_state
-
     else:
-        return expanded_output[::num_householder].clone(), output_state
+        output = expanded_output[::num_householder].clone()
+
+    if output_final_state:
+        return output, output_state
+    else:
+        return output
