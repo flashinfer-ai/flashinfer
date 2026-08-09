@@ -50,6 +50,10 @@ def chunk_gated_delta_product(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    # expansion scratch -- required for cudagraph capture, else allocated here
+    expanded_q: Optional[torch.Tensor] = None,  # [T*n_h, num_q_heads,  D]
+    expanded_g: Optional[torch.Tensor] = None,  # [T*n_h, num_sab_heads]
+    expanded_output: Optional[torch.Tensor] = None,  # [T*n_h, num_o_heads,  D]
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated DeltaProduct attention for prefill.
 
@@ -122,40 +126,52 @@ def chunk_gated_delta_product(
             state_indices=state_indices,
         )
 
-    # -----------------------------------------------------------------------
-    # TODO(you): the expansion.
-    #
-    # Build the n_h-times-longer sequence, call chunk_gated_delta_rule on it,
-    # then slice back to one row per real token.
-    #
-    #   k, v      reshape [T, n_h, H, D] -> [T * n_h, H, D]
-    #   beta      reshape [T, n_h, H]    -> [T * n_h, H]
-    #   g         scatter: g_flat[0::n_h] = g, ELSE 1.0   (multiplicative!)
-    #   q         scatter: q_flat[n_h-1::n_h] = q, else anything (rows discarded)
-    #   cu_seqlens                       -> cu_seqlens * n_h
-    #
-    #   out_flat = chunk_gated_delta_rule(...)   # [T * n_h, num_o_heads, D]
-    #   out      = out_flat[n_h - 1 :: n_h]      # one row per real token
-    #
-    # Three things to get right, in rough order of how easy they are to miss:
-    #
-    #  * `output=` / `output_state=`. The caller's `output` buffer is sized for
-    #    T rows, but the kernel writes T * n_h. Allocate the expanded buffer
-    #    here and copy the strided slice into the caller's, or pass None and
-    #    copy afterwards. `output_state` is NOT expanded -- state shape is
-    #    independent of n_h -- so it can be forwarded unchanged.
-    #
-    #  * The strided slice `[n_h - 1 :: n_h]` is only valid because every
-    #    sequence's expanded length is a multiple of n_h, so every sequence
-    #    still starts at a multiple of n_h. That is what makes
-    #    `cu_seqlens * n_h` sufficient rather than needing per-sequence fixups.
-    #
-    #  * Zeroed q rows are safe (the in-kernel l2 norm has an eps), but the
-    #    rows are discarded anyway -- so replicating q is equally fine and
-    #    avoids depending on that eps.
-    #
-    # `tests/gdn/test_prefill_delta_product.py::test_reference_equals_expanded_
-    # delta_rule` already validates this exact expansion in pure torch. If the
-    # kernel disagrees, the fault is in the marshalling here, not the algebra.
-    # -----------------------------------------------------------------------
-    raise NotImplementedError("chunk_gated_delta_product: the n_h expansion")
+    # GDP = GDN with a sequence n_h times longer
+    k = torch.flatten(k, start_dim=0, end_dim=1)
+    v = torch.flatten(v, start_dim=0, end_dim=1)
+    if beta is not None:
+        beta = torch.flatten(beta, start_dim=0, end_dim=1)
+
+    if expanded_q is None:
+        expanded_q = torch.empty(
+            q.size(0) * num_householder, *q.shape[1:], dtype=q.dtype, device=q.device
+        )
+    expanded_q[::num_householder] = q
+
+    if g is not None:
+        if expanded_g is None:
+            expanded_g = torch.ones(
+                g.size(0) * num_householder,
+                *g.shape[1:],
+                dtype=g.dtype,
+                device=g.device,
+            )
+        expanded_g[::num_householder] = g
+    else:
+        expanded_g = None
+
+    if expanded_output is None:
+        expanded_output = torch.empty_like(expanded_q)
+
+    chunk_gated_delta_rule(
+        expanded_q,
+        k,
+        v,
+        expanded_g,
+        beta,
+        scale,
+        initial_state,
+        output_final_state,
+        cu_seqlens * num_householder,
+        use_qk_l2norm_in_kernel,
+        output=expanded_output,
+        output_state=output_state,
+        state_indices=state_indices,
+    )
+
+    if output is not None:
+        output[:] = expanded_output[::num_householder]
+        return output
+
+    else:
+        return expanded_output[::num_householder].clone()
