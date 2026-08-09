@@ -196,9 +196,10 @@ def test_top_k_varlen_next_n_negative_effective_lengths_clamp_to_zero():
     assert torch.equal(values, torch.zeros_like(values))
 
 
-def test_top_k_varlen_compact_page_table_raw_values_and_outputs():
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_top_k_varlen_compact_page_table_raw_values_and_outputs(page_size):
     """Compact physical, raw, and value outputs stay positionally aligned."""
-    num_rows, width, top_k, page_size = 2, 20, 5, 4
+    num_rows, width, top_k = 2, 20, 5
     logits = torch.full((num_rows, width), -100, device="cuda", dtype=torch.float32)
     selected = ((1, 6, 11, 12, 16), (0, 4, 5, 8, 12))
     for row, row_indices in enumerate(selected):
@@ -206,11 +207,19 @@ def test_top_k_varlen_compact_page_table_raw_values_and_outputs():
             top_k, 0, -1, device="cuda", dtype=logits.dtype
         )
     seq_lens = torch.tensor([17, 13], device="cuda", dtype=torch.int32)
-    src_page_table = torch.tensor(
-        [[9, 2, 17, 5, 11], [30, 25, 40, 35, 50]],
-        device="cuda",
-        dtype=torch.int32,
-    )
+    if page_size == 1:
+        src_page_table = torch.stack(
+            (
+                torch.arange(width, device="cuda", dtype=torch.int32) + 100,
+                torch.arange(width, device="cuda", dtype=torch.int32) + 1000,
+            )
+        )
+    else:
+        src_page_table = torch.tensor(
+            [[9, 2, 17, 5, 11], [30, 25, 40, 35, 50]],
+            device="cuda",
+            dtype=torch.int32,
+        )
     out = torch.empty((num_rows, top_k), device="cuda", dtype=torch.int32)
     out_raw = torch.empty_like(out)
     out_values = torch.empty_like(out, dtype=logits.dtype)

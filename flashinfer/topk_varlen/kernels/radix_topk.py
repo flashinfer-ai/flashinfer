@@ -1676,6 +1676,11 @@ class SinglePassMultiCTARadixTopKKernel:
                             barrier_phase * ctas_per_group,
                             tidx,
                         )
+                else:
+                    # The selection helpers distribute output writes across
+                    # threads. Synchronize before those same threads read the
+                    # completed raw output for compact-page translation.
+                    cute.arch.barrier()
                 if cta_in_group == 0:
                     self.translate_page_indices(
                         output_indices_row,
