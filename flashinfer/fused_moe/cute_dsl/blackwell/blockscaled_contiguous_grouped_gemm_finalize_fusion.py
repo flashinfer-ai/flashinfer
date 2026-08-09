@@ -2781,7 +2781,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
-        num_non_exiting_tiles_ptr: cute.Pointer,
+        num_non_exiting_tiles: cute.Tensor,
         token_final_scales_ptr: cute.Pointer,
         a_per_token_scale_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
@@ -2832,9 +2832,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
         permuted_idx_to_expanded_idx = cute.make_tensor(
             permuted_idx_to_expanded_idx_ptr, layout=cute.make_layout((m,))
-        )
-        num_non_exiting_tiles = cute.make_tensor(
-            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
         token_final_scales = cute.make_tensor(
             token_final_scales_ptr,

@@ -240,7 +240,6 @@ def _get_compiled_finalize_kernel(
     tile_idx_ptr,
     mn_limit_ptr,
     permuted_idx_ptr,
-    num_tiles_ptr,
     token_scales_ptr,
     a_per_token_scale_ptr,
     max_active_clusters: int,
@@ -306,10 +305,13 @@ def _get_compiled_finalize_kernel(
         # Order must match wrapper signature:
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
-        #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
+        #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles,
         #  token_final_scales_ptr, a_per_token_scale_ptr,
         #  m, n, k, l, num_tokens, top_k,
         #  tile_size, scaling_vector_size, max_active_clusters, env stream)
+        num_tiles_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (1,), assumed_align=4
+        )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         compiled_gemm = build_and_load_cute_dsl_kernel(
             _CUTE_DSL_MODULE,
@@ -327,7 +329,7 @@ def _get_compiled_finalize_kernel(
                 tile_idx_ptr,
                 mn_limit_ptr,
                 permuted_idx_ptr,
-                num_tiles_ptr,
+                num_tiles_fake,
                 token_scales_ptr,
                 a_per_token_scale_ptr,
                 permuted_m,
@@ -574,9 +576,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     mn_limit_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_mn_limit.data_ptr(), cute.AddressSpace.gmem
     )
-    num_tiles_ptr = make_ptr(
-        cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
-    )
     permuted_idx_ptr = make_ptr(
         cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -616,7 +615,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         tile_idx_ptr=tile_idx_ptr,
         mn_limit_ptr=mn_limit_ptr,
         permuted_idx_ptr=permuted_idx_ptr,
-        num_tiles_ptr=num_tiles_ptr,
         token_scales_ptr=token_scales_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
@@ -640,7 +638,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     # the caller's current stream is supplied by the TVM-FFI environment.
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
-    #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
+    #  mn_limit_ptr, permuted_idx_ptr, num_tiles_tensor, token_scales_ptr,
     #  a_per_token_scale_ptr, m, n, k, l, num_tokens, top_k)
     compiled_gemm(
         a.data_ptr(),
@@ -652,7 +650,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         tile_idx_to_expert_idx.data_ptr(),
         tile_idx_to_mn_limit.data_ptr(),
         permuted_idx_to_expanded_idx.data_ptr(),
-        num_non_exiting_tiles.data_ptr(),
+        num_non_exiting_tiles,
         token_final_scales.data_ptr(),
         a_per_token_scale.data_ptr() if a_per_token_scale is not None else None,
         permuted_m,

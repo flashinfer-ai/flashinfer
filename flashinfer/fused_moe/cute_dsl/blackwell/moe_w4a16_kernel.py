@@ -540,7 +540,7 @@ class Sm100W4A16GroupedGemmKernel:
         activation_ptr: cute.Pointer,
         tile_idx_to_expert_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
-        num_non_exiting_tiles_ptr: cute.Pointer,
+        num_non_exiting_tiles: cute.Tensor,
         alpha_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: Optional[cute.Pointer],
@@ -585,9 +585,6 @@ class Sm100W4A16GroupedGemmKernel:
         )
         tile_idx_to_mn_limit = cute.make_tensor(
             tile_idx_to_mn_limit_ptr, cute.make_layout((num_route_tiles,))
-        )
-        num_non_exiting_tiles = cute.make_tensor(
-            num_non_exiting_tiles_ptr, cute.make_layout((1,))
         )
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((self.group_count,)))
         permuted_idx_to_expanded_idx = (

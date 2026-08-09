@@ -3830,7 +3830,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         token_id_mapping_ptr: cute.Pointer,
-        num_non_exiting_tiles_ptr: cute.Pointer,
+        num_non_exiting_tiles: cute.Tensor,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
@@ -3892,9 +3892,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         )
         token_id_mapping = cute.make_tensor(
             token_id_mapping_ptr, layout=cute.make_layout((m,))
-        )
-        num_non_exiting_tiles = cute.make_tensor(
-            num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
         global_sf = (
             cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))

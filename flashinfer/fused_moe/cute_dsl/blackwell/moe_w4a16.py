@@ -245,8 +245,8 @@ def _get_compiled_kernel(
         tile_idx_to_mn_limit_ptr = make_ptr(
             cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16
         )
-        num_non_exiting_tiles_ptr = make_ptr(
-            cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16
+        num_non_exiting_tiles_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (1,), assumed_align=16
         )
         alpha_ptr = make_ptr(
             cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16
@@ -283,7 +283,7 @@ def _get_compiled_kernel(
                 activation_ptr,
                 tile_idx_to_expert_idx_ptr,
                 tile_idx_to_mn_limit_ptr,
-                num_non_exiting_tiles_ptr,
+                num_non_exiting_tiles_fake,
                 alpha_ptr,
                 output_ptr,
                 permuted_idx_to_expanded_idx_ptr,
@@ -364,13 +364,14 @@ def _run_grouped_gemm(
     # Pointer-typed TVM-FFI arguments are raw addresses. The stream is omitted:
     # make_fake_stream(use_tvm_ffi_env_stream=True) binds the caller's current
     # stream from the TVM-FFI environment, including during CUDA graph capture.
+    _aligned_data_ptr(num_non_exiting_tiles, 16)
     compiled(
         _aligned_data_ptr(weight, 32),
         _aligned_data_ptr(weight_sf, 16),
         _aligned_data_ptr(activations, 32),
         _aligned_data_ptr(tile_idx_to_expert_idx, 16),
         _aligned_data_ptr(tile_idx_to_mn_limit, 16),
-        _aligned_data_ptr(num_non_exiting_tiles, 16),
+        num_non_exiting_tiles,
         _aligned_data_ptr(alpha, 16),
         _aligned_data_ptr(output, 32),
         (
