@@ -1701,7 +1701,31 @@ def fp8_gemm_sm100(
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_fp8_runner())
+        # On SM12x without override_shape (cuDNN backend < 9.23.1) cuDNN builds
+        # a fresh ``policy=ALL`` execution graph for every distinct problem
+        # shape. At serving time, where the token count changes almost every
+        # step, that is unbounded host-side work and each build also loads a
+        # CUDA module that is never released, so device memory grows for the
+        # lifetime of the process. Same condition ``bmm_fp8`` auto already
+        # gates on (#4165); repeated here because callers can reach this
+        # helper with an explicitly built runner list that never passes
+        # through the ``bmm_fp8`` heuristic. Only skipped when another runner
+        # is available, so an explicit cuDNN-only request still works.
+        if (
+            runners
+            and _match_sm_version(a.device, ["120", "121"])
+            and not _is_cudnn_override_shape_available()
+        ):
+            if "fp8_gemm_sm100" not in _CUDNN_SM12X_SKIP_LOGGED:
+                _CUDNN_SM12X_SKIP_LOGGED.add("fp8_gemm_sm100")
+                logger.warning(
+                    "Skipping cuDNN in fp8_gemm candidates on SM12x: "
+                    "override_shape unavailable (cuDNN backend < 9.23.1); "
+                    "per-shape policy=ALL graph build is unbounded at serving "
+                    "time and leaks a CUDA module per build."
+                )
+        else:
+            runners.append(_cudnn_gemm_fp8_runner())
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]

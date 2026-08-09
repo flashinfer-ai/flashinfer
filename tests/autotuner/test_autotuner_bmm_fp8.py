@@ -248,3 +248,71 @@ def test_bmm_fp8_heuristic_gates_cudnn_on_sm12x_without_override_shape(monkeypat
 
     # override_shape available -> cuDNN retained.
     assert "cudnn" in call(override_shape_available=True)
+
+
+def test_fp8_gemm_sm100_gates_cudnn_on_sm12x_without_override_shape(monkeypatch):
+    """``fp8_gemm_sm100`` must apply the same SM12x/override_shape gate as the
+    ``bmm_fp8`` auto heuristic (#4165).
+
+    Callers can reach this helper with an already-built runner-name list that
+    never passed through ``_heuristic_func_bmm_fp8``, so the gate is repeated
+    here. Without ``override_shape`` (cuDNN backend < 9.23.1) each distinct
+    problem shape triggers a fresh ``policy=ALL`` graph build, and every build
+    also loads a CUDA module that is never released -- device memory grows for
+    the lifetime of the process.
+
+    An explicit cuDNN-only request is still honoured, so opting in deliberately
+    keeps working. SM version and cuDNN availability are monkeypatched so this
+    runs on any host.
+    """
+    monkeypatch.setattr(gemm_base, "_match_sm_version", lambda dev, vers: "120" in vers)
+
+    cudnn_runner = object()
+    cutlass_runner = object()
+    seen = {}
+
+    class _FakeTuner:
+        def choose_one(self, name, runners, config, inputs):
+            seen["runners"] = list(runners)
+            return (lambda inputs, tactic: None), 0
+
+    class _FakeAutoTuner:
+        @staticmethod
+        def get():
+            return _FakeTuner()
+
+    class _FakeCutlassModule:
+        @staticmethod
+        def cutlass_fp8_gemm_runner():
+            return cutlass_runner
+
+    monkeypatch.setattr(gemm_base, "AutoTuner", _FakeAutoTuner)
+    monkeypatch.setattr(gemm_base, "_cudnn_gemm_fp8_runner", lambda: cudnn_runner)
+    monkeypatch.setattr(
+        gemm_base, "get_gemm_sm120_module_cutlass_fp8", lambda: _FakeCutlassModule
+    )
+
+    t = torch.empty(1, 1, 1)
+
+    def call(runner_names, override_shape_available):
+        monkeypatch.setattr(
+            gemm_base,
+            "_is_cudnn_override_shape_available",
+            lambda: override_shape_available,
+        )
+        gemm_base.fp8_gemm_sm100(t, t, t, t, t, t, runner_names)
+        return seen["runners"]
+
+    both = ["cutlass_sm12x", "cudnn"]
+
+    # override_shape unavailable -> cuDNN dropped, cutlass retained.
+    runners = call(both, override_shape_available=False)
+    assert cudnn_runner not in runners
+    assert cutlass_runner in runners
+
+    # override_shape available -> cuDNN retained.
+    assert cudnn_runner in call(both, override_shape_available=True)
+
+    # Explicit cuDNN-only request is still honoured even when gated, so the
+    # "No suitable runners found" assertion can never be tripped by the gate.
+    assert cudnn_runner in call(["cudnn"], override_shape_available=False)
