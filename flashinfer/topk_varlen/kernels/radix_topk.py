@@ -50,13 +50,19 @@ def half_as_ushort(half_val):
 #   [512..767]   histogram buffer 2
 #   [768]        arrival_counter
 #   [769]        output_counter
+#   [770..1025]  per-CTA pivot-equality counts (tie-break specializations)
 _HIST_SIZE = 256
 _HIST_BUF_0 = 0
 _HIST_BUF_1 = _HIST_SIZE
 _HIST_BUF_2 = 2 * _HIST_SIZE
 _ARRIVAL_COUNTER = 3 * _HIST_SIZE  # 768
 _OUTPUT_COUNTER = 3 * _HIST_SIZE + 1  # 769
-STATE_SIZE = 3 * _HIST_SIZE + 2  # 770
+_EQ_COUNTS = 3 * _HIST_SIZE + 2  # 770
+STATE_SIZE = 4 * _HIST_SIZE + 2  # 1026
+
+_TIE_NONE = 0
+_TIE_SMALL = 1
+_TIE_LARGE = 2
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +182,9 @@ class SinglePassMultiCTARadixTopKKernel:
          a. Pass 1: elements strictly greater than pivot → atomicAdd to get
             position in output.
          b. Inter-CTA barrier.
-         c. Pass 2: elements equal to pivot → per-element atomicAdd, write
-            only while pos < k.
+         c. Pass 2: elements equal to pivot → either the original atomic
+            collection (no tie-break) or an index-ordered block scan that
+            selects the smallest/largest boundary indices.
     """
 
     def __init__(
@@ -190,6 +197,7 @@ class SinglePassMultiCTARadixTopKKernel:
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
+        tie_break: int = _TIE_NONE,
     ):
         self.dtype = dtype
         self.chunk_size = chunk_size
@@ -199,6 +207,9 @@ class SinglePassMultiCTARadixTopKKernel:
         self.ctas_per_group = ctas_per_group
         self.num_sms = num_sms
         self.num_copy_bits = num_copy_bits
+        if tie_break not in (_TIE_NONE, _TIE_SMALL, _TIE_LARGE):
+            raise ValueError(f"tie_break must be 0, 1, or 2; got {tie_break}")
+        self.tie_break = tie_break
 
         # Radix config
         self.radix = 256
@@ -724,6 +735,27 @@ class SinglePassMultiCTARadixTopKKernel:
 
         return local_histogram[0]
 
+    @cute.jit
+    def compute_local_eq_count(
+        self, shared_ordered, actual_chunk_size, ordered_pivot, local_histogram, tidx
+    ):
+        """Count pivot-equal elements in this CTA for global tie ranking."""
+        if tidx == 0:
+            local_histogram[0] = cutlass.Int32(0)
+        cute.arch.barrier()
+
+        my_count = cutlass.Int32(0)
+        for i in range(tidx, actual_chunk_size, self.num_threads):
+            if shared_ordered[i] == ordered_pivot:
+                my_count = my_count + cutlass.Int32(1)
+
+        warp_sum = cute.arch.warp_reduction_sum(my_count)
+        if cute.arch.lane_idx() == 0:
+            if warp_sum > 0:
+                atomicAdd(local_histogram.iterator, warp_sum)
+        cute.arch.barrier()
+        return local_histogram[0]
+
     # ------------------------------------------------------------------
     # Step 3a: Collect elements strictly greater than pivot
     # ------------------------------------------------------------------
@@ -836,6 +868,73 @@ class SinglePassMultiCTARadixTopKKernel:
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(ordered_pivot)
 
+    @cute.jit
+    def _collect_pass_eq_tie(
+        self,
+        shared_ordered,
+        actual_chunk_size,
+        chunk_start,
+        prologue_elems,
+        aligned_size,
+        ordered_pivot,
+        top_k,
+        gt_count,
+        eq_base,
+        prefix_buf,
+        output_indices_row,
+        output_values_row,
+        tidx,
+    ):
+        """Collect pivot ties in ascending or descending logical-index order.
+
+        ``eq_base`` is the number of preferred pivot-equal elements owned by
+        earlier CTA chunks (SMALL) or later chunks (LARGE). Within a chunk, a
+        block prefix scan assigns stable ranks in contiguous row-index order.
+        """
+        num_threads = cutlass.const_expr(self.num_threads)
+        num_warps = cutlass.const_expr(self.num_warps)
+        selected_before = eq_base
+        tile_base = cutlass.Int32(0)
+
+        while tile_base < actual_chunk_size and gt_count + selected_before < top_k:
+            linear = tile_base + tidx
+            local_idx = cutlass.Int32(0)
+            is_eq = cutlass.Int32(0)
+            if linear < actual_chunk_size:
+                if cutlass.const_expr(self.tie_break == _TIE_LARGE):
+                    local_idx = actual_chunk_size - cutlass.Int32(1) - linear
+                else:
+                    local_idx = linear
+
+                # load_chunk_to_smem rotates the alignment prologue behind the
+                # aligned body. Map the logical local index back to that layout.
+                smem_idx = local_idx
+                if local_idx < prologue_elems:
+                    smem_idx = aligned_size + local_idx
+                elif local_idx < prologue_elems + aligned_size:
+                    smem_idx = local_idx - prologue_elems
+                if shared_ordered[smem_idx] == ordered_pivot:
+                    is_eq = cutlass.Int32(1)
+
+            prefix, tile_total = block_prefix_sum_kernel(
+                is_eq,
+                prefix_buf,
+                tidx,
+                num_threads,
+                num_warps,
+                barrier_id=1,
+                need_total_sum=True,
+            )
+            eq_rank = selected_before + prefix - is_eq
+            pos = gt_count + eq_rank
+            if is_eq != cutlass.Int32(0) and pos < top_k:
+                output_indices_row[pos] = cutlass.Int32(chunk_start) + local_idx
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered_pivot)
+
+            selected_before = selected_before + tile_total
+            tile_base = tile_base + cutlass.Int32(num_threads)
+
     # ------------------------------------------------------------------
     # Step 3: Collect output indices and values
     # ------------------------------------------------------------------
@@ -855,7 +954,11 @@ class SinglePassMultiCTARadixTopKKernel:
         arrival_counter_ptr,
         barrier_phase,
         ctas_per_group,
+        cta_in_group,
+        state_base_ptr,
+        state_row,
         local_histogram,
+        prefix_buf,
         output_indices_row,
         output_values_row,
         tidx,
@@ -872,6 +975,22 @@ class SinglePassMultiCTARadixTopKKernel:
         elements from all CTAs are counted before == pivot elements start
         filling the remaining slots.
         """
+        # Tie-break specializations publish one equality count per CTA. The
+        # dedicated state tail avoids perturbing the rotating radix histograms.
+        if cutlass.const_expr(self.tie_break != _TIE_NONE):
+            local_eq_count = self.compute_local_eq_count(
+                shared_ordered,
+                actual_chunk_size,
+                ordered_pivot,
+                local_histogram,
+                tidx,
+            )
+            if tidx == 0:
+                st_release_gpu(
+                    state_base_ptr + cutlass.Int32(_EQ_COUNTS) + cta_in_group,
+                    local_eq_count,
+                )
+
         # Reuse local_histogram for counters (FlashInfer convention):
         #   [0] = local_offset_gt  (local position within CTA allocation)
         #   [1] = global_base_gt   (global base from batch atomicAdd)
@@ -902,20 +1021,54 @@ class SinglePassMultiCTARadixTopKKernel:
         barrier_phase = barrier_phase + 1
         barrier_inter_cta(arrival_counter_ptr, barrier_phase * ctas_per_group, tidx)
 
-        # Pass 2: equal to pivot
-        self._collect_pass_eq(
-            shared_ordered,
-            chunk_start,
-            prologue_elems,
-            aligned_size,
-            left_size,
-            ordered_pivot,
-            top_k,
-            output_counter_ptr,
-            output_indices_row,
-            output_values_row,
-            tidx,
-        )
+        # Pass 2: equal to pivot. The default specialization retains the
+        # original atomic fast path. Tie modes rank CTA chunks globally and use
+        # a block scan for stable contiguous-index ranks within this chunk.
+        if cutlass.const_expr(self.tie_break == _TIE_NONE):
+            self._collect_pass_eq(
+                shared_ordered,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                left_size,
+                ordered_pivot,
+                top_k,
+                output_counter_ptr,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
+        else:
+            gt_count = ld_acquire_gpu(output_counter_ptr)
+            if tidx == 0:
+                eq_base = cutlass.Int32(0)
+                for peer in cutlass.range_constexpr(self.ctas_per_group):
+                    preferred = cutlass.Int32(0)
+                    if cutlass.const_expr(self.tie_break == _TIE_SMALL):
+                        if cutlass.Int32(peer) < cta_in_group:
+                            preferred = cutlass.Int32(1)
+                    if cutlass.const_expr(self.tie_break == _TIE_LARGE):
+                        if cutlass.Int32(peer) > cta_in_group:
+                            preferred = cutlass.Int32(1)
+                    if preferred != cutlass.Int32(0):
+                        eq_base = eq_base + state_row[cutlass.Int32(_EQ_COUNTS + peer)]
+                local_histogram[2] = eq_base
+            cute.arch.barrier()
+            self._collect_pass_eq_tie(
+                shared_ordered,
+                actual_chunk_size,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                ordered_pivot,
+                top_k,
+                gt_count,
+                local_histogram[2],
+                prefix_buf,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
 
         return barrier_phase
 
@@ -934,6 +1087,7 @@ class SinglePassMultiCTARadixTopKKernel:
         ordered_pivot,
         top_k,
         local_histogram,
+        prefix_buf,
         output_indices_row,
         output_values_row,
         tidx,
@@ -980,35 +1134,58 @@ class SinglePassMultiCTARadixTopKKernel:
                     output_values_row[pos] = self.from_ordered(ordered)
         cute.arch.barrier()
 
-        # Pass 2: equal to pivot (fill remaining slots up to k)
-        for i in range(tidx, aligned_size, self.num_threads):
-            ordered = shared_ordered[i]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + i + prologue_elems
+        # Pass 2: equal to pivot (fill remaining slots up to k).
+        if cutlass.const_expr(self.tie_break == _TIE_NONE):
+            for i in range(tidx, aligned_size, self.num_threads):
+                ordered = shared_ordered[i]
+                if ordered == ordered_pivot:
+                    pos = atomicAdd(
+                        local_histogram.iterator + cutlass.Int32(2), val_one
                     )
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, prologue_elems, self.num_threads):
-            ordered = shared_ordered[i + aligned_size]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
-        for i in range(tidx, left_size, self.num_threads):
-            ordered = shared_ordered[i + aligned_size + prologue_elems]
-            if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
-                if pos < top_k:
-                    output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + prologue_elems + aligned_size + i
+                    if pos < top_k:
+                        output_indices_row[pos] = cutlass.Int32(
+                            chunk_start + i + prologue_elems
+                        )
+                        if cutlass.const_expr(output_values_row is not None):
+                            output_values_row[pos] = self.from_ordered(ordered_pivot)
+            for i in range(tidx, prologue_elems, self.num_threads):
+                ordered = shared_ordered[i + aligned_size]
+                if ordered == ordered_pivot:
+                    pos = atomicAdd(
+                        local_histogram.iterator + cutlass.Int32(2), val_one
                     )
-                    if cutlass.const_expr(output_values_row is not None):
-                        output_values_row[pos] = self.from_ordered(ordered_pivot)
+                    if pos < top_k:
+                        output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                        if cutlass.const_expr(output_values_row is not None):
+                            output_values_row[pos] = self.from_ordered(ordered_pivot)
+            for i in range(tidx, left_size, self.num_threads):
+                ordered = shared_ordered[i + aligned_size + prologue_elems]
+                if ordered == ordered_pivot:
+                    pos = atomicAdd(
+                        local_histogram.iterator + cutlass.Int32(2), val_one
+                    )
+                    if pos < top_k:
+                        output_indices_row[pos] = cutlass.Int32(
+                            chunk_start + prologue_elems + aligned_size + i
+                        )
+                        if cutlass.const_expr(output_values_row is not None):
+                            output_values_row[pos] = self.from_ordered(ordered_pivot)
+        else:
+            self._collect_pass_eq_tie(
+                shared_ordered,
+                actual_chunk_size,
+                chunk_start,
+                prologue_elems,
+                aligned_size,
+                ordered_pivot,
+                top_k,
+                local_histogram[2],
+                cutlass.Int32(0),
+                prefix_buf,
+                output_indices_row,
+                output_values_row,
+                tidx,
+            )
 
     # ------------------------------------------------------------------
     # Single-CTA radix select + collect (shared by parent and subclasses)
@@ -1066,6 +1243,7 @@ class SinglePassMultiCTARadixTopKKernel:
             prefix,
             top_k,
             local_histogram,
+            prefix_buf,
             output_indices_row,
             output_values_row,
             tidx,
@@ -1392,7 +1570,11 @@ class SinglePassMultiCTARadixTopKKernel:
                         arrival_counter_ptr,
                         barrier_phase,
                         ctas_per_group,
+                        cta_in_group,
+                        state_base_ptr,
+                        state_row,
                         local_histogram,
+                        prefix_buf,
                         output_indices_row,
                         output_values_row,
                         tidx,

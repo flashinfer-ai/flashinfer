@@ -155,9 +155,8 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    # GVR does not yet implement the existing radix transform's canonical
-    # output ordering, boundary-index tie-break, or score-window start.  Auto
-    # routing must therefore use radix_cutlass whenever one is requested.
+    # GVR's capped candidate buffer does not retain enough information to
+    # resolve arbitrarily large K-th-value ties exactly.
     if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
         return False
     if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
@@ -207,7 +206,15 @@ def _top_k_varlen_heuristic(
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
     """
-    return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
+    # Tie specializations add a short ordered collection to radix. GVR is
+    # filtered out for tie modes; keep the established GVR-first order for the
+    # default fast path.
+    preference = (
+        ("radix", "gvr", "radix_cutlass")
+        if tie_break != TopKTieBreak.NONE
+        else ("gvr", "radix", "radix_cutlass")
+    )
+    return [b for b in preference if b in suitable_backends]
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +607,7 @@ def _compile_radix(
     ctas_per_group,
     chunk_size,
     num_sms,
+    tie_break,
 ):
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
@@ -619,6 +627,7 @@ def _compile_radix(
         compress_ratio=compress_ratio,
         ctas_per_group=ctas_per_group,
         num_sms=num_sms,
+        tie_break=tie_break,
     )
     sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
     sym_n = N  # static vocab width
@@ -629,6 +638,7 @@ def _compile_radix(
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
+        f"_tie{tie_break}"
     )
 
     def _compile_fn():
@@ -954,12 +964,7 @@ def _radix_top_k_varlen_check(
     row_starts=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return (
-        _CUTE_DSL_AVAILABLE
-        and not deterministic
-        and tie_break == TopKTieBreak.NONE
-        and row_starts is None
-    )
+    return _CUTE_DSL_AVAILABLE and not deterministic and row_starts is None
 
 
 def _run_radix(
@@ -971,6 +976,7 @@ def _run_radix(
     return_output_values: bool,
     out_indices: torch.Tensor,
     out_values: Optional[torch.Tensor],
+    tie_break: int,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CuTe DSL multi-CTA radix top-k: native varlen, no logit masking needed."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
@@ -1003,6 +1009,7 @@ def _run_radix(
         ctas_per_group,
         chunk_size,
         num_sms,
+        tie_break,
     )
 
     # row_states holds the global histograms + inter-CTA barrier counters used
@@ -1182,8 +1189,10 @@ def top_k_varlen(
         local indices and ``TopKTieBreak.LARGE`` prefers larger local indices
         when values equal the K-th value. Tie-breaking controls the selected
         set, not output ordering; combine it with ``deterministic=True`` for
-        canonical ordering. Non-default modes currently route ``"auto"`` to
-        ``"radix_cutlass"``.
+        canonical ordering. The CuTe DSL ``radix`` backend handles non-default
+        modes natively; on Blackwell, ``"auto"`` prefers radix for tie modes.
+        GVR's capped candidate buffer cannot resolve arbitrarily large boundary
+        ties, so explicit GVR remains limited to ``NONE``.
     dsa_graph_safe : bool, optional
         For ``"radix_cutlass"``, force the FilteredTopK graph-safe path and
         scalar vectorization. The CuTe DSL backends are already CUDA-graph
@@ -1245,19 +1254,24 @@ def top_k_varlen(
     tie_break = TopKTieBreak(tie_break)
 
     if backend == "auto":
-        if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
+        if deterministic or row_starts is not None:
             # These semantics are CUTLASS-only today. Resolve them directly so
             # skip_check=True cannot reuse stale auto-routing state.
             backend = "radix_cutlass"
         else:
             backend = top_k_varlen.suitable_auto_backends[0]
 
-    if backend in ("radix", "gvr") and (
-        deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None
-    ):
+    unsupported_options = []
+    if deterministic:
+        unsupported_options.append("deterministic=True")
+    if backend == "gvr" and tie_break != TopKTieBreak.NONE:
+        unsupported_options.append(f"tie_break={tie_break.name}")
+    if row_starts is not None:
+        unsupported_options.append("row_starts")
+    if backend in ("radix", "gvr") and unsupported_options:
         raise ValueError(
-            f"backend={backend!r} does not yet support deterministic output, "
-            "index tie-breaking, or row_starts; use backend='auto' or "
+            f"backend={backend!r} does not support "
+            f"{', '.join(unsupported_options)}; use backend='auto' or "
             "backend='radix_cutlass'"
         )
 
@@ -1296,6 +1310,7 @@ def top_k_varlen(
             return_values,
             out_indices,
             out_values,
+            int(tie_break),
         )
     elif backend == "gvr":
         use_lb = bool(load_balance)

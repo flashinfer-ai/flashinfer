@@ -376,9 +376,17 @@ def _native_backend_available(backend: str) -> bool:
     return flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor)
 
 
-@pytest.mark.parametrize("backend", ["radix", "gvr"])
-@pytest.mark.parametrize("feature", ["deterministic", "tie_break", "row_starts"])
-def test_top_k_varlen_explicit_native_backend_rejects_radix_only_features(
+@pytest.mark.parametrize(
+    ("backend", "feature"),
+    [
+        ("radix", "deterministic"),
+        ("radix", "row_starts"),
+        ("gvr", "deterministic"),
+        ("gvr", "tie_break"),
+        ("gvr", "row_starts"),
+    ],
+)
+def test_top_k_varlen_explicit_native_backend_rejects_cutlass_only_features(
     backend, feature
 ):
     """Explicit native backends reject options implemented only by radix_cutlass."""
@@ -408,3 +416,78 @@ def test_top_k_varlen_explicit_native_backend_rejects_radix_only_features(
             backend=backend,
             **kwargs,
         )
+
+
+def _make_native_boundary_tie_case():
+    """Construct a large boundary tie for a native radix specialization."""
+    # An odd 32-byte row stride exercises radix's rotated alignment prologue on
+    # the second row as well as the ordinary aligned layout on the first.
+    num_rows, width, top_k = 2, 4104, 128
+    strict_indices = (11, 2037)
+    logits = torch.zeros((num_rows, width), device="cuda", dtype=torch.bfloat16)
+    logits[:, strict_indices[0]] = 3
+    logits[:, strict_indices[1]] = 2
+    seq_lens = torch.full((num_rows,), width, device="cuda", dtype=torch.int32)
+
+    return logits, seq_lens, top_k, strict_indices
+
+
+@pytest.mark.parametrize(
+    ("tie_break", "prefer_large"),
+    [
+        (1, False),
+        (2, True),
+    ],
+    ids=["small", "large"],
+)
+def test_top_k_varlen_native_backend_exact_boundary_tie_set(tie_break, prefer_large):
+    """Native radix selects the requested side of a K-th-value tie."""
+    if not _native_backend_available("radix"):
+        pytest.skip("radix is not available on this device")
+
+    logits, seq_lens, top_k, strict_indices = _make_native_boundary_tie_case()
+    indices, values = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        tie_break=tie_break,
+        backend="radix",
+        return_values=True,
+    )
+
+    expected = _expected_boundary_indices(
+        logits.shape[1], top_k, strict_indices, prefer_large
+    ).expand(logits.shape[0], -1)
+    assert torch.equal(indices.sort(dim=-1).values, expected)
+    torch.testing.assert_close(values, torch.gather(logits, 1, indices.long()))
+
+
+@pytest.mark.parametrize(
+    ("tie_break", "prefer_large"),
+    [(1, False), (2, True)],
+    ids=["small", "large"],
+)
+def test_top_k_varlen_radix_multi_cta_exact_boundary_tie_set(tie_break, prefer_large):
+    """Tie ranking remains global when a long row spans multiple radix CTAs."""
+    if not _native_backend_available("radix"):
+        pytest.skip("radix is not available on this device")
+
+    width, top_k = 131072, 512
+    strict_indices = (1000, 70000)
+    logits = torch.zeros((1, width), device="cuda", dtype=torch.bfloat16)
+    logits[:, strict_indices[0]] = 3
+    logits[:, strict_indices[1]] = 2
+    seq_lens = torch.full((1,), width, device="cuda", dtype=torch.int32)
+
+    indices, _ = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        tie_break=tie_break,
+        backend="radix",
+    )
+
+    expected = _expected_boundary_indices(
+        width, top_k, strict_indices, prefer_large
+    ).unsqueeze(0)
+    assert torch.equal(indices.sort(dim=-1).values, expected)
