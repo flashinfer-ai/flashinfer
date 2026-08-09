@@ -1573,7 +1573,8 @@ def _should_use_qk_pv_interleaved_paired_schedule(cfg: FmhaConfig) -> bool:
     """True when the paired MMA task should use ``Qk0_Pv0_Qk1_Pv1``.
 
     Opt-in for SM103a context with ``head_dim_v >= 128``. Excludes head-paired.
-    Causal (including peer0-skip) uses the same order with peer0-balancing drains.
+    Causal (including peer0-skip and non-tile-aligned k>q) uses the same order
+    with peer0-balancing drains.
     """
     if cfg.single_qkv_instance:
         return False
@@ -1582,13 +1583,6 @@ def _should_use_qk_pv_interleaved_paired_schedule(cfg: FmhaConfig) -> bool:
     head_dim_v = cfg.pv_mma_tiler[1]
     if head_dim_v < 128:
         return False
-    if cfg.is_causal:
-        # A non-tile-aligned bottom-right Q offset (k>q not a K/V-tile multiple)
-        # self-disables skip_causal_invalid_peer0 and pushes a right mask into
-        # the LOOP, leaving peer0's drain unbalanced -> deadlock. Defer to the
-        # legacy Pv0Qk0Pv1Qk1 schedule, which masks per LOOP iteration.
-        if cfg.has_q_offset and not cfg.has_tile_aligned_uniform_q_offset:
-            return False
     capability = _current_sm_major_minor()
     return capability == (10, 3)
 

@@ -1928,15 +1928,17 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.cfg.uses_qk_pv_interleaved_causal_paired_schedule:
-                # Causal TAIL. Non-skip peer0 drains an extra empty S slot here
-                # (matched by MMA's peer0 TAIL sp0.acquire/commit) before its
-                # masked row-max. Under skip_causal_invalid_peer0 that drain
-                # moves AFTER the ghost slot (below) so the ghost's sp.wait binds
-                # to MMA's early LOOP sp0 commit, avoiding the peer0/peer1
-                # OrderedSequence phase deadlock.
-                if index == 0 and not tmem_sp.uses_query_paired_invalid_tail:
-                    sp.wait()
-                    sp.release()
+                # Causal TAIL. Peer0's masked row-max must read the REAL last
+                # causal tile S, which MMA commits from its last LOOP sp0 slot;
+                # the empty peer0 slot that matches MMA's TAIL sp0.acquire/commit
+                # is drained AFTER the masked slot (below) so FIFO sp0 binding
+                # lines up: masked <- MMA LOOP[last], empty <- MMA TAIL. Draining
+                # it *before* masked would swap the binding -- masked would read
+                # MMA's empty TAIL slot while the real last-tile S is silently
+                # consumed -- which both corrupts the result and desynchronises
+                # the peer0/peer1 OrderedSequence phase. This mirrors the
+                # skip_causal_invalid_peer0 layout, where the empty slot likewise
+                # trails the ghost slot.
                 sp.wait()
                 old_row_max, row_max = sp.masked_row_max(
                     row_max=row_max,
@@ -2015,6 +2017,14 @@ def create_softmax_task(
                     # fully elided so there is no P to order. Placed AFTER the
                     # ghost so the ghost binds to MMA's early LOOP commit; see the
                     # Causal TAIL note above.
+                    sp.wait()
+                    sp.release()
+                elif index == 0:
+                    # Non-skip peer0: same empty TAIL S slot as the skip case,
+                    # but there is no ghost slot in front of it. It trails the
+                    # masked slot so masked binds to MMA's real last LOOP sp0
+                    # commit and this drain binds to MMA's empty TAIL commit. No
+                    # OrderedSequence/tp: nothing real is produced here.
                     sp.wait()
                     sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
