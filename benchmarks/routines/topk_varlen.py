@@ -21,6 +21,7 @@ import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.topk import TopKTieBreak
 from flashinfer.utils import get_compute_capability
 
 from .flashinfer_benchmark_utils import (
@@ -79,6 +80,17 @@ def parse_topk_varlen_args(line, parser):
         required=False,
         default=512,
         help="Number of top elements to select per row.",
+    )
+    parser.add_argument(
+        "--tie_break",
+        type=str,
+        required=False,
+        default="none",
+        choices=["none", "small", "large", "all"],
+        help=(
+            "Boundary tie-break specialization to benchmark. 'all' runs the "
+            "nondeterministic baseline plus SMALL and LARGE for every backend."
+        ),
     )
 
     args = parser.parse_args(line)
@@ -148,6 +160,16 @@ def testTopKVarlen(args):
         return res
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    tie_break_modes = {
+        "none": [("none", TopKTieBreak.NONE)],
+        "small": [("small", TopKTieBreak.SMALL)],
+        "large": [("large", TopKTieBreak.LARGE)],
+        "all": [
+            ("none", TopKTieBreak.NONE),
+            ("small", TopKTieBreak.SMALL),
+            ("large", TopKTieBreak.LARGE),
+        ],
+    }[args.tie_break]
 
     logits = torch.randn(batch_size, max_seq_len, dtype=input_dtype, device=device)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
@@ -162,63 +184,127 @@ def testTopKVarlen(args):
     if args.verbose >= 2:
         print(f"[VVERBOSE] {logits.shape = }, {seq_lens.shape = }, {top_k = }")
 
-    def run_backend(backend, logits):
+    def run_backend(backend, tie_break, logits):
         if backend == "radix":
             # CuTe DSL multi-CTA radix (Blackwell); no pre_idx needed.
             return flashinfer.top_k_varlen(
-                logits, seq_lens, top_k, pre_idx=None, backend="radix"
+                logits,
+                seq_lens,
+                top_k,
+                pre_idx=None,
+                backend="radix",
+                tie_break=tie_break,
             )
         elif backend == "radix_cutlass":
             # Masked CUTLASS radix fallback (any GPU); no pre_idx needed.
             return flashinfer.top_k_varlen(
-                logits, seq_lens, top_k, pre_idx=None, backend="radix_cutlass"
+                logits,
+                seq_lens,
+                top_k,
+                pre_idx=None,
+                backend="radix_cutlass",
+                tie_break=tie_break,
             )
         elif backend == "gvr":
             return flashinfer.top_k_varlen(
-                logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
+                logits,
+                seq_lens,
+                top_k,
+                pre_idx=pre_idx,
+                backend="gvr",
+                tie_break=tie_break,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    backend_times = {backend: [] for backend in backends}
+    runners = []
+    for backend in backends:
+        for tie_name, tie_break in tie_break_modes:
+            if backend == "gvr" and tie_break != TopKTieBreak.NONE:
+                print(
+                    f"[WARNING] Skipping gvr tie_break={tie_name}: exact boundary "
+                    "ties require radix or radix_cutlass."
+                )
+                continue
+            runners.append((backend, tie_name, tie_break))
+    if not runners:
+        print("[ERROR] No supported backend/tie-break combinations to test.")
+        return res
+    backend_times = {(backend, tie_name): [] for backend, tie_name, _ in runners}
     outputs = {}
-    for cur_backend in backends:
+    for cur_backend, tie_name, tie_break in runners:
+        runner_key = (cur_backend, tie_name)
         if run_refcheck:
             # top_k_varlen returns (indices, values_or_None); refcheck compares indices.
-            outputs[cur_backend] = run_backend(cur_backend, logits)[0].detach()
-        backend_times[cur_backend] = bench_gpu_time(
+            outputs[runner_key] = run_backend(cur_backend, tie_break, logits)[
+                0
+            ].detach()
+        backend_times[runner_key] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, logits),
+            input_args=(cur_backend, tie_break, logits),
         )
 
     if run_refcheck and outputs:
         col_idx = torch.arange(max_seq_len, device=device).unsqueeze(0)
         masked = logits.masked_fill(col_idx >= seq_lens.unsqueeze(1), float("-inf"))
-        ref_indices = torch.topk(masked.float(), k=top_k, dim=-1).indices.int()
+        ref_values = torch.topk(masked.float(), k=top_k, dim=-1).values
 
-        for backend, out_indices in outputs.items():
-            mismatches = sum(
-                set(ref_indices[row].cpu().tolist())
-                != set(out_indices[row].cpu().tolist())
-                for row in range(batch_size)
-            )
+        for (backend, tie_name), out_indices in outputs.items():
+            if tie_name == "none":
+                # Nondeterministic boundary ties may choose any equal-valued
+                # subset. Compare selected values, not arbitrary torch indices.
+                out_values = torch.gather(logits.float(), 1, out_indices.long())
+                mismatches = int(
+                    (
+                        ~torch.isclose(
+                            out_values.sort(dim=-1, descending=True).values,
+                            ref_values,
+                        ).all(dim=-1)
+                    )
+                    .sum()
+                    .item()
+                )
+            else:
+                # Stable value sort over the requested index order gives the
+                # exact SMALL/LARGE selected set without imposing output order.
+                preferred_indices = torch.arange(max_seq_len, device=device)
+                if tie_name == "large":
+                    preferred_indices = preferred_indices.flip(0)
+                preferred_indices = preferred_indices.expand(batch_size, -1)
+                preferred_values = torch.gather(masked.float(), 1, preferred_indices)
+                value_order = torch.argsort(
+                    preferred_values, dim=-1, descending=True, stable=True
+                )
+                ref_indices = torch.gather(
+                    preferred_indices, 1, value_order[:, :top_k]
+                ).int()
+                mismatches = int(
+                    (out_indices.sort(dim=-1).values != ref_indices.sort(dim=-1).values)
+                    .any(dim=-1)
+                    .sum()
+                    .item()
+                )
             pct = 100.0 * mismatches / batch_size
             if mismatches > 0:
                 print(
-                    f"[REFCHECK] Backend {backend}: {mismatches}/{batch_size} rows "
+                    f"[REFCHECK] Backend {backend} tie_break={tie_name}: "
+                    f"{mismatches}/{batch_size} rows "
                     f"({pct:.1f}%) differ from torch.topk reference"
                 )
                 if not args.allow_output_mismatch:
-                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} tie_break={tie_name} output mismatch"
+                    )
 
-    for backend in backends:
-        if len(backend_times[backend]) > 0:
-            median_time = np.median(backend_times[backend])
-            std_time = np.std(backend_times[backend])
+    for backend, tie_name, _ in runners:
+        runner_key = (backend, tie_name)
+        if len(backend_times[runner_key]) > 0:
+            median_time = np.median(backend_times[runner_key])
+            std_time = np.std(backend_times[runner_key])
 
             problem_bytes = (
                 batch_size * max_seq_len * input_dtype.itemsize  # logits read
@@ -227,7 +313,8 @@ def testTopKVarlen(args):
             )
             tb_per_sec = problem_bytes / (1e9 * median_time)
 
-            print_perf_metrics(backend, median_time, std_time, 0, tb_per_sec)
+            label = backend if tie_name == "none" else f"{backend}/tie_{tie_name}"
+            print_perf_metrics(label, median_time, std_time, 0, tb_per_sec)
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -240,6 +327,7 @@ def testTopKVarlen(args):
                 cur_res["max_seq_len"] = max_seq_len
                 cur_res["top_k"] = top_k
                 cur_res["backend"] = backend
+                cur_res["tie_break"] = tie_name
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

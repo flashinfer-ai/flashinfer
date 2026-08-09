@@ -921,6 +921,79 @@ def bench_varlen_transform(
     return result
 
 
+def bench_top_k_varlen_backend(
+    case: VarLenCase,
+    backend: str,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    deterministic: bool = False,
+    compare_tie_break: bool = False,
+) -> dict:
+    """Benchmark one native/fallback ``top_k_varlen`` backend.
+
+    This is decode-only: ``top_k_varlen`` consumes one request-level length per
+    row (its ``next_n`` axis is speculative decode, not causal prefill rows).
+    """
+    device = torch.device("cuda")
+    inputs = generate_varlen_inputs(case, dtype, generator, device)
+    scores = inputs["scores"]
+    lengths = inputs["lengths"]
+    k = case.k
+    masked_scores = build_masked_scores(scores, lengths)
+    pre_idx = torch.topk(masked_scores.float(), k, dim=-1, sorted=False).indices.int()
+    pre_idx[:, 0] = masked_scores.argmax(dim=-1).int()
+
+    def run(deterministic_mode, tie_break=TopKTieBreak.NONE):
+        return flashinfer.top_k_varlen(
+            scores,
+            lengths,
+            k,
+            pre_idx=pre_idx if backend == "gvr" else None,
+            backend=backend,
+            deterministic=deterministic_mode,
+            tie_break=tie_break,
+        )
+
+    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(run, deterministic)
+    len_min, len_mean, len_max, trivial_frac = summarize_lengths(lengths, k)
+    result = {
+        "regime": case.regime,
+        "length_dist": case.length_dist,
+        "transform": "top_k_varlen",
+        "backend": backend,
+        "num_rows": scores.size(0),
+        "num_requests": inputs["num_requests"],
+        "max_len": case.max_len,
+        "k": k,
+        "len_min": len_min,
+        "len_mean": len_mean,
+        "len_max": len_max,
+        "trivial_frac": trivial_frac,
+        "flashinfer_us": fi_ms * 1e3,
+    }
+    if fi_nondeterministic_ms is not None:
+        result["flashinfer_nondeterministic_us"] = fi_nondeterministic_ms * 1e3
+        result["deterministic_slowdown_vs_nondeterministic"] = (
+            fi_ms / fi_nondeterministic_ms
+        )
+    if compare_tie_break:
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: run(deterministic, tie_break),
+                baseline_ms,
+            )
+        )
+
+    with torch_deterministic_algorithms(deterministic):
+        torch_ms = bench_median_ms(lambda: torch.topk(masked_scores, k, dim=-1))
+    result["torch_us"] = torch_ms * 1e3
+    result["speedup_vs_torch"] = torch_ms / fi_ms
+    return result
+
+
 def parse_dtype(dtype_str: str) -> torch.dtype:
     """Parse dtype string to torch.dtype."""
     dtype_map = {
@@ -945,7 +1018,15 @@ def main():
     )
     parser.add_argument(
         "--op",
-        choices=["all", "top_k", "dsa_topk", "page_table", "ragged", "varlen"],
+        choices=[
+            "all",
+            "top_k",
+            "dsa_topk",
+            "page_table",
+            "ragged",
+            "varlen",
+            "top_k_varlen",
+        ],
         default="all",
         help="Which operation to benchmark",
     )
@@ -1032,6 +1113,16 @@ def main():
         type=int,
         default=128,
         help="Query length per request for the varlen prefill (causal) regime (default: 128)",
+    )
+    parser.add_argument(
+        "--top-k-varlen-backends",
+        nargs="+",
+        choices=["radix", "gvr", "radix_cutlass"],
+        default=["radix", "gvr", "radix_cutlass"],
+        help=(
+            "top_k_varlen backends to include for decode cases (default: all; "
+            "unsupported backends are skipped)."
+        ),
     )
     args = parser.parse_args()
 
@@ -1590,7 +1681,7 @@ def main():
                         else:
                             raise
 
-    if args.op in ["all", "varlen"]:
+    if args.op in ["all", "varlen", "top_k_varlen"]:
         device = torch.device("cuda")
         cap = get_compute_capability(device)
         has_clusters = cap[0] == 10
@@ -1618,11 +1709,14 @@ def main():
 
         show_det_or_tie = args.deterministic or args.tie_break
         # clusters is a non-deterministic SM100 path; omit it under deterministic/tie-break.
-        show_clusters = has_clusters and not show_det_or_tie
+        show_clusters = (
+            has_clusters and not show_det_or_tie and args.op != "top_k_varlen"
+        )
 
         print("\n" + "=" * 100)
         print(
-            "varlen: Variable-length segment top-k transforms (production-realistic) "
+            "varlen: Variable-length top-k transforms and top_k_varlen backends "
+            "(production-realistic) "
             f"(dtype={dtype_str}, length_dist={args.length_dist}, k={args.varlen_k}, "
             f"deterministic={args.deterministic}, tie_break={args.tie_break})"
         )
@@ -1657,7 +1751,7 @@ def main():
         print("=" * 100)
 
         base_header = (
-            f"{'regime':>8} {'dist':>10} {'transform':>11} {'rows':>8} {'reqs':>6} "
+            f"{'regime':>8} {'dist':>10} {'transform/backend':>31} {'rows':>8} {'reqs':>6} "
             f"{'max_len':>9} {'k':>6} | {'len_min':>8} {'len_mean':>9} {'len_max':>8} "
             f"{'triv%':>6} | "
         )
@@ -1677,24 +1771,54 @@ def main():
         print("-" * len(header))
 
         for case_idx, case in enumerate(varlen_cases):
-            for transform in ["page_table", "ragged"]:
+            transform_specs = []
+            if args.op in ("all", "varlen"):
+                transform_specs.extend([("page_table", None), ("ragged", None)])
+            if args.op in ("all", "top_k_varlen") and case.regime == "decode":
+                for backend in args.top_k_varlen_backends:
+                    if not flashinfer.top_k_varlen.is_backend_supported(
+                        backend, cap[0] * 10 + cap[1]
+                    ):
+                        continue
+                    if backend == "gvr" and case.k not in (512, 1024, 2048):
+                        continue
+                    if args.tie_break and backend == "gvr":
+                        continue
+                    if args.deterministic and backend != "radix_cutlass":
+                        continue
+                    transform_specs.append(("top_k_varlen", backend))
+
+            for transform, backend in transform_specs:
                 # Re-seed per case so page_table and ragged see identical inputs,
                 # keeping the per-case transform comparison and length stats equivalent.
                 generator.manual_seed(1234 + case_idx)
                 needs_cache_cleanup = False
                 try:
-                    result = bench_varlen_transform(
-                        case,
-                        transform,
-                        dtype,
-                        generator,
-                        has_clusters,
-                        deterministic=args.deterministic,
-                        compare_tie_break=args.tie_break,
-                    )
+                    if transform == "top_k_varlen":
+                        result = bench_top_k_varlen_backend(
+                            case,
+                            backend,
+                            dtype,
+                            generator,
+                            deterministic=args.deterministic,
+                            compare_tie_break=args.tie_break,
+                        )
+                    else:
+                        result = bench_varlen_transform(
+                            case,
+                            transform,
+                            dtype,
+                            generator,
+                            has_clusters,
+                            deterministic=args.deterministic,
+                            compare_tie_break=args.tie_break,
+                        )
+                    transform_label = result["transform"]
+                    if result.get("backend"):
+                        transform_label += f"/{result['backend']}"
                     base_line = (
                         f"{result['regime']:>8} {result['length_dist']:>10} "
-                        f"{result['transform']:>11} {result['num_rows']:>8} "
+                        f"{transform_label:>31} {result['num_rows']:>8} "
                         f"{result['num_requests']:>6} {result['max_len']:>9} "
                         f"{result['k']:>6} | {result['len_min']:>8} "
                         f"{result['len_mean']:>9.1f} {result['len_max']:>8} "
@@ -1750,7 +1874,8 @@ def main():
                         raise
                     print(
                         f"{case.regime:>8} {case.length_dist:>10} "
-                        f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
+                        f"{(transform + ('/' + backend if backend else '')):>31} "
+                        f"{case.max_len:>9} {case.k:>6} | {error_label}"
                     )
                     needs_cache_cleanup = True
                 # Reclaim cached memory only after the except block exits. While the
