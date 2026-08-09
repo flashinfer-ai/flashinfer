@@ -91,6 +91,56 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
+def has_prebuilt_aot_module(module_name: str) -> bool:
+    """Whether a prebuilt AOT artifact for ``module_name`` exists.
+
+    Mirrors ``JitSpecNvcc.aot_path`` without constructing the spec (which
+    would run generation side effects). When this returns True, try_load()
+    serves the module from the AOT cache and no JIT build happens.
+    """
+    return (jit_env.FLASHINFER_AOT_DIR / module_name / f"{module_name}.so").exists()
+
+
+def version_gated_nvcc_flag(flag: str, min_version: str, module_name: str) -> str:
+    """Return ``flag`` if the CUDA toolkit is at least ``min_version``, else ``""``.
+
+    When the flag is dropped, warn loudly at flag-generation time so the
+    capability gap is visible when the module is built, instead of surfacing
+    much later as a generic "unsupported input combination" runtime error deep
+    inside kernel-runner construction (issue #3951). If a prebuilt AOT module
+    (e.g. from flashinfer-jit-cache) exists, the drop only affects a JIT flag
+    list that will never be compiled, so it is logged at info level instead of
+    warning.
+    """
+    if is_cuda_version_at_least(min_version):
+        return flag
+    if has_prebuilt_aot_module(module_name):
+        logger.info(
+            "%s: dropping %s from the JIT flags because the local CUDA toolkit "
+            "is %s (< %s), but a prebuilt AOT module exists and will be used, "
+            "so the gated kernels remain available. If the AOT module fails to "
+            "load, the JIT fallback build will lack %s.",
+            module_name,
+            flag,
+            get_cuda_version(),
+            min_version,
+            flag,
+        )
+        return ""
+    logger.warning(
+        "%s: dropping %s because the CUDA toolkit used for JIT compilation is "
+        "%s (< %s). Kernels gated by this flag will be unavailable in the "
+        "compiled module. Use a CUDA %s+ toolkit or install a matching "
+        "flashinfer-jit-cache wheel to enable them.",
+        module_name,
+        flag,
+        get_cuda_version(),
+        min_version,
+        min_version,
+    )
+    return ""
+
+
 def get_nvcc_parallelism_flags() -> List[str]:
     """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
     env_var_name = "FLASHINFER_NVCC_THREADS"
