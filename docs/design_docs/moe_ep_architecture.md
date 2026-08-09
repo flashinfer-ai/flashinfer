@@ -4,7 +4,7 @@
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -24,13 +24,16 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl,mxfp8_cutedsl,…}
-  kernel_src/cutedsl_megamoe/  ← CuTeDSL kernel src (kernel team) + FI shim
+  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by nvfp4_cutedsl / mxfp8_cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
     TUNING.md                  ← tuning surface, measured perf, benchmark methodology
     ACKNOWLEDGEMENT.md         ← kernel authors
+  kernel_src/sm90/pull_style_cutedsl_megakernel/  ← Hopper pull-style FP8 kernel src + FI shim
+    src/                       ← VERBATIM drop, fork of the sm100 kernel repo (common, src, moe_nvfp4_swapab, moe_hopper_fp8)
+    shim/, __init__.py, SKILL.md  ← same layering; process-exclusive with the sm100 tree (module names collide)
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -172,17 +175,92 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|multirank|split_path_correctness_bf16|mega|smoke|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
+- **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
+- **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_pull_fp8 mega kernel
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
-- **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR) vs a single-process `MoELayer` reference (Blackwell)
-- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank MXFP8 preprocess-vs-reference check (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
+- **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
+- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
+- **mega_sm90** — 4-GPU (Hopper) sm90_pull_fp8 mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
+- **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
 
-Split-path numerics are **bf16-only for now** (the `split_path_correctness_bf16` target above). An HT FLAT test (`test_moe_ep_ht_correctness.py`, bf16) and an NVFP4 split test (`test_moe_ep_compute_correctness_nvfp4.py`) exist in the tree but are not yet wired into a target / enabled.
+`all` runs the eight Blackwell-relevant sections (everything above except the two `*_sm90` targets, which need Hopper).
 
 Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
+
+## Torch oracles
+
+Every compute path is anchored to plain-torch ground truth, at two levels.
+
+**Why they exist.** The other correctness tests are *parity* tests: layer path
+vs direct-shim path, or EP vs non-EP. For the split paths that is a genuine
+cross-check (dispatch/combine and the compute kernel are separate stages, and
+the non-EP side exercises different communication code). For the **mega**
+paths it is not: communication and compute are fused into one kernel, so both
+sides of a parity test run the same CUDA kernel and a kernel that is *wrong
+but self-consistent* passes silently. Worse, bit-exact layer-vs-shim tests
+share the preprocessing on both sides, so wrong-preprocess bugs also pass
+silently (this class produced three real bugs on the day the single-GPU
+oracles landed: nvfp4 weight strides, nvfp4 norm_const, split-bf16 gated
+reorder). The oracles close both gaps.
+
+**What an oracle does.**
+
+- *Single-GPU oracles* (`run_tests.sh oracle` / `oracle_sm90`): stage inputs
+  exactly as the layer does, launch the kernel once on one rank, and recompute
+  the output with plain torch — dequant → fp32 `@` GEMMs → SwiGLU
+  (`torch.sigmoid`) → the path's exact fc1-out quant round-trip → fp32 fc2 →
+  topk combine — asserting a tight band (typically `rel_l2 < 0.02`; residual
+  is quant RTNE flips + accumulation-order noise, since both sides consume the
+  same quantized operands).
+- *Multi-rank oracles* (inside `mega` / `mega_sm90`, 4 GPUs, names
+  `test_moe_ep_*_mega_multirank_torch_oracle`): each rank stages its own
+  shard and launches the fused kernel with **real cross-rank NVSHMEM
+  traffic**, then `all_gather`s the *actual* operands the kernel consumed —
+  the plain (pre-swizzle) quantized weight legs of every rank, and for
+  mxfp8/sm90 also the staged activation payloads + routing — and recomputes
+  its own output slice with torch math over the **global** expert set
+  (`y[t] = Σ_k w_k · expert_{id_k}(x_t)` is per-token math, so local tokens
+  vs global weights is full ground truth). The all-gather is evidence
+  collection, not part of the math: it removes any reliance on cross-rank RNG
+  determinism. Token 0 is force-routed to one expert per rank so cross-rank
+  traffic exists by construction. This is the only test where the multi-rank
+  numerics (peer-pull addressing, expert→rank ownership, peer-token dequant,
+  cross-rank combine) are judged by something other than the kernel itself.
+- *Variant coverage*: the nvfp4 multirank oracle is parametrized over
+  `in_kernel_fc2_reduce` and the quantized combine wires (`16e2m1xbf16`,
+  `32e4m3xe8m0`; the reference models the wire exactly via
+  `combine_roundtrip_to_fp32` per fc2 term); mxfp8 over
+  `in_kernel_fc2_reduce`; sm90 over `per_tensor`/`blockwise` × `swap_ab`.
+  ikr variants keep the explicit-reduce reference and widen the band by the
+  bf16 K-term accumulation bound (`_assert_ikr_close`).
+
+**Independence contract.** No oracle executes the kernel under test or any
+reference *device* kernel — GEMMs are torch fp32, elementwise is torch/triton
+host code. What is *deliberately shared* is the host-side quantization recipe
+(`nvfp4_quantize_per_block_16`, `per_token_cast_to_fp8/fp4`,
+`combine_roundtrip_to_fp32`), so the oracle consumes the kernel's exact
+operands and the band stays tight; bugs inside those shared helpers are
+covered separately by the preprocess-vs-plain-quant tests (two independent
+quant implementations compared bit-exactly). Provenance caveat: the
+nvfp4/deep_gemm references live in the test files; the mxfp8/sm90 references
+(`compute_megamoe_reference_{mxfp8,fp8}`) ship with the kernel drop —
+independent in execution, same-team in authorship.
+
+**Last passed** (update when re-validated; single-GPU + multi-rank oracle
+unless noted):
+
+| Kernel path | Last passed | Where |
+|---|---|---|
+| split trtllm bf16 (LL + HT share the compute kernel) | 2026-07-31 | `run_tests.sh all`, 4x GB200 (oracle + EP-vs-non-EP) |
+| split trtllm nvfp4 | 2026-07-31 | same run |
+| mega deep_gemm (fp8_fp4) | 2026-07-31 | same run + variant job (multirank oracle) |
+| mega nvfp4_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
+| mega mxfp8_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
+| mega sm90_pull_fp8 (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
 
 ## Forward flow
 

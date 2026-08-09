@@ -277,7 +277,8 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 
 @pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
 @pytest.mark.parametrize("causal", [False, True])
-def test_blockscaled_quantize_and_prefill(qk_mode, causal):
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
     from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
     from flashinfer.attention.cute_dsl.fmha_blockscaled import (
@@ -296,7 +297,7 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal):
     )
     v_store = v.to(torch.float8_e4m3fn)
     v_deq = v_store.float()
-    o = torch.empty(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+    o = torch.empty(b, s, H, D, device=DEVICE, dtype=out_dtype)
     cute_dsl_fmha_blockscaled_prefill(
         q_store,
         k_store,
@@ -321,4 +322,6 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal):
         s_logits = s_logits.masked_fill((col > row).view(1, 1, s, s), float("-inf"))
     p = torch.softmax(s_logits, dim=-1)
     o_ref = torch.einsum("bhqk,bkhd->bqhd", p, v_deq)
-    torch.testing.assert_close(o.float(), o_ref, atol=0.1, rtol=1e-2)
+    atol = 0.25 if out_dtype == torch.float8_e4m3fn else 0.1
+    rtol = 0.1 if out_dtype == torch.float8_e4m3fn else 1e-2
+    torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)

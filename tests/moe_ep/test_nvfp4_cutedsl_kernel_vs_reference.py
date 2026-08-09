@@ -27,7 +27,7 @@ import pytest
 # Verify only through the cutedsl_megamoe shim public API (plus the FI backend
 # helpers); never import the src/ kernel packages directly, so a new src/ drop
 # can't silently break this test.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 NVFP4_BLOCK = 16
 
@@ -151,7 +151,7 @@ def _plain_nvfp4_from_bf16(problem: dict):
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         _interleave_gate_up_16,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         nvfp4_quantize_per_block_16,
     )
 
@@ -198,6 +198,7 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
@@ -205,10 +206,14 @@ def _torch_nvfp4_mega_reference(
     SwiGLU fold (+clamp) → per-token topk weight folded in BEFORE the fc1-out
     NVFP4 round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is
     bounded by NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
+
+    ``term_transform``, when set, is applied to each per-(token, topk) fc2
+    output term before the topk sum; the multirank oracle uses it to model the
+    quantized cross-rank combine wire (``combine_roundtrip_to_fp32``).
     """
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         nvfp4_quantize_per_block_16,
     )
 
@@ -254,7 +259,10 @@ def _torch_nvfp4_mega_reference(
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        out[tokens, slots] = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        if term_transform is not None:
+            fc2_out = term_transform(fc2_out)
+        out[tokens, slots] = fc2_out
 
     return out.sum(dim=1).to(torch.bfloat16)
 
@@ -270,7 +278,7 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import to_blocked
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import to_blocked
 
     problem = _single_rank_problem()
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
@@ -357,7 +365,7 @@ def test_nvfp4_kernel_matches_torch_reference(monkeypatch, hidden, intermediate)
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
