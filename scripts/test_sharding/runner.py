@@ -68,6 +68,18 @@ _LEASE_HEARTBEAT_SECONDS = 10.0
 _LEASE_CLOSE_SECONDS = 2.0
 _CONTROLLER_PROGRESS_SECONDS = 60.0
 
+# The SM90 pull-style and SM100 MegaMoE drops both import vendored modules such
+# as ``common`` as top-level packages, so they cannot be imported by one pytest
+# collection process. Keep the smaller SM90 family isolated for now. Long term,
+# namespace both vendored trees and use package-relative imports; once they can
+# coexist in ``sys.modules``, remove this collection partition.
+_COLLECTION_ISOLATION_GROUPS = (
+    (
+        "sm90-pull-style-cutedsl-megakernel",
+        ("test_moe_ep_sm90_pull_*_mega_multirank.py",),
+    ),
+)
+
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -246,61 +258,165 @@ def _wait_for_collection(
             )
 
 
+def _isolated_collection_groups(test_path: Path) -> list[tuple[str, list[Path]]]:
+    groups = []
+    for name, patterns in _COLLECTION_ISOLATION_GROUPS:
+        matches: set[Path] = set()
+        for pattern in patterns:
+            if test_path.is_file():
+                if test_path.match(pattern):
+                    matches.add(test_path)
+            else:
+                matches.update(
+                    path for path in test_path.rglob(pattern) if path.is_file()
+                )
+        if matches:
+            groups.append(
+                (name, sorted(matches, key=lambda path: str(path).encode("utf-8")))
+            )
+    return groups
+
+
+def _collect_partition(
+    repo_root: Path,
+    test_path: Path,
+    targets: list[Path],
+    ignored_paths: list[Path],
+    timeout_seconds: float | None,
+    grace_seconds: float,
+    directory: Path,
+    partition_index: int,
+    partition_name: str,
+    *,
+    allow_empty: bool,
+) -> list[dict[str, Any]]:
+    output = directory / f"collection-{partition_index:02d}.json"
+    log_path = directory / f"collection-{partition_index:02d}.log"
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else str(repo_root)
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-q",
+        "--continue-on-collection-errors",
+        "-p",
+        "scripts.test_sharding.pytest_plugin",
+        f"--flashinfer-collection-json={output}",
+        *(f"--ignore={path}" for path in ignored_paths),
+        *(str(path) for path in targets),
+    ]
+    with log_path.open("wb") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=repo_root,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        _wait_for_collection(
+            process,
+            test_path=test_path,
+            timeout_seconds=timeout_seconds,
+            grace_seconds=grace_seconds,
+        )
+    if allow_empty and process.returncode == 5:
+        return []
+    if process.returncode != 0 or not output.exists():
+        diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+        raise RunnerStateError(
+            f"pytest collection failed for {partition_name} "
+            f"with exit code {process.returncode}:\n{diagnostic}"
+        )
+    try:
+        value = json.loads(output.read_text(encoding="utf-8"))
+        nodes = value["nodes"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RunnerStateError(
+            f"invalid collection metadata for {partition_name}: {error}"
+        ) from error
+    if not nodes and not allow_empty:
+        raise RunnerStateError(f"pytest collected no tests for {partition_name}")
+    return nodes
+
+
 def _collect_nodes(
     repo_root: Path,
     test_path: Path,
     timeout_seconds: float | None,
     grace_seconds: float,
 ) -> list[dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix="flashinfer-test-collection-") as directory:
-        output = Path(directory) / "collection.json"
-        log_path = Path(directory) / "collection.log"
-        env = os.environ.copy()
-        pythonpath = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else str(repo_root)
-        )
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-q",
-            "--continue-on-collection-errors",
-            "-p",
-            "scripts.test_sharding.pytest_plugin",
-            f"--flashinfer-collection-json={output}",
-            str(test_path),
-        ]
-        with log_path.open("wb") as log:
-            process = subprocess.Popen(
-                command,
-                cwd=repo_root,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            _wait_for_collection(
-                process,
-                test_path=test_path,
-                timeout_seconds=timeout_seconds,
-                grace_seconds=grace_seconds,
-            )
-        if process.returncode != 0 or not output.exists():
-            diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
-            raise RunnerStateError(
-                f"pytest collection failed with exit code {process.returncode}:\n{diagnostic}"
-            )
-        try:
-            value = json.loads(output.read_text(encoding="utf-8"))
-            nodes = value["nodes"]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise RunnerStateError(f"invalid collection metadata: {error}") from error
-        if not nodes:
-            raise RunnerStateError(f"pytest collected no tests below {test_path}")
-        return nodes
+    started_at = time.monotonic()
+    isolated_groups = _isolated_collection_groups(test_path)
+    isolated_paths = [path for _, paths in isolated_groups for path in paths]
+
+    def remaining_timeout() -> float | None:
+        if timeout_seconds is None:
+            return None
+        return max(0.0, timeout_seconds - (time.monotonic() - started_at))
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="flashinfer-test-collection-"
+        ) as temporary_directory:
+            directory = Path(temporary_directory)
+            partitions = []
+            if test_path not in isolated_paths:
+                partitions.append(
+                    _collect_partition(
+                        repo_root,
+                        test_path,
+                        [test_path],
+                        isolated_paths,
+                        remaining_timeout(),
+                        grace_seconds,
+                        directory,
+                        0,
+                        "primary test scope",
+                        allow_empty=bool(isolated_paths),
+                    )
+                )
+            for partition_index, (name, paths) in enumerate(isolated_groups, start=1):
+                partitions.append(
+                    _collect_partition(
+                        repo_root,
+                        test_path,
+                        paths,
+                        [],
+                        remaining_timeout(),
+                        grace_seconds,
+                        directory,
+                        partition_index,
+                        name,
+                        allow_empty=False,
+                    )
+                )
+    except CollectionTimeoutError as error:
+        error.elapsed_seconds = time.monotonic() - started_at
+        raise
+
+    nodes = []
+    seen_nodeids = set()
+    for partition in partitions:
+        for node in partition:
+            nodeid = node["nodeid"]
+            if nodeid in seen_nodeids:
+                raise RunnerStateError(
+                    f"duplicate pytest node ID across collection partitions: {nodeid}"
+                )
+            seen_nodeids.add(nodeid)
+            merged = dict(node)
+            merged["order"] = len(nodes)
+            nodes.append(merged)
+    if not nodes:
+        raise RunnerStateError(f"pytest collected no tests below {test_path}")
+    return nodes
 
 
 def _validate_selection(selection: SelectionSettings) -> None:

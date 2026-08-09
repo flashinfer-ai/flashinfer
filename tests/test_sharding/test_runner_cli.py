@@ -505,6 +505,64 @@ def test_slow_collection_reports_a_live_heartbeat(
     assert f"test_path={suite}" in output
 
 
+def test_collection_isolates_sm90_pull_multirank_modules(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    sm100 = suite / "sm100"
+    sm100.mkdir()
+    (sm100 / "common.py").write_text("BACKEND = 'sm100'\n", encoding="utf-8")
+    sm90 = suite / "sm90"
+    sm90.mkdir()
+    (sm90 / "common.py").write_text("BACKEND = 'sm90'\n", encoding="utf-8")
+    (suite / "test_aaa_sm100.py").write_text(
+        """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "sm100"))
+import common
+
+assert common.BACKEND == "sm100"
+
+def test_sm100():
+    pass
+""",
+        encoding="utf-8",
+    )
+    isolated = suite / "test_moe_ep_sm90_pull_fp8_mega_multirank.py"
+    isolated.write_text(
+        """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "sm90"))
+import common
+
+if common.BACKEND != "sm90":
+    raise RuntimeError("SM100 and SM90 common modules cannot share one process")
+
+def test_sm90():
+    pass
+""",
+        encoding="utf-8",
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+
+    assert [node["nodeid"] for node in nodes] == [
+        "test_aaa_sm100.py::test_sm100",
+        f"{isolated.name}::test_sm90",
+    ]
+    assert [node["order"] for node in nodes] == [0, 1]
+
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, isolated, 15, 0)
+
+    assert [node["nodeid"] for node in isolated_nodes] == [
+        f"{isolated.name}::test_sm90"
+    ]
+    assert [node["order"] for node in isolated_nodes] == [0]
+
+
 def test_collection_termination_uses_configured_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
