@@ -120,8 +120,9 @@ def testTopKVarlen(args):
                      ``top_k_varlen.is_backend_supported`` (its
                      ``@backend_requirement`` decorator).
 
-    Reference check compares the *set* of selected indices against ``torch.topk``
-    applied to logits masked to ``seq_lens``.
+    Reference checking compares selected values for ``NONE`` and the exact
+    preferred boundary-index set for ``SMALL``/``LARGE`` against a stable
+    PyTorch reference applied to logits masked to ``seq_lens``.
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopKVarlen")
@@ -308,9 +309,11 @@ def testTopKVarlen(args):
 
             problem_bytes = (
                 batch_size * max_seq_len * input_dtype.itemsize  # logits read
-                + batch_size * top_k * 4  # pre_idx read (int32)
+                + batch_size * 4  # seq_lens read (int32)
                 + batch_size * top_k * 4  # indices write (int32)
             )
+            if backend == "gvr":
+                problem_bytes += batch_size * top_k * 4  # pre_idx read (int32)
             tb_per_sec = problem_bytes / (1e9 * median_time)
 
             label = backend if tie_name == "none" else f"{backend}/tie_{tie_name}"
