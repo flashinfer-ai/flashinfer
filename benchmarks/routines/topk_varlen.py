@@ -89,7 +89,8 @@ def parse_topk_varlen_args(line, parser):
         choices=["none", "small", "large", "all"],
         help=(
             "Boundary tie-break specialization to benchmark. 'all' runs the "
-            "nondeterministic baseline plus SMALL and LARGE for every backend."
+            "nondeterministic baseline plus SMALL and LARGE for every compatible "
+            "backend. GVR supports only 'none'."
         ),
     )
 
@@ -139,7 +140,7 @@ def testTopKVarlen(args):
     batch_size = args.batch_size
     max_seq_len = args.max_seq_len
     top_k = args.top_k
-    is_cuda_graph_compatible = False  # GVR LB uses dynamic counters; not graph-safe
+    is_cuda_graph_compatible = True
     run_refcheck = args.refcheck
     res = []
 

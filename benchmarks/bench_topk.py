@@ -928,12 +928,19 @@ def bench_top_k_varlen_backend(
     generator: torch.Generator,
     deterministic: bool = False,
     compare_tie_break: bool = False,
+    page_table: bool = False,
 ) -> dict:
     """Benchmark one native/fallback ``top_k_varlen`` backend.
 
     This is decode-only: ``top_k_varlen`` consumes one request-level length per
     row (its ``next_n`` axis is speculative decode, not causal prefill rows).
+    ``page_table=True`` measures the radix kernel's fused compact-page stores.
     """
+    if deterministic:
+        raise ValueError("top_k_varlen does not support deterministic=True")
+    if page_table and backend != "radix":
+        raise ValueError("top_k_varlen page translation requires backend='radix'")
+
     device = torch.device("cuda")
     inputs = generate_varlen_inputs(case, dtype, generator, device)
     scores = inputs["scores"]
@@ -942,8 +949,28 @@ def bench_top_k_varlen_backend(
     masked_scores = build_masked_scores(scores, lengths)
     pre_idx = torch.topk(masked_scores.float(), k, dim=-1, sorted=False).indices.int()
     pre_idx[:, 0] = masked_scores.argmax(dim=-1).int()
+    page_size = 64
+    max_pages = math.ceil(case.max_len / page_size)
+    compact_page_table = torch.arange(
+        inputs["num_requests"] * max_pages,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(inputs["num_requests"], max_pages)
+    out = torch.empty((scores.size(0), k), dtype=torch.int32, device=device)
 
     def run(deterministic_mode, tie_break=TopKTieBreak.NONE):
+        if page_table:
+            return flashinfer.top_k_varlen_page_table_transform(
+                scores,
+                compact_page_table,
+                lengths,
+                k,
+                out=out,
+                backend="radix",
+                deterministic=deterministic_mode,
+                tie_break=tie_break,
+                page_size=page_size,
+            )
         return flashinfer.top_k_varlen(
             scores,
             lengths,
@@ -959,7 +986,7 @@ def bench_top_k_varlen_backend(
     result = {
         "regime": case.regime,
         "length_dist": case.length_dist,
-        "transform": "top_k_varlen",
+        "transform": ("top_k_varlen_page_table" if page_table else "top_k_varlen"),
         "backend": backend,
         "num_rows": scores.size(0),
         "num_requests": inputs["num_requests"],
@@ -1784,9 +1811,17 @@ def main():
                         continue
                     if args.tie_break and backend == "gvr":
                         continue
-                    if args.deterministic and backend != "radix_cutlass":
+                    if args.deterministic:
                         continue
                     transform_specs.append(("top_k_varlen", backend))
+                if (
+                    not args.deterministic
+                    and "radix" in args.top_k_varlen_backends
+                    and flashinfer.top_k_varlen.is_backend_supported(
+                        "radix", cap[0] * 10 + cap[1]
+                    )
+                ):
+                    transform_specs.append(("top_k_varlen_page_table", "radix"))
 
             for transform, backend in transform_specs:
                 # Re-seed per case so page_table and ragged see identical inputs,
@@ -1794,7 +1829,10 @@ def main():
                 generator.manual_seed(1234 + case_idx)
                 needs_cache_cleanup = False
                 try:
-                    if transform == "top_k_varlen":
+                    if transform in (
+                        "top_k_varlen",
+                        "top_k_varlen_page_table",
+                    ):
                         result = bench_top_k_varlen_backend(
                             case,
                             backend,
@@ -1802,6 +1840,7 @@ def main():
                             generator,
                             deterministic=args.deterministic,
                             compare_tie_break=args.tie_break,
+                            page_table=transform == "top_k_varlen_page_table",
                         )
                     else:
                         result = bench_varlen_transform(

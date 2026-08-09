@@ -43,7 +43,7 @@ def test_top_k_varlen_reference_correctness(shape_kwargs):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("page_size", [1, 64])
 def test_top_k_varlen_page_table_transform_reference_correctness(page_size):
-    """Compact physical indices match the varlen page-table reference."""
+    """Native radix physical indices match the compact-page reference."""
     import flashinfer
     from flashinfer.trace.templates.topk import (
         top_k_varlen_page_table_transform_trace,
