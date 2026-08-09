@@ -39,21 +39,22 @@ Key features:
 - Support for SM100 (Blackwell) architecture
 """
 
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cuda.bindings.driver as cuda
 import torch
 
-from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import (
-    get_cutlass_dtype,
     cutlass_to_torch_dtype,
-    get_num_sm,
+    get_cutlass_dtype,
     get_max_active_clusters,
+    get_num_sm,
     make_ptr,
 )
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 
 # Import the TRT-LLM kernel implementation
 from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
@@ -154,8 +155,71 @@ def create_finalize_fusion_tensors(
     return permuted_idx_to_expanded_idx, token_final_scales
 
 
-# Kernel cache for compiled kernels (class-level to persist across calls)
+# Two-level cache: this dict avoids repeated loads within a process, while the
+# shared CuTe-DSL cache below persists each specialization across processes.
 _finalize_kernel_cache: Dict[Tuple, Any] = {}
+
+_CUTE_DSL_MODULE = "sm100_moe_w4a4_finalize"
+
+
+def _finalize_kernel_source_files() -> Tuple[str, ...]:
+    """Device-code sources whose contents invalidate finalize artifacts."""
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from .blackwell import (
+        blockscaled_contiguous_grouped_gemm_finalize_fusion as kernel_impl,
+    )
+    from .blackwell import utils as blackwell_utils
+
+    return (
+        __file__,
+        kernel_impl.__file__,
+        blackwell_utils.__file__,
+        cute_dsl_utils.__file__,
+    )
+
+
+def _disk_kernel_name(prefix: str, cache_key: Tuple) -> str:
+    """Return a symbol-safe artifact name injective in ``cache_key``."""
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _finalize_kernel_cache_key(
+    *,
+    ab_dtype: str,
+    sf_dtype: str,
+    out_dtype: str,
+    token_scales_dtype: str,
+    sf_vec_size: int,
+    tile_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    raster_along_m: bool,
+    enable_pdl: bool,
+    use_a_per_token_scale: bool,
+    use_fused_finalize: bool,
+    has_a_per_token_scale: bool,
+    max_active_clusters: int,
+) -> Tuple:
+    """Every value that changes finalize codegen or its exported pointer ABI."""
+    return (
+        "finalize",
+        ab_dtype,
+        sf_dtype,
+        out_dtype,
+        token_scales_dtype,
+        sf_vec_size,
+        tile_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        raster_along_m,
+        enable_pdl,
+        use_a_per_token_scale,
+        use_fused_finalize,
+        has_a_per_token_scale,
+        max_active_clusters,
+    )
 
 
 def _get_compiled_finalize_kernel(
@@ -180,7 +244,11 @@ def _get_compiled_finalize_kernel(
     token_scales_ptr,
     a_per_token_scale_ptr,
     max_active_clusters: int,
-    stream,
+    # Pointer dtype parameters (compile-time - IN cache key)
+    ab_dtype: str,
+    sf_dtype: str,
+    out_dtype: str,
+    token_scales_dtype: str,
     # Tactic parameters (compile-time - IN cache key)
     sf_vec_size: int,
     tile_size: int,
@@ -193,7 +261,7 @@ def _get_compiled_finalize_kernel(
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    This function caches compiled kernels by codegen and pointer-ABI parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
@@ -202,16 +270,24 @@ def _get_compiled_finalize_kernel(
     """
     global _finalize_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
-    cache_key = (
-        sf_vec_size,
-        tile_size,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        raster_along_m,
-        enable_pdl,
-        use_a_per_token_scale,
-        use_fused_finalize,
+    # Single source of truth for the in-process and on-disk specialization keys.
+    # Problem dimensions stay runtime parameters, while pointer types and optional
+    # argument presence are part of the exported TVM-FFI ABI.
+    cache_key = _finalize_kernel_cache_key(
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        token_scales_dtype=token_scales_dtype,
+        sf_vec_size=sf_vec_size,
+        tile_size=tile_size,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        enable_pdl=enable_pdl,
+        use_a_per_token_scale=use_a_per_token_scale,
+        use_fused_finalize=use_fused_finalize,
+        has_a_per_token_scale=a_per_token_scale_ptr is not None,
+        max_active_clusters=max_active_clusters,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -233,31 +309,40 @@ def _get_compiled_finalize_kernel(
         #  permuted_idx_to_expanded_idx_ptr, num_non_exiting_tiles_ptr,
         #  token_final_scales_ptr, a_per_token_scale_ptr,
         #  m, n, k, l, num_tokens, top_k,
-        #  tile_size, scaling_vector_size, max_active_clusters, stream)
-        compiled_gemm = cute.compile(
-            gemm.wrapper,
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            alpha_ptr,
-            tile_idx_ptr,
-            mn_limit_ptr,
-            permuted_idx_ptr,
-            num_tiles_ptr,
-            token_scales_ptr,
-            a_per_token_scale_ptr,
-            permuted_m,
-            n,
-            k,
-            num_experts,
-            seq_len,
-            topk,
-            tile_size=tile_size,
-            scaling_vector_size=sf_vec_size,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
+        #  tile_size, scaling_vector_size, max_active_clusters, env stream)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        compiled_gemm = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _disk_kernel_name(
+                f"finalize_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}", cache_key
+            ),
+            lambda: cute.compile(
+                gemm.wrapper,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                alpha_ptr,
+                tile_idx_ptr,
+                mn_limit_ptr,
+                permuted_idx_ptr,
+                num_tiles_ptr,
+                token_scales_ptr,
+                a_per_token_scale_ptr,
+                permuted_m,
+                n,
+                k,
+                num_experts,
+                seq_len,
+                topk,
+                tile_size=tile_size,
+                scaling_vector_size=sf_vec_size,
+                max_active_clusters=max_active_clusters,
+                stream=stream_fake,
+                options="--opt-level 2 --enable-tvm-ffi",
+            ),
+            extra_key_files=_finalize_kernel_source_files(),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -512,11 +597,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     else:
         a_per_token_scale_ptr = None
 
-    # Get CUDA stream
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # Get or compile the kernel (cached by tactic parameters only)
+    # Get or compile the kernel (cached by codegen and pointer-ABI parameters)
     compiled_gemm = _get_compiled_finalize_kernel(
         # Runtime parameters (problem dimensions)
         seq_len=seq_len,
@@ -539,7 +620,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         token_scales_ptr=token_scales_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
-        stream=stream,
+        # Pointer dtype parameters (compile-time, cached)
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        out_dtype=out_dtype,
+        token_scales_dtype=str(token_final_scales.dtype),
         # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
@@ -551,31 +636,31 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         use_a_per_token_scale=use_a_per_token_scale,
     )
 
-    # Execute kernel with runtime parameters
+    # Execute through TVM-FFI. Pointer arguments use raw integer addresses and
+    # the caller's current stream is supplied by the TVM-FFI environment.
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, alpha_ptr, tile_idx_ptr,
     #  mn_limit_ptr, permuted_idx_ptr, num_tiles_ptr, token_scales_ptr,
-    #  a_per_token_scale_ptr, m, n, k, l, num_tokens, top_k, stream)
+    #  a_per_token_scale_ptr, m, n, k, l, num_tokens, top_k)
     compiled_gemm(
-        a_ptr,
-        b_ptr,
-        a_sf_ptr,
-        b_sf_ptr,
-        c_ptr,
-        alpha_ptr,
-        tile_idx_ptr,
-        mn_limit_ptr,
-        permuted_idx_ptr,
-        num_tiles_ptr,
-        token_scales_ptr,
-        a_per_token_scale_ptr,
+        a.data_ptr(),
+        b.data_ptr(),
+        a_scale.data_ptr(),
+        b_scale.data_ptr(),
+        out.data_ptr(),
+        alpha.data_ptr(),
+        tile_idx_to_expert_idx.data_ptr(),
+        tile_idx_to_mn_limit.data_ptr(),
+        permuted_idx_to_expanded_idx.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        token_final_scales.data_ptr(),
+        a_per_token_scale.data_ptr() if a_per_token_scale is not None else None,
         permuted_m,
         n,
         k,
         num_experts,
         seq_len,
         topk,
-        stream=stream,
     )
 
     return out

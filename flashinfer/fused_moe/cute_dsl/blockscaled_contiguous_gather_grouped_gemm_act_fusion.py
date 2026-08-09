@@ -44,34 +44,35 @@ Comparison with non-gather activation fusion:
 - Gather: Uses LDGSTS to gather A directly using token_id_mapping, no moe_permute needed
 """
 
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cuda.bindings.driver as cuda
 import torch
 
+from flashinfer.cute_dsl.utils import (
+    cutlass_to_torch_dtype,
+    get_cutlass_dtype,
+    get_max_active_clusters,
+    get_num_sm,
+    make_ptr,
+)
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from flashinfer.tllm_enums import (
-    ActivationType,
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
 )
 from flashinfer.utils import get_compute_capability
-from flashinfer.cute_dsl.utils import (
-    get_cutlass_dtype,
-    cutlass_to_torch_dtype,
-    get_num_sm,
-    get_max_active_clusters,
-    make_ptr,
+
+from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    BlockScaledContiguousGatherGroupedGemmKernel,
 )
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
-)
-
-from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
-    BlockScaledContiguousGatherGroupedGemmKernel,
 )
 
 # Re-export the kernel class
@@ -191,8 +192,95 @@ def create_gather_gemm_tensors(
     )
 
 
-# Kernel cache for compiled kernels (class-level to persist across calls)
+# Two-level cache: this dict avoids repeated loads within a process, while the
+# shared CuTe-DSL cache below persists each specialization across processes.
 _gather_kernel_cache: Dict[Tuple, Any] = {}
+
+_CUTE_DSL_MODULE = "sm100_moe_w4a4_gather"
+
+
+def _gather_kernel_source_files() -> Tuple[str, ...]:
+    """Device-code sources whose contents invalidate gather artifacts."""
+    from flashinfer import tllm_enums
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from . import moe_utils
+    from .blackwell import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion as kernel_impl,
+    )
+    from .blackwell import custom_pipeline
+    from .blackwell import utils as blackwell_utils
+
+    return (
+        __file__,
+        kernel_impl.__file__,
+        custom_pipeline.__file__,
+        blackwell_utils.__file__,
+        moe_utils.__file__,
+        tllm_enums.__file__,
+        cute_dsl_utils.__file__,
+    )
+
+
+def _disk_kernel_name(prefix: str, cache_key: Tuple) -> str:
+    """Return a symbol-safe artifact name injective in ``cache_key``."""
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _gather_kernel_cache_key(
+    *,
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
+    sf_vec_size: int,
+    tile_size: int,
+    topk: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    vectorized_f32: bool,
+    raster_along_m: bool,
+    enable_pdl: bool,
+    activation_type: int,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+    gated: bool,
+    use_a_per_token_scale: bool,
+    has_c_sf: bool,
+    has_norm_const: bool,
+    has_a_per_token_scale: bool,
+    max_active_clusters: int,
+) -> Tuple:
+    """Every value that changes gather codegen or its exported pointer ABI."""
+    return (
+        "gather",
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
+        sf_vec_size,
+        tile_size,
+        topk,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        vectorized_f32,
+        raster_along_m,
+        enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
+        gated,
+        use_a_per_token_scale,
+        has_c_sf,
+        has_norm_const,
+        has_a_per_token_scale,
+        max_active_clusters,
+    )
 
 
 def _get_compiled_gather_kernel(
@@ -217,7 +305,6 @@ def _get_compiled_gather_kernel(
     norm_const_ptr,
     a_per_token_scale_ptr,
     max_active_clusters: int,
-    stream,
     # Dtype parameters (compile-time - IN cache key)
     # cute.compile specializes on pointer types, so dtype must be in cache key
     ab_dtype: str,
@@ -243,7 +330,7 @@ def _get_compiled_gather_kernel(
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
-    This function caches compiled kernels by tactic and dtype parameters.
+    This function caches compiled kernels by codegen and pointer-ABI parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
 
     The cache key includes dtype parameters because cute.compile specializes
@@ -267,27 +354,33 @@ def _get_compiled_gather_kernel(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
 
-    # Cache key includes dtype and tactic parameters, NOT problem dimensions
-    cache_key = (
-        ab_dtype,
-        sf_dtype,
-        c_dtype,
-        sf_vec_size,
-        tile_size,
-        topk,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        vectorized_f32,
-        raster_along_m,
-        enable_pdl,
-        normalized_activation_type.value,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
-        gated,
-        use_a_per_token_scale,
+    # Single source of truth for the in-process and on-disk specialization keys.
+    # Problem dimensions stay runtime parameters, while pointer types and optional
+    # argument presence are part of the exported TVM-FFI ABI.
+    cache_key = _gather_kernel_cache_key(
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+        tile_size=tile_size,
+        topk=topk,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        vectorized_f32=vectorized_f32,
+        raster_along_m=raster_along_m,
+        enable_pdl=enable_pdl,
+        activation_type=normalized_activation_type.value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gated=gated,
+        use_a_per_token_scale=use_a_per_token_scale,
+        has_c_sf=c_sf_ptr is not None,
+        has_norm_const=norm_const_ptr is not None,
+        has_a_per_token_scale=a_per_token_scale_ptr is not None,
+        max_active_clusters=max_active_clusters,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -316,31 +409,40 @@ def _get_compiled_gather_kernel(
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
         #  num_non_exiting_tiles_ptr, global_sf_ptr, a_per_token_scale_ptr,
         #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
-        #  max_active_clusters, stream)
-        compiled_gemm = cute.compile(
-            gemm.wrapper,
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            c_sf_ptr,
-            alpha_ptr,
-            tile_idx_ptr,
-            mn_limit_ptr,
-            token_id_ptr,
-            num_tiles_ptr,
-            norm_const_ptr,
-            a_per_token_scale_ptr,
-            orig_m,
-            permuted_m,
-            n,
-            k,
-            num_experts,
-            tile_size=tile_size,
-            scaling_vector_size=sf_vec_size,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
+        #  max_active_clusters, env stream)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        compiled_gemm = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _disk_kernel_name(
+                f"gather_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}", cache_key
+            ),
+            lambda: cute.compile(
+                gemm.wrapper,
+                a_ptr,
+                b_ptr,
+                a_sf_ptr,
+                b_sf_ptr,
+                c_ptr,
+                c_sf_ptr,
+                alpha_ptr,
+                tile_idx_ptr,
+                mn_limit_ptr,
+                token_id_ptr,
+                num_tiles_ptr,
+                norm_const_ptr,
+                a_per_token_scale_ptr,
+                orig_m,
+                permuted_m,
+                n,
+                k,
+                num_experts,
+                tile_size=tile_size,
+                scaling_vector_size=sf_vec_size,
+                max_active_clusters=max_active_clusters,
+                stream=stream_fake,
+                options="--opt-level 2 --enable-tvm-ffi",
+            ),
+            extra_key_files=_gather_kernel_source_files(),
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -659,10 +761,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
     )
 
-    # Get CUDA stream
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
     # Get or compile the kernel (cached by dtype and tactic parameters)
     compiled_gemm = _get_compiled_gather_kernel(
         # Runtime parameters (problem dimensions)
@@ -686,7 +784,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         norm_const_ptr=norm_const_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
-        stream=stream,
         # Dtype parameters (compile-time, in cache key)
         ab_dtype=ab_dtype,
         sf_dtype=sf_dtype,
@@ -710,31 +807,31 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         use_a_per_token_scale=use_a_per_token_scale,
     )
 
-    # Execute kernel with runtime parameters
+    # Execute through TVM-FFI. Pointer arguments use raw integer addresses and
+    # the caller's current stream is supplied by the TVM-FFI environment.
     # Order must match wrapper signature:
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  a_per_token_scale_ptr, orig_m, m, n, k, l, stream)
+    #  a_per_token_scale_ptr, orig_m, m, n, k, l)
     compiled_gemm(
-        a_ptr,
-        b_ptr,
-        a_sf_ptr,
-        b_sf_ptr,
-        c_ptr,
-        c_sf_ptr,
-        alpha_ptr,
-        tile_idx_ptr,
-        mn_limit_ptr,
-        token_id_ptr,
-        num_tiles_ptr,
-        norm_const_ptr,
-        a_per_token_scale_ptr,
+        a.data_ptr(),
+        b.data_ptr(),
+        a_scale.data_ptr(),
+        b_scale.data_ptr(),
+        out.data_ptr(),
+        out_scale.data_ptr() if out_scale is not None else None,
+        alpha.data_ptr(),
+        tile_idx_to_expert_idx.data_ptr(),
+        tile_idx_to_mn_limit.data_ptr(),
+        token_id_mapping.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        global_scale.data_ptr() if global_scale is not None else None,
+        a_per_token_scale.data_ptr() if a_per_token_scale is not None else None,
         seq_len,  # orig_m
         permuted_m,
         n,
         k,
         num_experts,
-        stream=stream,
     )
 
     return out, out_scale if generate_sfc else None

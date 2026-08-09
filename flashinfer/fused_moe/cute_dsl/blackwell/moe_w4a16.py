@@ -3,6 +3,7 @@
 
 """SM100 NVFP4-weight, BF16-activation fused MoE launcher."""
 
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -11,7 +12,6 @@ import cutlass.cute as cute
 import torch
 
 from flashinfer.cute_dsl.utils import (
-    current_cuda_stream,
     get_max_active_clusters,
     make_ptr,
 )
@@ -24,6 +24,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
 )
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from flashinfer.tllm_enums import (
     ActivationType,
     DEFAULT_SWIGLU_ALPHA,
@@ -53,7 +54,69 @@ class _W4A16Workspace:
     intermediate: torch.Tensor
 
 
+# Two-level cache: this dict avoids repeated loads within a process, while the
+# shared CuTe-DSL cache below persists each specialization across processes.
 _kernel_cache: Dict[Tuple, object] = {}
+_CUTE_DSL_MODULE = "sm100_w4a16_moe"
+
+
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates cached W4A16 kernels."""
+    from flashinfer import tllm_enums
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from . import moe_w4a16_kernel, moe_w4a16_utils
+    from . import utils as blackwell_utils
+
+    return (
+        __file__,
+        moe_w4a16_kernel.__file__,
+        moe_w4a16_utils.__file__,
+        blackwell_utils.__file__,
+        cute_dsl_utils.__file__,
+        tllm_enums.__file__,
+    )
+
+
+def _disk_kernel_name(prefix: str, cache_key: Tuple) -> str:
+    """Return a symbol-safe disk name derived from the complete cache key."""
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _w4a16_kernel_cache_key(
+    *,
+    num_local_experts: int,
+    activation_type: Optional[ActivationType],
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    use_fused_finalize: bool,
+    enable_pdl: bool,
+    use_clc_scheduler: bool,
+    mma_tiler_mnk: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+    raster_along_m: bool,
+    transform_fragment_size: int,
+    max_active_clusters: int,
+) -> Tuple:
+    """Return every code-generation parameter for a W4A16 GEMM kernel."""
+    return (
+        "w4a16",
+        num_local_experts,
+        int(activation_type) if activation_type is not None else None,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        use_fused_finalize,
+        enable_pdl,
+        use_clc_scheduler,
+        mma_tiler_mnk,
+        cluster_shape_mn,
+        raster_along_m,
+        transform_fragment_size,
+        max_active_clusters,
+    )
 
 
 def _get_workspace(
@@ -106,24 +169,8 @@ def _get_workspace(
 
 
 def _get_compiled_kernel(
+    *,
     num_local_experts: int,
-    weight_ptr,
-    weight_sf_ptr,
-    activation_ptr,
-    tile_idx_to_expert_idx_ptr,
-    tile_idx_to_mn_limit_ptr,
-    num_non_exiting_tiles_ptr,
-    alpha_ptr,
-    output_ptr,
-    permuted_idx_to_expanded_idx_ptr,
-    token_final_scales_ptr,
-    m: int,
-    n: int,
-    k: int,
-    num_tokens: int,
-    top_k: int,
-    max_active_clusters: int,
-    stream,
     activation_type: Optional[ActivationType],
     swiglu_alpha: float,
     swiglu_beta: float,
@@ -134,27 +181,25 @@ def _get_compiled_kernel(
     mma_tiler_mnk: Tuple[int, int, int],
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
+    transform_fragment_size: int,
+    max_active_clusters: int,
 ):
     mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
-    transform_fragment_size = (
-        128 if activation_type is not None or k == mma_tiler_k else 32
-    )
-    cache_key = (
-        num_local_experts,
-        activation_type,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        use_fused_finalize,
-        enable_pdl,
-        use_clc_scheduler,
-        mma_tiler_m,
-        mma_tiler_k,
-        route_tile,
-        cluster_shape_mn,
-        raster_along_m,
-        transform_fragment_size,
+    cache_key = _w4a16_kernel_cache_key(
+        num_local_experts=num_local_experts,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
+        use_clc_scheduler=use_clc_scheduler,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        transform_fragment_size=transform_fragment_size,
+        max_active_clusters=max_active_clusters,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -176,25 +221,74 @@ def _get_compiled_kernel(
             raster_along_m=raster_along_m,
             transform_fragment_size=transform_fragment_size,
         )
-        compiled = cute.compile(
-            kernel.wrapper,
-            weight_ptr,
-            weight_sf_ptr,
-            activation_ptr,
-            tile_idx_to_expert_idx_ptr,
-            tile_idx_to_mn_limit_ptr,
-            num_non_exiting_tiles_ptr,
-            alpha_ptr,
-            output_ptr,
-            permuted_idx_to_expanded_idx_ptr,
-            token_final_scales_ptr,
-            m,
-            n,
-            k,
-            num_tokens,
-            top_k,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
+        weight_ptr = make_ptr(
+            cutlass.Float4E2M1FN, 32, cute.AddressSpace.gmem, assumed_align=32
+        )
+        weight_sf_ptr = make_ptr(
+            cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        activation_ptr = make_ptr(
+            cutlass.BFloat16, 32, cute.AddressSpace.gmem, assumed_align=32
+        )
+        tile_idx_to_expert_idx_ptr = make_ptr(
+            cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        tile_idx_to_mn_limit_ptr = make_ptr(
+            cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        num_non_exiting_tiles_ptr = make_ptr(
+            cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        alpha_ptr = make_ptr(
+            cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16
+        )
+        output_ptr = make_ptr(
+            cutlass.BFloat16, 32, cute.AddressSpace.gmem, assumed_align=32
+        )
+        permuted_idx_to_expanded_idx_ptr = (
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
+            if use_fused_finalize
+            else None
+        )
+        token_final_scales_ptr = (
+            make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16)
+            if use_fused_finalize
+            else None
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel_kind = (
+            "gemm1"
+            if activation_type is not None
+            else ("gemm2_fused" if use_fused_finalize else "gemm2_expanded")
+        )
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _disk_kernel_name(
+                f"{kernel_kind}_m{mma_tiler_m}_n{route_tile}_k{mma_tiler_k}",
+                cache_key,
+            ),
+            lambda: cute.compile(
+                kernel.wrapper,
+                weight_ptr,
+                weight_sf_ptr,
+                activation_ptr,
+                tile_idx_to_expert_idx_ptr,
+                tile_idx_to_mn_limit_ptr,
+                num_non_exiting_tiles_ptr,
+                alpha_ptr,
+                output_ptr,
+                permuted_idx_to_expanded_idx_ptr,
+                token_final_scales_ptr,
+                cutlass.Int64(1),
+                cutlass.Int64(1),
+                cutlass.Int64(1),
+                cutlass.Int64(1),
+                cutlass.Int64(1),
+                max_active_clusters=max_active_clusters,
+                stream=stream_fake,
+                options="--enable-tvm-ffi",
+            ),
+            extra_key_files=_kernel_source_files(),
         )
         _kernel_cache[cache_key] = compiled
     return compiled
@@ -223,7 +317,6 @@ def _run_grouped_gemm(
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
     n = int(activations.size(0))
-    stream = current_cuda_stream()
     mma_tiler_mnk, cluster_shape_mn, raster_along_m = tactic
     mma_tiler_m, route_tile, _ = mma_tiler_mnk
     max_active_clusters = get_max_active_clusters(
@@ -239,123 +332,49 @@ def _run_grouped_gemm(
     use_clc_scheduler = (
         activation_type is not None and num_problem_clusters > max_active_clusters
     )
-    weight_ptr = make_ptr(
-        cutlass.Float4E2M1FN,
-        weight.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=32,
-    )
-    weight_sf_ptr = make_ptr(
-        cutlass.Float8E4M3FN,
-        weight_sf.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    activation_ptr = make_ptr(
-        cutlass.BFloat16,
-        activations.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=32,
-    )
-    tile_idx_to_expert_idx_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_expert_idx.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    tile_idx_to_mn_limit_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_mn_limit.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    num_non_exiting_tiles_ptr = make_ptr(
-        cutlass.Int32,
-        num_non_exiting_tiles.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    alpha_ptr = make_ptr(
-        cutlass.Float32,
-        alpha.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    output_ptr = make_ptr(
-        cutlass.BFloat16,
-        output.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=32,
-    )
-    permuted_idx_to_expanded_idx_ptr = (
-        make_ptr(
-            cutlass.Int32,
-            permuted_idx_to_expanded_idx.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        if permuted_idx_to_expanded_idx is not None
-        else None
-    )
-    token_final_scales_ptr = (
-        make_ptr(
-            cutlass.Float32,
-            token_final_scales.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        if token_final_scales is not None
-        else None
-    )
     num_tokens = int(output.size(0)) if use_fused_finalize else 0
     top_k = int(token_final_scales.size(1)) if token_final_scales is not None else 0
-    compiled = _get_compiled_kernel(
-        num_local_experts,
-        weight_ptr,
-        weight_sf_ptr,
-        activation_ptr,
-        tile_idx_to_expert_idx_ptr,
-        tile_idx_to_mn_limit_ptr,
-        num_non_exiting_tiles_ptr,
-        alpha_ptr,
-        output_ptr,
-        permuted_idx_to_expanded_idx_ptr,
-        token_final_scales_ptr,
-        m,
-        n,
-        k,
-        num_tokens,
-        top_k,
-        max_active_clusters,
-        stream,
-        activation_type,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        use_fused_finalize,
-        enable_pdl,
-        use_clc_scheduler,
-        mma_tiler_mnk,
-        cluster_shape_mn,
-        raster_along_m,
+    transform_fragment_size = (
+        128 if activation_type is not None or k == mma_tiler_mnk[2] else 32
     )
+    compiled = _get_compiled_kernel(
+        num_local_experts=num_local_experts,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
+        use_clc_scheduler=use_clc_scheduler,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mn=cluster_shape_mn,
+        raster_along_m=raster_along_m,
+        transform_fragment_size=transform_fragment_size,
+        max_active_clusters=max_active_clusters,
+    )
+    # Pointer-typed TVM-FFI arguments are raw addresses. The stream is omitted:
+    # make_fake_stream(use_tvm_ffi_env_stream=True) binds the caller's current
+    # stream from the TVM-FFI environment, including during CUDA graph capture.
     compiled(
-        weight_ptr,
-        weight_sf_ptr,
-        activation_ptr,
-        tile_idx_to_expert_idx_ptr,
-        tile_idx_to_mn_limit_ptr,
-        num_non_exiting_tiles_ptr,
-        alpha_ptr,
-        output_ptr,
-        permuted_idx_to_expanded_idx_ptr,
-        token_final_scales_ptr,
+        weight.data_ptr(),
+        weight_sf.data_ptr(),
+        activations.data_ptr(),
+        tile_idx_to_expert_idx.data_ptr(),
+        tile_idx_to_mn_limit.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        alpha.data_ptr(),
+        output.data_ptr(),
+        (
+            permuted_idx_to_expanded_idx.data_ptr()
+            if permuted_idx_to_expanded_idx is not None
+            else None
+        ),
+        token_final_scales.data_ptr() if token_final_scales is not None else None,
         m,
         n,
         k,
         num_tokens,
         top_k,
-        stream=stream,
     )
 
 
