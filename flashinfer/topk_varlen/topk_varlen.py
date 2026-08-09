@@ -603,6 +603,10 @@ def _compile_radix(
     num_sms,
     tie_break,
     has_row_starts,
+    page_size,
+    has_row_to_batch,
+    has_page_table_row_starts,
+    return_raw_indices,
 ):
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
@@ -623,17 +627,22 @@ def _compile_radix(
         ctas_per_group=ctas_per_group,
         num_sms=num_sms,
         tie_break=tie_break,
+        page_size=page_size,
     )
     sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
     sym_n = N  # static vocab width
     sym_rows = sym_groups * next_n
+    sym_page_rows = cute.sym_int()
+    sym_page_columns = cute.sym_int()
     max_num_groups = max(1, num_sms // ctas_per_group)
 
     dtype_name = str(cute_dtype).split(".")[-1]
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
-        f"_tie{tie_break}_rs{int(has_row_starts)}"
+        f"_tie{tie_break}_rs{int(has_row_starts)}_ps{page_size}"
+        f"_rtb{int(has_row_to_batch)}_ptrs{int(has_page_table_row_starts)}"
+        f"_raw{int(return_raw_indices)}"
     )
 
     def _compile_fn():
@@ -654,8 +663,30 @@ def _compile_radix(
             if has_row_starts
             else None,
             cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (sym_page_rows, sym_page_columns),
+                stride_order=(1, 0),
+            )
+            if page_size > 0
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows,), stride_order=(0,)
+            )
+            if has_row_to_batch
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows,), stride_order=(0,)
+            )
+            if has_page_table_row_starts
+            else None,
+            cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
             ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_raw_indices
+            else None,
             cute.runtime.make_fake_compact_tensor(
                 cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
             )
@@ -969,6 +1000,11 @@ def _run_radix(
     out_values: Optional[torch.Tensor],
     tie_break: int,
     row_starts: Optional[torch.Tensor],
+    src_page_table: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
+    page_table_row_starts: Optional[torch.Tensor] = None,
+    page_size: int = 0,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CuTe DSL multi-CTA radix top-k: native varlen, no logit masking needed."""
     cute_dtype = torch_to_cutlass_dtype(logits.dtype)
@@ -1003,6 +1039,10 @@ def _run_radix(
         num_sms,
         tie_break,
         row_starts is not None,
+        page_size,
+        row_to_batch is not None,
+        page_table_row_starts is not None,
+        out_raw_indices is not None,
     )
 
     # row_states holds the global histograms + inter-CTA barrier counters used
@@ -1039,7 +1079,11 @@ def _run_radix(
         row_states,
         seq_lens,
         row_starts,
+        src_page_table,
+        row_to_batch,
+        page_table_row_starts,
         out_indices,
+        out_raw_indices,
         out_values if return_output_values else None,
     )
     return out_indices, (out_values if return_output_values else None)
@@ -1251,7 +1295,7 @@ def top_k_varlen(
             f"{logits.shape[0]} and {seq_lens.shape[0]} * {next_n}"
         )
 
-    tie_break = TopKTieBreak(tie_break)
+    tie_break_mode = TopKTieBreak(tie_break)
 
     if backend == "auto":
         if row_starts is not None:
@@ -1262,8 +1306,8 @@ def top_k_varlen(
             backend = top_k_varlen.suitable_auto_backends[0]
 
     unsupported_options = []
-    if backend == "gvr" and tie_break != TopKTieBreak.NONE:
-        unsupported_options.append(f"tie_break={tie_break.name}")
+    if backend == "gvr" and tie_break_mode != TopKTieBreak.NONE:
+        unsupported_options.append(f"tie_break={tie_break_mode.name}")
     if backend in ("gvr", "radix_cutlass") and row_starts is not None:
         unsupported_options.append("row_starts")
     if unsupported_options:
@@ -1306,7 +1350,7 @@ def top_k_varlen(
             return_values,
             out_indices,
             out_values,
-            int(tie_break),
+            int(tie_break_mode),
             row_starts,
         )
     elif backend == "gvr":
@@ -1347,7 +1391,7 @@ def top_k_varlen(
             return_values,
             out_indices,
             out_values,
-            tie_break,
+            int(tie_break_mode),
         )
     else:
         raise ValueError(
@@ -1363,8 +1407,8 @@ def top_k_varlen(
 # ---------------------------------------------------------------------------
 
 
-@supported_compute_capability(_ALL_CCS)
-def _radix_cutlass_top_k_varlen_page_table_check(
+@supported_compute_capability(_BLACKWELL_PLUS_CCS)
+def _radix_top_k_varlen_page_table_check(
     logits,
     src_page_table,
     seq_lens,
@@ -1377,7 +1421,6 @@ def _radix_cutlass_top_k_varlen_page_table_check(
     out_values=None,
     deterministic=False,
     tie_break=TopKTieBreak.NONE,
-    dsa_graph_safe=False,
     row_starts=None,
     page_table_row_starts=None,
     *,
@@ -1385,10 +1428,8 @@ def _radix_cutlass_top_k_varlen_page_table_check(
     out_raw_indices=None,
     backend="auto",
 ):
-    """The parity-first page-table API uses the existing CUTLASS transform."""
-    return _radix_cutlass_required_filtered_supported(
-        logits, top_k, tie_break, dsa_graph_safe
-    )
+    """Native fused page translation is provided by the CuTe radix kernel."""
+    return _CUTE_DSL_AVAILABLE
 
 
 def _top_k_varlen_page_table_heuristic(
@@ -1405,7 +1446,6 @@ def _top_k_varlen_page_table_heuristic(
     out_values=None,
     deterministic=False,
     tie_break=TopKTieBreak.NONE,
-    dsa_graph_safe=False,
     row_starts=None,
     page_table_row_starts=None,
     *,
@@ -1413,11 +1453,11 @@ def _top_k_varlen_page_table_heuristic(
     out_raw_indices=None,
     backend="auto",
 ):
-    return [b for b in ("radix_cutlass",) if b in suitable_backends]
+    return [b for b in ("radix",) if b in suitable_backends]
 
 
 @backend_requirement(
-    {"radix_cutlass": _radix_cutlass_top_k_varlen_page_table_check},
+    {"radix": _radix_top_k_varlen_page_table_check},
     heuristic_func=_top_k_varlen_page_table_heuristic,
 )
 @flashinfer_api(trace=top_k_varlen_page_table_transform_trace_dispatch)
@@ -1434,13 +1474,12 @@ def top_k_varlen_page_table_transform(
     out_values: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     tie_break: int = TopKTieBreak.NONE,
-    dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
     page_table_row_starts: Optional[torch.Tensor] = None,
     *,
     page_size: int = 1,
     out_raw_indices: Optional[torch.Tensor] = None,
-    backend: Literal["radix_cutlass", "auto"] = "auto",
+    backend: Literal["radix", "auto"] = "auto",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Varlen Top-K selection followed by compact page-table translation.
 
@@ -1456,10 +1495,9 @@ def top_k_varlen_page_table_transform(
     ``batch_idx`` is ``row_to_batch[row]`` when supplied. Otherwise it is
     ``row // next_n``, which is identity when ``next_n == 1``.
 
-    The initial implementation intentionally uses the existing fused
-    ``radix_cutlass`` page-table transform for exact tie-breaking, canonical
-    ordering, and score/page-window semantics. Native GVR and CuTe radix page
-    translation can be added later without changing the result contract.
+    Selection, score-window handling, optional raw/value outputs, and compact
+    page translation are fused into the existing CuTe radix kernel. This API
+    never falls back to the older C++/CUTLASS page-table implementation.
 
     Parameters
     ----------
@@ -1486,12 +1524,10 @@ def top_k_varlen_page_table_transform(
     out_values : torch.Tensor, optional
         Contiguous selected-value output buffer matching ``logits.dtype``.
     deterministic : bool, optional
-        Canonically order selected raw local indices before translation.
+        Reserved for future support. ``True`` raises ``ValueError``.
     tie_break : int, optional
         Boundary tie mode: ``TopKTieBreak.NONE``, ``SMALL``, or ``LARGE``.
         Tie mode controls the selected set independently of ordering.
-    dsa_graph_safe : bool, optional
-        Force the FilteredTopK graph-safe path and scalar vectorization.
     row_starts : torch.Tensor, optional
         Contiguous ``int32[num_rows]`` score-window starts. Selected raw
         indices remain local to these windows; effective lengths are clipped
@@ -1509,10 +1545,9 @@ def top_k_varlen_page_table_transform(
         ``-1``. It must not overlap ``out``. Only raw indices are in the right
         index domain for a later GVR decode step, but the caller must still
         select the relevant speculative row and ensure column zero is the
-        argmax; deterministic local-index ordering does not preserve that GVR
-        precondition.
-    backend : {"radix_cutlass", "auto"}, optional
-        ``"auto"`` currently selects ``"radix_cutlass"``.
+        argmax. Output ordering is unspecified.
+    backend : {"radix", "auto"}, optional
+        Native CuTe radix backend. ``"auto"`` resolves to ``"radix"``.
 
     Returns
     -------
@@ -1522,17 +1557,28 @@ def top_k_varlen_page_table_transform(
     """
     assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
-    tie_break = TopKTieBreak(tie_break)
+    if deterministic:
+        raise ValueError(
+            "deterministic=True is not supported by top_k_varlen_page_table_transform"
+        )
+    if next_n <= 0:
+        raise ValueError(f"next_n must be positive, got {next_n}")
+    if compress_ratio <= 0:
+        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    tie_break_mode = TopKTieBreak(tie_break)
 
     if backend == "auto":
-        backend = "radix_cutlass"
-    if backend != "radix_cutlass":
-        raise ValueError(
-            f"Unknown backend: {backend!r}. Expected 'radix_cutlass' or 'auto'."
-        )
+        backend = "radix"
+    if backend != "radix":
+        raise ValueError(f"Unknown backend: {backend!r}. Expected 'radix' or 'auto'.")
 
-    num_rows, max_seq_len = logits.shape
+    num_rows = logits.shape[0]
     device = logits.device
+    if num_rows != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            "logits.shape[0] must equal seq_lens.shape[0] * next_n, got "
+            f"{num_rows} and {seq_lens.shape[0]} * {next_n}"
+        )
     if page_size <= 0 or page_size > 1 << 30 or page_size & (page_size - 1):
         raise ValueError(
             "page_size must be a positive power of two no greater than 2**30, "
@@ -1555,9 +1601,6 @@ def top_k_varlen_page_table_transform(
     if not src_page_table.is_contiguous():
         raise ValueError("src_page_table must be contiguous")
 
-    if row_to_batch is None and next_n > 1:
-        row_to_batch = torch.arange(num_rows, dtype=torch.int32, device=device)
-        row_to_batch.div_(next_n, rounding_mode="floor")
     for tensor, name in (
         (row_to_batch, "row_to_batch"),
         (row_starts, "row_starts"),
@@ -1567,15 +1610,6 @@ def top_k_varlen_page_table_transform(
             check_shape_dtype_device(tensor, (num_rows,), torch.int32, device, name)
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
-
-    lengths = _get_effective_row_lengths(
-        seq_lens,
-        num_rows,
-        max_seq_len,
-        next_n,
-        compress_ratio,
-        row_starts,
-    )
 
     if out is None:
         out = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
@@ -1594,10 +1628,12 @@ def top_k_varlen_page_table_transform(
         )
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
-
-    raw_indices = out_raw_indices
-    if return_values and raw_indices is None:
-        raw_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+        out_begin = out.data_ptr()
+        out_end = out_begin + out.numel() * out.element_size()
+        raw_begin = out_raw_indices.data_ptr()
+        raw_end = raw_begin + out_raw_indices.numel() * out_raw_indices.element_size()
+        if out_begin < raw_end and raw_begin < out_end:
+            raise ValueError("out_raw_indices must not overlap out")
     if return_values and out_values is None:
         out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=device)
     elif return_values:
@@ -1607,37 +1643,21 @@ def top_k_varlen_page_table_transform(
         if not out_values.is_contiguous():
             raise ValueError("out_values must be contiguous")
 
-    row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,
-        device,
-        zero_init=True,
-    )
-    get_topk_module().radix_topk_page_table_transform(
+    physical_indices, values = _run_radix(
         logits,
-        out,
-        src_page_table,
-        row_to_batch,
-        lengths,
-        row_states_buffer,
+        seq_lens,
         top_k,
-        deterministic,
-        tie_break,
-        page_size,
-        dsa_graph_safe,
-        row_starts=row_starts,
+        next_n,
+        compress_ratio,
+        return_values,
+        out,
+        out_values,
+        int(tie_break_mode),
+        row_starts,
+        src_page_table=src_page_table,
+        row_to_batch=row_to_batch,
         page_table_row_starts=page_table_row_starts,
-        output_raw_indices=raw_indices,
+        page_size=page_size,
+        out_raw_indices=out_raw_indices,
     )
-
-    if return_values:
-        assert raw_indices is not None and out_values is not None
-        sentinel = raw_indices < 0
-        gather_idx = raw_indices.long()
-        if row_starts is not None:
-            gather_idx.add_(row_starts[:, None])
-        gather_idx.masked_fill_(sentinel, 0)
-        out_values.copy_(torch.gather(logits, 1, gather_idx))
-        out_values.masked_fill_(sentinel, 0)
-
-    return out, (out_values if return_values else None)
+    return physical_indices, values

@@ -202,7 +202,7 @@ flashinfer.top_k_varlen_page_table_transform(
     compress_ratio=1,
     next_n=1,
     page_size=_topk_pt_PS,
-    backend="radix_cutlass",
+    backend="radix",
 )
 
 # ── sampling (Qwen3 vocab=151936) ─────────────────────────────────────────────

@@ -198,6 +198,7 @@ class SinglePassMultiCTARadixTopKKernel:
         ctas_per_group: int = 1,
         num_sms: int = 148,
         tie_break: int = _TIE_NONE,
+        page_size: int = 0,
     ):
         self.dtype = dtype
         self.chunk_size = chunk_size
@@ -210,6 +211,7 @@ class SinglePassMultiCTARadixTopKKernel:
         if tie_break not in (_TIE_NONE, _TIE_SMALL, _TIE_LARGE):
             raise ValueError(f"tie_break must be 0, 1, or 2; got {tie_break}")
         self.tie_break = tie_break
+        self.page_size = page_size
 
         # Radix config
         self.radix = 256
@@ -229,6 +231,41 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # Vec size for loading
         self.vec_size = num_copy_bits // dtype.width
+
+    # ------------------------------------------------------------------
+    # Optional compact page-table translation
+    # ------------------------------------------------------------------
+    @cute.jit
+    def translate_page_indices(
+        self,
+        raw_indices_row,
+        physical_indices_row,
+        src_page_table,
+        row_to_batch,
+        page_table_row_starts,
+        row_idx,
+        row_start,
+        top_k,
+        tidx,
+    ):
+        """Translate completed window-local indices without a second kernel."""
+        batch_idx = row_idx // cutlass.const_expr(self.next_n)
+        if cutlass.const_expr(row_to_batch is not None):
+            batch_idx = row_to_batch[row_idx]
+
+        page_start = row_start
+        if cutlass.const_expr(page_table_row_starts is not None):
+            page_start = page_table_row_starts[row_idx]
+
+        page_size = cutlass.const_expr(self.page_size)
+        for pos in range(tidx, top_k, self.num_threads):
+            raw_idx = raw_indices_row[pos]
+            physical_idx = cutlass.Int32(-1)
+            if raw_idx >= 0:
+                page_column = page_start + raw_idx // page_size
+                physical_page = src_page_table[batch_idx, page_column]
+                physical_idx = physical_page * page_size + raw_idx % page_size
+            physical_indices_row[pos] = physical_idx
 
     # ------------------------------------------------------------------
     # Bit-pattern helpers
@@ -1266,7 +1303,11 @@ class SinglePassMultiCTARadixTopKKernel:
         row_states: cute.Tensor,
         seqlen: cute.Tensor,
         row_starts: cute.Tensor,
+        src_page_table: cute.Tensor,
+        row_to_batch: cute.Tensor,
+        page_table_row_starts: cute.Tensor,
         output_indices: cute.Tensor,
+        output_raw_indices: cute.Tensor,
         output_values: cute.Tensor,
     ):
         """Main single-pass multi-CTA radix top-k kernel.
@@ -1375,7 +1416,10 @@ class SinglePassMultiCTARadixTopKKernel:
 
             # Early exit: k >= length → return all indices directly
             input_row = input_data[row_idx, None]
-            output_indices_row = output_indices[row_idx, None]
+            physical_indices_row = output_indices[row_idx, None]
+            output_indices_row = physical_indices_row
+            if cutlass.const_expr(output_raw_indices is not None):
+                output_indices_row = output_raw_indices[row_idx, None]
             if cutlass.const_expr(output_values is not None):
                 output_values_row = output_values[row_idx, None]
             else:
@@ -1397,12 +1441,10 @@ class SinglePassMultiCTARadixTopKKernel:
                         output_indices_row[i] = cutlass.Int32(-1)
                         if cutlass.const_expr(output_values is not None):
                             output_values_row[i] = self.dtype(0)
-                # Multi-CTA: clear next iter's first histogram buffer.
-                # No inter-CTA barrier needed here (FlashInfer pattern):
-                # early-exit writes no global histogram, so there is nothing
-                # to synchronize.  barrier_phase is intentionally NOT
-                # incremented so the next normal row's barrier targets remain
-                # consistent.
+                # Multi-CTA: clear next iter's first histogram buffer. Normal
+                # top-k needs no barrier here because early exit writes no
+                # global histogram. Page mode adds a barrier below before CTA
+                # 0 translates every CTA's raw output.
                 if cutlass.const_expr(ctas_per_group > 1):
                     # CTA 0 clears the first buffer used by the next iteration
                     # (FlashInfer pattern: histogram[(iter+1)*num_rounds % 3]).
@@ -1617,6 +1659,36 @@ class SinglePassMultiCTARadixTopKKernel:
                         arrival_counter_ptr, barrier_phase * ctas_per_group, tidx
                     )
 
+            if cutlass.const_expr(self.page_size > 0):
+                # The normal multi-CTA path already ended with a barrier. The
+                # short-row path needs one here so CTA 0 sees every raw index
+                # before translating the completed output in place.
+                if cutlass.const_expr(ctas_per_group > 1):
+                    if top_k >= length:
+                        if tidx == 0:
+                            red_release_gpu(
+                                state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                                cutlass.Int32(1),
+                            )
+                        barrier_phase = barrier_phase + 1
+                        barrier_inter_cta(
+                            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                            barrier_phase * ctas_per_group,
+                            tidx,
+                        )
+                if cta_in_group == 0:
+                    self.translate_page_indices(
+                        output_indices_row,
+                        physical_indices_row,
+                        src_page_table,
+                        row_to_batch,
+                        page_table_row_starts,
+                        row_idx,
+                        row_start,
+                        top_k,
+                        tidx,
+                    )
+
             # Advance to next row (round-robin).
             row_idx = row_idx + num_groups
             if cutlass.const_expr(ctas_per_group > 1):
@@ -1647,7 +1719,11 @@ class SinglePassMultiCTARadixTopKKernel:
         row_states: cute.Tensor,
         seqlen: cute.Tensor,
         row_starts: cute.Tensor,
+        src_page_table: cute.Tensor,
+        row_to_batch: cute.Tensor,
+        page_table_row_starts: cute.Tensor,
         output_indices: cute.Tensor,
+        output_raw_indices: cute.Tensor,
         output_values: cute.Tensor,
         stream,
     ):
@@ -1661,7 +1737,11 @@ class SinglePassMultiCTARadixTopKKernel:
             row_states,
             seqlen,
             row_starts,
+            src_page_table,
+            row_to_batch,
+            page_table_row_starts,
             output_indices,
+            output_raw_indices,
             output_values,
         ).launch(
             grid=(total_ctas, 1, 1),

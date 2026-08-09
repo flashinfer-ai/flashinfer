@@ -411,7 +411,7 @@ def _top_k_varlen_page_table_transform_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build a compact-page ``radix_cutlass`` trace without side outputs."""
+    """Build a compact-page native-radix trace without side outputs."""
     if next_n <= 0:
         raise ValueError(f"next_n must be positive, got {next_n}")
     if compress_ratio <= 0:
@@ -460,7 +460,7 @@ def _top_k_varlen_page_table_transform_init(
         "compress_ratio": compress_ratio,
         "next_n": next_n,
         "page_size": page_size,
-        "backend": "radix_cutlass",
+        "backend": "radix",
     }
     if batch_size != num_requests:
         result["row_to_batch"] = (
@@ -509,7 +509,6 @@ top_k_varlen_page_table_transform_trace = _TopKVarlenPageTableTransformTraceTemp
         "next_n": Scalar("int32", optional=True),
         "deterministic": Scalar("bool", optional=True),
         "tie_break": Scalar("int32", optional=True),
-        "dsa_graph_safe": Scalar("bool", optional=True),
         "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
         "page_size": Scalar("int32", optional=True),

@@ -332,6 +332,199 @@ def test_top_k_varlen_page_table_next_n_default_row_to_batch():
     assert torch.equal(physical, expected_physical)
 
 
+@pytest.mark.parametrize(
+    ("tie_break", "prefer_large"),
+    [(1, False), (2, True)],
+    ids=["small", "large"],
+)
+def test_top_k_varlen_page_table_multi_cta_tie_break(tie_break, prefer_large):
+    """Compact translation preserves exact native ties across radix CTAs."""
+    if not _native_backend_available("radix"):
+        pytest.skip("radix is not available on this device")
+
+    width, row_start, top_k, page_size = 131072, 5, 512, 64
+    effective_width = width - row_start
+    strict_indices = (1000, 70000)
+    logits = torch.zeros((1, width), device="cuda", dtype=torch.bfloat16)
+    logits[0, row_start + strict_indices[0]] = 3
+    logits[0, row_start + strict_indices[1]] = 2
+    seq_lens = torch.tensor([width], device="cuda", dtype=torch.int32)
+    row_starts = torch.tensor([row_start], device="cuda", dtype=torch.int32)
+    page_starts = torch.tensor([2], device="cuda", dtype=torch.int32)
+    page_table_width = 2 + (effective_width + page_size - 1) // page_size
+    src_page_table = torch.arange(
+        page_table_width, device="cuda", dtype=torch.int32
+    ).unsqueeze(0)
+    out_raw = torch.empty((1, top_k), device="cuda", dtype=torch.int32)
+
+    physical, _ = flashinfer.top_k_varlen_page_table_transform(
+        logits,
+        src_page_table,
+        seq_lens,
+        top_k,
+        tie_break=tie_break,
+        row_starts=row_starts,
+        page_table_row_starts=page_starts,
+        page_size=page_size,
+        out_raw_indices=out_raw,
+        backend="radix",
+    )
+
+    expected_raw = _expected_boundary_indices(
+        effective_width, top_k, strict_indices, prefer_large
+    ).unsqueeze(0)
+    assert torch.equal(out_raw.sort(dim=-1).values, expected_raw)
+    page_columns = page_starts[:, None] + out_raw // page_size
+    expected_pages = src_page_table[:, page_columns[0].long()]
+    assert torch.equal(physical, expected_pages * page_size + out_raw % page_size)
+
+
+def test_top_k_varlen_page_table_short_and_empty_rows():
+    """Native page mode preserves raw/physical/value sentinels for short rows."""
+    # A long score width forces the radix specialization to use multiple CTAs
+    # even though both effective rows take the short-row path.
+    width, top_k = 131072, 8
+    logits = torch.arange(2 * width, device="cuda", dtype=torch.float32).view(2, width)
+    seq_lens = torch.tensor([3, 0], device="cuda", dtype=torch.int32)
+    src_page_table = (
+        torch.arange(2 * width, device="cuda", dtype=torch.int32).view(2, width) + 100
+    )
+    out_raw = torch.empty((2, top_k), device="cuda", dtype=torch.int32)
+
+    physical, values = flashinfer.top_k_varlen_page_table_transform(
+        logits,
+        src_page_table,
+        seq_lens,
+        top_k,
+        return_values=True,
+        out_raw_indices=out_raw,
+        backend="radix",
+    )
+
+    assert set(out_raw[0, :3].cpu().tolist()) == {0, 1, 2}
+    assert torch.equal(out_raw[0, 3:], torch.full_like(out_raw[0, 3:], -1))
+    assert torch.equal(out_raw[1], torch.full_like(out_raw[1], -1))
+    valid = out_raw[0, :3].long()
+    assert torch.equal(physical[0, :3], src_page_table[0, valid])
+    assert torch.equal(physical[:, 3:], torch.full_like(physical[:, 3:], -1))
+    assert torch.equal(physical[1], torch.full_like(physical[1], -1))
+    torch.testing.assert_close(values[0, :3], logits[0, valid])
+    assert torch.equal(values[0, 3:], torch.zeros_like(values[0, 3:]))
+    assert torch.equal(values[1], torch.zeros_like(values[1]))
+
+
+@pytest.mark.parametrize("backend", ["auto", "radix"])
+@pytest.mark.parametrize("skip_check", [False, True])
+def test_top_k_varlen_page_table_deterministic_is_unsupported(backend, skip_check):
+    logits = torch.randn((1, 1024), device="cuda", dtype=torch.bfloat16)
+    seq_lens = torch.tensor([1024], device="cuda", dtype=torch.int32)
+    page_table = torch.arange(1024, device="cuda", dtype=torch.int32).unsqueeze(0)
+    with pytest.raises(ValueError, match="deterministic=True is not supported"):
+        flashinfer.top_k_varlen_page_table_transform(
+            logits,
+            page_table,
+            seq_lens,
+            512,
+            deterministic=True,
+            backend=backend,
+            skip_check=skip_check,
+        )
+
+
+def test_top_k_varlen_page_table_rejects_cpp_backend_and_invalid_buffers():
+    logits = torch.randn((1, 1024), device="cuda", dtype=torch.bfloat16)
+    seq_lens = torch.tensor([1024], device="cuda", dtype=torch.int32)
+    page_table = torch.arange(1024, device="cuda", dtype=torch.int32).unsqueeze(0)
+    out = torch.empty((1, 512), device="cuda", dtype=torch.int32)
+
+    with pytest.raises(BackendSupportedError, match="radix_cutlass"):
+        flashinfer.top_k_varlen_page_table_transform(
+            logits,
+            page_table,
+            seq_lens,
+            512,
+            backend="radix_cutlass",
+        )
+    with pytest.raises(ValueError, match="page_table_row_starts is required"):
+        flashinfer.top_k_varlen_page_table_transform(
+            logits,
+            page_table,
+            seq_lens,
+            512,
+            row_starts=torch.zeros(1, device="cuda", dtype=torch.int32),
+            page_size=64,
+        )
+    with pytest.raises(ValueError, match="must not overlap"):
+        flashinfer.top_k_varlen_page_table_transform(
+            logits,
+            page_table,
+            seq_lens,
+            512,
+            out=out,
+            out_raw_indices=out,
+        )
+
+
+def test_top_k_varlen_page_table_cuda_graph_replay():
+    """Captured native page mode rereads every device-side mapping input."""
+    num_rows, width, top_k, page_size = 2, 4096, 128, 64
+    logits = torch.randn((num_rows, width), device="cuda", dtype=torch.bfloat16)
+    seq_lens = torch.full((num_rows,), width, device="cuda", dtype=torch.int32)
+    row_starts = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
+    page_starts = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    row_to_batch = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    page_table = torch.arange(2 * 80, device="cuda", dtype=torch.int32).reshape(2, 80)
+    out = torch.empty((num_rows, top_k), device="cuda", dtype=torch.int32)
+    out_raw = torch.empty_like(out)
+    out_values = torch.empty_like(out, dtype=logits.dtype)
+
+    def call():
+        return flashinfer.top_k_varlen_page_table_transform(
+            logits,
+            page_table,
+            seq_lens,
+            top_k,
+            row_to_batch=row_to_batch,
+            return_values=True,
+            out=out,
+            out_values=out_values,
+            row_starts=row_starts,
+            page_table_row_starts=page_starts,
+            page_size=page_size,
+            out_raw_indices=out_raw,
+            backend="radix",
+        )
+
+    call()  # compile and allocate persistent state before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result, values = call()
+    assert result.data_ptr() == out.data_ptr()
+    assert values.data_ptr() == out_values.data_ptr()
+
+    logits.copy_(torch.randn_like(logits))
+    row_starts.copy_(torch.tensor([16, 0], device="cuda", dtype=torch.int32))
+    page_starts.copy_(torch.tensor([3, 1], device="cuda", dtype=torch.int32))
+    row_to_batch.copy_(torch.tensor([1, 0], device="cuda", dtype=torch.int32))
+    page_table.add_(1000)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for row in range(num_rows):
+        start = int(row_starts[row].item())
+        length = min(int(seq_lens[row].item()), width - start)
+        expected_raw = torch.topk(
+            logits[row, start : start + length].float(), top_k, sorted=False
+        ).indices.int()
+        assert torch.equal(out_raw[row].sort().values, expected_raw.sort().values)
+    page_columns = page_starts[:, None] + out_raw // page_size
+    expected_pages = page_table[row_to_batch[:, None], page_columns.long()]
+    assert torch.equal(out, expected_pages * page_size + out_raw % page_size)
+    absolute = row_starts[:, None].long() + out_raw.long()
+    torch.testing.assert_close(out_values, torch.gather(logits, 1, absolute))
+
+
 def _native_backend_available(backend: str) -> bool:
     if not _CUTE_DSL_AVAILABLE:
         return False
