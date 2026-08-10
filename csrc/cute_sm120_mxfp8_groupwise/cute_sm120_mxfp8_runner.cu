@@ -23,6 +23,7 @@
 #include "cute_sm120_mxfp8_groupwise/cute_sm120_mxfp8_runner.h"
 #include "cutlass/gemm_coord.h"
 #include "tvm_ffi_utils.h"
+#include "cute_sm120_mxfp8_groupwise/sm120_common/moe_tile_selection.h"
 #include "cute_sm120_mxfp8_groupwise/sm120_fused_moe/launch.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/builder.cuh"
 #include "cute_sm120_mxfp8_groupwise/sm120_blockscaled/kernel_impl.cuh"
@@ -47,11 +48,9 @@ namespace flashinfer::gemm::mxfp8_cute_sm120 {
 
 static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
                                          int num_sms) {
-  int m_per_expert = num_experts > 0 ? (total_rows + num_experts - 1) / num_experts : 0;
+  int max_m_per_expert = sm120_moe_select::balanced_max_rows(total_rows, num_experts);
   auto tile_count = [&](int tile_m, int tile_n) {
-    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
-    int64_t num_n = (int64_t(shape_n) + tile_n - 1) / tile_n;
-    return int64_t(num_experts) * num_m * num_n;
+    return sm120_moe_select::balanced_tile_count(total_rows, shape_n, num_experts, tile_m, tile_n);
   };
 
   int64_t swapab_tiles = tile_count(8, 128);
@@ -60,13 +59,13 @@ static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_
   int64_t m128_tiles = tile_count(128, 64);
   bool short_k = shape_k <= 2048;
 
-  if (m_per_expert <= 8 || (short_k && m32_tiles < num_sms / 2 && swapab_tiles <= num_sms)) {
+  if (max_m_per_expert <= 8 || (short_k && m32_tiles < num_sms / 2 && swapab_tiles <= num_sms)) {
     return 8;
   }
 
-  int64_t m32_waves = (m32_tiles + num_sms - 1) / num_sms;
-  int64_t m64_waves = (m64_tiles + num_sms - 1) / num_sms;
-  int64_t m128_waves = (m128_tiles + num_sms - 1) / num_sms;
+  int64_t m32_waves = sm120_moe_select::wave_count(m32_tiles, num_sms);
+  int64_t m64_waves = sm120_moe_select::wave_count(m64_tiles, num_sms);
+  int64_t m128_waves = sm120_moe_select::wave_count(m128_tiles, num_sms);
 
   if (m64_waves >= m32_waves) {
     return 32;
@@ -83,31 +82,19 @@ static int select_mxfp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_
   return 128;
 }
 
-static int select_plain_m64_or_m128(int m_per_expert, int shape_n, int num_experts, int num_sms) {
-  constexpr int kPlainTileOverhead = 48;
-  auto cost = [&](int tile_m) {
-    int64_t num_m = (int64_t(m_per_expert) + tile_m - 1) / tile_m;
-    int64_t num_n = (int64_t(shape_n) + 127) / 128;
-    int64_t num_tiles = int64_t(num_experts) * num_m * num_n;
-    int64_t num_waves = (num_tiles + num_sms - 1) / num_sms;
-    return num_waves * int64_t(tile_m + kPlainTileOverhead);
-  };
-  return (cost(64) < cost(128)) ? 64 : 128;
-}
-
 static int select_mxfp8_plain_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
                                          int num_sms) {
-  int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
-  if (m_per_expert <= 12) {
+  int max_m_per_expert = sm120_moe_select::balanced_max_rows(total_rows, num_experts);
+  if (max_m_per_expert <= 12) {
     return 8;
   }
-  if (m_per_expert <= 32) {
+  if (max_m_per_expert <= 32) {
     return 32;
   }
   if (shape_k <= 2048) {
-    return (m_per_expert < 192) ? 64 : 128;
+    return (max_m_per_expert < 192) ? 64 : 128;
   }
-  return select_plain_m64_or_m128(m_per_expert, shape_n, num_experts, num_sms);
+  return sm120_moe_select::select_plain_m64_or_m128(total_rows, shape_n, num_experts, num_sms);
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
