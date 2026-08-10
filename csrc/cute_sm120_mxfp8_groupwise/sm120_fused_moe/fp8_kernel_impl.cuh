@@ -41,10 +41,10 @@ struct SM120BlockScalingFusedMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
   static constexpr int kNumSchedStages = 2;
   static constexpr int kNumSchedConsumers =
       KT::MMAConfig::kNumMathWarps + (KT::kUseStagedR2G ? 3 : 2);
-  using TensorStorage = std::conditional_t<
-      KT::kUseStagedR2G, typename KT::TensorStorageStagedR2G,
-      std::conditional_t<KT::kSwapAB, typename KT::TensorStorageUnion,
-                         typename KT::TensorStorageR2GSplit>>;
+  using TensorStorage =
+      std::conditional_t<KT::kUseStagedR2G, typename KT::TensorStorageStagedR2G,
+                         std::conditional_t<KT::kSwapAB, typename KT::TensorStorageUnion,
+                                            typename KT::TensorStorageR2GSplit>>;
   struct SharedStorage {
     TensorStorage tensors;
     alignas(16) typename KT::BarrierStorage barriers;

@@ -48,8 +48,8 @@ static void check_scale_granularity_mnk(int scale_granularity_m, int scale_granu
 static int select_fp8_plain_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
                                        int num_sms);
 
-static int select_fp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_k,
-                                       int num_experts, int num_sms) {
+static int select_fp8_fused_moe_tile_m(int total_rows, int shape_n, int shape_k, int num_experts,
+                                       int num_sms) {
   return select_fp8_plain_moe_tile_m(total_rows, shape_n, shape_k, num_experts, num_sms);
 }
 
@@ -173,28 +173,29 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
   }
   if (tile_m == KT_M32::kTileM) {
     sm120_blockscaling::launch_fused_moe<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
-                                                 out_n, shape_k, num_experts, token_offset,
-                                                 num_sms, stream);
+                                                 out_n, shape_k, num_experts, token_offset, num_sms,
+                                                 stream);
     return;
   }
   if (tile_m == KT_M64::kTileM) {
     sm120_blockscaling::launch_fused_moe<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
-                                                 out_n, shape_k, num_experts, token_offset,
-                                                 num_sms, stream);
+                                                 out_n, shape_k, num_experts, token_offset, num_sms,
+                                                 stream);
     return;
   }
   sm120_blockscaling::launch_fused_moe<KT_M128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
-                                                out_n, shape_k, num_experts, token_offset,
-                                                num_sms, stream);
+                                                out_n, shape_k, num_experts, token_offset, num_sms,
+                                                stream);
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, BlockScaleElementType>::
-    fused_moe_fp8_nt_groupwise_tuned_impl(
-        void* D, void const* A, void const* B, int32_t const* token_offset, int num_experts,
-        int total_rows, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
-        float const* SFB, int tactic_tile_m, int tactic_tile_n) {
+    fused_moe_fp8_nt_groupwise_tuned_impl(void* D, void const* A, void const* B,
+                                          int32_t const* token_offset, int num_experts,
+                                          int total_rows, int shape_n, int shape_k,
+                                          cudaStream_t stream, float const* SFA, float const* SFB,
+                                          int tactic_tile_m, int tactic_tile_n) {
   using KT_SWAPAB = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<128, 8, 128, 2, true>;
   using KT_M32 = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<32, 128, 128, 2>;
   using KT_M64 = sm120_blockscaling::SM120BlockScalingFusedMoeBuilder<64, 128, 128, 2>;
@@ -214,16 +215,16 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                                                     token_offset, num_sms, stream);
   } else if (tactic_tile_m == 32) {
     sm120_blockscaling::launch_fused_moe<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
-                                                 out_n, shape_k, num_experts, token_offset,
-                                                 num_sms, stream);
+                                                 out_n, shape_k, num_experts, token_offset, num_sms,
+                                                 stream);
   } else if (tactic_tile_m == 64) {
     sm120_blockscaling::launch_fused_moe<KT_M64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
-                                                 out_n, shape_k, num_experts, token_offset,
-                                                 num_sms, stream);
+                                                 out_n, shape_k, num_experts, token_offset, num_sms,
+                                                 stream);
   } else {
-    sm120_blockscaling::launch_fused_moe<KT_M128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                                  total_rows, out_n, shape_k, num_experts,
-                                                  token_offset, num_sms, stream);
+    sm120_blockscaling::launch_fused_moe<KT_M128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
+                                                  out_n, shape_k, num_experts, token_offset,
+                                                  num_sms, stream);
   }
 }
 
@@ -383,8 +384,8 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                               int scale_granularity_k, bool is_gated) {
   check_scale_granularity_mnk(scale_granularity_m, scale_granularity_n, scale_granularity_k);
   if (is_gated) {
-    fused_moe_fp8_nt_groupwise_impl(D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k,
-                                    stream, SFA, SFB);
+    fused_moe_fp8_nt_groupwise_impl(D, A, B, token_offset, num_experts, total_rows, shape_n,
+                                    shape_k, stream, SFA, SFB);
   } else {
     moe_gemm_fp8_nt_groupwise_impl(D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k,
                                    stream, SFA, SFB);
@@ -394,11 +395,12 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, BlockScaleElementType>::
-    moe_gemm_fp8_nt_groupwise_tuned(
-        void* D, void const* A, void const* B, int32_t const* token_offset, int num_experts,
-        int total_rows, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
-        float const* SFB, int tactic_tile_m, int tactic_tile_n, int scale_granularity_m,
-        int scale_granularity_n, int scale_granularity_k, bool is_gated) {
+    moe_gemm_fp8_nt_groupwise_tuned(void* D, void const* A, void const* B,
+                                    int32_t const* token_offset, int num_experts, int total_rows,
+                                    int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
+                                    float const* SFB, int tactic_tile_m, int tactic_tile_n,
+                                    int scale_granularity_m, int scale_granularity_n,
+                                    int scale_granularity_k, bool is_gated) {
   check_scale_granularity_mnk(scale_granularity_m, scale_granularity_n, scale_granularity_k);
   bool valid_plain = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
                      (tactic_tile_m == 64 && tactic_tile_n == 128) ||
@@ -409,12 +411,11 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                      (tactic_tile_m == 128 && tactic_tile_n == 64) ||
                      (tactic_tile_m == 128 && tactic_tile_n == 8);
   TVM_FFI_ICHECK(is_gated ? valid_gated : valid_plain)
-      << "unsupported FP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m << ", "
-      << tactic_tile_n << ")";
+      << "unsupported FP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m << ", " << tactic_tile_n
+      << ")";
   if (is_gated) {
-    fused_moe_fp8_nt_groupwise_tuned_impl(
-        D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB,
-        tactic_tile_m, tactic_tile_n);
+    fused_moe_fp8_nt_groupwise_tuned_impl(D, A, B, token_offset, num_experts, total_rows, shape_n,
+                                          shape_k, stream, SFA, SFB, tactic_tile_m, tactic_tile_n);
   } else {
     moe_gemm_fp8_nt_groupwise_tuned_impl(D, A, B, token_offset, num_experts, total_rows, shape_n,
                                          shape_k, stream, SFA, SFB, tactic_tile_m, tactic_tile_n);
@@ -465,17 +466,15 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, BlockScaleElementType>::
-    moe_gemm_fp8_nt_groupwise_tuned_impl(
-        void* D, void const* A, void const* B, int32_t const* token_offset, int num_experts,
-        int total_rows, int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
-        float const* SFB, int tactic_tile_m, int tactic_tile_n) {
+    moe_gemm_fp8_nt_groupwise_tuned_impl(void* D, void const* A, void const* B,
+                                         int32_t const* token_offset, int num_experts,
+                                         int total_rows, int shape_n, int shape_k,
+                                         cudaStream_t stream, float const* SFA, float const* SFB,
+                                         int tactic_tile_m, int tactic_tile_n) {
   constexpr auto kGT = sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
-  using KT_M32 =
-      sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M64 =
-      sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 2, 1, 128, 128, kGT>;
-  using KT_M128 =
-      sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 2, 1, 128, 128, kGT>;
+  using KT_M32 = sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 2, 1, 128, 128, kGT>;
+  using KT_M64 = sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 2, 1, 128, 128, kGT>;
+  using KT_M128 = sm120_blockscaling::SM120BlockScalingBuilder<128, 128, 128, 2, 1, 128, 128, kGT>;
   using KT_SWAPAB =
       sm120_blockscaling::SM120BlockScalingBuilder<128, 8, 128, 2, 128, 1, 128, kGT, true>;
 

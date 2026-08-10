@@ -168,12 +168,7 @@ class _CuteSm120Mxfp8MoeRunner(Sm120MoeTunableRunner):
 def _should_autotune_mxfp8_moe(a: torch.Tensor, b: torch.Tensor) -> bool:
     num_experts, physical_n, k = b.shape
     m_per_expert = a.shape[0] // num_experts if num_experts > 0 else 0
-    return (
-        num_experts > 0
-        and m_per_expert > 0
-        and k > 2048
-        and physical_n % 32 == 0
-    )
+    return num_experts > 0 and m_per_expert > 0 and k > 2048 and physical_n % 32 == 0
 
 
 def _launch_mxfp8_moe_fallback(

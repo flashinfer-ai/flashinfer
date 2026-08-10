@@ -233,12 +233,8 @@ def per_block_dequant_from_fp8(
     fp8_padded[:, :n, :k] = fp8.to(torch.float32)
     return (
         (
-            fp8_padded.view(
-                g, padded_n // gran_k, gran_k, padded_k // gran_k, gran_k
-            )
-            * sf_ue8m0.view(
-                g, padded_n // gran_k, 1, padded_k // gran_k, 1
-            )
+            fp8_padded.view(g, padded_n // gran_k, gran_k, padded_k // gran_k, gran_k)
+            * sf_ue8m0.view(g, padded_n // gran_k, 1, padded_k // gran_k, 1)
         )
         .view(g, padded_n, padded_k)[:, :n, :k]
         .to(dtype)
@@ -492,9 +488,7 @@ def test_moe_gemm_mxfp8_nt_groupwise_forced_tactic(
         num_groups=num_groups,
         is_sfa=False,
     )
-    b_deq = per_block_dequant_from_fp8(
-        b_fp8, b_sf_ue8m0, gran_k=k_gran, dtype=b.dtype
-    )
+    b_deq = per_block_dequant_from_fp8(b_fp8, b_sf_ue8m0, gran_k=k_gran, dtype=b.dtype)
 
     ref = torch.empty((token_num, out_n), dtype=torch.bfloat16, device="cuda")
     for group_idx in range(num_groups):

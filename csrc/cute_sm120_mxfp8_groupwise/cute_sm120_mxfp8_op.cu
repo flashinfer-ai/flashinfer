@@ -18,11 +18,13 @@
 #include "cute_sm120_mxfp8_groupwise/cute_sm120_mxfp8_runner.h"
 #include "tvm_ffi_utils.h"
 
-static void CutlassMXFP8GroupwiseMoeGEMMSM120Impl(
-    TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indptr,
-    TensorView out, std::string scale_major_mode, int64_t scale_granularity_m,
-    int64_t scale_granularity_n, int64_t scale_granularity_k, int64_t is_gated,
-    int64_t tactic_tile_m, int64_t tactic_tile_n) {
+static void CutlassMXFP8GroupwiseMoeGEMMSM120Impl(TensorView a, TensorView b, TensorView a_scale,
+                                                  TensorView b_scale, TensorView m_indptr,
+                                                  TensorView out, std::string scale_major_mode,
+                                                  int64_t scale_granularity_m,
+                                                  int64_t scale_granularity_n,
+                                                  int64_t scale_granularity_k, int64_t is_gated,
+                                                  int64_t tactic_tile_m, int64_t tactic_tile_n) {
   TVM_FFI_ICHECK(scale_major_mode == "MN")
       << "Only scale_major_mode=\"MN\" is supported; got \"" << scale_major_mode << "\"";
 
@@ -41,9 +43,8 @@ static void CutlassMXFP8GroupwiseMoeGEMMSM120Impl(
                       (tactic_tile_m == 128 && tactic_tile_n == 8) ||
                       (tactic_tile_m == 128 && tactic_tile_n == 64) ||
                       (tactic_tile_m == 128 && tactic_tile_n == 128);
-  TVM_FFI_ICHECK(fallback_tactic || tuned_tactic)
-      << "unsupported MXFP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m << ", "
-      << tactic_tile_n << ")";
+  TVM_FFI_ICHECK(fallback_tactic || tuned_tactic) << "unsupported MXFP8 MoE tactic (TileM, TileN)=("
+                                                  << tactic_tile_m << ", " << tactic_tile_n << ")";
 
   // Scale tensors are int32-packed UE8M0 views over TMA-aligned storage.
   CHECK_INPUT_AND_TYPE(a, dl_float8_e4m3fn);
@@ -160,15 +161,17 @@ void CutlassMXFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_
                                        int64_t scale_granularity_n, int64_t scale_granularity_k,
                                        int64_t is_gated) {
   CutlassMXFP8GroupwiseMoeGEMMSM120Impl(a, b, a_scale, b_scale, m_indptr, out, scale_major_mode,
-                                       scale_granularity_m, scale_granularity_n,
-                                       scale_granularity_k, is_gated, -1, -1);
+                                        scale_granularity_m, scale_granularity_n,
+                                        scale_granularity_k, is_gated, -1, -1);
 }
 
-void CutlassMXFP8GroupwiseMoeGEMMSM120Tuned(
-    TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indptr,
-    TensorView out, std::string scale_major_mode, int64_t scale_granularity_m,
-    int64_t scale_granularity_n, int64_t scale_granularity_k, int64_t is_gated,
-    int64_t tactic_tile_m, int64_t tactic_tile_n) {
+void CutlassMXFP8GroupwiseMoeGEMMSM120Tuned(TensorView a, TensorView b, TensorView a_scale,
+                                            TensorView b_scale, TensorView m_indptr, TensorView out,
+                                            std::string scale_major_mode,
+                                            int64_t scale_granularity_m,
+                                            int64_t scale_granularity_n,
+                                            int64_t scale_granularity_k, int64_t is_gated,
+                                            int64_t tactic_tile_m, int64_t tactic_tile_n) {
   CutlassMXFP8GroupwiseMoeGEMMSM120Impl(
       a, b, a_scale, b_scale, m_indptr, out, scale_major_mode, scale_granularity_m,
       scale_granularity_n, scale_granularity_k, is_gated, tactic_tile_m, tactic_tile_n);

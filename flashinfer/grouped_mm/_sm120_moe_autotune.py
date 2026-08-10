@@ -26,7 +26,7 @@ def prepare_uniform_m_indptr(inputs: list[torch.Tensor]) -> list[torch.Tensor]:
     return [a, b, inputs[2], inputs[3], uniform_m_indptr]
 
 
-SM120_MOE_TUNING_CONFIG = TuningConfig(
+SM120_MOE_TUNING_CONFIG: TuningConfig = TuningConfig(
     use_cold_l2_cache=True,
     inputs_pre_hook=prepare_uniform_m_indptr,
 )
@@ -63,7 +63,9 @@ class Sm120MoeTunableRunner(TunableRunner):
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple:
         a = inputs[0]
         device_index = (
-            a.device.index if a.device.index is not None else torch.cuda.current_device()
+            a.device.index
+            if a.device.index is not None
+            else torch.cuda.current_device()
         )
         properties = torch.cuda.get_device_properties(device_index)
         return (

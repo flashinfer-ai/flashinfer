@@ -47,12 +47,8 @@ def test_runner_hash_and_tactics_are_mode_specific():
     assert not gated.is_valid_tactic(
         (fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 128, 128)
     )
-    assert gated.is_valid_tactic(
-        (fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128)
-    )
-    assert not plain.is_valid_tactic(
-        (fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 64)
-    )
+    assert gated.is_valid_tactic((fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128))
+    assert not plain.is_valid_tactic((fp8_core._FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 64))
 
 
 def test_plain_and_gated_use_separate_cache_keys():
@@ -123,6 +119,7 @@ def test_runner_rejects_malformed_tactics():
         {"schema": 1, "tile_m": 64, "tile_n": 128},
     )
     assert all(not runner.is_valid_tactic(tactic) for tactic in malformed)
+
 
 def test_profile_uses_actual_gated_mode_and_output_shape():
     inputs = _inputs(n=128)

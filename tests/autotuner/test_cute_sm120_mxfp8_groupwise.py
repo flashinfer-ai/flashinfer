@@ -89,9 +89,7 @@ def test_mxfp8_tactics_are_independent_per_grank():
 def test_mxfp8_profile_and_actual_launch_use_gated_mode():
     inputs = _inputs(total_rows=64, num_experts=1, n=128, k=128)
     out = torch.empty((64, 64), device="meta")
-    runner = mxfp8_core._CuteSm120Mxfp8MoeRunner(
-        out, True, (1, 1, 128), "MN"
-    )
+    runner = mxfp8_core._CuteSm120Mxfp8MoeRunner(out, True, (1, 1, 128), "MN")
     runner(inputs, do_preparation=True)
     module = MagicMock()
     tactic = mxfp8_core._MXFP8_MOE_TACTICS[0]
