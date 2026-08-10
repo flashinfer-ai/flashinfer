@@ -93,6 +93,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.mypy]
 files = ["flashinfer"]
+python_version = "3.10"
 ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
@@ -124,6 +125,7 @@ exclude = [
 # `x in (a, b)` yields a Python bool, not the DSL Boolean predicate that
 # `x == a or x == b` produces).
 [tool.ruff]
+target-version = "py310"
 extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
