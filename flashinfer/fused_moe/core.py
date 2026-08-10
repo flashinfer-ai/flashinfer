@@ -94,9 +94,34 @@ from ..utils import (
 )
 from .utils import (
     get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket,
+    make_hybrid_bucket_mapper,
     make_random_topk_ids,
 )
+
+
+@functools.cache
+def _moe_topk_ids_init(num_experts: int, *, packed: bool = True):
+    """Return a stable top-k-ID initializer for a given expert count."""
+
+    def _init(
+        shapes: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        expert_ids = make_random_topk_ids(
+            num_experts=num_experts,
+            num_tokens=math.prod(shapes[:-1]),
+            top_k=shapes[-1],
+            device=device,
+        ).view(shapes)
+        if not packed:
+            return expert_ids
+        expert_weights = torch.ones(
+            shapes, dtype=torch.bfloat16, device=device
+        ).view(torch.int16)
+        return (expert_ids << 16) | expert_weights
+
+    return _init
 
 
 @functools.cache
@@ -140,7 +165,7 @@ def _maybe_get_cached_w3_w1_permute_indices(
     num_elts_per_sf: Union[None, int] = None,
     is_gated_act_gemm: bool = True,
 ) -> torch.Tensor:
-    # Create a unique cache key covering every input that affects the permutation.
+    # Include every parameter that changes the generated permutation.
     cache_key = (
         "w3_w1",
         dst_w3_w1_weight.shape,
@@ -178,8 +203,13 @@ def get_w2_permute_indices_with_cache(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    # Create a unique cache key covering every input that affects the permutation.
-    cache_key = ("w2", dst_w2_weight.shape, epilogue_tile_m, num_elts_per_sf)
+    # Include every parameter that changes the generated permutation.
+    cache_key = (
+        "w2",
+        dst_w2_weight.shape,
+        epilogue_tile_m,
+        num_elts_per_sf,
+    )
     if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
@@ -322,7 +352,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     (0,),
                     (0,),
                     get_hybrid_num_tokens_buckets(8192),
-                    lambda x: map_to_hybrid_bucket(x, 8192),
+                    make_hybrid_bucket_mapper(8192),
                 ),
             )
         )
@@ -451,7 +481,52 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             # a sentinel so the autotuner contract is never violated with an empty list.
             if not all_tactics:
                 return [-1]
-            return valid_tactics if valid_tactics else all_tactics
+            valid_tactics = valid_tactics if valid_tactics else all_tactics
+
+            if not self.use_w4_group_scaling:
+                return valid_tactics
+
+            if stage not in (1, 2):
+                return valid_tactics
+
+            x, fc1_expert_weights, _, fc2_expert_weights, _ = inputs
+            if stage == 1:
+                gemm_n = int(fc1_expert_weights.shape[1])
+                gemm_k = int(x.shape[1])
+            else:
+                gemm_n = int(fc2_expert_weights.shape[1])
+                if fc2_expert_weights.dtype == torch.uint8:
+                    gemm_k = int(fc2_expert_weights.shape[2]) * 2
+                elif fc2_expert_weights.dtype == torch.int64:
+                    gemm_k = int(fc2_expert_weights.shape[2]) * 16
+                else:
+                    gemm_k = int(fc2_expert_weights.shape[2])
+
+            try:
+                get_valid_tactics_for_shape = (
+                    self.fused_moe_runner.get_valid_tactics_for_shape
+                )
+                shape_valid_tactics = set(
+                    int(t)
+                    for t in get_valid_tactics_for_shape(
+                        int(stage), int(gemm_n), int(gemm_k)
+                    )
+                )
+            except AttributeError:
+                return valid_tactics
+            except Exception as e:
+                logger.warning(
+                    "get_valid_tactics_for_shape failed for stage %s, N=%d, K=%d: %s; "
+                    "including occupancy-valid tactics in autotuner",
+                    stage,
+                    gemm_n,
+                    gemm_k,
+                    e,
+                )
+                return valid_tactics
+
+            filtered_tactics = [t for t in valid_tactics if t in shape_valid_tactics]
+            return filtered_tactics if filtered_tactics else valid_tactics
 
         def forward(
             self,
@@ -498,7 +573,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                         (0,),
                         (0,),
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens),
-                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                        make_hybrid_bucket_mapper(tune_max_num_tokens),
                     ),
                 )
             )
@@ -540,11 +615,11 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
+        profile_ids: Optional[List[int]] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         # allocate workspace for profiling
         moe_runner = MoERunner(
@@ -570,37 +645,47 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
 
-        # Limit tactics to GEMM1 during tuning
-        moe_runner.gemm_idx_for_tuning = 1
-        _, gemm_tactic_1 = tuner.choose_one(
-            "trtllm::fused_moe::gemm1",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=1,
-        )
+        if profile_ids is None:
+            tuner = AutoTuner.get()
+            MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-        # Limit tactics to GEMM2 during tuning
-        moe_runner.gemm_idx_for_tuning = 2
-        _, gemm_tactic_2 = tuner.choose_one(
-            "trtllm::fused_moe::gemm2",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=2,
-        )
+            # Limit tactics to GEMM1 during tuning
+            moe_runner.gemm_idx_for_tuning = 1
+            _, gemm_tactic_1 = tuner.choose_one(
+                "trtllm::fused_moe::gemm1",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=1,
+            )
+
+            # Limit tactics to GEMM2 during tuning
+            moe_runner.gemm_idx_for_tuning = 2
+            _, gemm_tactic_2 = tuner.choose_one(
+                "trtllm::fused_moe::gemm2",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=2,
+            )
+        else:
+            if len(profile_ids) != 2:
+                raise ValueError(
+                    "profile_ids must contain [gemm1_profile, gemm2_profile]"
+                )
+            gemm_tactic_1, gemm_tactic_2 = profile_ids
 
         run_moe = (
             moe_runner.fused_moe_runner.run_moe_min_latency
@@ -656,6 +741,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
             activation_type,
+            workspace_buffer,
         )
 
         return (
@@ -703,6 +789,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
+        profile_ids: Optional[List[int]] = None,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -721,9 +809,73 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         else:
             return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
 
+    def _cutlass_fused_moe_workspace_size(
+        max_num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts_total: int,
+        top_k: int,
+        *,
+        x_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        output_dtype: torch.dtype = torch.bfloat16,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        min_latency_mode: bool = False,
+        use_deepseek_fp8_block_scale: bool = False,
+        use_w4_group_scaling: bool = False,
+        use_mxfp8_act_scaling: bool = False,
+        use_fused_finalize: bool = True,
+        use_packed_weights: bool = False,
+        use_wfp4afp8_humming: bool = False,
+    ) -> int:
+        enable_pdl = device_support_pdl(torch.device("cuda"))
+        moe_runner = MoERunner(
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            top_k=top_k,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            cluster_size=1,
+            cluster_rank=0,
+            enable_alltoall=False,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_packed_weights=use_packed_weights,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
+        return int(
+            moe_runner.fused_moe_runner.get_workspace_size(
+                max_num_tokens,
+                hidden_size,
+                intermediate_size,
+                num_experts_total,
+                top_k,
+                tp_size,
+                tp_rank,
+                ep_size,
+                ep_rank,
+                min_latency_mode,
+                activation_type,
+            )
+        )
+
     # Register the module
     return SimpleNamespace(
+        MoERunner=MoERunner,
         cutlass_fused_moe=cutlass_fused_moe,
+        cutlass_fused_moe_workspace_size=_cutlass_fused_moe_workspace_size,
         interleave_moe_weights_for_sm90_mixed_gemm=(
             module.interleave_moe_weights_for_sm90_mixed_gemm
         ),
@@ -765,6 +917,8 @@ def cutlass_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
     use_fused_finalize: bool = True,
+    profile_ids: Optional[List[int]] = None,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -987,18 +1141,117 @@ def cutlass_fused_moe(
         activation_type=activation_type,
         use_fused_finalize=use_fused_finalize,
         use_wfp4afp8_humming=use_wfp4afp8_humming,
+        profile_ids=profile_ids,
+        workspace_buffer=workspace_buffer,
     )
+
+
+def cutlass_fused_moe_workspace_size(
+    max_num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts_total: int,
+    top_k: int,
+    *,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    output_dtype: torch.dtype = torch.bfloat16,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    min_latency_mode: bool = False,
+    use_deepseek_fp8_block_scale: bool = False,
+    use_w4_group_scaling: bool = False,
+    use_mxfp8_act_scaling: bool = False,
+    use_fused_finalize: bool = True,
+    use_packed_weights: bool = False,
+    use_wfp4afp8_humming: bool = False,
+    device: Optional[torch.device] = None,
+) -> int:
+    """Return the workspace size in bytes required by :func:`cutlass_fused_moe`."""
+    if max_num_tokens <= 0:
+        raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+    if intermediate_size <= 0:
+        raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
+    if num_experts_total <= 0:
+        raise ValueError(f"num_experts_total must be positive, got {num_experts_total}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if ep_size <= 0:
+        raise ValueError(f"ep_size must be positive, got {ep_size}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}")
+    if num_experts_total % ep_size != 0:
+        raise ValueError(
+            f"num_experts_total ({num_experts_total}) must be divisible by "
+            f"ep_size ({ep_size})"
+        )
+
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"device must be a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    with torch.cuda.device(device):
+        major, minor = get_compute_capability(device)
+        device_arch = f"{major * 10 + minor}"
+        return get_cutlass_fused_moe_module(
+            device_arch
+        ).cutlass_fused_moe_workspace_size(
+            max_num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts_total,
+            top_k,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            output_dtype=output_dtype,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            min_latency_mode=min_latency_mode,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            use_fused_finalize=use_fused_finalize,
+            use_packed_weights=use_packed_weights,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+        )
 
 
 # trtllmgen-moe-fp8
 
 
-@functools.cache
 def get_trtllm_moe_sm100_module():
-    module = gen_trtllm_gen_fused_moe_sm100_module()
+    device = torch.device("cuda", torch.cuda.current_device())
+    enable_rubin = get_compute_capability(device) == (10, 7)
+    return _get_trtllm_moe_sm100_module_impl(enable_rubin)
+
+
+@functools.cache
+def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
+    module = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
     moe_op = module.build_and_load()
     setup_cubin_loader(str(module.get_library_path()))
-    MoERunner = create_trtllm_moe_runner_class(moe_op, logger=logger)
+    MoERunner = create_trtllm_moe_runner_class(
+        moe_op,
+        logger=logger,
+        topk_ids_initializer_factory=_moe_topk_ids_init,
+    )
     trtllm_bf16_moe_op = register_trtllm_bf16_moe_op(moe_op, MoERunner)
 
     @register_custom_op(

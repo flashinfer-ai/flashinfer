@@ -22,7 +22,7 @@ import torch
 
 from ...autotuner import DynamicTensorSpec, TuningConfig
 from ...tllm_enums import Fp8QuantizationType
-from ..utils import get_hybrid_num_tokens_buckets, map_to_hybrid_bucket
+from ..utils import get_hybrid_num_tokens_buckets, make_hybrid_bucket_mapper
 from .inputs import MoeRunnerInputs
 
 
@@ -106,7 +106,7 @@ def make_moe_tuning_config(
                 input_idx,
                 dim_idx,
                 get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
-                lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                make_hybrid_bucket_mapper(tune_max_num_tokens),
                 initializers,
             ),
         ),

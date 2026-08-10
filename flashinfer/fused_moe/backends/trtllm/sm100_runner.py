@@ -16,15 +16,13 @@
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
 from flashinfer.autotuner import OptimizationProfile, TunableRunner, TuningConfig
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import make_moe_tuning_config
-from flashinfer.fused_moe.utils import make_random_topk_ids
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -34,7 +32,12 @@ from flashinfer.tllm_enums import (
 )
 
 
-def create_trtllm_moe_runner_class(moe_op, *, logger):
+def create_trtllm_moe_runner_class(
+    moe_op,
+    *,
+    logger,
+    topk_ids_initializer_factory: Callable,
+):
     """Build the cubin MoERunner class bound to a loaded JIT moe_op module."""
 
     class MoERunner(TunableRunner):
@@ -79,26 +82,20 @@ def create_trtllm_moe_runner_class(moe_op, *, logger):
             self,
             moe_inputs: MoeRunnerInputs,
             tune_max_num_tokens: int = 8192,
+            routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
             **kwargs,
         ) -> TuningConfig:
-            def _init_packed_topk_ids(shapes, dtype, device):
-                expert_ids = make_random_topk_ids(
-                    num_experts=self.num_experts,
-                    num_tokens=math.prod(shapes[:-1]),
-                    top_k=shapes[-1],
-                    device=device,
-                ).view(shapes)
-                expert_weights = torch.ones(
-                    shapes, dtype=torch.bfloat16, device=device
-                ).view(torch.int16)
-                return (expert_ids << 16) | expert_weights
-
             return make_moe_tuning_config(
                 moe_inputs,
                 num_experts=self.num_experts,
                 hidden_size=self.hidden_size,
                 fp8_quantization_type=self.fp8_quantization_type,
-                init_packed_topk_ids=_init_packed_topk_ids,
+                init_packed_topk_ids=topk_ids_initializer_factory(
+                    self.num_experts,
+                    packed=(
+                        routing_input_mode != RoutingInputMode.UnpackedPrecomputed
+                    ),
+                ),
                 tune_max_num_tokens=tune_max_num_tokens,
                 **kwargs,
             )
