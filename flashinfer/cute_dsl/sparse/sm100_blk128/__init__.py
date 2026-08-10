@@ -16,9 +16,7 @@ try:
     import quack  # noqa: F401
 except ImportError as e:
     raise ImportError(
-        "The vsa_sm100_blk128 backend requires the `quack` package "
-        "from https://github.com/Dao-AILab/quack.\n"
-        "Note: the `quack` package on PyPI is an unrelated project — install "
-        "from source instead:\n"
-        "    pip install git+https://github.com/Dao-AILab/quack.git"
+        "The vsa_sm100_blk128 backend requires the `quack-kernels` package.\n"
+        "Install it from PyPI:\n"
+        "    pip install quack-kernels==0.6.4"
     ) from e
