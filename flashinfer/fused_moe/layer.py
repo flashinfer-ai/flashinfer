@@ -30,6 +30,8 @@ from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -43,6 +45,8 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
@@ -57,6 +61,8 @@ from .utils import map_to_hybrid_bucket
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
@@ -69,6 +75,8 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CutlassBf16Config: CutlassBf16Runner,
+    CutlassW4A16Config: CutlassW4A16Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
@@ -119,6 +127,7 @@ class MoELayer:
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
+            runner.build()
             self.runners.append(runner)
 
         if not self.runners:

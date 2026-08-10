@@ -27,14 +27,21 @@ from typing import Any, ClassVar, List
 
 import torch
 
-from ..autotuner import TunableRunner, TuningConfig
+from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
+from ..utils import next_positive_power_of_2
 from .api import (
+    _CUTLASS_BF16_ARCHS,
+    _CUTLASS_W4A16_ARCHS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
     QuantVariant,
     RoutingInputMode,
+)
+from .utils import (
+    make_hybrid_bucket_mapper,
+    map_to_hybrid_bucket,
 )
 
 
@@ -189,6 +196,490 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
+
+    def build(self) -> None:
+        """Prepare backend resources after support has been validated.
+
+        Existing runners that finish initialization in ``__init__`` inherit
+        this no-op. Backends can migrate expensive module loading here
+        incrementally.
+        """
+
+
+# ---------------------------------------------------------------------------
+# CUTLASS runners — dense BF16 and mixed-input W4A16
+# ---------------------------------------------------------------------------
+
+
+class _CutlassRunnerBase(MoERunner):
+    """Shared launch, tuning, and workspace mechanics for CUTLASS MoE.
+
+    Direct callers must invoke ``check_support()`` followed by ``build()``
+    before ``pack_inputs()``, ``get_valid_tactics()``, or ``forward()``.
+    ``MoELayer`` enforces this lifecycle when constructing its runners.
+
+    A runner is a single-stream resource. Concurrent use or CUDA-graph replay
+    on multiple streams requires one runner (or ``MoELayer``) per stream.
+    """
+
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    _supported_archs: ClassVar[tuple[int, ...]]
+    _weight_dtype: ClassVar[torch.dtype]
+    _use_w4_group_scaling: ClassVar[bool]
+    _required_weight_keys: ClassVar[tuple[str, ...]]
+    _expected_num_inputs: ClassVar[int]
+
+    def check_support(self) -> None:
+        super().check_support()
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu activation."
+            )
+        if not self.config.execution.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
+        if experts.local_expert_offset != 0 or (
+            local_num_experts != self.config.routing.num_experts
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not yet support expert parallelism."
+            )
+        if self._device_arch not in self._supported_archs:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support "
+                f"SM{self._device_arch}; supported architectures are "
+                f"{self._supported_archs}."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..utils import device_support_pdl, get_compute_capability
+
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"{type(self).__name__} requires CUDA, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        self._device_arch = major * 10 + minor
+
+        enable_pdl = config.execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(self.device)
+        self._enable_pdl = enable_pdl
+        self._use_fused_finalize = True
+        self._inner: Any = None
+
+        # pack_inputs replaces this with the current MoELayer token bucket.
+        self.tuning_config = TuningConfig()
+        # Retain geometrically sized buffers because captured CUDA graphs keep
+        # their raw pointers. Deterministic capacities make a request shape
+        # select the same pointer regardless of allocation history.
+        self._workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._workspace: torch.Tensor | None = None
+        self._workspace_num_tokens = 0
+        self._workspace_hidden_size: int | None = None
+
+    def build(self) -> None:
+        """Load the CUTLASS module and create the inner runner once."""
+        if self._inner is not None:
+            return
+
+        from .core import get_cutlass_fused_moe_module
+
+        with torch.cuda.device(self.device):
+            module = get_cutlass_fused_moe_module(str(self._device_arch))
+            self._inner = module.MoERunner(
+                x_dtype=torch.bfloat16,
+                weight_dtype=self._weight_dtype,
+                output_dtype=torch.bfloat16,
+                top_k=self.config.routing.top_k,
+                tp_size=1,
+                tp_rank=0,
+                ep_size=1,
+                ep_rank=0,
+                cluster_size=1,
+                cluster_rank=0,
+                enable_alltoall=False,
+                use_deepseek_fp8_block_scale=False,
+                use_w4_group_scaling=self._use_w4_group_scaling,
+                use_mxfp8_act_scaling=False,
+                min_latency_mode=False,
+                enable_pdl=self._enable_pdl,
+                activation_type=self.config.activation.type,
+                use_packed_weights=False,
+                use_fused_finalize=self._use_fused_finalize,
+                use_wfp4afp8_humming=False,
+            )
+
+    def _require_built(self) -> None:
+        """Reject execution before the explicit runner lifecycle completes."""
+        if self._inner is None:
+            raise RuntimeError(
+                f"{type(self).__name__} must be initialized with "
+                "check_support() followed by build()."
+            )
+
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Populate synthesized routing inputs with a valid balanced pattern."""
+        num_tokens = inputs[1].shape[0]
+        self._ensure_workspace(num_tokens, inputs[1].shape[1])
+        top_k = self.config.routing.top_k
+        num_experts = self.config.routing.num_experts
+        token_offsets = torch.arange(
+            num_tokens, dtype=torch.int32, device=inputs[2].device
+        ).unsqueeze(1)
+        slots = torch.arange(
+            top_k, dtype=torch.int32, device=inputs[2].device
+        ).unsqueeze(0)
+        inputs[2].copy_((token_offsets * top_k + slots) % num_experts)
+        inputs[3].fill_(1.0 / top_k)
+        return inputs
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        self._validate_input_count(inputs)
+        # The two GEMMs have independent tactic spaces. Preserve the legacy
+        # O(n1+n2) tuning flow, then let the outer unified tuner profile only
+        # the selected pair as one full-MoE candidate.
+        # FIXME: get_valid_tactics() is supposed to list candidates, but the
+        # autotuner cannot express multi-stage / factorized tactics yet, so we
+        # nest choose_one() per GEMM and return one compound winner. Refine the
+        # autotuner to own staged tuning instead of selecting winners here.
+        tuner = AutoTuner.get()
+        profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
+        stage_tuning_config = TuningConfig()
+        try:
+            self._inner.gemm_idx_for_tuning = 1
+            _, gemm1 = tuner.choose_one(
+                f"moe_{self.backend_key}_sm{self._device_arch}_gemm1",
+                [self._inner],
+                stage_tuning_config,
+                profile_inputs,
+                gemm_idx=1,
+            )
+            self._inner.gemm_idx_for_tuning = 2
+            _, gemm2 = tuner.choose_one(
+                f"moe_{self.backend_key}_sm{self._device_arch}_gemm2",
+                [self._inner],
+                stage_tuning_config,
+                profile_inputs,
+                gemm_idx=2,
+            )
+        finally:
+            self._inner.gemm_idx_for_tuning = None
+        if gemm1 is None or gemm2 is None:
+            return [-1]
+        return [(int(gemm1), int(gemm2))]
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        max_num_tokens = self.config.execution.tune_max_num_tokens
+        if num_tokens > max_num_tokens:
+            raise ValueError(
+                f"workspace num_tokens={num_tokens} exceeds tune_max_num_tokens="
+                f"{max_num_tokens}."
+            )
+        if (
+            self._workspace_hidden_size is not None
+            and hidden_size != self._workspace_hidden_size
+        ):
+            raise ValueError(
+                "CUTLASS runner hidden_size changed after workspace allocation: "
+                f"{self._workspace_hidden_size} -> {hidden_size}."
+            )
+
+        capacity = min(next_positive_power_of_2(num_tokens), max_num_tokens)
+        key = (capacity, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is not None:
+            self._workspace = workspace
+            self._workspace_num_tokens = capacity
+            return
+        from .core import cutlass_fused_moe_workspace_size
+
+        size = cutlass_fused_moe_workspace_size(
+            capacity,
+            hidden_size,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            x_dtype=torch.bfloat16,
+            weight_dtype=self._weight_dtype,
+            output_dtype=torch.bfloat16,
+            activation_type=self.config.activation.type,
+            use_w4_group_scaling=self._use_w4_group_scaling,
+            use_fused_finalize=self._use_fused_finalize,
+            device=self.device,
+        )
+        workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
+        self._workspace_cache[key] = workspace
+        self._workspace = workspace
+        self._workspace_num_tokens = capacity
+        self._workspace_hidden_size = hidden_size
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
+            )
+        hidden_states = act.hidden_states_q
+        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
+                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device:
+            raise ValueError(
+                f"hidden_states_q is on {hidden_states.device}, expected {self.device}."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} activations do not use hidden_states_scale."
+            )
+
+        num_tokens, hidden_size = hidden_states.shape
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}. "
+                "Reconstruct the runner with a larger ceiling."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self._required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        weight_inputs = self._pack_weight_inputs(view, hidden_size)
+
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=(bucket,),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
+                        self.config.execution.tune_max_num_tokens
+                    ),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        self._ensure_workspace(bucket, hidden_size)
+        output = hidden_states.new_empty((num_tokens, hidden_size))
+        return [
+            output,
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *weight_inputs,
+        ]
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        raise NotImplementedError
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return []
+
+    def _validate_weight_storage(self, tensors: tuple[torch.Tensor, ...]) -> None:
+        if any(t.device != self.device for t in tensors):
+            raise ValueError("CUTLASS prepared weights must match the runner device.")
+        if any(not t.is_contiguous() for t in tensors):
+            raise ValueError("CUTLASS prepared weights must be contiguous.")
+
+    def _validate_input_count(self, inputs: List[torch.Tensor]) -> None:
+        if len(inputs) != self._expected_num_inputs:
+            raise ValueError(
+                f"{type(self).__name__} expects {self._expected_num_inputs} inputs, "
+                f"got {len(inputs)}."
+            )
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        self._validate_input_count(inputs)
+        if self._workspace is None:
+            raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
+        if tactic == -1:
+            profile_ids = [-1, -1]
+        elif isinstance(tactic, (tuple, list)) and len(tactic) == 2:
+            profile_ids = [int(tactic[0]), int(tactic[1])]
+        else:
+            raise ValueError(
+                f"{type(self).__name__} tactic must be -1 or a (gemm1, gemm2) pair."
+            )
+
+        # CUTLASS tactics require a stage-specific preparation launch before
+        # they can be selected by run_moe.  The legacy flat API gets this from
+        # its two internal autotuner passes; the unified compound tactic must
+        # preserve the same contract when the outer autotuner requests setup.
+        if do_preparation:
+            profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
+            self._inner.forward(
+                profile_inputs,
+                tactic=profile_ids[0],
+                do_preparation=True,
+                gemm_idx=1,
+            )
+            self._inner.forward(
+                profile_inputs,
+                tactic=profile_ids[1],
+                do_preparation=True,
+                gemm_idx=2,
+            )
+            return inputs[0]
+
+        # Select the deterministic geometric-capacity workspace for this
+        # launch; older cached buffers remain alive for captured graphs.
+        num_tokens, hidden_size = inputs[1].shape
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self._ensure_workspace(bucket, hidden_size)
+
+        from .core import cutlass_fused_moe
+
+        cutlass_fused_moe(
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            output_dtype=torch.bfloat16,
+            quant_scales=self._quant_scales(inputs),
+            output=inputs[0],
+            tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
+            enable_pdl=self._enable_pdl,
+            activation_type=self.config.activation.type,
+            use_w4_group_scaling=self._use_w4_group_scaling,
+            use_fused_finalize=self._use_fused_finalize,
+            profile_ids=profile_ids,
+            workspace_buffer=self._workspace,
+        )
+        return inputs[0]
+
+    def __hash__(self):
+        return hash((self.backend_key, self.config, self._device_arch))
+
+    def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
+        return (self._device_arch, self._enable_pdl)
+
+
+class CutlassBf16Runner(_CutlassRunnerBase):
+    """Unified adapter for dense BF16 CUTLASS fused MoE."""
+
+    backend_key = "cutlass_bf16"
+    supported_quant_variants = (QuantVariant.BF16,)
+    _supported_archs = _CUTLASS_BF16_ARCHS
+    _weight_dtype = torch.bfloat16
+    _use_w4_group_scaling = False
+    _required_weight_keys = ("fc1_expert_weights", "fc2_expert_weights")
+    _expected_num_inputs = 6
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2 = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
+            raise TypeError("Cutlass BF16 prepared weights must use torch.bfloat16.")
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"Cutlass BF16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        self._validate_weight_storage((w1, w2))
+        return [w1, w2]
+
+
+class CutlassW4A16Runner(_CutlassRunnerBase):
+    """Unified adapter for MXFP4-weight x BF16-activation fused MoE."""
+
+    backend_key = "cutlass_w4a16"
+    supported_quant_variants = (QuantVariant.W4A16,)
+    _supported_archs = _CUTLASS_W4A16_ARCHS
+    _weight_dtype = torch.uint8
+    _use_w4_group_scaling = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+    )
+    _expected_num_inputs = 8
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_scale, w2_scale = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        expected_s1 = (
+            num_experts,
+            2 * intermediate_size // 64,
+            hidden_size // 128,
+            16,
+            16,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            16,
+            16,
+        )
+        if any(t.dtype is not torch.uint8 for t in (w1, w2, w1_scale, w2_scale)):
+            raise TypeError("Cutlass W4A16 prepared weights and scales must be uint8.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass W4A16 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if (tuple(w1_scale.shape), tuple(w2_scale.shape)) != (
+            expected_s1,
+            expected_s2,
+        ):
+            raise ValueError(
+                "Cutlass W4A16 scale shapes "
+                f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale))
+        return [w1, w2, w1_scale, w2_scale]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [inputs[6].view(torch.int32), inputs[7].view(torch.int32)]
 
 
 # ---------------------------------------------------------------------------

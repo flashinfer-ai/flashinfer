@@ -32,6 +32,7 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from typing_extensions import deprecated
 
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
@@ -238,6 +239,13 @@ _TRTLLM_ROUTED_ARCHS = (100, 103, 107)
 # The FP8 kernels are validated on the SM100 family only — the outer JIT module
 # compiles for major 12 as well, but those cubins fail at runtime on SM120/121.
 _TRTLLM_ROUTED_FP8_ARCHS = (100, 103)
+
+# Dense BF16 follows the architecture dispatch already exposed by the flat
+# CUTLASS API.
+_CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
+
+# W4A16 uses Hopper-specific mixed-input weight and scale layouts.
+_CUTLASS_W4A16_ARCHS = (90,)
 
 
 @dataclass(frozen=True)
@@ -483,16 +491,118 @@ class TrtllmMxInt4Config:
         return "TrtllmMxInt4Config()"
 
 
+@deprecated(
+    "CutlassConfig is deprecated and non-runnable; use CutlassBf16Config or "
+    "CutlassW4A16Config instead."
+)
 @dataclass(frozen=True)
 class CutlassConfig:
-    """CUTLASS backend — broadest architecture support."""
+    """Legacy quantization-neutral CUTLASS configuration placeholder.
+
+    .. deprecated::
+        Use :class:`CutlassBf16Config` or :class:`CutlassW4A16Config` instead.
+
+    This type is preserved for source compatibility, but it is intentionally
+    not registered with :class:`MoELayer` and therefore is not runnable. Select
+    a concrete tensor contract such as :class:`CutlassBf16Config` or
+    :class:`CutlassW4A16Config` instead.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        # Compatibility-only placeholder: it has no registered runner and must
+        # never be surfaced as a dispatch candidate by BackendOptions.valid_for().
+        return False
 
     def __repr__(self) -> str:
         return "CutlassConfig()"
+
+
+@dataclass(frozen=True)
+class CutlassBf16Config:
+    """CUTLASS BF16 backend for the unified MoE API.
+
+    Architecture coverage follows the dense-BF16 legacy flat API. The unified
+    GPU tests currently exercise SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Build the ``cutlass_bf16`` canonical BF16 weight view.
+
+        GEMM1 uses the public ``[up, gate]`` row convention.  Unlike TRTLLM's
+        BlockMajorK path, CUTLASS BF16 kernels consume these weights directly
+        and need no physical reordering.
+        """
+        from .prepare import prepare_cutlass_bf16_weights
+
+        return prepare_cutlass_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CutlassW4A16Config:
+    """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
+
+    This backend supports packed precomputed routing with SwiGLU and requires
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported. Both ``hidden_size`` and ``intermediate_size`` must be divisible
+    by 128.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTLASS_W4A16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        device=None,
+    ):
+        """Quantize and interleave canonical BF16 weights for SM90 W4A16."""
+        from .prepare import prepare_cutlass_w4a16_weights
+
+        return prepare_cutlass_w4a16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CutlassW4A16Config()"
 
 
 @dataclass(frozen=True)
@@ -629,6 +739,8 @@ BackendConfigType = Union[
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassConfig,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -641,6 +753,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassConfig,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
@@ -695,7 +809,8 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmFp8PerTensorConfig(),
         TrtllmBf16Config(),
         TrtllmMxInt4Config(),
-        CutlassConfig(),
+        CutlassBf16Config(),
+        CutlassW4A16Config(),
         CuteDslConfig(),
     )
 )
