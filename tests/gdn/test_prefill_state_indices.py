@@ -24,11 +24,11 @@ from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
-def _skip_if_not_sm90_or_sm100():
+def _skip_if_not_supported():
     device = torch.device("cuda")
     major, _ = get_compute_capability(device)
-    if major not in (9, 10):
-        pytest.skip("state_indices GDN prefill path requires SM90 or SM100/SM103")
+    if major not in (9, 10, 12):
+        pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     if is_sm100a_supported(device) and cuda_major < 13:
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
@@ -64,7 +64,9 @@ def _make_inputs(seq_lens, H, D, dtype, device, seed):
     )
     g = torch.exp(g_log).contiguous()
     beta = torch.rand(total, H, dtype=torch.float32, device=device).contiguous()
-    state_dtype = torch.float32 if get_compute_capability(device)[0] == 9 else dtype
+    state_dtype = (
+        torch.float32 if get_compute_capability(device)[0] in (9, 12) else dtype
+    )
     init_state = torch.randn(
         num_seqs, H, D, D, dtype=state_dtype, device=device
     ).contiguous()
@@ -139,7 +141,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     """A pool + state_indices in-place update must match the packed,
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
-    _skip_if_not_sm90_or_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     D = 128
     num_seqs = len(seq_lens)
@@ -187,7 +189,7 @@ def test_prefill_state_indices_requires_output_state_pool():
     """With state_indices set, output_state must be a caller-provided pool: an
     auto-allocated compact [num_seqs, ...] tensor would be indexed out of bounds
     by the pool slot ids, so output_state=None must be rejected."""
-    _skip_if_not_sm90_or_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 64]
@@ -223,10 +225,10 @@ def test_prefill_state_indices_requires_output_state_pool():
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_with_state_checkpoints(use_cp):
     """Indexed final-state I/O must not change packed checkpoint ordering."""
-    _skip_if_not_sm90_or_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
-    if use_cp and get_compute_capability(device)[0] not in (9, 10):
-        pytest.skip("CP state checkpointing requires SM90 or SM100")
+    if use_cp and get_compute_capability(device)[0] not in (9, 10, 12):
+        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
     H, D = 16, 128
     seq_lens = [128, 512]
     num_seqs = len(seq_lens)
@@ -320,7 +322,7 @@ def test_prefill_state_indices_with_state_checkpoints(use_cp):
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_without_final_state(use_cp):
     """A state pool can supply initial state without requesting a final state."""
-    _skip_if_not_sm90_or_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [64, 512]
@@ -363,7 +365,7 @@ def test_prefill_state_indices_without_final_state(use_cp):
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_none_is_default(use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""
-    _skip_if_not_sm90_or_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 192]

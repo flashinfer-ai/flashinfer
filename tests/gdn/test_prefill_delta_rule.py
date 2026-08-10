@@ -875,8 +875,9 @@ def test_checkpoint_correctness(
     if use_cp and not (
         is_sm90a_supported(torch.device("cuda"))
         or is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
     ):
-        pytest.skip("CP state checkpointing requires SM90 or SM100")
+        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,

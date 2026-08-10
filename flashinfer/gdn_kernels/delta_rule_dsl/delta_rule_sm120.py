@@ -119,6 +119,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         needs_checkpointing: bool,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        use_state_indices: bool = False,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -126,6 +127,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self.needs_checkpointing = needs_checkpointing
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.use_state_indices = use_state_indices
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -142,6 +144,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             "needs_checkpointing",
             "dtype",
             "acc_dtype",
+            "use_state_indices",
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
@@ -1188,6 +1191,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         beta_pipeline,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         work_desc: WorkDesc,
@@ -1233,15 +1237,41 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         )
         tKVrKV.fill(self.acc_dtype(0.0))
 
-        state_layout = cute.make_ordered_layout(
+        packed_state_layout = cute.make_ordered_layout(
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
+        state_idx = work_desc.seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])
+            state_layout = cute.make_layout(
+                (self.D, self.D, num_sab_heads, g_state.shape[0]),
+                stride=(
+                    g_state.stride[3],
+                    g_state.stride[2],
+                    g_state.stride[1],
+                    g_state.stride[0],
+                ),
+            )
+        else:
+            state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
+        gStateKV = mState[None, None, o_head_idx, state_idx]
         if cutlass.const_expr(self.needs_init_state):
-            mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-            gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
+            if cutlass.const_expr(self.use_state_indices):
+                init_state_layout = cute.make_layout(
+                    (self.D, self.D, num_sab_heads, g_init_state.shape[0]),
+                    stride=(
+                        g_init_state.stride[3],
+                        g_init_state.stride[2],
+                        g_init_state.stride[1],
+                        g_init_state.stride[0],
+                    ),
+                )
+            else:
+                init_state_layout = packed_state_layout
+            mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)
+            gInitKV = mInitState[None, None, o_head_idx, state_idx]
             self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
         first_B = work_desc.seq_len
@@ -1463,6 +1493,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_beta: cute.Tensor,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
@@ -1620,6 +1651,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             tma_tensor_o,
             g_state,
             g_init_state,
+            g_state_indices,
             g_state_checkpoints,
             checkpoint_cu_starts,
             g_tensormaps,
@@ -1655,6 +1687,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tma_tensor_o: cute.Tensor,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
@@ -1924,6 +1957,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 beta_pipeline,
                 g_state,
                 g_init_state,
+                g_state_indices,
                 g_state_checkpoints,
                 checkpoint_cu_starts,
                 work_desc,
@@ -1957,6 +1991,7 @@ def delta_rule_prefill_dsl(
     state_checkpoints: torch.Tensor | None = None,
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
+    state_indices: torch.Tensor | None = None,
 ):
     from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
@@ -1980,6 +2015,7 @@ def delta_rule_prefill_dsl(
     needs_beta = beta is not None
     needs_init_state = init_state is not None
     needs_checkpointing = checkpoint_every_n_tokens > 0
+    use_state_indices = state_indices is not None
     kernel_dtype = {
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
@@ -2006,18 +2042,50 @@ def delta_rule_prefill_dsl(
             f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
         )
 
+    expected_state_tail = (num_sab_heads, D, D)
+    for name, tensor in (("state", state), ("init_state", init_state)):
+        if tensor is None:
+            continue
+        if (
+            not use_state_indices and tensor.shape != (num_seqs, *expected_state_tail)
+        ) or (use_state_indices and tuple(tensor.shape[1:]) != expected_state_tail):
+            raise RuntimeError(
+                f"{name} must have shape "
+                f"{('[N_pool]' if use_state_indices else f'[{num_seqs}]')} + {expected_state_tail}, "
+                f"got {tuple(tensor.shape)}"
+            )
+    if use_state_indices and (
+        state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+    ):
+        raise RuntimeError(
+            f"state_indices must have shape {(num_seqs,)} and dtype int32"
+        )
+
     for name, tensor in (
         ("q", q),
         ("k", k),
         ("v", v),
         ("o", o),
-        ("state", state),
         ("cu_seqlens", cu_seqlens),
     ):
         if not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
-    for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
+    for name, tensor in (
+        ("alpha", alpha),
+        ("beta", beta),
+        ("state_indices", state_indices),
+    ):
         if tensor is not None and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    for name, tensor in (("state", state), ("init_state", init_state)):
+        if tensor is None:
+            continue
+        if use_state_indices:
+            if tensor.stride()[1:] != (D * D, D, 1):
+                raise RuntimeError(
+                    f"{name} inner dimensions must be contiguous when state_indices is used"
+                )
+        elif not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
 
     total_seqlen = q.shape[0]
@@ -2067,10 +2135,15 @@ def delta_rule_prefill_dsl(
         if needs_beta
         else None
     )
-    state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    state_cute = from_dlpack(state, assumed_align=16).mark_layout_dynamic()
     init_state_cute = (
-        from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
         if needs_init_state
+        else None
+    )
+    state_indices_cute = (
+        from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+        if use_state_indices
         else None
     )
     state_checkpoints_cute = (
@@ -2089,7 +2162,12 @@ def delta_rule_prefill_dsl(
     cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
 
     delta_rule_kernel = _FullyFusedDeltaRuleSm120(
-        needs_alpha, needs_beta, needs_init_state, needs_checkpointing, kernel_dtype
+        needs_alpha,
+        needs_beta,
+        needs_init_state,
+        needs_checkpointing,
+        kernel_dtype,
+        use_state_indices=use_state_indices,
     )
 
     kernel_args = (
@@ -2101,6 +2179,7 @@ def delta_rule_prefill_dsl(
         beta_cute,
         state_cute,
         init_state_cute,
+        state_indices_cute,
         state_checkpoints_cute,
         checkpoint_cu_cute,
         tensormaps_cute,
