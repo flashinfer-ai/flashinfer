@@ -58,6 +58,7 @@ from flashinfer.fused_moe.api import (
     BackendOptions,
     CuteDslConfig,
     CutlassConfig,
+    CutlassBf16Config,
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
@@ -258,19 +259,21 @@ class TestBackendOptions:
 
     def test_valid_for_filtering(self):
         opts = BackendOptions(
-            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
-        # TRTLLM-gen BF16 and block-FP8 require SM100+; Cutlass is universal.
-        valid = opts.valid_for(80)
+        # SM90 is supported by CUTLASS BF16 but not the TRTLLM runners above.
+        valid = opts.valid_for(90)
         assert len(valid) == 1
-        assert isinstance(valid[0], CutlassConfig)
+        assert isinstance(valid[0], CutlassBf16Config)
 
     def test_valid_for_blackwell(self):
         opts = BackendOptions(
-            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmBf16Config(), TrtllmFp8BlockConfig(), CutlassBf16Config())
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
+        assert not CutlassConfig.supported(100)
+        assert CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
@@ -403,7 +406,9 @@ class TestHashability:
             routing=RoutingConfig(num_experts=8, top_k=2),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmBf16Config(), CutlassBf16Config())
+            ),
         )
         # Must not raise
         h = hash(cfg)
@@ -505,7 +510,9 @@ class TestExpressiveness:
             ),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions(candidates=(TrtllmBf16Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmBf16Config(), CutlassBf16Config())
+            ),
         )
         assert cfg.quant.variant == QuantVariant.BF16
 
@@ -520,7 +527,7 @@ class TestExpressiveness:
         assert cfg.quant.variant == QuantVariant.MxInt4
 
     def test_cutlass_modular_fp8(self):
-        """CUTLASS modular (pre-routed) FP8 config."""
+        """Legacy declarative CUTLASS modular FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
@@ -528,8 +535,8 @@ class TestExpressiveness:
             activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions((CutlassConfig(),)),
         )
-        # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
-        # MoEActivationPack (topk_ids/topk_weights), not via config
+        # CutlassConfig preserves the historical quant-neutral declarative form for
+        # compatibility; it is not a registered runnable backend.
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
