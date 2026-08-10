@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Mxfp8CutedslMegaMoeConfig:
-    """Kernel params for ``kernel_src.cutedsl_megamoe.mxfp8_mega_moe``.
+    """Kernel params for ``kernel_src.sm100.cutedsl_megamoe.mxfp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.
     The MXFP8 kernel's full FC1 gate+up width is derived internally as
@@ -28,7 +28,7 @@ class Mxfp8CutedslMegaMoeConfig:
     fast_math: bool = True
     in_kernel_fc2_reduce: bool = False
     token_back_by_dispatch: bool = False
-    # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
+    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
     # "auto" -> online autotune at the first forward: collectively time the

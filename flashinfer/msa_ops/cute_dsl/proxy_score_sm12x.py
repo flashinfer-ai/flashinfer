@@ -149,8 +149,15 @@ class MsaProxyScoreSm12x:
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._n_block_size)
         group_size = mQ.shape[1] // mK.shape[1]
         kv_head = qo_head // group_size
@@ -541,8 +548,15 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._n_block_size)
 
         sQ_layout = self._make_sq_layout()
@@ -887,8 +901,15 @@ class MsaProxyScoreDecodeStreamSm12x:
         tile, qi, kv_head = cute.arch.block_idx()
 
         G = self._G
-        k_start = mCuK[qi]
-        seqlen_k = mCuK[qi + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[qi]
+        else:
+            k_start = mCuK[qi]
+            seqlen_k = mCuK[qi + 1] - k_start
         if cutlass.const_expr(self._is_causal and not self._qoff_default):
             col_limit = cutlass.min(mQOffset[qi] + 1, seqlen_k)
         else:
