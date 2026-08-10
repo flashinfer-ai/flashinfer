@@ -37,11 +37,16 @@ def delta_product(
     beta: torch.Tensor | None = None,  # [total_seq_len, n_h, num_sab_heads]
     scale_factor: float = 1.0,
     state_dtype: torch.dtype = torch.float32,
+    initial_state: torch.Tensor | None = None,  # [num_seqs, H, K, V], K-major
 ):
     """Returns (output, final_state).
 
     output      [total_seq_len, num_o_heads, head_size]   -- one row per REAL token
     final_state [num_seqs, num_sab_heads, head_size, head_size]   (K-major, [.., K, V])
+
+    ``initial_state`` seeds each sequence instead of starting from zero. Needed
+    by the decode tests, where a step continues an existing state rather than
+    beginning a sequence; zero (the default) is the prefill case.
     """
     assert k.dim() == 4 and v.dim() == 4, (
         "k/v must have a householder axis: [T, n_h, H, D]"
@@ -91,9 +96,16 @@ def delta_product(
         alphas, betas = alpha[s], beta[s]
 
         # state size remains fixed between GDN and GDP
-        state_HKV = torch.zeros(
-            num_state_heads, head_size, head_size, dtype=state_dtype, device=q.device
-        )
+        if initial_state is None:
+            state_HKV = torch.zeros(
+                num_state_heads,
+                head_size,
+                head_size,
+                dtype=state_dtype,
+                device=q.device,
+            )
+        else:
+            state_HKV = initial_state[seq_idx].to(state_dtype).clone()
 
         for i in range(seq_len):
             alpha_H11 = alphas[i].unsqueeze(1).unsqueeze(2)

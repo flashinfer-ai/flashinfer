@@ -12,6 +12,19 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Note on ``use_qk_l2norm_in_kernel``: as of this writing the prefill path
+**ignores it**. ``chunk_gated_delta_rule`` declares and documents the parameter,
+but no SM90/SM100/SM120 prefill kernel reads it, and vLLM's bridge normalises
+q/k on the host before calling in (see ``fi_chunk_gated_delta_rule``). These
+tests therefore pass ``False`` and pre-normalise ``k`` in
+``_gen_product_inputs`` -- which is what the algorithm actually needs
+(``||k|| == 1`` for the Householder interpretation; q needs nothing). Passing
+``True`` behaves identically today but would silently break these tests the day
+the flag is implemented.
+
+Decode is the opposite: there ``use_qk_l2norm`` is live and normalises BOTH q
+and k, which is why ``test_decode_delta_product._reference`` mirrors it.
 """
 
 from __future__ import annotations
@@ -212,7 +225,7 @@ def test_reference_nh1_matches_kernel(
         None,  # initial_state
         True,  # output_final_state
         cu_seqlens,
-        True,  # use_qk_l2norm_in_kernel
+        False,  # use_qk_l2norm_in_kernel -- see note below; k is pre-normalised
         output=our_o,
         output_state=our_state,
     )
@@ -369,7 +382,7 @@ def test_prefill_kernel_matches_reference(
         None,  # initial_state
         True,  # output_final_state
         cu_seqlens,
-        True,  # use_qk_l2norm_in_kernel
+        False,  # use_qk_l2norm_in_kernel -- see note below; k is pre-normalised
         output=our_o,
         output_state=our_state,
     )
@@ -469,7 +482,7 @@ def test_prefill_kernel_output_conventions(
         None,  # initial_state
         output_final_state,
         cu_seqlens,
-        True,  # use_qk_l2norm_in_kernel
+        False,  # use_qk_l2norm_in_kernel -- see note below; k is pre-normalised
         output=our_o,
         output_state=None,  # force the wrapper to own the state buffer
     )

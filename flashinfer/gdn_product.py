@@ -221,3 +221,159 @@ def chunk_gated_delta_product(
         return output, out[-1]
     else:
         return output
+
+
+# Sentinel written into `a` on the non-first micro-steps of each token, to make
+# the FUSED gate evaluate to alpha == 1.0 (no decay).
+#
+# Unlike prefill -- where `g` is a plain multiplicative tensor and the neutral
+# value is simply 1.0 -- the decode kernel computes the gate itself:
+#
+#     alpha = exp(-exp(A_log) * softplus(a + dt_bias))
+#
+# so neutralising it means driving softplus to zero through `a`. At -1e4 the
+# inner exp underflows to exactly 0, hence log1p(0) == 0 and alpha == 1.0
+# bit-exactly, for ANY A_log and dt_bias. Do NOT tighten this to -30: that is
+# one ULP short of 1.0 once exp(A_log)*softplus() exceeds 2^-24, and do NOT use
+# -inf, which becomes NaN in the kernel's `(1-use_softplus) * x` blend.
+GATE_NEUTRAL_A_SENTINEL = -1.0e4
+
+
+def gated_delta_product_mtp(
+    q: torch.Tensor,  # [B, T,      num_q_heads, K]
+    k: torch.Tensor,  # [B, T, n_h, num_k_heads, K]
+    v: torch.Tensor,  # [B, T, n_h, num_v_heads, V]
+    initial_state: torch.Tensor,  # [pool_size, HV, V, K] fp32 -- the state POOL
+    initial_state_indices: torch.Tensor,  # [B] read slot per batch row
+    A_log: torch.Tensor,  # [HV]
+    a: torch.Tensor,  # [B, T,      HV]  decay logits, ONE per real token
+    dt_bias: torch.Tensor,  # [HV]
+    b: torch.Tensor,  # [B, T, n_h, HV]  update-gate logits, per householder
+    scale: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,  # [B, T, HV, V]
+    ssm_state_indices: Optional[torch.Tensor] = None,  # [B, T] per-token scatter
+    scratch_state_indices: Optional[torch.Tensor] = None,  # [B] throwaway slots
+    disable_state_update: Optional[bool] = None,
+    use_qk_l2norm: bool = True,
+    output_state_indices: Optional[torch.Tensor] = None,  # [B]
+    # expansion scratch -- see chunk_gated_delta_product
+    expanded_q: Optional[torch.Tensor] = None,  # [B, T*n_h, num_q_heads, K]
+    expanded_a: Optional[torch.Tensor] = None,  # [B, T*n_h, HV]
+    expanded_output: Optional[torch.Tensor] = None,  # [B, T*n_h, HV, V]
+    expanded_ssm_state_indices: Optional[torch.Tensor] = None,  # [B, T*n_h] int32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Gated DeltaProduct decode / MTP.
+
+    GDP decode is :func:`flashinfer.gdn_decode.gated_delta_rule_mtp` with
+    ``T -> T * num_householder``: one real token becomes ``n_h`` micro-steps.
+    With speculative decoding on top, ``T`` is already ``num_spec + 1``, so the
+    expanded axis is ``n_h * (num_spec + 1)``.
+
+    Two things differ from the prefill wrapper, both because the decode kernel
+    is less of a blank slate:
+
+    1. **The gate is fused.** Prefill takes ``g`` directly; here the kernel
+       derives alpha from ``A_log``/``a``/``dt_bias``. Neutralising the gate on
+       micro-steps ``1..n_h-1`` therefore happens through ``a``, using
+       :data:`GATE_NEUTRAL_A_SENTINEL` -- not by writing 1.0 anywhere.
+    2. **The per-token state scatter is unguarded.** ``gated_delta_rule_mtp``
+       writes ``h_{t+1}`` to ``initial_state[ssm_state_indices[i, t]]`` for
+       every ``t``, with no "skip this one" sentinel (unlike FLA, whose kernel
+       guards on a non-positive slot id). Intermediate micro-steps must
+       therefore be pointed at a **throwaway pool row**, one per batch row --
+       see ``scratch_state_indices``.
+
+    Parameters
+    ----------
+    k, v, b : torch.Tensor
+        Carry a householder axis at dim 2. ``q`` and ``a`` do not: one query and
+        one gate per REAL token.
+    ssm_state_indices : torch.Tensor, optional
+        ``[B, T]`` int32, one pool slot per REAL token, as for GDN MTP. The
+        wrapper expands this to ``[B, T*n_h]``, routing micro-steps
+        ``1..n_h-1`` to the scratch rows and only the last micro-step of each
+        token to the caller's slot.
+    scratch_state_indices : torch.Tensor, optional
+        ``[B]`` int32. Pool rows whose contents are discarded -- one per batch
+        row, and they **must be distinct from each other and from every live
+        slot**, or two batch rows will race writing the same pool row. Required
+        when ``ssm_state_indices`` is given and ``n_h > 1``.
+    expanded_* : torch.Tensor, optional
+        Scratch for the expansion; required for CUDA graph capture. See
+        :func:`chunk_gated_delta_product` for why.
+
+    Returns
+    -------
+    ``(output, initial_state)``, matching ``gated_delta_rule_mtp``. ``output``
+    is ``[B, T, HV, V]`` -- one row per REAL token.
+    """
+    if k.dim() != 5 or v.dim() != 5:
+        raise ValueError(
+            f"k/v must carry a householder axis [B, T, n_h, H, D]; "
+            f"got k.shape={tuple(k.shape)}, v.shape={tuple(v.shape)}"
+        )
+    num_householder = k.size(2)
+    if v.size(2) != num_householder:
+        raise ValueError(
+            f"k/v householder counts differ: {num_householder} vs {v.size(2)}"
+        )
+    if b.dim() != 4 or b.size(2) != num_householder:
+        raise ValueError(
+            f"b must be [B, T, n_h, HV] with n_h={num_householder}; "
+            f"got {tuple(b.shape)}"
+        )
+    if a.dim() != 3:
+        raise ValueError(
+            f"a is one decay logit per REAL token, expected [B, T, HV]; "
+            f"got {tuple(a.shape)}"
+        )
+
+    from .gdn_decode import gated_delta_rule_mtp
+
+    # n_h == 1 is plain GDN MTP. Delegate so this path stays bit-identical.
+    if num_householder == 1:
+        return gated_delta_rule_mtp(
+            q,
+            k.squeeze(2),
+            v.squeeze(2),
+            initial_state,
+            initial_state_indices,
+            A_log,
+            a,
+            dt_bias,
+            b.squeeze(2),
+            scale=scale,
+            output=output,
+            ssm_state_indices=ssm_state_indices,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+            output_state_indices=output_state_indices,
+        )
+
+    # -----------------------------------------------------------------------
+    # TODO(you): the decode expansion.
+    #
+    #   k, v, b   [B, T, n_h, H, D] -> [B, T*n_h, H, D]      (flatten dims 1,2)
+    #   q         scatter into [:, n_h-1 :: n_h]             (read at the LAST)
+    #   a         scatter into [:, 0     :: n_h],
+    #             ALL OTHER ROWS = GATE_NEUTRAL_A_SENTINEL   (not 1.0! fused gate)
+    #   ssm_state_indices  [B, T] -> [B, T*n_h] int32:
+    #                 [:, n_h-1 :: n_h] = the caller's slots
+    #                 everything else   = scratch_state_indices[:, None]
+    #   out       gather [:, n_h-1 :: n_h]
+    #
+    # `initial_state`, `initial_state_indices` and `output_state_indices` pass
+    # through untouched -- the number of SEQUENCES is unchanged, only the token
+    # axis grows, and the state shape never depends on n_h.
+    #
+    # Watch for:
+    #  * The kernel asserts `ssm_state_indices.dtype == torch.int32` and
+    #    `T >= 2`. The expanded T is n_h*T so T>=2 is automatic for n_h>=2, but
+    #    the dtype is easy to lose through a `torch.full` default of int64.
+    #  * `expanded_a` must be PRE-FILLED with the sentinel, not zeros -- only
+    #    the [0::n_h] rows get written, exactly like expanded_g in prefill
+    #    (where the pre-fill value is 1.0 instead).
+    #  * Every batch row needs its OWN scratch slot. Sharing one across rows is
+    #    a data race, silent and nondeterministic.
+    # -----------------------------------------------------------------------
+    raise NotImplementedError("gated_delta_product_mtp: the n_h expansion")
