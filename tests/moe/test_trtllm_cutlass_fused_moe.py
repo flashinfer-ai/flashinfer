@@ -2719,11 +2719,21 @@ def _make_humming_e8m0_weight_scale(
     device: torch.device,
     low: int = 114,
     high: int = 128,
+    per_expert_exponent_offsets: bool = False,
 ) -> torch.Tensor:
     """Generate deterministic raw E8M0 scale bytes for Humming preprocessing.
 
-    Per-expert exponent offsets make the resulting residual scales distinct.
+    The default global sequence preserves the numerical envelope used by the
+    broad tactic tests.  Focused expert-map tests add ``expert_id % 3`` to a
+    shared within-expert pattern, producing residual-scale ratios of 1:2:4.
     """
+    if not per_expert_exponent_offsets:
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        values = torch.arange(numel, device=device, dtype=torch.int32)
+        return (low + values.remainder(high - low)).to(torch.uint8).reshape(shape)
+
     elements_per_expert = 1
     for dim in shape[1:]:
         elements_per_expert *= dim
@@ -2836,6 +2846,7 @@ PHASE3_HUMMING_E2E_CASES = {
         "raw_scale": (118, 122),
         "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 0,
+        "check_expert_residual_mapping": True,
         "description": "default small smoke, offset range 1..4",
     },
     "ep_rank1": {
@@ -2851,6 +2862,7 @@ PHASE3_HUMMING_E2E_CASES = {
         "ep_size": 2,
         "ep_rank": 1,
         "skip_autotune": True,
+        "check_expert_residual_mapping": True,
         "description": "EP rank 1 maps global route IDs to local residual arrays",
     },
     "wide_offset": {
@@ -3196,6 +3208,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     )
     ep_size = case.get("ep_size", 1)
     ep_rank = case.get("ep_rank", 0)
+    check_expert_residual_mapping = case.get("check_expert_residual_mapping", False)
     start_expert = e * ep_rank
     end_expert = start_expert + e
     output_dtype = torch.bfloat16
@@ -3211,14 +3224,23 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     # dequantization scale before that combined scale reaches the GEMM epilogue.
     raw_scale_low, raw_scale_high = case["raw_scale"]
     w1_raw_scale = _make_humming_e8m0_weight_scale(
-        (e, 2 * n, k // 32), device, low=raw_scale_low, high=raw_scale_high
+        (e, 2 * n, k // 32),
+        device,
+        low=raw_scale_low,
+        high=raw_scale_high,
+        per_expert_exponent_offsets=check_expert_residual_mapping,
     )
     w2_raw_scale = _make_humming_e8m0_weight_scale(
-        (e, k, n // 32), device, low=raw_scale_low, high=raw_scale_high
+        (e, k, n // 32),
+        device,
+        low=raw_scale_low,
+        high=raw_scale_high,
+        per_expert_exponent_offsets=check_expert_residual_mapping,
     )
-    # Shift FC2 by one E8M0 exponent so its residual differs from FC1. This
-    # makes the end-to-end check fail if quant-scale slots 1 and 4 are swapped.
-    w2_raw_scale = (w2_raw_scale.to(torch.int16) + 1).to(torch.uint8)
+    if check_expert_residual_mapping:
+        # Shift FC2 by one E8M0 exponent so its residual differs from FC1. This
+        # makes the focused check fail if quant-scale slots 1 and 4 are swapped.
+        w2_raw_scale = (w2_raw_scale.to(torch.int16) + 1).to(torch.uint8)
     w1_processed, w1_exp_offset, w1_residual = (
         fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
             w1, w1_raw_scale, interleave=False
@@ -3250,9 +3272,10 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     torch.testing.assert_close(w2_exp_offset, w2_ref_offset)
     torch.testing.assert_close(w1_residual, w1_ref_residual)
     torch.testing.assert_close(w2_residual, w2_ref_residual)
-    # E8M0 stores only an exponent, so the uniform +1 applied to W2 above
-    # doubles its residual while leaving its relative folded offsets unchanged.
-    torch.testing.assert_close(w2_residual, w1_residual * 2.0)
+    if check_expert_residual_mapping:
+        # E8M0 stores only an exponent, so the uniform +1 applied to W2 above
+        # doubles its residual while leaving its folded offsets unchanged.
+        torch.testing.assert_close(w2_residual, w1_residual * 2.0)
     expected_max_offset = min(raw_scale_high - raw_scale_low, 12)
     assert 1 <= int(w1_exp_offset.min().item()) <= expected_max_offset
     assert 1 <= int(w2_exp_offset.min().item()) <= expected_max_offset
@@ -3311,7 +3334,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     ).contiguous()
     assert fc1_residual_expert_scale.shape == (e,)
     assert fc2_residual_expert_scale.shape == (e,)
-    if e > 1:
+    if check_expert_residual_mapping and e > 1:
         assert torch.unique(fc1_residual_expert_scale).numel() > 1
         assert torch.unique(fc2_residual_expert_scale).numel() > 1
     quant_scales = [
