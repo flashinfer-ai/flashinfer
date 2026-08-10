@@ -21,11 +21,13 @@ which must contain one beta-pack activity followed by the M128 recurrence.
 The recurrence-only (prepared) activity is retained under a separate field and
 is never substituted for the public number.
 
-The harness also verifies the exact pinned MoonshotAI/FlashKDA checkout and,
-when FLA is installed, forces its Triton path with ``FLA_FLASH_KDA=0`` and
-reports it separately.  Correctness covers the public output and complete
-final state against a direct BF16-state recurrence, the pinned FlashKDA
-implementation, and the optional FLA/Triton implementation.
+The harness also verifies an in-allocation force-build of the exact pinned
+MoonshotAI/FlashKDA checkout and requires a clean, identifiable FLA checkout
+whose Triton path is forced with ``FLA_FLASH_KDA=0``.  Correctness covers the
+public output and complete final state against a direct BF16-state recurrence,
+the pinned FlashKDA implementation, and FLA/Triton.  Promotion additionally
+requires the exact changed-beta CUDA Graph test and matching SM100a+SM103a
+receipts.
 """
 
 from __future__ import annotations
@@ -41,12 +43,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from kda_h12_evidence import (
+    EVIDENCE_REPORT_SCHEMA_VERSION,
     FLASH_KDA_BASELINE_REVISION,
+    FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION,
     FLASHINFER_H12_ROUTE_REVISION,
     FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION,
+    GRAPH_TEST_NODE_ID,
+    GRAPH_TEST_SOURCE,
+    GRAPH_TEST_SOURCE_LINE_RANGE,
     CpuBracket,
     EvidencePreset,
     GpuActivity,
@@ -82,7 +89,7 @@ class CaseRuntime:
     flash_kda_raw_run: Callable[[], object]
     flash_kda_adapted_run: Callable[[], object]
     flash_kda_adapted_reset: Callable[[], None]
-    fla_run: Optional[Callable[[], object]]
+    fla_run: Callable[[], object]
 
 
 def _git_output(root: Path, *args: str) -> str:
@@ -108,16 +115,18 @@ def _sha256(path: Path) -> str:
 
 def _candidate_provenance(stack: SimpleNamespace) -> dict:
     source_commit = _git_output(REPOSITORY_ROOT, "rev-parse", "HEAD")
-    tracked_changes = _git_output(
+    worktree_changes = _git_output(
         REPOSITORY_ROOT,
         "status",
-        "--porcelain",
-        "--untracked-files=no",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
     )
-    if tracked_changes:
+    if worktree_changes:
         raise RuntimeError(
-            "Phase-A evidence requires a clean tracked FlashInfer checkout; "
-            f"found:\n{tracked_changes}"
+            "Phase-A evidence requires a FlashInfer checkout with no tracked "
+            "or nonignored untracked changes; "
+            f"found:\n{worktree_changes}"
         )
     required_ancestors = {
         "phase_a_upstream_main": FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION,
@@ -155,15 +164,18 @@ def _candidate_provenance(stack: SimpleNamespace) -> dict:
         Path("csrc/kda/flashkda_bf16_fused_m128_binding.cu"),
         Path("csrc/kda/flashkda_bf16_fused_m128.cu"),
         Path("benchmarks/bench_recurrent_kda_prefill_h12_phase_a.py"),
+        Path("benchmarks/build_flash_kda_phase_a.py"),
         Path("benchmarks/kda_h12_evidence.py"),
         Path("benchmarks/presets/recurrent_kda_prefill_h12_phase_a.json"),
+        Path("benchmarks/reduce_kda_h12_phase_a.py"),
+        Path(GRAPH_TEST_SOURCE),
     )
     return {
         "repository": "https://github.com/flashinfer-ai/flashinfer.git",
         "source_dir": str(REPOSITORY_ROOT),
         "source_commit": source_commit,
         "required_ancestor_revisions": required_ancestors,
-        "tracked_worktree_clean": True,
+        "worktree_clean_including_untracked": True,
         "imported_module_paths": {
             name: str(path) for name, path in imported_module_paths.items()
         },
@@ -250,7 +262,40 @@ def _hardware_metadata(stack: SimpleNamespace) -> dict:
     }
 
 
-def _load_flash_kda(source_dir: Path) -> tuple[Any, dict]:
+def _run_changed_beta_graph_test() -> dict:
+    """Run and receipt the exact H6/H12 changed-beta CUDA Graph regression."""
+
+    command = [sys.executable, "-m", "pytest", "-q", GRAPH_TEST_NODE_ID]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        command,
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    source_path = REPOSITORY_ROOT / GRAPH_TEST_SOURCE
+    return {
+        "source": GRAPH_TEST_SOURCE,
+        "source_line_range": list(GRAPH_TEST_SOURCE_LINE_RANGE),
+        "source_sha256": _sha256(source_path),
+        "node_id": GRAPH_TEST_NODE_ID,
+        "parameterization": {"num_heads": [6, 12]},
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "passed": completed.returncode == 0,
+    }
+
+
+def _load_flash_kda(
+    source_dir: Path,
+    build_manifest_path: Path,
+) -> tuple[Any, dict]:
     source_dir = source_dir.resolve(strict=True)
     sys.path.insert(0, str(source_dir))
     try:
@@ -265,6 +310,7 @@ def _load_flash_kda(source_dir: Path) -> tuple[Any, dict]:
         package_path=Path(flash_kda.__file__),
         extension_path=Path(extension.__file__),
         source_dir=source_dir,
+        build_manifest_path=build_manifest_path,
     )
     return flash_kda, provenance
 
@@ -278,21 +324,37 @@ def _package_git_facts(path: Path) -> dict:
         check=False,
     )
     if result.returncode != 0:
-        return {"git_source_dir": None, "git_revision": None, "git_status": None}
+        raise RuntimeError(
+            f"required FLA package is not identifiable as a Git checkout: {path}"
+        )
     root = Path(result.stdout.strip()).resolve()
+    status = _git_output(
+        root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    if status:
+        raise RuntimeError(
+            "required FLA checkout has tracked or nonignored untracked changes:\n"
+            f"{status}"
+        )
+    revision = _git_output(root, "rev-parse", "HEAD")
+    if len(revision) != 40 or any(
+        character not in "0123456789abcdef" for character in revision
+    ):
+        raise RuntimeError(
+            f"required FLA checkout has invalid Git revision {revision!r}"
+        )
     return {
         "git_source_dir": str(root),
-        "git_revision": _git_output(root, "rev-parse", "HEAD"),
-        "git_status": _git_output(
-            root,
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-        ),
+        "git_revision": revision,
+        "worktree_clean_including_untracked": True,
     }
 
 
-def _load_optional_fla() -> tuple[Optional[Callable], dict]:
+def _load_required_fla() -> tuple[Callable, dict]:
     # FLA's FlashKDA backend is enabled by default whenever flash_kda is
     # importable.  Force zero before importing FLA so this comparison remains
     # the independent Triton implementation rather than the pinned peer again.
@@ -302,35 +364,30 @@ def _load_optional_fla() -> tuple[Optional[Callable], dict]:
         name for name in sys.modules if name == "fla" or name.startswith("fla.")
     )
     if preimported:
-        return None, {
-            "available": False,
-            "reason": (
-                "FLA was imported before its backend-dispatch policy could be "
-                f"frozen: {preimported!r}"
-            ),
-            "forced_environment": {
-                "FLA_FLASH_KDA": "0",
-                "FLA_DISABLE_BACKEND_DISPATCH": "1",
-            },
-        }
+        raise RuntimeError(
+            "FLA was imported before its backend-dispatch policy could be "
+            f"frozen: {preimported!r}"
+        )
     try:
         fla = importlib.import_module("fla")
         kda_ops = importlib.import_module("fla.ops.kda")
         chunk_kda = kda_ops.chunk_kda
     except (ImportError, ModuleNotFoundError) as error:
-        return None, {
-            "available": False,
-            "reason": f"{type(error).__name__}: {error}",
-            "forced_environment": {
-                "FLA_FLASH_KDA": "0",
-                "FLA_DISABLE_BACKEND_DISPATCH": "1",
-            },
-        }
+        raise RuntimeError(
+            "Phase-A evidence requires an installed FLA/Triton checkout"
+        ) from error
 
     package_path = Path(fla.__file__).resolve(strict=True)
     op_path = Path(importlib.import_module("fla.ops.kda.chunk").__file__).resolve(
         strict=True
     )
+    git_facts = _package_git_facts(op_path)
+    git_source_dir = Path(git_facts["git_source_dir"])
+    for label, path in (("package", package_path), ("KDA op", op_path)):
+        if not path.is_relative_to(git_source_dir):
+            raise RuntimeError(
+                f"FLA {label} must resolve inside its verified Git checkout: {path}"
+            )
     distribution_version = None
     for distribution in ("flash-linear-attention", "fla"):
         try:
@@ -350,7 +407,7 @@ def _load_optional_fla() -> tuple[Optional[Callable], dict]:
             "FLA_FLASH_KDA": "0",
             "FLA_DISABLE_BACKEND_DISPATCH": "1",
         },
-        **_package_git_facts(op_path),
+        **git_facts,
     }
 
 
@@ -371,7 +428,7 @@ def _make_case_runtime(
     case,
     rotations: int,
     flash_kda,
-    fla_chunk_kda: Optional[Callable],
+    fla_chunk_kda: Callable,
 ) -> CaseRuntime:
     torch = stack.torch
     device = torch.device("cuda")
@@ -535,32 +592,30 @@ def _make_case_runtime(
         flash_kda_adapted_state_pool.copy_(initial_state_seed.unsqueeze(0))
         flash_kda_adapted_cursor[0] = 0
 
-    fla_run = None
-    if fla_chunk_kda is not None:
-        fla_initial_state = initial_state_seed.float()
+    fla_initial_state = initial_state_seed.float()
 
-        def fla_run():
-            with torch.inference_mode():
-                return fla_chunk_kda(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    scale=scale,
-                    initial_state=fla_initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    use_gate_in_kernel=True,
-                    use_beta_sigmoid_in_kernel=True,
-                    safe_gate=True,
-                    lower_bound=-5.0,
-                    state_v_first=True,
-                    cu_seqlens=cu_seqlens,
-                    cu_seqlens_cpu=cu_seqlens_cpu,
-                )
+    def fla_run():
+        with torch.inference_mode():
+            return fla_chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=fla_initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                safe_gate=True,
+                lower_bound=-5.0,
+                state_v_first=True,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
 
     tensors = {
         "q": q,
@@ -748,26 +803,22 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
         ),
     }
 
-    fla = {"available": runtime.fla_run is not None}
-    if runtime.fla_run is not None:
-        fla_output, fla_state = runtime.fla_run()
-        torch.cuda.synchronize()
-        fla.update(
-            {
-                "output": _assert_bf16_close(
-                    torch,
-                    label="public output vs FLA/Triton",
-                    actual=candidate_output,
-                    expected=fla_output,
-                ),
-                "final_state": _assert_bf16_close(
-                    torch,
-                    label="public final state vs FLA/Triton",
-                    actual=candidate_state,
-                    expected=fla_state,
-                ),
-            }
-        )
+    fla_output, fla_state = runtime.fla_run()
+    torch.cuda.synchronize()
+    fla = {
+        "output": _assert_bf16_close(
+            torch,
+            label="public output vs FLA/Triton",
+            actual=candidate_output,
+            expected=fla_output,
+        ),
+        "final_state": _assert_bf16_close(
+            torch,
+            label="public final state vs FLA/Triton",
+            actual=candidate_state,
+            expected=fla_state,
+        ),
+    }
     return {
         "passed": True,
         "public_output_and_full_final_state": True,
@@ -936,9 +987,8 @@ def _run_timing_blocks(
             runtime.flash_kda_adapted_reset,
             False,
         ),
+        "fla_triton": (runtime.fla_run, lambda: None, False),
     }
-    if runtime.fla_run is not None:
-        paths["fla_triton"] = (runtime.fla_run, lambda: None, False)
 
     base_order = list(paths)
     sample_blocks = {name: [] for name in paths}
@@ -984,16 +1034,17 @@ def _run_timing_blocks(
     }
     for name, timing in timings.items():
         timing["call_path"] = call_paths[name]
-    if "fla_triton" in timings:
-        fla_names = [
-            name
-            for sample_names in timings["fla_triton"]["kernel_activity_names_samples"]
-            for name in sample_names
-        ]
-        if any("flashkda" in name.lower() for name in fla_names):
-            raise RuntimeError(
-                "FLA comparison routed back to FlashKDA despite FLA_FLASH_KDA=0"
-            )
+    fla_names = [
+        name
+        for sample_names in timings["fla_triton"]["kernel_activity_names_samples"]
+        for name in sample_names
+    ]
+    if not fla_names:
+        raise RuntimeError("required FLA/Triton path produced no kernel activities")
+    if any("flashkda" in name.lower() for name in fla_names):
+        raise RuntimeError(
+            "FLA comparison routed back to FlashKDA despite FLA_FLASH_KDA=0"
+        )
     return timings, measurement_order
 
 
@@ -1003,7 +1054,7 @@ def _case_result(
     tracer: _CuptiTracer,
     case,
     flash_kda,
-    fla_chunk_kda: Optional[Callable],
+    fla_chunk_kda: Callable,
     warmup_iters: int,
     repeat_iters: int,
     blocks: int,
@@ -1020,8 +1071,7 @@ def _case_result(
     runtime.candidate_reset()
     runtime.candidate_run()
     runtime.flash_kda_raw_run()
-    if runtime.fla_run is not None:
-        runtime.fla_run()
+    runtime.fla_run()
     stack.torch.cuda.synchronize()
 
     correctness = _check_correctness(stack.torch, runtime)
@@ -1043,10 +1093,9 @@ def _case_result(
             / candidate_ms
         ),
     }
-    if "fla_triton" in timings:
-        speedups["vs_fla_triton"] = (
-            timings["fla_triton"]["median_gpu_span_ms"] / candidate_ms
-        )
+    speedups["vs_fla_triton"] = (
+        timings["fla_triton"]["median_gpu_span_ms"] / candidate_ms
+    )
     return {
         **runtime.metadata,
         "correctness": correctness,
@@ -1062,8 +1111,14 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         return
     if args.flash_kda_source_dir is None:
         parser.error("--flash-kda-source-dir is required for GPU evidence")
+    if args.flash_kda_build_manifest is None:
+        parser.error("--flash-kda-build-manifest is required for GPU evidence")
     if args.json is None:
         parser.error("--json is required so raw activity samples are preserved")
+    if args.json.resolve().is_relative_to(REPOSITORY_ROOT):
+        parser.error("--json must be outside the verified FlashInfer checkout")
+    if args.json.resolve().is_relative_to(args.flash_kda_source_dir.resolve()):
+        parser.error("--json must be outside the verified FlashKDA checkout")
     if args.warmup_iters <= 0 or args.repeat_iters <= 0:
         parser.error("--warmup-iters and --repeat-iters must be positive")
     if args.blocks < 2:
@@ -1099,6 +1154,7 @@ def main() -> None:
         help="Validate and print the checked-in preset without importing torch.",
     )
     parser.add_argument("--flash-kda-source-dir", type=Path)
+    parser.add_argument("--flash-kda-build-manifest", type=Path)
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--repeat-iters", type=int, default=20)
     parser.add_argument("--blocks", type=int, default=2)
@@ -1113,6 +1169,37 @@ def main() -> None:
                 {
                     "preset": _preset_summary(preset),
                     "flash_kda_required_revision": FLASH_KDA_BASELINE_REVISION,
+                    "flash_kda_build_manifest": {
+                        "required": True,
+                        "schema_version": FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION,
+                        "helper": "benchmarks/build_flash_kda_phase_a.py",
+                        "requires_slurm_gpu_allocation": True,
+                        "requires_force_rebuild": True,
+                    },
+                    "fla_triton": {
+                        "required": True,
+                        "preimported_fails_closed": True,
+                        "clean_identifiable_git_checkout_required": True,
+                        "forced_environment": {
+                            "FLA_FLASH_KDA": "0",
+                            "FLA_DISABLE_BACKEND_DISPATCH": "1",
+                        },
+                        "all_six_cases_require_output_final_state_and_timing": True,
+                    },
+                    "changed_beta_cuda_graph_test": {
+                        "required": True,
+                        "source": GRAPH_TEST_SOURCE,
+                        "source_line_range": list(GRAPH_TEST_SOURCE_LINE_RANGE),
+                        "node_id": GRAPH_TEST_NODE_ID,
+                        "parameterization": {"num_heads": [6, 12]},
+                        "command": ["python", "-m", "pytest", "-q", GRAPH_TEST_NODE_ID],
+                    },
+                    "promotion": {
+                        "per_arch_flag": "complete_per_arch_denominator",
+                        "required_architectures": ["sm100a", "sm103a"],
+                        "reducer": "benchmarks/reduce_kda_h12_phase_a.py",
+                        "dual_arch_flag": "promotion_complete_dual_arch",
+                    },
                     "flashinfer_required_ancestor_revisions": {
                         "phase_a_upstream_main": (
                             FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION
@@ -1131,13 +1218,18 @@ def main() -> None:
     stack = _import_gpu_stack()
     cupti, cupti_version = _require_cupti()
     hardware = _hardware_metadata(stack)
+    graph_receipt = _run_changed_beta_graph_test()
     candidate_provenance = _candidate_provenance(stack)
     assert args.flash_kda_source_dir is not None
-    flash_kda, flash_kda_provenance = _load_flash_kda(args.flash_kda_source_dir)
-    fla_chunk_kda, fla_provenance = _load_optional_fla()
+    assert args.flash_kda_build_manifest is not None
+    flash_kda, flash_kda_provenance = _load_flash_kda(
+        args.flash_kda_source_dir,
+        args.flash_kda_build_manifest,
+    )
+    fla_chunk_kda, fla_provenance = _load_required_fla()
 
     report = {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_REPORT_SCHEMA_VERSION,
         "suite": "recurrent_kda_prefill_h12_phase_a",
         "preset": _preset_summary(preset),
         "candidate_provenance": candidate_provenance,
@@ -1150,6 +1242,7 @@ def main() -> None:
             "fla_triton": fla_provenance,
         },
         "hardware": hardware,
+        "changed_beta_cuda_graph_test": graph_receipt,
         "measurement": {
             "timing_backend": "cupti_activity",
             "cupti_python_version": cupti_version,
@@ -1166,10 +1259,19 @@ def main() -> None:
             ),
             "synchronized_e2e_is_diagnostic_only": True,
             "cross_shape_geomean": False,
-            "promotion_unit": "one case on one architecture",
+            "promotion_unit": "complete six-case denominator on one architecture",
         },
         "cases": [],
     }
+    if not graph_receipt["passed"]:
+        report["complete_per_arch_denominator"] = False
+        assert args.json is not None
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(report, indent=2) + "\n")
+        raise RuntimeError(
+            "changed-beta CUDA Graph promotion test failed; "
+            f"receipt written to {args.json}"
+        )
     tracer = _CuptiTracer(stack=stack, cupti=cupti)
     try:
         for case in preset.cases:
@@ -1196,7 +1298,7 @@ def main() -> None:
     finally:
         tracer.close()
 
-    report["complete_denominator"] = len(report["cases"]) == 6
+    report["complete_per_arch_denominator"] = len(report["cases"]) == 6
     assert args.json is not None
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(report, indent=2) + "\n")
