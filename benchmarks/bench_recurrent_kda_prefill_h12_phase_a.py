@@ -715,6 +715,10 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
 
     tensors = runtime.tensors
     q = tensors["q"]
+    if q.dtype != torch.bfloat16:
+        raise ValueError(
+            "the independent Phase-A recurrence requires BF16 input/state rounding"
+        )
     num_heads = q.shape[2]
     head_dim = q.shape[3]
     q_flat = torch.nn.functional.normalize(q.float(), dim=-1).reshape(
@@ -735,7 +739,9 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     )
     decay = torch.exp(gate)
     state = runtime.initial_state_seed.clone()
-    out = torch.empty_like(q_flat)
+    # q_flat is FP32 for the recurrence arithmetic, but the frozen contract
+    # rounds every output token to BF16 just as it rounds every state update.
+    out = torch.empty_like(q_flat, dtype=torch.bfloat16)
     seq_lens = tuple(runtime.metadata["seq_lens"])
     offsets = _offsets(seq_lens)
     max_seq_len = max(seq_lens)

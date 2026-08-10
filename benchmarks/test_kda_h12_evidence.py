@@ -878,3 +878,29 @@ def test_runner_has_no_reportable_timer_fallback_or_top_level_gpu_import():
     ):
         assert forbidden not in source
     assert source.count(".finalize()") == 1
+
+
+def test_independent_recurrence_allocates_a_bf16_output_buffer():
+    tree = ast.parse(_runner_path().read_text())
+    recurrence = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_independent_bf16_recurrence"
+    )
+    out_assignment = next(
+        node
+        for node in ast.walk(recurrence)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "out"
+            for target in node.targets
+        )
+    )
+    assert isinstance(out_assignment.value, ast.Call)
+    dtype = next(
+        keyword.value
+        for keyword in out_assignment.value.keywords
+        if keyword.arg == "dtype"
+    )
+    assert ast.unparse(dtype) == "torch.bfloat16"
