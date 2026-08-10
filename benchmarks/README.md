@@ -2,6 +2,8 @@
 
 The aim of `flashinfer_benchmark.py` is to provide a single framework for benchmarking any FlashInfer kernel and replace standalone benchmarking scripts.
 
+Specialized review harnesses: [recurrent KDA H12 Phase-A evidence](KDA_H12_PHASE_A.md).
+
 ## Overview
 
 This framework provides tools to:

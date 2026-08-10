@@ -14,7 +14,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,6 +38,10 @@ SPEC.loader.exec_module(evidence)
 
 def _preset_path() -> Path:
     return BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12_phase_a.json"
+
+
+def _runner_path() -> Path:
+    return BENCHMARKS_DIR / "bench_recurrent_kda_prefill_h12_phase_a.py"
 
 
 def test_checked_in_preset_is_exact_and_per_case_only():
@@ -63,9 +71,13 @@ def test_checked_in_preset_is_exact_and_per_case_only():
 
 
 def test_preset_rejects_cross_shape_aggregation(tmp_path):
-    payload = _preset_path().read_text().replace(
-        '"aggregation": "per_case_only"',
-        '"aggregation": "geomean"',
+    payload = (
+        _preset_path()
+        .read_text()
+        .replace(
+            '"aggregation": "per_case_only"',
+            '"aggregation": "geomean"',
+        )
     )
     path = tmp_path / "bad.json"
     path.write_text(payload)
@@ -100,6 +112,73 @@ def test_flash_kda_identity_mismatch_is_rejected(tmp_path):
             extension_path=extension_path,
             source_dir=source_dir,
             git_output=wrong_revision,
+        )
+
+
+def test_flash_kda_exact_identity_is_recorded(tmp_path):
+    source_dir = tmp_path / "FlashKDA"
+    package_path = source_dir / "flash_kda" / "__init__.py"
+    extension_path = source_dir / "flash_kda_C.so"
+    cutlass_dir = source_dir / "cutlass"
+    package_path.parent.mkdir(parents=True)
+    cutlass_dir.mkdir(parents=True)
+    package_path.write_text("# pinned package\n")
+    extension_path.write_bytes(b"pinned extension")
+
+    def exact_revision(root, *args):
+        root = Path(root)
+        if root == source_dir and args == ("rev-parse", "HEAD"):
+            return evidence.FLASH_KDA_BASELINE_REVISION
+        if root == cutlass_dir and args == ("rev-parse", "HEAD"):
+            return evidence.FLASH_KDA_CUTLASS_REVISION
+        if root == source_dir and args == ("ls-tree", "HEAD", "cutlass"):
+            return f"160000 commit {evidence.FLASH_KDA_CUTLASS_REVISION}\tcutlass"
+        if root == source_dir and args == (
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ):
+            return ""
+        raise AssertionError(f"unexpected git query at {root}: {args!r}")
+
+    provenance = evidence.verify_flash_kda_provenance(
+        package_path=package_path,
+        extension_path=extension_path,
+        source_dir=source_dir,
+        git_output=exact_revision,
+    )
+
+    assert provenance["source_commit"] == evidence.FLASH_KDA_BASELINE_REVISION
+    assert provenance["cutlass_commit"] == evidence.FLASH_KDA_CUTLASS_REVISION
+    assert len(provenance["package_sha256"]) == 64
+    assert len(provenance["extension_sha256"]) == 64
+
+
+def test_flash_kda_cutlass_identity_mismatch_is_rejected(tmp_path):
+    source_dir = tmp_path / "FlashKDA"
+    package_path = source_dir / "flash_kda" / "__init__.py"
+    extension_path = source_dir / "build" / "flash_kda_C.so"
+    cutlass_dir = source_dir / "cutlass"
+    package_path.parent.mkdir(parents=True)
+    extension_path.parent.mkdir(parents=True)
+    cutlass_dir.mkdir(parents=True)
+    package_path.write_text("# package\n")
+    extension_path.write_bytes(b"extension")
+
+    def wrong_cutlass(root, *args):
+        root = Path(root)
+        if root == source_dir and args == ("rev-parse", "HEAD"):
+            return evidence.FLASH_KDA_BASELINE_REVISION
+        if root == cutlass_dir and args == ("rev-parse", "HEAD"):
+            return "0" * 40
+        raise AssertionError(f"unexpected git query at {root}: {args!r}")
+
+    with pytest.raises(RuntimeError, match="unexpected FlashKDA CUTLASS revision"):
+        evidence.verify_flash_kda_provenance(
+            package_path=package_path,
+            extension_path=extension_path,
+            source_dir=source_dir,
+            git_output=wrong_cutlass,
         )
 
 
@@ -148,6 +227,10 @@ def test_h12_public_activity_reduction_preserves_span_decomposition_and_names():
     assert report["submission_ms_samples"] == [0.00015]
     assert report["synchronized_e2e_ms_samples"] == [0.0009]
     assert report["launch_activity_count_samples"] == [4]
+    assert [
+        launch["correlation_id"]
+        for launch in report["launch_activity_order_samples"][0]
+    ] == [7, 7, 8, 8]
     assert report["kernel_activity_count_samples"] == [2]
     assert report["kernel_activity_names_samples"] == [
         [
@@ -156,9 +239,15 @@ def test_h12_public_activity_reduction_preserves_span_decomposition_and_names():
         ]
     ]
     prepared = report["prepared_recurrence"]
+    assert report["call_path"] == "flashinfer.kda.recurrent_kda"
+    assert report["includes_beta_preparation"] is True
     assert prepared["derived_from_same_public_samples"] is True
     assert prepared["includes_beta_pack"] is False
     assert prepared["gpu_span_ms_samples"] == [0.00045]
+    assert prepared["launch_activity_count_samples"] == [2]
+    assert prepared["launch_activity_names_samples"] == [
+        ["runtime:cudaLaunchKernel", "driver:cuLaunchKernel"]
+    ]
     assert prepared["kernel_activity_count_samples"] == [1]
 
 
@@ -189,3 +278,56 @@ def test_h12_public_activity_reduction_rejects_missing_pack():
             ],
             require_h12_public_route=True,
         )
+
+
+def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, str(_runner_path()), "--validate-only"],
+        cwd=BENCHMARKS_DIR.parent,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    payload = json.loads(completed.stdout)
+
+    assert payload["gpu_execution"] == "not_requested"
+    assert payload["flash_kda_required_revision"] == (
+        "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
+    )
+    assert payload["flashinfer_required_ancestor_revisions"] == {
+        "phase_a_upstream_main": "2ab910c58fdd2392914ea05e2a8714946ac0eef6",
+        "non_aligned_h12_public_route_pr_4351": (
+            "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
+        ),
+    }
+    assert len(payload["preset"]["cases"]) == 6
+    assert payload["preset"]["aggregation"] == "per_case_only"
+
+
+def test_runner_has_no_reportable_timer_fallback_or_top_level_gpu_import():
+    source = _runner_path().read_text()
+    tree = ast.parse(source)
+    top_level_imports = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.update(
+                alias.name.split(".", 1)[0] for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top_level_imports.add(node.module.split(".", 1)[0])
+
+    assert "torch" not in top_level_imports
+    assert "flashinfer" not in top_level_imports
+    assert "cupti" not in top_level_imports
+    for forbidden in (
+        "time.perf_counter",
+        "time.time",
+        "torch.cuda.Event",
+        "bench_gpu_time",
+    ):
+        assert forbidden not in source
+    assert source.count(".finalize()") == 1

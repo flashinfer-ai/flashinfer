@@ -35,6 +35,8 @@ from typing import Callable, Iterable, Sequence
 FLASH_KDA_REPOSITORY = "https://github.com/MoonshotAI/FlashKDA.git"
 FLASH_KDA_BASELINE_REVISION = "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
 FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
+FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
+FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
 SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 
@@ -286,7 +288,9 @@ def verify_flash_kda_provenance(
         )
     gitlink = git_output(source_dir, "ls-tree", "HEAD", "cutlass").split()
     if len(gitlink) < 3 or gitlink[2] != cutlass_commit:
-        raise RuntimeError("FlashKDA CUTLASS checkout does not match the pinned gitlink")
+        raise RuntimeError(
+            "FlashKDA CUTLASS checkout does not match the pinned gitlink"
+        )
     tracked_changes = git_output(
         source_dir,
         "status",
@@ -295,8 +299,7 @@ def verify_flash_kda_provenance(
     )
     if tracked_changes:
         raise RuntimeError(
-            "verified FlashKDA checkout has tracked modifications:\n"
-            f"{tracked_changes}"
+            f"verified FlashKDA checkout has tracked modifications:\n{tracked_changes}"
         )
     return {
         "repository": FLASH_KDA_REPOSITORY,
@@ -320,7 +323,9 @@ def _validate_timestamp_range(start_ns: int, end_ns: int, label: str) -> None:
 def _interval_metrics(activities: Sequence[GpuActivity]) -> dict:
     if not activities:
         raise EvidenceSchemaError("timing scope contains no correlated GPU activities")
-    ordered = sorted(activities, key=lambda activity: (activity.start_ns, activity.end_ns))
+    ordered = sorted(
+        activities, key=lambda activity: (activity.start_ns, activity.end_ns)
+    )
     for activity in ordered:
         _validate_timestamp_range(
             activity.start_ns,
@@ -358,6 +363,12 @@ def _activity_identity(activity: GpuActivity) -> dict:
     return payload
 
 
+def _launch_identity(launch: LaunchActivity) -> dict:
+    payload = asdict(launch)
+    payload["duration_ms"] = (launch.end_ns - launch.start_ns) / 1e6
+    return payload
+
+
 def _correlated_sample(
     *,
     sample_index: int,
@@ -390,7 +401,9 @@ def _correlated_sample(
         raise EvidenceSchemaError(
             f"sample {sample_index} has no GPU activities correlated to its host call"
         )
-    if any(activity.end_ns > bracket.synchronized_ns for activity in selected_activities):
+    if any(
+        activity.end_ns > bracket.synchronized_ns for activity in selected_activities
+    ):
         raise EvidenceSchemaError(
             f"sample {sample_index} contains an activity after its synchronized boundary"
         )
@@ -405,7 +418,9 @@ def _correlated_sample(
             f"sample {sample_index} has no contributing launch activities"
         )
 
-    kernels = [activity for activity in selected_activities if activity.kind == "kernel"]
+    kernels = [
+        activity for activity in selected_activities if activity.kind == "kernel"
+    ]
     copies = [
         activity
         for activity in selected_activities
@@ -416,12 +431,12 @@ def _correlated_sample(
         "sample_index": sample_index,
         **public_metrics,
         "submission_ms": (bracket.submitted_ns - bracket.start_ns) / 1e6,
-        "synchronized_e2e_ms": (
-            bracket.synchronized_ns - bracket.start_ns
-        )
-        / 1e6,
+        "synchronized_e2e_ms": (bracket.synchronized_ns - bracket.start_ns) / 1e6,
         "launch_activity_count": len(selected_launches),
         "launch_activity_names": [launch.name for launch in selected_launches],
+        "launch_activity_order": [
+            _launch_identity(launch) for launch in selected_launches
+        ],
         "gpu_activity_count": len(selected_activities),
         "gpu_activity_names": [activity.name for activity in selected_activities],
         "kernel_activity_count": len(kernels),
@@ -452,9 +467,19 @@ def _correlated_sample(
             raise EvidenceSchemaError(
                 "H12 public beta-pack must complete before the recurrence activity"
             )
+        recurrence_launches = [
+            launch
+            for launch in selected_launches
+            if launch.correlation_id == recurrence[0].correlation_id
+        ]
         prepared_metrics = _interval_metrics(recurrence)
         result["prepared_recurrence"] = {
             **prepared_metrics,
+            "launch_activity_count": len(recurrence_launches),
+            "launch_activity_names": [launch.name for launch in recurrence_launches],
+            "launch_activity_order": [
+                _launch_identity(launch) for launch in recurrence_launches
+            ],
             "gpu_activity_count": len(recurrence),
             "gpu_activity_names": [activity.name for activity in recurrence],
             "kernel_activity_count": len(recurrence),
@@ -513,6 +538,7 @@ _PREPARED_NUMERIC_FIELDS = (
     "kernel_sum_ms",
     "active_union_ms",
     "inter_kernel_gap_ms",
+    "launch_activity_count",
     "gpu_activity_count",
     "kernel_activity_count",
 )
@@ -538,13 +564,16 @@ def summarize_samples(
         "timing_scope": (
             PUBLIC_TIMING_SCOPE
             if require_h12_public_route
-            else "backend_public_call_first_to_last_correlated_gpu_activity"
+            else "backend_call_first_to_last_correlated_gpu_activity"
         ),
         "timing_backend": "cupti_activity",
         "cold_l2": True,
         "raw_samples": list(samples),
         "launch_activity_names_samples": [
             sample["launch_activity_names"] for sample in samples
+        ],
+        "launch_activity_order_samples": [
+            sample["launch_activity_order"] for sample in samples
         ],
         "gpu_activity_names_samples": [
             sample["gpu_activity_names"] for sample in samples
@@ -559,22 +588,31 @@ def summarize_samples(
         **_summarize_numeric(samples, _PUBLIC_NUMERIC_FIELDS),
     }
     if require_h12_public_route:
+        report["call_path"] = "flashinfer.kda.recurrent_kda"
+        report["includes_beta_preparation"] = True
         prepared = [sample["prepared_recurrence"] for sample in samples]
         report["prepared_recurrence"] = {
+            "call_path": (
+                "recurrence activity derived from flashinfer.kda.recurrent_kda"
+            ),
             "timing_scope": PREPARED_TIMING_SCOPE,
             "timing_backend": "cupti_activity",
             "derived_from_same_public_samples": True,
             "includes_beta_pack": False,
             "raw_samples": prepared,
+            "launch_activity_names_samples": [
+                sample["launch_activity_names"] for sample in prepared
+            ],
+            "launch_activity_order_samples": [
+                sample["launch_activity_order"] for sample in prepared
+            ],
             "gpu_activity_names_samples": [
                 sample["gpu_activity_names"] for sample in prepared
             ],
             "kernel_activity_names_samples": [
                 sample["kernel_activity_names"] for sample in prepared
             ],
-            "activity_order_samples": [
-                sample["activity_order"] for sample in prepared
-            ],
+            "activity_order_samples": [sample["activity_order"] for sample in prepared],
             **_summarize_numeric(prepared, _PREPARED_NUMERIC_FIELDS),
         }
     return report
