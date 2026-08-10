@@ -117,6 +117,11 @@ output_column_dict = {
         "max_len",
         "num_rows",
     ],
+    # top_k_varlen selects top-K KV positions per request; its row width is a
+    # max sequence length, not a vocab size (see routines/topk_varlen.py).
+    "topk_varlen": [
+        "max_seq_len",
+    ],
     "rope": [
         "seq_len",
         "head_dim",
@@ -189,6 +194,7 @@ full_output_columns = (
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
+    + output_column_dict["topk_varlen"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
@@ -271,6 +277,11 @@ benchmark_apis = {
         "top_k",
         "top_k_page_table_transform",
         "top_k_ragged_transform",
+    ],
+    # top_k_varlen is a sparse-attention KV-selection primitive (not vocab
+    # sampling), so it has its own category + routine module (routines/topk_varlen.py).
+    "topk_varlen": [
+        "top_k_varlen",
     ],
     "rope": [
         "apply_rope",
@@ -494,7 +505,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -886,6 +897,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # Note: top_k_varlen uses its @backend_requirement support checks
+    # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
     # ROPE
     "apply_rope": {
         "7.5": ["cuda"],
