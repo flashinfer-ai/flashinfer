@@ -320,7 +320,8 @@ def create_tensor_map_ragged_from_tensor(
         auto-detect from ``tensor.element_type``.
     :raises ValueError: For unsupported rank (``R ∉ {2, 3}``),
         invalid ``ragged_dim``, ragged axis being the innermost, or
-        ambiguous stride ordering.
+        ambiguous stride ordering, or static TMA strides that are
+        smaller than 16 bytes or not 16-byte aligned.
     :return: A :class:`TensorMap` of TMA rank ``R + 2``.
     :rtype: TensorMap
 

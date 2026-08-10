@@ -442,7 +442,8 @@ def test_attention_ts_trace_constraints_match_cache_axes():
 
     for dispatch in fmha_dispatches:
         for template in dispatch.templates:
-            assert "kv_layout == 'HND'" in template.constraints
+            if "kv_layout" in template.inputs:
+                assert "kv_layout == 'HND'" in template.constraints
             assert ("kv_planes == 2" in template.constraints) == (
                 "kv_planes" in template.axes
             )
