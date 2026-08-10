@@ -904,3 +904,12 @@ def test_independent_recurrence_allocates_a_bf16_output_buffer():
         if keyword.arg == "dtype"
     )
     assert ast.unparse(dtype) == "torch.bfloat16"
+    contraction_signatures = [
+        node.value
+        for node in ast.walk(recurrence)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "->" in node.value
+    ]
+    assert contraction_signatures.count("hk,hvk->hv") == 2
+    assert "nhk,nhvk->nhv" not in contraction_signatures

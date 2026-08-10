@@ -744,51 +744,25 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     out = torch.empty_like(q_flat, dtype=torch.bfloat16)
     seq_lens = tuple(runtime.metadata["seq_lens"])
     offsets = _offsets(seq_lens)
-    max_seq_len = max(seq_lens)
-    device = q.device
-    num_sequences = len(seq_lens)
-    sequence_rows = []
-    token_rows = []
-    active_counts = []
-    for token_in_sequence in range(max_seq_len):
-        active_sequences = [
-            sequence
-            for sequence, seq_len in enumerate(seq_lens)
-            if token_in_sequence < seq_len
-        ]
-        token_indices = [
-            offsets[sequence] + token_in_sequence for sequence in active_sequences
-        ]
-        active_counts.append(len(active_sequences))
-        sequence_rows.append(
-            active_sequences + [0] * (num_sequences - len(active_sequences))
-        )
-        token_rows.append(token_indices + [0] * (num_sequences - len(token_indices)))
-    sequence_schedule = torch.tensor(
-        sequence_rows,
-        dtype=torch.int64,
-        device=device,
-    )
-    token_schedule = torch.tensor(token_rows, dtype=torch.int64, device=device)
     scale = head_dim**-0.5
-    for token_in_sequence, active_count in enumerate(active_counts):
-        active_sequences = sequence_schedule[token_in_sequence, :active_count]
-        token_indices = token_schedule[token_in_sequence, :active_count]
-        k_token = k_flat[token_indices]
-        decayed = state[active_sequences].float() * decay[token_indices].unsqueeze(-2)
-        predicted = torch.einsum("nhk,nhvk->nhv", k_token, decayed)
-        residual = beta_flat[token_indices].unsqueeze(-1) * (
-            v_flat[token_indices] - predicted
-        )
-        updated = decayed + residual.unsqueeze(-1) * k_token.unsqueeze(-2)
-        quantized_state = updated.to(torch.bfloat16)
-        state[active_sequences] = quantized_state
-        projected = torch.einsum(
-            "nhk,nhvk->nhv",
-            q_flat[token_indices],
-            quantized_state.float(),
-        )
-        out[token_indices] = (scale * projected).to(torch.bfloat16)
+    # Preserve the canonical per-sequence contraction order from the public
+    # API tests. A batched active-sequence einsum selects a different CUDA
+    # contraction and its FP32 reduction drift compounds through BF16 stores.
+    for sequence in range(len(offsets) - 1):
+        for token in range(offsets[sequence], offsets[sequence + 1]):
+            state_f32 = state[sequence].float()
+            decayed = state_f32 * decay[token].unsqueeze(1)
+            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
+            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
+            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+            quantized_state = updated.to(torch.bfloat16)
+            state[sequence] = quantized_state
+            projected = torch.einsum(
+                "hk,hvk->hv",
+                q_flat[token],
+                quantized_state.float(),
+            )
+            out[token] = (scale * projected).to(torch.bfloat16)
     return out.reshape_as(q), state
 
 
