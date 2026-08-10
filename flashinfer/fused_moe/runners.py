@@ -878,7 +878,10 @@ class CuteDslNvfp4Runner(MoERunner):
         return self._inner.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + tuple(self._inner.get_cache_key_extras([]))
+        return super()._cache_key_extras() + (
+            bool(self._inner.use_fused_finalize),
+            bool(self._inner.enable_pdl),
+        )
 
     def forward(
         self,
@@ -1282,6 +1285,32 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     f"{name} must be {scale_dtype} with shape {expected}, got "
                     f"{tensor.dtype} {tuple(tensor.shape)}."
                 )
+
+        for name in (
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            tensor = view.get(name)
+            if tensor is None:
+                continue
+            if tensor.device != act.hidden_states_q.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected "
+                    f"{act.hidden_states_q.device}."
+                )
+            if tensor.dtype != torch.float32:
+                raise TypeError(f"{name} must be float32, got {tensor.dtype}.")
+            if tuple(tensor.shape) != (self._num_weight_rows,):
+                raise ValueError(
+                    f"{name} must have shape ({self._num_weight_rows},), got "
+                    f"{tuple(tensor.shape)}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous.")
         return scale
 
     def pack_inputs(

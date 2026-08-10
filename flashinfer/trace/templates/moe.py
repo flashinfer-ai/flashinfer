@@ -1292,29 +1292,6 @@ trtllm_fp8_block_scale_moe_trace_dispatch.templates = [  # type: ignore[attr-def
 # ---------------------------------------------------------------------------
 
 
-# FP4 e2m1fn magnitudes. The 4-bit code is {sign(1), exponent(2), mantissa(1)};
-# this table maps the 16 possible nibble values to the corresponding float32
-# magnitude so dequantization is a single gather.
-_E2M1_LUT_VALUES = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
-
-
 @torch.no_grad()
 def _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
     """Unpack a uint8 tensor of packed e2m1fn FP4 values into float32.
@@ -1322,7 +1299,29 @@ def _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
     Each byte stores two 4-bit values (low nibble = first element along the
     last axis). The returned tensor has twice the last-dim size of *packed*.
     """
-    lut = torch.tensor(_E2M1_LUT_VALUES, dtype=torch.float32, device=packed.device)
+    # Keep the LUT local so serialized trace references remain standalone.
+    lut = torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.float32,
+        device=packed.device,
+    )
     p = packed.view(torch.uint8).to(torch.int64)
     lo = lut[p & 0x0F]
     hi = lut[(p >> 4) & 0x0F]
@@ -1449,14 +1448,14 @@ def _fp4_moe_run_experts(
     T = A.shape[0]
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
-    activation_type = normalize_activation_type(activation_type)
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Situ):
+    activation_type = int(activation_type)
+    swiglu, situ = 3, 10
+    if activation_type not in (swiglu, situ):
         raise ValueError(
-            "FP4 MoE trace reference supports "
-            f"{ActivationType.Swiglu!r} and {ActivationType.Situ!r}, "
-            f"got {activation_type!r}"
+            "FP4 MoE trace reference supports activation_type 3 (SwiGLU) "
+            f"and 10 (SiTU), got {activation_type}"
         )
-    if activation_type == ActivationType.Situ:
+    if activation_type == situ:
         for name, param in (
             ("gemm1_alpha", gemm1_alpha),
             ("gemm1_beta", gemm1_beta),
@@ -1489,7 +1488,7 @@ def _fp4_moe_run_experts(
             G1 = G1 + gemm1_bias[le].to(torch.float32)
         # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.
         x0, x1 = G1[:, :I], G1[:, I:]
-        if activation_type == ActivationType.Situ:
+        if activation_type == situ:
             alpha = (
                 torch.tensor(1.0, dtype=torch.float32, device=device)
                 if gemm1_alpha is None
@@ -1707,7 +1706,14 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
 
 cast(
     Any, _trtllm_fp4_block_scale_moe_ds_routing_reference
-)._trace_reference_dependencies = (_fp4_moe_run_experts,)
+)._trace_reference_dependencies = (
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+    _decode_block_scales,
+    _dequantize_fp4_tensor,
+    _dequantize_fp4_hidden_states,
+    _fp4_moe_run_experts,
+)
 
 
 @torch.no_grad()
@@ -2015,11 +2021,11 @@ def _moe_fp4_block_scale_init(
         on by default for parity with the test).
     Requires SM100+ at runtime; CPU smoke tests skip.
     """
-    activation_type = normalize_activation_type(activation_type)
+    activation_type = int(activation_type)
     situ_alpha = gemm1_alpha
     situ_beta = gemm1_beta
     situ_clamp = gemm1_clamp_limit
-    if activation_type == ActivationType.Situ:
+    if activation_type == 10:
         materialized: dict[str, torch.Tensor | None] = {}
         for name, value, default in (
             ("gemm1_alpha", gemm1_alpha, 1.0),
@@ -2208,6 +2214,7 @@ def _moe_fp4_block_scale_ds_shared_experts_init(
 
 
 cast(Any, _moe_fp4_block_scale_ds_shared_experts_init)._trace_init_dependencies = (
+    _moe_fp4_block_scale_init,
     _moe_fp4_block_scale_ds_init,
 )
 
@@ -2291,14 +2298,6 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     },
     inputs={
         **_FP4_STANDARD_INPUTS,
-        "num_fused_shared_experts": Scalar(
-            "int32",
-            description=(
-                "Number of fused shared experts appended after the routed "
-                "experts (weight rows num_experts + k, constant weight 1.0). "
-                "Only supported with DeepSeekV3 routing."
-            ),
-        ),
     },
     outputs=dict(_FP4_STANDARD_OUTPUTS),
     tags=_FP4_STANDARD_TAGS,

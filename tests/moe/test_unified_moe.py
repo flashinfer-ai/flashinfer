@@ -2657,15 +2657,15 @@ def test_every_registered_runner_defines_stable_extras():
 
 def test_cute_dsl_cache_key_extends_unified_fields():
     class Inner:
-        def get_cache_key_extras(self, _inputs):
-            return ("inner-option", 7)
+        use_fused_finalize = False
+        enable_pdl = True
 
     runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
     runner.config = _cache_key_config(CuteDslConfig(), QuantVariant.NVFP4)
     runner._inner = Inner()
 
     shared = MoERunner._cache_key_extras(runner)
-    assert runner.get_cache_key_extras([]) == shared + ("inner-option", 7)
+    assert runner.get_cache_key_extras([]) == shared + (False, True)
 
 
 def test_profiling_cache_key_file_key_separates_configs():

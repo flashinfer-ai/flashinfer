@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from flashinfer.trace.templates.moe import (
+    trtllm_fp4_block_scale_moe_ds_routing_trace as FP4_ROUTED,
+    trtllm_fp4_block_scale_moe_ds_shared_experts_trace as FP4_SHARED,
+    trtllm_fp4_block_scale_moe_trace_dispatch as FP4_DISPATCH,
     trtllm_fp8_block_scale_moe_ds_routing_trace as ROUTED,
     trtllm_fp8_block_scale_moe_ds_shared_experts_trace as SHARED,
     trtllm_fp8_block_scale_moe_trace_dispatch as DISPATCH,
@@ -18,6 +21,10 @@ FI_TRACE_OUT = Path(__file__).parent / "fi_trace_out"
 SHARED_JSON = (
     FI_TRACE_OUT
     / "moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048.json"
+)
+FP4_SHARED_JSON = (
+    FI_TRACE_OUT
+    / "moe_fp4_block_scale_ds_shared_experts_s1_e33_topk8_h256_i128_act3_ng8_kg4.json"
 )
 
 _DEEPSEEK_V3 = 2
@@ -287,3 +294,175 @@ def test_shared_expert_init_rejects_inconsistent_geometry():
             topk_group=4,
             top_k=8,
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. FP4 sibling trace
+# ---------------------------------------------------------------------------
+
+
+def _fp4_axes(**overrides):
+    axes = dict(
+        seq_len=8,
+        num_experts=32,
+        top_k=8,
+        hidden_size=1024,
+        intermediate_size=512,
+        activation_type=3,
+        n_group=8,
+        topk_group=4,
+    )
+    axes.update(overrides)
+    return axes
+
+
+def test_fp4_dispatch_selects_shared_sibling():
+    assert FP4_DISPATCH(routing_method_type=2, num_fused_shared_experts=1) is FP4_SHARED
+    assert FP4_DISPATCH(routing_method_type=2, num_fused_shared_experts=0) is FP4_ROUTED
+    assert FP4_SHARED in FP4_DISPATCH.templates
+    assert "num_fused_shared_experts" not in FP4_ROUTED.inputs
+
+
+def test_fp4_shared_name_records_s_and_preserves_routed_name():
+    routed = FP4_ROUTED.definition_name(_fp4_axes(num_local_experts=33))
+    shared = FP4_SHARED.definition_name(
+        _fp4_axes(num_weight_rows=33, num_fused_shared_experts=1)
+    )
+    assert routed != shared
+    assert "_s1_" in shared
+    assert "shared_experts" in shared
+
+
+def test_fp4_shared_init_rejects_inconsistent_geometry():
+    from flashinfer.trace.templates.moe import (
+        _moe_fp4_block_scale_ds_shared_experts_init as init,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent shared-expert definition"):
+        init(
+            seq_len=8,
+            num_weight_rows=33,
+            num_fused_shared_experts=2,
+            num_experts=32,
+            hidden_size=1024,
+            intermediate_size=512,
+            n_group=8,
+            topk_group=4,
+            top_k=8,
+        )
+
+
+@pytest.mark.skipif(
+    not FP4_SHARED_JSON.exists(), reason="FP4 shared-expert trace not generated"
+)
+def test_fp4_committed_shared_expert_init_runs_standalone():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    source = json.loads(FP4_SHARED_JSON.read_text())["init"]
+    namespace = _exec_in_fresh_namespace(source)
+    init = namespace["_moe_fp4_block_scale_ds_shared_experts_init"]
+    out = init(
+        seq_len=2,
+        num_weight_rows=9,
+        num_fused_shared_experts=1,
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        n_group=2,
+        topk_group=1,
+        top_k=2,
+    )
+    assert out["gemm1_weights"].shape[0] == 9
+    assert out["local_num_experts"] == 8
+    assert out["num_fused_shared_experts"] == 1
+
+
+@pytest.mark.skipif(
+    not FP4_SHARED_JSON.exists(), reason="FP4 shared-expert trace not generated"
+)
+def test_fp4_committed_shared_expert_reference_runs_standalone():
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    source = json.loads(FP4_SHARED_JSON.read_text())["reference"]
+    namespace = _exec_in_fresh_namespace(source)
+    reference = namespace["_trtllm_fp4_block_scale_moe_ds_routing_reference"]
+
+    T, H, I, E, S = 2, 256, 128, 8, 1
+    output = reference(
+        torch.randn(T, E, device="cuda"),
+        torch.zeros(E, dtype=torch.bfloat16, device="cuda"),
+        torch.zeros(T, H // 2, dtype=torch.uint8, device="cuda"),
+        torch.ones(T, H // 16, dtype=torch.float8_e4m3fn, device="cuda"),
+        torch.zeros(E + S, 2 * I, H // 2, dtype=torch.uint8, device="cuda"),
+        torch.ones(E + S, 2 * I, H // 16, dtype=torch.float8_e4m3fn, device="cuda"),
+        None,
+        torch.zeros(E + S, H, I // 2, dtype=torch.uint8, device="cuda"),
+        torch.ones(E + S, H, I // 16, dtype=torch.float8_e4m3fn, device="cuda"),
+        None,
+        2,
+        2,
+        1,
+        0,
+        2.5,
+        num_fused_shared_experts=S,
+    )
+    assert output.shape == (T, H)
+
+
+def test_fi_trace_emits_fp4_shared_expert_definition():
+    import torch
+
+    import flashinfer
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    T, H, I, E, S = 2, 256, 128, 8, 1
+    rows = E + S
+    ones = torch.ones(rows, dtype=torch.float32, device="cuda")
+    definition = flashinfer.fused_moe.trtllm_fp4_block_scale_moe.fi_trace(
+        routing_logits=torch.randn(T, E, dtype=torch.bfloat16, device="cuda"),
+        routing_bias=torch.zeros(E, dtype=torch.bfloat16, device="cuda"),
+        hidden_states=torch.zeros(T, H // 2, dtype=torch.uint8, device="cuda"),
+        hidden_states_scale=torch.ones(
+            T, H // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        gemm1_weights=torch.zeros(
+            rows, 2 * I, H // 2, dtype=torch.uint8, device="cuda"
+        ),
+        gemm1_weights_scale=torch.ones(
+            rows, 2 * I, H // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        gemm1_bias=None,
+        gemm1_alpha=ones,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=torch.zeros(rows, H, I // 2, dtype=torch.uint8, device="cuda"),
+        gemm2_weights_scale=torch.ones(
+            rows, H, I // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        gemm2_bias=None,
+        output1_scale_scalar=ones,
+        output1_scale_gate_scalar=ones,
+        output2_scale_scalar=ones,
+        num_experts=E,
+        top_k=2,
+        n_group=2,
+        topk_group=1,
+        intermediate_size=I,
+        local_expert_offset=0,
+        local_num_experts=E,
+        routed_scaling_factor=2.5,
+        routing_method_type=2,
+        num_fused_shared_experts=S,
+    )
+
+    assert definition["name"].startswith("moe_fp4_block_scale_ds_shared_experts")
+    assert definition["axes"]["num_experts"]["value"] == E
+    assert definition["axes"]["num_weight_rows"]["value"] == rows
+    assert definition["axes"]["num_fused_shared_experts"]["value"] == S
+    assert "num_local_experts" not in definition["axes"]

@@ -335,25 +335,22 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     )
 
 
-@pytest.mark.parametrize(
-    "variant,num_shared",
-    [
-        pytest.param(QuantVariant.NVFP4, 1, id="nvfp4-s1"),
-        pytest.param(QuantVariant.MXFP4, 2, id="mxfp4-s2"),
-        pytest.param(QuantVariant.W4A16, 1, id="w4a16-s1"),
-    ],
-)
-def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
-    """All FP4 contracts must forward routed E and physical E + S consistently."""
-    _xfail_w4a16_sm103(variant)
-    torch.manual_seed(42)
+def _make_fp4_shared_case(variant, num_shared, *, shared_scale=1.0):
     device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(42)
     num_tokens, hidden_size, intermediate_size = 8, 1024, 512
     num_experts, top_k = 8, 2
     num_weight_rows = num_experts + num_shared
 
     hidden_states = (
-        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+        torch.randn(
+            num_tokens,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.1
     )
     w1 = (
         torch.randn(
@@ -362,6 +359,7 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
+            generator=generator,
         )
         * 0.1
     )
@@ -372,9 +370,12 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
             intermediate_size,
             device=device,
             dtype=torch.bfloat16,
+            generator=generator,
         )
         * 0.1
     )
+    w1[num_experts:] *= shared_scale
+    w2[num_experts:] *= shared_scale
     hidden_states_q, hidden_states_scale = TrtllmFp4Config.prepare_activations(
         hidden_states, variant=variant
     )
@@ -391,7 +392,11 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
     weights.prepare_for("trtllm_fp4_routed", view)
 
     routing_logits = torch.randn(
-        num_tokens, num_experts, device=device, dtype=torch.bfloat16
+        num_tokens,
+        num_experts,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
     )
     routing_bias = torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
     act = MoEActivationPack(
@@ -419,13 +424,30 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
     )
+    return act, weights, config, view, (routing_logits, routing_bias)
 
-    actual = MoELayer(config, device=device)(act, weights).clone()
+
+@pytest.mark.parametrize(
+    "variant,num_shared",
+    [
+        pytest.param(QuantVariant.NVFP4, 1, id="nvfp4-s1"),
+        pytest.param(QuantVariant.MXFP4, 2, id="mxfp4-s2"),
+        pytest.param(QuantVariant.W4A16, 1, id="w4a16-s1"),
+    ],
+)
+def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
+    """All FP4 contracts must forward routed E and physical E + S consistently."""
+    _xfail_w4a16_sm103(variant)
+    act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
+        variant, num_shared
+    )
+
+    actual = MoELayer(config, device=torch.device("cuda"))(act, weights).clone()
     expected = trtllm_fp4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=routing_bias,
-        hidden_states=hidden_states_q,
-        hidden_states_scale=hidden_states_scale,
+        hidden_states=act.hidden_states_q,
+        hidden_states_scale=act.hidden_states_scale,
         gemm1_weights=view["gemm1_weights"],
         gemm1_weights_scale=view["gemm1_weights_scale"],
         gemm1_bias=None,
@@ -438,19 +460,96 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
         output1_scale_scalar=view.get("output1_scale_scalar"),
         output1_scale_gate_scalar=view.get("output1_scale_gate_scalar"),
         output2_scale_scalar=view.get("output2_scale_scalar"),
-        num_experts=num_experts,
-        top_k=top_k,
+        num_experts=config.routing.num_experts,
+        top_k=config.routing.top_k,
         n_group=2,
         topk_group=1,
-        intermediate_size=intermediate_size,
+        intermediate_size=config.experts.intermediate_size,
         local_expert_offset=0,
-        local_num_experts=num_experts,
+        local_num_experts=config.routing.num_experts,
         routed_scaling_factor=2.5,
         routing_method_type=RoutingMethodType.DeepSeekV3,
-        tune_max_num_tokens=num_tokens,
+        tune_max_num_tokens=act.num_tokens,
         num_fused_shared_experts=num_shared,
     )[0]
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
+
+
+def test_trtllm_fp4_fused_shared_experts_contribute():
+    live_act, live_weights, live_config, _, _ = _make_fp4_shared_case(
+        QuantVariant.NVFP4, 1
+    )
+    live = MoELayer(live_config)(live_act, live_weights).clone()
+
+    muted_act, muted_weights, muted_config, _, _ = _make_fp4_shared_case(
+        QuantVariant.NVFP4, 1, shared_scale=0.0
+    )
+    muted = MoELayer(muted_config)(muted_act, muted_weights).clone()
+
+    rel = (live.float() - muted.float()).abs().max() / (
+        muted.float().abs().max() + 1e-6
+    )
+    assert rel > 0.1, (
+        f"zeroing the shared row moved the output by only {rel:.4f}; "
+        "the shared expert is not being applied."
+    )
+
+
+def test_trtllm_fp4_fused_shared_experts_cuda_graph_replay():
+    act, weights, config, _, _ = _make_fp4_shared_case(QuantVariant.NVFP4, 1)
+    layer = MoELayer(config)
+    eager = layer(act, weights).clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = layer(act, weights)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured, eager, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "gemm1_alpha",
+        "gemm1_beta",
+        "gemm1_clamp_limit",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    ],
+)
+def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
+    T, H, I, rows = 2, 256, 128, 9
+    runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+    runner._variant = QuantVariant.NVFP4
+    runner._num_weight_rows = rows
+    runner._intermediate_size = I
+    act = MoEActivationPack(
+        hidden_states_q=torch.zeros(T, H // 2, dtype=torch.uint8, device="cuda"),
+        hidden_states_scale=torch.ones(
+            T, H // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        topk_ids=torch.zeros(T, 2, dtype=torch.int32, device="cuda"),
+        topk_weights=torch.ones(T, 2, dtype=torch.float32, device="cuda"),
+    )
+    view = {
+        "gemm1_weights": torch.zeros(
+            rows, 2 * I, H // 2, dtype=torch.uint8, device="cuda"
+        ),
+        "gemm1_weights_scale": torch.ones(
+            rows, 2 * I, H // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        "gemm2_weights": torch.zeros(rows, H, I // 2, dtype=torch.uint8, device="cuda"),
+        "gemm2_weights_scale": torch.ones(
+            rows, H, I // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        name: torch.ones(rows - 1, dtype=torch.float32, device="cuda"),
+    }
+
+    with pytest.raises(ValueError, match=rf"{name} must have shape \({rows},\)"):
+        runner._validate_fp4_tensors(act, view, H)
 
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
