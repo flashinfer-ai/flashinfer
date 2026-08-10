@@ -40,8 +40,8 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
               Optional<TensorView> maybe_lengths, Optional<TensorView> maybe_workspace_buffer,
               int64_t top_k, int64_t tie_break);
 
-int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_lengths,
-                                int64_t top_k, int64_t tie_break);
+int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_lengths, int64_t top_k,
+                                int64_t tie_break);
 
 // Radix-based Top-K selection
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk, radix_topk);
