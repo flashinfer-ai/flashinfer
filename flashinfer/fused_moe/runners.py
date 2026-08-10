@@ -253,6 +253,10 @@ class _CutlassRunnerBase(MoERunner):
     _use_w4_group_scaling: ClassVar[bool]
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
+    # Keep top-k tactics per GEMM stage, then return their Cartesian product as
+    # compound candidates for the outer end-to-end autotuner. k=1 preserves the
+    # legacy independent-winner behavior.
+    _stage_tactic_top_k: ClassVar[int] = 2
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -358,37 +362,41 @@ class _CutlassRunnerBase(MoERunner):
         self._require_built()
         self._validate_input_count(inputs)
         # The two GEMMs have independent tactic spaces. Preserve the legacy
-        # O(n1+n2) tuning flow, then let the outer unified tuner profile only
-        # the selected pair as one full-MoE candidate.
-        # FIXME: get_valid_tactics() is supposed to list candidates, but the
-        # autotuner cannot express multi-stage / factorized tactics yet, so we
-        # nest choose_one() per GEMM and return one compound winner. Refine the
-        # autotuner to own staged tuning instead of selecting winners here.
+        # O(n1+n2) stage search, keep the top-k tactics per stage, then let the
+        # outer unified tuner profile only the k² compound pairs end-to-end.
+        # FIXME: Prefer a first-class factorized/multi-stage autotuner API so
+        # runners do not need to nest stage ranking inside get_valid_tactics().
         tuner = AutoTuner.get()
         profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
         stage_tuning_config = TuningConfig()
+        top_k = self._stage_tactic_top_k
         try:
             self._inner.gemm_idx_for_tuning = 1
-            _, gemm1 = tuner.choose_one(
+            gemm1_tactics = tuner.rank_tactics(
                 f"moe_{self.backend_key}_sm{self._device_arch}_gemm1",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
+                k=top_k,
                 gemm_idx=1,
             )
             self._inner.gemm_idx_for_tuning = 2
-            _, gemm2 = tuner.choose_one(
+            gemm2_tactics = tuner.rank_tactics(
                 f"moe_{self.backend_key}_sm{self._device_arch}_gemm2",
                 [self._inner],
                 stage_tuning_config,
                 profile_inputs,
+                k=top_k,
                 gemm_idx=2,
             )
         finally:
             self._inner.gemm_idx_for_tuning = None
-        if gemm1 is None or gemm2 is None:
-            return [-1]
-        return [(int(gemm1), int(gemm2))]
+        pairs = [
+            (int(gemm1), int(gemm2))
+            for gemm1 in gemm1_tactics
+            for gemm2 in gemm2_tactics
+        ]
+        return pairs if pairs else [-1]
 
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
         max_num_tokens = self.config.execution.tune_max_num_tokens

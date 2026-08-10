@@ -1721,6 +1721,127 @@ class AutoTuner:
 
             return runners[runner_id], tactic
 
+    def rank_tactics(
+        self,
+        custom_op: str,
+        runners: list[TunableRunner],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor],
+        k: int = 1,
+        **kwargs,
+    ) -> list[Any]:
+        """Return up to ``k`` tactics for ``runners[0]``, ordered best-first.
+
+        Outside tuning mode (or when ``k == 1``), this matches ``choose_one``
+        and returns a single cached / fallback tactic. During tuning with
+        ``k > 1``, every valid tactic is profiled once; the winner is cached
+        under the same key as ``choose_one``, and the top ``k`` by measured
+        time are returned for callers that need a shortlist (e.g. multi-stage
+        compound-tactic refinement).
+        """
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        if not runners:
+            raise ValueError(f"No runners provided for op '{custom_op}'")
+
+        if k == 1 or not self.is_tuning_mode:
+            _, tactic = self.choose_one(
+                custom_op, runners, tuning_config, inputs, **kwargs
+            )
+            return [-1 if tactic is None else tactic]
+
+        if custom_op in self._effective_skip_ops:
+            logger.debug(
+                f"[AutoTuner]: Skipping ranking for '{custom_op}' "
+                f"(in skip_ops). Using fallback tactic."
+            )
+            return [-1]
+
+        with self._lock:
+            if self._override_tuning_buckets is not None or self._override_round_up:
+                tuning_config = self._apply_tuning_overrides(tuning_config)
+
+            input_shapes = tuple(self._get_input_sizes(inputs))
+            profiles = self._generate_optimization_profiles(tuning_config, inputs)
+            runner = runners[0]
+            runner_arg_names = {
+                param.name
+                for param in inspect.signature(runner.forward).parameters.values()
+            }
+
+            # Rank against the profile nearest the caller's shapes. Stage
+            # shortlists are used as candidates for one outer shape, so a
+            # single representative profile is enough.
+            profile = profiles[0]
+            for candidate in profiles:
+                if candidate.get_opt_shapes() == input_shapes:
+                    profile = candidate
+                    break
+
+            is_cache_hit, _, cached_tactic, _ = self.search_cache(
+                custom_op,
+                runners,
+                profile.get_opt_shapes(),
+                tuning_config,
+                inputs=inputs,
+            )
+            if is_cache_hit:
+                # Warm stage cache: keep choose_one compatibility and skip
+                # re-profiling. Top-k shortlists are produced on cache miss.
+                return [-1 if cached_tactic is None else cached_tactic]
+
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = list(tuning_config.inputs_pre_hook(tensors))
+
+            valid_tactics = runner.get_valid_tactics(tensors, profile)
+            valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+            if not valid_tactics:
+                return [-1]
+
+            if "do_preparation" in runner_arg_names:
+                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
+
+            scored: list[tuple[float, Any]] = []
+            for tac in valid_tactics:
+                try:
+                    time_measured = self._profile_single_kernel(
+                        runner, tensors, tac, tuning_config, **kwargs
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[Autotuner]: Skipping tactic {runner} {tac} while "
+                        f"ranking {custom_op}: {e}"
+                    )
+                    with contextlib.suppress(Exception):
+                        torch.cuda.synchronize()
+                    with contextlib.suppress(Exception):
+                        torch.cuda.cudart().cudaGetLastError()
+                    time_measured = float("inf")
+                scored.append((time_measured, tac))
+
+            scored.sort(key=lambda item: item[0])
+            ranked = [
+                tac for time_measured, tac in scored if time_measured < float("inf")
+            ]
+            if not ranked:
+                return [-1]
+
+            # Populate the choose_one cache with the winner so stage lookups
+            # remain consistent between rank_tactics and choose_one.
+            cache_key = AutoTuner._get_cache_key(
+                custom_op,
+                runner,
+                profile.get_opt_shapes(),
+                tuning_config,
+                runner.get_cache_key_extras(tensors),
+            )
+            self.profiling_cache[cache_key] = (ranked[0], profile)
+            self._dirty = True
+            self._dirty_seq += 1
+
+            return ranked[:k]
+
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""
         return tuple(

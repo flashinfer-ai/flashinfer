@@ -519,9 +519,13 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
-            self.calls.append((custom_op, kwargs["gemm_idx"]))
-            return runners[0], 3 if kwargs["gemm_idx"] == 1 else 9
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            self.calls.append((custom_op, kwargs["gemm_idx"], k))
+            if kwargs["gemm_idx"] == 1:
+                return [3, 5][:k]
+            return [9, 7][:k]
 
     class Inner:
         gemm_idx_for_tuning = None
@@ -532,16 +536,37 @@ def test_cutlass_tunes_gemm_stages_independently(monkeypatch):
     runner._inner = Inner()
     runner._built = True
     runner._device_arch = 100
+    runner._stage_tactic_top_k = 2
     inputs = [torch.empty(1) for _ in range(6)]
 
     tactics = runner.get_valid_tactics(inputs, None)
 
-    assert tactics == [(3, 9)]
+    assert tactics == [(3, 9), (3, 7), (5, 9), (5, 7)]
     assert tuner.calls == [
-        ("moe_cutlass_bf16_sm100_gemm1", 1),
-        ("moe_cutlass_bf16_sm100_gemm2", 2),
+        ("moe_cutlass_bf16_sm100_gemm1", 1, 2),
+        ("moe_cutlass_bf16_sm100_gemm2", 2, 2),
     ]
     assert runner._inner.gemm_idx_for_tuning is None
+
+
+def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
+    class RecordingTuner:
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            return [3] if kwargs["gemm_idx"] == 1 else [9]
+
+    monkeypatch.setattr(
+        AutoTuner, "get", classmethod(lambda cls: RecordingTuner())
+    )
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner._inner = type("Inner", (), {"gemm_idx_for_tuning": None})()
+    runner._built = True
+    runner._device_arch = 100
+    runner._stage_tactic_top_k = 1
+    inputs = [torch.empty(1) for _ in range(6)]
+
+    assert runner.get_valid_tactics(inputs, None) == [(3, 9)]
 
 
 def test_cutlass_outer_cache_key_includes_enable_pdl():
