@@ -37,12 +37,14 @@ USER $USERNAME
 WORKDIR /home/$USERNAME
 
 # Install python
+ENV FLASHINFER_PYTHON_ENV=flashinfer
+COPY .python-version /install/.python-version
 COPY docker/install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh /home/$USERNAME/conda py310
+RUN bash /install/install_python.sh /home/$USERNAME/conda "$FLASHINFER_PYTHON_ENV" /install/.python-version
 
-RUN echo "source activate py310" >> ~/.bashrc
+RUN echo "source activate ${FLASHINFER_PYTHON_ENV}" >> ~/.bashrc
 ENV PATH="/home/$USERNAME/conda/bin:$PATH"
-ENV PATH="/home/$USERNAME/conda/envs/py310/bin:$PATH"
+ENV PATH="/home/$USERNAME/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 
 # Install torch and other python packages
 # TODO: update cu130 -> cu131 when PyTorch starts publishing cu131 wheels
@@ -54,7 +56,7 @@ RUN bash /install/install_python_packages.sh cu130 && pip3 install pre-commit
 RUN pip install tilelang cuda-tile
 
 # Install mpi4py in the conda environment
-RUN conda install -n py310 -y mpi4py mpich
+RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
 # Install oh-my-zsh
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended

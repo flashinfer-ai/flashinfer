@@ -9,18 +9,20 @@ RUN apt-get update && apt-get install -y \
     wget
 
 # Install python
+ENV FLASHINFER_PYTHON_ENV=flashinfer
+COPY .python-version /install/.python-version
 COPY docker/install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh /opt/conda py310
+RUN bash /install/install_python.sh /opt/conda "$FLASHINFER_PYTHON_ENV" /install/.python-version
 
 # Set home directory
 WORKDIR /workspace
 
-RUN echo "source activate py310" >> ~/.bashrc
+RUN echo "source activate ${FLASHINFER_PYTHON_ENV}" >> ~/.bashrc
 ENV PATH="/opt/conda/bin:$PATH"
-ENV PATH="/opt/conda/envs/py310/bin:$PATH"
+ENV PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/bin:$PATH"
 
 # Set LD_LIBRARY_PATH to ensure pip-installed nvidia-cublas takes precedence over system libraries
-ENV LD_LIBRARY_PATH="/opt/conda/envs/py310/lib/python3.10/site-packages/nvidia/cu13/lib/:$LD_LIBRARY_PATH"
+ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packages/nvidia/cu13/lib/:$LD_LIBRARY_PATH"
 
 # Triton
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
@@ -35,7 +37,7 @@ RUN bash /install/install_python_packages.sh cu130
 RUN pip install tilelang cuda-tile
 
 # Install mpi4py in the conda environment
-RUN conda install -n py310 -y mpi4py mpich
+RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
 # Configure pip for user-site installations (allows arbitrary users to install packages)
 # This enables 'pip install --user' and 'pip install -e .' to work for any user

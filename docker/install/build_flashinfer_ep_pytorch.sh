@@ -81,7 +81,7 @@ echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
 cd "${FI_SRC}"
 # --no-build-isolation makes pyproject's [build-system] requires OUR job:
 # setuptools>=77 (PEP 639 SPDX `license = "Apache-2.0"`), packaging>=24, and
-# apache-tvm-ffi. The flashinfer-ci conda py310 image ships an older
+# apache-tvm-ffi. The flashinfer-ci Conda environment ships an older
 # setuptools that fails metadata generation on the SPDX license string
 # without this upgrade.
 PIP_CONSTRAINT="" pip install --no-cache-dir -U \

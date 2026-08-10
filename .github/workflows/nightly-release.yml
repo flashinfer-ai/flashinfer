@@ -57,7 +57,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -92,7 +92,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Install build dependencies
         run: |
@@ -369,7 +369,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Download all JIT cache reports
         uses: actions/download-artifact@v4
@@ -418,7 +418,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
         run: |
