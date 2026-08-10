@@ -307,11 +307,7 @@ class MoERunner(TunableRunner):
             # Declared quant flags are keyed before runners begin consuming them.
             self.config.quant.per_token_scale,
             self.config.quant.swizzled_scale_factors,
-        ) + tuple(self._backend_cache_key_parts())
-
-    def _backend_cache_key_parts(self) -> tuple:
-        """Return backend-specific tactic inputs not covered by the shared key."""
-        return ()
+        )
 
     def __hash__(self) -> int:
         return hash(self._cache_key_extras())
@@ -697,11 +693,11 @@ class _CutlassRunnerBase(MoERunner):
         )
         return inputs[0]
 
-    def __hash__(self):
-        return hash((self.backend_key, self.config, self._device_arch))
-
-    def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
-        return (self._device_arch, self._enable_pdl)
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + (
+            self._device_arch,
+            self._enable_pdl,
+        )
 
 
 class CutlassBf16Runner(_CutlassRunnerBase):
@@ -881,8 +877,8 @@ class CuteDslNvfp4Runner(MoERunner):
         self._require_built()
         return self._inner.get_valid_tactics(inputs, profile)
 
-    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return self._inner.get_cache_key_extras(inputs)
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + tuple(self._inner.get_cache_key_extras([]))
 
     def forward(
         self,

@@ -2648,18 +2648,24 @@ def test_cache_key_extras_are_str_stable(runner_cls, backend_cfg, variant, alt_v
 
 
 def test_every_registered_runner_defines_stable_extras():
-    """No unified runner may fall back to the empty default.
-
-    A backend that inherits ``get_cache_key_extras() -> ()`` from
-    ``TunableRunner`` keys its on-disk cache on the profile alone, which cannot
-    see the expert geometry.
-    """
+    """Every runner must use the unified in-memory and persisted-key entrypoints."""
     assert _BACKEND_RUNNERS, "no unified runners registered"
     for runner_cls in set(_BACKEND_RUNNERS.values()):
-        assert "_cache_key_extras" in dir(runner_cls), (
-            f"{runner_cls.__name__} does not inherit the unified cache-key "
-            "contract from MoERunner."
-        )
+        assert runner_cls.__hash__ is MoERunner.__hash__
+        assert runner_cls.get_cache_key_extras is MoERunner.get_cache_key_extras
+
+
+def test_cute_dsl_cache_key_extends_unified_fields():
+    class Inner:
+        def get_cache_key_extras(self, _inputs):
+            return ("inner-option", 7)
+
+    runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+    runner.config = _cache_key_config(CuteDslConfig(), QuantVariant.NVFP4)
+    runner._inner = Inner()
+
+    shared = MoERunner._cache_key_extras(runner)
+    assert runner.get_cache_key_extras([]) == shared + ("inner-option", 7)
 
 
 def test_profiling_cache_key_file_key_separates_configs():

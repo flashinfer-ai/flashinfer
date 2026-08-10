@@ -569,6 +569,7 @@ def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
 
 def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config()
     runner._device_arch = 90
     runner._enable_pdl = False
     without_pdl = runner.get_cache_key_extras([])
@@ -576,8 +577,9 @@ def test_cutlass_outer_cache_key_includes_enable_pdl():
     runner._enable_pdl = True
     with_pdl = runner.get_cache_key_extras([])
 
-    assert without_pdl == (90, False)
-    assert with_pdl == (90, True)
+    assert without_pdl[-2:] == (90, False)
+    assert with_pdl[-2:] == (90, True)
+    assert without_pdl[:-2] == with_pdl[:-2]
 
 
 def test_cutlass_direct_runner_rejects_tokens_above_tuning_ceiling():
