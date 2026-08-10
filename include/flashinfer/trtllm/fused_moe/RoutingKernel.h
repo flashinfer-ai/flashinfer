@@ -40,6 +40,19 @@ struct PackedScoreIdx {
 struct DataBase {
   bool mUsePdl{false};
 
+  // Opt-in: give each CTA of the cooperative routing kernel one contiguous
+  // range of expanded indices instead of a grid stride. Rows of an expert then
+  // arrive in a few narrow token windows, so a downstream grouped-GEMM tile
+  // gathers from a bounded slice of the activation tensor instead of the whole
+  // token range. Measured on B200 (hidden 6144, 256 experts, top_k 8, 32 local,
+  // tile 256): distinct 2 MiB pages touched per GEMM1 tile drops from 190 to 30
+  // at 128K tokens, making GEMM1 1.33-1.42x faster and the fused-MoE pipeline
+  // 1.15-1.17x faster. The effect only appears once the gather working set
+  // outgrows the uTLB, so callers should enable it only for large batches; it
+  // is neutral-to-negative below ~64K tokens. Only the cooperative kernel
+  // honours this flag -- the block, cluster and multi-kernel paths ignore it.
+  bool mUseContiguousRouteWindows{false};
+
   // optional: only used as an intermediate buffer when the number of tokens is large.
   // dim: max([2*NumThreads] = [512], mNumExperts*2)
   int32_t* mPtrExpertCounts{nullptr};
@@ -157,11 +170,14 @@ struct KernelParamsBase {
 
   // NOTE: placed at end to preserve field offsets for existing routing kernels
   int16_t* mPtrRoutingReplayOut = nullptr;
+  // See DataBase::mUseContiguousRouteWindows. Appended for the same reason.
+  bool mUseContiguousRouteWindows = false;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
   void setBaseParams(DataType const& data) {
     mUsePdl = data.mUsePdl;
+    mUseContiguousRouteWindows = data.mUseContiguousRouteWindows;
     mIsPow2 = data.mPaddingLog2 > 0;
     mPtrExpertCounts = data.mPtrExpertCounts;
     mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
