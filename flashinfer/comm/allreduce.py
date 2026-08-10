@@ -947,10 +947,11 @@ def allreduce_fusion(
                     "norm_out is required for kARResidualRMSNormOutDynamicFP8Quant"
                 )
 
-        # Dynamic FP8 patterns do not materialize allreduce_out, so avoid
-        # allocating an unused tensor. This keeps the preallocated dynamic path
-        # compatible with CUDA Graph capture.
-        if output is None and pattern not in dynamic_fp8_patterns:
+        # Only the plain all-reduce pattern materializes ``allreduce_out``.
+        # Fused RMSNorm/quantization patterns have HasAllReduceOut=false in the
+        # kernel traits, so keep the optional output unset unless the caller
+        # explicitly supplied one.
+        if output is None and pattern == AllReduceFusionPattern.kAllReduce:
             output = torch.empty_like(input)
 
         # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
