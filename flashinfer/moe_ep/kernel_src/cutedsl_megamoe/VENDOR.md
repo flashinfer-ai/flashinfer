@@ -26,18 +26,25 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
-- `src/src/inputs_process.py` and `src/common/host_utils.py` are synced
-  **ahead** of the recorded drop, to upstream commit
-  `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
-  (<https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/tree/50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab>),
+- `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
+  upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
+  (<https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/blob/50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab/src/inputs_process.py>),
   taken 2026-08-10: the kernel team's fix for the fused activation-quant
   staging breaking on CuTe-DSL 4.7 (mxfp8 path reworked so each lane owns one
   contiguous 16-byte fp8 store, lane pairs reduce the 32-element block amax
   via shuffle; plus a hidden-size row-alignment guard in `__init__`).
-  `host_utils.py` rides along because the file's self-test harness imports
-  its `mxfp8_quantize_per_block_32_row` reference quantizer (additive change,
-  no dependents beyond the harness). Resolves at the next full re-sync once
-  the tree moves past that commit.
+  ONLY this one file is ahead: at that commit upstream also renamed
+  `common/host_utils.py`'s `mxfp8_quantize_per_block_32` to `..._row`, and
+  pulling that file forward breaks the rest of the recorded drop (shim
+  `kernel_helpers`, `mega_reference*.py` — the rename ripples through
+  `mega_reference.py`'s changed return signature into the runners). Known
+  cost: the harness at the bottom of `inputs_process.py`
+  (`python -m src.inputs_process`) fails its **mxfp8** case with an
+  ImportError against the recorded-drop `host_utils` — the nvfp4 cases and
+  every shim/kernel path are unaffected (the kernel code imports
+  `host_utils` nowhere). The harness was validated green (3/3 cases, dsl
+  4.6.1 + 4.7.0) with the newer `host_utils` before this was understood.
+  Resolves at the next full re-sync once the tree moves past that commit.
 
 ## Related trees
 
