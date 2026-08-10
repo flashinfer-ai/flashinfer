@@ -632,6 +632,14 @@ class TraceTemplate:
 
             return extractor
 
+        def _make_fixed_extractor(
+            value: int,
+        ) -> Callable[[Dict[str, Any]], Optional[int]]:
+            def extractor(_kw: Dict[str, Any]) -> Optional[int]:
+                return value
+
+            return extractor
+
         def _tensor_source(
             axis_name: str, allow_optional: bool
         ) -> Optional[Callable[[Dict[str, Any]], Optional[int]]]:
@@ -650,10 +658,10 @@ class TraceTemplate:
 
         for axis_name in self.axes:
             marker = self.axes[axis_name]
+            extractor: Optional[Callable[[Dict[str, Any]], Optional[int]]]
             # 0. Explicitly fixed Const, independent of runtime arguments.
             if isinstance(marker, Const) and marker.value is not None:
-                fixed_value = marker.value
-                extractor = lambda _kwargs, value=fixed_value: value
+                extractor = _make_fixed_extractor(marker.value)
             else:
                 extractor = None
             # 1. Required tensor whose shape carries the axis.
