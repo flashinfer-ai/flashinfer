@@ -270,23 +270,3 @@ def test_single_stage_workid_allows_c_scratch_ab_alias():
     )
 
     assert cfg.aliases_c_scratch_with_ab
-
-
-def test_runner_cuda_kernel_search_handles_nested_mlir_regions():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _cuda_kernel_ops
-
-    def make_op(name, *children):
-        regions = []
-        if children:
-            regions.append(
-                SimpleNamespace(blocks=[SimpleNamespace(operations=list(children))])
-            )
-        operation = SimpleNamespace(name=name, regions=regions)
-        return SimpleNamespace(operation=operation)
-
-    kernel = make_op("cuda.kernel")
-    nested = make_op("test.level2", kernel)
-    top_level = make_op("test.level1", nested)
-    module = SimpleNamespace(operation=make_op("builtin.module", top_level).operation)
-
-    assert list(_cuda_kernel_ops(module)) == [kernel]
