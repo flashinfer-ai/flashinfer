@@ -57,6 +57,11 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
+            # The drop's own shim bound (kernel_src/cutedsl_megamoe/shim/
+            # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
+            # SF-word 128 default. 32 covers hidden here; the stricter
+            # intermediate bound is enforced below.
+            alignment=32,
         )
         if fleet_params.token_hidden_size % 32:
             raise ValueError("BF16 MegaMoE requires hidden size divisible by 32.")
