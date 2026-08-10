@@ -5767,8 +5767,7 @@ def _cutlass_gemm_fp4_requirement(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if _is_per_token_alpha(alpha) and get_compute_capability(a.device)[0] != 12:
         raise ValueError(
-            "The CUTLASS FP4 GEMM backend only supports per-token alpha on "
-            "SM120/SM121."
+            "The CUTLASS FP4 GEMM backend only supports per-token alpha on SM120/SM121."
         )
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
@@ -6329,6 +6328,9 @@ def _b12x_gemm_fp4_runner(
             sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
+            # The b12x kernel reads alpha at the global row index under both
+            # swap_ab settings, so the vector always walks M.
+            alpha_mode = "m" if per_token_alpha else None
             cache_key = (
                 sf_vec_size,
                 mma_tiler_mn,
@@ -6339,7 +6341,7 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
                 enable_pdl,
                 out_dtype,
-                per_token_alpha,
+                alpha_mode,
             )
 
             # ctor takes mma_k/tile_k/single_work_tile_per_cta before use_prefetch,
@@ -6371,7 +6373,7 @@ def _b12x_gemm_fp4_runner(
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=batch_size,
-                per_token_alpha=per_token_alpha,
+                per_token_alpha=alpha_mode,
             )
 
             alpha_for_launch = (

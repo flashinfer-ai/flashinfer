@@ -256,7 +256,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;                                                 \
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;                                        \
     /* Runtime-strided alpha: one instantiation serves the per-tensor scale    */                                    \
-    /* and a per-token vector. SwapAB puts the tokens on N.                     */                                    \
+    /* and a per-token vector. SwapAB puts the tokens on N.                     */                                   \
     using FusionOperation = std::conditional_t<                                                                      \
         SWAP_AB_, cutlass::epilogue::fusion::PerColScaledAcc<OutElementType, float, float>,                          \
         cutlass::epilogue::fusion::PerRowScaledAcc<OutElementType, float, float>>;                                   \
