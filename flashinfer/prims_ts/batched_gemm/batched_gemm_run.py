@@ -2357,9 +2357,30 @@ def reference_check(
                 return False, c_logical.detach().clone()
             return False
 
+    # Routed MoE kernels are only required to write rows/columns that map to
+    # real tokens. Expert padding remains outside the observable output, so do
+    # not treat unspecified padding values as correctness failures.
+    active_route_mask = torch.tensor(
+        [expert_idx >= 0 for expert_idx in token_layout.expanded_to_expert],
+        dtype=torch.bool,
+        device=device,
+    )
+
+    def _active_routes(output):
+        token_dim = 1 if cfg.is_swap_ab else 0
+        if output.shape[token_dim] != active_route_mask.numel():
+            raise AssertionError(
+                "output token extent does not match routed metadata: "
+                f"{output.shape[token_dim]} != {active_route_mask.numel()}"
+            )
+        if cfg.is_swap_ab:
+            return output[:, active_route_mask]
+        return output[active_route_mask, :]
+
     # --- PyTorch reference ---
-    has_nan = torch.isnan(c_logical).any().item()
-    has_inf = torch.isinf(c_logical).any().item()
+    c_active = _active_routes(c_logical)
+    has_nan = torch.isnan(c_active).any().item()
+    has_inf = torch.isinf(c_active).any().item()
 
     def _return(result):
         if return_output:
@@ -2368,7 +2389,7 @@ def reference_check(
 
     if has_nan or has_inf:
         print(f"FAIL: output has NaN={has_nan}, Inf={has_inf}")
-        bad_mask = torch.isnan(c_logical) | torch.isinf(c_logical)
+        bad_mask = torch.isnan(c_active) | torch.isinf(c_active)
         bad_count = bad_mask.sum().item()
         bad_indices = bad_mask.nonzero(as_tuple=False)[:8].detach().cpu().tolist()
         print(f"Bad value count: {bad_count}, first indices: {bad_indices}")
@@ -2646,11 +2667,13 @@ def reference_check(
             )
             return _return(False)
 
-    diff = (c_compare.float() - ref_torch.float()).abs()
+    c_compare_active = _active_routes(c_compare)
+    ref_active = _active_routes(ref_torch)
+    diff = (c_compare_active.float() - ref_active.float()).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
-    ref_max = ref_torch.float().abs().max().item()
-    out_max = c_compare.float().abs().max().item()
+    ref_max = ref_active.float().abs().max().item()
+    out_max = c_compare_active.float().abs().max().item()
     print(
         f"Reference comparison: max_abs={max_abs:.6f}, "
         f"mean_abs={mean_abs:.6f}, ref_max={ref_max:.6f}"
@@ -2670,8 +2693,12 @@ def reference_check(
             dst_in_block = indices[src_in_block]
             unshuffle_idx[block_idx * block_size + dst_in_block] = mi
         inv_ref = ref_torch[unshuffle_idx, :]
-        shuffled_diff = (c_compare.float() - shuffled_ref.float()).abs()
-        inv_diff = (c_compare.float() - inv_ref.float()).abs()
+        shuffled_diff = (
+            c_compare_active.float() - _active_routes(shuffled_ref).float()
+        ).abs()
+        inv_diff = (
+            c_compare_active.float() - _active_routes(inv_ref).float()
+        ).abs()
         print(
             "CastA row-diagnostic: "
             f"shuffled_max={shuffled_diff.max().item():.6f}, "
