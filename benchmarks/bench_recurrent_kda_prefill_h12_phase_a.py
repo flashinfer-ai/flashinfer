@@ -55,6 +55,8 @@ from kda_h12_evidence import (
     GRAPH_TEST_NODE_ID,
     GRAPH_TEST_SOURCE,
     GRAPH_TEST_SOURCE_LINE_RANGE,
+    PHASE_A_MEASUREMENT_CONTRACT,
+    REQUIRED_CANDIDATE_SOURCE_PATHS,
     CpuBracket,
     EvidencePreset,
     GpuActivity,
@@ -160,19 +162,7 @@ def _candidate_provenance(stack: SimpleNamespace) -> dict:
                 f"{name} must be imported from the verified FlashInfer "
                 f"worktree: module={path}, worktree={REPOSITORY_ROOT}"
             )
-    source_paths = (
-        Path("flashinfer/kda.py"),
-        Path("flashinfer/kda_prefill.py"),
-        Path("csrc/kda/flashkda_binding_common.cuh"),
-        Path("csrc/kda/flashkda_bf16_fused_m128_binding.cu"),
-        Path("csrc/kda/flashkda_bf16_fused_m128.cu"),
-        Path("benchmarks/bench_recurrent_kda_prefill_h12_phase_a.py"),
-        Path("benchmarks/build_flash_kda_phase_a.py"),
-        Path("benchmarks/kda_h12_evidence.py"),
-        Path("benchmarks/presets/recurrent_kda_prefill_h12_phase_a.json"),
-        Path("benchmarks/reduce_kda_h12_phase_a.py"),
-        Path(GRAPH_TEST_SOURCE),
-    )
+    source_paths = tuple(Path(path) for path in REQUIRED_CANDIDATE_SOURCE_PATHS)
     return {
         "repository": "https://github.com/flashinfer-ai/flashinfer.git",
         "source_dir": str(REPOSITORY_ROOT),
@@ -771,7 +761,11 @@ def _assert_bf16_close(torch, *, label: str, actual, expected) -> dict:
         actual = actual.to(torch.bfloat16)
     if expected.dtype != torch.bfloat16:
         expected = expected.to(torch.bfloat16)
-    max_abs = float((actual.float() - expected.float()).abs().max())
+    absolute_error = (actual.float() - expected.float()).abs()
+    allowed_error = BF16_ATOL + BF16_RTOL * expected.float().abs()
+    max_abs = float(absolute_error.max())
+    max_allowed_abs = float(allowed_error.max())
+    mismatch_count = int((absolute_error > allowed_error).count_nonzero())
     try:
         torch.testing.assert_close(
             actual,
@@ -784,6 +778,8 @@ def _assert_bf16_close(torch, *, label: str, actual, expected) -> dict:
     return {
         "passed": True,
         "max_abs": max_abs,
+        "max_allowed_abs": max_allowed_abs,
+        "mismatch_count": mismatch_count,
         "atol": BF16_ATOL,
         "rtol": BF16_RTOL,
         "compared_dtype": "bfloat16",
@@ -1156,6 +1152,15 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--warmup-iters and --repeat-iters must be positive")
     if args.blocks < 2:
         parser.error("--blocks must be at least 2 for forward/reverse order evidence")
+    exact_sampling = (
+        args.warmup_iters == PHASE_A_MEASUREMENT_CONTRACT["warmup_iters_per_block"]
+        and args.repeat_iters == PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+        and args.blocks == PHASE_A_MEASUREMENT_CONTRACT["blocks"]
+    )
+    if not exact_sampling:
+        parser.error(
+            "Phase-A promotion requires exact --warmup-iters 5 --repeat-iters 20 --blocks 2"
+        )
 
 
 def _preset_summary(preset: EvidencePreset) -> dict:
@@ -1284,22 +1289,8 @@ def main() -> None:
         "hardware": hardware,
         "changed_beta_cuda_graph_test": graph_receipt,
         "measurement": {
-            "timing_backend": "cupti_activity",
+            **PHASE_A_MEASUREMENT_CONTRACT,
             "cupti_python_version": cupti_version,
-            "cold_l2": True,
-            "warmup_iters_per_block": args.warmup_iters,
-            "repeat_iters_per_block": args.repeat_iters,
-            "blocks": args.blocks,
-            "public_metric": (
-                "first-to-last correlated activity span including beta pack "
-                "and recurrence"
-            ),
-            "prepared_metric": (
-                "recurrence activity from the same public sample, reported separately"
-            ),
-            "synchronized_e2e_is_diagnostic_only": True,
-            "cross_shape_geomean": False,
-            "promotion_unit": "complete six-case denominator on one architecture",
         },
         "cases": [],
     }

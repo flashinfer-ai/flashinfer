@@ -25,7 +25,9 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import math
 import os
+import re
 import statistics
 import subprocess
 import uuid
@@ -40,9 +42,9 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 2
+EVIDENCE_REPORT_SCHEMA_VERSION = 3
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
-DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 1
+DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 2
 FROZEN_PRESET_SHA256 = (
     "eef38e8697e2818822186f6c0537c34c1defa41e0b0e08ee272448103a3cf314"
 )
@@ -61,6 +63,31 @@ REQUIRED_TIMING_PATHS = (
     "flash_kda_public_semantics_adapted",
     "fla_triton",
 )
+REQUIRED_TIMING_CALL_PATHS = {
+    "flashinfer_public": "flashinfer.kda.recurrent_kda",
+    "flash_kda_raw": "flash_kda._fwd_raw",
+    "flash_kda_public_semantics_adapted": (
+        "flash_kda._fwd_raw followed by final-state copy-back"
+    ),
+    "fla_triton": "fla.ops.kda.chunk_kda (backend dispatch disabled)",
+}
+REQUIRED_CANDIDATE_IMPORTED_MODULES = (
+    "flashinfer.kda",
+    "flashinfer.kda_prefill",
+)
+REQUIRED_CANDIDATE_SOURCE_PATHS = (
+    "flashinfer/kda.py",
+    "flashinfer/kda_prefill.py",
+    "csrc/kda/flashkda_binding_common.cuh",
+    "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
+    "csrc/kda/flashkda_bf16_fused_m128.cu",
+    "benchmarks/bench_recurrent_kda_prefill_h12_phase_a.py",
+    "benchmarks/build_flash_kda_phase_a.py",
+    "benchmarks/kda_h12_evidence.py",
+    "benchmarks/presets/recurrent_kda_prefill_h12_phase_a.json",
+    "benchmarks/reduce_kda_h12_phase_a.py",
+    GRAPH_TEST_SOURCE,
+)
 
 PUBLIC_TIMING_SCOPE = (
     "public_recurrent_kda_first_to_last_correlated_gpu_activity_"
@@ -69,8 +96,31 @@ PUBLIC_TIMING_SCOPE = (
 PREPARED_TIMING_SCOPE = (
     "prepared_recurrence_kernel_activity_selected_from_the_same_public_call"
 )
+PHASE_A_MEASUREMENT_CONTRACT = {
+    "timing_backend": "cupti_activity",
+    "cold_l2": True,
+    "warmup_iters_per_block": 5,
+    "repeat_iters_per_block": 20,
+    "blocks": 2,
+    "public_metric": (
+        "first-to-last correlated activity span including beta pack and recurrence"
+    ),
+    "prepared_metric": (
+        "recurrence activity from the same public sample, reported separately"
+    ),
+    "synchronized_e2e_is_diagnostic_only": True,
+    "cross_shape_geomean": False,
+    "promotion_unit": "complete six-case denominator on one architecture",
+}
+PHASE_A_EXPECTED_SAMPLE_COUNT = (
+    PHASE_A_MEASUREMENT_CONTRACT["blocks"]
+    * PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+)
+BF16_CORRECTNESS_ATOL = 1e-2
+BF16_CORRECTNESS_RTOL = 1e-2
 BETA_PACK_ACTIVITY_MARKER = "PackBetaForTmaKernel"
 RECURRENCE_ACTIVITY_MARKER = "kernel_flashkda_bf16_fused_m128"
+CUPTI_MEMCPY_KIND_DEVICE_TO_DEVICE = 8
 
 
 class EvidenceSchemaError(ValueError):
@@ -481,10 +531,12 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
     if (
         not isinstance(command, list)
         or any(not isinstance(item, str) or not item for item in command)
-        or command[-4:] != ["setup.py", "build_ext", "--inplace", "--force"]
+        or len(command) != 5
+        or command[1:] != ["setup.py", "build_ext", "--inplace", "--force"]
     ):
         raise EvidenceSchemaError(
-            "build manifest command must end in setup.py build_ext --inplace --force"
+            "build manifest command must be exactly Python setup.py build_ext "
+            "--inplace --force"
         )
     if build["cwd"] != source_dir_value:
         raise EvidenceSchemaError("build manifest cwd must equal its source_dir")
@@ -507,6 +559,14 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
     if build["environment"]["FLASH_KDA_CUDA_ARCHS"] != "auto":
         raise EvidenceSchemaError(
             "Phase-A FlashKDA build must use FLASH_KDA_CUDA_ARCHS=auto"
+        )
+    if build["environment"]["NVCC_PREPEND_FLAGS"] is not None:
+        raise EvidenceSchemaError(
+            "Phase-A FlashKDA build forbids ambient NVCC_PREPEND_FLAGS"
+        )
+    if build["environment"]["TORCH_CUDA_ARCH_LIST"] is not None:
+        raise EvidenceSchemaError(
+            "Phase-A FlashKDA build forbids ambient TORCH_CUDA_ARCH_LIST"
         )
     nvcc_threads = build["environment"]["NVCC_THREADS"]
     if (
@@ -1067,7 +1127,452 @@ def _require_commit(value: object, label: str) -> str:
     return value
 
 
-def _require_oracle(case: dict, key: str) -> None:
+def _require_finite_number(
+    value: object,
+    label: str,
+    *,
+    positive: bool = False,
+) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        or (positive and value <= 0)
+    ):
+        qualifier = "positive " if positive else "non-negative "
+        raise EvidenceSchemaError(f"{label} must be a finite {qualifier}number")
+    return float(value)
+
+
+def _validate_activity_records(
+    records: object,
+    names: object,
+    expected_count: int,
+    *,
+    label: str,
+    allowed_kinds: set[str],
+) -> list[dict]:
+    if (
+        not isinstance(records, list)
+        or len(records) != expected_count
+        or not isinstance(names, list)
+        or len(names) != expected_count
+    ):
+        raise EvidenceSchemaError(f"{label} activity records/count disagree")
+    expected_keys = {
+        "start_ns",
+        "end_ns",
+        "correlation_id",
+        "kind",
+        "name",
+        "duration_ms",
+    }
+    previous_start = -1
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise EvidenceSchemaError(f"{label} activity {index} must be an object")
+        _require_exact_keys(record, expected_keys, f"{label} activity {index}")
+        start_ns = record["start_ns"]
+        end_ns = record["end_ns"]
+        if (
+            type(start_ns) is not int
+            or type(end_ns) is not int
+            or type(record["correlation_id"]) is not int
+            or record["correlation_id"] < 0
+            or start_ns < previous_start
+            or start_ns < 0
+            or end_ns < start_ns
+            or record["kind"] not in allowed_kinds
+            or not isinstance(record["name"], str)
+            or not record["name"]
+            or record["name"] != names[index]
+            or (
+                record["kind"] in {"runtime", "driver"}
+                and not record["name"].startswith(f"{record['kind']}:")
+            )
+        ):
+            raise EvidenceSchemaError(f"{label} activity {index} is malformed")
+        duration_ms = _require_finite_number(
+            record["duration_ms"], f"{label} activity {index} duration"
+        )
+        if duration_ms != (end_ns - start_ns) / 1e6:
+            raise EvidenceSchemaError(
+                f"{label} activity {index} duration does not match timestamps"
+            )
+        previous_start = start_ns
+    return records
+
+
+def _validate_prepared_raw_sample(sample: object, *, label: str) -> None:
+    expected_keys = {
+        *_PREPARED_NUMERIC_FIELDS,
+        "launch_activity_names",
+        "launch_activity_order",
+        "gpu_activity_names",
+        "kernel_activity_names",
+        "activity_order",
+    }
+    if not isinstance(sample, dict):
+        raise EvidenceSchemaError(f"{label} must be an object")
+    _require_exact_keys(sample, expected_keys, label)
+    for field in _PREPARED_NUMERIC_FIELDS:
+        if field.endswith("_count"):
+            if type(sample[field]) is not int or sample[field] <= 0:
+                raise EvidenceSchemaError(f"{label} {field} must be a positive integer")
+        else:
+            _require_finite_number(
+                sample[field],
+                f"{label} {field}",
+                positive=field in {"gpu_span_ms", "kernel_sum_ms", "active_union_ms"},
+            )
+    launches = _validate_activity_records(
+        sample["launch_activity_order"],
+        sample["launch_activity_names"],
+        sample["launch_activity_count"],
+        label=f"{label} launch",
+        allowed_kinds={"runtime", "driver"},
+    )
+    activities = _validate_activity_records(
+        sample["activity_order"],
+        sample["gpu_activity_names"],
+        sample["gpu_activity_count"],
+        label=f"{label} GPU",
+        allowed_kinds={"kernel", "memcpy", "memset"},
+    )
+    kernel_names = [
+        record["name"] for record in activities if record["kind"] == "kernel"
+    ]
+    if (
+        sample["kernel_activity_count"] != 1
+        or sample["gpu_activity_count"] != 1
+        or kernel_names != sample["kernel_activity_names"]
+        or len(kernel_names) != 1
+        or RECURRENCE_ACTIVITY_MARKER not in kernel_names[0]
+        or {record["correlation_id"] for record in activities}
+        != {record["correlation_id"] for record in launches}
+    ):
+        raise EvidenceSchemaError(f"{label} is not recurrence-only CUPTI evidence")
+    recomputed = _interval_metrics(
+        [
+            GpuActivity(
+                start_ns=record["start_ns"],
+                end_ns=record["end_ns"],
+                correlation_id=record["correlation_id"],
+                kind=record["kind"],
+                name=record["name"],
+            )
+            for record in activities
+        ]
+    )
+    if any(sample[field] != value for field, value in recomputed.items()):
+        raise EvidenceSchemaError(f"{label} interval metrics do not match raw activity")
+
+
+def _validate_raw_sample(
+    sample: object,
+    *,
+    path_name: str,
+    block_index: int,
+    order_index: int,
+    sample_index: int,
+    expected_final_state_bytes: int,
+) -> None:
+    expected_keys = {
+        "sample_index",
+        *_PUBLIC_NUMERIC_FIELDS,
+        "launch_activity_names",
+        "launch_activity_order",
+        "gpu_activity_names",
+        "kernel_activity_names",
+        "copy_activity_names",
+        "activity_order",
+        "block_index",
+        "order_index",
+    }
+    if path_name == "flashinfer_public":
+        expected_keys.add("prepared_recurrence")
+    label = f"path {path_name} block {block_index} sample {sample_index}"
+    if not isinstance(sample, dict):
+        raise EvidenceSchemaError(f"{label} must be an object")
+    _require_exact_keys(sample, expected_keys, label)
+    if (
+        sample["sample_index"] != sample_index
+        or sample["block_index"] != block_index
+        or sample["order_index"] != order_index
+    ):
+        raise EvidenceSchemaError(f"{label} sample/block/order identity is wrong")
+    for field in _PUBLIC_NUMERIC_FIELDS:
+        if field.endswith("_count"):
+            if type(sample[field]) is not int or sample[field] < 0:
+                raise EvidenceSchemaError(
+                    f"{label} {field} must be a non-negative integer"
+                )
+        else:
+            _require_finite_number(
+                sample[field],
+                f"{label} {field}",
+                positive=field in {"gpu_span_ms", "kernel_sum_ms", "active_union_ms"},
+            )
+    if (
+        sample["launch_activity_count"] <= 0
+        or sample["gpu_activity_count"] <= 0
+        or sample["kernel_activity_count"] <= 0
+        or sample["synchronized_e2e_ms"] < sample["submission_ms"]
+        or sample["synchronized_e2e_ms"] < sample["gpu_span_ms"]
+    ):
+        raise EvidenceSchemaError(f"{label} has incomplete correlated timing")
+    launches = _validate_activity_records(
+        sample["launch_activity_order"],
+        sample["launch_activity_names"],
+        sample["launch_activity_count"],
+        label=f"{label} launch",
+        allowed_kinds={"runtime", "driver"},
+    )
+    activities = _validate_activity_records(
+        sample["activity_order"],
+        sample["gpu_activity_names"],
+        sample["gpu_activity_count"],
+        label=f"{label} GPU",
+        allowed_kinds={"kernel", "memcpy", "memset"},
+    )
+    kernel_names = [
+        record["name"] for record in activities if record["kind"] == "kernel"
+    ]
+    copy_names = [
+        record["name"]
+        for record in activities
+        if record["kind"] in {"memcpy", "memset"}
+    ]
+    if (
+        kernel_names != sample["kernel_activity_names"]
+        or len(kernel_names) != sample["kernel_activity_count"]
+        or copy_names != sample["copy_activity_names"]
+        or len(copy_names) != sample["copy_activity_count"]
+        or {record["correlation_id"] for record in activities}
+        != {record["correlation_id"] for record in launches}
+    ):
+        raise EvidenceSchemaError(f"{label} activity counts/names are inconsistent")
+    recomputed = _interval_metrics(
+        [
+            GpuActivity(
+                start_ns=record["start_ns"],
+                end_ns=record["end_ns"],
+                correlation_id=record["correlation_id"],
+                kind=record["kind"],
+                name=record["name"],
+            )
+            for record in activities
+        ]
+    )
+    if any(sample[field] != value for field, value in recomputed.items()):
+        raise EvidenceSchemaError(f"{label} interval metrics do not match raw activity")
+    kernel_records = [record for record in activities if record["kind"] == "kernel"]
+    copy_records = [
+        record for record in activities if record["kind"] in {"memcpy", "memset"}
+    ]
+    recurrence_records = [
+        record
+        for record in kernel_records
+        if RECURRENCE_ACTIVITY_MARKER in record["name"]
+    ]
+    if path_name == "flashinfer_public":
+        beta_pack_records = [
+            record
+            for record in kernel_records
+            if BETA_PACK_ACTIVITY_MARKER in record["name"]
+        ]
+        if (
+            len(kernel_records) != 2
+            or len(activities) != 2
+            or copy_records
+            or len(beta_pack_records) != 1
+            or len(recurrence_records) != 1
+            or beta_pack_records[0]["end_ns"] > recurrence_records[0]["start_ns"]
+        ):
+            raise EvidenceSchemaError(
+                f"{label} is not the exact nonoverlapping pack-to-recurrence route"
+            )
+        _validate_prepared_raw_sample(
+            sample["prepared_recurrence"], label=f"{label} prepared recurrence"
+        )
+    elif path_name == "flash_kda_raw":
+        if (
+            len(activities) != 1
+            or len(kernel_records) != 1
+            or copy_records
+            or len(recurrence_records) != 1
+        ):
+            raise EvidenceSchemaError(
+                f"{label} is not the exact pinned FlashKDA recurrence route"
+            )
+    elif path_name == "flash_kda_public_semantics_adapted":
+        expected_copy_name = (
+            "MEMCPY(copy_kind="
+            f"{CUPTI_MEMCPY_KIND_DEVICE_TO_DEVICE},"
+            f"bytes={expected_final_state_bytes})"
+        )
+        if (
+            len(activities) != 2
+            or len(kernel_records) != 1
+            or len(recurrence_records) != 1
+            or len(copy_records) != 1
+            or copy_records[0]["kind"] != "memcpy"
+            or copy_records[0]["name"] != expected_copy_name
+            or copy_records[0]["start_ns"] < recurrence_records[0]["end_ns"]
+        ):
+            raise EvidenceSchemaError(
+                f"{label} lacks the exact post-recurrence full-state D2D copy-back"
+            )
+    elif path_name == "fla_triton":
+        if not any("kda" in record["name"].lower() for record in kernel_records):
+            raise EvidenceSchemaError(
+                f"{label} lacks an identifiable FLA KDA kernel activity"
+            )
+
+
+def _validate_timing_summary(
+    timing: object,
+    *,
+    path_name: str,
+    expected_sample_count: int,
+    expected_final_state_bytes: int,
+) -> None:
+    if not isinstance(timing, dict):
+        raise EvidenceSchemaError(f"path {path_name} timing must be an object")
+    expected_scope = (
+        PUBLIC_TIMING_SCOPE
+        if path_name == "flashinfer_public"
+        else "backend_call_first_to_last_correlated_gpu_activity"
+    )
+    expected_keys = {
+        "timing_scope",
+        "timing_backend",
+        "cold_l2",
+        "raw_samples",
+        "launch_activity_names_samples",
+        "launch_activity_order_samples",
+        "gpu_activity_names_samples",
+        "kernel_activity_names_samples",
+        "copy_activity_names_samples",
+        "activity_order_samples",
+        "call_path",
+        *(f"{field}_samples" for field in _PUBLIC_NUMERIC_FIELDS),
+        *(f"median_{field}" for field in _PUBLIC_NUMERIC_FIELDS),
+    }
+    if path_name == "flashinfer_public":
+        expected_keys.update({"includes_beta_preparation", "prepared_recurrence"})
+    _require_exact_keys(timing, expected_keys, f"path {path_name} timing")
+    if (
+        timing["timing_scope"] != expected_scope
+        or timing["timing_backend"] != "cupti_activity"
+        or timing["cold_l2"] is not True
+        or timing["call_path"] != REQUIRED_TIMING_CALL_PATHS[path_name]
+    ):
+        raise EvidenceSchemaError(f"path {path_name} timing scope is not exact")
+    raw_samples = timing["raw_samples"]
+    if not isinstance(raw_samples, list) or len(raw_samples) != expected_sample_count:
+        raise EvidenceSchemaError(f"path {path_name} lacks the exact raw denominator")
+    base_order = list(REQUIRED_TIMING_PATHS)
+    samples_per_block = PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+    for flat_index, sample in enumerate(raw_samples):
+        block_index = flat_index // samples_per_block
+        sample_index = flat_index % samples_per_block
+        block_order = base_order if block_index % 2 == 0 else list(reversed(base_order))
+        order_index = block_order.index(path_name)
+        _validate_raw_sample(
+            sample,
+            path_name=path_name,
+            block_index=block_index,
+            order_index=order_index,
+            sample_index=sample_index,
+            expected_final_state_bytes=expected_final_state_bytes,
+        )
+    derived_arrays = {
+        "launch_activity_names_samples": [
+            sample["launch_activity_names"] for sample in raw_samples
+        ],
+        "launch_activity_order_samples": [
+            sample["launch_activity_order"] for sample in raw_samples
+        ],
+        "gpu_activity_names_samples": [
+            sample["gpu_activity_names"] for sample in raw_samples
+        ],
+        "kernel_activity_names_samples": [
+            sample["kernel_activity_names"] for sample in raw_samples
+        ],
+        "copy_activity_names_samples": [
+            sample["copy_activity_names"] for sample in raw_samples
+        ],
+        "activity_order_samples": [sample["activity_order"] for sample in raw_samples],
+    }
+    if any(timing[key] != value for key, value in derived_arrays.items()):
+        raise EvidenceSchemaError(
+            f"path {path_name} summary arrays differ from raw data"
+        )
+    expected_numeric = _summarize_numeric(raw_samples, _PUBLIC_NUMERIC_FIELDS)
+    if any(timing[key] != value for key, value in expected_numeric.items()):
+        raise EvidenceSchemaError(f"path {path_name} medians differ from raw data")
+
+    if path_name != "flashinfer_public":
+        return
+    if timing["includes_beta_preparation"] is not True:
+        raise EvidenceSchemaError("public timing must include beta preparation")
+    prepared = timing["prepared_recurrence"]
+    prepared_keys = {
+        "call_path",
+        "timing_scope",
+        "timing_backend",
+        "derived_from_same_public_samples",
+        "includes_beta_pack",
+        "raw_samples",
+        "launch_activity_names_samples",
+        "launch_activity_order_samples",
+        "gpu_activity_names_samples",
+        "kernel_activity_names_samples",
+        "activity_order_samples",
+        *(f"{field}_samples" for field in _PREPARED_NUMERIC_FIELDS),
+        *(f"median_{field}" for field in _PREPARED_NUMERIC_FIELDS),
+    }
+    if not isinstance(prepared, dict):
+        raise EvidenceSchemaError("public timing lacks prepared recurrence object")
+    _require_exact_keys(prepared, prepared_keys, "prepared recurrence timing")
+    prepared_raw = [sample["prepared_recurrence"] for sample in raw_samples]
+    if (
+        prepared["call_path"]
+        != "recurrence activity derived from flashinfer.kda.recurrent_kda"
+        or prepared["timing_scope"] != PREPARED_TIMING_SCOPE
+        or prepared["timing_backend"] != "cupti_activity"
+        or prepared["derived_from_same_public_samples"] is not True
+        or prepared["includes_beta_pack"] is not False
+        or prepared["raw_samples"] != prepared_raw
+    ):
+        raise EvidenceSchemaError("prepared timing is not derived from public samples")
+    prepared_arrays = {
+        "launch_activity_names_samples": [
+            sample["launch_activity_names"] for sample in prepared_raw
+        ],
+        "launch_activity_order_samples": [
+            sample["launch_activity_order"] for sample in prepared_raw
+        ],
+        "gpu_activity_names_samples": [
+            sample["gpu_activity_names"] for sample in prepared_raw
+        ],
+        "kernel_activity_names_samples": [
+            sample["kernel_activity_names"] for sample in prepared_raw
+        ],
+        "activity_order_samples": [sample["activity_order"] for sample in prepared_raw],
+    }
+    expected_prepared_numeric = _summarize_numeric(
+        prepared_raw, _PREPARED_NUMERIC_FIELDS
+    )
+    if any(prepared[key] != value for key, value in prepared_arrays.items()) or any(
+        prepared[key] != value for key, value in expected_prepared_numeric.items()
+    ):
+        raise EvidenceSchemaError("prepared summary differs from raw public samples")
+
+
+def _require_oracle(case: dict, key: str, expected: CasePreset) -> None:
     correctness = case.get("correctness")
     if not isinstance(correctness, dict):
         raise EvidenceSchemaError(f"case {case.get('name')!r} lacks correctness")
@@ -1076,11 +1581,55 @@ def _require_oracle(case: dict, key: str) -> None:
         raise EvidenceSchemaError(
             f"case {case.get('name')!r} lacks required oracle {key}"
         )
+    _require_exact_keys(oracle, {"output", "final_state"}, f"oracle {key}")
+    expected_numel = {
+        "output": expected.total_tokens * 12 * 128,
+        "final_state": len(expected.seq_lens) * 12 * 128 * 128,
+    }
     for result_name in ("output", "final_state"):
         result = oracle.get(result_name)
-        if not isinstance(result, dict) or result.get("passed") is not True:
+        if isinstance(result, dict):
+            _require_exact_keys(
+                result,
+                {
+                    "passed",
+                    "max_abs",
+                    "max_allowed_abs",
+                    "mismatch_count",
+                    "atol",
+                    "rtol",
+                    "compared_dtype",
+                    "compared_numel",
+                },
+                f"oracle {key} {result_name}",
+            )
+        max_abs = result.get("max_abs") if isinstance(result, dict) else None
+        max_allowed_abs = (
+            result.get("max_allowed_abs") if isinstance(result, dict) else None
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("passed") is not True
+            or isinstance(max_abs, bool)
+            or not isinstance(max_abs, (int, float))
+            or not math.isfinite(max_abs)
+            or max_abs < 0
+            or isinstance(max_allowed_abs, bool)
+            or not isinstance(max_allowed_abs, (int, float))
+            or not math.isfinite(max_allowed_abs)
+            or max_allowed_abs < 0
+            or max_abs > max_allowed_abs
+            or type(result.get("mismatch_count")) is not int
+            or result["mismatch_count"] != 0
+            or result.get("atol") != BF16_CORRECTNESS_ATOL
+            or result.get("rtol") != BF16_CORRECTNESS_RTOL
+            or result.get("compared_dtype") != "bfloat16"
+            or type(result.get("compared_numel")) is not int
+            or result["compared_numel"] != expected_numel[result_name]
+        ):
             raise EvidenceSchemaError(
-                f"case {case.get('name')!r} oracle {key} {result_name} did not pass"
+                f"case {case.get('name')!r} oracle {key} {result_name} "
+                "does not prove the exact BF16 full-tensor contract"
             )
 
 
@@ -1094,12 +1643,28 @@ def _validate_case_receipt(
         "name": expected.name,
         "layout": expected.layout,
         "seq_lens": list(expected.seq_lens),
+        "total_tokens": expected.total_tokens,
+        "num_sequences": len(expected.seq_lens),
         "seed": expected.seed,
         "num_heads": 12,
         "head_dim_qk": 128,
         "head_dim_vo": 128,
         "dtype": "bfloat16",
+        "initial_state": "provided_bfloat16",
+        "variant": "m128",
     }
+    _require_exact_keys(
+        case,
+        {
+            *expected_identity,
+            "correctness",
+            "timings",
+            "measurement_order",
+            "per_case_speedups",
+            "cross_shape_aggregate",
+        },
+        f"case {expected.name!r}",
+    )
     for key, value in expected_identity.items():
         if case.get(key) != value:
             raise EvidenceSchemaError(
@@ -1114,12 +1679,23 @@ def _validate_case_receipt(
         raise EvidenceSchemaError(
             f"case {expected.name!r} lacks complete public correctness"
         )
+    _require_exact_keys(
+        correctness,
+        {
+            "passed",
+            "public_output_and_full_final_state",
+            "independent_bf16_recurrence",
+            "pinned_flash_kda",
+            "fla_triton",
+        },
+        f"case {expected.name!r} correctness",
+    )
     for oracle in (
         "independent_bf16_recurrence",
         "pinned_flash_kda",
         "fla_triton",
     ):
-        _require_oracle(case, oracle)
+        _require_oracle(case, oracle, expected)
 
     timings = case.get("timings")
     if not isinstance(timings, dict) or set(timings) != set(REQUIRED_TIMING_PATHS):
@@ -1127,36 +1703,13 @@ def _validate_case_receipt(
             f"case {expected.name!r} must time exactly {REQUIRED_TIMING_PATHS!r}"
         )
     for path_name in REQUIRED_TIMING_PATHS:
-        timing = timings[path_name]
-        raw_samples = timing.get("raw_samples") if isinstance(timing, dict) else None
-        kernel_names = (
-            timing.get("kernel_activity_names_samples")
-            if isinstance(timing, dict)
-            else None
+        _validate_timing_summary(
+            timings[path_name],
+            path_name=path_name,
+            expected_sample_count=expected_sample_count,
+            expected_final_state_bytes=(len(expected.seq_lens) * 12 * 128 * 128 * 2),
         )
-        if (
-            not isinstance(timing, dict)
-            or timing.get("timing_backend") != "cupti_activity"
-            or not isinstance(raw_samples, list)
-            or len(raw_samples) != expected_sample_count
-            or not isinstance(kernel_names, list)
-            or len(kernel_names) != expected_sample_count
-            or any(not isinstance(names, list) or not names for names in kernel_names)
-        ):
-            raise EvidenceSchemaError(
-                f"case {expected.name!r} path {path_name} lacks raw CUPTI timing"
-            )
     public = timings["flashinfer_public"]
-    prepared = public.get("prepared_recurrence")
-    if (
-        public.get("includes_beta_preparation") is not True
-        or not isinstance(prepared, dict)
-        or prepared.get("derived_from_same_public_samples") is not True
-        or prepared.get("includes_beta_pack") is not False
-    ):
-        raise EvidenceSchemaError(
-            f"case {expected.name!r} does not preserve public/prepared timing scopes"
-        )
     for names in public["kernel_activity_names_samples"]:
         if (
             len(names) != 2
@@ -1174,24 +1727,69 @@ def _validate_case_receipt(
         raise EvidenceSchemaError(
             f"case {expected.name!r} FLA timing routed through FlashKDA"
         )
-    if (
-        not isinstance(prepared.get("raw_samples"), list)
-        or len(prepared["raw_samples"]) != expected_sample_count
-        or not isinstance(prepared.get("kernel_activity_names_samples"), list)
-        or len(prepared["kernel_activity_names_samples"]) != expected_sample_count
-        or any(
-            len(names) != 1 or RECURRENCE_ACTIVITY_MARKER not in names[0]
-            for names in prepared["kernel_activity_names_samples"]
+    base_order = list(REQUIRED_TIMING_PATHS)
+    expected_measurement_order = []
+    for block_index in range(PHASE_A_MEASUREMENT_CONTRACT["blocks"]):
+        block_order = base_order if block_index % 2 == 0 else list(reversed(base_order))
+        expected_measurement_order.extend(
+            {
+                "block_index": block_index,
+                "order_index": order_index,
+                "path": path_name,
+            }
+            for order_index, path_name in enumerate(block_order)
         )
-    ):
+    if case["measurement_order"] != expected_measurement_order:
         raise EvidenceSchemaError(
-            f"case {expected.name!r} prepared timing lacks recurrence-only raw samples"
+            f"case {expected.name!r} measurement order is not exact forward/reverse"
+        )
+    speedups = case["per_case_speedups"]
+    expected_speedup_keys = {
+        "vs_pinned_flash_kda_raw": "flash_kda_raw",
+        "vs_pinned_flash_kda_public_semantics_adapted": (
+            "flash_kda_public_semantics_adapted"
+        ),
+        "vs_fla_triton": "fla_triton",
+    }
+    if not isinstance(speedups, dict) or set(speedups) != set(expected_speedup_keys):
+        raise EvidenceSchemaError(f"case {expected.name!r} speedup keys are incomplete")
+    candidate_ms = public["median_gpu_span_ms"]
+    for speedup_name, timing_name in expected_speedup_keys.items():
+        expected_speedup = timings[timing_name]["median_gpu_span_ms"] / candidate_ms
+        value = _require_finite_number(
+            speedups[speedup_name],
+            f"case {expected.name!r} {speedup_name}",
+            positive=True,
+        )
+        if value != expected_speedup:
+            raise EvidenceSchemaError(
+                f"case {expected.name!r} {speedup_name} differs from raw timing"
+            )
+    if case["cross_shape_aggregate"] is not None:
+        raise EvidenceSchemaError(
+            f"case {expected.name!r} injected a forbidden cross-shape aggregate"
         )
 
 
 def _validate_graph_receipt(graph: object) -> None:
     if not isinstance(graph, dict):
         raise EvidenceSchemaError("receipt lacks changed-beta CUDA Graph evidence")
+    _require_exact_keys(
+        graph,
+        {
+            "source",
+            "source_line_range",
+            "source_sha256",
+            "node_id",
+            "parameterization",
+            "command",
+            "returncode",
+            "stdout",
+            "stderr",
+            "passed",
+        },
+        "changed-beta CUDA Graph receipt",
+    )
     if graph.get("passed") is not True or graph.get("returncode") != 0:
         raise EvidenceSchemaError("changed-beta CUDA Graph test did not pass")
     if graph.get("node_id") != GRAPH_TEST_NODE_ID:
@@ -1210,6 +1808,14 @@ def _validate_graph_receipt(graph: object) -> None:
         GRAPH_TEST_NODE_ID,
     ]:
         raise EvidenceSchemaError("CUDA Graph receipt command is not the exact target")
+    if (
+        not isinstance(command[0], str)
+        or not Path(command[0]).is_absolute()
+        or not isinstance(graph["stdout"], str)
+        or not isinstance(graph["stderr"], str)
+        or re.search(r"\b2 passed\b", graph["stdout"]) is None
+    ):
+        raise EvidenceSchemaError("CUDA Graph receipt process evidence is malformed")
     _require_sha256(graph.get("source_sha256"), "CUDA Graph source hash")
 
 
@@ -1225,6 +1831,24 @@ def validate_per_arch_receipt(
 
     _require_commit(expected_candidate_commit, "expected FlashInfer commit")
     _require_commit(expected_fla_commit, "expected FLA commit")
+    if not isinstance(report, dict):
+        raise EvidenceSchemaError("per-architecture receipt must be an object")
+    _require_exact_keys(
+        report,
+        {
+            "schema_version",
+            "suite",
+            "preset",
+            "candidate_provenance",
+            "baselines",
+            "hardware",
+            "changed_beta_cuda_graph_test",
+            "measurement",
+            "cases",
+            "complete_per_arch_denominator",
+        },
+        "per-architecture receipt",
+    )
     if report.get("schema_version") != EVIDENCE_REPORT_SCHEMA_VERSION:
         raise EvidenceSchemaError("unexpected per-architecture receipt schema")
     if report.get("suite") != "recurrent_kda_prefill_h12_phase_a":
@@ -1233,17 +1857,28 @@ def validate_per_arch_receipt(
         raise EvidenceSchemaError(
             f"{expected_arch} receipt is not a complete per-architecture denominator"
         )
-    if "complete_denominator" in report:
-        raise EvidenceSchemaError(
-            "stale one-GPU complete_denominator flag is forbidden"
-        )
-
     preset_payload = report.get("preset")
+    expected_preset_cases = [
+        {
+            "name": case.name,
+            "layout": case.layout,
+            "seq_lens": list(case.seq_lens),
+            "total_tokens": case.total_tokens,
+            "seed": case.seed,
+        }
+        for case in preset.cases
+    ]
     if (
         not isinstance(preset_payload, dict)
+        or set(preset_payload)
+        != {"name", "path", "sha256", "common", "aggregation", "cases"}
         or preset_payload.get("sha256") != FROZEN_PRESET_SHA256
         or preset_payload.get("name") != preset.name
+        or preset_payload.get("common") != preset.common
         or preset_payload.get("aggregation") != "per_case_only"
+        or preset_payload.get("cases") != expected_preset_cases
+        or not isinstance(preset_payload.get("path"), str)
+        or Path(preset_payload["path"]).name != "recurrent_kda_prefill_h12_phase_a.json"
     ):
         raise EvidenceSchemaError("receipt preset identity is not frozen Phase A")
 
@@ -1253,27 +1888,68 @@ def validate_per_arch_receipt(
         raise EvidenceSchemaError(f"unsupported promotion architecture {expected_arch}")
     if (
         not isinstance(hardware, dict)
+        or set(hardware)
+        != {
+            "device_name",
+            "device_index",
+            "device_uuid",
+            "compute_capability",
+            "cuda_arch",
+            "multiprocessor_count",
+            "total_memory_bytes",
+            "l2_cache_bytes",
+            "torch_version",
+            "torch_cuda_version",
+        }
         or hardware.get("cuda_arch") != expected_arch
         or hardware.get("compute_capability") != expected_capabilities[expected_arch]
+        or not isinstance(hardware.get("device_name"), str)
+        or not hardware["device_name"]
+        or not isinstance(hardware.get("device_uuid"), str)
+        or not hardware["device_uuid"]
+        or type(hardware.get("device_index")) is not int
+        or hardware["device_index"] < 0
+        or any(
+            type(hardware.get(key)) is not int or hardware[key] <= 0
+            for key in ("multiprocessor_count", "total_memory_bytes", "l2_cache_bytes")
+        )
+        or not isinstance(hardware.get("torch_version"), str)
+        or not hardware["torch_version"]
+        or not isinstance(hardware.get("torch_cuda_version"), str)
+        or not hardware["torch_cuda_version"]
     ):
         raise EvidenceSchemaError(
             f"receipt hardware does not match required {expected_arch}"
         )
 
     measurement = report.get("measurement")
+    expected_measurement_keys = set(PHASE_A_MEASUREMENT_CONTRACT) | {
+        "cupti_python_version"
+    }
+    cupti_python_version = (
+        measurement.get("cupti_python_version")
+        if isinstance(measurement, dict)
+        else None
+    )
+    cupti_major = (
+        cupti_python_version.split(".", 1)[0]
+        if isinstance(cupti_python_version, str)
+        else ""
+    )
     if (
         not isinstance(measurement, dict)
-        or measurement.get("timing_backend") != "cupti_activity"
-        or measurement.get("cross_shape_geomean") is not False
-        or type(measurement.get("blocks")) is not int
-        or measurement["blocks"] < 2
-        or type(measurement.get("repeat_iters_per_block")) is not int
-        or measurement["repeat_iters_per_block"] <= 0
+        or set(measurement) != expected_measurement_keys
+        or any(
+            measurement.get(key) != value
+            for key, value in PHASE_A_MEASUREMENT_CONTRACT.items()
+        )
+        or not isinstance(cupti_python_version, str)
+        or not cupti_python_version
+        or not cupti_major.isdigit()
+        or int(cupti_major) < 13
     ):
-        raise EvidenceSchemaError("receipt measurement contract is incomplete")
-    expected_sample_count = (
-        measurement["blocks"] * measurement["repeat_iters_per_block"]
-    )
+        raise EvidenceSchemaError("receipt measurement contract is not exact Phase A")
+    expected_sample_count = PHASE_A_EXPECTED_SAMPLE_COUNT
 
     candidate = report.get("candidate_provenance")
     required_ancestors = {
@@ -1282,25 +1958,97 @@ def validate_per_arch_receipt(
     }
     if (
         not isinstance(candidate, dict)
+        or set(candidate)
+        != {
+            "repository",
+            "source_dir",
+            "source_commit",
+            "required_ancestor_revisions",
+            "worktree_clean_including_untracked",
+            "imported_module_paths",
+            "imported_module_sha256",
+            "source_sha256",
+        }
+        or candidate.get("repository")
+        != "https://github.com/flashinfer-ai/flashinfer.git"
+        or not isinstance(candidate.get("source_dir"), str)
+        or not Path(candidate["source_dir"]).is_absolute()
         or candidate.get("source_commit") != expected_candidate_commit
         or candidate.get("required_ancestor_revisions") != required_ancestors
         or candidate.get("worktree_clean_including_untracked") is not True
     ):
         raise EvidenceSchemaError("receipt candidate identity is not frozen/clean")
-    for label in ("imported_module_sha256", "source_sha256"):
-        hashes = candidate.get(label)
-        if not isinstance(hashes, dict) or not hashes:
-            raise EvidenceSchemaError(f"candidate {label} is missing")
+    imported_paths = candidate.get("imported_module_paths")
+    imported_hashes = candidate.get("imported_module_sha256")
+    source_hashes = candidate.get("source_sha256")
+    if (
+        not isinstance(imported_paths, dict)
+        or set(imported_paths) != set(REQUIRED_CANDIDATE_IMPORTED_MODULES)
+        or not isinstance(imported_hashes, dict)
+        or set(imported_hashes) != set(REQUIRED_CANDIDATE_IMPORTED_MODULES)
+        or not isinstance(source_hashes, dict)
+        or set(source_hashes) != set(REQUIRED_CANDIDATE_SOURCE_PATHS)
+    ):
+        raise EvidenceSchemaError("candidate source/module hash key sets are not exact")
+    source_dir = Path(candidate["source_dir"])
+    if source_dir != source_dir.resolve(strict=False):
+        raise EvidenceSchemaError("candidate source_dir must be a normalized path")
+    imported_source_paths = {
+        "flashinfer.kda": "flashinfer/kda.py",
+        "flashinfer.kda_prefill": "flashinfer/kda_prefill.py",
+    }
+    for name, path in imported_paths.items():
+        expected_path = source_dir / imported_source_paths[name]
+        if (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or Path(path) != expected_path
+        ):
+            raise EvidenceSchemaError(
+                f"candidate imported module path {name} is invalid"
+            )
+    for label, hashes in (
+        ("imported_module_sha256", imported_hashes),
+        ("source_sha256", source_hashes),
+    ):
         for name, digest in hashes.items():
             _require_sha256(digest, f"candidate {label} {name}")
+    for module_name, source_path in imported_source_paths.items():
+        if imported_hashes[module_name] != source_hashes[source_path]:
+            raise EvidenceSchemaError(
+                f"candidate imported module {module_name} hash differs from source"
+            )
 
     baselines = report.get("baselines")
-    if not isinstance(baselines, dict):
+    if not isinstance(baselines, dict) or set(baselines) != {
+        "flash_kda",
+        "fla_triton",
+    }:
         raise EvidenceSchemaError("receipt baselines are missing")
     flash_kda = baselines.get("flash_kda")
+    expected_flash_kda_keys = {
+        "available",
+        "required_revision",
+        "repository",
+        "source_dir",
+        "source_commit",
+        "cutlass_commit",
+        "worktree_clean_including_untracked",
+        "package_path",
+        "package_sha256",
+        "extension_path",
+        "extension_sha256",
+        "build_manifest_path",
+        "build_manifest_sha256",
+        "build_manifest",
+        "current_receipt_binding",
+    }
     if (
         not isinstance(flash_kda, dict)
+        or set(flash_kda) != expected_flash_kda_keys
         or flash_kda.get("available") is not True
+        or flash_kda.get("required_revision") != FLASH_KDA_BASELINE_REVISION
+        or flash_kda.get("repository") != FLASH_KDA_REPOSITORY
         or flash_kda.get("source_commit") != FLASH_KDA_BASELINE_REVISION
         or flash_kda.get("cutlass_commit") != FLASH_KDA_CUTLASS_REVISION
         or flash_kda.get("worktree_clean_including_untracked") is not True
@@ -1325,6 +2073,24 @@ def validate_per_arch_receipt(
         raise EvidenceSchemaError(
             "FlashKDA build manifest is not bound to this architecture/artifact"
         )
+    flash_source_dir = Path(flash_kda["source_dir"])
+    package_path = Path(flash_kda["package_path"])
+    extension_path = Path(flash_kda["extension_path"])
+    build_manifest_path = Path(flash_kda["build_manifest_path"])
+    if (
+        not flash_source_dir.is_absolute()
+        or flash_source_dir != flash_source_dir.resolve(strict=False)
+        or build_manifest["source"]["source_dir"] != str(flash_source_dir)
+        or package_path != Path(build_manifest["artifacts"]["package_path"])
+        or extension_path != Path(build_manifest["artifacts"]["extension_path"])
+        or not package_path.is_relative_to(flash_source_dir)
+        or not extension_path.is_relative_to(flash_source_dir)
+        or not build_manifest_path.is_absolute()
+        or build_manifest_path.is_relative_to(flash_source_dir)
+    ):
+        raise EvidenceSchemaError(
+            "FlashKDA source/artifact/manifest paths are not exactly bound"
+        )
     current_binding = flash_kda.get("current_receipt_binding")
     expected_binding_hardware = {
         key: build_manifest["hardware"][key]
@@ -1348,6 +2114,16 @@ def validate_per_arch_receipt(
     }
     if (
         not isinstance(current_binding, dict)
+        or set(current_binding)
+        != {
+            "schema_version",
+            "same_slurm_allocation",
+            "same_gpu",
+            "same_python_torch_cuda_runtime",
+            "allocation",
+            "hardware",
+            "runtime",
+        }
         or current_binding.get("schema_version") != 1
         or current_binding.get("same_slurm_allocation") is not True
         or current_binding.get("same_gpu") is not True
@@ -1359,11 +2135,39 @@ def validate_per_arch_receipt(
         raise EvidenceSchemaError(
             "FlashKDA build is not bound to the current receipt allocation/GPU/runtime"
         )
+    receipt_binding_hardware = {
+        key: hardware[key]
+        for key in ("cuda_arch", "compute_capability", "device_name", "device_uuid")
+    }
+    if (
+        receipt_binding_hardware != current_binding["hardware"]
+        or hardware["torch_version"] != current_binding["runtime"]["torch_version"]
+        or hardware["torch_cuda_version"]
+        != current_binding["runtime"]["torch_cuda_version"]
+    ):
+        raise EvidenceSchemaError(
+            "receipt hardware/runtime differs from its FlashKDA build binding"
+        )
 
     fla = baselines.get("fla_triton")
+    expected_fla_keys = {
+        "available",
+        "implementation",
+        "distribution_version",
+        "package_path",
+        "package_sha256",
+        "op_path",
+        "op_sha256",
+        "forced_environment",
+        "git_source_dir",
+        "git_revision",
+        "worktree_clean_including_untracked",
+    }
     if (
         not isinstance(fla, dict)
+        or set(fla) != expected_fla_keys
         or fla.get("available") is not True
+        or fla.get("implementation") != "fla.ops.kda.chunk_kda (Triton forced)"
         or fla.get("git_revision") != expected_fla_commit
         or fla.get("worktree_clean_including_untracked") is not True
         or fla.get("forced_environment")
@@ -1372,8 +2176,36 @@ def validate_per_arch_receipt(
         raise EvidenceSchemaError("required FLA/Triton peer is missing or unclean")
     _require_sha256(fla.get("package_sha256"), "FLA package hash")
     _require_sha256(fla.get("op_sha256"), "FLA KDA op hash")
+    fla_source_dir = Path(fla["git_source_dir"])
+    fla_package_path = Path(fla["package_path"])
+    fla_op_path = Path(fla["op_path"])
+    distribution_version = fla["distribution_version"]
+    if (
+        not fla_source_dir.is_absolute()
+        or fla_source_dir != fla_source_dir.resolve(strict=False)
+        or not fla_package_path.is_absolute()
+        or not fla_package_path.is_relative_to(fla_source_dir)
+        or fla_package_path.relative_to(fla_source_dir) != Path("fla/__init__.py")
+        or not fla_op_path.is_absolute()
+        or not fla_op_path.is_relative_to(fla_source_dir)
+        or fla_op_path.relative_to(fla_source_dir) != Path("fla/ops/kda/chunk.py")
+        or (
+            distribution_version is not None
+            and (not isinstance(distribution_version, str) or not distribution_version)
+        )
+    ):
+        raise EvidenceSchemaError("FLA source/package/op identity is not exact")
 
-    _validate_graph_receipt(report.get("changed_beta_cuda_graph_test"))
+    graph_receipt = report.get("changed_beta_cuda_graph_test")
+    _validate_graph_receipt(graph_receipt)
+    if (
+        graph_receipt["source_sha256"] != source_hashes[GRAPH_TEST_SOURCE]
+        or graph_receipt["command"][0]
+        != current_binding["runtime"]["python_executable"]
+    ):
+        raise EvidenceSchemaError(
+            "CUDA Graph source/runtime differs from candidate receipt provenance"
+        )
     cases = report.get("cases")
     if not isinstance(cases, list) or len(cases) != len(preset.cases):
         raise EvidenceSchemaError("receipt does not contain exactly six cases")
@@ -1409,6 +2241,7 @@ def validate_per_arch_receipt(
         "graph_test_source_sha256": report["changed_beta_cuda_graph_test"][
             "source_sha256"
         ],
+        "measurement_contract": dict(measurement),
     }
 
 

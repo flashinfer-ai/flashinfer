@@ -342,6 +342,8 @@ def test_flash_kda_manifest_schema_validate_only_is_cpu_safe(tmp_path):
     [
         ("FLASH_KDA_CUDA_ARCHS", "all", "CUDA_ARCHS=auto"),
         ("NVCC_THREADS", "0", "positive integer"),
+        ("NVCC_PREPEND_FLAGS", "--use_fast_math", "forbids ambient"),
+        ("TORCH_CUDA_ARCH_LIST", "9.0", "forbids ambient"),
     ],
 )
 def test_flash_kda_manifest_rejects_noncanonical_build_environment(
@@ -355,6 +357,15 @@ def test_flash_kda_manifest_rejects_noncanonical_build_environment(
     payload["build"]["environment"][key] = value
 
     with pytest.raises(evidence.EvidenceSchemaError, match=message):
+        evidence.validate_flash_kda_build_manifest_schema(payload)
+
+
+def test_flash_kda_manifest_rejects_prefixed_build_command(tmp_path):
+    source_dir, package_path, extension_path, _ = _flash_kda_paths(tmp_path)
+    _, payload = _build_manifest(tmp_path, source_dir, package_path, extension_path)
+    payload["build"]["command"].insert(1, "-I")
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="must be exactly"):
         evidence.validate_flash_kda_build_manifest_schema(payload)
 
 
@@ -584,43 +595,121 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
     }
 
 
-def _timing_receipt(name):
-    names = [f"{name}_kernel"]
-    if name == "flashinfer_public":
-        names = [
-            "void PackBetaForTmaKernel<bf16>",
-            "kernel_flashkda_bf16_fused_m128",
-        ]
-    timing = {
-        "timing_backend": "cupti_activity",
-        "raw_samples": [{"gpu_span_ms": 1.0}, {"gpu_span_ms": 1.1}],
-        "kernel_activity_names_samples": [list(names), list(names)],
-    }
-    if name == "flashinfer_public":
-        timing.update(
-            {
-                "includes_beta_preparation": True,
-                "prepared_recurrence": {
-                    "derived_from_same_public_samples": True,
-                    "includes_beta_pack": False,
-                    "raw_samples": [
-                        {"gpu_span_ms": 0.9},
-                        {"gpu_span_ms": 1.0},
-                    ],
-                    "kernel_activity_names_samples": [
-                        ["kernel_flashkda_bf16_fused_m128"],
-                        ["kernel_flashkda_bf16_fused_m128"],
-                    ],
-                },
-            }
-        )
+def _timing_receipt(name, *, num_sequences):
+    base_order = list(evidence.REQUIRED_TIMING_PATHS)
+    raw_samples = []
+    for block_index in range(evidence.PHASE_A_MEASUREMENT_CONTRACT["blocks"]):
+        block_order = base_order if block_index % 2 == 0 else list(reversed(base_order))
+        order_index = block_order.index(name)
+        for sample_index in range(
+            evidence.PHASE_A_MEASUREMENT_CONTRACT["repeat_iters_per_block"]
+        ):
+            base = (block_index * 100 + sample_index) * 100_000
+            launches = [
+                evidence.LaunchActivity(
+                    start_ns=base + 1_000,
+                    end_ns=base + 1_100,
+                    correlation_id=1,
+                    kind="runtime",
+                    name="runtime:cbid=13",
+                )
+            ]
+            if name == "flashinfer_public":
+                launches.append(
+                    evidence.LaunchActivity(
+                        start_ns=base + 2_000,
+                        end_ns=base + 2_100,
+                        correlation_id=2,
+                        kind="runtime",
+                        name="runtime:cbid=13",
+                    )
+                )
+                activities = [
+                    evidence.GpuActivity(
+                        start_ns=base + 6_000,
+                        end_ns=base + 6_500,
+                        correlation_id=1,
+                        kind="kernel",
+                        name="void PackBetaForTmaKernel<bf16>",
+                    ),
+                    evidence.GpuActivity(
+                        start_ns=base + 7_000,
+                        end_ns=base + 9_000,
+                        correlation_id=2,
+                        kind="kernel",
+                        name="kernel_flashkda_bf16_fused_m128",
+                    ),
+                ]
+            elif name == "flash_kda_public_semantics_adapted":
+                launches.append(
+                    evidence.LaunchActivity(
+                        start_ns=base + 2_000,
+                        end_ns=base + 2_100,
+                        correlation_id=2,
+                        kind="runtime",
+                        name="runtime:cbid=41",
+                    )
+                )
+                activities = [
+                    evidence.GpuActivity(
+                        start_ns=base + 6_000,
+                        end_ns=base + 8_000,
+                        correlation_id=1,
+                        kind="kernel",
+                        name="kernel_flashkda_bf16_fused_m128",
+                    ),
+                    evidence.GpuActivity(
+                        start_ns=base + 8_200,
+                        end_ns=base + 8_700,
+                        correlation_id=2,
+                        kind="memcpy",
+                        name=(
+                            "MEMCPY(copy_kind=8,bytes="
+                            f"{num_sequences * 12 * 128 * 128 * 2})"
+                        ),
+                    ),
+                ]
+            else:
+                kernel_name = (
+                    "kernel_flashkda_bf16_fused_m128"
+                    if name == "flash_kda_raw"
+                    else "triton_red_fused_kda"
+                )
+                activities = [
+                    evidence.GpuActivity(
+                        start_ns=base + 6_000,
+                        end_ns=base + 8_000,
+                        correlation_id=1,
+                        kind="kernel",
+                        name=kernel_name,
+                    )
+                ]
+            sample = evidence._correlated_sample(
+                sample_index=sample_index,
+                bracket=evidence.CpuBracket(
+                    start_ns=base,
+                    submitted_ns=base + 4_000,
+                    synchronized_ns=base + 12_000,
+                ),
+                launches=launches,
+                activities=activities,
+                require_h12_public_route=name == "flashinfer_public",
+            )
+            sample["block_index"] = block_index
+            sample["order_index"] = order_index
+            raw_samples.append(sample)
+    timing = evidence.summarize_samples(
+        raw_samples,
+        require_h12_public_route=name == "flashinfer_public",
+    )
+    timing["call_path"] = evidence.REQUIRED_TIMING_CALL_PATHS[name]
     return timing
 
 
 def _complete_per_arch_report(tmp_path, arch):
     preset = evidence.load_preset(_preset_path())
     source_dir, package_path, extension_path, _ = _flash_kda_paths(tmp_path / arch)
-    _, build_manifest = _build_manifest(
+    build_manifest_path, build_manifest = _build_manifest(
         tmp_path / arch,
         source_dir,
         package_path,
@@ -629,22 +718,63 @@ def _complete_per_arch_report(tmp_path, arch):
     )
     candidate_commit = "1" * 40
     fla_commit = "2" * 40
-    oracle_result = {
-        "output": {"passed": True},
-        "final_state": {"passed": True},
-    }
     cases = []
     for case in preset.cases:
+        oracle_result = {
+            "output": {
+                "passed": True,
+                "max_abs": 0.0,
+                "max_allowed_abs": 0.01,
+                "mismatch_count": 0,
+                "atol": 0.01,
+                "rtol": 0.01,
+                "compared_dtype": "bfloat16",
+                "compared_numel": case.total_tokens * 12 * 128,
+            },
+            "final_state": {
+                "passed": True,
+                "max_abs": 0.0,
+                "max_allowed_abs": 0.01,
+                "mismatch_count": 0,
+                "atol": 0.01,
+                "rtol": 0.01,
+                "compared_dtype": "bfloat16",
+                "compared_numel": len(case.seq_lens) * 12 * 128 * 128,
+            },
+        }
+        timings = {
+            name: _timing_receipt(name, num_sequences=len(case.seq_lens))
+            for name in evidence.REQUIRED_TIMING_PATHS
+        }
+        base_order = list(evidence.REQUIRED_TIMING_PATHS)
+        measurement_order = []
+        for block_index in range(evidence.PHASE_A_MEASUREMENT_CONTRACT["blocks"]):
+            block_order = (
+                base_order if block_index % 2 == 0 else list(reversed(base_order))
+            )
+            measurement_order.extend(
+                {
+                    "block_index": block_index,
+                    "order_index": order_index,
+                    "path": name,
+                }
+                for order_index, name in enumerate(block_order)
+            )
+        candidate_ms = timings["flashinfer_public"]["median_gpu_span_ms"]
         cases.append(
             {
                 "name": case.name,
                 "layout": case.layout,
                 "seq_lens": list(case.seq_lens),
+                "total_tokens": case.total_tokens,
+                "num_sequences": len(case.seq_lens),
                 "seed": case.seed,
                 "num_heads": 12,
                 "head_dim_qk": 128,
                 "head_dim_vo": 128,
                 "dtype": "bfloat16",
+                "initial_state": "provided_bfloat16",
+                "variant": "m128",
                 "correctness": {
                     "passed": True,
                     "public_output_and_full_final_state": True,
@@ -654,10 +784,23 @@ def _complete_per_arch_report(tmp_path, arch):
                     "pinned_flash_kda": json.loads(json.dumps(oracle_result)),
                     "fla_triton": json.loads(json.dumps(oracle_result)),
                 },
-                "timings": {
-                    name: _timing_receipt(name)
-                    for name in evidence.REQUIRED_TIMING_PATHS
+                "timings": timings,
+                "measurement_order": measurement_order,
+                "per_case_speedups": {
+                    "vs_pinned_flash_kda_raw": (
+                        timings["flash_kda_raw"]["median_gpu_span_ms"] / candidate_ms
+                    ),
+                    "vs_pinned_flash_kda_public_semantics_adapted": (
+                        timings["flash_kda_public_semantics_adapted"][
+                            "median_gpu_span_ms"
+                        ]
+                        / candidate_ms
+                    ),
+                    "vs_fla_triton": (
+                        timings["fla_triton"]["median_gpu_span_ms"] / candidate_ms
+                    ),
                 },
+                "cross_shape_aggregate": None,
             }
         )
     capability = [10, 0] if arch == "sm100a" else [10, 3]
@@ -666,10 +809,24 @@ def _complete_per_arch_report(tmp_path, arch):
         "suite": "recurrent_kda_prefill_h12_phase_a",
         "preset": {
             "name": preset.name,
+            "path": preset.path,
             "sha256": preset.sha256,
+            "common": preset.common,
             "aggregation": "per_case_only",
+            "cases": [
+                {
+                    "name": case.name,
+                    "layout": case.layout,
+                    "seq_lens": list(case.seq_lens),
+                    "total_tokens": case.total_tokens,
+                    "seed": case.seed,
+                }
+                for case in preset.cases
+            ],
         },
         "candidate_provenance": {
+            "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+            "source_dir": "/src/flashinfer",
             "source_commit": candidate_commit,
             "required_ancestor_revisions": {
                 "phase_a_upstream_main": (
@@ -680,18 +837,31 @@ def _complete_per_arch_report(tmp_path, arch):
                 ),
             },
             "worktree_clean_including_untracked": True,
-            "imported_module_sha256": {"flashinfer.kda": "a" * 64},
-            "source_sha256": {"flashinfer/kda.py": "b" * 64},
+            "imported_module_paths": {
+                "flashinfer.kda": "/src/flashinfer/flashinfer/kda.py",
+                "flashinfer.kda_prefill": ("/src/flashinfer/flashinfer/kda_prefill.py"),
+            },
+            "imported_module_sha256": {
+                name: "b" * 64 for name in evidence.REQUIRED_CANDIDATE_IMPORTED_MODULES
+            },
+            "source_sha256": {
+                path: "b" * 64 for path in evidence.REQUIRED_CANDIDATE_SOURCE_PATHS
+            },
         },
         "baselines": {
             "flash_kda": {
                 "available": True,
+                "required_revision": evidence.FLASH_KDA_BASELINE_REVISION,
                 "repository": evidence.FLASH_KDA_REPOSITORY,
+                "source_dir": build_manifest["source"]["source_dir"],
                 "source_commit": evidence.FLASH_KDA_BASELINE_REVISION,
                 "cutlass_commit": evidence.FLASH_KDA_CUTLASS_REVISION,
                 "worktree_clean_including_untracked": True,
+                "package_path": build_manifest["artifacts"]["package_path"],
                 "package_sha256": build_manifest["artifacts"]["package_sha256"],
+                "extension_path": build_manifest["artifacts"]["extension_path"],
                 "extension_sha256": build_manifest["artifacts"]["extension_sha256"],
+                "build_manifest_path": str(build_manifest_path.resolve()),
                 "build_manifest_sha256": (
                     evidence.flash_kda_build_manifest_sha256(build_manifest)
                 ),
@@ -700,28 +870,47 @@ def _complete_per_arch_report(tmp_path, arch):
             },
             "fla_triton": {
                 "available": True,
+                "implementation": "fla.ops.kda.chunk_kda (Triton forced)",
+                "distribution_version": "0.3.2",
+                "package_path": str(
+                    (tmp_path / arch / "fla" / "fla" / "__init__.py").resolve()
+                ),
+                "package_sha256": "d" * 64,
+                "op_path": str(
+                    (
+                        tmp_path / arch / "fla" / "fla" / "ops" / "kda" / "chunk.py"
+                    ).resolve()
+                ),
+                "op_sha256": "e" * 64,
+                "git_source_dir": str((tmp_path / arch / "fla").resolve()),
                 "git_revision": fla_commit,
                 "worktree_clean_including_untracked": True,
-                "distribution_version": "0.3.2",
-                "package_sha256": "d" * 64,
-                "op_sha256": "e" * 64,
                 "forced_environment": {
                     "FLA_FLASH_KDA": "0",
                     "FLA_DISABLE_BACKEND_DISPATCH": "1",
                 },
             },
         },
-        "hardware": {"cuda_arch": arch, "compute_capability": capability},
+        "hardware": {
+            "device_name": build_manifest["hardware"]["device_name"],
+            "device_index": 0,
+            "device_uuid": build_manifest["hardware"]["device_uuid"],
+            "compute_capability": capability,
+            "cuda_arch": arch,
+            "multiprocessor_count": 100,
+            "total_memory_bytes": 1_000_000,
+            "l2_cache_bytes": 100_000,
+            "torch_version": build_manifest["toolchain"]["torch_version"],
+            "torch_cuda_version": build_manifest["toolchain"]["torch_cuda_version"],
+        },
         "measurement": {
-            "timing_backend": "cupti_activity",
-            "cross_shape_geomean": False,
-            "blocks": 2,
-            "repeat_iters_per_block": 1,
+            **evidence.PHASE_A_MEASUREMENT_CONTRACT,
+            "cupti_python_version": "13.0.0",
         },
         "changed_beta_cuda_graph_test": {
             "source": evidence.GRAPH_TEST_SOURCE,
             "source_line_range": list(evidence.GRAPH_TEST_SOURCE_LINE_RANGE),
-            "source_sha256": "f" * 64,
+            "source_sha256": "b" * 64,
             "node_id": evidence.GRAPH_TEST_NODE_ID,
             "parameterization": {"num_heads": [6, 12]},
             "command": [
@@ -732,6 +921,8 @@ def _complete_per_arch_report(tmp_path, arch):
                 evidence.GRAPH_TEST_NODE_ID,
             ],
             "returncode": 0,
+            "stdout": "2 passed\n",
+            "stderr": "",
             "passed": True,
         },
         "cases": cases,
@@ -806,7 +997,7 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
 
     missing_oracle = json.loads(json.dumps(sm100a))
     del missing_oracle["cases"][0]["correctness"]["fla_triton"]
-    with pytest.raises(evidence.EvidenceSchemaError, match="required oracle"):
+    with pytest.raises(evidence.EvidenceSchemaError, match="correctness keys"):
         evidence.validate_per_arch_receipt(
             missing_oracle,
             expected_arch="sm100a",
@@ -843,6 +1034,9 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
         )
 
     sm103a["candidate_provenance"]["source_sha256"]["flashinfer/kda.py"] = "0" * 64
+    sm103a["candidate_provenance"]["imported_module_sha256"]["flashinfer.kda"] = (
+        "0" * 64
+    )
     with pytest.raises(evidence.EvidenceSchemaError, match="exactly matching"):
         evidence.reduce_dual_arch_receipts(
             sm100a_report=sm100a,
@@ -853,6 +1047,367 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
             expected_fla_commit=fla_commit,
             preset=preset,
         )
+
+
+def _refresh_timing_summary_arrays(timing):
+    raw_samples = timing["raw_samples"]
+    timing.update(
+        evidence._summarize_numeric(raw_samples, evidence._PUBLIC_NUMERIC_FIELDS)
+    )
+    for summary_key, sample_key in (
+        ("launch_activity_names_samples", "launch_activity_names"),
+        ("launch_activity_order_samples", "launch_activity_order"),
+        ("gpu_activity_names_samples", "gpu_activity_names"),
+        ("kernel_activity_names_samples", "kernel_activity_names"),
+        ("copy_activity_names_samples", "copy_activity_names"),
+        ("activity_order_samples", "activity_order"),
+    ):
+        timing[summary_key] = [sample[sample_key] for sample in raw_samples]
+
+
+def _rewrite_first_case_kernel(payload, path_name, kernel_name):
+    timing = payload["cases"][0]["timings"][path_name]
+    for sample in timing["raw_samples"]:
+        for record in sample["activity_order"]:
+            if record["kind"] == "kernel":
+                record["name"] = kernel_name
+        sample["gpu_activity_names"] = [
+            record["name"] for record in sample["activity_order"]
+        ]
+        sample["kernel_activity_names"] = [
+            record["name"]
+            for record in sample["activity_order"]
+            if record["kind"] == "kernel"
+        ]
+    _refresh_timing_summary_arrays(timing)
+
+
+def _rewrite_first_adapted_copy(payload, *, kind, name):
+    timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
+    for sample in timing["raw_samples"]:
+        copy = next(
+            record
+            for record in sample["activity_order"]
+            if record["kind"] in {"memcpy", "memset"}
+        )
+        copy["kind"] = kind
+        copy["name"] = name
+        sample["gpu_activity_names"] = [
+            record["name"] for record in sample["activity_order"]
+        ]
+        sample["copy_activity_names"] = [name]
+    _refresh_timing_summary_arrays(timing)
+
+
+def _overlap_first_public_pack_and_recurrence(payload):
+    timing = payload["cases"][0]["timings"]["flashinfer_public"]
+    sample = timing["raw_samples"][0]
+    pack, recurrence = sample["activity_order"]
+    pack["end_ns"] = recurrence["start_ns"] + 1
+    pack["duration_ms"] = (pack["end_ns"] - pack["start_ns"]) / 1e6
+    metrics = evidence._interval_metrics(
+        [
+            evidence.GpuActivity(
+                start_ns=record["start_ns"],
+                end_ns=record["end_ns"],
+                correlation_id=record["correlation_id"],
+                kind=record["kind"],
+                name=record["name"],
+            )
+            for record in sample["activity_order"]
+        ]
+    )
+    sample.update(metrics)
+    _refresh_timing_summary_arrays(timing)
+
+
+def _overlap_first_adapted_copy(payload):
+    timing = payload["cases"][0]["timings"]["flash_kda_public_semantics_adapted"]
+    sample = timing["raw_samples"][0]
+    recurrence, copy = sample["activity_order"]
+    copy["start_ns"] = recurrence["end_ns"] - 1
+    copy["duration_ms"] = (copy["end_ns"] - copy["start_ns"]) / 1e6
+    metrics = evidence._interval_metrics(
+        [
+            evidence.GpuActivity(
+                start_ns=record["start_ns"],
+                end_ns=record["end_ns"],
+                correlation_id=record["correlation_id"],
+                kind=record["kind"],
+                name=record["name"],
+            )
+            for record in sample["activity_order"]
+        ]
+    )
+    sample.update(metrics)
+    _refresh_timing_summary_arrays(timing)
+
+
+def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+
+    def reject(mutator, message):
+        mutated = json.loads(json.dumps(report))
+        mutator(mutated)
+        with pytest.raises(evidence.EvidenceSchemaError, match=message):
+            evidence.validate_per_arch_receipt(
+                mutated,
+                expected_arch="sm100a",
+                expected_candidate_commit=candidate_commit,
+                expected_fla_commit=fla_commit,
+                preset=preset,
+            )
+
+    reject(
+        lambda payload: payload["measurement"].__setitem__("warmup_iters_per_block", 1),
+        "not exact Phase A",
+    )
+    reject(
+        lambda payload: payload["measurement"].__setitem__(
+            "cupti_python_version", "not-a-version"
+        ),
+        "not exact Phase A",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["correctness"][
+            "independent_bf16_recurrence"
+        ]["output"].__setitem__("compared_dtype", "float32"),
+        "exact BF16 full-tensor",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["correctness"]["pinned_flash_kda"][
+            "final_state"
+        ].__setitem__("compared_numel", 1),
+        "exact BF16 full-tensor",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["correctness"]["fla_triton"][
+            "output"
+        ].__setitem__("atol", 999.0),
+        "exact BF16 full-tensor",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["correctness"][
+            "independent_bf16_recurrence"
+        ]["output"].__setitem__("mismatch_count", 1),
+        "exact BF16 full-tensor",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["correctness"][
+            "independent_bf16_recurrence"
+        ]["output"].__setitem__("max_abs", 1e30),
+        "exact BF16 full-tensor",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
+            0
+        ].pop("activity_order"),
+        "keys must be exactly",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["fla_triton"].__setitem__(
+            "median_gpu_span_ms", 99.0
+        ),
+        "medians differ",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["flashinfer_public"].__setitem__(
+            "cold_l2", False
+        ),
+        "timing scope is not exact",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
+            0
+        ].__setitem__("block_index", 1),
+        "sample/block/order identity",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"][
+            "flash_kda_public_semantics_adapted"
+        ]["raw_samples"][0].__setitem__("copy_activity_count", 0),
+        "activity counts/names",
+    )
+    reject(
+        lambda payload: _rewrite_first_case_kernel(
+            payload,
+            "flash_kda_raw",
+            "totally_unrelated_kernel",
+        ),
+        "exact pinned FlashKDA recurrence",
+    )
+    reject(
+        lambda payload: _rewrite_first_case_kernel(
+            payload,
+            "fla_triton",
+            "totally_unrelated_kernel",
+        ),
+        "identifiable FLA KDA kernel",
+    )
+    reject(
+        lambda payload: _rewrite_first_adapted_copy(
+            payload,
+            kind="memcpy",
+            name="MEMCPY(copy_kind=8,bytes=1)",
+        ),
+        "exact post-recurrence full-state D2D copy-back",
+    )
+    reject(
+        _overlap_first_adapted_copy,
+        "exact post-recurrence full-state D2D copy-back",
+    )
+    reject(
+        lambda payload: _rewrite_first_adapted_copy(
+            payload,
+            kind="memset",
+            name="MEMSET(value=0,bytes=1)",
+        ),
+        "exact post-recurrence full-state D2D copy-back",
+    )
+    reject(
+        _overlap_first_public_pack_and_recurrence,
+        "exact nonoverlapping pack-to-recurrence",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
+            0
+        ]["launch_activity_order"][0].__setitem__("correlation_id", 99),
+        "activity counts/names are inconsistent",
+    )
+    reject(
+        lambda payload: payload["cases"][0]["measurement_order"].reverse(),
+        "measurement order",
+    )
+    reject(
+        lambda payload: payload["preset"]["common"].__setitem__("beta_is_logit", False),
+        "preset identity",
+    )
+    reject(
+        lambda payload: payload["cases"][0].__setitem__(
+            "initial_state", "provided_float32"
+        ),
+        "initial_state must be",
+    )
+    reject(
+        lambda payload: payload["candidate_provenance"]["source_sha256"].pop(
+            "flashinfer/kda.py"
+        ),
+        "hash key sets",
+    )
+    reject(
+        lambda payload: payload["candidate_provenance"][
+            "imported_module_paths"
+        ].__setitem__("flashinfer.kda", "/src/flashinfer/not_the_source/evil_kda.py"),
+        "imported module path",
+    )
+    reject(
+        lambda payload: payload["candidate_provenance"][
+            "imported_module_sha256"
+        ].__setitem__("flashinfer.kda", "c" * 64),
+        "hash differs from source",
+    )
+    reject(
+        lambda payload: payload["changed_beta_cuda_graph_test"].__setitem__(
+            "source_sha256", "0" * 64
+        ),
+        "differs from candidate",
+    )
+    reject(
+        lambda payload: payload["changed_beta_cuda_graph_test"].__setitem__(
+            "stdout", ""
+        ),
+        "process evidence is malformed",
+    )
+    reject(
+        lambda payload: payload["changed_beta_cuda_graph_test"]["command"].__setitem__(
+            0, "/different/python"
+        ),
+        "source/runtime differs",
+    )
+    reject(
+        lambda payload: payload["hardware"].__setitem__(
+            "device_uuid", "GPU-not-the-build-device"
+        ),
+        "hardware/runtime differs",
+    )
+    reject(
+        lambda payload: payload["hardware"].__setitem__("torch_version", "0.fake"),
+        "hardware/runtime differs",
+    )
+    reject(
+        lambda payload: payload["baselines"]["flash_kda"].__setitem__(
+            "unexpected", True
+        ),
+        "pinned FlashKDA peer",
+    )
+    reject(
+        lambda payload: payload["baselines"]["flash_kda"].__setitem__(
+            "repository", "https://example.invalid/fake.git"
+        ),
+        "pinned FlashKDA peer",
+    )
+    reject(
+        lambda payload: payload["baselines"]["fla_triton"].__setitem__(
+            "package_path", "/outside/fla/__init__.py"
+        ),
+        "FLA source/package/op identity",
+    )
+    reject(
+        lambda payload: payload["cases"][0].__setitem__(
+            "cross_shape_aggregate", {"geomean": 2.0}
+        ),
+        "forbidden cross-shape",
+    )
+    reject(
+        lambda payload: payload.__setitem__("cross_shape_geomean", 2.0),
+        "keys must be exactly",
+    )
+
+
+def test_dual_arch_reducer_rejects_different_cupti_contract_identity(tmp_path):
+    sm100a, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    sm103a, _, _, _ = _complete_per_arch_report(tmp_path, "sm103a")
+    sm103a["measurement"]["cupti_python_version"] = "13.1.0"
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="exactly matching"):
+        evidence.reduce_dual_arch_receipts(
+            sm100a_report=sm100a,
+            sm103a_report=sm103a,
+            sm100a_receipt_sha256="1" * 64,
+            sm103a_receipt_sha256="2" * 64,
+            expected_candidate_commit=candidate_commit,
+            expected_fla_commit=fla_commit,
+            preset=preset,
+        )
+
+
+def test_runner_rejects_non_exact_phase_a_sampling_without_gpu_import(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_runner_path()),
+            "--flash-kda-source-dir",
+            str(tmp_path / "flash-kda"),
+            "--flash-kda-build-manifest",
+            str(tmp_path / "manifest.json"),
+            "--warmup-iters",
+            "1",
+            "--json",
+            str(tmp_path / "receipt.json"),
+        ],
+        cwd=BENCHMARKS_DIR.parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "exact --warmup-iters 5 --repeat-iters 20 --blocks 2" in completed.stderr
 
 
 def test_runner_has_no_reportable_timer_fallback_or_top_level_gpu_import():
