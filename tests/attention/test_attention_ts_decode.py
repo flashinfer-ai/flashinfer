@@ -63,6 +63,7 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
+    _decode_min_blocks_per_mp,
     build_decode_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_kv_tile_idx import (
@@ -1434,7 +1435,7 @@ def test_attention_ts_decode_query_head_extent_guard() -> None:
 def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
     """The public K/V bound leaves room for the final exclusive tile endpoint."""
 
-    safe_max = 2**31 - 128
+    safe_max = 2**31 - _DECODE_MAX_KV_TILE_SIZE
     assert safe_max == _DECODE_MAX_KV_LEN
     assert _validate_max_kv_len(safe_max, "max_seq_len") == safe_max
     assert safe_max + _DECODE_MAX_KV_TILE_SIZE - 1 == 2**31 - 1
@@ -1454,9 +1455,16 @@ def test_attention_ts_decode_reserves_int32_kv_tile_padding() -> None:
     _validate_decode_policy_kv_tile_size(
         type("Config", (), {"tile_size_kv": _DECODE_MAX_KV_TILE_SIZE})()
     )
-    with pytest.raises(RuntimeError, match=r"K/V tile no larger than 128.*got 256"):
+    unsupported_tile_size = _DECODE_MAX_KV_TILE_SIZE * 2
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            rf"K/V tile no larger than {_DECODE_MAX_KV_TILE_SIZE}"
+            rf".*got {unsupported_tile_size}"
+        ),
+    ):
         _validate_decode_policy_kv_tile_size(
-            type("Config", (), {"tile_size_kv": 256})()
+            type("Config", (), {"tile_size_kv": unsupported_tile_size})()
         )
 
 
@@ -1515,30 +1523,45 @@ def test_attention_ts_decode_planned_kv_domain_detects_unpaired_tail(
 
 
 @pytest.mark.parametrize(
-    ("tile_size_q", "use_keeps_mma_ab", "expected"),
-    ((64, True, False), (128, False, False), (128, True, True)),
+    (
+        "tile_size_q",
+        "tile_size_kv",
+        "use_keeps_mma_ab",
+        "total_kv_tiles",
+        "expected_budgets",
+    ),
+    (
+        (64, 128, True, 32, (None, None, None)),
+        (128, 128, False, 32, (None, None, None)),
+        (128, 128, True, 1, (184, 88, 56)),
+        (64, 256, True, 31, (None, None, None)),
+        (64, 256, True, 32, (176, 104, 56)),
+    ),
 )
 def test_attention_ts_decode_register_reallocation_follows_task_graph(
     tile_size_q: int,
+    tile_size_kv: int,
     use_keeps_mma_ab: bool,
-    expected: bool,
+    total_kv_tiles: int,
+    expected_budgets: tuple[int | None, int | None, int | None],
 ) -> None:
-    """Only the full TileQ128 Keeps graph redistributes task registers."""
+    """Register hand-off follows topology and amortized KV256 loop length."""
 
     config = FmhaDecodeConfig(
         tile_size_q=tile_size_q,
+        tile_size_kv=tile_size_kv,
         use_keeps_mma_ab=use_keeps_mma_ab,
+        total_kv_tiles=total_kv_tiles,
     )
     budgets = (
         config.softmax_task_num_registers,
         config.correction_task_num_registers,
         config.mma_load_task_num_registers,
     )
-    assert config.uses_task_register_reallocation is expected
-    if expected:
+    assert budgets == expected_budgets
+    assert config.uses_task_register_reallocation is (expected_budgets[0] is not None)
+    if config.uses_task_register_reallocation:
         assert all(value is not None and value % 8 == 0 for value in budgets)
-    else:
-        assert budgets == (None, None, None)
 
 
 @pytest.mark.arch_blackwell
@@ -1816,6 +1839,43 @@ def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128
     )
 
 
+def _make_contiguous_kv256_config(
+    *,
+    persistent: bool | None = None,
+    config_args: dict[str, object] | None = None,
+    split_kv_mode: str = "disabled",
+    splits_kv: int = 1,
+):
+    """Build the qualified Q64/KV256 profile for schedule-level tests."""
+
+    args = {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": 64,
+        "tile_size_kv": 256,
+        "groups_tokens_heads_q": True,
+    }
+    if persistent is not None:
+        args["use_persistent_scheduler"] = persistent
+    if config_args is not None:
+        args.update(config_args)
+    return make_decode_config(
+        headdim=128,
+        args=args,
+        seq_len_q=64,
+        seq_len_kv=4096,
+        batch_size=1,
+        num_heads_q=32,
+        num_heads_kv=32,
+        qkv_dtype=BFloat16,
+        o_dtype=BFloat16,
+        qkv_layout="contiguousKv",
+        split_kv_mode=split_kv_mode,
+        splits_kv=splits_kv,
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+
 def _make_paged_window_crossing_config(*, page_size: int):
     """Build two visible K tiles whose page IDs cross the 32-ID window."""
 
@@ -1928,6 +1988,24 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     p1 = resources["smemP1"]._tmem_alloc
     output = resources["tmemO"]._alloc
 
+    for name in ("tmemSoftmaxLocal0", "tmemSoftmaxLocal1"):
+        stats = resources[name]
+        if cfg.keeps_stats_via_smem:
+            assert stats._alloc is None
+        else:
+            assert stats._alloc is not None
+    if cfg.keeps_stats_via_smem:
+        assert p0.offset == s0.offset + cfg.tmem_stats_cols
+        assert p1.offset == s1.offset + cfg.tmem_stats_cols
+    else:
+        stats0 = resources["tmemSoftmaxLocal0"]._alloc
+        stats1 = resources["tmemSoftmaxLocal1"]._alloc
+        assert p0.offset == s0.offset
+        assert p1.offset == s1.offset
+        assert stats0.offset == s1.offset + s1.num_columns
+        assert stats1.offset == stats0.offset + stats0.num_columns
+        assert output.offset == stats1.offset + stats1.num_columns
+
     expected_p_cols = cfg.tile_size_kv * cfg.q_dtype_bytes // 4
     assert p0.num_columns == p1.num_columns == expected_p_cols
     assert s0.offset <= p0.offset
@@ -1940,6 +2018,262 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
+    """KV256 publishes four TMEM P fragments without a full/empty FIFO."""
+
+    cfg = _make_contiguous_kv256_config()
+    resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+
+    assert cfg.keeps_stats_via_smem
+    assert resources["tmemSoftmaxLocal0"]._alloc is None
+    assert resources["tmemSoftmaxLocal1"]._alloc is None
+    assert resources["tmemO"]._alloc.offset == 0
+    assert resources["smemP0"]._tmem_alloc.offset == resources["tmemS0"]._alloc.offset
+    assert resources["smemP1"]._tmem_alloc.offset == resources["tmemS1"]._alloc.offset
+
+    # One score generation advances both P-ready parity and the matching
+    # two-stage O completion credit exactly once per instance. These structural
+    # invariants keep the hand-managed fragment protocol aligned across
+    # persistent work-tile boundaries.
+    assert cfg.num_insts_kv == cfg.o_stages == 2
+    assert resources["tmemS0"].pipeline_config.num_stages == 1
+    assert resources["tmemS1"].pipeline_config.num_stages == 1
+    assert resources["tmemO"].pipeline_config.num_stages == cfg.o_stages
+    for name in ("smemP0", "smemP1"):
+        p = resources[name]
+        assert p.pipeline_config is None
+        assert p.tmem_o_ref is resources["tmemO"]
+        assert isinstance(p._fragment_ready_alloc, SmemAllocation)
+        assert p._fragment_ready_alloc.size_bytes == (
+            cfg.num_softmax_score_fragments * 8
+        )
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check(
+) -> None:
+    """Keep structural validation enabled when TS cannot model P barriers."""
+
+    cfg = _make_contiguous_kv256_config(persistent=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        task_manager = build_decode_task_manager(
+            cfg,
+            seq_len_kv=2 * cfg.tile_size_kv,
+            batch_size=1,
+            num_heads_kv=32,
+            verbose=False,
+            skip_validation=False,
+            exhaustive_deadlock_race_check=True,
+        )
+
+    assert task_manager._exhaustive_deadlock_race_check is False
+
+
+@pytest.mark.parametrize(
+    "config_args",
+    tuple(
+        {field: expected + 1}
+        for field, expected in (
+            ("softmax0_warp_idx", 0),
+            ("softmax0_num_warps", 4),
+            ("softmax1_warp_idx", 4),
+            ("softmax1_num_warps", 4),
+            ("correction_warp_idx", 8),
+            ("correction_num_warps", 4),
+            ("mma_warp_idx", 12),
+            ("mma_num_warps", 1),
+            ("load_warp_idx", 13),
+            ("load_num_warps", 1),
+            ("page_offsets_warp_idx", 14),
+            ("page_offsets_num_warps", 1),
+            ("padding_warp_idx", 14),
+            ("padding_num_warps", 2),
+            ("scheduler_warp_idx", 13),
+            ("scheduler_num_warps", 1),
+            ("clc_load_warp_idx", 15),
+            ("clc_padding_warp_idx", 14),
+            ("clc_padding_num_warps", 1),
+            ("clc_tail_padding_warp_idx", 12),
+            ("clc_tail_padding_num_warps", 0),
+        )
+    ),
+)
+def test_attention_ts_decode_kv256_rejects_invalid_warp_topology(
+    config_args: dict[str, object],
+) -> None:
+    """Reject every explicit override of the qualified KV256 role layout."""
+
+    with pytest.raises(ValueError, match="qualified Q64 BF16/D128"):
+        _make_contiguous_kv256_config(config_args=config_args)
+
+
+def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
+    """Direct persistent KV256 carries its drained-stage alias in one credit."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_corr import (
+        TmemCorrResource,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_tasks import (
+        SmemKvReuseCreditResource,
+    )
+
+    cfg = _make_contiguous_kv256_config(persistent=True)
+    assert cfg.uses_rotating_kv256_exchange
+    reuse_credit = SmemKvReuseCreditResource(
+        cfg=cfg,
+        pipeline_config=None,
+        name="smem_kv_reuse_credit",
+    )
+    credit_alloc = reuse_credit.get_smem_requirements()[0]
+    tmem_corr1 = TmemCorrResource(
+        cfg=cfg,
+        inst_id=1,
+        pipeline_config=None,
+        name="tmemCorr1",
+    )
+    exchange_alloc = tmem_corr1.get_smem_requirements()[-1]
+
+    # Direct output exchanges 128 float4 stats plus 64 rows of 132 floats.
+    # The live 35,840-byte view dynamically selects one stage inside a
+    # full-ring allocation envelope that aliases, but does not enlarge, KV.
+    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 35_840
+    assert exchange_alloc.size_bytes == 3 * 65_536
+    assert credit_alloc.size_bytes == 4
+
+
+@pytest.mark.parametrize(
+    ("split_kv_mode", "uses_separate_reduction"),
+    (
+        pytest.param("gmem_reduction", False, id="fused"),
+        pytest.param(
+            "gmem_reduction_with_separate_kernel",
+            True,
+            id="separate",
+        ),
+    ),
+)
+def test_attention_ts_decode_kv256_split_uses_compact_exchange(
+    split_kv_mode: str,
+    uses_separate_reduction: bool,
+) -> None:
+    """Both KV256 split reducers exchange only 64 logical output rows."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_corr import (
+        TmemCorrResource,
+    )
+
+    cfg = _make_contiguous_kv256_config(
+        split_kv_mode=split_kv_mode,
+        splits_kv=2,
+    )
+    assert cfg.use_split_kv
+    assert cfg.splits_kv == 2
+    assert cfg.use_separate_reduction_kernel is uses_separate_reduction
+
+    tmem_corr1 = TmemCorrResource(
+        cfg=cfg,
+        inst_id=1,
+        pipeline_config=None,
+        name="tmemCorr1",
+    )
+    exchange_alloc = tmem_corr1.get_smem_requirements()[-1]
+
+    assert tmem_corr1._kv_tile_256_exchange_entries() * 4 == 35_840
+    assert exchange_alloc.size_bytes == 35_840
+
+
+def test_attention_ts_decode_rotating_exchange_is_a_storage_agnostic_capability(
+) -> None:
+    """Select rotation by physical topology, not contiguous versus paged K/V."""
+
+    contiguous = _make_contiguous_kv256_config(persistent=True)
+    paged = make_decode_config(
+        headdim=128,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+            "use_persistent_scheduler": True,
+        },
+        seq_len_q=64,
+        seq_len_kv=4096,
+        batch_size=1,
+        num_heads_q=32,
+        num_heads_kv=32,
+        qkv_dtype=BFloat16,
+        o_dtype=BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=64,
+        split_kv_mode="disabled",
+        splits_kv=1,
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+    assert contiguous.uses_rotating_kv256_exchange
+    assert paged.uses_rotating_kv256_exchange
+    assert not replace(
+        contiguous, use_persistent_scheduler=False
+    ).uses_rotating_kv256_exchange
+    assert not replace(
+        contiguous, use_split_kv=True
+    ).uses_rotating_kv256_exchange
+    assert not replace(
+        contiguous, use_attention_sinks=True
+    ).uses_rotating_kv256_exchange
+
+
+def test_attention_ts_decode_kv256_register_launch_bound_is_amortized() -> None:
+    """Only long KV256 mainloops pay for dynamic register hand-off."""
+
+    cfg = _make_contiguous_kv256_config()
+    assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv) == 0
+    assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv + 1) == 1
+
+
+def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> None:
+    """KV256 enables its 176/104/56 hand-off only once it is amortized."""
+
+    cfg = make_decode_config(
+        headdim=128,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        },
+        seq_len_q=64,
+        seq_len_kv=8192,
+        batch_size=1,
+        num_heads_q=32,
+        num_heads_kv=32,
+        qkv_dtype=BFloat16,
+        o_dtype=BFloat16,
+        qkv_layout="contiguousKv",
+        split_kv_mode="disabled",
+        splits_kv=1,
+        mask_type="dense",
+        auto_tuner=False,
+    )
+
+    short_cfg = replace(cfg, total_kv_tiles=31)
+    long_cfg = replace(cfg, total_kv_tiles=32)
+    assert (
+        short_cfg.softmax_task_num_registers,
+        short_cfg.correction_task_num_registers,
+        short_cfg.mma_load_task_num_registers,
+    ) == (None, None, None)
+    assert (
+        long_cfg.softmax_task_num_registers,
+        long_cfg.correction_task_num_registers,
+        long_cfg.mma_load_task_num_registers,
+    ) == (176, 104, 56)
+    assert cfg.tmem_s_cols == 128
+    assert cfg.mma_tile_n_bmm1 == 256
 
 
 @pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
@@ -1957,6 +2291,26 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
     )
     assert not cfg.uses_tmem_p
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    s0 = resources["tmemS0"]._alloc
+    s1 = resources["tmemS1"]._alloc
+    output = resources["tmemO"]._alloc
+    for name in ("tmemSoftmaxLocal0", "tmemSoftmaxLocal1"):
+        stats = resources[name]
+        if cfg.keeps_stats_via_smem:
+            assert stats._alloc is None
+        else:
+            assert stats._alloc is not None
+    if cfg.keeps_stats_via_smem:
+        assert output.offset == 0
+    else:
+        stats0 = resources["tmemSoftmaxLocal0"]._alloc
+        stats1 = resources["tmemSoftmaxLocal1"]._alloc
+        assert stats0.offset == 0
+        assert stats1.offset == stats0.offset + stats0.num_columns
+        assert output.offset == stats1.offset + stats1.num_columns
+    assert s0.offset == output.offset + output.num_columns
+    assert s1.offset == s0.offset + s0.num_columns
+    assert s1.offset + s1.num_columns == cfg.tmem_total_cols
     for name in ("smemP0", "smemP1"):
         p = resources[name]
         assert isinstance(p._alloc, SmemAllocation)
@@ -1985,6 +2339,10 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
     resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
     s = resources["tmemS0"]._alloc
     p = resources["smemP0"]._tmem_alloc
+
+    assert cfg.keeps_stats_via_smem
+    assert resources["tmemSoftmaxLocal0"]._alloc is None
+    assert p.offset == s.offset + cfg.tmem_stats_cols
 
     assert "tmemStatsDone0" in resources
     assert "tmemStatsDone1" not in resources
@@ -2332,6 +2690,105 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
     assert cfg.num_q_ctas == seq_len_q
 
 
+def _make_auto_kv_tile_config(monkeypatch, **overrides):
+    """Resolve one automatic KV-tile candidate without compiling a kernel."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "_select_auto_launch_mode",
+        lambda **_kwargs: "static",
+    )
+    kwargs = {
+        "headdim": 128,
+        "seq_len_q": 64,
+        "seq_len_kv": 1024,
+        "batch_size": 1,
+        "num_heads_q": 32,
+        "num_heads_kv": 32,
+        "qkv_dtype": BFloat16,
+        "o_dtype": BFloat16,
+        "qkv_layout": "pagedKv",
+        "num_tokens_per_page": 16,
+        "mask_type": "dense",
+        "auto_tuner": True,
+    }
+    return fmha_decode_config.make_decode_config(**{**kwargs, **overrides})
+
+
+def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch):
+    """KV256 participates in the ordinary auto selection."""
+
+    cfg = _make_auto_kv_tile_config(monkeypatch)
+    explicit_reference = _make_auto_kv_tile_config(
+        monkeypatch,
+        args={
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        },
+    )
+
+    assert cfg.use_keeps_mma_ab is True
+    assert cfg.tile_size_q == 64
+    assert cfg.tile_size_kv == 256
+    assert cfg.groups_tokens_heads_q is True
+    assert cfg.q_tokens_per_cta == 64
+    register_cfg = replace(cfg, total_kv_tiles=32)
+    assert register_cfg.softmax_task_num_registers == 176
+    assert register_cfg.correction_task_num_registers == 104
+    assert cfg == explicit_reference
+
+
+def test_attention_ts_decode_auto_config_selects_kv256_for_ratio_64(monkeypatch):
+    """Probe KV256 before deriving the narrower default Swaps tile."""
+
+    cfg = _make_auto_kv_tile_config(
+        monkeypatch,
+        num_heads_q=64,
+        num_heads_kv=1,
+    )
+
+    assert cfg.use_keeps_mma_ab is True
+    assert cfg.tile_size_q == 64
+    assert cfg.tile_size_kv == 256
+    assert cfg.heads_q_per_kv == 64
+    assert cfg.q_tokens_per_cta == 1
+
+
+def test_attention_ts_decode_auto_config_selection_is_device_agnostic(monkeypatch):
+    """Kernel config selection relies on the public wrapper's device guard."""
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    cfg = _make_auto_kv_tile_config(monkeypatch)
+
+    assert cfg.tile_size_kv == 256
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        pytest.param(
+            {"qkv_dtype": Float16, "o_dtype": Float16},
+            id="fp16",
+        ),
+        pytest.param({"headdim": 64}, id="head-dim-64"),
+        pytest.param({"args": {"tile_size_kv": 128}}, id="explicit-kv128"),
+    ),
+)
+def test_attention_ts_decode_auto_config_falls_back_to_kv128(
+    monkeypatch,
+    overrides,
+):
+    """An unqualified or explicitly pinned request retains generic KV128."""
+
+    cfg = _make_auto_kv_tile_config(monkeypatch, **overrides)
+
+    assert cfg.tile_size_kv == 128
+
+
 @pytest.mark.parametrize(
     ("packed_q", "sliding_window"),
     (
@@ -2355,9 +2812,15 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
             return 4
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
+    # Keep this launch-mode unit test on the generic KV128 profile. The
+    # BF16/D128 auto candidate uses Q64/KV256 and changes the number of physical
+    # Q CTAs used by the wave boundary below.
+    config_args: dict[str, object] = {"tile_size_kv": 128}
+    if packed_q:
+        config_args["use_variable_seqlens_q"] = True
     common = dict(
         headdim=128,
-        args={"use_variable_seqlens_q": True} if packed_q else None,
+        args=config_args,
         seq_len_q=3,
         seq_len_kv=257,
         num_heads_q=8,
@@ -2927,8 +3390,6 @@ def test_attention_ts_decode_q64_kv256_auto_launch(
 ):
     """Exercise the KV256 policy through the standard public decode path."""
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("KV256 auto launch currently targets SM100")
     case = _make_decode_case(
         kv_lens=(1024,),
         num_qo_heads=num_qo_heads,
@@ -2946,9 +3407,130 @@ def test_attention_ts_decode_q64_kv256_auto_launch(
 
     policy = _exercise_auto_case(case)
 
-    assert policy["mma_variant"] == "keeps_mma_ab"
     assert policy["tile_size_q"] == 64
     assert policy["tile_size_kv"] == 256
+    assert policy["mma_variant"] == "keeps_mma_ab"
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("kv_len", "num_heads"),
+    (
+        pytest.param(8192, 32, id="multi-head"),
+        pytest.param(65536, 1, id="long-kv"),
+    ),
+)
+def test_attention_ts_decode_q64_kv256_split_launch(
+    kv_len: int,
+    num_heads: int,
+) -> None:
+    """Exercise automatic KV256 split-KV across distinct fanout shapes."""
+
+    case = _make_decode_case(
+        kv_lens=(kv_len,),
+        num_qo_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=128,
+        seq_len_q=64,
+        page_size=128,
+        qkv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cache_form="combined",
+        mask_type="dense",
+        device="cuda",
+        seed=20260805,
+    )
+
+    policy = _exercise_auto_case(case)
+
+    assert policy["tile_size_kv"] == 256
+    assert policy["use_split_kv"] is True
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    (
+        "seq_len_q",
+        "kv_lens",
+        "page_size",
+        "cache_form",
+        "mask_type",
+        "window_left",
+        "persistent",
+    ),
+    (
+        pytest.param(
+            64,
+            (129,),
+            16,
+            "combined",
+            "causal",
+            -1,
+            False,
+            id="single-kv-tile-tail",
+        ),
+        pytest.param(
+            64,
+            (769,),
+            128,
+            "tuple",
+            "causal",
+            127,
+            False,
+            id="static-window-kv-tail",
+        ),
+        pytest.param(
+            512,
+            # Two, four, and six physical KV tiles produce runtime loop
+            # domains 0/1/2, exercising every modulo-three cursor advance in
+            # one persistent launch.
+            (257, 769, 1281),
+            64,
+            "combined",
+            "dense",
+            -1,
+            True,
+            id="persistent-ragged-rotating-cursor",
+        ),
+    ),
+)
+def test_attention_ts_decode_q64_kv256_boundaries(
+    seq_len_q: int,
+    kv_lens: tuple[int, ...],
+    page_size: int,
+    cache_form: str,
+    mask_type: str,
+    window_left: int,
+    persistent: bool,
+):
+    """Cover KV256 tails under windowed static and ragged persistent work."""
+
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=32,
+        num_kv_heads=32,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        qkv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cache_form=cache_form,
+        mask_type=mask_type,
+        window_left=window_left,
+        device="cuda",
+        seed=20260804 + max(kv_lens),
+    )
+
+    policy = _exercise_auto_case(case)
+
+    assert policy["tile_size_q"] == 64
+    assert policy["tile_size_kv"] == 256
+    assert policy["window_left"] == window_left
+    assert policy["use_persistent_scheduler"] is persistent
+    if persistent:
+        assert policy["use_split_kv"] is False
 
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")

@@ -41,7 +41,18 @@ fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
 fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
 ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 
-TaskCache = tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32]
+TaskCache = tuple[
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+]
 DescriptorValue = prims.Tcgen05SmemDesc | cutlass.Int64
 ResourceVarValue = (
     Int32 | Float32 | Uint32 | cutlass.Int64 | cutlass.Array | DescriptorValue
@@ -80,6 +91,18 @@ def _freeze_smem_descriptor(desc):
         write_only_types=[Int64],
         read_only_args=[desc],
     )
+
+
+@cute.jit
+def _wait_for_mbarrier_phase(barrier, phase: Int32) -> None:
+    """Wait for one parity of a CTA-local reusable mbarrier."""
+
+    while not prims.mbarrier_try_wait_parity(
+        barrier,
+        phase,
+        time_limit=10_000_000,
+    ):
+        pass
 
 
 def _softmax_scale_pair_width(num_scale_groups: int, scale_base: int) -> int:
@@ -323,7 +346,18 @@ def _decode_gen_task_cache(stage_info: StageInfo) -> TaskCache:
     """Return the task cache or a zero-filled placeholder cache."""
     if cutlass.const_expr(stage_info.task_cache is None):
         zero = Int32(0)
-        return (zero, zero, zero, zero, zero, zero, zero, zero, zero, zero)
+        return (
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+        )
     return stage_info.task_cache
 
 

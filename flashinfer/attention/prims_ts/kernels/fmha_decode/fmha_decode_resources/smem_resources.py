@@ -41,7 +41,13 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import KV_INST0, KV_INST1, KV_KIND_K, KV_KIND_V
+from ..fmha_decode_constants import (
+    KV_INST0,
+    KV_INST1,
+    KV_KIND_K,
+    KV_KIND_V,
+    KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM,
+)
 from ...stage import FmhaStage
 from ...tensor_map import transform_ragged_coords
 from ...placeholder_helpers import (
@@ -65,14 +71,12 @@ from .helpers_common import (
 )
 from .helpers_kv_tile_idx import (
     _load_runtime_seq_len_kv,
-    _runtime_split_kv_global_tile_idx,
     _num_skipped_kv_tiles,
     _runtime_clamp_valid_tile_idx,
     _runtime_last_valid_page_idx,
+    _runtime_split_kv_global_tile_idx,
     _static_split_kv_global_tile_idx,
 )
-
-_KV_TILE_256_K_SLOT_FOR_SEMANTIC_BLOCK = (0, 2, 1, 3)
 
 
 @cute.jit
@@ -963,7 +967,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=cached_page_ids)
     @cute.jit
     def init_cached_read_state(self, stage_info: StageInfo) -> cutlass.Array:
-        """Initialize D256's per-tile page-ID register cache."""
+        """Initialize the per-tile page-ID register cache."""
         self._create_initial_task_locals(stage_info.context)
         return cutlass.Array(
             Int32,
@@ -1638,7 +1642,7 @@ class SmemKvResource(DecodeGenResourceBase):
             for semantic_block in cutlass.range_constexpr(4):
                 physical_block = semantic_block
                 if cutlass.const_expr(kv_kind == KV_KIND_K):
-                    physical_block = _KV_TILE_256_K_SLOT_FOR_SEMANTIC_BLOCK[
+                    physical_block = KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM[
                         semantic_block
                     ]
                 for dim_half in cutlass.range_constexpr(2):

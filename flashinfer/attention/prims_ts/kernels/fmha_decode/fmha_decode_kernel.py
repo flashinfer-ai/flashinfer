@@ -61,7 +61,11 @@ from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
 from .fmha_decode_config import FmhaDecodeConfig, validate_paged_kv_staging_config
-from .fmha_decode_constants import KV_KIND_K, KV_KIND_V
+from .fmha_decode_constants import (
+    KV_KIND_K,
+    KV_KIND_V,
+    KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
+)
 from .fmha_decode_resources import (
     SmemKvTileResource,
     SmemKvResource,
@@ -84,6 +88,7 @@ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
+    SmemKvReuseCreditResource,
     create_correction_task,
     create_correction_task_one_inst_qkv,
     create_load_task,
@@ -132,6 +137,27 @@ def _compute_decode_gen_loop_domain(total_kv_tiles: int, num_insts_kv: int) -> i
 def _compute_total_kv_tiles(seq_len_kv: int, tile_size_kv: int) -> int:
     """Number of KV tiles needed for a fixed-length launch."""
     return (seq_len_kv + tile_size_kv - 1) // tile_size_kv
+
+
+def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
+    """Return the launch bound needed for dynamic register reallocation.
+
+    ``setmaxnreg`` needs a kernel-entry occupancy bound before ptxas can infer
+    the initial per-thread register allocation. KV256 only pays that fixed
+    hand-off cost for a long enough mainloop; the established profiles below
+    retain their existing unconditional launch bounds.
+    """
+    kv256_reallocation = (
+        cfg.tile_size_kv == 256
+        and _compute_total_kv_tiles(seq_len_kv, cfg.tile_size_kv)
+        >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+    )
+    return int(
+        kv256_reallocation
+        or cfg.tile_size_q == 8
+        or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
+        or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
+    )
 
 
 def _compute_static_num_skipped_kv_tiles(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
@@ -223,7 +249,7 @@ def _build_decode_gen_schedule(
     dict[tuple[MemoryResource, MemoryResource], set[str]],
     SmemAllocator,
     TmemAllocator,
-    list[TmemCorrResource],
+    list[MemoryResource],
 ]:
     """Build all resources, tasks, and dep graph.
 
@@ -244,7 +270,7 @@ def _build_decode_gen_schedule(
     -------
     tuple
         (task_list, dep_graph, dma labels, smem_allocator, tmem_allocator,
-        correction_init_resources)
+        eager_init_resources)
     """
     if cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1 and not cfg.uses_tmem_p:
         raise ValueError(
@@ -471,24 +497,27 @@ def _build_decode_gen_schedule(
         cta_layout_vmnk=cta_layout,
         advance_on_wait=True,
     )
-    smem_p0_cfg = PipelineConfig(
-        num_stages=one_inst_tmem_stages,
-        num_bytes=0,
-        producer_group=softmax0_grp,
-        consumer_group=umma_hw,
-        pipeline_type=PipelineType.AsyncUmma,
-        cta_layout_vmnk=cta_layout,
-        advance_on_wait=True,
-    )
-    smem_p1_cfg = PipelineConfig(
-        num_stages=1,
-        num_bytes=0,
-        producer_group=softmax1_grp,
-        consumer_group=umma_hw,
-        pipeline_type=PipelineType.AsyncUmma,
-        cta_layout_vmnk=cta_layout,
-        advance_on_wait=True,
-    )
+    smem_p0_cfg = None
+    smem_p1_cfg = None
+    if not cfg.streams_tmem_p_fragments:
+        smem_p0_cfg = PipelineConfig(
+            num_stages=one_inst_tmem_stages,
+            num_bytes=0,
+            producer_group=softmax0_grp,
+            consumer_group=umma_hw,
+            pipeline_type=PipelineType.AsyncUmma,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
+        smem_p1_cfg = PipelineConfig(
+            num_stages=one_inst_tmem_stages,
+            num_bytes=0,
+            producer_group=softmax1_grp,
+            consumer_group=umma_hw,
+            pipeline_type=PipelineType.AsyncUmma,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
     tmem_o_cfg = PipelineConfig(
         num_stages=cfg.o_stages,
         num_bytes=0,
@@ -540,6 +569,7 @@ def _build_decode_gen_schedule(
     # ------------------------------------------------------------------
     work_queue = None
     schedule_token_throttle = None
+    smem_kv_reuse_credit = None
     # CLC remains the single persistent policy for every supported topology.
     # The stock static WorkQueue advances and decodes coordinates separately
     # in every task, which regresses multi-wave decode workloads. CLC computes
@@ -581,6 +611,17 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
+        if cfg.uses_rotating_kv256_exchange:
+            smem_kv_reuse_credit = SmemKvReuseCreditResource(
+                cfg=cfg,
+                pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                    num_stages=1,
+                    producer_group=load_grp,
+                    consumer_group=correction_grp,
+                    cta_layout_vmnk=cta_layout,
+                ),
+                name="smem_kv_reuse_credit",
+            )
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -831,8 +872,8 @@ def _build_decode_gen_schedule(
     )
     smem_p0.tmem_s_ref = tmem_s0
     smem_p1.tmem_s_ref = tmem_s1
-    tmem_o.tmem_p0_ref = smem_p0
-    tmem_o.tmem_p1_ref = smem_p1
+    smem_p0.tmem_o_ref = tmem_o
+    smem_p1.tmem_o_ref = tmem_o
     tmem_softmax_global0.p_ref = smem_p0
     tmem_softmax_global1.p_ref = smem_p1
     tmem_softmax_global0.tmem_s_ref = tmem_s0
@@ -957,6 +998,7 @@ def _build_decode_gen_schedule(
             smem_kv,
             work_queue,
             schedule_token_throttle,
+            smem_kv_reuse_credit,
             cfg,
             domain=load_domain,
             domain_bias=0,
@@ -1092,6 +1134,7 @@ def _build_decode_gen_schedule(
             tmem_corr0,
             tmem_corr1,
             work_queue,
+            smem_kv_reuse_credit,
             cfg,
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
@@ -1216,6 +1259,12 @@ def _build_decode_gen_schedule(
         )
     if schedule_token_throttle is not None:
         resource_dependency_graph[schedule_token_throttle] = [work_queue]
+    if smem_kv_reuse_credit is not None:
+        # A self-edge models the one-slot ownership token: Load produces it
+        # for the current tile and Correction consumes it before the next Load.
+        resource_dependency_graph[smem_kv_reuse_credit] = [
+            smem_kv_reuse_credit
+        ]
     dma_consumer_release_labels = {}
     if smem_page_offsets is not None:
         if use_one_inst_qkv:
@@ -1265,6 +1314,8 @@ def _build_decode_gen_schedule(
         smem_allocator.add_resource(work_queue)
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
+    if smem_kv_reuse_credit is not None:
+        smem_allocator.add_resource(smem_kv_reuse_credit)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -1297,9 +1348,9 @@ def _build_decode_gen_schedule(
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
     if cfg.tile_size_kv == 256:
-        # KV256 tail correction runs only after the shared K/V pipeline has
-        # drained. Reuse that 192-KiB ring for the 68-KiB spatial merge rather
-        # than increasing the CTA footprint beyond SM100 capacity.
+        # KV256 direct-output correction rotates one compact 35,840-byte
+        # payload through the shared 192-KiB K/V ring. Split-KV retains the
+        # fixed full exchange. Neither path increases the CTA SMEM footprint.
         smem_allocator.add_alias_group(
             [
                 smem_kv.get_smem_requirements(),
@@ -1315,36 +1366,26 @@ def _build_decode_gen_schedule(
     if cfg.use_keeps_mma_ab:
         if use_one_inst_qkv:
             tmem_allocator.add_resource(tmem_s0)
-        elif cfg.keeps_separates_tmem_s_and_stats:
-            tmem_allocator.add_alias_group(
-                [
-                    tmem_s0.get_tmem_requirements(),
-                    smem_p0.get_tmem_requirements(),
-                ]
-            )
-            tmem_allocator.add_alias_group(
-                [
-                    tmem_s1.get_tmem_requirements(),
-                    smem_p1.get_tmem_requirements(),
-                ]
-            )
+        else:
+            # Build each instruction-local phase from resources that really
+            # use TMEM. P may overlay S or live in SMEM, while stats may use
+            # standalone TMEM or an SMEM handoff. Empty resources must not
+            # become scheduler aliases.
+            for tmem_s, p in (
+                (tmem_s0, smem_p0),
+                (tmem_s1, smem_p1),
+            ):
+                p_requirements = p.get_tmem_requirements()
+                if p_requirements:
+                    tmem_allocator.add_alias_group(
+                        [tmem_s.get_tmem_requirements(), p_requirements]
+                    )
+                else:
+                    tmem_allocator.add_resource(tmem_s)
+            # Register standalone stats only after both S/P phases, preserving
+            # the established allocation order. SMEM-backed stats are a no-op.
             tmem_allocator.add_resource(tmem_softmax_local0)
             tmem_allocator.add_resource(tmem_softmax_local1)
-        else:
-            tmem_allocator.add_alias_group(
-                [
-                    tmem_s0.get_tmem_requirements(),
-                    tmem_softmax_local0.get_tmem_requirements()
-                    + smem_p0.get_tmem_requirements(),
-                ]
-            )
-            tmem_allocator.add_alias_group(
-                [
-                    tmem_s1.get_tmem_requirements(),
-                    tmem_softmax_local1.get_tmem_requirements()
-                    + smem_p1.get_tmem_requirements(),
-                ]
-            )
     else:
         tmem_allocator.add_resource(tmem_s0)
         tmem_allocator.add_resource(tmem_s1)
@@ -1352,32 +1393,55 @@ def _build_decode_gen_schedule(
         tmem_allocator.add_resource(tmem_softmax_local1)
     tmem_allocator.add_resource(tmem_o)
     tmem_allocator.compute_layout()
-    if cfg.uses_two_inst_tmem_p:
-        # Two independent S regions become stats+P regions after Softmax
-        # consumes each QK result.
+    if (
+        cfg.use_keeps_mma_ab
+        and not use_one_inst_qkv
+        and not cfg.uses_tmem_p
+    ):
+        # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
+        # standalone-first S/O layout after unused stats aliases are removed.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
         s1_alloc = tmem_s1.get_tmem_requirements()[0]
-        stats0_alloc = tmem_softmax_local0.get_tmem_requirements()[0]
-        stats1_alloc = tmem_softmax_local1.get_tmem_requirements()[0]
+        o_alloc = tmem_o.get_tmem_requirements()[0]
+        stats0_requirements = tmem_softmax_local0.get_tmem_requirements()
+        stats1_requirements = tmem_softmax_local1.get_tmem_requirements()
+        if stats0_requirements:
+            assert len(stats0_requirements) == len(stats1_requirements) == 1
+            stats0_requirements[0].offset = 0
+            stats1_requirements[0].offset = cfg.tmem_stats_cols
+            o_alloc.offset = 2 * cfg.tmem_stats_cols
+        else:
+            assert not stats1_requirements
+            o_alloc.offset = 0
+        s0_alloc.offset = o_alloc.offset + o_alloc.num_columns
+        s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols
+        assert s1_alloc.offset + cfg.tmem_s_cols == cfg.tmem_total_cols
+    elif cfg.uses_two_inst_tmem_p:
+        # P reuses each independent S region after Softmax consumes QK. Stats
+        # are either standalone TMEM or an SMEM handoff.
+        s0_alloc = tmem_s0.get_tmem_requirements()[0]
+        s1_alloc = tmem_s1.get_tmem_requirements()[0]
         p0_alloc = smem_p0.get_tmem_requirements()[0]
         p1_alloc = smem_p1.get_tmem_requirements()[0]
         o_alloc = tmem_o.get_tmem_requirements()[0]
         if cfg.tile_size_kv == 256:
-            # M64N256 keeps O in the low 256 columns and overlays stats+P on
-            # the two consumed S regions in the high half. This preserves the
-            # native datapath's TMEM addressing while sharing the generic
-            # two-instance P allocation and store implementation.
+            # KV256 keeps O in the low 256 columns and overlays packed P on
+            # each S region from its first column. Softmax streams K32
+            # fragments in order, so every 16-column P store only overwrites
+            # scores that have already been consumed. Starting P after the
+            # nominal stats columns would instead clobber the next unread S
+            # fragment; KV256 keeps its softmax stats in SMEM.
             o_alloc.offset = 0
             s0_alloc.offset = 2 * cfg.tmem_o_stage_cols
             s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols
-            stats0_alloc.offset = s0_alloc.offset
-            stats1_alloc.offset = s1_alloc.offset
-            p0_alloc.offset = s0_alloc.offset + cfg.tmem_stats_cols
-            p1_alloc.offset = s1_alloc.offset + cfg.tmem_stats_cols
+            p0_alloc.offset = s0_alloc.offset
+            p1_alloc.offset = s1_alloc.offset
         else:
             # Re-state the intended phase offsets after layout so every
             # resource observes the same S/P alias. Stats remain standalone
-            # when the whole allocation fits; otherwise they share S/P.
+            # when the whole allocation fits; otherwise they use SMEM. Keep
+            # the historical gap before P so this modeling cleanup does not
+            # change runtime addresses.
             s0_alloc.offset = 0
             s1_alloc.offset = cfg.tmem_s_cols
             p0_alloc.offset = (
@@ -1387,12 +1451,12 @@ def _build_decode_gen_schedule(
                 0 if cfg.keeps_separates_tmem_s_and_stats else cfg.tmem_stats_cols
             )
             if cfg.keeps_separates_tmem_s_and_stats:
+                stats0_alloc = tmem_softmax_local0.get_tmem_requirements()[0]
+                stats1_alloc = tmem_softmax_local1.get_tmem_requirements()[0]
                 stats0_alloc.offset = 2 * cfg.tmem_s_cols
                 stats1_alloc.offset = 2 * cfg.tmem_s_cols + cfg.tmem_stats_cols
                 o_alloc.offset = 2 * (cfg.tmem_s_cols + cfg.tmem_stats_cols)
             else:
-                stats0_alloc.offset = 0
-                stats1_alloc.offset = cfg.tmem_s_cols
                 o_alloc.offset = 2 * cfg.tmem_s_cols
         expected_p_cols = cfg.tmem_p_cols_per_inst
         assert p0_alloc.num_columns == p1_alloc.num_columns == expected_p_cols
@@ -1410,11 +1474,23 @@ def _build_decode_gen_schedule(
         )
     if use_one_inst_qkv:
         tmem_s_alloc = tmem_s0.get_tmem_requirements()[0]
-        tmem_softmax_local0.get_tmem_requirements()[0].offset = tmem_s_alloc.offset
+        # One-inst Keeps also transports stats through SMEM, so there is no
+        # TMEM stats allocation to alias with S.
+        assert cfg.keeps_stats_via_smem
         assert cfg.tmem_stats_cols + cfg.tmem_p_cols <= cfg.tmem_s_cols
         smem_p0.get_tmem_requirements()[0].offset = (
             tmem_s_alloc.offset + cfg.tmem_stats_cols
         )
+
+    eager_init_resources = [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
+    if smem_kv_reuse_credit is not None:
+        # Initialize the persistent ring cursor under the same CTA-wide fence
+        # and barrier used by other manually managed SMEM control state.
+        eager_init_resources.append(smem_kv_reuse_credit)
+    if cfg.tile_size_kv == 256:
+        # KV256's TMEM P operands use one-way per-fragment ready barriers.
+        # Initialize them beside correction's manually managed SMEM state.
+        eager_init_resources.extend([smem_p0, smem_p1])
 
     return (
         task_list,
@@ -1422,13 +1498,28 @@ def _build_decode_gen_schedule(
         dma_consumer_release_labels,
         smem_allocator,
         tmem_allocator,
-        [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1],
+        eager_init_resources,
     )
 
 
 def _round_up_tmem_columns(num_columns: int) -> int:
     """tcgen05_alloc requires a power-of-two column count in [32, 512]."""
     return max(32, 1 << (num_columns - 1).bit_length())
+
+
+def _has_unmodeled_tmem_p_alias_protocol(cfg: FmhaDecodeConfig) -> bool:
+    """Whether exhaustive TS checking would report a known false P/S race.
+
+    The staged D256 path selects one of two physical P/S stages at runtime.
+    Static KV256 instead orders streamed P fragments with private mbarriers and
+    reuses the matching TmemO-full barrier as the next-QK overwrite credit.
+    Those intra-work protocols are below TaskManager's resource transitions,
+    so its allocation-level checker cannot prove them. Persistent KV256 has
+    enough task-level ordering for the checker and remains covered.
+    """
+    return cfg.uses_staged_one_inst_tmem_p or (
+        cfg.streams_tmem_p_fragments and not cfg.use_persistent_scheduler
+    )
 
 
 def build_decode_task_manager(
@@ -1450,11 +1541,15 @@ def build_decode_task_manager(
         overrides without monkey-patching the kernel module.
     seq_len_kv : int
         KV sequence length.
+    exhaustive_deadlock_race_check : bool
+        Run exhaustive interleaving validation where TaskManager can model the
+        complete synchronization protocol. Structural checks always run.
 
     Returns
     -------
     TaskManager
-        Fully validated task manager (deadlock-free, bracketing OK, etc.).
+        Structurally validated task manager, exhaustively checked when the
+        profile does not use a private TMEM-P alias protocol.
     """
     effective_seq_len_kv = _configure_static_sliding_window(cfg, seq_len_kv)
     total_kv_tiles = _compute_total_kv_tiles(effective_seq_len_kv, cfg.tile_size_kv)
@@ -1466,7 +1561,7 @@ def build_decode_task_manager(
         dma_consumer_release_labels,
         smem_allocator,
         tmem_allocator,
-        _correction_init_resources,
+        _eager_init_resources,
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
@@ -1481,7 +1576,10 @@ def build_decode_task_manager(
         tmem_allocator=tmem_allocator,
         verbose=verbose,
         skip_validation=skip_validation,
-        exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
+        exhaustive_deadlock_race_check=(
+            exhaustive_deadlock_race_check
+            and not _has_unmodeled_tmem_p_alias_protocol(cfg)
+        ),
     )
 
     return tm
@@ -1589,7 +1687,7 @@ def _run_decode_gen_active(
         dma_consumer_release_labels,
         smem_allocator,
         tmem_allocator,
-        correction_init_resources,
+        eager_init_resources,
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
@@ -1644,11 +1742,8 @@ def _run_decode_gen_active(
         dma_consumer_release_labels=dma_consumer_release_labels,
         skip_validation=True,
         verbose=False,
-        # TODO: Model stage-selected allocation aliases in the exhaustive
-        # checker. D256 uses two physical S/stats/P stages, but the checker
-        # currently sees their aggregate allocation and reports false races.
-        exhaustive_deadlock_race_check=not (
-            cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
+        exhaustive_deadlock_race_check=not _has_unmodeled_tmem_p_alias_protocol(
+            cfg
         ),
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
@@ -1659,11 +1754,10 @@ def _run_decode_gen_active(
         smem_base=smem_allocator.smem_base,
         tmem_ptr_i32=tmem_ptr_i32,
     )
-    for resource in correction_init_resources:
-        # Materialize correction-side function variables before the TS tasks
-        # start. In cluster transaction-barrier mode this initializes each owner
-        # CTA's mbarrier and expected byte count before peer CTAs can issue
-        # async distributed-SMEM partial stores against it.
+    for resource in eager_init_resources:
+        # Materialize manually managed resource state before TS tasks start.
+        # This covers correction's cluster transaction barriers and KV256's
+        # per-fragment P-ready barriers.
         resource.create_function_variables(resource_context)
     # Ensure every CTA thread observes initialized mbarriers and SMEM resource
     # bases before any task body can use them.
@@ -2217,12 +2311,11 @@ def fmha_decode_launch(
         swizzle=tma_swizzle,
     )
 
-    use_clc_dynamic = cutlass.const_expr(cfg.use_persistent_scheduler)
     grid_x = q_groups
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
 
-    if cutlass.const_expr(use_clc_dynamic):
+    if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (grid_x, h_k, b),
             (1, 1, 1),
@@ -2268,12 +2361,6 @@ def fmha_decode_launch(
         block=[cfg.threads_per_cta, 1, 1],
         cluster=cluster_shape,
         stream=stream,
-        min_blocks_per_mp=(
-            1
-            if cfg.tile_size_q == 8
-            or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
-            or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
-            else 0
-        ),
+        min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, effective_seq_len_kv),
         use_pdl=cfg.use_parallel_separate_reduction_pdl,
     )

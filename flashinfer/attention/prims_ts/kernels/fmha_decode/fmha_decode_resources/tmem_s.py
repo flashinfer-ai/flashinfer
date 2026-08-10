@@ -42,6 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import KV_TILE_256_RESCALE_THRESHOLD_LOG2
 from ...tcgen05_compat import tcgen05_mma_ws
 from ...placeholder_helpers import (
     _placeholder_local_array,
@@ -80,9 +81,9 @@ from .helpers_common import (
 from .helpers_kv_tile_idx import (
     _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
-    _runtime_split_kv_global_tile_idx,
     _num_skipped_kv_tiles,
     _runtime_clamp_valid_tile_idx,
+    _runtime_split_kv_global_tile_idx,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
     _static_split_kv_global_tile_idx,
@@ -114,6 +115,12 @@ class TmemSResource(DecodeGenResourceBase):
     correction.
     """
 
+    _rts_internal_consumer_var_names: ClassVar[tuple[str, ...]] = (
+        "old_max_arr",
+        "sum_arr",
+        "new_max_arr",
+        "s_arr",
+    )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         ("old_max_arr", cutlass.Array, None, "Previous running softmax maximum."),
         ("sum_arr", cutlass.Array, None, "Running softmax denominator."),
@@ -143,7 +150,7 @@ class TmemSResource(DecodeGenResourceBase):
     def _init_placeholder_state(self) -> None:
         """Create placeholder register and scratch state for softmax."""
         num_scale_groups = self.cfg.num_softmax_scale_groups
-        num_s_regs = self.cfg.num_s_regs_per_thread
+        num_s_regs = self.cfg.softmax_score_fragment_regs
         self.old_max_arr.default = _placeholder_local_array(Float32, num_scale_groups)
         self.sum_arr.default = _placeholder_local_array(Float32, num_scale_groups)
         self.new_max_arr.default = _placeholder_local_array(Float32, num_scale_groups)
@@ -311,7 +318,7 @@ class TmemSResource(DecodeGenResourceBase):
             )
 
         num_scale_groups = self.cfg.num_softmax_scale_groups
-        num_s_regs = self.cfg.num_s_regs_per_thread
+        num_s_regs = self.cfg.softmax_score_fragment_regs
         # Cross-resource mutable arrays are stored as instance attributes, not
         # consumer vars, so SmemP and TmemSoftmaxGlobal can update them in
         # place between schedule steps.
@@ -346,12 +353,6 @@ class TmemSResource(DecodeGenResourceBase):
             # Invalid lanes start at -inf so masks and empty tiles naturally
             # contribute zero probability.
             result["s_arr"][idx] = _neg_max_f32()
-        if cutlass.const_expr(not self.cfg.use_fp8_qkv):
-            result["packed_p_arr"] = cutlass.Array(
-                Int32, self.cfg.num_packed_p_regs, space=cutlass.AddressSpace.rmem
-            )
-            for idx in cutlass.range_constexpr(self.cfg.num_packed_p_regs):
-                result["packed_p_arr"][idx] = Int32(0)
         return result
 
     @cute.jit
@@ -363,7 +364,7 @@ class TmemSResource(DecodeGenResourceBase):
         # Reinitialize the softmax state for each persistent-scheduler work
         # tile while preserving the resource-level scratch allocation.
         num_scale_groups = self.cfg.num_softmax_scale_groups
-        num_s_regs = self.cfg.num_s_regs_per_thread
+        num_s_regs = self.cfg.softmax_score_fragment_regs
         result = {
             "old_max_arr": cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
@@ -386,12 +387,6 @@ class TmemSResource(DecodeGenResourceBase):
             self._global_sum_arr[idx] = Float32(0.0)
         for idx in cutlass.range_constexpr(num_s_regs):
             result["s_arr"][idx] = _neg_max_f32()
-        if cutlass.const_expr(not self.cfg.use_fp8_qkv):
-            result["packed_p_arr"] = cutlass.Array(
-                Int32, self.cfg.num_packed_p_regs, space=cutlass.AddressSpace.rmem
-            )
-            for idx in cutlass.range_constexpr(self.cfg.num_packed_p_regs):
-                result["packed_p_arr"][idx] = Int32(0)
         return result
 
     @consumer_work(
@@ -628,7 +623,110 @@ class TmemSResource(DecodeGenResourceBase):
                     )
 
     @cute.jit
-    def _load_mask_reduce_keeps(
+    def _resolve_keeps_tile_context(self, stage_info: StageInfo):
+        """Resolve one score tile's logical position and boundary-mask state."""
+        cfg = self.cfg
+        task_cache = _decode_gen_task_cache(stage_info)
+        if cutlass.const_expr(self.seqlens_kv is None):
+            seq_len_kv = Int32(self.max_seq_len_kv)
+        else:
+            seq_len_kv = _load_runtime_seq_len_kv(
+                self.seqlens_kv,
+                self.max_seq_len_kv,
+                stage_info,
+                Int32(0),
+                Int32(0),
+            )
+
+        logical_q_group_idx = _logical_q_group_idx(
+            cfg, stage_info, self.q_group_idx
+        )
+        q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
+        element_mask_end_idx = seq_len_kv
+        if cutlass.const_expr(cfg.uses_uniform_causal_mask):
+            element_mask_end_idx = (
+                seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
+            )
+
+        use_runtime_kv_domain = (
+            self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+        )
+        local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
+        if cutlass.const_expr(not use_runtime_kv_domain):
+            effective_tile_idx = _static_split_kv_global_tile_idx(
+                cfg, stage_info, local_tile_idx
+            )
+            effective_total_kv_tiles = Int32(cfg.total_kv_tiles)
+            tile_idx = _clamp_valid_tile_idx(cfg, effective_tile_idx)
+            tile_idx = tile_idx + Int32(cfg.static_num_skipped_kv_tiles)
+            window_start_idx = Int32(cfg.static_window_start_idx)
+        elif cutlass.const_expr(cfg.use_paged_kv and not cfg.use_split_kv):
+            effective_tile_idx = (
+                Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tile_idx
+            )
+            effective_total_kv_tiles = Int32(
+                task_cache[_TASK_CACHE_KV_VALID_TILE_END]
+            )
+            tile_idx = effective_tile_idx
+            window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
+        else:
+            effective_tile_idx = _runtime_split_kv_global_tile_idx(
+                cfg,
+                stage_info,
+                local_tile_idx,
+                seq_len_kv,
+                self.seq_len_q,
+                q_token_base,
+            )
+            effective_total_kv_tiles = _runtime_total_kv_tiles(
+                cfg, seq_len_kv, self.seq_len_q, q_token_base
+            )
+            tile_idx = _runtime_clamp_valid_tile_idx(
+                cfg,
+                effective_tile_idx,
+                seq_len_kv,
+                self.seq_len_q,
+                q_token_base,
+            )
+            tile_idx = tile_idx + _num_skipped_kv_tiles(
+                cfg, seq_len_kv, self.seq_len_q, q_token_base
+            )
+            window_start_idx = _sliding_window_start_idx(
+                cfg, seq_len_kv, self.seq_len_q, q_token_base
+            )
+
+        tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
+        is_valid_effective_tile = effective_tile_idx < effective_total_kv_tiles
+        is_masked_final_wave = False
+        if cutlass.const_expr(not use_runtime_kv_domain and not cfg.use_split_kv):
+            if cutlass.const_expr(cfg.has_odd_kv_tail and self.inst_id == 1):
+                is_masked_final_wave = _is_last_loop_iteration(stage_info)
+        tile_has_valid_scores = (
+            is_valid_effective_tile
+            and (tile_offset_k < seq_len_kv)
+            and not is_masked_final_wave
+        )
+        tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
+            cfg,
+            tile_offset_k,
+            seq_len_kv,
+            self.seq_len_q,
+            q_token_base,
+            tile_has_valid_scores,
+        )
+        return (
+            seq_len_kv,
+            logical_q_group_idx,
+            element_mask_end_idx,
+            tile_offset_k,
+            window_start_idx,
+            is_valid_effective_tile,
+            is_masked_final_wave,
+            tile_is_unmasked,
+        )
+
+    @cute.jit
+    def _load_keeps_fragment_impl(
         self,
         stage_info: StageInfo,
         s_vals: cutlass.Array,
@@ -641,16 +739,20 @@ class TmemSResource(DecodeGenResourceBase):
         is_masked_final_wave: cutlass.Boolean,
         *,
         apply_boundary_mask: Constexpr[bool],
-    ) -> Float32:
-        """Load one Keeps fragment and reduce its row maximum.
+        fragment_idx: Constexpr[int] = 0,
+    ) -> None:
+        """Load one Keeps score fragment with a compile-time mask policy.
 
         The caller chooses the masked/unmasked path before TMEM load. Keeping the
         score fragment out of the branch condition avoids carrying 64/128 live
-        S registers through a post-load control-flow edge.
+        S registers through a post-load control-flow edge. Max reduction is a
+        separate operation because the later P-materialization reload only
+        needs the masked scores.
         """
         cfg = self.cfg
-        num_s_regs = cfg.num_s_regs_per_thread
         task_cache = _decode_gen_task_cache(stage_info)
+        num_s_regs = cfg.softmax_score_fragment_regs
+        fragment_reg_base = fragment_idx * num_s_regs
         base_addr = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
             + Int32(self._alloc.offset)
@@ -660,7 +762,9 @@ class TmemSResource(DecodeGenResourceBase):
             atom_col = load_atom_idx * 32
             loaded = _keeps_tcgen05_ld(
                 cfg,
-                prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
+                prims.make_tmem_ptr(
+                    base_addr + Int32(fragment_reg_base + atom_col), Float32
+                ),
                 num=32,
                 offset=cfg.tile_size_kv // 2,
             )
@@ -702,7 +806,10 @@ class TmemSResource(DecodeGenResourceBase):
             if cutlass.const_expr(not cfg.uses_per_row_causal_mask):
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
                     token_idx = tile_offset_k + _keeps_score_col(
-                        cfg, warp_grp_thread_idx, reg_idx, col_base
+                        cfg,
+                        warp_grp_thread_idx,
+                        fragment_reg_base + reg_idx,
+                        col_base,
                     )
                     if token_idx >= element_mask_end_idx:
                         s_vals[reg_idx] = _neg_max_f32()
@@ -727,7 +834,10 @@ class TmemSResource(DecodeGenResourceBase):
                 causal_end_rel = causal_end - tile_offset_k
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
                     score_col = _keeps_score_col(
-                        cfg, warp_grp_thread_idx, reg_idx, col_base
+                        cfg,
+                        warp_grp_thread_idx,
+                        fragment_reg_base + reg_idx,
+                        col_base,
                     )
                     if cutlass.const_expr(cfg.use_sliding_window_causal):
                         if score_col < causal_start_rel:
@@ -745,6 +855,64 @@ class TmemSResource(DecodeGenResourceBase):
             ):
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
                     s_vals[reg_idx] = _neg_max_f32()
+
+    @cute.jit
+    def _load_keeps_fragment(
+        self,
+        stage_info: StageInfo,
+        s_vals: cutlass.Array,
+        tile_offset_k: Int32,
+        element_mask_end_idx: Int32,
+        window_start_idx: Int32,
+        seq_len_kv: Int32,
+        logical_q_group_idx: Int32,
+        is_valid_effective_tile: cutlass.Boolean,
+        is_masked_final_wave: cutlass.Boolean,
+        tile_is_unmasked: cutlass.Boolean,
+        *,
+        fragment_idx: Constexpr[int] = 0,
+    ) -> None:
+        """Select the masked or unmasked fragment loader before LDTM.
+
+        ``tile_is_unmasked`` is runtime state, whereas the implementation's
+        mask policy remains constexpr. Keeping the branch outside the loader
+        lets the unmasked specialization erase boundary-mask instructions and
+        avoids carrying the loaded score registers through a post-LDTM branch.
+        """
+        if tile_is_unmasked:
+            self._load_keeps_fragment_impl(
+                stage_info,
+                s_vals,
+                tile_offset_k,
+                element_mask_end_idx,
+                window_start_idx,
+                seq_len_kv,
+                logical_q_group_idx,
+                is_valid_effective_tile,
+                is_masked_final_wave,
+                apply_boundary_mask=False,
+                fragment_idx=fragment_idx,
+            )
+        else:
+            self._load_keeps_fragment_impl(
+                stage_info,
+                s_vals,
+                tile_offset_k,
+                element_mask_end_idx,
+                window_start_idx,
+                seq_len_kv,
+                logical_q_group_idx,
+                is_valid_effective_tile,
+                is_masked_final_wave,
+                apply_boundary_mask=True,
+                fragment_idx=fragment_idx,
+            )
+
+    @cute.jit
+    def _reduce_keeps_fragment_max(self, s_vals: cutlass.Array) -> Float32:
+        """Reduce the row maximum of a previously loaded Keeps fragment."""
+        cfg = self.cfg
+        num_s_regs = cfg.softmax_score_fragment_regs
 
         max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(4):
@@ -797,7 +965,8 @@ class TmemSResource(DecodeGenResourceBase):
         reduction, whose 16x256b register mapping is unrelated to Keeps.
         """
         cfg = self.cfg
-        num_s_regs = cfg.num_s_regs_per_thread
+        task_cache = _decode_gen_task_cache(stage_info)
+        num_s_regs = cfg.softmax_score_fragment_regs
         old_max = new_max_arr[0]
         running_sum = sum_arr[0]
         s_vals = cutlass.Array(Float32, num_s_regs, space=cutlass.AddressSpace.rmem)
@@ -814,119 +983,79 @@ class TmemSResource(DecodeGenResourceBase):
             for reg_idx in cutlass.range_constexpr(num_s_regs):
                 s_vals[reg_idx] = _neg_max_f32()
 
-        task_cache = _decode_gen_task_cache(stage_info)
-        if cutlass.const_expr(self.seqlens_kv is None):
-            seq_len_kv = Int32(self.max_seq_len_kv)
-        else:
-            seq_len_kv = _load_runtime_seq_len_kv(
-                self.seqlens_kv,
-                self.max_seq_len_kv,
-                stage_info,
-                Int32(0),
-                Int32(0),
-            )
+        (
+            seq_len_kv,
+            logical_q_group_idx,
+            element_mask_end_idx,
+            tile_offset_k,
+            window_start_idx,
+            is_valid_effective_tile,
+            is_masked_final_wave,
+            tile_is_unmasked,
+        ) = self._resolve_keeps_tile_context(stage_info)
 
-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
-        q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
-        element_mask_end_idx = seq_len_kv
-        if cutlass.const_expr(cfg.uses_uniform_causal_mask):
-            element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
-        use_runtime_kv_domain = (
-            self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
-        )
-        local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
-        if cutlass.const_expr(not use_runtime_kv_domain):
-            effective_tile_idx = _static_split_kv_global_tile_idx(
-                cfg, stage_info, local_tile_idx
-            )
-            effective_total_kv_tiles = Int32(cfg.total_kv_tiles)
-            tile_idx = _clamp_valid_tile_idx(cfg, effective_tile_idx)
-            tile_idx = tile_idx + Int32(cfg.static_num_skipped_kv_tiles)
-            window_start_idx = Int32(cfg.static_window_start_idx)
-        elif cutlass.const_expr(cfg.use_paged_kv and not cfg.use_split_kv):
-            effective_tile_idx = (
-                Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tile_idx
-            )
-            effective_total_kv_tiles = Int32(task_cache[_TASK_CACHE_KV_VALID_TILE_END])
-            tile_idx = effective_tile_idx
-            window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
-        else:
-            effective_tile_idx = _runtime_split_kv_global_tile_idx(
-                cfg,
-                stage_info,
-                local_tile_idx,
-                seq_len_kv,
-                self.seq_len_q,
-                q_token_base,
-            )
-            effective_total_kv_tiles = _runtime_total_kv_tiles(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
-            tile_idx = _runtime_clamp_valid_tile_idx(
-                cfg,
-                effective_tile_idx,
-                seq_len_kv,
-                self.seq_len_q,
-                q_token_base,
-            )
-            tile_idx = tile_idx + _num_skipped_kv_tiles(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
-            window_start_idx = _sliding_window_start_idx(
-                cfg, seq_len_kv, self.seq_len_q, q_token_base
-            )
+        if cutlass.const_expr(cfg.tile_size_kv == 256):
+            # KV256 owns four physical K32 fragments per lane. Reduce the max
+            # one fragment at a time so only one native LDTM atom is live; the
+            # P pass reloads the same fragments after the reference max is
+            # known.
+            tile_max = _neg_max_f32()
+            for fragment_idx in cutlass.range_constexpr(
+                cfg.num_softmax_score_fragments
+            ):
+                self._load_keeps_fragment(
+                    stage_info,
+                    s_vals,
+                    tile_offset_k,
+                    element_mask_end_idx,
+                    window_start_idx,
+                    seq_len_kv,
+                    logical_q_group_idx,
+                    is_valid_effective_tile,
+                    is_masked_final_wave,
+                    tile_is_unmasked,
+                    fragment_idx=fragment_idx,
+                )
+                fragment_max = self._reduce_keeps_fragment_max(s_vals)
+                tile_max = cute.math.max(tile_max, fragment_max, ftz=True)
 
-        tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
-        is_valid_effective_tile = effective_tile_idx < effective_total_kv_tiles
-        is_masked_final_wave = False
-        if cutlass.const_expr(not use_runtime_kv_domain and not cfg.use_split_kv):
-            if cutlass.const_expr(cfg.has_odd_kv_tail and self.inst_id == 1):
-                is_masked_final_wave = _is_last_loop_iteration(stage_info)
+            new_max = cute.math.max(old_max, tile_max, ftz=True)
+            if old_max != _neg_max_f32():
+                # Keeping the previous reference max avoids an in-place O
+                # rescale when the new tile raises it only modestly. BF16 P
+                # can represent the resulting probabilities above one; the
+                # numerator and denominator remain in the same scale frame.
+                # Large jumps still rebase to keep P comfortably in range.
+                max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
+                if max_delta_log2 >= Float32(
+                    -KV_TILE_256_RESCALE_THRESHOLD_LOG2
+                ):
+                    new_max = old_max
+            old_max_arr[0] = old_max
+            sum_arr[0] = running_sum
+            new_max_arr[0] = new_max
+            for reg_idx in cutlass.range_constexpr(num_s_regs):
+                s_arr[reg_idx] = s_vals[reg_idx]
+            return old_max_arr, sum_arr, new_max_arr, s_arr
 
         if cutlass.const_expr(use_preload_mask_split):
             # Select the complete unmasked/masked TMEM load+max path before any S
             # registers are materialized. The shared predicate covers the
             # intersection of all active grouped-Q causal/window intervals.
-            tile_has_valid_scores = (
-                is_valid_effective_tile
-                and (tile_offset_k < seq_len_kv)
-                and not is_masked_final_wave
-            )
-            tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
-                cfg,
-                tile_offset_k,
-                seq_len_kv,
-                self.seq_len_q,
-                q_token_base,
-                tile_has_valid_scores,
-            )
             tile_max = _neg_max_f32()
-            if tile_is_unmasked:
-                tile_max = self._load_mask_reduce_keeps(
-                    stage_info,
-                    s_vals,
-                    tile_offset_k,
-                    element_mask_end_idx,
-                    window_start_idx,
-                    seq_len_kv,
-                    logical_q_group_idx,
-                    is_valid_effective_tile,
-                    is_masked_final_wave,
-                    apply_boundary_mask=False,
-                )
-            else:
-                tile_max = self._load_mask_reduce_keeps(
-                    stage_info,
-                    s_vals,
-                    tile_offset_k,
-                    element_mask_end_idx,
-                    window_start_idx,
-                    seq_len_kv,
-                    logical_q_group_idx,
-                    is_valid_effective_tile,
-                    is_masked_final_wave,
-                    apply_boundary_mask=True,
-                )
+            self._load_keeps_fragment(
+                stage_info,
+                s_vals,
+                tile_offset_k,
+                element_mask_end_idx,
+                window_start_idx,
+                seq_len_kv,
+                logical_q_group_idx,
+                is_valid_effective_tile,
+                is_masked_final_wave,
+                tile_is_unmasked,
+            )
+            tile_max = self._reduce_keeps_fragment_max(s_vals)
 
             new_max = cute.math.max(old_max, tile_max, ftz=True)
             old_max_arr[0] = old_max
@@ -1055,6 +1184,41 @@ class TmemSResource(DecodeGenResourceBase):
         for reg_idx in cutlass.range_constexpr(num_s_regs):
             s_arr[reg_idx] = s_vals[reg_idx]
         return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @consumer_work(returns=s_arr, work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def load_softmax_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+        s_arr: cutlass.Array,
+    ) -> cutlass.Array:
+        """Reload and mask one KV256 K32 fragment for P materialization."""
+        (
+            seq_len_kv,
+            logical_q_group_idx,
+            element_mask_end_idx,
+            tile_offset_k,
+            window_start_idx,
+            is_valid_effective_tile,
+            is_masked_final_wave,
+            tile_is_unmasked,
+        ) = self._resolve_keeps_tile_context(stage_info)
+        self._load_keeps_fragment(
+            stage_info,
+            s_arr,
+            tile_offset_k,
+            element_mask_end_idx,
+            window_start_idx,
+            seq_len_kv,
+            logical_q_group_idx,
+            is_valid_effective_tile,
+            is_masked_final_wave,
+            tile_is_unmasked,
+            fragment_idx=fragment_idx,
+        )
+        return s_arr
 
     @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, s_arr))
     @cute.jit

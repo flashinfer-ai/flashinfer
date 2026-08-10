@@ -1230,154 +1230,6 @@ def _resolve_decode_launch_spec(
     )
 
 
-def _uses_plan_kv_tile_256(
-    *,
-    device_index: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    max_kv_len: int,
-    q_dtype_key: str,
-    kv_dtype_key: str,
-    output_dtype_key: str,
-    kv_layout: str,
-) -> bool:
-    """Return whether this plan can use the BF16/D128 KV256 physical tile.
-
-    Sequence-length mode, mask mode, Q packing, and tail geometry are handled
-    by the common FMHA decode workflow and are deliberately not eligibility
-    dimensions here.
-    """
-
-    if (
-        head_dim != 128
-        or page_size not in _SUPPORTED_PAGE_SIZES
-        or max_kv_len <= 0
-        or q_dtype_key != "bfloat16"
-        or kv_dtype_key != "bfloat16"
-        or output_dtype_key != "bfloat16"
-        or kv_layout != "HND"
-        or num_qo_heads <= 0
-        or num_kv_heads <= 0
-        or num_qo_heads % num_kv_heads != 0
-    ):
-        return False
-
-    head_ratio = num_qo_heads // num_kv_heads
-    if head_ratio > 64:
-        return False
-    with torch.cuda.device(device_index):
-        return torch.cuda.get_device_capability(device_index) == (10, 0)
-
-
-@functools.cache
-def _resolve_plan_aware_decode_launch_spec(
-    device_index: int,
-    batch_size: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    max_kv_len: int,
-    seq_len_q: int,
-    q_dtype_key: str,
-    kv_dtype_key: str,
-    output_dtype_key: str,
-    kv_layout: str,
-    mask_type: str,
-    use_packed_q: bool,
-    window_left: int,
-    kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
-) -> _DecodeLaunchSpec:
-    """Resolve a plan-qualified native profile or the existing generic one."""
-
-    seq_len_q = _validate_seq_len_q(seq_len_q)
-    _validate_decode_query_head_extent(
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        max_seq_len_q=seq_len_q,
-    )
-    max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
-    window_left = _validate_window_left(window_left, mask_type)
-
-    semantic_key = (
-        device_index,
-        batch_size,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        max_kv_len,
-        seq_len_q,
-        q_dtype_key,
-        kv_dtype_key,
-        output_dtype_key,
-        kv_layout,
-        mask_type,
-        use_packed_q,
-        window_left,
-    )
-    if not _uses_plan_kv_tile_256(
-        device_index=device_index,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        max_kv_len=max_kv_len,
-        q_dtype_key=q_dtype_key,
-        kv_dtype_key=kv_dtype_key,
-        output_dtype_key=output_dtype_key,
-        kv_layout=kv_layout,
-    ):
-        return _resolve_decode_launch_spec(*semantic_key)
-
-    import cutlass
-
-    from .kernels.fmha_decode.fmha_decode_config import (
-        get_max_active_clusters_for_cluster_size,
-        make_decode_config,
-    )
-
-    with torch.cuda.device(device_index):
-        max_active_clusters = get_max_active_clusters_for_cluster_size(1)
-        cfg = make_decode_config(
-            headdim=head_dim,
-            args={
-                "use_keeps_mma_ab": True,
-                "tile_size_q": 64,
-                "tile_size_kv": 256,
-                "groups_tokens_heads_q": True,
-                "use_variable_seqlens_q": use_packed_q,
-            },
-            seq_len_q=seq_len_q,
-            seq_len_kv=max_kv_len,
-            batch_size=batch_size,
-            num_heads_q=num_qo_heads,
-            num_heads_kv=num_kv_heads,
-            qkv_dtype=cutlass.BFloat16,
-            o_dtype=cutlass.BFloat16,
-            qkv_layout="pagedKv",
-            num_tokens_per_page=page_size,
-            split_kv_mode="disabled",
-            mask_type=mask_type,
-            sliding_window_causal=window_left >= 0,
-            attention_window_size=window_left + 1 if window_left >= 0 else 0,
-            auto_tuner=True,
-        )
-
-    _validate_decode_policy_kv_tile_size(cfg)
-    return _decode_launch_spec_from_config(
-        cfg,
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        seq_len_q=seq_len_q,
-        max_active_clusters=max_active_clusters,
-    )
-
-
 @functools.cache
 def _get_compiled_decode(
     device_index: int,
@@ -1421,7 +1273,7 @@ def _get_compiled_decode(
     }
     qkv_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
-    spec = _resolve_plan_aware_decode_launch_spec(
+    spec = _resolve_decode_launch_spec(
         device_index,
         batch_size,
         num_qo_heads,
@@ -1437,7 +1289,6 @@ def _get_compiled_decode(
         mask_type,
         use_packed_q,
         window_left,
-        kv_lengths_mode,
     )
     cfg = spec.config
     max_active_clusters = spec.max_active_clusters
@@ -1748,8 +1599,8 @@ def get_prims_ts_batch_decode_workspace_size(
     the internal section offsets can change with that key. Fixed-Q launches use
     ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
     static ``max_seq_len_q`` bound used for workspace geometry and JIT policy.
-    ``max_seq_len`` must be no larger than ``2,147,483,520`` so the padded
-    128-token K/V tile endpoint remains representable as signed Int32.
+    ``max_seq_len`` must be no larger than ``2,147,483,392`` so the padded
+    256-token K/V tile endpoint remains representable as signed Int32.
     This sizing helper validates that every cumulative-offset delta is positive
     and no larger than the bound. If ``device`` is omitted, it is inferred from
     ``qo_indptr`` for a packed launch.
@@ -1798,7 +1649,7 @@ def get_prims_ts_batch_decode_workspace_size(
             max_seq_len_q=seq_len_q,
         )
 
-    spec = _resolve_plan_aware_decode_launch_spec(
+    spec = _resolve_decode_launch_spec(
         device_index,
         batch_size,
         num_qo_heads,
@@ -1814,7 +1665,6 @@ def get_prims_ts_batch_decode_workspace_size(
         mask_type,
         use_packed_q,
         window_left,
-        "dynamic",
     )
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
@@ -2028,7 +1878,7 @@ def prims_ts_batch_decode_with_kv_cache(
     ``[pages, Hkv, page_size, D]`` tensors. The metadata uses FlashInfer's
     native CSR page-ID ABI; ``seq_lens`` is explicit and ``max_seq_len`` is the
     exact static maximum used for automatic policy selection and JIT caching.
-    It must be no larger than ``2,147,483,520`` so the padded 128-token K/V
+    It must be no larger than ``2,147,483,392`` so the padded 256-token K/V
     tile endpoint remains representable as signed Int32.
     Each request must own enough CSR entries for its live length::
 
@@ -2167,7 +2017,7 @@ def prims_ts_batch_decode_with_kv_cache(
         use_packed_q,
         window_left,
     )
-    spec = _resolve_plan_aware_decode_launch_spec(*semantic_key, "dynamic")
+    spec = _resolve_decode_launch_spec(*semantic_key)
     layout = _make_decode_workspace_layout(
         spec.scratch_shapes,
         output_dtype,
@@ -2296,8 +2146,8 @@ class BatchDecodePagedTSWrapper:
         full-prefix and fixed-length specializations. If ``max_kv_len`` is
         omitted, the metadata maximum becomes the exact plan bound. An explicit
         value is a static upper bound and planning rejects metadata that exceeds
-        it. The bound must be no larger than ``2,147,483,520`` so the padded
-        128-token K/V tile endpoint remains representable as signed Int32. The
+        it. The bound must be no larger than ``2,147,483,392`` so the padded
+        256-token K/V tile endpoint remains representable as signed Int32. The
         fixed-length specialization is selected only when every row is
         exactly equal to that bound and the resolved K-tile domain consists of
         complete instruction groups. Sliding-window plans retain runtime K/V
@@ -2444,7 +2294,7 @@ class BatchDecodePagedTSWrapper:
             use_packed_q,
             window_left,
         )
-        spec = _resolve_plan_aware_decode_launch_spec(*semantic_key, "dynamic")
+        spec = _resolve_decode_launch_spec(*semantic_key)
         static_full_split_prefix = _planned_full_split_prefix(
             spec.config,
             seq_lens_host,

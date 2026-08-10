@@ -31,11 +31,16 @@ from typing import Any, Callable
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int32
 from cutlass.experimental import primitives as prims
-from cutlass.experimental.task_scheduling.memory import ResourceContext
+from cutlass.experimental.task_scheduling.memory import (
+    ResourceContext,
+    SmemAllocation,
+)
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     StageInfo,
+    TaskLocalVariable,
     WorkQueue,
     consumer_work,
     producer_work,
@@ -49,8 +54,18 @@ from cutlass.experimental.task_scheduling.task import Task
 
 from ..stage import FmhaStage
 from .fmha_decode_config import FmhaDecodeConfig
-from .fmha_decode_constants import KV_INST0, KV_INST1, KV_KIND_K, KV_KIND_V
-from .fmha_decode_resources.helpers_common import _q_group_token_base, _q_seq_bounds
+from .fmha_decode_constants import (
+    KV_INST0,
+    KV_INST1,
+    KV_KIND_K,
+    KV_KIND_V,
+    KV_TILE_256_SHARED_FIFO_STAGES,
+)
+from .fmha_decode_resources.helpers_common import (
+    ResourceVars,
+    _q_group_token_base,
+    _q_seq_bounds,
+)
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
@@ -83,6 +98,101 @@ class ScheduleTokenThrottleResource(MemoryResource):
     def consume_schedule_token(self, stage_info: StageInfo) -> None:
         """Wait until the load task no longer needs the current schedule token."""
         del stage_info
+
+
+@dataclass(kw_only=True)
+class SmemKvReuseCreditResource(MemoryResource):
+    """One-slot credit carrying the rotating KV256 exchange-stage index.
+
+    Load publishes which drained 64-KiB physical K/V stage Correction may use
+    as tail scratch. The one-stage pipeline couples that payload to the same
+    ownership epoch: the following Load may use the other two physical stages,
+    but cannot publish a new alias until Correction releases this credit after
+    all output work completes.
+    """
+
+    cfg: cutlass.Constexpr[FmhaDecodeConfig] = None
+    _alloc: cutlass.Constexpr[SmemAllocation | None] = None
+    scratch_stage_slot: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+
+    def __post_init__(self) -> None:
+        """Create the routed consumer slot for one physical K/V stage."""
+        if not self.cfg.uses_rotating_kv256_exchange:
+            raise ValueError(
+                "rotating KV scratch requires persistent direct Q64/KV256 "
+                "with two KV instructions, one head-dimension stage, and "
+                "one load warp"
+            )
+        self.scratch_stage_slot = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="Physical shared-K/V stage reserved for KV256 tail exchange.",
+        )
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Allocate the one-word stage payload guarded by this pipeline."""
+        if self._alloc is None:
+            self._alloc = SmemAllocation(
+                name=f"{self.name}_scratchStage",
+                size_bytes=4,
+                alignment=4,
+            )
+        return [self._alloc]
+
+    @cute.jit
+    def _payload(self, stage_info: StageInfo) -> cutlass.Array:
+        """Return the natural next-stage cursor owned by this credit."""
+        return cutlass.Array(
+            stage_info.context.smem_base.data_ptr() + self._alloc.offset,
+            dtype=Int32,
+            shape=(1,),
+            addrspace=3,
+        )
+
+    @cute.jit
+    def create_function_variables(
+        self,
+        context: ResourceContext | None = None,
+    ) -> ResourceVars:
+        """Initialize the persistent ring cursor before TS tasks start."""
+        if cutlass.const_expr(
+            context is not None and context.smem_base is not None
+        ):
+            payload = cutlass.Array(
+                context.smem_base.data_ptr() + self._alloc.offset,
+                dtype=Int32,
+                shape=(1,),
+                addrspace=3,
+            )
+            thread_idx, _, _ = cute.arch.thread_idx()
+            if thread_idx == Int32(0):
+                payload[0] = Int32(0)
+        return {}
+
+    @producer_work
+    @cute.jit
+    def publish_scratch_stage(self, stage_info: StageInfo) -> None:
+        """Advance the persistent ring cursor and publish the drained stage."""
+        num_stages = Int32(KV_TILE_256_SHARED_FIFO_STAGES)
+        if prims.elect_sync():
+            payload = self._payload(stage_info)
+            # Each work commits T = 4 * (loop_end + 1) K/V transactions.
+            # Since 4 == 1 (mod 3), the cursor advances by loop_end + 1.
+            # loop_end is the resolved per-work domain, so heterogeneous
+            # runtime sequence lengths do not inherit a captured host bound.
+            payload[0] = (
+                Int32(payload[0]) + stage_info.loop_end + Int32(1)
+            ) % num_stages
+
+    @consumer_work(returns=scratch_stage_slot)
+    @cute.jit
+    def read_scratch_stage(self, stage_info: StageInfo) -> Int32:
+        """Read the alias only after the matching credit wait completes."""
+        num_stages = Int32(KV_TILE_256_SHARED_FIFO_STAGES)
+        next_stage = Int32(self._payload(stage_info)[0])
+        return (next_stage + num_stages - Int32(1)) % num_stages
 
 
 @dataclass(kw_only=True)
@@ -251,6 +361,7 @@ def _produce_staged_page_offsets(
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
+    aliased_p: MemoryResource,
     q_desc: Any,
     k_desc_label: str,
     qk_mma_label: str,
@@ -258,11 +369,20 @@ def _consume_staged_qk_mma(
     cfg: FmhaDecodeConfig,
 ) -> None:
     """Consume all K head-dim stages for one QK MMA wave."""
-    _ = section
     tmem_s.acquire()
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
         smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
+        if cutlass.const_expr(
+            cfg.streams_tmem_p_fragments
+            and head_dim_stage_idx == 0
+            and (section == FmhaStage.Loop or cfg.use_persistent_scheduler)
+        ):
+            # Wait as late as possible: K staging overlaps the previous PV,
+            # but QK cannot overwrite the matching S/P alias until PV is done.
+            # Static HEAD has no previous tile; persistent HEAD may follow the
+            # same CTA's tail from another logical work tile and must wait.
+            aliased_p.wait_until_reusable_before_qk()
         if cfg.uses_q_desc_ref:
             getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
                 kv_desc=kv_desc,
@@ -290,6 +410,36 @@ def _consume_staged_pv_mma(
 ) -> None:
     """Consume all V head-dim stages for one PV MMA wave."""
     _ = section
+    if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+        assert cfg.num_head_dim_stages_kv == 1
+        fragment_label = f"{vp_mma_label}_fragment"
+
+        # P fragment 0 is the earliest dependency. Wait for it and for the
+        # correction credit before holding the shared V FIFO stage.
+        p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=0)
+        tmem_o.acquire()
+        smem_kv.wait()
+        v_desc = getattr(smem_kv, v_desc_label)()
+        getattr(tmem_o, fragment_label)(
+            v_desc=v_desc,
+            p_tmem_addr=p_tmem_addr,
+            fragment_idx=0,
+        )
+
+        # Later P fragments may become ready while the previous PV fragment is
+        # already executing. Keep every slot live through the complete async
+        # UMMA wave so the producer cannot overwrite an operand prematurely.
+        for fragment_idx in range(1, cfg.num_softmax_score_fragments):
+            p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=fragment_idx)
+            getattr(tmem_o, fragment_label)(
+                v_desc=v_desc,
+                p_tmem_addr=p_tmem_addr,
+                fragment_idx=fragment_idx,
+            )
+        smem_kv.release()
+        tmem_o.commit()
+        return
+
     tmem_p.wait()
     p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1 = tmem_p.p_operands()
     p_desc = p_desc_0 if p_desc_idx == KV_INST0 else p_desc_1
@@ -572,7 +722,7 @@ class DecodeGenTask(Task):
         skip_work_tile: Any = None,
         context: ResourceContext | None = None,
     ) -> None:
-        """Run one ordinary task tile and synchronize extended shared tails."""
+        """Run one ordinary task tile and synchronize attention-sink tails."""
         Task._run_task_body_impl(
             self,
             work_tile,
@@ -582,16 +732,12 @@ class DecodeGenTask(Task):
         if cutlass.const_expr(
             self.cfg is not None
             and self.cfg.use_persistent_scheduler
-            and (
-                self.cfg.use_attention_sinks
-                or self.cfg.tile_size_kv == 256
-            )
+            and self.cfg.use_attention_sinks
         ):
-            # Attention sinks extend correction's tail. KV256 correction also
-            # aliases its spatial-merge scratch with the drained shared-KV
-            # ring. Keep all persistent tasks on the same logical tile so the
-            # next load cannot reuse either scratch region before correction
-            # and output publication have drained.
+            # Attention sinks extend correction's tail beyond the ordinary
+            # task graph.  Keep all persistent tasks on the same logical tile
+            # until that tail has drained.  KV256's shared-KV alias instead
+            # uses a narrow Load/Correction credit in the captured schedule.
             if cutlass.const_expr(
                 self.cfg.use_variable_seqlens_q and self.cfg.use_persistent_scheduler
             ):
@@ -652,10 +798,7 @@ class DecodeGenTask(Task):
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
             Task._run_task_body_impl(self, work_tile, None, context=context)
-            if cutlass.const_expr(
-                self.cfg.use_attention_sinks
-                or self.cfg.tile_size_kv == 256
-            ):
+            if cutlass.const_expr(self.cfg.use_attention_sinks):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
             self.dummy = cutlass.Boolean(True)
@@ -807,6 +950,7 @@ def create_load_task(
     smem_kv: MemoryResource,
     work_queue: WorkQueue | None,
     schedule_token_throttle: MemoryResource | None,
+    smem_kv_reuse_credit: MemoryResource | None,
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
@@ -824,6 +968,7 @@ def create_load_task(
         smem_kv: MemoryResource,
         smem_page_offsets: MemoryResource | None,
         schedule_token_throttle: MemoryResource | None,
+        smem_kv_reuse_credit: MemoryResource | None,
     ) -> None:
         """Build the shared-KV load cadence for HEAD, LOOP, and TAIL."""
         smem_q.init_load_state()
@@ -863,6 +1008,10 @@ def create_load_task(
                 _page_offsets_consume(smem_page_offsets)
         for label in ("load_k0", "load_k1"):
             _kv_load(label, FmhaStage.Head)
+        if smem_kv_reuse_credit is not None:
+            # K0/K1 occupy the two stages disjoint from the previous work's
+            # scratch. Acquire only before issuing the third K/V transaction.
+            smem_kv_reuse_credit.acquire()
 
         # LOOP: each iter prefetches the full ``num_insts_kv`` K/V pair set.
         # When P aliases the consumed S columns, MMA must consume each V/P pair
@@ -881,6 +1030,11 @@ def create_load_task(
         # tiles consumed by the final BMM2 calls.
         for label in ("load_v0", "load_v1"):
             _kv_load(label, FmhaStage.Tail)
+        if smem_kv_reuse_credit is not None:
+            # Publish the physical stage drained by this work together with
+            # the ownership token consumed by the correction tail.
+            smem_kv_reuse_credit.publish_scratch_stage()
+            smem_kv_reuse_credit.commit()
         if hold_page_window:
             _page_offsets_release(smem_page_offsets)
 
@@ -890,12 +1044,19 @@ def create_load_task(
         smem_kv: MemoryResource,
         work_queue: WorkQueue | None = None,
         schedule_token_throttle: MemoryResource | None = None,
+        smem_kv_reuse_credit: MemoryResource | None = None,
     ) -> None:
         """Schedule dense shared-KV loads without page-offset resources."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
-            lambda: load_schedule_body(smem_q, smem_kv, None, schedule_token_throttle),
+            lambda: load_schedule_body(
+                smem_q,
+                smem_kv,
+                None,
+                schedule_token_throttle,
+                smem_kv_reuse_credit,
+            ),
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
 
@@ -906,13 +1067,18 @@ def create_load_task(
         smem_page_offsets: MemoryResource,
         work_queue: WorkQueue | None = None,
         schedule_token_throttle: MemoryResource | None = None,
+        smem_kv_reuse_credit: MemoryResource | None = None,
     ) -> None:
         """Schedule shared-KV loads with paged-KV offset consumption."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
             lambda: load_schedule_body(
-                smem_q, smem_kv, smem_page_offsets, schedule_token_throttle
+                smem_q,
+                smem_kv,
+                smem_page_offsets,
+                schedule_token_throttle,
+                smem_kv_reuse_credit,
             ),
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
@@ -922,9 +1088,17 @@ def create_load_task(
             captured_schedule = load_schedule(smem_q, smem_kv)
         elif schedule_token_throttle is None:
             captured_schedule = load_schedule(smem_q, smem_kv, work_queue)
-        else:
+        elif smem_kv_reuse_credit is None:
             captured_schedule = load_schedule(
                 smem_q, smem_kv, work_queue, schedule_token_throttle
+            )
+        else:
+            captured_schedule = load_schedule(
+                smem_q,
+                smem_kv,
+                work_queue,
+                schedule_token_throttle,
+                smem_kv_reuse_credit,
             )
     else:
         if work_queue is None:
@@ -933,10 +1107,15 @@ def create_load_task(
             )
         elif schedule_token_throttle is None:
             captured_schedule = load_page_offsets_schedule(
+                smem_q, smem_kv, smem_page_offsets, work_queue
+            )
+        elif smem_kv_reuse_credit is None:
+            captured_schedule = load_page_offsets_schedule(
                 smem_q,
                 smem_kv,
                 smem_page_offsets,
                 work_queue,
+                schedule_token_throttle,
             )
         else:
             captured_schedule = load_page_offsets_schedule(
@@ -945,6 +1124,7 @@ def create_load_task(
                 smem_page_offsets,
                 work_queue,
                 schedule_token_throttle,
+                smem_kv_reuse_credit,
             )
     src = []
     if smem_page_offsets is not None:
@@ -954,6 +1134,8 @@ def create_load_task(
     dst = [smem_q, smem_kv]
     if schedule_token_throttle is not None:
         dst.append(schedule_token_throttle)
+    if smem_kv_reuse_credit is not None:
+        dst.append(smem_kv_reuse_credit)
     return task_class(
         src_resources=src,
         dst_resources=dst,
@@ -2135,6 +2317,7 @@ def create_mma_task(
         _consume_staged_qk_mma(
             smem_kv,
             tmem_s0,
+            smem_p0,
             q_desc,
             "k_desc_0",
             "qk_mma_head",
@@ -2144,6 +2327,7 @@ def create_mma_task(
         _consume_staged_qk_mma(
             smem_kv,
             tmem_s1,
+            smem_p1,
             q_desc,
             "k_desc_1",
             "qk_mma_head",
@@ -2169,6 +2353,7 @@ def create_mma_task(
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s0,
+                smem_p0,
                 q_desc,
                 "k_desc_0",
                 "qk_mma_loop",
@@ -2200,6 +2385,7 @@ def create_mma_task(
             _consume_staged_qk_mma(
                 smem_kv,
                 tmem_s1,
+                smem_p1,
                 q_desc,
                 "k_desc_1",
                 "qk_mma_loop",
@@ -2323,7 +2509,7 @@ def create_mma_task(
 
 
 # ======================================================================
-# Softmax0Task — warps 0-3, 4 warps
+# Softmax0Task — warps 0-3, 4 warps, profile-selected register budget
 # LOOP: consume S, produce stats + P + running sum
 # LoopLastIter: emit final sum/max for correction tail
 # ======================================================================
@@ -2381,22 +2567,36 @@ def create_softmax0_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local0.commit()
-            # Wait for a free P stage before entering the ordered window so
-            # BMM2 backpressure on this group's P pipeline cannot extend the
-            # baton hold and stall the partner softmax group.
-            smem_p0.acquire()
-            if tmem_softmax_order is not None:
-                tmem_softmax_order.wait_softmax0()
-            # ProdWork: compute P=exp(S-new_max), store it in the profile's
-            # SMEM or staged-TMEM operand, and record local sums for the
-            # running softmax sum update.
-            smem_p0.compute_p(
-                new_max_arr=new_max_arr,
-                s_arr=s_arr,
-            )  # publishes the local denominator through tmem_s0
-            smem_p0.commit()
-            if tmem_softmax_order is not None:
-                tmem_softmax_order.release_softmax1()
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+                # Publish one K32 probability fragment at a time so PV can
+                # consume early fragments while later scores are processed.
+                for fragment_idx in range(cfg.num_softmax_score_fragments):
+                    s_arr = tmem_s0.load_softmax_p_fragment(
+                        fragment_idx=fragment_idx,
+                        s_arr=s_arr,
+                    )
+                    smem_p0.compute_p_fragment(
+                        fragment_idx=fragment_idx,
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                    )
+            else:
+                # Wait for a free P stage before entering the ordered window so
+                # BMM2 backpressure on this group's P pipeline cannot extend the
+                # baton hold and stall the partner softmax group.
+                smem_p0.acquire()
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax0()
+                # ProdWork: compute P=exp(S-new_max), store it in the profile's
+                # SMEM or staged-TMEM operand, and record local sums for the
+                # running softmax sum update.
+                smem_p0.compute_p(
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                )  # publishes the local denominator through tmem_s0
+                smem_p0.commit()
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax1()
             if cutlass.const_expr(cfg.use_keeps_mma_ab and cfg.uses_tmem_p):
                 # The TMEM-P store has consumed the aliased S columns, so the
                 # next QK wave can now overwrite them.
@@ -2543,7 +2743,7 @@ def create_softmax0_task(
 
 
 # ======================================================================
-# Softmax1Task — warps 4-7, 4 warps
+# Softmax1Task — warps 4-7, 4 warps, profile-selected register budget
 # ======================================================================
 def create_softmax1_task(
     tmem_s1: MemoryResource,
@@ -2597,17 +2797,29 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
-            # Wait for a free P stage before entering the ordered window so
-            # BMM2 backpressure on this group's P pipeline cannot extend the
-            # baton hold and stall the partner softmax group.
-            smem_p1.acquire()
-            if tmem_softmax_order is not None:
-                tmem_softmax_order.wait_softmax1()
-            # ProdWork: compute and publish P1 for BMM2.
-            smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
-            smem_p1.commit()
-            if tmem_softmax_order is not None:
-                tmem_softmax_order.release_softmax0()
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+                for fragment_idx in range(cfg.num_softmax_score_fragments):
+                    s_arr = tmem_s1.load_softmax_p_fragment(
+                        fragment_idx=fragment_idx,
+                        s_arr=s_arr,
+                    )
+                    smem_p1.compute_p_fragment(
+                        fragment_idx=fragment_idx,
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                    )
+            else:
+                # Wait for a free P stage before entering the ordered window so
+                # BMM2 backpressure on this group's P pipeline cannot extend the
+                # baton hold and stall the partner softmax group.
+                smem_p1.acquire()
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax1()
+                # ProdWork: compute and publish P1 for BMM2.
+                smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                smem_p1.commit()
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax0()
             if cutlass.const_expr(cfg.use_keeps_mma_ab and cfg.uses_tmem_p):
                 # The TMEM-P store has consumed the aliased S columns, so the
                 # next QK wave can now overwrite them.
@@ -2750,7 +2962,7 @@ def create_softmax1_task(
 
 
 # ======================================================================
-# CorrectionTask — warps 8-11, 4 warps
+# CorrectionTask — warps 8-11, 4 warps, profile-selected register budget
 # HEAD: drain initial softmax-local stats
 # LOOP: correct O0 / O1 in-place before the next BMM2 accumulation
 # TAIL: combine final O0/O1, normalize, store to GMEM
@@ -2762,6 +2974,7 @@ def create_correction_task(
     tmem_corr0: MemoryResource,
     tmem_corr1: MemoryResource,
     work_queue: WorkQueue | None,
+    smem_kv_reuse_credit: MemoryResource | None,
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
@@ -2780,6 +2993,7 @@ def create_correction_task(
         tmem_corr1: MemoryResource,
         tmem_stats_done0: MemoryResource | None,
         tmem_stats_done1: MemoryResource | None,
+        smem_kv_reuse_credit: MemoryResource | None,
     ) -> None:
         """Schedule two-instance O correction and final output normalization."""
 
@@ -2973,17 +3187,37 @@ def create_correction_task(
             tail_o_stage_idx_1=tail_1,
             inst_idx=KV_INST1,
         )
-        tmem_corr1.correction_tail_epilogue(
-            o_stage_idx=o_stage_idx,
-            tail_o_stage_idx_0=tail_0,
-            tail_o_stage_idx_1=tail_1,
-            old_max_arr=old_max_arr,
-            new_max_arr=new_max_arr,
-            inst0_new_max_arr=inst0_new_max_arr,
-            inst0_sum_arr=inst0_sum_arr,
-            inst1_new_max_arr=inst1_new_max_arr,
-            inst1_sum_arr=inst1_sum_arr,
-        )
+        if smem_kv_reuse_credit is None:
+            tmem_corr1.correction_tail_epilogue(
+                o_stage_idx=o_stage_idx,
+                tail_o_stage_idx_0=tail_0,
+                tail_o_stage_idx_1=tail_1,
+                old_max_arr=old_max_arr,
+                new_max_arr=new_max_arr,
+                inst0_new_max_arr=inst0_new_max_arr,
+                inst0_sum_arr=inst0_sum_arr,
+                inst1_new_max_arr=inst1_new_max_arr,
+                inst1_sum_arr=inst1_sum_arr,
+            )
+        else:
+            # The stage selector and ownership token share one pipeline epoch.
+            # Wait before the first aliased access and release immediately
+            # after correction stops touching the selected KV-ring stage.
+            smem_kv_reuse_credit.wait()
+            scratch_stage = smem_kv_reuse_credit.read_scratch_stage()
+            tmem_corr1.correction_tail_epilogue_rotating_exchange(
+                scratch_stage=scratch_stage,
+                o_stage_idx=o_stage_idx,
+                tail_o_stage_idx_0=tail_0,
+                tail_o_stage_idx_1=tail_1,
+                old_max_arr=old_max_arr,
+                new_max_arr=new_max_arr,
+                inst0_new_max_arr=inst0_new_max_arr,
+                inst0_sum_arr=inst0_sum_arr,
+                inst1_new_max_arr=inst1_new_max_arr,
+                inst1_sum_arr=inst1_sum_arr,
+            )
+            smem_kv_reuse_credit.release()
         # Inst1 final reduction consumes both O0 and O1, so defer O0 release
         # until after inst1 has finished reading it.
         tmem_o.release()
@@ -2997,6 +3231,7 @@ def create_correction_task(
         tmem_corr1: MemoryResource,
         tmem_stats_done0: MemoryResource | None,
         tmem_stats_done1: MemoryResource | None,
+        smem_kv_reuse_credit: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
         """Wrap correction with optional stats lifetime gates."""
@@ -3011,6 +3246,7 @@ def create_correction_task(
                 tmem_corr1,
                 tmem_stats_done0,
                 tmem_stats_done1,
+                smem_kv_reuse_credit,
             ),
         )
 
@@ -3022,6 +3258,7 @@ def create_correction_task(
         tmem_corr0: MemoryResource,
         tmem_corr1: MemoryResource,
         work_queue: WorkQueue | None = None,
+        smem_kv_reuse_credit: MemoryResource | None = None,
     ) -> None:
         """Capture the Swaps correction schedule."""
         run_correction_schedule(
@@ -3032,6 +3269,7 @@ def create_correction_task(
             tmem_corr1,
             None,
             None,
+            smem_kv_reuse_credit,
             work_queue,
         )
 
@@ -3045,6 +3283,7 @@ def create_correction_task(
         tmem_stats_done0: MemoryResource,
         tmem_stats_done1: MemoryResource,
         work_queue: WorkQueue | None = None,
+        smem_kv_reuse_credit: MemoryResource | None = None,
     ) -> None:
         """Capture Keeps correction with explicit stats lifetime gates."""
         run_correction_schedule(
@@ -3055,20 +3294,21 @@ def create_correction_task(
             tmem_corr1,
             tmem_stats_done0,
             tmem_stats_done1,
+            smem_kv_reuse_credit,
             work_queue,
         )
 
     if tmem_stats_done0 is None or tmem_stats_done1 is None:
-        captured_schedule = (
-            correction_schedule(
+        if work_queue is None:
+            captured_schedule = correction_schedule(
                 tmem_softmax_local0,
                 tmem_softmax_local1,
                 tmem_o,
                 tmem_corr0,
                 tmem_corr1,
             )
-            if work_queue is None
-            else correction_schedule(
+        elif smem_kv_reuse_credit is None:
+            captured_schedule = correction_schedule(
                 tmem_softmax_local0,
                 tmem_softmax_local1,
                 tmem_o,
@@ -3076,11 +3316,20 @@ def create_correction_task(
                 tmem_corr1,
                 work_queue,
             )
-        )
+        else:
+            captured_schedule = correction_schedule(
+                tmem_softmax_local0,
+                tmem_softmax_local1,
+                tmem_o,
+                tmem_corr0,
+                tmem_corr1,
+                work_queue,
+                smem_kv_reuse_credit,
+            )
         src = [tmem_softmax_local0, tmem_softmax_local1, tmem_o]
     else:
-        captured_schedule = (
-            correction_keeps_schedule(
+        if work_queue is None:
+            captured_schedule = correction_keeps_schedule(
                 tmem_softmax_local0,
                 tmem_softmax_local1,
                 tmem_o,
@@ -3089,8 +3338,8 @@ def create_correction_task(
                 tmem_stats_done0,
                 tmem_stats_done1,
             )
-            if work_queue is None
-            else correction_keeps_schedule(
+        elif smem_kv_reuse_credit is None:
+            captured_schedule = correction_keeps_schedule(
                 tmem_softmax_local0,
                 tmem_softmax_local1,
                 tmem_o,
@@ -3100,7 +3349,18 @@ def create_correction_task(
                 tmem_stats_done1,
                 work_queue,
             )
-        )
+        else:
+            captured_schedule = correction_keeps_schedule(
+                tmem_softmax_local0,
+                tmem_softmax_local1,
+                tmem_o,
+                tmem_corr0,
+                tmem_corr1,
+                tmem_stats_done0,
+                tmem_stats_done1,
+                work_queue,
+                smem_kv_reuse_credit,
+            )
         src = [
             tmem_softmax_local0,
             tmem_softmax_local1,
@@ -3110,6 +3370,8 @@ def create_correction_task(
         ]
     if work_queue is not None:
         src.append(work_queue)
+    if smem_kv_reuse_credit is not None:
+        src.append(smem_kv_reuse_credit)
     return task_class(
         src_resources=src,
         dst_resources=[tmem_corr0, tmem_corr1],
