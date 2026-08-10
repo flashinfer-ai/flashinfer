@@ -14,7 +14,10 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.gemm.gemm_base import (
+    CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR,
+)
 
 
 def _test_mm_fp4(
@@ -235,6 +238,89 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
             use_nvfp4=True,
             skip_check=False,
         )
+
+
+@pytest.mark.parametrize("m", [4, 17, 48, 128, 257])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [128, 256])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["cutlass", "cute-dsl", "b12x", "auto"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
+    """A per-token alpha must scale each output row by its own dequant scale."""
+    major, minor = get_compute_capability(torch.device("cuda"))
+    arch_backends = _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.get(major, ())
+    if backend == "auto":
+        if not arch_backends:
+            pytest.skip(f"No per-token alpha FP4 backend on SM{major}{minor}.")
+    elif backend not in arch_backends:
+        pytest.skip(f"{backend} has no per-token alpha epilogue on SM{major}{minor}.")
+    if backend == "b12x" and not version_at_least(torch.version.cuda, "13.0"):
+        pytest.skip("b12x backend requires CUDA 13+.")
+
+    torch.manual_seed(0)
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+
+    # Distinct, non-monotonic-in-magnitude row scales: a kernel that indexes
+    # alpha with the wrong coordinate still lands on a plausible value, so the
+    # per-row values have to differ enough to be told apart.
+    scalar_alpha = (1.0 / (g_in * g_w)).float().reshape(1)
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    with autotune(auto_tuning):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            res_dtype,
+            out,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            scalar_alpha,
+            res_dtype,
+            out_scalar,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+    reference = torch.mm(a, b.T).float() * row[:, None]
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.float().reshape(-1), dim=0)
+    assert cos_sim > 0.97
+
+    # Both calls accumulate the same products, so the per-token result must be
+    # the scalar-alpha result scaled row by row, up to output-dtype rounding.
+    # This is what catches an epilogue that reads alpha at the wrong coordinate;
+    # cosine similarity alone stays high even then.
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
 
 
 if __name__ == "__main__":

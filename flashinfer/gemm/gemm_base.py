@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import replace
 from enum import Enum
+from itertools import chain
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
 
@@ -56,6 +57,7 @@ from ..fused_moe.utils import (
 from .gemm_mm_fp4_cute_dsl import (
     _compile_block_scaled_gemm,
     _mm_fp4_cache_key,
+    per_token_alpha_mode,
     precompile_mm_fp4_tactics,
 )
 from .kernels.utils import (
@@ -4743,8 +4745,17 @@ def _get_sm100_block_scaled_tactics(
 _CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
 
 
-# FP4 backends whose epilogue can apply one alpha per output row.
-_PER_TOKEN_ALPHA_BACKENDS = frozenset({"b12x", "cutlass"})
+# FP4 backends whose epilogue can apply one alpha per output row, keyed by the
+# compute capability major that implements it. Each backend builds the per-row
+# epilogue only for the architectures it has kernels for, so the arch decides
+# which candidates can serve a per-token alpha at all.
+_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR = {
+    10: ("cute-dsl",),
+    12: ("b12x", "cutlass"),
+}
+_PER_TOKEN_ALPHA_BACKENDS = frozenset(
+    chain.from_iterable(_PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.values())
+)
 
 
 def _is_per_token_alpha(alpha_tensor) -> bool:
@@ -5789,11 +5800,11 @@ def _cutlass_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
+    a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
-    alpha: Optional[torch.Tensor] = None,  # unused
+    alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
@@ -5813,6 +5824,11 @@ def _cute_dsl_gemm_fp4_requirement(
         if backend != "cute-dsl":
             return False
         raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
+    if _is_per_token_alpha(alpha) and alpha.numel() != a.shape[0]:
+        raise ValueError(
+            "CuTe-DSL FP4 GEMM per-token alpha must have one scale per row of "
+            f"a: got {alpha.numel()} for m={a.shape[0]}."
+        )
     _check_cute_dsl_availability()
     return True
 
@@ -6064,6 +6080,13 @@ def _cute_dsl_gemm_fp4_runner(
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
+            per_token_alpha = _is_per_token_alpha(alpha_tensor)
+            if per_token_alpha and alpha_tensor.numel() != m:
+                raise ValueError(
+                    "CuTe-DSL FP4 GEMM per-token alpha must have one scale per "
+                    f"row of a: got {alpha_tensor.numel()} for m={m}."
+                )
+
             if do_preparation:
                 try:
                     precompile_mm_fp4_tactics(
@@ -6076,6 +6099,7 @@ def _cute_dsl_gemm_fp4_runner(
                         out_dtype,
                         _CUTE_DSL_MM_FP4_KERNEL_CACHE,
                         a.device,
+                        per_token_alpha,
                     )
                 except Exception as e:  # noqa: BLE001 -- serial fallback is intentional
                     logger.warning(
@@ -6118,9 +6142,17 @@ def _cute_dsl_gemm_fp4_runner(
             sf_n = (kernel_n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
-            cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
+            alpha_mode = per_token_alpha_mode(per_token_alpha, swap_ab)
+            cache_key = _mm_fp4_cache_key(
+                sf_vec_size, tactic, enable_pdl, out_dtype, alpha_mode
+            )
 
             if kernel_type == "sm103" and Sm103Kernel is not None:
+                if alpha_mode is not None:
+                    raise ValueError(
+                        "The SM103 3xFP4 CuTe-DSL kernel has no per-token alpha "
+                        "epilogue."
+                    )
                 make_kernel = lambda: Sm103Kernel(
                     sf_vec_size,
                     mma_tiler_mn,
@@ -6135,6 +6167,7 @@ def _cute_dsl_gemm_fp4_runner(
                     cluster_shape_mn,
                     use_prefetch,
                     enable_pdl,
+                    alpha_mode,
                 )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
@@ -6153,9 +6186,17 @@ def _cute_dsl_gemm_fp4_runner(
                 batch_size=batch_size,
                 cache_module_name="mm_fp4",
                 device_index=get_device_index(a.device),
+                per_token_alpha=alpha_mode,
             )
 
-            alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
+            if per_token_alpha:
+                alpha_for_launch = alpha_tensor.reshape(m).to(
+                    device=a.device, dtype=torch.float32
+                )
+                if not alpha_for_launch.is_contiguous():
+                    alpha_for_launch = alpha_for_launch.contiguous()
+            else:
+                alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
             # swap_ab compiled kernel expects column-major mC with shape
             # (sym_n, sym_m) = (m, n).  Reinterpret out's storage as
@@ -6639,11 +6680,13 @@ def mm_fp4(
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
-        Global scale tensor, float scalar. On SM120/SM121 the ``"b12x"`` and
-        ``"cutlass"`` backends additionally accept a per-token alpha: a float32
-        tensor of ``m`` elements holding one dequant scale per row of ``a``, for
-        activations quantized with a dynamic per-token NVFP4 global scale. No
-        other backend or architecture supports it.
+        Global scale tensor, float scalar. Some backends additionally accept a
+        per-token alpha: a float32 tensor of ``m`` elements holding one dequant
+        scale per row of ``a``, for activations quantized with a dynamic
+        per-token NVFP4 global scale. That form is supported by ``"b12x"`` and
+        ``"cutlass"`` on SM120/SM121 and by ``"cute-dsl"`` on SM100/SM103; no
+        other backend or architecture supports it. Under ``backend="auto"`` the
+        candidate list narrows to whichever of those the GPU implements.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -6724,18 +6767,25 @@ def mm_fp4(
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
-    # Only the SM120 b12x and cutlass epilogues apply a row scale; any other
-    # backend would silently consume alpha[0] for every row, so narrow the
-    # candidate list rather than let the tuner pick one that mis-scales.
+    # Only some epilogues apply a row scale; any other backend would silently
+    # consume alpha[0] for every row, so narrow the candidate list rather than
+    # let the tuner pick one that mis-scales.
     per_token_alpha = _is_per_token_alpha(alpha)
     if per_token_alpha:
-        supported = [bk for bk in backends if bk in _PER_TOKEN_ALPHA_BACKENDS]
-        if not supported or major != 12:
+        arch_backends = _PER_TOKEN_ALPHA_BACKENDS_BY_SM_MAJOR.get(major, ())
+        supported = [bk for bk in backends if bk in arch_backends]
+        if not supported and backend == "auto":
+            # cute-dsl is never in the auto list, but on SM100/SM103 it is the
+            # only FP4 backend with a per-row epilogue, so pick it here instead
+            # of making a per-token alpha unreachable without an explicit
+            # backend.
+            supported = list(arch_backends)
+        if not supported:
             raise ValueError(
-                "Per-token alpha (one scale per row of a) is only implemented "
-                f"by the {sorted(_PER_TOKEN_ALPHA_BACKENDS)} FP4 backends on "
-                f"SM120/SM121. Got alpha with {alpha.numel()} elements for "
-                f"backends {backends} on SM{major}{minor}."
+                "Per-token alpha (one scale per row of a) is implemented by "
+                f"the {sorted(_PER_TOKEN_ALPHA_BACKENDS)} FP4 backends only, "
+                f"and on SM{major}{minor} only by {sorted(arch_backends)}. Got "
+                f"alpha with {alpha.numel()} elements for backends {backends}."
             )
         backends = supported
 

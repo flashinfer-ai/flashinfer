@@ -87,6 +87,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        per_token_alpha: Optional[str] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -104,8 +105,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             sf_vec_size (int): Scalefactor vector size.
             mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
+            per_token_alpha (Optional[str]): ``None`` for a scalar alpha, or the
+                kernel mode along which ``alpha`` holds one scale per coordinate:
+                ``"m"`` for one per row of C, ``"n"`` for one per column. Callers
+                that swap A and B pass ``"n"``, since tokens land on N there.
         """
 
+        if per_token_alpha not in (None, "m", "n"):
+            raise ValueError(
+                f"per_token_alpha must be None, 'm' or 'n', got {per_token_alpha!r}"
+            )
+        self.per_token_alpha = per_token_alpha
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -322,7 +332,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         sfa_tensor: cute.Tensor,
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
-        alpha: cute.Tensor,  # Single-element tensor containing alpha value
+        alpha: cute.Tensor,  # (1,) scalar alpha, or (m,)/(n,) per-token alpha
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -496,7 +506,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
+        # In per-token mode alpha is a vector, so the scale is folded into the
+        # accumulator registers in the epilogue once the output coordinate is
+        # known and this stays neutral.
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            alpha_value = cutlass.Float32(1.0)
+        else:
+            alpha_value = alpha[0].to(cutlass.Float32)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -669,6 +685,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            # Identity tensor over C, partitioned exactly like tCgC, so the
+            # epilogue can recover each accumulator element's (m, n) coordinate
+            # and index the alpha vector with it.
+            cC_mnl = cute.local_tile(
+                cute.make_identity_tensor(mC_mnl.shape),
+                cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+            tCcC = thr_mma.partition_C(cC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1216,6 +1244,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 )
             )
 
+            if cutlass.const_expr(self.per_token_alpha is not None):
+                # Same partitioning epilog_tmem_copy_and_partition applies to
+                # tCgC, so tTR_cC_partitioned mirrors the t2r register fragment
+                # element for element.
+                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+                tTR_cC_partitioned = tiled_copy_t2r.get_slice(epi_tidx).partition_D(
+                    cute.flat_divide(
+                        tCcC[((None, None), 0, 0, None, None, None)], epi_tile
+                    )
+                )
+                alpha_extent = (
+                    mC_mnl.shape[0]
+                    if cutlass.const_expr(self.per_token_alpha == "m")
+                    else mC_mnl.shape[1]
+                )
+
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
@@ -1269,6 +1313,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         *mma_tile_coord_mnl,
                     )
                 ]
+
+                if cutlass.const_expr(self.per_token_alpha is not None):
+                    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
+                    tTR_cC = tTR_cC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            *mma_tile_coord_mnl,
+                        )
+                    ]
+                    tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1325,6 +1383,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
+                    #
+                    # Fold the per-token scale into the accumulators
+                    #
+                    if cutlass.const_expr(self.per_token_alpha is not None):
+                        # (T2R, T2R_M, T2R_N). The t2r value mode is strided
+                        # across both M and N, so every element needs its own
+                        # coordinate -- there is no sub-mode to hoist the load
+                        # out of.
+                        tTR_cC_subtile = tTR_cC[(None, None, None, real_subtile_idx)]
+                        for i in cutlass.range_constexpr(cute.size(tTR_cC_subtile)):
+                            coord = tTR_cC_subtile[i]
+                            token = (
+                                coord[0]
+                                if cutlass.const_expr(self.per_token_alpha == "m")
+                                else coord[1]
+                            )
+                            # Elements past the token extent are dropped by the
+                            # TMA store, so clamping the index just avoids
+                            # reading alpha out of bounds.
+                            token = cutlass.min(token, alpha_extent - 1)
+                            tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(cutlass.Float32)
+
                     #
                     # Convert to C type
                     #

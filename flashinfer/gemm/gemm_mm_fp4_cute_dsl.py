@@ -138,14 +138,17 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         use_tma_store,
         enable_pdl,
         out_dtype,
+        per_token_alpha,
     ) = cache_key
     tma = "x" if use_tma_store is None else int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")
+    alpha = "x" if per_token_alpha is None else per_token_alpha
     return (
         f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
         f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
         f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
+        f"_pta{alpha}"
         f"_b{batch_size}_mac{max_active_clusters}"
     )
 
@@ -204,10 +207,20 @@ def _make_blockscaled_gemm_compile_fn(
 
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
-        # Per-token alpha is one scale per output row; binding it to the same
-        # sym_m as A keeps a single compiled kernel across all M.
+        # Per-token alpha is one scale per token; binding it to the symbolic
+        # extent the tokens live on keeps a single compiled kernel across all
+        # of them. Callers that swap A and B put tokens on N ("n"), the rest
+        # on M (``True``/"m").
+        if per_token_alpha in (True, "m"):
+            alpha_extent = sym_m
+        elif per_token_alpha == "n":
+            alpha_extent = sym_n
+        elif not per_token_alpha:
+            alpha_extent = 1
+        else:
+            raise ValueError(f"unsupported per_token_alpha: {per_token_alpha!r}")
         alpha_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (sym_m if per_token_alpha else 1,), assumed_align=4
+            cutlass.Float32, (alpha_extent,), assumed_align=4
         )
 
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -264,6 +277,7 @@ def _mm_fp4_precompile_worker(payload):
             _use_tma_store,
             enable_pdl,
             out_dtype,
+            per_token_alpha,
         ) = payload["cache_key"]
 
         gemm = Sm100BlockScaledPersistentDenseGemmKernel(
@@ -272,6 +286,7 @@ def _mm_fp4_precompile_worker(payload):
             cluster_shape_mn,
             use_prefetch,
             enable_pdl,
+            per_token_alpha,
         )
         compile_fn = _make_blockscaled_gemm_compile_fn(
             gemm,
@@ -287,6 +302,7 @@ def _mm_fp4_precompile_worker(payload):
             sf_k=payload["sf_k"],
             batch_size=payload["batch_size"],
             max_active_clusters=payload["max_active_clusters"],
+            per_token_alpha=per_token_alpha,
         )
         spec = JitSpecCuteDsl(
             "mm_fp4",
@@ -396,17 +412,37 @@ def _run_mm_fp4_precompile_pool(payloads) -> None:
             )
 
 
-def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype):
+def per_token_alpha_mode(per_token_alpha, swap_ab):
+    """Kernel mode the per-token alpha vector indexes, or ``None`` if scalar.
+
+    The SM100 runner swaps A and B at the call site rather than inside the
+    kernel, so under ``swap_ab`` the caller's rows are the kernel's N extent.
+    """
+    if not per_token_alpha:
+        return None
+    return "n" if swap_ab else "m"
+
+
+def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype, per_token_alpha=None):
     """In-memory kernel-cache key for one mm_fp4 tactic tuple.
 
     Shared by the runner's forward path and the precompile path, which
     must agree byte-for-byte: the on-disk kernel name derives from it.
     """
-    return (sf_vec_size, *tactic, enable_pdl, out_dtype)
+    return (sf_vec_size, *tactic, enable_pdl, out_dtype, per_token_alpha)
 
 
 def precompile_mm_fp4_tactics(
-    tactics, m, n, real_k, use_nvfp4, enable_pdl, out_dtype, kernel_cache, device
+    tactics,
+    m,
+    n,
+    real_k,
+    use_nvfp4,
+    enable_pdl,
+    out_dtype,
+    kernel_cache,
+    device,
+    per_token_alpha=False,
 ) -> None:
     """Batch-compile not-yet-cached mm_fp4 tactics into the on-disk
     CuTe-DSL cache with a pool of subprocesses.
@@ -446,7 +482,13 @@ def precompile_mm_fp4_tactics(
         ) = tactic
         if kernel_type != "sm100":
             continue
-        cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
+        cache_key = _mm_fp4_cache_key(
+            sf_vec_size,
+            tactic,
+            enable_pdl,
+            out_dtype,
+            per_token_alpha_mode(per_token_alpha, swap_ab),
+        )
         if (device_index, cache_key) in kernel_cache:
             continue
 
