@@ -1340,6 +1340,7 @@ def nvfp4_quantize(
     backend: str = "cuda",
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ):
     r"""Quantize input tensor to NVFP4 format.
 
@@ -1375,6 +1376,12 @@ def nvfp4_quantize(
         ``a_global_sf`` is the inverse base scale multiplier (typically
         ``1 / (448 * 6)``) and the function also returns per-token FP32
         scales.
+    out_scale : torch.Tensor, optional
+        Per-token mode only, ``"cute-dsl"`` backend only.  Scalar folded into
+        the returned per-token scales, so a caller that would otherwise
+        multiply them by a constant (a weight dequant scale, say) gets the
+        product straight out of the quantize kernel.  Leaves the quantization
+        itself untouched.
     expanded_idx_to_permuted_idx : torch.Tensor, optional
         Optional row-remapping buffer for per-token activation
         quantization.
@@ -1460,6 +1467,7 @@ def nvfp4_quantize(
                 ),
                 sf_layout=_sf_layout_map[sf_layout],
                 enable_pdl=enable_pdl,
+                out_scale=out_scale,
             )
         else:
             raise ValueError(
