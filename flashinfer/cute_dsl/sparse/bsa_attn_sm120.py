@@ -176,9 +176,21 @@ def bsa_attn_sm120_blk64_fwd(
             f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}): "
             "the kernel reuses Q shared memory for the O epilogue and requires identical dtypes"
         )
+        assert out.shape == (batch, seqlen_q, num_heads, head_dim_v), (
+            f"out.shape {tuple(out.shape)} must be "
+            f"(batch={batch}, seqlen_q={seqlen_q}, num_heads={num_heads}, head_dim_v={head_dim_v})"
+        )
     if out is None:
         out = torch.empty(
             (batch, seqlen_q, num_heads, head_dim_v), dtype=q.dtype, device=q.device
+        )
+    if lse is not None:
+        assert lse.dtype == torch.float32, (
+            f"lse.dtype ({lse.dtype}) must be float32: the kernel always writes LSE in float32"
+        )
+        assert lse.shape == (batch, num_heads, seqlen_q), (
+            f"lse.shape {tuple(lse.shape)} must be "
+            f"(batch={batch}, num_heads={num_heads}, seqlen_q={seqlen_q})"
         )
     if lse is None:
         lse = torch.empty(

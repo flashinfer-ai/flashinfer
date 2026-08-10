@@ -516,6 +516,10 @@ class BlockSparseAttentionWrapper:
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+
+        .. note::
+            The ``vsa_sm100_blk64`` backend does not support GQA/MQA: it has no
+            KV-head mapping and requires ``num_kv_heads == num_qo_heads``.
         """
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
@@ -639,6 +643,8 @@ class BlockSparseAttentionWrapper:
                 raise ValueError(
                     "vsa_sm100_blk64 backend only supports bfloat16 inputs"
                 )
+            # blk64 has no KV-head mapping: the launcher sizes K/V by the Q head
+            # count, so num_qo_heads must equal num_kv_heads.
             _vsa_common_checks(
                 "vsa_sm100_blk64",
                 R,

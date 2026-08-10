@@ -32,6 +32,10 @@ from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 # ---------------------------------------------------------------------------
 
 _HAS_QUACK = importlib.util.find_spec("quack") is not None
+_requires_sm100 = pytest.mark.skipif(
+    not is_sm100a_supported(torch.device("cuda")),
+    reason="vsa_sm100_blk64 requires SM100 (Blackwell)",
+)
 
 pytestmark = [
     pytest.mark.skipif(
@@ -672,6 +676,7 @@ def _make_wrapper_blk64(workspace):
     return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
 
 
+@_requires_sm100
 def test_vsa_blk64_rejects_empty_rows(workspace):
     """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
     device = torch.device("cuda")
@@ -718,6 +723,7 @@ def test_vsa_blk64_rejects_empty_rows(workspace):
         )
 
 
+@_requires_sm100
 @pytest.mark.parametrize(
     "density,num_blocks,num_heads",
     [
@@ -758,6 +764,7 @@ def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
 
 
+@_requires_sm100
 @pytest.mark.parametrize(
     "seqlen,topk_frac",
     [
@@ -1139,6 +1146,7 @@ def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100
 @pytest.mark.parametrize(
     "MB64,NB64,density",
     [
@@ -1239,6 +1247,7 @@ def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100
 def test_vsa_blk64_return_lse(workspace):
     """blk64 return_lse=True must produce finite LSE values matching PyTorch reference."""
     device = torch.device("cuda")

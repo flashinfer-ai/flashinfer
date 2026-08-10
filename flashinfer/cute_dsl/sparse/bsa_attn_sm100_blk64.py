@@ -37,12 +37,13 @@ def bsa_attn_sm100_blk64_fwd(
     """Forward pass for BSA block-sparse attention using the blk64 CUDA C++ kernel (SM100 only).
 
     Block granularity is 64 tokens (kSparseBlockSize=64, kRows=64).  Only bfloat16
-    inputs are supported and head_dim must be 128.
+    inputs are supported, head_dim must be 128, and num_kv_heads must equal
+    num_heads — this kernel has no KV-head mapping and does not support GQA/MQA.
 
     Args:
         q: Query tensor (batch, seqlen_q, num_heads, head_dim).
-        k: Key tensor (batch, seqlen_k, num_heads_kv, head_dim).
-        v: Value tensor (batch, seqlen_k, num_heads_kv, head_dim).
+        k: Key tensor (batch, seqlen_k, num_heads, head_dim).
+        v: Value tensor (batch, seqlen_k, num_heads, head_dim).
         q2k_block_index: Block index tensor (batch, num_heads, num_q_blocks, max_kv_blocks), int32.
         block_sparse_num: Number of KV blocks each Q block attends to (>= 1).
             Ignored when q2k_block_nums is provided.
