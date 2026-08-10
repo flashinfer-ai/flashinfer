@@ -448,35 +448,6 @@ def test_mxfp4_mxfp8_runner_passes_generic_flags_to_tactic_mapper(monkeypatch):
     assert "intermediate_size" not in captured
 
 
-def test_mxfp4_mxfp8_has_config_set_cache_discriminator():
-    discriminator = ("prims_ts_mxfp4_mxfp8_config_version", 1)
-    runner = PrimsTsMxfp4Mxfp8MoERunner(
-        None,
-        top_k=4,
-        num_local_experts=128,
-        hidden_size=3072,
-        intermediate_size=3072,
-    )
-    runner.set_cache_key_static_extras(enable_pdl=True)
-
-    target_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
-    assert discriminator in target_key
-
-    bs256_key = runner.get_cache_key_extras(_flat_moe_inputs(256))
-    assert discriminator in bs256_key
-
-    runner.set_cache_key_static_extras(enable_pdl=False)
-    non_pdl_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
-    assert discriminator in non_pdl_key
-
-    runner.set_cache_key_static_extras(
-        enable_pdl=True,
-        gemm1_bias=torch.empty((), device="meta"),
-    )
-    biased_key = runner.get_cache_key_extras(_flat_moe_inputs(1024))
-    assert discriminator in biased_key
-
-
 def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
     kwargs = dict(
         activation_type=int(ActivationType.Swiglu),

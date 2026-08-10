@@ -1089,8 +1089,6 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     valid_tactics_dict: dict = {}
 
-    _MXFP4_MXFP8_CONFIG_VERSION = 1
-
     def __init__(
         self,
         moe_op,
@@ -1118,15 +1116,6 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
-
-    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (
-            *super().get_cache_key_extras(inputs),
-            (
-                "prims_ts_mxfp4_mxfp8_config_version",
-                self._MXFP4_MXFP8_CONFIG_VERSION,
-            ),
-        )
 
     def _make_tuning_config(
         self,
