@@ -719,6 +719,7 @@ def _test_checkpoint(
     scale: float,
     checkpoint_every_n_tokens: int,
     seed: int | None = None,
+    use_cp: bool = False,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
     _skip_if_unsupported()
@@ -787,7 +788,7 @@ def _test_checkpoint(
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        use_cp=False,
+        use_cp=use_cp,
     )
     torch.cuda.synchronize()
 
@@ -839,11 +840,13 @@ def _test_checkpoint(
             actual_ckpt = state_checkpoints[ckpt_global_idx]
             expected_ckpt = prefix_state[0]
 
+            atol = 1e-2 if use_cp and dtype == torch.bfloat16 else 1e-3
+            rtol = 5e-3 if use_cp and dtype == torch.bfloat16 else 1e-4
             torch.testing.assert_close(
                 actual_ckpt,
                 expected_ckpt,
-                atol=1e-3,
-                rtol=1e-4,
+                atol=atol,
+                rtol=rtol,
                 msg=f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}",
             )
 
@@ -856,6 +859,7 @@ def _test_checkpoint(
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -865,8 +869,14 @@ def test_checkpoint_correctness(
     head_size: int,
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if use_cp and not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+    ):
+        pytest.skip("CP state checkpointing requires SM90 or SM100")
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,
@@ -879,6 +889,7 @@ def test_checkpoint_correctness(
         scale,
         checkpoint_every_n_tokens,
         seed,
+        use_cp=use_cp,
     )
 
 
