@@ -21,7 +21,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from kda_h12_evidence import load_preset, reduce_dual_arch_receipts
+from kda_h12_evidence import (
+    load_preset,
+    reduce_dual_arch_receipts,
+    write_json_atomic,
+)
 
 
 BENCHMARKS_DIR = Path(__file__).resolve().parent
@@ -59,8 +63,7 @@ def main() -> None:
     )
     result["receipts"]["sm100a"]["path"] = str(args.sm100a.resolve())
     result["receipts"]["sm103a"]["path"] = str(args.sm103a.resolve())
-    args.json.parent.mkdir(parents=True, exist_ok=True)
-    args.json.write_text(json.dumps(result, indent=2) + "\n")
+    write_json_atomic(args.json, result)
     print(json.dumps(result, indent=2))
 
 

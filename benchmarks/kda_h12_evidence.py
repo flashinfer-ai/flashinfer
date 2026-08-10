@@ -25,11 +25,13 @@ from __future__ import annotations
 import bisect
 import hashlib
 import json
+import os
 import statistics
 import subprocess
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 FLASH_KDA_REPOSITORY = "https://github.com/MoonshotAI/FlashKDA.git"
@@ -73,6 +75,35 @@ RECURRENCE_ACTIVITY_MARKER = "kernel_flashkda_bf16_fused_m128"
 
 class EvidenceSchemaError(ValueError):
     """Raised when checked-in evidence input or activity shape is invalid."""
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace one JSON receipt without exposing a partial file."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(
+                payload,
+                stream,
+                indent=2,
+                allow_nan=False,
+                ensure_ascii=False,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 @dataclass(frozen=True)
@@ -466,13 +497,12 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
         )
 
     allocation = payload["allocation"]
-    if (
-        not isinstance(allocation["slurm_job_id"], str)
-        or not allocation["slurm_job_id"]
-    ):
-        raise EvidenceSchemaError(
-            "FlashKDA build manifest must identify its allocated Slurm job"
-        )
+    for key in _FLASH_KDA_ALLOCATION_KEYS:
+        value = allocation[key]
+        if not isinstance(value, str) or not value or value == "unknown":
+            raise EvidenceSchemaError(
+                f"FlashKDA build manifest allocation {key} must be resolved"
+            )
     hardware = payload["hardware"]
     if hardware["cuda_available"] is not True:
         raise EvidenceSchemaError("FlashKDA build did not run with an allocated GPU")
@@ -485,6 +515,12 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
         raise EvidenceSchemaError(
             "FlashKDA build architecture and compute capability disagree"
         )
+    for key in ("device_name", "device_uuid"):
+        value = hardware[key]
+        if not isinstance(value, str) or not value or value == "unavailable":
+            raise EvidenceSchemaError(
+                f"FlashKDA build manifest hardware {key} must be resolved"
+            )
 
     artifacts = payload["artifacts"]
     source_dir = Path(source_dir_value)
@@ -604,6 +640,73 @@ def verify_flash_kda_provenance(
         "build_manifest_path": str(build_manifest_path),
         "build_manifest_sha256": manifest_sha256,
         "build_manifest": manifest,
+    }
+
+
+def verify_flash_kda_current_receipt_binding(
+    manifest: dict,
+    *,
+    allocation: dict[str, str],
+    hardware: dict[str, object],
+    runtime: dict[str, str],
+) -> dict:
+    """Bind one FlashKDA build to this receipt's allocation, GPU, and runtime."""
+
+    manifest = validate_flash_kda_build_manifest_schema(manifest)
+    expected_allocation = manifest["allocation"]
+    if set(allocation) != _FLASH_KDA_ALLOCATION_KEYS:
+        raise EvidenceSchemaError(
+            "current receipt allocation must contain the exact Slurm identity"
+        )
+    for key, value in allocation.items():
+        if not isinstance(value, str) or not value or value == "unknown":
+            raise EvidenceSchemaError(
+                f"current receipt allocation {key} must be resolved"
+            )
+    if allocation != expected_allocation:
+        raise EvidenceSchemaError(
+            "FlashKDA build manifest does not belong to the current Slurm allocation"
+        )
+
+    expected_hardware = {
+        key: manifest["hardware"][key]
+        for key in (
+            "cuda_arch",
+            "compute_capability",
+            "device_name",
+            "device_uuid",
+        )
+    }
+    if hardware != expected_hardware:
+        raise EvidenceSchemaError(
+            "FlashKDA build manifest does not belong to the current GPU"
+        )
+
+    runtime_keys = {
+        "python_executable",
+        "python_version",
+        "platform",
+        "torch_version",
+        "torch_cuda_version",
+        "cuda_home",
+    }
+    if set(runtime) != runtime_keys:
+        raise EvidenceSchemaError(
+            "current receipt runtime must contain the exact Python/Torch/CUDA identity"
+        )
+    expected_runtime = {key: manifest["toolchain"][key] for key in runtime_keys}
+    if runtime != expected_runtime:
+        raise EvidenceSchemaError(
+            "FlashKDA build manifest runtime differs from the current receipt runtime"
+        )
+    return {
+        "schema_version": 1,
+        "same_slurm_allocation": True,
+        "same_gpu": True,
+        "same_python_torch_cuda_runtime": True,
+        "allocation": dict(allocation),
+        "hardware": dict(hardware),
+        "runtime": dict(runtime),
     }
 
 
@@ -1189,6 +1292,40 @@ def validate_per_arch_receipt(
     ):
         raise EvidenceSchemaError(
             "FlashKDA build manifest is not bound to this architecture/artifact"
+        )
+    current_binding = flash_kda.get("current_receipt_binding")
+    expected_binding_hardware = {
+        key: build_manifest["hardware"][key]
+        for key in (
+            "cuda_arch",
+            "compute_capability",
+            "device_name",
+            "device_uuid",
+        )
+    }
+    expected_binding_runtime = {
+        key: build_manifest["toolchain"][key]
+        for key in (
+            "python_executable",
+            "python_version",
+            "platform",
+            "torch_version",
+            "torch_cuda_version",
+            "cuda_home",
+        )
+    }
+    if (
+        not isinstance(current_binding, dict)
+        or current_binding.get("schema_version") != 1
+        or current_binding.get("same_slurm_allocation") is not True
+        or current_binding.get("same_gpu") is not True
+        or current_binding.get("same_python_torch_cuda_runtime") is not True
+        or current_binding.get("allocation") != build_manifest["allocation"]
+        or current_binding.get("hardware") != expected_binding_hardware
+        or current_binding.get("runtime") != expected_binding_runtime
+    ):
+        raise EvidenceSchemaError(
+            "FlashKDA build is not bound to the current receipt allocation/GPU/runtime"
         )
 
     fla = baselines.get("fla_triton")

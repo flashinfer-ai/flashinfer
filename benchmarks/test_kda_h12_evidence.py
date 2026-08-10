@@ -169,6 +169,35 @@ def _build_manifest(tmp_path, source_dir, package_path, extension_path, arch="sm
     return path, payload
 
 
+def _current_receipt_binding(build_manifest):
+    hardware = {
+        key: build_manifest["hardware"][key]
+        for key in (
+            "cuda_arch",
+            "compute_capability",
+            "device_name",
+            "device_uuid",
+        )
+    }
+    runtime = {
+        key: build_manifest["toolchain"][key]
+        for key in (
+            "python_executable",
+            "python_version",
+            "platform",
+            "torch_version",
+            "torch_cuda_version",
+            "cuda_home",
+        )
+    }
+    return evidence.verify_flash_kda_current_receipt_binding(
+        build_manifest,
+        allocation=dict(build_manifest["allocation"]),
+        hardware=hardware,
+        runtime=runtime,
+    )
+
+
 def _exact_flash_kda_git(source_dir, cutlass_dir, *, source_status=""):
     def exact_revision(root, *args):
         root = Path(root)
@@ -292,8 +321,69 @@ def test_flash_kda_manifest_schema_validate_only_is_cpu_safe(tmp_path):
 
     assert json.loads(completed.stdout)["validation"] == "schema_only_no_cuda_import"
     payload["allocation"]["slurm_job_id"] = ""
-    with pytest.raises(evidence.EvidenceSchemaError, match="Slurm job"):
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="allocation slurm_job_id",
+    ):
         evidence.validate_flash_kda_build_manifest_schema(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("allocation", "slurm_job_id", "stale-job", "Slurm allocation"),
+        ("hardware", "device_uuid", "GPU-other", "current GPU"),
+        ("runtime", "torch_version", "9.9.9", "current receipt runtime"),
+    ],
+)
+def test_flash_kda_current_receipt_binding_rejects_stale_identity(
+    tmp_path,
+    section,
+    key,
+    value,
+    message,
+):
+    source_dir, package_path, extension_path, _ = _flash_kda_paths(tmp_path)
+    _, manifest = _build_manifest(
+        tmp_path,
+        source_dir,
+        package_path,
+        extension_path,
+    )
+    allocation = dict(manifest["allocation"])
+    hardware = {
+        name: manifest["hardware"][name]
+        for name in (
+            "cuda_arch",
+            "compute_capability",
+            "device_name",
+            "device_uuid",
+        )
+    }
+    runtime = {
+        name: manifest["toolchain"][name]
+        for name in (
+            "python_executable",
+            "python_version",
+            "platform",
+            "torch_version",
+            "torch_cuda_version",
+            "cuda_home",
+        )
+    }
+    current = {
+        "allocation": allocation,
+        "hardware": hardware,
+        "runtime": runtime,
+    }
+    current[section][key] = value
+    with pytest.raises(evidence.EvidenceSchemaError, match=message):
+        evidence.verify_flash_kda_current_receipt_binding(
+            manifest,
+            allocation=allocation,
+            hardware=hardware,
+            runtime=runtime,
+        )
 
 
 def test_flash_kda_cutlass_identity_mismatch_is_rejected(tmp_path):
@@ -576,6 +666,7 @@ def _complete_per_arch_report(tmp_path, arch):
                     evidence.flash_kda_build_manifest_sha256(build_manifest)
                 ),
                 "build_manifest": build_manifest,
+                "current_receipt_binding": _current_receipt_binding(build_manifest),
             },
             "fla_triton": {
                 "available": True,
@@ -699,6 +790,22 @@ def test_dual_arch_reducer_rejects_missing_oracle_graph_or_identity(tmp_path):
     with pytest.raises(evidence.EvidenceSchemaError, match="Graph test did not pass"):
         evidence.validate_per_arch_receipt(
             failed_graph,
+            expected_arch="sm100a",
+            expected_candidate_commit=candidate_commit,
+            expected_fla_commit=fla_commit,
+            preset=preset,
+        )
+
+    stale_build = json.loads(json.dumps(sm100a))
+    stale_build["baselines"]["flash_kda"]["current_receipt_binding"][
+        "same_slurm_allocation"
+    ] = False
+    with pytest.raises(
+        evidence.EvidenceSchemaError,
+        match="current receipt allocation/GPU/runtime",
+    ):
+        evidence.validate_per_arch_receipt(
+            stale_build,
             expected_arch="sm100a",
             expected_candidate_commit=candidate_commit,
             expected_fla_commit=fla_commit,

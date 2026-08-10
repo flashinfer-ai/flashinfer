@@ -33,6 +33,7 @@ from kda_h12_evidence import (
     load_flash_kda_build_manifest,
     validate_flash_kda_build_manifest_schema,
     verify_flash_kda_checkout,
+    write_json_atomic,
 )
 
 
@@ -55,6 +56,15 @@ def _required_executable(name: str) -> str:
     if path is None:
         raise RuntimeError(f"required build tool {name!r} is not on PATH")
     return str(Path(path).resolve())
+
+
+def _required_environment(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Phase-A FlashKDA build requires resolved Slurm environment {name}"
+        )
+    return value
 
 
 def _validate_only_payload(manifest_path: Path | None) -> dict:
@@ -83,10 +93,12 @@ def _validate_only_payload(manifest_path: Path | None) -> dict:
 
 
 def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
-    if not os.environ.get("SLURM_JOB_ID"):
-        raise RuntimeError(
-            "Phase-A FlashKDA must be built inside an allocated Slurm GPU job"
-        )
+    allocation = {
+        "slurm_job_id": _required_environment("SLURM_JOB_ID"),
+        "slurm_cluster_name": _required_environment("SLURM_CLUSTER_NAME"),
+        "slurm_partition": _required_environment("SLURM_JOB_PARTITION"),
+        "slurm_node_list": _required_environment("SLURM_JOB_NODELIST"),
+    }
     source_dir = source_dir.resolve(strict=True)
     manifest_path = manifest_path.resolve()
     if manifest_path.is_relative_to(source_dir):
@@ -146,6 +158,9 @@ def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
             )
 
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    device_uuid = getattr(properties, "uuid", None)
+    if device_uuid is None or not str(device_uuid):
+        raise RuntimeError("FlashKDA allocation build requires a CUDA device UUID")
     cuda_home = str(Path(CUDA_HOME).resolve())
     manifest = {
         "schema_version": FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION,
@@ -178,18 +193,13 @@ def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
             "cxx_path": cxx_path,
             "cxx_version": _command_version(cxx_path, "--version"),
         },
-        "allocation": {
-            "slurm_job_id": os.environ["SLURM_JOB_ID"],
-            "slurm_cluster_name": os.environ.get("SLURM_CLUSTER_NAME", "unknown"),
-            "slurm_partition": os.environ.get("SLURM_JOB_PARTITION", "unknown"),
-            "slurm_node_list": os.environ.get("SLURM_JOB_NODELIST", "unknown"),
-        },
+        "allocation": allocation,
         "hardware": {
             "cuda_available": True,
             "cuda_arch": SUPPORTED_ARCHITECTURES[capability],
             "compute_capability": list(capability),
             "device_name": properties.name,
-            "device_uuid": str(getattr(properties, "uuid", "unavailable")),
+            "device_uuid": str(device_uuid),
         },
         "artifacts": {
             "package_path": str(package_path),
@@ -217,8 +227,7 @@ def main() -> None:
         source_dir=args.flash_kda_source_dir,
         manifest_path=args.manifest,
     )
-    args.manifest.parent.mkdir(parents=True, exist_ok=True)
-    args.manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+    write_json_atomic(args.manifest, manifest)
     print(
         json.dumps(
             {

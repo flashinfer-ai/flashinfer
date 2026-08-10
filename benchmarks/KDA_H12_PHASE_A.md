@@ -55,7 +55,10 @@ resolve inside that clean checkout and match a build manifest produced by
 the extension and receipts the exact command, Python/C++/NVCC/CUDA/PyTorch
 toolchain, Slurm allocation, GPU architecture, source/CUTLASS pins, imported
 artifact paths, and package/extension SHA-256 hashes. An arbitrary or stale
-`.so` without that binding is rejected.
+`.so` without that binding is rejected. The evidence runner additionally
+requires the manifest's Slurm job/cluster/partition/node, GPU UUID/architecture,
+and Python/PyTorch/CUDA runtime to equal the current receipt process exactly;
+same-architecture output from an earlier allocation is not reusable.
 
 FLA is required and never impersonated. Before importing FLA, the runner sets
 `FLA_FLASH_KDA=0` and `FLA_DISABLE_BACKEND_DISPATCH=1`, so the required FLA
@@ -119,7 +122,9 @@ pytest -q benchmarks/test_kda_h12_evidence.py
 
 Prepare the pinned peer checkout, then force-build and receipt it inside each
 allocated SM100a/SM103a job. Both manifest and final evidence JSON must live
-outside the source checkouts:
+outside the source checkouts. The build helper and benchmark command below must
+run sequentially in the same allocation and on the same selected GPU; submitting
+them as separate jobs fails the receipt binding:
 
 ```bash
 git clone https://github.com/MoonshotAI/FlashKDA.git /absolute/path/to/FlashKDA
@@ -167,5 +172,8 @@ python benchmarks/reduce_kda_h12_phase_a.py \
 A missing case, oracle, timing path, graph receipt, provenance rejection,
 activity-route rejection, identity mismatch, or absent architecture is a named
 gap rather than evidence that may be filled by averaging another shape or GPU.
+Build manifests, per-architecture receipts, and the dual-architecture reduction
+are written by same-directory temporary file, `fsync`, and atomic replace so a
+preempted job cannot leave a reportable partial JSON file.
 
 [#4351]: https://github.com/flashinfer-ai/flashinfer/pull/4351

@@ -38,6 +38,7 @@ import importlib
 import importlib.metadata
 import json
 import os
+import platform
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -62,7 +63,9 @@ from kda_h12_evidence import (
     correlate_samples,
     load_preset,
     summarize_samples,
+    verify_flash_kda_current_receipt_binding,
     verify_flash_kda_provenance,
+    write_json_atomic,
 )
 
 
@@ -260,6 +263,56 @@ def _hardware_metadata(stack: SimpleNamespace) -> dict:
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
     }
+
+
+def _required_slurm_environment(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Phase-A receipt requires resolved Slurm environment {name}"
+        )
+    return value
+
+
+def _bind_flash_kda_build_to_current_receipt(
+    *,
+    stack: SimpleNamespace,
+    hardware: dict,
+    manifest: dict,
+) -> dict:
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    if CUDA_HOME is None:
+        raise RuntimeError("torch did not resolve CUDA_HOME for the receipt runtime")
+    allocation = {
+        "slurm_job_id": _required_slurm_environment("SLURM_JOB_ID"),
+        "slurm_cluster_name": _required_slurm_environment("SLURM_CLUSTER_NAME"),
+        "slurm_partition": _required_slurm_environment("SLURM_JOB_PARTITION"),
+        "slurm_node_list": _required_slurm_environment("SLURM_JOB_NODELIST"),
+    }
+    current_hardware = {
+        key: hardware[key]
+        for key in (
+            "cuda_arch",
+            "compute_capability",
+            "device_name",
+            "device_uuid",
+        )
+    }
+    current_runtime = {
+        "python_executable": str(Path(sys.executable).resolve()),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": stack.torch.__version__,
+        "torch_cuda_version": str(stack.torch.version.cuda),
+        "cuda_home": str(Path(CUDA_HOME).resolve()),
+    }
+    return verify_flash_kda_current_receipt_binding(
+        manifest,
+        allocation=allocation,
+        hardware=current_hardware,
+        runtime=current_runtime,
+    )
 
 
 def _run_changed_beta_graph_test() -> dict:
@@ -1226,6 +1279,13 @@ def main() -> None:
         args.flash_kda_source_dir,
         args.flash_kda_build_manifest,
     )
+    flash_kda_provenance["current_receipt_binding"] = (
+        _bind_flash_kda_build_to_current_receipt(
+            stack=stack,
+            hardware=hardware,
+            manifest=flash_kda_provenance["build_manifest"],
+        )
+    )
     fla_chunk_kda, fla_provenance = _load_required_fla()
 
     report = {
@@ -1266,8 +1326,7 @@ def main() -> None:
     if not graph_receipt["passed"]:
         report["complete_per_arch_denominator"] = False
         assert args.json is not None
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(report, indent=2) + "\n")
+        write_json_atomic(args.json, report)
         raise RuntimeError(
             "changed-beta CUDA Graph promotion test failed; "
             f"receipt written to {args.json}"
@@ -1300,8 +1359,7 @@ def main() -> None:
 
     report["complete_per_arch_denominator"] = len(report["cases"]) == 6
     assert args.json is not None
-    args.json.parent.mkdir(parents=True, exist_ok=True)
-    args.json.write_text(json.dumps(report, indent=2) + "\n")
+    write_json_atomic(args.json, report)
     print(f"wrote {args.json}")
 
 
