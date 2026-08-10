@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_blackwell():
@@ -57,7 +57,7 @@ def _make_buffers(quant_type: str, capacity: int, hidden: int, topk: int):
     # reset the tail-fill memo for this (possibly reused) address so the
     # fused path treats the dirty buffer as fully live.
     topk_idx = torch.full((capacity, topk), 7, dtype=torch.int64, device="cuda")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import note_staged_tokens
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
     note_staged_tokens(topk_idx, capacity)
     topk_weights = torch.zeros(capacity, topk, dtype=torch.float32, device="cuda")
@@ -208,6 +208,70 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     assert torch.equal(ref[1].view(torch.uint8), got[1].view(torch.uint8)), "x_sf"
     assert torch.equal(ref[2], got[2]), "topk_idx"
     assert torch.equal(ref[3], got[3]), "topk_weights"
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("quant_type", ["nvfp4", "mxfp8_e4m3"])
+def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
+    """A zero-token staging must re-mask rows the previous batch left live.
+
+    Regression: both the staging wrapper and ``fused_quant_stage`` used to
+    early-return on ``num_tokens == 0`` before tail masking and the live-count
+    memo update, leaving the previous batch's rows routed and
+    ``staged_tokens()`` reporting the stale count.
+    """
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        fused_quant_stage,
+        staged_tokens,
+    )
+
+    _require_blackwell()
+
+    hidden, topk, num_experts, capacity = 2048, 4, 16, 64
+    norm_const = 1.0 if quant_type == "nvfp4" else None
+
+    # Wrapper path: live batch then a zero-token batch.
+    buffers = _make_buffers(quant_type, capacity, hidden, topk)
+    _stage(
+        quant_type,
+        monkeypatch,
+        True,
+        _make_batch(32, hidden, topk, num_experts, seed=1),
+        buffers,
+        norm_const,
+    )
+    _stage(
+        quant_type,
+        monkeypatch,
+        True,
+        _make_batch(0, hidden, topk, num_experts, seed=2),
+        buffers,
+        norm_const,
+    )
+    torch.cuda.synchronize()
+    assert (buffers[2] == -1).all(), "zero-token staging left stale live rows"
+    assert staged_tokens(buffers[2]) == 0
+
+    # Direct fused_quant_stage path (bypasses the wrapper's early-out).
+    buffers = _make_buffers(quant_type, capacity, hidden, topk)
+    x, sf, idx_out, w_out = buffers
+    batch = _make_batch(0, hidden, topk, num_experts, seed=3)
+    fused_quant_stage(
+        batch[0],
+        batch[1],
+        batch[2],
+        x,
+        sf,
+        idx_out,
+        w_out,
+        quant_type=quant_type,
+        norm_const=norm_const,
+    )
+    torch.cuda.synchronize()
+    assert (idx_out == -1).all(), "zero-token fused_quant_stage left live rows"
+    assert staged_tokens(idx_out) == 0
 
 
 @pytest.mark.arch_blackwell

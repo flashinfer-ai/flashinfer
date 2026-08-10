@@ -1216,6 +1216,68 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
 
 
 @pytest.mark.parametrize(
+    "Hq,Hkv,seqs_q,seqs_k",
+    [
+        (4, 1, [8, 3, 1], [2048, 300, 1280]),  # group 4, mixed q lens, ragged tail
+        (8, 2, [2, 2], [1024, 640]),  # group 4 (Hq/Hkv), multi kv-head
+    ],
+)
+def test_msa_proxy_score_decode_packed_paged(Hq, Hkv, seqs_q, seqs_k):
+    """Paged KV on the packed decode schedule (flat-only elsewhere).
+
+    ``seqused_k`` reaches the kernel as per-request lengths rather than a prefix
+    sum, so only a heterogeneous batch separates the two derivations. Paged must
+    also stay bit-identical to flat, page permutation and ragged tail included.
+    """
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(180 + Hq)
+    dev = "cuda"
+    B = len(seqs_k)
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+
+    out_flat = msa_proxy_score(q, k, cu_q, cu_k, causal=True)
+    torch.cuda.synchronize()
+    ref = _ref_proxy_score(
+        q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), True, out_flat.shape[1]
+    )
+    got = out_flat.cpu()
+    assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
+    fin = ref != float("-inf")
+    assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
+
+    # The same K behind a shuffled page table must reproduce it bit-identically.
+    npg = [-(-s // BLK_KV) for s in seqs_k]
+    perm = torch.randperm(sum(npg))
+    k_pg = torch.zeros(sum(npg), Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev)
+    ptab = torch.full((B, max(npg)), -1, dtype=torch.int32, device=dev)
+    pi = 0
+    for b in range(B):
+        for blk in range(npg[b]):
+            pg = int(perm[pi])
+            pi += 1
+            ptab[b, blk] = pg
+            lo = int(cu_k[b]) + blk * BLK_KV
+            hi = min(lo + BLK_KV, int(cu_k[b + 1]))
+            k_pg[pg, :, : hi - lo] = k[lo:hi].transpose(0, 1)
+    seqused = torch.tensor(seqs_k, dtype=torch.int32, device=dev)
+    out_paged = msa_proxy_score(
+        q, k_pg, cu_q, page_table=ptab, seqused_k=seqused, causal=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_paged, out_flat)
+
+
+@pytest.mark.parametrize(
     "Hq,Hkv,paged,explicit_qoff",
     [
         (4, 1, False, False),  # M3 shape, ragged flat
@@ -1645,10 +1707,13 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     score = torch.randn(H, P, S, device=dev, dtype=torch.float32)
     score[0, 5, :] = float("nan")
     score[1, 40, ::3] = float("nan")
+    # Scalar num_valid_pages path: the per-token tensor is a signature filler
+    # the kernel does not read.
+    nvp_unused = torch.zeros(1, dtype=torch.int32, device=dev)
     outs = []
     for small in (True, False, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-        _get_compiled_topk(topk, small)(score, out, P, 0, 0, S, H)
+        _get_compiled_topk(topk, small, False)(score, out, nvp_unused, P, 0, 0, S, H)
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"

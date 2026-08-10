@@ -54,7 +54,8 @@ class CuteSm120Mxfp8GemmRunnerInterface {
                                            int32_t const* token_offset, int num_groups,
                                            int max_shape_m, int shape_n, int shape_k,
                                            cudaStream_t stream, int32_t const* SFA = nullptr,
-                                           int32_t const* SFB = nullptr, int granK = 128) = 0;
+                                           int32_t const* SFB = nullptr, int granK = 128,
+                                           bool is_gated = false) = 0;
 
   virtual void group_gemm_mxfp8_nt_groupwise_contiguous(
       void* D, void const* A, void const* B, int32_t const* m_indices, int num_groups, int m,
@@ -88,7 +89,7 @@ class CuteSm120Mxfp8GemmRunner : public CuteSm120Mxfp8GemmRunnerInterface {
                                    int32_t const* token_offset, int num_groups, int max_shape_m,
                                    int shape_n, int shape_k, cudaStream_t stream,
                                    int32_t const* SFA = nullptr, int32_t const* SFB = nullptr,
-                                   int granK = 128) override;
+                                   int granK = 128, bool is_gated = false) override;
 
   void group_gemm_mxfp8_nt_groupwise_contiguous(void* D, void const* A, void const* B,
                                                 int32_t const* m_indices, int num_groups, int m,
@@ -121,6 +122,13 @@ class CuteSm120Mxfp8GemmRunner : public CuteSm120Mxfp8GemmRunnerInterface {
                                         int max_shape_m, int shape_n, int shape_k,
                                         cudaStream_t stream, int32_t const* SFA,
                                         int32_t const* SFB);
+
+  template <int GranK>
+  void fused_moe_mxfp8_nt_groupwise_impl(void* D, void const* A, void const* B,
+                                         int32_t const* token_offset, int num_groups,
+                                         int max_shape_m, int shape_n, int shape_k,
+                                         cudaStream_t stream, int32_t const* SFA,
+                                         int32_t const* SFB);
 
   template <int GranK>
   void group_gemm_mxfp8_nt_groupwise_contiguous_impl(void* D, void const* A, void const* B,

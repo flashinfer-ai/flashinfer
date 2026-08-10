@@ -37,6 +37,8 @@ _requires_sm100 = pytest.mark.skipif(
     reason="vsa_sm100_blk64 requires SM100 (Blackwell)",
 )
 
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
 pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available()
@@ -50,6 +52,14 @@ pytestmark = [
         not _HAS_QUACK,
         reason="VSA SM100 backend requires the quack package "
         "(pip install quack-kernels==0.6.4)",
+    ),
+    pytest.mark.skipif(
+        torch.cuda.is_available()
+        and not is_cute_dsl_arch_supported(
+            *torch.cuda.get_device_capability(), native_only=True
+        ),
+        reason="installed CuTe DSL cannot natively target this device "
+        "architecture (VSA blk128 kernels are CuTe-DSL block-scaled)",
     ),
 ]
 
