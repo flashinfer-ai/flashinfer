@@ -556,9 +556,7 @@ def test_cutlass_stage_top_k_one_preserves_single_compound_pair(monkeypatch):
         ):
             return [3] if kwargs["gemm_idx"] == 1 else [9]
 
-    monkeypatch.setattr(
-        AutoTuner, "get", classmethod(lambda cls: RecordingTuner())
-    )
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: RecordingTuner()))
     runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
     runner._inner = type("Inner", (), {"gemm_idx_for_tuning": None})()
     runner._built = True

@@ -1074,6 +1074,10 @@ class AutoTuner:
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
+        # Ranked shortlists are process-local. Persisted configs retain the
+        # selected winner; a later tuning session rebuilds the shortlist when
+        # compound refinement needs more than one candidate.
+        self._ranked_tactics_cache: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
 
@@ -1741,8 +1745,11 @@ class AutoTuner:
         """
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
-        if not runners:
-            raise ValueError(f"No runners provided for op '{custom_op}'")
+        if len(runners) != 1:
+            raise ValueError(
+                f"rank_tactics requires exactly one runner, got {len(runners)} "
+                f"for op '{custom_op}'"
+            )
 
         if k == 1 or not self.is_tuning_mode:
             _, tactic = self.choose_one(
@@ -1769,26 +1776,32 @@ class AutoTuner:
                 for param in inspect.signature(runner.forward).parameters.values()
             }
 
-            # Rank against the profile nearest the caller's shapes. Stage
-            # shortlists are used as candidates for one outer shape, so a
-            # single representative profile is enough.
-            profile = profiles[0]
-            for candidate in profiles:
-                if candidate.get_opt_shapes() == input_shapes:
-                    profile = candidate
-                    break
+            nearest_profile = self._find_nearest_profile(input_shapes, tuning_config)
+            try:
+                profile = next(
+                    candidate
+                    for candidate in profiles
+                    if self._find_nearest_profile(
+                        candidate.get_opt_shapes(), tuning_config
+                    )
+                    == nearest_profile
+                )
+            except StopIteration as e:
+                raise RuntimeError(
+                    f"No optimization profile for mapped shapes {nearest_profile} "
+                    f"while ranking '{custom_op}'"
+                ) from e
 
-            is_cache_hit, _, cached_tactic, _ = self.search_cache(
+            cache_key = AutoTuner._get_cache_key(
                 custom_op,
-                runners,
+                runner,
                 profile.get_opt_shapes(),
                 tuning_config,
-                inputs=inputs,
+                runner.get_cache_key_extras(inputs),
             )
-            if is_cache_hit:
-                # Warm stage cache: keep choose_one compatibility and skip
-                # re-profiling. Top-k shortlists are produced on cache miss.
-                return [-1 if cached_tactic is None else cached_tactic]
+            cached_ranking = self._ranked_tactics_cache.get(cache_key)
+            if cached_ranking is not None:
+                return list(cached_ranking[:k])
 
             tensors = self._prepare_input_tensors(profile, inputs)
             if tuning_config.inputs_pre_hook is not None:
@@ -1829,14 +1842,8 @@ class AutoTuner:
 
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
-            cache_key = AutoTuner._get_cache_key(
-                custom_op,
-                runner,
-                profile.get_opt_shapes(),
-                tuning_config,
-                runner.get_cache_key_extras(tensors),
-            )
             self.profiling_cache[cache_key] = (ranked[0], profile)
+            self._ranked_tactics_cache[cache_key] = tuple(ranked)
             self._dirty = True
             self._dirty_seq += 1
 
@@ -2555,6 +2562,7 @@ class AutoTuner:
         """Clear the profiling cache and user-loaded file configs."""
         with self._lock:
             self.profiling_cache.clear()
+            self._ranked_tactics_cache.clear()
             self._file_configs.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()

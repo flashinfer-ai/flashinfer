@@ -828,9 +828,7 @@ class TestBuiltInRunnerLifecycle:
                 return 0
 
         monkeypatch.setattr(tuner, "CuteDslFusedMoENvfp4Runner", Inner)
-        monkeypatch.setattr(
-            fused_moe, "_cute_dsl_fused_moe_nvfp4_impl", object()
-        )
+        monkeypatch.setattr(fused_moe, "_cute_dsl_fused_moe_nvfp4_impl", object())
         runner = CuteDslNvfp4Runner(
             self._config(QuantVariant.NVFP4), torch.device("cuda:0")
         )
@@ -1795,7 +1793,7 @@ class TestTrtllmRoutedPackingContract:
                 local_num_experts=local_num_experts,
             ),
         )
-        runner = spec.runner_cls(config, device=device)
+        runner = _build_direct_runner(spec.runner_cls, config, device)
 
         # Global expert ids drawn from this rank's local shard.
         selected_experts = (
@@ -2151,9 +2149,7 @@ class TestTrtllmFromLogitsPackingContract:
             routing_input_mode=RoutingInputMode.FromLogits,
             routing_logits=logits,
         )
-        runner = _build_direct_runner(
-            TrtllmBf16RoutedRunner, config, logits.device
-        )
+        runner = _build_direct_runner(TrtllmBf16RoutedRunner, config, logits.device)
         inputs = runner.pack_inputs(logits_act, weights)
         return runner, inputs, MoeRunnerInputs.from_list(inputs), logits
 

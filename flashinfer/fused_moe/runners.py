@@ -391,7 +391,7 @@ class _CutlassRunnerBase(MoERunner):
             )
         finally:
             self._inner.gemm_idx_for_tuning = None
-        pairs = [
+        pairs: List[Any] = [
             (int(gemm1), int(gemm2))
             for gemm1 in gemm1_tactics
             for gemm2 in gemm2_tactics
@@ -752,34 +752,35 @@ class CuteDslNvfp4Runner(MoERunner):
         routing = self.config.routing
         num_local_experts = experts.local_num_experts or routing.num_experts
         enable_pdl = (
-            True if config.execution.enable_pdl is None else config.execution.enable_pdl
+            True
+            if self.config.execution.enable_pdl is None
+            else self.config.execution.enable_pdl
         )
-        self._inner: CuteDslFusedMoENvfp4Runner | CuteDslFusedMoEW4A16Runner
-        if config.quant.variant is QuantVariant.NVFP4:
+        if self.config.quant.variant is QuantVariant.NVFP4:
             self._inner = CuteDslFusedMoENvfp4Runner(
                 forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(config.activation.type),
-                use_per_token_activation=bool(config.quant.per_token_scale),
+                activation_type=int(self.config.activation.type),
+                use_per_token_activation=bool(self.config.quant.per_token_scale),
             )
-        elif config.quant.variant is QuantVariant.W4A16:
+        elif self.config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(config.activation.type),
+                activation_type=int(self.config.activation.type),
             )
         else:
             raise NotImplementedError(
-                f"CuteDslNvfp4Runner does not support {config.quant.variant}."
+                f"CuteDslNvfp4Runner does not support {self.config.quant.variant}."
             )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
