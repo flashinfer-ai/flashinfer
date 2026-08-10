@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -172,6 +174,47 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
         atol=0,
         msg="tune-cache reuse produced divergent output",
     )
+
+
+def test_mm_bf16_cutile_gb300_llama3_mlp():
+    if "GB300" not in torch.cuda.get_device_name():
+        pytest.skip("This regression is specific to GB300.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    m, n, k = 64, 14336, 4096
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, b.T, backend="cutile")
+    reference = torch.mm(a, b.T)
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
+
+
+def test_mm_bf16_cutile_prunes_gb300_crashing_config(monkeypatch):
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    from flashinfer.gemm.kernels.cutile.mm_bf16_cutile import (
+        _prune_unsafe_autotune_configs,
+    )
+
+    unsafe = SimpleNamespace(
+        BLOCK_M=256,
+        BLOCK_N=256,
+        BLOCK_K=64,
+        GROUP_SIZE_M=8,
+        num_ctas=2,
+        occupancy=2,
+        EPILOGUE_SUBTILE=0,
+    )
+    safe = SimpleNamespace(**{**vars(unsafe), "occupancy": 4})
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA GB300")
+
+    configs = _prune_unsafe_autotune_configs(
+        [unsafe, safe], 64, 14336, 4096, torch.device("cuda")
+    )
+    assert configs == [safe]
 
 
 def test_cublaslt_bf16_runner_zero_algos():

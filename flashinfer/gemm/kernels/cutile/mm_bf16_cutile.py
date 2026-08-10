@@ -258,6 +258,30 @@ def _autotune_configs(device=None):
                     )
 
 
+def _prune_unsafe_autotune_configs(configs, M, N, K, device):
+    if "GB300" not in torch.cuda.get_device_name(device) or (M, N, K) != (
+        64,
+        14336,
+        4096,
+    ):
+        return configs
+
+    # This candidate poisons the CUDA context on GB300 for the Llama-3 MLP shape.
+    return [
+        cfg
+        for cfg in configs
+        if not (
+            cfg.BLOCK_M == 256
+            and cfg.BLOCK_N == 256
+            and cfg.BLOCK_K == 64
+            and cfg.GROUP_SIZE_M == 8
+            and cfg.num_ctas == 2
+            and cfg.occupancy == 2
+            and cfg.EPILOGUE_SUBTILE == 0
+        )
+    ]
+
+
 def _default_kernel_config(device=None):
     """GPU-specific fallback config for the non-autotune path.
 
@@ -502,8 +526,11 @@ def _gemm_alpha_beta_cutile(
             str(a.device),
         )
         if cache_key not in _TUNE_CACHE:
+            configs = _prune_unsafe_autotune_configs(
+                list(_autotune_configs(a.device)), M, N, K, a.device
+            )
             result = exhaustive_search(
-                list(_autotune_configs(a.device)),
+                configs,
                 stream,
                 grid_fn,
                 _gemm_alpha_beta_kernel_cutile,
