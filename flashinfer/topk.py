@@ -29,7 +29,6 @@ from .trace.templates.sampling import (
     top_k_ragged_transform_trace,
 )
 from .utils import (
-    _get_cache_buf,
     check_shape_dtype_device,
     get_compute_capability,
     get_shared_bytes_per_block_optin,
@@ -628,15 +627,8 @@ def top_k(
             return sorted_values, sorted_indices
         return output_values, indices
 
-    # Allocate row_states buffer for multi-CTA path
-    # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
-        1024 * 1024,  # 1MB
-        input.device,
-        zero_init=True,
-    )
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=input.device)
 
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
@@ -838,13 +830,8 @@ def top_k_page_table_transform(
     ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
-    )
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=device)
 
     if out is None:
         out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
@@ -967,13 +954,8 @@ def top_k_ragged_transform(
     ):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
-    )
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=device)
 
     # Allocate output
     output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
