@@ -79,6 +79,12 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue
+  // fusion. This field is part of the public TensorRT-LLM 7801d34 cubin ABI.
+  float const* ptrDsv4InvRopeCosSinCache;
+  // DSv4 output block-scaled tensor, only for epilogue fusion. This field is part of the public
+  // TensorRT-LLM 7801d34 cubin ABI.
+  float* ptrDsv4OScaleFp32;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -130,6 +136,9 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // Padded token dimension for the DSv4 fused FP32 scale layout. This field is part of the public
+  // TensorRT-LLM 7801d34 cubin ABI.
+  int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
   float mInflateMax;

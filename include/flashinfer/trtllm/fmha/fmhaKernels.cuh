@@ -227,6 +227,12 @@ class TllmGenFmhaKernel {
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
     // The selectKernelParams that might be updated.
     SelectKernelParams selectKernelParams{params};
+    // Match TensorRT-LLM 7801d34's native dispatcher: SageAttention kernels with P or V scaling
+    // use the static scheduler until the persistent cubins carrying the corresponding fix are
+    // refreshed.
+    if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0) {
+      selectKernelParams.mTileScheduler = TileScheduler::Static;
+    }
     // Select the kernel.
     selectKernel(params, selectKernelParams);
     // Hash the runner params.
@@ -237,6 +243,10 @@ class TllmGenFmhaKernel {
   // start here
   void run(RunnerParams const& params) const {
     SelectKernelParams selectKernelParams{params};
+    // Match TensorRT-LLM 7801d34's native dispatcher; see checkIfKernelExist() above.
+    if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0) {
+      selectKernelParams.mTileScheduler = TileScheduler::Static;
+    }
     CtaLaunchParams ctaLaunchParams;
 
     // Kernel selection loop (bounded). Each pass may update selectKernelParams (e.g. switch
