@@ -713,15 +713,14 @@ class AddRMSNormFP4QuantKernel:
                                 self.cols_per_tile,
                             )
                             if cutlass.const_expr(is_fp16):
-                                hw_h2 = half2_mul_8(h_h2, w_h2)
-                                max_abs = hmax_to_f32(half2_max_abs_8(hw_h2)) * rstd
-                                y_f32 = half2_to_float16(hw_h2, rstd)
+                                h_f32 = half2_to_float16(h_h2, Float32(1.0))
+                                w_f32 = half2_to_float16(w_h2, Float32(1.0))
                             else:
-                                hw_h2 = bfloat2_mul_8(h_h2, w_h2)
-                                max_abs = (
-                                    bfloat2_hmax_to_f32(bfloat2_max_abs_8(hw_h2)) * rstd
-                                )
-                                y_f32 = bfloat2_to_float16(hw_h2, rstd)
+                                h_f32 = bfloat2_to_float16(h_h2, Float32(1.0))
+                                w_f32 = bfloat2_to_float16(w_h2, Float32(1.0))
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                h_f32, w_f32, rstd
+                            )
 
                             # E4M3: global_scale is incorporated into block scale
                             scale_float = global_scale_val * max_abs * fp4_max_rcp
