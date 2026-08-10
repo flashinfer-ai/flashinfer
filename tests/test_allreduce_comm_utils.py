@@ -274,6 +274,15 @@ class TestAllReduceCommUtils(unittest.TestCase):
 
         self.assertEqual(actual, records)
 
+    def test_append_jsonl_rejects_nonfinite_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "raw.jsonl"
+            with self.assertRaises(ValueError):
+                append_jsonl(
+                    str(output_path),
+                    [{"aggregated_times": [1.0, float("nan")]}],
+                )
+
     def test_rank0_write_error_is_broadcast_before_raise(self):
         class FakeComm:
             def __init__(self, shared_error):

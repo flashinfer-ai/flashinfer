@@ -436,6 +436,7 @@ def _benchmark_single_config(
     comm.Barrier()
     torch.cuda.synchronize()
 
+    local_bench_error = None
     try:
         times = bench_gpu_time(
             fn=run_allreduce,
@@ -452,13 +453,22 @@ def _benchmark_single_config(
             aggregate_op=partial(select_rank_value, rank=rank),
         )
     except RuntimeError as e:
-        # Kernel may fail for very large message sizes or unsupported configs
+        # A rank-local launch failure must become one collective decision before
+        # any successful rank enters the raw-sample allgather below.
+        times = []
+        local_bench_error = f"{type(e).__name__}: {e}"
+
+    bench_error = gather_rank_errors(
+        comm, "AllReduce benchmark", local_bench_error
+    )
+    if bench_error is not None:
+        # Kernel may fail for very large message sizes or unsupported configs.
         if rank == 0:
             elem_size = torch.tensor([], dtype=input_dtype).element_size()
             msg_size_mb = num_tokens * hidden_size * elem_size / (1024 * 1024)
             print(
                 f"[ERROR] Kernel failed for shape=({num_tokens}, {hidden_size}) "
-                f"msg_size={msg_size_mb:.1f} MiB: {e}"
+                f"msg_size={msg_size_mb:.1f} MiB: {bench_error}"
             )
         return None
 
@@ -693,7 +703,6 @@ def test_allreduce_fusion(args):
                 # Preserve one collective control flow: every rank falls back
                 # to TRT-LLM instead of letting auto re-select failed MNNVL.
                 backend_list = ["trtllm"]
-                needs_mnnvl = False
             else:
                 if rank == 0:
                     print("[ERROR] No backends available after MNNVL init failure")
