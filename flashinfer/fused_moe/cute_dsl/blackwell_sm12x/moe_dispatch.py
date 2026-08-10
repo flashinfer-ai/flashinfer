@@ -7,6 +7,7 @@ selection.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import weakref
 from dataclasses import dataclass
@@ -19,11 +20,11 @@ import torch
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
     convert_sf_to_mma_layout,
-    current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
 )
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -31,7 +32,11 @@ from .moe_direct_micro_kernel import (
     compile_direct_micro_kernel,
     compiled_direct_micro_accepts_block_dim,
 )
-from .moe_dynamic_kernel import _TASK_SLICE_CHUNK, MoEDynamicKernel
+from .moe_dynamic_kernel import (
+    _MAX_SHARED_INPUT_TOPK,
+    _TASK_SLICE_CHUNK,
+    MoEDynamicKernel,
+)
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
 from .moe_w4a16_fp4_helpers import swizzle_block_scale
@@ -593,7 +598,201 @@ def _get_weight_views(
 
 # ---------------------------------------------------------------------------
 # Kernel compilation cache
+#
+# The three kernels below are compiled through the shared on-disk CuTe-DSL
+# cache (#3874, #4029; docs/design_docs/cute_dsl_kernel_cache.md), so a fresh
+# process JITLinks an exported ``.o`` instead of re-running the MLIR pipeline.
+# The in-process dicts stay as the level-1 memoization the design describes.
 # ---------------------------------------------------------------------------
+_CUTE_DSL_MODULE = "b12x_moe"
+
+
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache.
+
+    Every module contributing device code to the three kernels compiled here:
+    the kernel bodies, the shared activation and FP4 device helpers, and the
+    SM120 layout builders and block-scaled mainloop they are built from.
+    """
+    from flashinfer.cute_dsl import fp4_common
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm120_b12x
+
+    from . import (
+        moe_activation,
+        moe_dynamic_kernel,
+        moe_micro_kernel,
+        moe_static_kernel,
+    )
+
+    return (
+        __file__,
+        moe_activation.__file__,
+        moe_static_kernel.__file__,
+        moe_micro_kernel.__file__,
+        moe_dynamic_kernel.__file__,
+        cute_dsl_utils.__file__,
+        fp4_common.__file__,
+        dense_blockscaled_gemm_sm120_b12x.__file__,
+    )
+
+
+def _disk_kernel_name(prefix: str, cache_key: Tuple) -> str:
+    """On-disk specialization name for an in-process kernel cache key.
+
+    The name is the *sole* per-kernel cache key — the module ``meta.json``
+    guards only module-wide facts (arch, DSL stack, source hashes) — so it has
+    to be injective in every codegen parameter. It is therefore derived from
+    the very tuple that keys the in-process cache: a readable shape prefix for
+    humans browsing ``cached_ops/``, plus a digest of the exact tuple.
+
+    The digest, rather than a formatted field list, is what makes the mapping
+    injective: the keys contain floats and ``None`` (``swiglu_alpha`` /
+    ``swiglu_beta`` / ``swiglu_limit``) whose textual forms would collide once
+    sanitized into a filename (``1.5`` and ``-1.5`` both sanitize to ``1_5``).
+    """
+    digest = hashlib.sha256(repr(cache_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def _static_kernel_cache_key(
+    *,
+    activation_precision: str,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+) -> Tuple:
+    """The static kernel's cache key: every parameter affecting its codegen.
+
+    Single source of truth for both cache levels — the in-process dict and,
+    through :func:`_disk_kernel_name`, the on-disk artifact name.
+    """
+    return (
+        "static",
+        activation_precision,
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+    )
+
+
+def _micro_kernel_cache_key(
+    *,
+    state_E: int,
+    weight_E: int,
+    m: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    share_input_across_experts: bool,
+    share_expert_scales: bool,
+    single_token: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+) -> Tuple:
+    """The micro kernel's cache key (see :func:`_static_kernel_cache_key`)."""
+    return (
+        "micro",
+        state_E,
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        max_rows,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        share_input_across_experts,
+        share_expert_scales,
+        single_token,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+    )
+
+
+def _dynamic_kernel_cache_key(
+    *,
+    activation_precision: str,
+    E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    mac: int,
+    mma_tiler_mn: Tuple[int, int],
+    topk_ids_dtype: torch.dtype,
+    input_scales_are_reciprocal: bool,
+    fast_math: bool,
+    activation: str,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float | None,
+    share_input_across_experts: bool,
+) -> Tuple:
+    """The dynamic kernel's cache key (see :func:`_static_kernel_cache_key`).
+
+    Deliberately free of ``m`` / ``max_rows``: the dynamic kernel takes its
+    runtime-shaped operands as pointers, so one artifact serves every batch
+    size.
+    """
+    return (
+        "dynamic",
+        activation_precision,
+        E,
+        k,
+        n,
+        num_topk,
+        mac,
+        mma_tiler_mn,
+        topk_ids_dtype,
+        input_scales_are_reciprocal,
+        fast_math,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        share_input_across_experts,
+    )
+
+
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -636,25 +835,24 @@ def _get_static_kernel(
     if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n, resident_clusters=mac)
 
-    cache_key = (
-        "static",
-        activation_precision,
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
+    cache_key = _static_kernel_cache_key(
+        activation_precision=activation_precision,
+        state_E=state_E,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        max_rows=max_rows,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -805,35 +1003,41 @@ def _get_static_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        lambda: cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -878,27 +1082,26 @@ def _get_micro_kernel(
     routed_rows = m * num_topk
     mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 
-    cache_key = (
-        "micro",
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        share_input_across_experts,
-        share_expert_scales,
-        single_token,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
+    cache_key = _micro_kernel_cache_key(
+        state_E=state_E,
+        weight_E=weight_E,
+        m=m,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        max_rows=max_rows,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=single_token,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1050,35 +1253,41 @@ def _get_micro_kernel(
         stride_order=(1, 0),
         assumed_align=16,
     )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"micro_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}", cache_key),
+        lambda: cute.compile(
+            kernel,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            active_expert_count_fake,
+            weight_expert_ids_fake,
+            global_to_local_expert_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -1459,6 +1668,10 @@ def launch_sm120_static_moe(
         launch_ids = flat_ids
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
+    # No stream argument: the kernels compile against
+    # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
+    # the caller's current stream and the parameter is absent from the
+    # compiled signature.
     runtime_args: Tuple[Any, ...] = (
         a,
         launch_ids,
@@ -1485,7 +1698,7 @@ def launch_sm120_static_moe(
         workspace.token_map,
         workspace.token_weights,
     )
-    compiled(*runtime_args, current_cuda_stream())
+    compiled(*runtime_args)
 
     return scatter_output
 
@@ -1839,8 +2052,13 @@ def _get_dynamic_kernel(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 dynamic compiler"
         )
+    # Both dynamic implementations reserve 32 route slots per token for the
+    # shared-input fast path. Larger top-k values remain correct by using the
+    # generic per-route producer instead.
     share_input_across_experts = bool(
-        share_input_across_experts and activation_precision == "fp4"
+        share_input_across_experts
+        and activation_precision == "fp4"
+        and num_topk <= _MAX_SHARED_INPUT_TOPK
     )
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
@@ -1851,23 +2069,22 @@ def _get_dynamic_kernel(
     # and scale indexing matches the allocated scratch geometry.
     mma_tiler_mn = (tile_m, _level_tile_n(activation_precision))
 
-    cache_key = (
-        "dynamic",
-        activation_precision,
-        E,
-        k,
-        n,
-        num_topk,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        share_input_across_experts,
+    cache_key = _dynamic_kernel_cache_key(
+        activation_precision=activation_precision,
+        E=E,
+        k=k,
+        n=n,
+        num_topk=num_topk,
+        mac=mac,
+        mma_tiler_mn=mma_tiler_mn,
+        topk_ids_dtype=topk_ids_dtype,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+        fast_math=fast_math,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        share_input_across_experts=share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1892,6 +2109,9 @@ def _get_dynamic_kernel(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
+        hidden_size=k,
+        intermediate_size=n,
+        num_topk=num_topk,
     )
     launch = _DynamicMoELaunch(
         kernel,
@@ -1991,43 +2211,49 @@ def _get_dynamic_kernel(
         alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
     )
 
-    compiled = cute.compile(
-        launch,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        pair_head_fake,
-        task_head_fake,
-        task_tail_fake,
-        task_expert_fake,
-        task_valid_rows_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        expert_write_rows_fake,
-        expert_tile_base_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        1,
-        1,
-        1,
-        1,  # runtime Int32 placeholders
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _disk_kernel_name(f"dynamic_e{E}_k{k}_n{n}_t{num_topk}", cache_key),
+        lambda: cute.compile(
+            launch,
+            a_input_fake,
+            topk_ids_fake,
+            topk_weights_fake,
+            packed_a_fake,
+            sfa_fake,
+            packed_a_storage_fake,
+            scale_storage_fake,
+            barrier_count_fake,
+            barrier_epoch_fake,
+            pair_head_fake,
+            task_head_fake,
+            task_tail_fake,
+            task_expert_fake,
+            task_valid_rows_fake,
+            b_w13_fake,
+            sfb_w13_fake,
+            b_down_fake,
+            sfb_down_fake,
+            row_counts_fake,
+            expert_write_rows_fake,
+            expert_tile_base_fake,
+            input_gs_fake,
+            alpha_fake,
+            down_alpha_fake,
+            global_scale_fake,
+            scatter_fake,
+            token_map_fake,
+            token_weights_fake,
+            1,
+            1,
+            1,
+            1,  # runtime Int32 placeholders
+            mac,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
+        extra_key_files=_kernel_source_files(),
     )
 
     result = (compiled, mac)
@@ -2096,7 +2322,8 @@ def launch_sm120_dynamic_moe(
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
-    # fixed-shape args are Tensor (pass torch tensor directly).
+    # fixed-shape args are Tensor (pass torch tensor directly).  No stream
+    # argument -- see the note in launch_sm120_static_moe.
     runtime_args: Tuple[Any, ...] = (
         a.data_ptr(),
         flat_ids.data_ptr(),
@@ -2131,7 +2358,7 @@ def launch_sm120_dynamic_moe(
         workspace.physical_tiles_capacity * workspace.tile_m,
         workspace.task_capacity,
     )
-    compiled(*runtime_args, current_cuda_stream())
+    compiled(*runtime_args)
 
     return scatter_output
 
