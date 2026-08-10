@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "recurrent_kda_prefill_h12_phase_a",
+  "common": {
+    "num_heads": 12,
+    "head_dim_qk": 128,
+    "head_dim_vo": 128,
+    "dtype": "bfloat16",
+    "initial_state": "provided",
+    "use_qk_l2norm_in_kernel": true,
+    "use_gate_in_kernel": true,
+    "beta_is_logit": true,
+    "lower_bound": -5.0
+  },
+  "aggregation": "per_case_only",
+  "cases": [
+    {
+      "name": "h12_packed_512x32",
+      "layout": "packed",
+      "seq_lens": [512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512, 512],
+      "seed": 12000
+    },
+    {
+      "name": "h12_packed_128x8",
+      "layout": "packed",
+      "seq_lens": [128, 128, 128, 128, 128, 128, 128, 128],
+      "seed": 12001
+    },
+    {
+      "name": "h12_fixed_512",
+      "layout": "fixed",
+      "seq_lens": [512],
+      "seed": 12002
+    },
+    {
+      "name": "h12_fixed_8192",
+      "layout": "fixed",
+      "seq_lens": [8192],
+      "seed": 12003
+    },
+    {
+      "name": "h12_packed_mixed",
+      "layout": "packed",
+      "seq_lens": [1300, 547, 2048, 963, 271, 3063],
+      "seed": 12004
+    },
+    {
+      "name": "h12_packed_1024x8",
+      "layout": "packed",
+      "seq_lens": [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024],
+      "seed": 12005
+    }
+  ]
+}
