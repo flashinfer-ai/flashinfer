@@ -51,25 +51,32 @@ NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
 error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
 with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
-### CUTLASS DSL version pin (PIN — do not `-U`)
+### CUTLASS DSL version
 
-After the editable install, pin the DSL exactly:
+After the editable install, bring the DSL up to a supported version:
 
 ```bash
-pip install "nvidia-cutlass-dsl[cu13]==4.6.1"
+pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
 ```
 
 The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
-kernels need ≥ 4.6.x. Do **not** use `pip install -U` (the older recipe):
-as of 2026-08-05 that resolves to **4.7.0**, whose bundled CUDA libs
-(`nvidia-cutlass-dsl-libs-cu13`) break the **deep_gemm** mega path — every
-4-rank `deep_gemm.fp8_fp4_mega_moe` launch dies with
-`CUDA_ERROR_MISALIGNED_ADDRESS` and the poisoned context cascades through the
-rest of the `mega` pytest session (bisected 2026-08-05 on prenyx B200: fails
-on dsl 4.7.0 at two commits / three nodes, passes on 4.6.1 with the identical
-deep_gemm 2.5.0+891d57b). The vLLM e2e sections below keep their own separate
-**4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for the vLLM engine
-env, not for running the moe_ep test suite.
+kernels need ≥ 4.6.x. **4.6.1** is the perf-validated reference (the TUNING.md
+and benchmark tables were measured on it); **4.7.0** is correctness-validated
+(2026-08-10, jobs 2384640/2384641/2384650: drop harness, fused-quant unit
+tests, and the full deep_gemm/nvfp4/mxfp8 mega multirank + oracle suites all
+green) but its perf has not been measured — pin 4.6.1 when producing numbers
+meant to compare against the reference tables.
+
+History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
+every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
+activation-quant staging (`DataPreprocess` in
+`kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+staging path — fixed by the upstream `50117315d` sync recorded in that drop's
+VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
+their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
+the vLLM engine env, not for running the moe_ep test suite.
 
 Tolerance note (dsl-version-independent, resolved 2026-08-05): on B200 nodes
 `test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` used to fail by
