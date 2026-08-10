@@ -191,7 +191,9 @@ The output CSV will contain detailed metrics including:
 | `--num_iters`            | Number of iterations for performance measurement                                                           |
 | `--dry_run_iters`        | Number of warmup iterations                                                                                |
 | `--no_cuda_graph`        | Disable CUDA graph to execute kernels outside of the graph.                                                |
-| `--use_cupti`            | Use CUPTI for timing GPU kernels when available. |
+| `--use_cupti`            | Deprecated compatibility flag; CUPTI is already the default timing path.                                  |
+| `--use_cuda_events`      | Force CUDA event timing instead of the default CUPTI path.                                                 |
+| `--enable_pdl`           | Enable Programmatic Dependent Launch for routines whose backing API accepts it.                            |
 | `--refcheck`             | Verify outputs match between different backends                                                            |
 | `--allow_output_mismatch`| Continue testing even if outputs don't pass refcheck                                              |
 | `--random_seed`          | Random seed for reproducibility                                                                            |
@@ -335,7 +337,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 ```
 
 ### AllReduce Communication Flags (allreduce_fusion)
-The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. Both oneshot and twoshot strategies are benchmarked automatically and reported side by side.
+The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. By default, forced oneshot and twoshot strategies are benchmarked and reported side by side, preserving the routine's previous behavior. `--strategy auto` instead exercises the API's internal strategy heuristic.
 
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
@@ -343,8 +345,21 @@ The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-
 | `--hidden_size`          | Hidden dimension size. Default: 4096                                                                       |
 | `--input_dtype`          | Data type for input tensors: `bfloat16` (default) or `float16`                                             |
 | `--ar_backend`           | AllReduce backend: `auto` (default), `trtllm`, or `mnnvl`. `auto` uses heuristic                          |
-| `--pattern`              | Fusion pattern: `allreduce` (default) or `ar_residual_rmsnorm` (AllReduce + Residual + RMSNorm)            |
+| `--pattern`              | Fusion pattern: `allreduce` (default), `ar_residual_rmsnorm`, or `ar_residual_rmsnorm_dynamic_fp8`         |
+| `--strategy`             | `oneshot`, `twoshot`, `both` (default), or `auto`. `auto` passes `use_oneshot=None` to the API              |
+| `--enable_pdl`           | Pass `launch_with_pdl=True` to validation and measured AllReduce launches. PDL is disabled by default       |
+| `--trigger_completion_at_end` / `--no_trigger_completion_at_end` | Request late (default) or early TRT-LLM PDL completion signaling                       |
+| `--fp32_acc`             | Use FP32 accumulation for TRT-LLM AllReduce. Disabled by default                                            |
+| `--l2_cache`             | `cold` (default) flushes or rotates benchmark inputs; `warm` measures without the cold-L2 treatment         |
+| `--rank_aggregation`     | Per-iteration cross-rank reduction: `max` (default), `rank0`, or `mean`                                    |
+| `--raw_jsonl_path`       | Optional rank-0 JSONL file containing every rank's raw timing vector and the reported aggregate             |
 | `--validate`             | Run correctness validation before benchmarking                                                             |
+
+The timer's internal distributed reduction is bypassed for this routine so raw rank-local samples remain available. The selected `--rank_aggregation` is applied exactly once after all ranks have reported each iteration. Median, population standard deviation, and linear-interpolated p90 are then computed from that aggregated per-iteration vector. CSV output records these latency statistics together with the requested strategy, PDL/completion/accumulation controls, cache mode, rank aggregation, world size, warmup/measurement counts, and requested timing mode. `strategy_request` records the value passed to the API; it does not claim which strategy the backend eventually selected for `auto` or an unsupported forced strategy. `trigger_completion_at_end_request` is likewise a request: TRT-LLM twoshot kernels and MNNVL ignore it, and an `auto` strategy may resolve to a path where it is not applicable. Likewise, `timing_mode_request` records `cupti`, `cuda_graph`, or `cuda_events` according to the timer arguments. It is not an effective-mode field because the CUPTI path can fall back internally. Use `--raw_jsonl_path` when the full per-rank distributions are needed for regression analysis. A requested JSONL write is treated as part of the run: a rank-0 filesystem error is broadcast and all ranks fail consistently instead of silently dropping the evidence.
+
+`trigger_completion_at_end` and `fp32_acc` are TRT-LLM controls and are ignored by MNNVL. The completion request is also ignored by TRT-LLM twoshot kernels. Early PDL completion is only safe when the following kernel is also PDL-aware and calls `cudaGridDependencySynchronize()`.
+
+Historical `allreduce_fusion` benchmark commands hardcoded PDL on for measured launches even when `--enable_pdl` was omitted and emitted an unsupported warning if the flag was supplied. The routine now follows the global `--enable_pdl` contract tracked by #3435: PDL is off unless the flag is present, and the same value is used for validation and measurement. This is an intentional correction to the historical default; the other default controls remain unchanged.
 
 **Launch Examples:**
 ```bash
@@ -370,6 +385,17 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
     --routine allreduce_fusion \
     --num_tokens 64 --hidden_size 4096 \
     --validate
+
+# Issue-style two-rank latency path: PDL off, trigger_completion_at_end=false, FP32 accumulation off
+mpirun -np 2 python benchmarks/flashinfer_benchmark.py \
+    --routine allreduce_fusion \
+    --num_tokens 128 --hidden_size 4096 \
+    --ar_backend trtllm --pattern ar_residual_rmsnorm \
+    --strategy oneshot --l2_cache warm --rank_aggregation rank0 \
+    --no_trigger_completion_at_end --no_cuda_graph \
+    --dry_run_iters 100 --num_iters 1000 --use_cuda_events \
+    --raw_jsonl_path allreduce_raw.jsonl \
+    --output_path allreduce_summary.csv --validate
 ```
 
 ### Norm Flags

@@ -50,14 +50,16 @@ Launch examples:
 Options:
     --ar_backend auto|trtllm|mnnvl : Backend selection (default: auto)
     --pattern allreduce|ar_residual_rmsnorm : Fusion pattern (default: allreduce)
+    --strategy oneshot|twoshot|both|auto   : Kernel strategy (default: both)
     --validate                     : Run correctness validation before benchmarking
 
-Note: Both oneshot and twoshot strategies are always benchmarked and reported.
+Note: Both oneshot and twoshot strategies are benchmarked by default. Use
+``--strategy`` to benchmark one forced strategy or the API's automatic choice.
 """
 
+from functools import partial
 from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 from mpi4py import MPI
 
@@ -75,13 +77,46 @@ try:
     from .flashinfer_benchmark_utils import (
         dtype_str_to_torch_dtype,
         print_perf_metrics,
-        warn_if_pdl_unsupported,
     )
 except ImportError:
     from flashinfer_benchmark_utils import (
         dtype_str_to_torch_dtype,
         print_perf_metrics,
-        warn_if_pdl_unsupported,
+    )
+
+try:
+    from .allreduce_comm_utils import (
+        add_allreduce_control_args,
+        aggregate_rank_times,
+        append_jsonl,
+        build_allreduce_control_kwargs,
+        gather_process_group_initialization,
+        gather_process_group_presence,
+        gather_rank_errors,
+        raise_if_rank0_error,
+        select_rank_value,
+        strategies_for_mode,
+        strategy_request_name,
+        summarize_times,
+        timing_mode_request,
+        validate_initialized_process_group,
+    )
+except ImportError:
+    from allreduce_comm_utils import (
+        add_allreduce_control_args,
+        aggregate_rank_times,
+        append_jsonl,
+        build_allreduce_control_kwargs,
+        gather_process_group_initialization,
+        gather_process_group_presence,
+        gather_rank_errors,
+        raise_if_rank0_error,
+        select_rank_value,
+        strategies_for_mode,
+        strategy_request_name,
+        summarize_times,
+        timing_mode_request,
+        validate_initialized_process_group,
     )
 
 PATTERN_NAME_TO_CODE = {
@@ -105,17 +140,24 @@ def _setup_mpi_and_device() -> Tuple[MPI.Comm, int, int, int]:
     return comm, rank, world_size, local_rank
 
 
-def _init_torch_distributed(rank: int, world_size: int):
-    """Initialize torch.distributed for TRTLLM backend (uses NCCL for IPC)."""
+def _init_torch_distributed(rank: int, world_size: int) -> bool:
+    """Ensure a matching process group exists and report benchmark ownership."""
     import os
 
     import torch.distributed as dist
 
     if dist.is_initialized():
-        return
+        validate_initialized_process_group(
+            expected_rank=rank,
+            expected_world_size=world_size,
+            actual_rank=dist.get_rank(),
+            actual_world_size=dist.get_world_size(),
+        )
+        return False
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    return True
 
 
 def _cleanup_torch_distributed():
@@ -163,6 +205,9 @@ def _validate_allreduce(
     world_size: int,
     rank: int,
     comm: MPI.Comm,
+    enable_pdl: bool,
+    trigger_completion_at_end: bool,
+    fp32_acc: bool,
     verbose: int = 0,
 ) -> bool:
     """Validate allreduce correctness via comparison with torch sum reference."""
@@ -182,9 +227,11 @@ def _validate_allreduce(
             input=x_local,
             workspace=workspace,
             pattern=pattern_code,
-            launch_with_pdl=False,
             output=output,
             use_oneshot=use_oneshot,
+            **build_allreduce_control_kwargs(
+                enable_pdl, trigger_completion_at_end, fp32_acc
+            ),
         )
         torch.cuda.synchronize()
 
@@ -228,7 +275,6 @@ def _validate_allreduce(
             input=x_local,
             workspace=workspace,
             pattern=pattern_code,
-            launch_with_pdl=False,
             residual_out=residual_out,
             norm_out=None if is_dynamic_fp8 else norm_out,
             quant_out=quant_out,
@@ -237,6 +283,9 @@ def _validate_allreduce(
             rms_gamma=norm_weight,
             rms_eps=eps,
             use_oneshot=use_oneshot,
+            **build_allreduce_control_kwargs(
+                enable_pdl, trigger_completion_at_end, fp32_acc
+            ),
         )
         torch.cuda.synchronize()
 
@@ -331,9 +380,13 @@ def _benchmark_single_config(
                 input=inp,
                 workspace=workspace,
                 pattern=pattern_code,
-                launch_with_pdl=True,
                 output=output,
                 use_oneshot=use_oneshot,
+                **build_allreduce_control_kwargs(
+                    args.enable_pdl,
+                    args.trigger_completion_at_end,
+                    args.fp32_acc,
+                ),
             )
             return output
 
@@ -358,7 +411,6 @@ def _benchmark_single_config(
                 input=inp,
                 workspace=workspace,
                 pattern=pattern_code,
-                launch_with_pdl=True,
                 residual_out=residual_out,
                 norm_out=None if is_dynamic_fp8 else norm_out,
                 quant_out=quant_out,
@@ -367,6 +419,11 @@ def _benchmark_single_config(
                 rms_gamma=norm_weight,
                 rms_eps=1e-5,
                 use_oneshot=use_oneshot,
+                **build_allreduce_control_kwargs(
+                    args.enable_pdl,
+                    args.trigger_completion_at_end,
+                    args.fp32_acc,
+                ),
             )
             return quant_out if is_dynamic_fp8 else norm_out
 
@@ -388,7 +445,11 @@ def _benchmark_single_config(
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
             use_cuda_graph=not args.no_cuda_graph,
-            cold_l2_cache=True,
+            cold_l2_cache=args.l2_cache == "cold",
+            # bench_gpu_time otherwise applies its default max reduction when
+            # torch.distributed is initialized. Select this process's rank so
+            # the MPI gather below receives the original per-rank samples.
+            aggregate_op=partial(select_rank_value, rank=rank),
         )
     except RuntimeError as e:
         # Kernel may fail for very large message sizes or unsupported configs
@@ -403,13 +464,18 @@ def _benchmark_single_config(
 
     num_measure_iters = len(times)
 
-    # Gather times from all ranks and use max (communication is synchronous)
-    all_times = comm.allgather(times)
+    # Gather raw rank-local samples, then aggregate exactly once according to
+    # the requested reporting policy.
+    all_times = comm.allgather([float(time) for time in times])
 
+    result = None
+    raw_write_error = None
     if rank == 0:
-        per_iter_max = [max(t[i] for t in all_times) for i in range(num_measure_iters)]
-        median_time = float(np.median(per_iter_max))
-        std_time = float(np.std(per_iter_max))
+        aggregated_times = aggregate_rank_times(all_times, args.rank_aggregation)
+        timing_summary = summarize_times(aggregated_times)
+        median_time = timing_summary["median_time"]
+        p90_time = timing_summary["p90_time"]
+        std_time = timing_summary["std_time"]
 
         elem_size = torch.tensor([], dtype=input_dtype).element_size()
         message_size_bytes = num_tokens * hidden_size * elem_size
@@ -419,13 +485,8 @@ def _benchmark_single_config(
 
         backend_name = workspace.backend
         pattern_name = PATTERN_CODE_TO_NAME.get(pattern_code, str(pattern_code))
-        oneshot_str = ""
-        if use_oneshot is True:
-            oneshot_str = "_oneshot"
-        elif use_oneshot is False:
-            oneshot_str = "_twoshot"
-
-        label = f"{backend_name}_{pattern_name}{oneshot_str}"
+        strategy_request = strategy_request_name(use_oneshot)
+        label = f"{backend_name}_{pattern_name}_{strategy_request}"
 
         print_perf_metrics(label, median_time, std_time, torch.nan, busbw)
 
@@ -433,12 +494,56 @@ def _benchmark_single_config(
             print(
                 f"  algbw={algbw:.4f} TB/s, "
                 f"msg_size={message_size_bytes / 1024:.1f} KiB, "
-                f"time={median_time * 1000:.1f} us"
+                f"time={median_time * 1000:.1f} us, "
+                f"p90={p90_time * 1000:.1f} us, "
+                f"rank_aggregation={args.rank_aggregation}"
             )
 
-        return {
+        if args.raw_jsonl_path is not None:
+            raw_record = {
+                "schema_version": 1,
+                "routine": args.routine,
+                "requested_backend": args.ar_backend,
+                "resolved_backend": backend_name,
+                "pattern": pattern_name,
+                "strategy_request": strategy_request,
+                "world_size": world_size,
+                "num_tokens": num_tokens,
+                "hidden_size": hidden_size,
+                "input_dtype": str(input_dtype),
+                "enable_pdl": args.enable_pdl,
+                "trigger_completion_at_end_request": (args.trigger_completion_at_end),
+                "fp32_acc": args.fp32_acc,
+                "l2_cache": args.l2_cache,
+                "rank_aggregation": args.rank_aggregation,
+                "timing_mode_request": timing_mode_request(
+                    enable_cupti=args.use_cupti,
+                    use_cuda_graph=not args.no_cuda_graph,
+                ),
+                "cuda_graph": not args.no_cuda_graph,
+                "dry_run_iters": args.dry_run_iters,
+                "num_measure_iters": num_measure_iters,
+                "units": "milliseconds",
+                "per_rank_times": [
+                    {"rank": rank_id, "times": rank_times}
+                    for rank_id, rank_times in enumerate(all_times)
+                ],
+                "aggregated_times": aggregated_times,
+                "median_time": median_time,
+                "p90_time": p90_time,
+                "std_time": std_time,
+            }
+            try:
+                append_jsonl(args.raw_jsonl_path, [raw_record])
+            except (OSError, TypeError, ValueError) as err:
+                raw_write_error = (
+                    f"Failed to append raw timings to {args.raw_jsonl_path}: {err}"
+                )
+
+        result = {
             "routine": args.routine,
             "median_time": median_time,
+            "p90_time": p90_time,
             "std_time": std_time,
             "tflops": "N/A",
             "tb_per_sec": busbw,
@@ -447,9 +552,27 @@ def _benchmark_single_config(
             "num_tokens": num_tokens,
             "hidden_size": hidden_size,
             "input_dtype": str(input_dtype),
+            "strategy_request": strategy_request,
+            "trigger_completion_at_end_request": args.trigger_completion_at_end,
+            "fp32_acc": args.fp32_acc,
+            "l2_cache": args.l2_cache,
+            "rank_aggregation": args.rank_aggregation,
+            "world_size": world_size,
+            "dry_run_iters": args.dry_run_iters,
+            "num_iters": num_measure_iters,
+            "enable_pdl": args.enable_pdl,
+            "timing_mode_request": timing_mode_request(
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=not args.no_cuda_graph,
+            ),
         }
 
-    return None
+    if args.raw_jsonl_path is not None:
+        # Propagate rank-0 filesystem failures through the existing MPI
+        # communicator so every rank exits the collective loop consistently.
+        raise_if_rank0_error(comm, raw_write_error)
+
+    return result
 
 
 def run_allreduce_comm_test(args):
@@ -501,6 +624,7 @@ def parse_allreduce_comm_args(line, parser):
         default=False,
         help="Run correctness validation before benchmarking.",
     )
+    add_allreduce_control_args(parser)
 
     args = parser.parse_args(line)
     return args
@@ -508,7 +632,6 @@ def parse_allreduce_comm_args(line, parser):
 
 def test_allreduce_fusion(args):
     """Benchmark allreduce fusion across shapes, backends, and patterns."""
-    warn_if_pdl_unsupported(args, args.routine)
     comm, rank, world_size, local_rank = _setup_mpi_and_device()
     gpus_per_node = torch.cuda.device_count()
 
@@ -530,45 +653,87 @@ def test_allreduce_fusion(args):
     hidden_size = args.hidden_size
     backend_list = [args.ar_backend]
     pattern_list = [args.pattern]
-    oneshot_list: List[Optional[bool]] = [True, False]
+    oneshot_list: List[Optional[bool]] = strategies_for_mode(args.strategy)
 
     # Initialize backends
     torch_dist_initialized = False
+    torch_dist_created_by_benchmark = False
 
     needs_mnnvl = any(b in ("mnnvl", "auto") for b in backend_list)
     needs_trtllm = any(b in ("trtllm", "auto") for b in backend_list)
 
+    # bench_gpu_time uses any already-initialized torch process group even for
+    # an explicit MNNVL run. Validate MPI/torch rank identity before either
+    # backend can enter timing; only TRT-LLM is allowed to create a new group.
+    import torch.distributed as dist
+
+    presence = gather_process_group_presence(comm, dist.is_initialized())
+    if not presence["ok"]:
+        if rank == 0:
+            print(
+                "[ERROR] Refusing mixed pre-existing process-group state: "
+                f"{presence['error']}"
+            )
+        return []
+
     if needs_mnnvl:
+        local_mnnvl_error = None
         try:
             MnnvlMemory.initialize()
         except Exception as e:
+            local_mnnvl_error = f"{type(e).__name__}: {e}"
+
+        mnnvl_error = gather_rank_errors(
+            comm, "MNNVL initialization", local_mnnvl_error
+        )
+        if mnnvl_error is not None:
             if rank == 0:
-                print(f"[WARNING] MNNVL initialization failed: {e}")
-            backend_list = [b for b in backend_list if b != "mnnvl"]
-            if not backend_list:
+                print(f"[WARNING] {mnnvl_error}")
+            if args.ar_backend == "auto":
+                # Preserve one collective control flow: every rank falls back
+                # to TRT-LLM instead of letting auto re-select failed MNNVL.
+                backend_list = ["trtllm"]
+                needs_mnnvl = False
+            else:
                 if rank == 0:
                     print("[ERROR] No backends available after MNNVL init failure")
                 return []
 
-    if needs_trtllm:
+    if needs_trtllm or presence["all_initialized"]:
+        local_error = None
+        local_created = False
         try:
-            _init_torch_distributed(rank, world_size)
-            torch_dist_initialized = True
+            local_created = _init_torch_distributed(rank, world_size)
         except Exception as e:
+            local_error = f"{type(e).__name__}: {e}"
+
+        init_status = gather_process_group_initialization(
+            comm=comm,
+            local_error=local_error,
+            local_created=local_created,
+            local_initialized=dist.is_initialized(),
+        )
+        if not init_status["ok"]:
+            # A partially created group cannot be used safely. Clean up only
+            # groups created by this invocation; preserve caller-owned groups.
+            if local_created and dist.is_initialized():
+                _cleanup_torch_distributed()
             if rank == 0:
-                print(f"[WARNING] torch.distributed initialization failed: {e}")
-            backend_list = [b for b in backend_list if b != "trtllm"]
-            if not backend_list:
-                if rank == 0:
-                    print(
-                        "[ERROR] No backends available after torch.distributed init failure"
-                    )
-                return []
+                print(
+                    "[ERROR] torch.distributed initialization was inconsistent "
+                    f"across MPI ranks: {init_status['error']}"
+                )
+            return []
+
+        torch_dist_initialized = True
+        torch_dist_created_by_benchmark = init_status["created_by_benchmark"]
 
     try:
         for backend in backend_list:
             # Create workspace sized for the largest shape
-            comm_backend = TorchDistBackend() if torch_dist_initialized else None
+            comm_backend = (
+                TorchDistBackend() if needs_trtllm and torch_dist_initialized else None
+            )
 
             try:
                 workspace = create_allreduce_fusion_workspace(
@@ -640,6 +805,11 @@ def test_allreduce_fusion(args):
                                 world_size=world_size,
                                 rank=rank,
                                 comm=comm,
+                                enable_pdl=args.enable_pdl,
+                                trigger_completion_at_end=(
+                                    args.trigger_completion_at_end
+                                ),
+                                fp32_acc=args.fp32_acc,
                                 verbose=args.verbose,
                             )
                             if not valid:
@@ -669,7 +839,7 @@ def test_allreduce_fusion(args):
                 workspace.destroy()
 
     finally:
-        if torch_dist_initialized:
+        if torch_dist_created_by_benchmark:
             _cleanup_torch_distributed()
 
     return res
