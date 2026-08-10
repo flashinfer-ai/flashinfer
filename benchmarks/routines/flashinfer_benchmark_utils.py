@@ -58,6 +58,7 @@ output_column_dict = {
         "weight_dtype",
         "activation_type",
         "fp4_mode",
+        "cold_l2_cache",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
@@ -115,6 +116,11 @@ output_column_dict = {
         "filter_apply_order",
         "max_len",
         "num_rows",
+    ],
+    # top_k_varlen selects top-K KV positions per request; its row width is a
+    # max sequence length, not a vocab size (see routines/topk_varlen.py).
+    "topk_varlen": [
+        "max_seq_len",
     ],
     "rope": [
         "seq_len",
@@ -188,6 +194,7 @@ full_output_columns = (
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["sampling"]
+    + output_column_dict["topk_varlen"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
@@ -270,6 +277,11 @@ benchmark_apis = {
         "top_k",
         "top_k_page_table_transform",
         "top_k_ragged_transform",
+    ],
+    # top_k_varlen is a sparse-attention KV-selection primitive (not vocab
+    # sampling), so it has its own category + routine module (routines/topk_varlen.py).
+    "topk_varlen": [
+        "top_k_varlen",
     ],
     "rope": [
         "apply_rope",
@@ -370,6 +382,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
         "10.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
+        "10.7": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
         "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
         "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
     },
@@ -384,6 +397,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "10.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
         "10.3": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
+        "10.7": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-gen", "trtllm-native"],
         "12.0": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
         "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
     },
@@ -427,6 +441,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["fa2", "fa3"],
         "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
         "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto"],
+        "10.7": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
     },
@@ -439,6 +454,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": [],
         "12.1": [],
     },
@@ -450,6 +466,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": [],
         "12.1": [],
     },
@@ -488,7 +505,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -498,6 +515,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -509,6 +527,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -520,6 +539,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
         "12.0": [],
         "12.1": [],
     },
@@ -531,6 +551,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
@@ -876,6 +897,8 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # Note: top_k_varlen uses its @backend_requirement support checks
+    # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
     # ROPE
     "apply_rope": {
         "7.5": ["cuda"],

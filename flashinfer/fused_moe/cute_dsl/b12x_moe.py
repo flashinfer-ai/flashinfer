@@ -69,6 +69,7 @@ def b12x_fused_moe(
     w1_alpha: torch.Tensor,
     w2_alpha: torch.Tensor,
     fc2_input_scale: Optional[torch.Tensor] = None,
+    input_global_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -115,8 +116,14 @@ def b12x_fused_moe(
         Per-expert global scale for FC2.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for FC2 input quantization.  Required for
-        ``quant_mode="nvfp4"``; accepted but ignored for
-        ``quant_mode="w4a16"``.
+        ``quant_mode="nvfp4"``; ignored for ``"mxfp4"`` and
+        ``"w4a16"``.
+    input_global_scale : Optional[torch.Tensor]
+        Global scale for FC1 input quantization, scalar or
+        ``[num_experts]``.  Lets ``w1_alpha`` carry the exact fp32 weight
+        scale; folded into the output multiplier internally.  Defaults to
+        ``w1_alpha``, which then serves both roles.  Ignored for
+        ``quant_mode="mxfp4"`` and ``quant_mode="w4a16"``.
     num_local_experts : Optional[int]
         Local experts for expert parallelism.  Defaults to ``num_experts``.
     output : Optional[torch.Tensor]
@@ -137,8 +144,9 @@ def b12x_fused_moe(
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
     quant_mode : Optional[str]
-        Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.  When set,
-        selects the backend and internal workspace family.
+        Quantization mode, ``"nvfp4"`` / ``"w4a4"``, ``"mxfp4"``, or
+        ``"w4a16"``. When set, selects the backend and internal workspace
+        family.
     source_format : str
         Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
         ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
@@ -205,6 +213,7 @@ def b12x_fused_moe(
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
         fc2_input_scale=fc2_input_scale,
+        input_global_scale=input_global_scale,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
         w2_alpha=w2_alpha,
@@ -243,8 +252,8 @@ class B12xMoEWrapper:
             "relu2". Default: "silu". swiglu_alpha/beta/limit apply to swigluoai.
         activation_precision: Backward-compatible alias for quant_mode.
             "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
-        quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
-            this selects the backend and internal workspace family.
+        quant_mode: Quantization mode, "nvfp4"/"w4a4", "mxfp4", or "w4a16".
+            When set, this selects the backend and internal workspace family.
         source_format: Source weight format for quant_mode="w4a16".
             Supports "modelopt" and "compressed_tensors". Default: "modelopt".
 
@@ -314,7 +323,8 @@ class B12xMoEWrapper:
             Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
             ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
         quant_mode : Optional[str]
-            Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.
+            Quantization mode, ``"nvfp4"`` / ``"w4a4"``, ``"mxfp4"``, or
+            ``"w4a16"``.
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.
@@ -375,6 +385,8 @@ class B12xMoEWrapper:
         self._padded_weights: Any = None
         self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
+        self._folded_w1_alpha: Optional[torch.Tensor] = None
+        self._folded_w1_alpha_key: Optional[Tuple] = None
 
         if use_cuda_graph:
             self._allocate_buffers()
@@ -417,6 +429,7 @@ class B12xMoEWrapper:
                 num_tokens=self.max_num_tokens,
                 num_topk=self.top_k,
                 activation_precision=self.activation_precision,
+                quant_mode=self.quant_mode,
             )
             == "dynamic"
             and self.num_local_experts == self.num_experts
@@ -482,6 +495,7 @@ class B12xMoEWrapper:
         w1_alpha: torch.Tensor,
         w2_alpha: torch.Tensor,
         fc2_input_scale: Optional[torch.Tensor] = None,
+        input_global_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the b12x fused-MoE forward pass.
 
@@ -509,6 +523,10 @@ class B12xMoEWrapper:
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for FC2 input quantization.  Required for
             ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
+        input_global_scale : Optional[torch.Tensor]
+            Global scale for FC1 input quantization, scalar or
+            ``[num_experts]``.  Defaults to ``w1_alpha``; see
+            :func:`b12x_fused_moe`.  Ignored for ``"w4a16"``.
 
         Returns
         -------
@@ -559,6 +577,7 @@ class B12xMoEWrapper:
                     num_tokens=num_tokens,
                     num_topk=self.top_k,
                     activation_precision=self.activation_precision,
+                    quant_mode=self.quant_mode,
                 )
                 == "dynamic"
             ):
@@ -566,7 +585,23 @@ class B12xMoEWrapper:
             else:
                 workspace = self._static_workspace
 
-        if self.quant_mode == "nvfp4":
+        if self.quant_mode == "nvfp4" and input_global_scale is not None:
+            # Fold once and reuse; launch_sm120_moe skips its fold when
+            # weight views are given.
+            fold_key = (
+                w1_alpha.data_ptr(),
+                input_global_scale.data_ptr(),
+                w1_alpha._version,
+                input_global_scale._version,
+            )
+            if self._folded_w1_alpha is None or self._folded_w1_alpha_key != fold_key:
+                self._folded_w1_alpha = (
+                    w1_alpha.to(torch.float32) * input_global_scale.to(torch.float32)
+                ).contiguous()
+                self._folded_w1_alpha_key = fold_key
+            w1_alpha = self._folded_w1_alpha
+
+        if self.quant_mode != "w4a16":
             # Cache weight views; invalidate if weight pointers change.
             weight_key = (
                 self.quant_mode,
@@ -600,6 +635,7 @@ class B12xMoEWrapper:
                         self.hidden_size,
                         w1_weight.size(0),
                         is_gated,
+                        self.quant_mode,
                     )
                     self._padded_weight_key = padded_weight_key
                 (
@@ -622,6 +658,7 @@ class B12xMoEWrapper:
                     n=n_eff,
                     k=self.hidden_size,
                     activation_precision=self.activation_precision,
+                    quant_mode=self.quant_mode,
                 )
                 self._weight_key = weight_key
         else:
@@ -636,6 +673,7 @@ class B12xMoEWrapper:
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
             fc2_input_scale=fc2_input_scale,
+            input_global_scale=input_global_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
             w2_alpha=w2_alpha,

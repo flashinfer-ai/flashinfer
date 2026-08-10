@@ -30,6 +30,8 @@ from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
+    CutlassBf16Config,
+    CutlassW4A16Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -38,15 +40,19 @@ from .api import (
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
 )
 from .utils import map_to_hybrid_bucket
 
@@ -55,22 +61,28 @@ from .utils import map_to_hybrid_bucket
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CutlassBf16Runner,
+    CutlassW4A16Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
 ]
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CutlassBf16Config: CutlassBf16Runner,
+    CutlassW4A16Config: CutlassW4A16Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorConfig: TrtllmFp8PerTensorRunner,
+    TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
 }
@@ -108,11 +120,14 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
+            if config.quant.variant not in runner_cls.supported_quant_variants:
+                continue
             runner = runner_cls(config, device=self.device)
             try:
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
+            runner.build()
             self.runners.append(runner)
 
         if not self.runners:

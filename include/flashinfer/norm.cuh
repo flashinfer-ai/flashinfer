@@ -33,6 +33,32 @@ namespace norm {
 
 using namespace tensorrt_llm::common;
 
+template <typename T>
+struct QuantTypeStaticVals;
+
+template <>
+struct QuantTypeStaticVals<int8_t> {
+  static constexpr float MAX_VAL = 127.f;
+  static constexpr float MIN_SCALING_FACTOR = 0.f;
+  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
+};
+
+// Same values as TRT-LLM quantTypeUtils.cuh; MIN_SCALING_FACTOR bound follows
+// https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e4m3> {
+  static constexpr float MAX_VAL = 448.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 448.f * 512.f;
+};
+
+template <>
+struct QuantTypeStaticVals<__nv_fp8_e5m2> {
+  static constexpr float MAX_VAL = 57344.f;
+  static constexpr float MIN_SCALING_FACTOR = 1.0f / (57344.f * 512.f);
+  static constexpr float MIN_SCALING_FACTOR_RCP = 57344.f * 512.f;
+};
+
 template <uint32_t VEC_SIZE, typename T>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
                               const uint32_t d, const uint32_t stride_input,
@@ -199,6 +225,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -214,7 +241,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] =
           float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-max_val, fminf(output_vec[j], max_val));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -583,6 +610,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<float, VEC_SIZE> output_vec;
@@ -598,7 +626,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] = x_vec[j] * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
-      output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
+      output_vec[j] = fmaxf(-max_val, fminf(output_vec[j], max_val));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -719,34 +747,6 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
 
   return cudaSuccess;
 }
-
-template <typename T>
-struct QuantTypeStaticVals;
-
-template <>
-struct QuantTypeStaticVals<int8_t> {
-  static constexpr float MAX_VAL = 127.f;
-  static constexpr float MIN_SCALING_FACTOR = 0.f;
-  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
-};
-
-#ifdef ENABLE_FP8
-// Same values as TRT-LLM quantTypeUtils.cuh; MIN_SCALING_FACTOR bound follows
-// https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/src/quantize/quantize.cu
-template <>
-struct QuantTypeStaticVals<__nv_fp8_e4m3> {
-  static constexpr float MAX_VAL = 448.f;
-  static constexpr float MIN_SCALING_FACTOR = 1.0f / (448.f * 512.f);
-  static constexpr float MIN_SCALING_FACTOR_RCP = 448.f * 512.f;
-};
-
-template <>
-struct QuantTypeStaticVals<__nv_fp8_e5m2> {
-  static constexpr float MAX_VAL = 57344.f;
-  static constexpr float MIN_SCALING_FACTOR = 1.0f / (57344.f * 512.f);
-  static constexpr float MIN_SCALING_FACTOR_RCP = 57344.f * 512.f;
-};
-#endif  // ENABLE_FP8
 
 template <typename Tf, typename T>
 __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_variance, T const* gemma,

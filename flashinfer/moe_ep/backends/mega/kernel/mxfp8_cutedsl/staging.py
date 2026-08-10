@@ -17,7 +17,7 @@ def _use_fused_stage() -> bool:
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from .....kernel_src.cutedsl_megamoe import kind_data_dtype
+    from .....kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -40,7 +40,7 @@ def stage_mega_moe_inputs(
     falls back to the original torch-composed staging below.
     """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -52,6 +52,11 @@ def stage_mega_moe_inputs(
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
+        # A zero-token step still owns the buffer: rows a previous batch left
+        # routed must be re-masked (and the live-count memo set to 0) or they
+        # would dispatch as stale live tokens.
+        topk_idx_out.fill_(-1)
+        note_staged_tokens(topk_idx_out, 0)
         return
     if hidden % 64 != 0:
         raise ValueError("hidden_size must be a multiple of 64.")
@@ -123,7 +128,7 @@ def validate_mxfp8_forward_inputs(
         return
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from .....kernel_src.cutedsl_megamoe import (
+    from .....kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         ceil_div,
