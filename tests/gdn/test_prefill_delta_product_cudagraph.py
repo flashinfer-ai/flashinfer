@@ -14,20 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CUDA graph capture/replay for chunk_gated_delta_product.
-
-Two failure modes this catches that the eager tests cannot:
-
-  * A host sync inside the wrapper -- ``.item()``, ``.tolist()``, ``int(t)``,
-    or any data-dependent control flow on a device tensor. Capture raises.
-  * Values baked in at capture time. The expansion derives ``cu_seqlens * n_h``,
-    ``g_flat`` and ``q_flat`` from device tensors; if any of that is computed on
-    the host, replay silently reuses the captured numbers. So we replay with
-    DIFFERENT input contents and check the output tracks them.
-
-Note the graph-safe calling convention: pass ``output=``/``output_state=`` so
-results land in caller-owned buffers. Letting the wrapper allocate works under
-capture (the allocation joins the graph pool) but the returned tensor is the
-same storage on every replay, which is a sharper edge than it looks.
 """
 
 from __future__ import annotations

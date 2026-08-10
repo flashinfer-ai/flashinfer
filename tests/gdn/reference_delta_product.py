@@ -15,15 +15,6 @@ limitations under the License.
 
 Reference implementation of Gated DeltaProduct (arXiv:2502.10297).
 
-DeltaProduct takes ``num_householder`` delta-rule steps per token instead of one,
-giving a state transition of rank up to ``num_householder``:
-
-    A(x_i) = alpha_i * prod_{j=1..n_h} (I - beta_{i,j} k_{i,j} k_{i,j}^T)
-
-The gate ``alpha`` fires ONCE per real token; ``beta``/``k``/``v`` are per
-(token, householder). At ``num_householder == 1`` this must reduce exactly to
-``reference_delta_rule.delta_rule``.
-
 Layout note: the householder axis sits immediately after the token axis, so
 ``x.reshape(total_seq_len * n_h, H, D)`` yields the ``(t n) h d`` ordering the
 kernel wrappers expand into.
