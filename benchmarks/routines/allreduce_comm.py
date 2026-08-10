@@ -458,9 +458,7 @@ def _benchmark_single_config(
         times = []
         local_bench_error = f"{type(e).__name__}: {e}"
 
-    bench_error = gather_rank_errors(
-        comm, "AllReduce benchmark", local_bench_error
-    )
+    bench_error = gather_rank_errors(comm, "AllReduce benchmark", local_bench_error)
     if bench_error is not None:
         # Kernel may fail for very large message sizes or unsupported configs.
         if rank == 0:
