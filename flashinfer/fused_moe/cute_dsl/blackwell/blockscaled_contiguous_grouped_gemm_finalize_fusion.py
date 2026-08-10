@@ -127,7 +127,8 @@ To collect performance with NCU profiler:
 Constraints:
 * Supported input data types: mxf8, mxf4, nvf4
   see detailed valid dtype combinations in below Sm100BlockScaledPersistentDenseGemmKernel class documentation
-* A/B tensor must have the same data type, mixed data type is not supported (e.g., mxf8 x mxf4)
+* In addition to homogeneous inputs, A=MXFP8 and B=MXFP4 is supported with
+  E8M0 block-32 scale factors and BF16 output
 * Mma tiler M must be 128 or 256(use_2cta_instrs)
 * Mma tiler N must be 64/128/192/256
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
@@ -323,13 +324,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
 
-    :note: In current version, A and B tensor must have the same data type
-        - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
-
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - MXF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU + sf_vec_size: 32
         - NVF4: A/B: Float4E2M1FN + SF: Float8E8M0FNU/Float8E4M3FN + sf_vec_size: 16
+        - Mixed MXFP8/MXFP4: A: Float8E4M3FN, B: Float4E2M1FN +
+          SF: Float8E8M0FNU + sf_vec_size: 32
 
     :note: Supported accumulator data types:
         - Float32
@@ -342,6 +342,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     :note: Constraints:
         - MMA tiler M must be 128 or 256 (use_2cta_instrs)
         - MMA tiler N must be 64/128/192/256
+        - Problem N must be divisible by both 128 (the scale-factor layout
+          atom) and the MMA N tile (the finalize epilogue currently has no
+          partial-N bulk-reduce path)
         - Cluster shape M must be multiple of 2 if Mma tiler M is 256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
         - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
@@ -471,6 +474,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Configure tiled mma
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -481,6 +485,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -553,8 +558,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         ) = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
-            self.a_dtype,
-            self.b_dtype,
+            self.smem_alloc_a_dtype,
+            self.smem_alloc_b_dtype,
             self.out_dtype,
             self.cta_tile_shape_mnk,
             self.sf_dtype,
@@ -568,13 +573,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
             self.mma_tiler,
-            self.a_dtype,
+            self.smem_alloc_a_dtype,
             self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
             self.mma_tiler,
-            self.b_dtype,
+            self.smem_alloc_b_dtype,
             self.num_ab_stage,
         )
         self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
@@ -693,9 +698,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.gemm_output_layout = utils.LayoutEnum.ROW_MAJOR
 
         self.topK = token_final_scales.shape[1]
-        # Check if input data types are compatible with MMA instruction
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+        self.needs_unpack = self.needs_unpack_tma(self.a_dtype, self.b_dtype)
+        self.smem_alloc_a_dtype = (
+            cutlass.Int8
+            if self.needs_unpack and self.a_dtype.width < 8
+            else self.a_dtype
+        )
+        self.smem_alloc_b_dtype = (
+            cutlass.Int8
+            if self.needs_unpack and self.b_dtype.width < 8
+            else self.b_dtype
+        )
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -710,6 +723,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -720,6 +734,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
+            self.b_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.sf_dtype,
@@ -741,6 +756,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=(
+                self.smem_alloc_a_dtype
+                if self.needs_unpack and self.a_dtype.width < 8
+                else None
+            ),
         )
 
         # Setup TMA load for B
@@ -755,6 +775,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.mma_tiler,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            internal_type=(
+                self.smem_alloc_b_dtype
+                if self.needs_unpack and self.b_dtype.width < 8
+                else None
+            ),
         )
 
         # Setup TMA load for SFA
@@ -878,14 +903,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.smem_alloc_a_dtype,
+                    cute.cosize(self.a_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.smem_alloc_b_dtype,
+                    cute.cosize(self.b_smem_layout_staged.outer),
                 ],
                 self.buffer_align_bytes,
             ]
@@ -2508,8 +2535,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raise ValueError(f"Invalid atom_sm_cnt: {atom_sm_cnt} and {mcast}")
 
     @staticmethod
+    def needs_unpack_tma(
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+    ) -> bool:
+        """Return whether mixed-width operands require TMA FP4 unpacking."""
+        return a_dtype.width != b_dtype.width
+
+    @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         out_dtype: Type[cutlass.Numeric],
@@ -2517,8 +2553,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
         Check if the dtypes are valid
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param sf_dtype: The data type of the scale factor
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
@@ -2529,36 +2567,37 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :return: True if the dtypes are valid, False otherwise
         :rtype: bool
         """
-        is_valid = True
-        if ab_dtype not in {
+        supported_ab_dtypes = {
             cutlass.Float4E2M1FN,
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
+        }
+        if a_dtype not in supported_ab_dtypes or b_dtype not in supported_ab_dtypes:
+            return False
 
-        # Check valid sf_vec_size
+        if a_dtype != b_dtype:
+            return (
+                a_dtype is cutlass.Float8E4M3FN
+                and b_dtype is cutlass.Float4E2M1FN
+                and sf_dtype is cutlass.Float8E8M0FNU
+                and sf_vec_size == 32
+                and out_dtype is cutlass.BFloat16
+            )
+
         if sf_vec_size not in {16, 32}:
-            is_valid = False
-
-        # Check valid sf_dtype
+            return False
         if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
-            is_valid = False
-
-        # Check valid sf_dtype and sf_vec_size combinations
+            return False
         if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        if out_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}:
-            is_valid = False
-
-        return is_valid
+            return False
+        if a_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
+            return False
+        return out_dtype in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}
 
     @staticmethod
     def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         out_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
@@ -2567,8 +2606,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
         Check if layouts and dtypes are valid combinations
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param out_dtype: The data type of the output tensor
         :type out_dtype: Type[cutlass.Numeric]
         :param a_major: The major dimension of the A tensor
@@ -2581,13 +2622,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :return: True if the layouts are valid, False otherwise
         :rtype: bool
         """
-        is_valid = True
-
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
+        if a_dtype is cutlass.Float4E2M1FN and a_major != "k":
+            return False
+        if b_dtype is cutlass.Float4E2M1FN and b_major != "k":
+            return False
         if out_dtype is cutlass.Float4E2M1FN and out_major == "m":
-            is_valid = False
-        return is_valid
+            return False
+        return True
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
@@ -2641,11 +2682,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         out_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         out_major: str,
+        mma_tiler_mn: Tuple[int, int],
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -2658,8 +2701,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type k: cutlass.Int64
         :param l: The number of columns in the C tensor
         :type l: cutlass.Int64
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param out_dtype: The data type of the output tensor
         :type out_dtype: Type[cutlass.Numeric]
         :param a_major: The major axis of the A tensor
@@ -2668,30 +2713,71 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type b_major: str
         :param out_major: The major axis of the C tensor
         :type out_major: str
+        :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
+        :type mma_tiler_mn: Tuple[int, int]
 
         :return: True if the problem shape is valid, False otherwise
         :rtype: bool
         """
-        is_valid = True
 
         def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
             major_mode_idx = 0 if is_mode0_major else 1
             num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
+            return (num_major_elements * dtype.width) % (16 * 8) == 0
+
+        def check_contigous_128_alignment(dtype, is_mode0_major, tensor_shape):
+            if dtype.width >= 8:
+                return True
+            major_mode_idx = 0 if is_mode0_major else 1
+            return tensor_shape[major_mode_idx] % 128 == 0
 
         if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
+            not check_contigous_16B_alignment(a_dtype, a_major == "m", (m, k, l))
+            or not check_contigous_16B_alignment(b_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(out_dtype, out_major == "m", (m, n, l))
         ):
-            is_valid = False
-        return is_valid
+            return False
+
+        # The wrapper exposes B scales in complete 128-row layout atoms, so a
+        # partial atom would silently under-describe the weight scales. The
+        # epilogue itself predicates the N tail via valid_columns.
+        if n % 128 != 0:
+            return False
+
+        needs_unpack = (
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.needs_unpack_tma(
+                a_dtype, b_dtype
+            )
+        )
+        if needs_unpack and (
+            not check_contigous_128_alignment(a_dtype, a_major == "m", (m, k, l))
+            or not check_contigous_128_alignment(b_dtype, b_major == "n", (n, k, l))
+        ):
+            return False
+
+        use_2cta_instrs = mma_tiler_mn[0] == 256
+        cta_div = 2 if use_2cta_instrs else 1
+        if (
+            needs_unpack
+            and a_major == "m"
+            and a_dtype.width < 8
+            and (mma_tiler_mn[0] // cta_div) % 128 != 0
+        ):
+            return False
+        if (
+            needs_unpack
+            and b_major == "n"
+            and b_dtype.width < 8
+            and (mma_tiler_mn[1] // cta_div) % 128 != 0
+        ):
+            return False
+        return True
 
     @classmethod
     def can_implement(
         cls,
-        ab_dtype: Type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         out_dtype: Type[cutlass.Numeric],
@@ -2709,8 +2795,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
         Check if the gemm can be implemented
 
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
+        :param a_dtype: The data type of the A operand
+        :type a_dtype: Type[cutlass.Numeric]
+        :param b_dtype: The data type of the B operand
+        :type b_dtype: Type[cutlass.Numeric]
         :param sf_dtype: The data type of the scale factor
         :type sf_dtype: Type[cutlass.Numeric]
         :param sf_vec_size: The vector size of the scale factor
@@ -2744,12 +2832,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         can_implement = True
         # Skip unsupported types
         if not cls.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, out_dtype
+            a_dtype, b_dtype, sf_dtype, sf_vec_size, out_dtype
         ):
             can_implement = False
 
         # Skip unsupported layouts
-        if not cls.is_valid_layouts(ab_dtype, out_dtype, a_major, b_major, out_major):
+        if not cls.is_valid_layouts(
+            a_dtype, b_dtype, out_dtype, a_major, b_major, out_major
+        ):
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
@@ -2757,7 +2847,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not cls.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, out_dtype, a_major, b_major, out_major
+            m,
+            n,
+            k,
+            l,
+            a_dtype,
+            b_dtype,
+            out_dtype,
+            a_major,
+            b_major,
+            out_major,
+            mma_tiler_mn,
         ):
             can_implement = False
         # Skip unsupported A/B layout
