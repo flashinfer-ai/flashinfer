@@ -436,8 +436,13 @@ class _PrimsTsMoERunnerMixin:
         del profile
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         hidden_states = moe_inputs.hidden_states
-        for tactic in tactics:
+
+        def _precompile_one(tactic: Any) -> None:
             try:
+                compile_only = getattr(self, "_precompile_tactic_compile_only", None)
+                if compile_only is not None:
+                    compile_only(inputs, tactic, **kwargs)
+                    return
                 self.forward(inputs, tactic=tactic, **kwargs)
                 torch.cuda.current_stream(device=hidden_states.device).synchronize()
             except Exception as exc:
@@ -449,6 +454,17 @@ class _PrimsTsMoERunnerMixin:
                     "[Prims-TS MoE] Skipping precompile for "
                     f"{self.__class__.__name__} tactic {tactic}: {exc}"
                 )
+
+        # Compilation is mostly host-side; fan out tactics when there are several.
+        max_workers = min(4, max(1, len(tactics)))
+        if max_workers == 1 or len(tactics) <= 1:
+            for tactic in tactics:
+                _precompile_one(tactic)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(_precompile_one, tactics))
         return True
 
 

@@ -140,12 +140,12 @@ Legend
 
   A/B tensor args                         scale-factor args*           page/route args*
         |                                       |                            |
-        | LoadA/LoadB: TMA                       | LoadSfA/LoadSfB: TMA       | Gather*: LDGSTS
+        | LoadA/LoadB: TMA                      | LoadSfA/LoadSfB: TMA       | Gather*: LDGSTS
         v                                       v                            | or TMA gather4
-  +-----+----+                          +-------+--------+                   v
-  | SmemA/B  |                          | SmemSfA/SfB    |          +--------+---------+
-  | A/B buffer |                          | SF buffer        |          | SmemGather*      |
-  +-----+----+                          +-------+--------+          +--------+---------+
+  +----------+                          +----------------+                   v
+  | SmemA/B  |                          | SmemSfA/SfB    |          +------------------+
+  | A/B buf  |                          | SF buffer      |          | SmemGather*      |
+  +----------+                          +----------------+          +------------------+
         |                                       |                            |
         |                                       | CopySfA/CopySfB: SMEM->TMEM
         |                                       v                            |

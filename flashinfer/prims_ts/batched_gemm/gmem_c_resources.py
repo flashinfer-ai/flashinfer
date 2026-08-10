@@ -2997,6 +2997,7 @@ class GmemCResource(MemoryResource):
                         val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                         val2_f32 = self._maybe_apply_scale_c(val2_f32, scale_c)
                         val3_f32 = self._maybe_apply_scale_c(val3_f32, scale_c)
+                        val0_vals.append(val0_f32)
                         val1_vals.append(val1_f32)
                         val2_vals.append(val2_f32)
                         val3_vals.append(val3_f32)
