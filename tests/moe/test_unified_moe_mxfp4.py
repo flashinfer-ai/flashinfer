@@ -503,9 +503,11 @@ def test_trtllm_fp4_fused_shared_experts_cuda_graph_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = layer(act, weights)
+    captured.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
 
+    assert torch.isfinite(captured).all()
     torch.testing.assert_close(captured, eager, rtol=0.05, atol=0.05)
 
 
