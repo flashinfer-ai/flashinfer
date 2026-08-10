@@ -79,7 +79,7 @@ def _cp_delta_rule_rejection_reason(
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
-    ) and arch_major != 9:
+    ) and arch_major not in (9, 10):
         return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
@@ -206,7 +206,7 @@ def chunk_gated_delta_rule(
         SM90/SM120.  The SM100 path also accepts bfloat16, float16,
         float8_e4m3fn, and float8_e5m2.  Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
-        currently supported on SM90 only.
+        currently supported on SM90 and SM100.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
@@ -445,7 +445,7 @@ def chunk_gated_delta_rule(
                     "checkpoint_cu_starts": checkpoint_cu_starts,
                     "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
                 }
-                if _arch_major == 9
+                if _arch_major in (9, 10)
                 else {}
             )
             cp_delta_rule_dsl(

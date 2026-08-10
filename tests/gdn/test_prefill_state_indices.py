@@ -225,8 +225,8 @@ def test_prefill_state_indices_with_state_checkpoints(use_cp):
     """Indexed final-state I/O must not change packed checkpoint ordering."""
     _skip_if_not_sm90_or_sm100()
     device = torch.device("cuda")
-    if use_cp and get_compute_capability(device)[0] != 9:
-        pytest.skip("CP state checkpointing is implemented by the SM90 kernel")
+    if use_cp and get_compute_capability(device)[0] not in (9, 10):
+        pytest.skip("CP state checkpointing requires SM90 or SM100")
     H, D = 16, 128
     seq_lens = [128, 512]
     num_seqs = len(seq_lens)
