@@ -84,11 +84,12 @@ def test_worker_unit_stealing_drains_queued_units_exactly_once() -> None:
     assert all(work.unfinished_tasks == 0 for work in work_by_worker)
 
 
-def test_compatibility_defaults_use_file_sized_units_without_time_limits(
+def test_compatibility_defaults_use_file_sized_units_with_failure_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("UNIT_TEST_DEADLINE_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("UNIT_TEST_TIMEOUT_POLICY", raising=False)
     monkeypatch.delenv("UNIT_TEST_DEFAULT_CASE_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_DEFAULT_SOURCE_OVERHEAD_SECONDS", raising=False)
     monkeypatch.delenv("UNIT_TEST_DURATION_ESTIMATES", raising=False)
@@ -100,7 +101,8 @@ def test_compatibility_defaults_use_file_sized_units_without_time_limits(
     args = unit_test_runner._parser().parse_args(["run"])
 
     assert args.deadline_seconds == 0
-    assert args.unit_timeout_seconds == 0
+    assert args.unit_timeout_seconds == 7_200
+    assert args.timeout_policy == "fail"
     assert args.default_case_seconds == 1
     assert args.default_source_overhead_seconds == 30
     assert args.duration_estimates is None

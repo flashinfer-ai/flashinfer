@@ -55,7 +55,7 @@ EXIT_HELP = (
     "3=configuration, manifest, collection, or infrastructure error"
 )
 DEFAULT_DEADLINE_SECONDS = 0
-DEFAULT_UNIT_TIMEOUT_SECONDS = 0
+DEFAULT_UNIT_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 def _env_int(name: str, default: int) -> int:
@@ -258,7 +258,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--timeout-policy",
         type=_timeout_policy,
         choices=("resume", "skip", "fail"),
-        default=os.environ.get("UNIT_TEST_TIMEOUT_POLICY", "resume"),
+        default=os.environ.get("UNIT_TEST_TIMEOUT_POLICY", "fail"),
         help="handling for unexecuted nodes (UNIT_TEST_TIMEOUT_POLICY)",
     )
     parser.add_argument(
