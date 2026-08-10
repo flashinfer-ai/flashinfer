@@ -344,6 +344,10 @@ class _CutlassRunnerBase(MoERunner):
         # The two GEMMs have independent tactic spaces. Preserve the legacy
         # O(n1+n2) tuning flow, then let the outer unified tuner profile only
         # the selected pair as one full-MoE candidate.
+        # FIXME: get_valid_tactics() is supposed to list candidates, but the
+        # autotuner cannot express multi-stage / factorized tactics yet, so we
+        # nest choose_one() per GEMM and return one compound winner. Refine the
+        # autotuner to own staged tuning instead of selecting winners here.
         tuner = AutoTuner.get()
         profile_inputs = [inputs[1], inputs[4], None, inputs[5], None]
         stage_tuning_config = TuningConfig()
