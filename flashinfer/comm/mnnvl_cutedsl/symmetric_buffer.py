@@ -23,6 +23,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
+from ..torch_symmetric_memory import _enable_symm_mem_for_group
+
 
 @dataclass(frozen=True, slots=True)
 class SymmetricBuffer:
@@ -51,6 +53,7 @@ class SymmetricBuffer:
             raise RuntimeError(
                 "PyTorch Symmetric Memory has no backend for the current device"
             )
+        _enable_symm_mem_for_group(group.group_name)
         return cls.rendezvous(
             symm_mem.empty(shape, dtype=dtype, device=device),
             group,
@@ -67,6 +70,7 @@ class SymmetricBuffer:
         require_multicast: bool = False,
         materialize_peer_addresses: bool = False,
     ) -> SymmetricBuffer:
+        _enable_symm_mem_for_group(group.group_name)
         handle = symm_mem.rendezvous(tensor, group)
         multicast_address = None
         if require_multicast:
