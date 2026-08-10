@@ -238,9 +238,6 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
-        # Per-token alpha: `alpha` is an (m,) row vector instead of a (1,)
-        # scalar, so each output row carries its own dequant scale. Used by
-        # NVFP4 activations quantized with a dynamic per-token global scale.
         self.per_token_alpha = per_token_alpha
         mma_atom_mn = (self.mma_tile_shape_mnk[0], self.mma_tile_shape_mnk[1])
         if mma_atom_mn in ((16, 64), (16, 128)):
@@ -844,9 +841,8 @@ class DenseGemmKernel:
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
-        # Keep alpha in FP32 for precision. In per-token mode the scale is a
-        # row vector, so it is folded into the accumulators (or read at the
-        # store) once the global row index is known, and this stays neutral.
+        # Keep alpha in FP32 for precision. In per-token mode the row scale is
+        # applied once the global row index is known, so this stays neutral.
         if cutlass.const_expr(self.per_token_alpha):
             alpha_value = cutlass.Float32(1.0)
         else:
@@ -1515,11 +1511,9 @@ class DenseGemmKernel:
                             )
 
                 if cutlass.const_expr(self.per_token_alpha and not self.swap_ab):
-                    # Fold the per-row scale into the accumulators once, before
-                    # any epilogue variant runs. Without swap_ab the M extent
-                    # maps to acc_mn's first mode, so one alpha load covers a
-                    # whole accumulator row. Rows past M keep their unscaled
-                    # values and are dropped by the store predication below.
+                    # Without swap_ab the M extent maps to acc_mn's first mode,
+                    # so one alpha load covers a whole accumulator row. Rows past
+                    # M are dropped by the store predication below.
                     pt_acc_mn = _reshape_acc_to_mn(accumulators)
                     pt_coord_mn = _reshape_acc_to_mn(
                         thr_mma.partition_C(
@@ -1568,8 +1562,7 @@ class DenseGemmKernel:
                                 directC_mnl.shape[0]
                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                 # swap_ab puts M on acc_mn's second mode, so the
-                                # row scale is read per element rather than
-                                # hoisted the way the non-swapped path does.
+                                # row scale cannot be hoisted per row here.
                                 if cutlass.const_expr(self.per_token_alpha):
                                     elem_alpha = alpha[m_coord].to(cutlass.Float32)
                                 else:

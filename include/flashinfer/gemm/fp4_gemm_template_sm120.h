@@ -113,10 +113,8 @@ inline typename Gemm::Arguments prepareGemmArgsImpl(void* D, void const* A, void
   typename Gemm::Arguments operator_args;
   operator_args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   operator_args.epilogue.thread.alpha_ptr = static_cast<ElementCompute const*>(global_sf);
-  // The alpha broadcast stride is a runtime value: 0 replays alpha_ptr[0] for
-  // every element (the per-tensor scale), 1 walks one alpha per token. Which
-  // mode holds the tokens depends on whether the kernel swapped A and B, so
-  // key off the stride type the fusion was built with.
+  // Stride 0 replays alpha_ptr[0] for every element, 1 walks one alpha per
+  // token. Which mode holds the tokens follows the fusion's stride type.
   using StrideAlpha = decltype(operator_args.epilogue.thread.dAlpha);
   if constexpr (cute::is_same_v<cute::remove_cvref_t<decltype(cute::get<0>(StrideAlpha{}))>,
                                 bool>) {
@@ -257,9 +255,8 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     using ElementAccumulator = float;                                                                                \
     using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;                                                 \
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;                                        \
-    /* D = alpha * acc with a runtime-strided alpha, so one instantiation      */                                    \
-    /* serves both the per-tensor scale and a per-token vector. SwapAB puts    */                                    \
-    /* the tokens on N, so the broadcast axis follows it.                      */                                    \
+    /* Runtime-strided alpha: one instantiation serves the per-tensor scale    */                                    \
+    /* and a per-token vector. SwapAB puts the tokens on N.                     */                                    \
     using FusionOperation = std::conditional_t<                                                                      \
         SWAP_AB_, cutlass::epilogue::fusion::PerColScaledAcc<OutElementType, float, float>,                          \
         cutlass::epilogue::fusion::PerRowScaledAcc<OutElementType, float, float>>;                                   \

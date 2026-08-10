@@ -136,8 +136,8 @@ void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tensor
   // k_packed stores 2 FP4 values per byte
   int64_t k = k_packed * 2;
 
-  // A globalScale with one entry per row of mat1 is a per-token dequant scale;
-  // a single entry is the usual per-tensor scale.
+  // One entry per row of mat1 is a per-token dequant scale; a single entry is
+  // the usual per-tensor scale.
   bool const per_token_alpha = globalScale.numel() != 1;
   TVM_FFI_ICHECK(!per_token_alpha || globalScale.numel() == m)
       << "globalScale must be a scalar tensor, or hold one scale per row of mat1 (" << m

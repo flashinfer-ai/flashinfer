@@ -58,7 +58,7 @@ def _compile_block_scaled_gemm(
     cluster_shape_k=1,
     cache_module_name=None,
     device_index=None,
-    per_token_alpha=False,
+    per_token_alpha=None,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -165,7 +165,7 @@ def _make_blockscaled_gemm_compile_fn(
     sf_k,
     batch_size,
     max_active_clusters,
-    per_token_alpha=False,
+    per_token_alpha=None,
 ):
     """Build a zero-arg closure that runs ``cute.compile`` for gemm."""
     import cutlass
@@ -207,18 +207,9 @@ def _make_blockscaled_gemm_compile_fn(
 
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
-        # Per-token alpha is one scale per token; binding it to the symbolic
-        # extent the tokens live on keeps a single compiled kernel across all
-        # of them. Callers that swap A and B put tokens on N ("n"), the rest
-        # on M (``True``/"m").
-        if per_token_alpha in (True, "m"):
-            alpha_extent = sym_m
-        elif per_token_alpha == "n":
-            alpha_extent = sym_n
-        elif not per_token_alpha:
-            alpha_extent = 1
-        else:
-            raise ValueError(f"unsupported per_token_alpha: {per_token_alpha!r}")
+        # Binding alpha to the symbolic extent the tokens live on keeps one
+        # compiled kernel across all token counts.
+        alpha_extent = {None: 1, "m": sym_m, "n": sym_n}[per_token_alpha]
         alpha_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (alpha_extent,), assumed_align=4
         )
@@ -413,10 +404,10 @@ def _run_mm_fp4_precompile_pool(payloads) -> None:
 
 
 def per_token_alpha_mode(per_token_alpha, swap_ab):
-    """Kernel mode the per-token alpha vector indexes, or ``None`` if scalar.
+    """Kernel extent the alpha vector indexes, or ``None`` for a scalar alpha.
 
-    The SM100 runner swaps A and B at the call site rather than inside the
-    kernel, so under ``swap_ab`` the caller's rows are the kernel's N extent.
+    The SM100 runner swaps A and B at the call site, so under ``swap_ab`` the
+    caller's rows are the kernel's N extent.
     """
     if not per_token_alpha:
         return None

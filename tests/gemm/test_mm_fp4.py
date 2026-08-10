@@ -270,9 +270,7 @@ def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
         b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
     )
 
-    # Distinct, non-monotonic-in-magnitude row scales: a kernel that indexes
-    # alpha with the wrong coordinate still lands on a plausible value, so the
-    # per-row values have to differ enough to be told apart.
+    # Row scales must differ enough that a wrong coordinate is visible.
     scalar_alpha = (1.0 / (g_in * g_w)).float().reshape(1)
     row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
     per_token_alpha = (scalar_alpha * row).contiguous()
@@ -312,9 +310,8 @@ def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
     assert cos_sim > 0.97
 
     # Both calls accumulate the same products, so the per-token result must be
-    # the scalar-alpha result scaled row by row, up to output-dtype rounding.
-    # This is what catches an epilogue that reads alpha at the wrong coordinate;
-    # cosine similarity alone stays high even then.
+    # the scalar-alpha result scaled row by row. Cosine similarity stays high
+    # even when the epilogue reads alpha at the wrong coordinate; this does not.
     torch.testing.assert_close(
         out.float(),
         out_scalar.float() * row[:, None],

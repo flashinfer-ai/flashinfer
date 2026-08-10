@@ -18,14 +18,10 @@
   \brief D = alpha * acc epilogue fusions where alpha may be a device scalar or
   one value per output row/column.
 
-  NVFP4 activations quantized with a dynamic per-token global scale need a
-  dequant alpha that varies per token. Both fusions below take the broadcast
-  stride as a runtime value (``bool`` mode), so one instantiation serves the
-  scalar and the per-token case: a zero stride reads ``alpha_ptr[0]`` for every
-  element, a unit stride reads one alpha per row (or column).
-
-  Use PerRowScaledAcc when tokens are the GEMM's M extent, and PerColScaledAcc
-  when the kernel swaps A and B so tokens land on N instead.
+  The broadcast stride is a runtime value, so one instantiation serves both: a
+  zero stride reads alpha_ptr[0] for every element, a unit stride reads one
+  alpha per row (or column). Use PerRowScaledAcc when tokens are the GEMM's M
+  extent, PerColScaledAcc when the kernel swaps A and B so tokens land on N.
 */
 
 #ifndef FLASHINFER_FP4_GEMM_PER_TOKEN_SCALE_H_

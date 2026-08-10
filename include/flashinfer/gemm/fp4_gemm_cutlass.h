@@ -45,10 +45,8 @@ class CutlassFp4GemmRunnerInterface {
 
   virtual ~CutlassFp4GemmRunnerInterface() {}
 
-  // per_token_alpha selects how global_sf is read: false is a single device
-  // scalar, true is one dequant scale per row of A (NVFP4 activations
-  // quantized with a dynamic per-token global scale). Only SM120/SM121
-  // implements the per-token form; other arches reject it.
+  // per_token_alpha selects how global_sf is read: false is a device scalar,
+  // true is one dequant scale per row of A. Only SM120/SM121 implements it.
   virtual void gemm(void* D, void const* A, void const* B, void const* input_sf,
                     void const* weight_sf, float const* global_sf, bool per_token_alpha, int m,
                     int n, int k, int batch_count, CutlassGemmConfig gemmConfig, char* workspace,
