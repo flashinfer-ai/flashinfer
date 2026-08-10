@@ -2,12 +2,21 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Host utility helpers shared across NVFP4 and MXFP8 runners."""
 
-from typing import Tuple
+import argparse
+import os
+import sys
+from typing import List, Optional, Tuple
 import torch
 
 from common.megamoe_constants import (
+    Fp8E5M2Max,
+    Fp8E4M3FNMax,
+    Nvfp4E2M1Max,
     Nvfp4BlockSize,
     Mxfp8BlockSize,
+    SfPaddingBlock,
+    TmaLeadingDimByteAlign,
+    Nvfp4E2M1RcpLimit,
     Fp8E4M3RcpLimit,
     Fp8E5M2RcpLimit,
 )
@@ -21,36 +30,55 @@ _Nvfp4ScaleDtype: torch.dtype = torch.float8_e4m3fn
 _Mxfp8DataDtype_e4m3: torch.dtype = torch.float8_e4m3fn
 _Mxfp8DataDtype_e5m2: torch.dtype = torch.float8_e5m2
 _Mxfp8ScaleDtype: torch.dtype = torch.float8_e8m0fnu
+_Fp8KindsE4M3 = ("mxfp8_e4m3", "fp8_e4m3")
+_Fp8KindsE5M2 = ("mxfp8_e5m2", "fp8_e5m2")
+_Fp8Kinds = _Fp8KindsE4M3 + _Fp8KindsE5M2
 
 # ---------------------------------------------------------------------------
 # kind_* helpers
 # ---------------------------------------------------------------------------
 
+def get_cutedsl_target_arch() -> str:
+    """Return the active cuTeDSL compilation target as an ``sm_XX`` string."""
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    return f"sm_{arch.major}{arch.minor}"
+
 
 def kind_data_dtype(kind: str) -> torch.dtype:
     if kind == "nvfp4":
         return _Nvfp4DataDtype
-    if kind == "mxfp8_e4m3":
+    if kind in _Fp8KindsE4M3:
         return _Mxfp8DataDtype_e4m3
-    if kind == "mxfp8_e5m2":
+    if kind in _Fp8KindsE5M2:
         return _Mxfp8DataDtype_e5m2
+    if kind == "bf16":
+        return torch.bfloat16
     raise ValueError(f"Unknown kind: {kind!r}")
 
 
 def kind_scale_dtype(kind: str) -> torch.dtype:
-    return _Nvfp4ScaleDtype if kind == "nvfp4" else _Mxfp8ScaleDtype
+    if kind == "nvfp4":
+        return _Nvfp4ScaleDtype
+    if kind in _Fp8Kinds:
+        return _Mxfp8ScaleDtype
+    raise ValueError(f"Unknown kind: {kind!r}")
 
 
 def kind_sf_vec_size(kind: str) -> int:
-    return Nvfp4BlockSize if kind == "nvfp4" else Mxfp8BlockSize
+    if kind == "nvfp4":
+        return Nvfp4BlockSize
+    if kind in _Fp8Kinds:
+        return Mxfp8BlockSize
+    raise ValueError(f"Unknown kind: {kind!r}")
 
 
 # ---------------------------------------------------------------------------
 # Mxfp8 quantize function. May move function to mxfp8 folder later
 # ---------------------------------------------------------------------------
 
-
-def mxfp8_quantize_per_block_32(
+def mxfp8_quantize_per_block_32_row(
     c_fp32: torch.Tensor,
     data_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -61,9 +89,7 @@ def mxfp8_quantize_per_block_32(
             f"Trailing dim ({N}) must be a multiple of sf_vec_size ({Mxfp8BlockSize})."
         )
     n_blocks = N // Mxfp8BlockSize
-    data_max_rcp_limit = (
-        Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
-    )
+    data_max_rcp_limit = Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
     blocked = c_fp32.view(M, n_blocks, Mxfp8BlockSize)
     absmax = blocked.abs().amax(dim=-1)
     safe_absmax = torch.clamp(absmax, min=1e-30)
@@ -78,10 +104,41 @@ def mxfp8_quantize_per_block_32(
     return c_fp8, sfc_e8m0
 
 
+def mxfp8_quantize_per_block_32_col(
+    c_fp32: torch.Tensor,
+    data_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize along the leading dim with per-32 E8M0 col-block scales.
+
+    Mirrors :func:`mxfp8_quantize_per_block_32_row` but reduces down the M axis:
+    one scale covers a ``(Mxfp8BlockSize-row × 1-col)`` block, so the SF
+    tensor has shape ``(M // Mxfp8BlockSize, N)``.  The M axis must be a
+    multiple of ``Mxfp8BlockSize``.
+    """
+    M, N = c_fp32.shape
+    if M % Mxfp8BlockSize != 0:
+        raise ValueError(
+            f"Leading dim ({M}) must be a multiple of sf_vec_size ({Mxfp8BlockSize})."
+        )
+    m_blocks = M // Mxfp8BlockSize
+    data_max_rcp_limit = Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
+    blocked = c_fp32.view(m_blocks, Mxfp8BlockSize, N)
+    absmax = blocked.abs().amax(dim=1)  # (m_blocks, N)
+    safe_absmax = torch.clamp(absmax, min=1e-30)
+    scale_exp = torch.ceil(torch.log2(safe_absmax * data_max_rcp_limit))
+    e_uint8 = torch.clamp(scale_exp + 127.0, min=0.0, max=254.0).to(torch.int32)
+    e_uint8 = torch.where(absmax == 0, torch.zeros_like(e_uint8), e_uint8)
+    sfc_e8m0 = e_uint8.to(torch.uint8).view(_Mxfp8ScaleDtype)
+    scale_fp32 = torch.pow(2.0, e_uint8.float() - 127.0)
+    scale_expanded = scale_fp32.unsqueeze(1).expand_as(blocked).reshape(M, N)
+    scaled = c_fp32 / scale_expanded
+    c_fp8 = scaled.to(data_dtype)
+    return c_fp8, sfc_e8m0
+
+
 # ---------------------------------------------------------------------------
 # referench check helper
 # ---------------------------------------------------------------------------
-
 
 def compare_and_report_mismatches(
     gpu_tensor,
@@ -93,7 +150,6 @@ def compare_and_report_mismatches(
     print_first_8=False,
 ):
     import torch as _torch  # host-only helper, keep out of module-level imports
-
     """
     Compare two tensors and report the first N mismatched elements.
 
@@ -128,7 +184,7 @@ def compare_and_report_mismatches(
             f"{'Index':<6} {'Coordinate':<30} {'GPU Data':<20} {'CPU Data':<20} {'Abs Error':<20}"
         )
         print("-" * 100)
-        print("\n")
+        print(f"\n")
 
         flat_gpu = gpu_data.flatten()
         flat_ref = ref_data.flatten()

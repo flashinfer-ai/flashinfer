@@ -26,7 +26,18 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
-(none)
+- `src/src/inputs_process.py` and `src/common/host_utils.py` are synced
+  **ahead** of the recorded drop, to upstream commit
+  `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
+  (<https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/tree/50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab>),
+  taken 2026-08-10: the kernel team's fix for the fused activation-quant
+  staging breaking on CuTe-DSL 4.7 (mxfp8 path reworked so each lane owns one
+  contiguous 16-byte fp8 store, lane pairs reduce the 32-element block amax
+  via shuffle; plus a hidden-size row-alignment guard in `__init__`).
+  `host_utils.py` rides along because the file's self-test harness imports
+  its `mxfp8_quantize_per_block_32_row` reference quantizer (additive change,
+  no dependents beyond the harness). Resolves at the next full re-sync once
+  the tree moves past that commit.
 
 ## Related trees
 
