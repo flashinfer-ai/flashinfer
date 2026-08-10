@@ -15,7 +15,7 @@ from ......core.validation.common import (
     validate_mega_forward_inputs,
 )
 from ......weights import MoEWeightPack
-from .config import Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig
+from .config import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 from .staging import stage_mega_moe_inputs
 from .weights import (
     TransformedMegaWeights,
@@ -28,16 +28,16 @@ if TYPE_CHECKING:
 
 
 @register_mega_kernel(
-    "sm100_fp8_nvfp4_bf16_deepgemm", deprecated_aliases=("deep_gemm_mega",)
+    "sm100_fp8_fp4_bf16_deepgemm", deprecated_aliases=("deep_gemm_mega",)
 )
 class DeepGemmMegaKernelBackend(MegaKernelBackend):
-    def __init__(self, config: Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig) -> None:
+    def __init__(self, config: Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig) -> None:
         super().__init__(config)
-        self._kernel_config: Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig = config
+        self._kernel_config: Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig = config
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm100_fp8_nvfp4_bf16_deepgemm"
+        return "sm100_fp8_fp4_bf16_deepgemm"
 
     def validate_init(
         self,
@@ -163,7 +163,7 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         fp = fleet_params
         return (
-            "sm100_fp8_nvfp4_bf16_deepgemm",
+            "sm100_fp8_fp4_bf16_deepgemm",
             torch.cuda.current_device(),
             id(self.ep_comm_group),
             fp.num_experts,

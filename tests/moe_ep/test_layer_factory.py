@@ -75,15 +75,15 @@ def _fake_deep_gemm_transformed(
 
 
 def _mega_config(*, preprocess_weights: bool = False):
-    from flashinfer.moe_ep import Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig, MegaConfig
+    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, MegaConfig
 
     if preprocess_weights:
         return MegaConfig(
-            megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+            megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
             preprocess_weights=True,
         )
     return MegaConfig(
-        megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+        megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
         preprocess_weights=False,
         transformed_weights=_fake_deep_gemm_transformed(),
     )
@@ -154,7 +154,7 @@ def test_factory_returns_mega_for_mega_config(dist_not_initialized):
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpMegaLayer
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -177,7 +177,7 @@ def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
 
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         pytest.warns(UserWarning, match="fleet_knobs are ignored"),
     ):
@@ -277,14 +277,14 @@ def test_split_layer_init_rejects_process_group_without_dist():
 
 
 def test_factory_rejects_raw_mega_kernel_config():
-    from flashinfer.moe_ep import BootstrapConfig, Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig, MoEEpLayer
+    from flashinfer.moe_ep import BootstrapConfig, Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, MoEEpLayer
 
     with pytest.raises(TypeError, match="MegaConfig"):
         MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=_split_fleet_params(),
             weights=_split_weights(),
-            backend=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+            backend=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
         )
 
 

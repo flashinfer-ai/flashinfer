@@ -38,8 +38,8 @@ from .algo_knobs import (
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
 )
-from .backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm import (
-    Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+from .backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm import (
+    Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
     preprocess_mega_weights,
 )
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
@@ -59,7 +59,7 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
 # These WILL BE REMOVED in a future release, together with the matching
 # deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
 # "mxfp8_cutedsl", "sm90_pull_fp8" — see core/kernel/registry.py).
-DeepGemmMegaMoeConfig = Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig
+DeepGemmMegaMoeConfig = Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
@@ -130,7 +130,7 @@ __all__ = [
     "BootstrapConfig",
     "CombineInputParams",
     "CombineOutput",
-    "Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig",
+    "Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig",
     "DeepGemmMegaMoeConfig",
     "Mxfp8CutedslMegaMoeConfig",
     "Nvfp4CutedslMegaMoeConfig",

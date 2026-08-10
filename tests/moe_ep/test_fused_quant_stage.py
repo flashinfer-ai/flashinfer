@@ -180,7 +180,7 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     _require_blackwell()
     pytest.importorskip("deep_gemm")
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 

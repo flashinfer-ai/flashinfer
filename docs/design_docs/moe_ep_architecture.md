@@ -23,7 +23,7 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_nvfp4_bf16_deepgemm}
+  backends/mega/kernel/sm100/{nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/fp8_fp8_bf16_pull_cutedsl
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_nvfp4_swapab, moe_mxfp8_glu, src)
@@ -111,7 +111,7 @@ classDiagram
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
 | Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; bf16 + NVFP4; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
-| Mega kernel | `sm100_fp8_nvfp4_bf16_deepgemm` | `Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
+| Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
 
@@ -154,7 +154,7 @@ Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe
 from flashinfer.moe_ep import (
     MoEEpLayer, BootstrapConfig, FleetParams, MoEEpTensors,
     MoEWeightPack, SplitConfig, NcclEpConfig, FusedMoeKernelConfig,
-    MegaConfig, Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+    MegaConfig, Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
 )
 
 # Split: NCCL-EP + fused MoE
@@ -170,7 +170,7 @@ out = layer.forward(MoEEpTensors(hidden_states=..., topk_ids=..., topk_weights=.
 
 # Mega: wrap megakernel config in MegaConfig
 layer = MoEEpLayer(..., backend=MegaConfig(
-    megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=1024, top_k=4)))
+    megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=1024, top_k=4)))
 out = layer.forward(MoEEpTensors(...))
 layer.destroy()
 ```

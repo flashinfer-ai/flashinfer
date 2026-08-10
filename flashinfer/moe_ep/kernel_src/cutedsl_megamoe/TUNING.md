@@ -22,7 +22,7 @@ runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
 Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
 CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
 every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
-top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens;
+top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens;
 CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
@@ -58,7 +58,7 @@ session, and node as the table above; CSVs
 generated tables in that repo's `model_shapes/RESULTS.md`).  Pattern holds
 everywhere: dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens (1.6-1.9x on 7168-hidden shapes).  `e2e_pipelined` p50 µs, speedup
-vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens.
+vs `sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 **deepseek_v3** — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the table above; matches within run noise):
@@ -131,7 +131,7 @@ distributions fare better — see the e2e GSM8K numbers below):
 
 | variant                | acc loss |
 |------------------------|---------:|
-| sm100_fp8_nvfp4_bf16_deepgemm         | 20.6%    |
+| sm100_fp8_fp4_bf16_deepgemm         | 20.6%    |
 | nvfp4 (bf16 wire)      | 23.2%    |
 | nvfp4 `+ikr`           | 23.2%    |
 | nvfp4 `+combine_mxfp8` | 23.3%    |
@@ -189,7 +189,7 @@ runs used a faster-but-wrong load pattern and produced incorrect results
 Caught by the torch-oracle tests
 (`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`); fixed in
 `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/weights.py` (K-major transpose views).
-`sm100_fp8_nvfp4_bf16_deepgemm` / `sm100_mxfp8_mxfp8_bf16_cutedsl` numbers were unaffected.  The corrected
+`sm100_fp8_fp4_bf16_deepgemm` / `sm100_mxfp8_mxfp8_bf16_cutedsl` numbers were unaffected.  The corrected
 2026-07-15 full sweep reproduces at the 2026-07-21 branch tip within run
 noise (<= ~4% per cell); the tables above are the current reference.
 
@@ -621,7 +621,7 @@ activations quantized at staging; random (uneven) routing from
   prestaged once outside the loop, so per-forward activation
   quantize/staging is NOT included (for any backend).
 Reported number = rank-0 median of the 50 iters (p50); min/max in the
-CSVs.  `sm100_fp8_nvfp4_bf16_deepgemm` has no thunk API, so its "kernel" number loops
+CSVs.  `sm100_fp8_fp4_bf16_deepgemm` has no thunk API, so its "kernel" number loops
 `compute()` (includes its thin FI wrapper).
 
 ### Runbook (rerun the sweep)
@@ -645,7 +645,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
       export MEGA_TIMING=$MODE
-      MEGA_LIST="sm100_fp8_nvfp4_bf16_deepgemm sm100_nvfp4_nvfp4_bf16_cutedsl" \
+      MEGA_LIST="sm100_fp8_fp4_bf16_deepgemm sm100_nvfp4_nvfp4_bf16_cutedsl" \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # baseline
       MEGA_LIST=sm100_nvfp4_nvfp4_bf16_cutedsl MEGA_IKR=1 \
         bash '"$ROOT"'/moe_ep_benchmark/run_sweep.sh              # +ikr

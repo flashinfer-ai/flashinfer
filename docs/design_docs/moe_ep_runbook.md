@@ -235,7 +235,7 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `sm100_fp8_nvfp4_bf16_deepgemm` | — |
+| `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
 | `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
 | `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
 | `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
@@ -269,7 +269,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens:
+knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -288,7 +288,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`sm100_fp8_nvfp4_bf16_deepgemm` in parens.
+`sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -363,7 +363,7 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_nvfp4_bf16_deepgemm` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_fp4_bf16_deepgemm` |
 | fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash
@@ -457,7 +457,7 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `sm100_fp8_nvfp4_bf16_deepgemm` | — |
+| `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
 | `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
 | `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
 | `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
@@ -491,7 +491,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `sm100_fp8_nvfp4_bf16_deepgemm` in parens:
+knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -510,7 +510,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`sm100_fp8_nvfp4_bf16_deepgemm` in parens.
+`sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -585,7 +585,7 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_nvfp4_bf16_deepgemm` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_fp4_bf16_deepgemm` |
 | fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash

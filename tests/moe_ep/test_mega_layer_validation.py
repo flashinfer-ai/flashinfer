@@ -36,7 +36,7 @@ def _mega_layer(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -44,7 +44,7 @@ def _mega_layer(
     )
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         if transformed_weights is None:
             transformed_weights = _fake_deep_gemm_transformed()
@@ -60,7 +60,7 @@ def _mega_layer(
                 w2=torch.zeros(1, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 quantize_input=quantize_input,
                 preprocess_weights=preprocess_weights,
                 transformed_weights=transformed_weights,
@@ -82,7 +82,7 @@ def _fake_symm_buffer(*, max_tokens: int = 64, hidden: int = 128, top_k: int = 2
 def test_mega_layer_requires_weights():
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -97,7 +97,7 @@ def test_mega_layer_requires_weights():
                 token_hidden_size=128,
             ),
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
         )
@@ -310,7 +310,7 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpConfigError,
@@ -320,7 +320,7 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
 
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         pytest.raises(MoEEpConfigError, match="num_experts // world_size"),
     ):
@@ -336,7 +336,7 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
                 w2=torch.zeros(4, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 preprocess_weights=True,
             ),
         )
@@ -349,7 +349,7 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -357,7 +357,7 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
     )
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False),
@@ -371,7 +371,7 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
                 w2=torch.zeros(4, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 preprocess_weights=False,
                 transformed_weights=_fake_deep_gemm_transformed(num_experts=2),
             ),
@@ -417,15 +417,15 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
         pytest.skip("needs torch.float8_e4m3fn")
 
     from flashinfer.moe_ep import MoEEpTensors
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.config import (
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.config import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
     )
 
     backend = DeepGemmMegaKernelBackend(
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     num_tokens = 4
     hidden = 128
@@ -486,7 +486,7 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
             f"deep_gemm transform requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.weights import (
         preprocess_mega_weights,
         validate_transformed_mega_weights,
     )
@@ -522,7 +522,7 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -535,7 +535,7 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
     )
     ref = weakref.ref(pack)
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -546,7 +546,7 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
             ),
             weights=pack,
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 preprocess_weights=False,
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
@@ -567,7 +567,7 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -582,10 +582,10 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
     sentinel = _fake_deep_gemm_transformed()
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_nvfp4_bf16_deepgemm.backend."
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend."
             "DeepGemmMegaKernelBackend.preprocess_weights",
             return_value=sentinel,
         ),
@@ -599,7 +599,7 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
             ),
             weights=pack,
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2),
                 preprocess_weights=True,
             ),
         )

@@ -136,7 +136,7 @@ def validate_transformed_mega_weights(
             )
         if weight.dtype != torch.int8:
             raise MoEEpConfigError(
-                f"transformed_weights {label} weight must be torch.int8 (NVFP4), "
+                f"transformed_weights {label} weight must be torch.int8 (FP4), "
                 f"got {weight.dtype}"
             )
         if weight.shape != expected_shape:

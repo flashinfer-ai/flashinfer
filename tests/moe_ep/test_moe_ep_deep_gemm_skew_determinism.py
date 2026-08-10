@@ -38,7 +38,7 @@ _SKEW_CYCLES = 200_000_000  # ~100 ms at ~2 GHz — grossly exceeds engine skew
 def _build_layer(rank: int, world_size: int):
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpLayer,
@@ -58,7 +58,7 @@ def _build_layer(rank: int, world_size: int):
         ),
         weights=problem["weights"],
         backend=MegaConfig(
-            megakernel=Sm100_Fp8_Nvfp4_Bf16_Deepgemm_MegaMoeConfig(
+            megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],
