@@ -267,12 +267,14 @@ _BATCH_CASES = [
 
 
 def test_packed_kda_cute_tile_selection_cpu():
-    assert _select_tile_v(1) == 8
-    assert _select_tile_v(25) == 8
-    assert _select_tile_v(26) == 16
-    assert _select_tile_v(31) == 16
-    assert _select_tile_v(32) == 16
-    assert _select_tile_v(512) == 16
+    assert _select_tile_v(1) == 16
+    assert _select_tile_v(11) == 16
+    assert _select_tile_v(12) == 8
+    assert _select_tile_v(23) == 8
+    assert _select_tile_v(24) == 64
+    assert _select_tile_v(37) == 64
+    assert _select_tile_v(38) == 128
+    assert _select_tile_v(512) == 128
 
 
 @pytest.mark.arch_blackwell

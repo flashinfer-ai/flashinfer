@@ -263,7 +263,10 @@ def main():
     print(f"{'mode':<10} {'B':>5} {'tile':>6} {'median_us':>12} {'logical_TB/s':>14}")
     for ordinal, batch in enumerate(args.batch_size):
         case = _make_case(batch, device, args.seed + ordinal)
-        tile_v = args.tile_v or _select_tile_v(batch)
+        # tile_v=None lets the per-batch policy pick the kernel shape;
+        # _select_tile_v is what it will choose (display only).
+        tile_v = args.tile_v
+        display_tile = tile_v or _select_tile_v(batch)
         output_error, state_error = _check(case, tile_v)
         for mode in modes:
             run = (
@@ -284,7 +287,7 @@ def main():
             row = {
                 "mode": mode,
                 "batch_size": batch,
-                "tile_v": tile_v,
+                "tile_v": display_tile,
                 "median_us": median_ms * 1000.0,
                 "logical_tb_per_second": logical_tbps,
                 "output_max_abs": output_error,
@@ -293,7 +296,7 @@ def main():
             }
             rows.append(row)
             print(
-                f"{mode:<10} {batch:>5} {tile_v:>6} "
+                f"{mode:<10} {batch:>5} {display_tile:>6} "
                 f"{row['median_us']:>12.4f} {logical_tbps:>14.4f}"
             )
         torch.cuda.empty_cache()
