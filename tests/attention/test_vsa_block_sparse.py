@@ -49,7 +49,7 @@ pytestmark = [
     pytest.mark.skipif(
         not _HAS_QUACK,
         reason="VSA SM100 backend requires the quack package "
-        "(pip install git+https://github.com/Dao-AILab/quack.git)",
+        "(pip install quack-kernels==0.6.4)",
     ),
 ]
 
@@ -813,6 +813,7 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100
 @pytest.mark.skipif(
     not os.environ.get("FLASHINFER_TEST_PERF"),
     reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
