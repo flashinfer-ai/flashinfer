@@ -79,6 +79,22 @@ def _required_environment(name: str) -> str:
     return value
 
 
+def _effective_build_environment() -> dict[str, str]:
+    """Return the exact canonical environment passed to ``setup.py``."""
+
+    environment = dict(os.environ)
+    environment["FLASH_KDA_CUDA_ARCHS"] = "auto"
+    environment.setdefault("NVCC_THREADS", "32")
+    nvcc_threads = environment["NVCC_THREADS"]
+    if not nvcc_threads.isdigit() or int(nvcc_threads) <= 0:
+        raise RuntimeError("NVCC_THREADS must be a positive integer")
+    for key in ("NVCC_PREPEND_FLAGS", "TORCH_CUDA_ARCH_LIST"):
+        if environment.get(key):
+            raise RuntimeError(f"Phase-A FlashKDA build forbids ambient {key}")
+        environment.pop(key, None)
+    return environment
+
+
 def _validate_only_payload(manifest_path: Path | None) -> dict:
     if manifest_path is None:
         return {
@@ -146,7 +162,13 @@ def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
         "--inplace",
         "--force",
     ]
-    subprocess.run(build_command, cwd=source_dir, check=True)
+    build_environment = _effective_build_environment()
+    subprocess.run(
+        build_command,
+        cwd=source_dir,
+        env=build_environment,
+        check=True,
+    )
     after_build = verify_flash_kda_checkout(source_dir=source_dir)
     if after_build != source:
         raise RuntimeError("FlashKDA source identity changed during build")
@@ -185,14 +207,7 @@ def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
             "command": build_command,
             "cwd": str(source_dir),
             "environment": {
-                key: (
-                    os.environ.get(key, "auto")
-                    if key == "FLASH_KDA_CUDA_ARCHS"
-                    else os.environ.get(key, "32")
-                    if key == "NVCC_THREADS"
-                    else os.environ.get(key)
-                )
-                for key in _RECORDED_BUILD_ENVIRONMENT
+                key: build_environment.get(key) for key in _RECORDED_BUILD_ENVIRONMENT
             },
         },
         "toolchain": {

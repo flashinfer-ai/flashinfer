@@ -392,11 +392,22 @@ class Const:
         * ``""`` — omit this axis from the file name entirely.
         * Any other string — use that as the prefix, e.g. ``"h"`` produces
           ``h32`` for ``num_qo_heads=32``.
+    value:
+        Optional fixed integer value. When provided, tracing resolves this
+        axis without requiring a tensor or scalar argument to carry it.
     """
 
-    def __init__(self, description: str = "", abbrev: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        description: str = "",
+        abbrev: Optional[str] = None,
+        value: Optional[int] = None,
+    ) -> None:
+        if value is not None and type(value) is not int:
+            raise TypeError("Const value must be an integer or None")
         self.description = description
         self.abbrev = abbrev
+        self.value = value
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +593,7 @@ class TraceTemplate:
         For each axis, pick a source that is *always present* in a generated
         trace sample, in priority order:
 
+          0. an explicit ``Const(value=...)``;
           1. a required (non-optional) ``Tensor`` whose ``dim_names`` include
              the axis — read ``shape[dim_idx]``;
           2. a ``Scalar`` input named after the axis — read the kwarg value;
@@ -637,8 +649,16 @@ class TraceTemplate:
             return None
 
         for axis_name in self.axes:
+            marker = self.axes[axis_name]
+            # 0. Explicitly fixed Const, independent of runtime arguments.
+            if isinstance(marker, Const) and marker.value is not None:
+                fixed_value = marker.value
+                extractor = lambda _kwargs, value=fixed_value: value
+            else:
+                extractor = None
             # 1. Required tensor whose shape carries the axis.
-            extractor = _tensor_source(axis_name, allow_optional=False)
+            if extractor is None:
+                extractor = _tensor_source(axis_name, allow_optional=False)
             # 2. Scalar input named after the axis (always present).
             if extractor is None:
                 scalar_desc = self.inputs.get(axis_name)

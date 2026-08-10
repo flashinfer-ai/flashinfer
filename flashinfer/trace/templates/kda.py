@@ -92,10 +92,11 @@ packed_kda_decode_trace = TraceTemplate(
     ),
     axes={
         "batch_size": Var(description="Number of one-token decode rows."),
-        # The public output is rank four, while no required input carries its
-        # fixed singleton axis. Keep it sweepable in the schema and constrain
-        # it to one; a caller-owned output resolves it directly when present.
-        "singleton": Var(description="Single-token output dimension."),
+        # The public output is rank four, but its optional caller-owned buffer
+        # is the only tensor that carries this dimension.
+        "singleton": Const(
+            description="Fixed single-token output dimension.", abbrev="", value=1
+        ),
         "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
         "head_dim": Const(description="KDA head dimension.", abbrev="d"),
         "mixed_width": Const(description="Width of the packed QKV row.", abbrev=""),

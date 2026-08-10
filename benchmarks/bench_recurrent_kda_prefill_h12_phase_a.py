@@ -251,7 +251,7 @@ def _hardware_metadata(stack: SimpleNamespace) -> dict:
         "total_memory_bytes": properties.total_memory,
         "l2_cache_bytes": stack.get_l2_cache_size(device),
         "torch_version": torch.__version__,
-        "torch_cuda_version": torch.version.cuda,
+        "torch_cuda_version": str(torch.version.cuda),
     }
 
 

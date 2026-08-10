@@ -35,6 +35,14 @@ evidence = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = evidence
 SPEC.loader.exec_module(evidence)
 
+BUILD_HELPER_SPEC = importlib.util.spec_from_file_location(
+    "build_flash_kda_phase_a",
+    BENCHMARKS_DIR / "build_flash_kda_phase_a.py",
+)
+assert BUILD_HELPER_SPEC is not None and BUILD_HELPER_SPEC.loader is not None
+build_helper = importlib.util.module_from_spec(BUILD_HELPER_SPEC)
+BUILD_HELPER_SPEC.loader.exec_module(build_helper)
+
 
 def _preset_path() -> Path:
     return BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12_phase_a.json"
@@ -335,6 +343,26 @@ def test_flash_kda_manifest_schema_validate_only_is_cpu_safe(tmp_path):
         match="allocation slurm_job_id",
     ):
         evidence.validate_flash_kda_build_manifest_schema(payload)
+
+
+def test_flash_kda_build_helper_applies_recorded_defaults(monkeypatch):
+    for key in build_helper._RECORDED_BUILD_ENVIRONMENT:
+        monkeypatch.delenv(key, raising=False)
+
+    environment = build_helper._effective_build_environment()
+
+    assert environment["FLASH_KDA_CUDA_ARCHS"] == "auto"
+    assert environment["NVCC_THREADS"] == "32"
+    assert environment.get("NVCC_PREPEND_FLAGS") is None
+    assert environment.get("TORCH_CUDA_ARCH_LIST") is None
+
+
+@pytest.mark.parametrize("key", ["NVCC_PREPEND_FLAGS", "TORCH_CUDA_ARCH_LIST"])
+def test_flash_kda_build_helper_rejects_forbidden_ambient_flags(monkeypatch, key):
+    monkeypatch.setenv(key, "forbidden")
+
+    with pytest.raises(RuntimeError, match=key):
+        build_helper._effective_build_environment()
 
 
 @pytest.mark.parametrize(

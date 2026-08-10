@@ -53,7 +53,6 @@ PRODUCTION_STATE_PADDING = 256
 DEFAULT_BATCHES = (1, 8, 16, 31, 32, 64, 128, 256, 512)
 SUPPORTED_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 DATA_SEED = 20260805
-TYPED_SOURCE_SHA256 = "24edeaf9676b12ec3301ff413080194282be0b35e604f785dffba41c0c48640e"
 FROZEN_BODY_SHA256 = {
     "tile8": "d0de8869242d09bf0c1c4840a7fd73dcd32835050cdc08db58b19a2c7506d0da",
     "tile16": "d8a446e42da47e2d8cd05139c77efe9c970f2d36394b68b49649beb6bc2bbfbe",
@@ -497,7 +496,6 @@ def main():
         "benchmark": "flashinfer_packed_kda_decode_t1",
         "hardware": hardware,
         "source_sha": source_sha,
-        "typed_source_sha256": TYPED_SOURCE_SHA256,
         "frozen_body_sha256": actual_frozen_body_sha256,
         "jit_binaries": jit_binaries,
         "cupti_python_version": cupti_python_version,
