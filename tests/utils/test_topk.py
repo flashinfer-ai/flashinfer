@@ -3042,10 +3042,12 @@ def test_top_k_cub_varlen(seq_len, dtype):
     lengths = torch.randint(
         1, seq_len + 1, (num_rows,), dtype=torch.int32, device="cuda"
     )
-    # Force some short rows (lengths < k) to exercise the -1 padding.
+    # Force some short rows (lengths < k) to exercise the -1 padding, and one
+    # empty row (lengths == 0 is a valid empty segment: all indices come back -1).
     lengths[::3] = torch.randint(
         1, k, (len(lengths[::3]),), dtype=torch.int32, device="cuda"
     )
+    lengths[1] = 0
 
     values, indices = flashinfer.top_k_cub(scores, k, lengths)
     assert indices.dtype == torch.int32 and values.dtype == dtype

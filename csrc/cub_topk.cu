@@ -29,6 +29,7 @@
 #include <cub/device/device_batched_topk.cuh>
 #include <cuda/argument>
 #include <cuda/iterator>
+#include <cuda/std/limits>
 
 #include "tvm_ffi_utils.h"
 
@@ -124,9 +125,16 @@ cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, int32_t* o
     // ceiling, failing single-CTA eligibility and forcing the wide multi-CTA path for every
     // segment. Passing max_len as the runtime ceiling restores the same launch shape as the
     // uniform path.
+    // The lower bound spans the full int32 range so no lengths value can violate the bounds
+    // contract (out-of-bounds values are UB): under a negative statically-known lower bound,
+    // CUB clamps any negative runtime size to an empty segment (size 0), and a zero-length row
+    // is a valid empty segment — CUB selects nothing for it, so with the caller's -1 prefill
+    // the whole output row reads as padding. The lower bound plays no role in launch sizing
+    // (only the upper bound does), so this costs nothing.
+    constexpr int32_t kLengthsFloor = cuda::std::numeric_limits<int32_t>::min();
     return run_with(cuda::args::deferred_sequence{
-        lengths, cuda::args::bounds<int32_t{1}, int32_t{MAX_LEN_BOUND}>(),
-        cuda::args::bounds(int32_t{1}, static_cast<int32_t>(max_len))});
+        lengths, cuda::args::bounds<kLengthsFloor, int32_t{MAX_LEN_BOUND}>(),
+        cuda::args::bounds(kLengthsFloor, static_cast<int32_t>(max_len))});
   }
   return run_with(cuda::args::immediate{max_len, cuda::args::bounds<int64_t{1}, MAX_LEN_BOUND>()});
 }
@@ -240,6 +248,12 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
   CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
   CHECK_DIM(2, output_values);   // output_values: (batch_size, top_k)
   CHECK_INPUT_TYPE(output_indices, dl_int32);
+  TVM_FFI_ICHECK(output_values.dtype() == input.dtype())
+      << "cub_topk output_values dtype must match input dtype";
+  TVM_FFI_ICHECK(output_indices.size(0) == input.size(0) && output_indices.size(1) == top_k)
+      << "cub_topk output_indices must have shape (batch_size, top_k) = (" << input.size(0) << ", "
+      << top_k << "), got (" << output_indices.size(0) << ", " << output_indices.size(1) << ")";
+  CHECK_SHAPE(output_values, output_indices);
 
   const int64_t num_rows = input.size(0);
   const int64_t max_len = input.size(1);
@@ -250,7 +264,7 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
-  cudaError_t status;
+  cudaError_t status = cudaErrorInvalidValue;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     auto* input_ptr = static_cast<c_type*>(input.data_ptr());
     auto* indices_ptr = static_cast<int32_t*>(output_indices.data_ptr());
@@ -283,7 +297,7 @@ int64_t cub_topk_workspace_size(TensorView input, Optional<TensorView> maybe_len
 
   Optional<TensorView> no_workspace;
   size_t workspace_bytes = 0;
-  cudaError_t status;
+  cudaError_t status = cudaErrorInvalidValue;
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
     // The size query only inspects types and bounds; output pointers are never dereferenced.
     status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),

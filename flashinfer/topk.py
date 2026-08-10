@@ -606,6 +606,10 @@ def top_k(
         Tie-breaking controls which boundary elements are selected; it does not
         imply deterministic output ordering. Set ``deterministic=True`` when
         repeatable output ordering is also required.
+    dsa_graph_safe : bool, optional
+        If True, force FilteredTopK path and graph-safe vectorization (VEC_SIZE=1).
+        Default is False.
+
     Returns
     -------
     values : torch.Tensor
