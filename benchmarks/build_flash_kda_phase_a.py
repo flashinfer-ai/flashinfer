@@ -37,6 +37,18 @@ from kda_h12_evidence import (
 )
 
 
+_RECORDED_BUILD_ENVIRONMENT = (
+    "CC",
+    "CXX",
+    "CUDA_HOME",
+    "FLASH_KDA_CUDA_ARCHS",
+    "MAX_JOBS",
+    "NVCC_PREPEND_FLAGS",
+    "NVCC_THREADS",
+    "TORCH_CUDA_ARCH_LIST",
+)
+
+
 def _command_version(executable: str, *args: str) -> str:
     completed = subprocess.run(
         [executable, *args],
@@ -79,6 +91,9 @@ def _validate_only_payload(manifest_path: Path | None) -> dict:
                 "--inplace",
                 "--force",
             ],
+            "effective_flash_kda_cuda_archs": "auto",
+            "effective_nvcc_threads_default": "32",
+            "recorded_build_environment": list(_RECORDED_BUILD_ENVIRONMENT),
             "requires_slurm_gpu_allocation": True,
             "supported_architectures": sorted(SUPPORTED_ARCHITECTURES.values()),
         }
@@ -170,15 +185,14 @@ def _build_manifest(*, source_dir: Path, manifest_path: Path) -> dict:
             "command": build_command,
             "cwd": str(source_dir),
             "environment": {
-                key: os.environ.get(key)
-                for key in (
-                    "CC",
-                    "CXX",
-                    "CUDA_HOME",
-                    "MAX_JOBS",
-                    "NVCC_PREPEND_FLAGS",
-                    "TORCH_CUDA_ARCH_LIST",
+                key: (
+                    os.environ.get(key, "auto")
+                    if key == "FLASH_KDA_CUDA_ARCHS"
+                    else os.environ.get(key, "32")
+                    if key == "NVCC_THREADS"
+                    else os.environ.get(key)
                 )
+                for key in _RECORDED_BUILD_ENVIRONMENT
             },
         },
         "toolchain": {

@@ -41,7 +41,7 @@ FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
 EVIDENCE_REPORT_SCHEMA_VERSION = 2
-FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 1
+FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 1
 FROZEN_PRESET_SHA256 = (
     "eef38e8697e2818822186f6c0537c34c1defa41e0b0e08ee272448103a3cf314"
@@ -390,6 +390,16 @@ _FLASH_KDA_BUILD_SOURCE_KEYS = {
     "worktree_clean_including_untracked",
 }
 _FLASH_KDA_BUILD_KEYS = {"command", "cwd", "environment"}
+_FLASH_KDA_BUILD_ENVIRONMENT_KEYS = {
+    "CC",
+    "CXX",
+    "CUDA_HOME",
+    "FLASH_KDA_CUDA_ARCHS",
+    "MAX_JOBS",
+    "NVCC_PREPEND_FLAGS",
+    "NVCC_THREADS",
+    "TORCH_CUDA_ARCH_LIST",
+}
 _FLASH_KDA_TOOLCHAIN_KEYS = {
     "python_executable",
     "python_version",
@@ -478,12 +488,34 @@ def validate_flash_kda_build_manifest_schema(payload: dict) -> dict:
         )
     if build["cwd"] != source_dir_value:
         raise EvidenceSchemaError("build manifest cwd must equal its source_dir")
-    if not isinstance(build["environment"], dict) or any(
-        not isinstance(key, str) or (value is not None and not isinstance(value, str))
-        for key, value in build["environment"].items()
+    if not isinstance(build["environment"], dict):
+        raise EvidenceSchemaError(
+            "build manifest environment must map strings to strings or null"
+        )
+    _require_exact_keys(
+        build["environment"],
+        _FLASH_KDA_BUILD_ENVIRONMENT_KEYS,
+        "build manifest environment",
+    )
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in build["environment"].values()
     ):
         raise EvidenceSchemaError(
             "build manifest environment must map strings to strings or null"
+        )
+    if build["environment"]["FLASH_KDA_CUDA_ARCHS"] != "auto":
+        raise EvidenceSchemaError(
+            "Phase-A FlashKDA build must use FLASH_KDA_CUDA_ARCHS=auto"
+        )
+    nvcc_threads = build["environment"]["NVCC_THREADS"]
+    if (
+        not isinstance(nvcc_threads, str)
+        or not nvcc_threads.isdigit()
+        or int(nvcc_threads) <= 0
+    ):
+        raise EvidenceSchemaError(
+            "Phase-A FlashKDA build NVCC_THREADS must be a positive integer"
         )
     toolchain = payload["toolchain"]
     for key in _FLASH_KDA_TOOLCHAIN_KEYS:

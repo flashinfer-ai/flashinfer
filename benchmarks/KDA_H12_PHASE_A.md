@@ -53,7 +53,8 @@ changes in either checkout are rejected. The Python package and extension must
 resolve inside that clean checkout and match a build manifest produced by
 `build_flash_kda_phase_a.py` in the same GPU allocation. The helper force-builds
 the extension and receipts the exact command, Python/C++/NVCC/CUDA/PyTorch
-toolchain, Slurm allocation, GPU architecture, source/CUTLASS pins, imported
+toolchain, the effective `FLASH_KDA_CUDA_ARCHS=auto` and `NVCC_THREADS` build
+settings, Slurm allocation, GPU architecture, source/CUTLASS pins, imported
 artifact paths, and package/extension SHA-256 hashes. An arbitrary or stale
 `.so` without that binding is rejected. The evidence runner additionally
 requires the manifest's Slurm job/cluster/partition/node, GPU UUID/architecture,

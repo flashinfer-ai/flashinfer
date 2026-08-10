@@ -130,7 +130,16 @@ def _build_manifest(tmp_path, source_dir, package_path, extension_path, arch="sm
                 "--force",
             ],
             "cwd": str(source_dir.resolve()),
-            "environment": {},
+            "environment": {
+                "CC": None,
+                "CXX": None,
+                "CUDA_HOME": None,
+                "FLASH_KDA_CUDA_ARCHS": "auto",
+                "MAX_JOBS": None,
+                "NVCC_PREPEND_FLAGS": None,
+                "NVCC_THREADS": "32",
+                "TORCH_CUDA_ARCH_LIST": None,
+            },
         },
         "toolchain": {
             "python_executable": "/venv/bin/python",
@@ -325,6 +334,27 @@ def test_flash_kda_manifest_schema_validate_only_is_cpu_safe(tmp_path):
         evidence.EvidenceSchemaError,
         match="allocation slurm_job_id",
     ):
+        evidence.validate_flash_kda_build_manifest_schema(payload)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("FLASH_KDA_CUDA_ARCHS", "all", "CUDA_ARCHS=auto"),
+        ("NVCC_THREADS", "0", "positive integer"),
+    ],
+)
+def test_flash_kda_manifest_rejects_noncanonical_build_environment(
+    tmp_path,
+    key,
+    value,
+    message,
+):
+    source_dir, package_path, extension_path, _ = _flash_kda_paths(tmp_path)
+    _, payload = _build_manifest(tmp_path, source_dir, package_path, extension_path)
+    payload["build"]["environment"][key] = value
+
+    with pytest.raises(evidence.EvidenceSchemaError, match=message):
         evidence.validate_flash_kda_build_manifest_schema(payload)
 
 
@@ -534,7 +564,7 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
     assert payload["fla_triton"]["required"] is True
     assert payload["flash_kda_build_manifest"] == {
         "required": True,
-        "schema_version": 1,
+        "schema_version": evidence.FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION,
         "helper": "benchmarks/build_flash_kda_phase_a.py",
         "requires_slurm_gpu_allocation": True,
         "requires_force_rebuild": True,
