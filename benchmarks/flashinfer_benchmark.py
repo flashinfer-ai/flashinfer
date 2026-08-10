@@ -55,6 +55,10 @@ def run_test(args):
         from routines.sampling import run_sampling_test
 
         res = run_sampling_test(args)
+    elif args.routine in benchmark_apis["topk_varlen"]:
+        from routines.topk_varlen import run_topk_varlen_test
+
+        res = run_topk_varlen_test(args)
     elif args.routine in benchmark_apis["rope"]:
         from routines.rope import run_rope_test
 
@@ -125,7 +129,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["rope"])
         + list(benchmark_apis["mamba"])
         + list(benchmark_apis["gdn"])
-        + list(benchmark_apis["sparse_attention"]),
+        + list(benchmark_apis["sparse_attention"])
+        + list(benchmark_apis["topk_varlen"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -270,6 +275,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.sampling import parse_sampling_args
 
         args = parse_sampling_args(line, parser)
+    elif args.routine in benchmark_apis["topk_varlen"]:
+        from routines.topk_varlen import parse_topk_varlen_args
+
+        args = parse_topk_varlen_args(line, parser)
     elif args.routine in benchmark_apis["rope"]:
         from routines.rope import parse_rope_args
 
