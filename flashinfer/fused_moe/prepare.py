@@ -218,8 +218,11 @@ def preprocess_moe_weights_for_sm90_mixed_gemm_humming(
         ``weight_out`` is the SM90 mixed-input weight layout and ``scale_out``
         is the folded scale layout.  With ``interleave=False``, they are the
         logical processed packed weight and logical offset scale.  ``residual``
-        is one FP32 value per expert and should be folded into the routed-token
-        activation scale together with Humming's fixed ``2^6`` compensation.
+        is one FP32 value per local expert.  For ``cutlass_fused_moe``, multiply
+        it by Humming's fixed ``2^6`` compensation and pass the resulting
+        ``[num_local_experts]`` tensor in quant-scale slot 1 (FC1) or 4 (FC2).
+        The runtime maps each routed row to its local expert and folds the
+        residual into that row's dynamic activation dequantization scale.
 
     Notes
     -----

@@ -436,9 +436,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          static_cast<int>(experts_per_token), base_activation_type,
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
-    int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             routed_tokens, quant_scales, base_activation_type);
+                                             quant_scales, base_activation_type);
     kernels::MoeMinLatencyParams min_latency_params{};
 
     // TODO: support lora in the future
@@ -628,9 +627,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          static_cast<int>(experts_per_token), base_activation_type,
                          parallelism_config, min_latency_mode, input.device(), workspace_buffer);
 
-    int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             routed_tokens, quant_scales, base_activation_type);
+                                             quant_scales, base_activation_type);
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -1100,7 +1098,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   kernels::QuantParams getQuantParams(
-      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size, int64_t routed_tokens,
+      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
       Optional<Array<Tensor>> quant_scales,
       ActivationType base_activation_type = ActivationType::Swiglu) const {
     if (isWMxfp8AMxfp8Quant()) {
@@ -1278,22 +1276,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "Expecting 5 quant scales for Humming-style MXFP4 x FP8 quantization";
 
       auto const fc1_weight_block = quant_scales.value()[0];
-      auto const fc1_token_scale = quant_scales.value()[1];
+      auto const fc1_expert_residual_scale = quant_scales.value()[1];
       auto const fc2_act_global = quant_scales.value()[2];
       auto const fc2_weight_block = quant_scales.value()[3];
-      auto const fc2_token_scale = quant_scales.value()[4];
+      auto const fc2_expert_residual_scale = quant_scales.value()[4];
 
-      CHECK_INPUT_TYPE(fc1_weight_block, dl_int32);
-      CHECK_INPUT_TYPE(fc1_token_scale, dl_float32);
-      CHECK_INPUT_TYPE(fc2_act_global, dl_float32);
-      CHECK_INPUT_TYPE(fc2_weight_block, dl_int32);
-      CHECK_INPUT_TYPE(fc2_token_scale, dl_float32);
+      CHECK_INPUT_AND_TYPE(fc1_weight_block, dl_int32);
+      CHECK_INPUT_AND_TYPE(fc1_expert_residual_scale, dl_float32);
+      CHECK_INPUT_AND_TYPE(fc2_act_global, dl_float32);
+      CHECK_INPUT_AND_TYPE(fc2_weight_block, dl_int32);
+      CHECK_INPUT_AND_TYPE(fc2_expert_residual_scale, dl_float32);
       CHECK_DIM(5, fc1_weight_block);
-      CHECK_DIM(1, fc1_token_scale);
+      CHECK_DIM(1, fc1_expert_residual_scale);
       TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1)
           << "fc2 act global must be a scalar or 1-D tensor";
       CHECK_DIM(5, fc2_weight_block);
-      CHECK_DIM(1, fc2_token_scale);
+      CHECK_DIM(1, fc2_expert_residual_scale);
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
       TVM_FFI_ICHECK(fc1_weight_block.size(0) == num_experts_on_rank &&
                      fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
@@ -1302,8 +1300,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc1 Humming-style folded weight scale must be "
              "(num_experts_on_rank, inter_size"
           << (fc1_n_mult == 2 ? " * 2" : "") << " / 64, hidden_size / 128, 16, 4)";
-      TVM_FFI_ICHECK_EQ(fc1_token_scale.size(0), routed_tokens)
-          << "fc1 token scale must have one element per routed token";
+      TVM_FFI_ICHECK_EQ(fc1_expert_residual_scale.size(0), num_experts_on_rank)
+          << "fc1 residual scale must have one element per local expert";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_weight_block.size(0) == num_experts_on_rank &&
@@ -1312,15 +1310,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                      fc2_weight_block.size(3) == 16 && fc2_weight_block.size(4) == 4)
           << "fc2 Humming-style folded weight scale must be "
              "(num_experts_on_rank, hidden_size / 64, inter_size / 128, 16, 4)";
-      TVM_FFI_ICHECK_EQ(fc2_token_scale.size(0), routed_tokens)
-          << "fc2 token scale must have one element per routed token";
+      TVM_FFI_ICHECK_EQ(fc2_expert_residual_scale.size(0), num_experts_on_rank)
+          << "fc2 residual scale must have one element per local expert";
 
       return kernels::QuantParams::FP8MXFP4(
           nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
-          static_cast<float const*>(fc1_token_scale.data_ptr()), nullptr,
+          static_cast<float const*>(fc1_expert_residual_scale.data_ptr()), nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-          static_cast<float const*>(fc2_token_scale.data_ptr()), false, false);
+          static_cast<float const*>(fc2_expert_residual_scale.data_ptr()), false, false);
     } else if (isWMxfp4AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())

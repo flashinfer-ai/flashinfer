@@ -2720,12 +2720,21 @@ def _make_humming_e8m0_weight_scale(
     low: int = 114,
     high: int = 128,
 ) -> torch.Tensor:
-    """Generate deterministic raw E8M0 scale bytes for Humming preprocessing."""
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    values = torch.arange(numel, device=device, dtype=torch.int32)
-    return (low + values.remainder(high - low)).to(torch.uint8).reshape(shape)
+    """Generate deterministic raw E8M0 scale bytes for Humming preprocessing.
+
+    Per-expert exponent offsets make the resulting residual scales distinct.
+    """
+    elements_per_expert = 1
+    for dim in shape[1:]:
+        elements_per_expert *= dim
+    values = torch.arange(
+        elements_per_expert, device=device, dtype=torch.int32
+    ).reshape((1, *shape[1:]))
+    expert_offsets = torch.arange(shape[0], device=device, dtype=torch.int32).remainder(
+        3
+    )
+    expert_offsets = expert_offsets.reshape((shape[0], *((1,) * (len(shape) - 1))))
+    return (low + values.remainder(high - low) + expert_offsets).to(torch.uint8)
 
 
 def _reference_humming_e8m0_weight_scale(
@@ -2828,6 +2837,21 @@ PHASE3_HUMMING_E2E_CASES = {
         "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 0,
         "description": "default small smoke, offset range 1..4",
+    },
+    "ep_rank1": {
+        "seed": 29,
+        "e": 2,
+        "m": 4,
+        "n": 512,
+        "k": 512,
+        "top_k": 2,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 0,
+        "ep_size": 2,
+        "ep_rank": 1,
+        "skip_autotune": True,
+        "description": "EP rank 1 maps global route IDs to local residual arrays",
     },
     "wide_offset": {
         "seed": 7,
@@ -3156,6 +3180,11 @@ def test_moe_bf16_mxfp4_hopper_activations(
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     case_name, case, use_autotune
 ):
+    if use_autotune and case.get("skip_autotune", False):
+        pytest.skip(
+            "autotune is covered by other Humming cases; "
+            "this case only checks EP expert mapping"
+        )
     torch.manual_seed(case["seed"])
     device = torch.device("cuda")
     e, m, n, k, top_k = (
@@ -3165,6 +3194,10 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         case["k"],
         case["top_k"],
     )
+    ep_size = case.get("ep_size", 1)
+    ep_rank = case.get("ep_rank", 0)
+    start_expert = e * ep_rank
+    end_expert = start_expert + e
     output_dtype = torch.bfloat16
 
     x_fp32 = torch.randn(m, k, dtype=torch.float32, device=device) * 0.05
@@ -3174,7 +3207,8 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
 
     # Humming-style preprocessing constrains the original E8M0 scale range and
     # stores only a small exponent offset for the pre-MMA FP4->E4M3 conversion.
-    # The residual is supplied through the GEMM epilogue routed-token scale.
+    # The per-expert residual is combined with each routed row's activation
+    # dequantization scale before that combined scale reaches the GEMM epilogue.
     raw_scale_low, raw_scale_high = case["raw_scale"]
     w1_raw_scale = _make_humming_e8m0_weight_scale(
         (e, 2 * n, k // 32), device, low=raw_scale_low, high=raw_scale_high
@@ -3182,6 +3216,9 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     w2_raw_scale = _make_humming_e8m0_weight_scale(
         (e, k, n // 32), device, low=raw_scale_low, high=raw_scale_high
     )
+    # Shift FC2 by one E8M0 exponent so its residual differs from FC1. This
+    # makes the end-to-end check fail if quant-scale slots 1 and 4 are swapped.
+    w2_raw_scale = (w2_raw_scale.to(torch.int16) + 1).to(torch.uint8)
     w1_processed, w1_exp_offset, w1_residual = (
         fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
             w1, w1_raw_scale, interleave=False
@@ -3213,6 +3250,9 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     torch.testing.assert_close(w2_exp_offset, w2_ref_offset)
     torch.testing.assert_close(w1_residual, w1_ref_residual)
     torch.testing.assert_close(w2_residual, w2_ref_residual)
+    # E8M0 stores only an exponent, so the uniform +1 applied to W2 above
+    # doubles its residual while leaving its relative folded offsets unchanged.
+    torch.testing.assert_close(w2_residual, w1_residual * 2.0)
     expected_max_offset = min(raw_scale_high - raw_scale_low, 12)
     assert 1 <= int(w1_exp_offset.min().item()) <= expected_max_offset
     assert 1 <= int(w2_exp_offset.min().item()) <= expected_max_offset
@@ -3252,35 +3292,34 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         torch.testing.assert_close(w2_residual, w2_api_residual)
 
     router_logits = torch.randn(m, e, dtype=output_dtype, device=device)
-    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    routing_weights, selected_local_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_local_experts + start_expert
+    assert int(selected_experts.min().item()) >= start_expert
+    assert int(selected_experts.max().item()) < end_expert
+    if ep_rank > 0:
+        assert int(selected_experts.min().item()) >= e
     # Humming keeps the FP4->FP8 exponent-bias compensation in the epilogue for
-    # this FP8 x MXFP4 path. Fold the derived residual and the known 2^6 factor
-    # into the routed-token scale inputs for both GEMMs.
+    # this FP8 x MXFP4 path. Slots 1 and 4 are per-local-expert residuals; the
+    # runtime maps each expert-permuted routed row to its expert before folding
+    # the residual into that row's dynamic activation dequantization scale.
     humming_epilogue_compensation = 64.0
-    fc1_residual_route_scale = (
-        w1_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
-    )
-    fc2_residual_route_scale = (
-        w2_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
-    )
-
-    def make_expert_contiguous_token_scale(route_scale):
-        return torch.cat(
-            [route_scale[selected_experts == expert_id] for expert_id in range(e)]
-        ).contiguous()
-
-    fc1_residual_token_scale = make_expert_contiguous_token_scale(
-        fc1_residual_route_scale
-    )
-    fc2_residual_token_scale = make_expert_contiguous_token_scale(
-        fc2_residual_route_scale
-    )
+    fc1_residual_expert_scale = (
+        w1_residual * humming_epilogue_compensation
+    ).contiguous()
+    fc2_residual_expert_scale = (
+        w2_residual * humming_epilogue_compensation
+    ).contiguous()
+    assert fc1_residual_expert_scale.shape == (e,)
+    assert fc2_residual_expert_scale.shape == (e,)
+    if e > 1:
+        assert torch.unique(fc1_residual_expert_scale).numel() > 1
+        assert torch.unique(fc2_residual_expert_scale).numel() > 1
     quant_scales = [
         w1_scale_il.view(torch.int32),
-        fc1_residual_token_scale,
+        fc1_residual_expert_scale,
         fc2_act_global,
         w2_scale_il.view(torch.int32),
-        fc2_residual_token_scale,
+        fc2_residual_expert_scale,
     ]
 
     def run_flash(profile_ids=None):
@@ -3295,6 +3334,8 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             quant_scales=quant_scales,
             use_w4_group_scaling=True,
             use_wfp4afp8_humming=True,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
             output=flash_output,
             profile_ids=profile_ids,
         )
@@ -3305,12 +3346,13 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     x_ref = x.to(torch.float32)
     ref_output = torch.zeros(m, k, dtype=torch.float32, device=device)
     print_ref_stats = os.environ.get("FLASHINFER_PRINT_PHASE3_REF_STATS", "0") == "1"
-    for expert_id in range(e):
-        mask = selected_experts == expert_id
+    for local_expert_id in range(e):
+        global_expert_id = start_expert + local_expert_id
+        mask = selected_experts == global_expert_id
         if not mask.any():
             continue
         batch_idx, nth_expert = torch.where(mask)
-        w3_expert, w1_expert = torch.chunk(w1_ref[expert_id], 2, dim=0)
+        w3_expert, w1_expert = torch.chunk(w1_ref[local_expert_id], 2, dim=0)
         x_rows = x_ref[batch_idx]
         fc1_amax = x_rows.abs().amax(dim=1)
         fc1_quant = torch.where(
@@ -3320,9 +3362,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
         x_fp8 = x_fp8_tensor.to(torch.float32)
-        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_route_scale[
-            batch_idx, nth_expert
-        ]
+        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_expert_scale[local_expert_id]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
         fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
@@ -3337,10 +3377,8 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
         fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_route_scale[
-            batch_idx, nth_expert
-        ]
-        fc2 = (fc1_fp8 @ w2_ref[expert_id].t()) * route_fc2_scale[:, None]
+        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_expert_scale[local_expert_id]
+        fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * route_fc2_scale[:, None]
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
     torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]
