@@ -756,7 +756,7 @@ def _independent_bf16_recurrence(torch, runtime: CaseRuntime):
     return out.reshape_as(q), state
 
 
-def _assert_bf16_close(torch, *, label: str, actual, expected) -> dict:
+def _compare_bf16_close(torch, *, label: str, actual, expected) -> dict:
     if actual.dtype != torch.bfloat16:
         actual = actual.to(torch.bfloat16)
     if expected.dtype != torch.bfloat16:
@@ -766,6 +766,7 @@ def _assert_bf16_close(torch, *, label: str, actual, expected) -> dict:
     max_abs = float(absolute_error.max())
     max_allowed_abs = float(allowed_error.max())
     mismatch_count = int((absolute_error > allowed_error).count_nonzero())
+    passed = True
     try:
         torch.testing.assert_close(
             actual,
@@ -773,10 +774,10 @@ def _assert_bf16_close(torch, *, label: str, actual, expected) -> dict:
             atol=BF16_ATOL,
             rtol=BF16_RTOL,
         )
-    except AssertionError as error:
-        raise AssertionError(f"{label}: {error}") from error
+    except AssertionError:
+        passed = False
     return {
-        "passed": True,
+        "passed": passed,
         "max_abs": max_abs,
         "max_allowed_abs": max_allowed_abs,
         "mismatch_count": mismatch_count,
@@ -801,13 +802,13 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
     reference_output, reference_state = _independent_bf16_recurrence(torch, runtime)
     torch.cuda.synchronize()
     independent = {
-        "output": _assert_bf16_close(
+        "output": _compare_bf16_close(
             torch,
             label="public output vs independent recurrence",
             actual=candidate_output,
             expected=reference_output,
         ),
-        "final_state": _assert_bf16_close(
+        "final_state": _compare_bf16_close(
             torch,
             label="public final state vs independent recurrence",
             actual=candidate_state,
@@ -818,13 +819,13 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
     runtime.flash_kda_raw_run()
     torch.cuda.synchronize()
     flash_kda = {
-        "output": _assert_bf16_close(
+        "output": _compare_bf16_close(
             torch,
             label="public output vs pinned FlashKDA",
             actual=candidate_output,
             expected=runtime.flash_kda_output,
         ),
-        "final_state": _assert_bf16_close(
+        "final_state": _compare_bf16_close(
             torch,
             label="public final state vs pinned FlashKDA",
             actual=candidate_state,
@@ -835,22 +836,28 @@ def _check_correctness(torch, runtime: CaseRuntime) -> dict:
     fla_output, fla_state = runtime.fla_run()
     torch.cuda.synchronize()
     fla = {
-        "output": _assert_bf16_close(
+        "output": _compare_bf16_close(
             torch,
             label="public output vs FLA/Triton",
             actual=candidate_output,
             expected=fla_output,
         ),
-        "final_state": _assert_bf16_close(
+        "final_state": _compare_bf16_close(
             torch,
             label="public final state vs FLA/Triton",
             actual=candidate_state,
             expected=fla_state,
         ),
     }
+    pinned_passed = all(result["passed"] for result in flash_kda.values())
+    diagnostic_consensus = all(
+        result["passed"] for oracle in (independent, fla) for result in oracle.values()
+    )
     return {
-        "passed": True,
-        "public_output_and_full_final_state": True,
+        "passed": pinned_passed,
+        "public_output_and_full_final_state": pinned_passed,
+        "contract_oracle": "pinned_flash_kda",
+        "diagnostic_consensus": diagnostic_consensus,
         "independent_bf16_recurrence": independent,
         "pinned_flash_kda": flash_kda,
         "fla_triton": fla,
@@ -1104,6 +1111,16 @@ def _case_result(
     stack.torch.cuda.synchronize()
 
     correctness = _check_correctness(stack.torch, runtime)
+    if not correctness["passed"]:
+        return {
+            **runtime.metadata,
+            "correctness": correctness,
+            "performance_reportable": False,
+            "timings": None,
+            "measurement_order": [],
+            "per_case_speedups": None,
+            "cross_shape_aggregate": None,
+        }
     timings, measurement_order = _run_timing_blocks(
         stack=stack,
         tracer=tracer,
@@ -1128,6 +1145,7 @@ def _case_result(
     return {
         **runtime.metadata,
         "correctness": correctness,
+        "performance_reportable": True,
         "timings": timings,
         "measurement_order": measurement_order,
         "per_case_speedups": speedups,
@@ -1293,6 +1311,7 @@ def main() -> None:
             "cupti_python_version": cupti_version,
         },
         "cases": [],
+        "diagnostic_consensus": None,
     }
     if not graph_receipt["passed"]:
         report["complete_per_arch_denominator"] = False
@@ -1316,6 +1335,18 @@ def main() -> None:
                 blocks=args.blocks,
             )
             report["cases"].append(result)
+            if not result["correctness"]["passed"]:
+                report["complete_per_arch_denominator"] = False
+                report["diagnostic_consensus"] = all(
+                    case_result["correctness"]["diagnostic_consensus"]
+                    for case_result in report["cases"]
+                )
+                assert args.json is not None
+                write_json_atomic(args.json, report)
+                raise RuntimeError(
+                    "pinned FlashKDA correctness failed; timing was not run and "
+                    f"receipt was written to {args.json}"
+                )
             print(
                 f"{case.name}: public="
                 f"{result['timings']['flashinfer_public']['median_gpu_span_ms'] * 1000:.3f}us "
@@ -1328,7 +1359,13 @@ def main() -> None:
     finally:
         tracer.close()
 
-    report["complete_per_arch_denominator"] = len(report["cases"]) == 6
+    report["complete_per_arch_denominator"] = len(report["cases"]) == 6 and all(
+        case_result["correctness"]["passed"] for case_result in report["cases"]
+    )
+    report["diagnostic_consensus"] = all(
+        case_result["correctness"]["diagnostic_consensus"]
+        for case_result in report["cases"]
+    )
     assert args.json is not None
     write_json_atomic(args.json, report)
     print(f"wrote {args.json}")

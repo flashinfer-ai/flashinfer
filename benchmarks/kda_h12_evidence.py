@@ -42,7 +42,7 @@ FLASH_KDA_CUTLASS_REVISION = "5c149f52a436782210263fb2f19b354443a61c6a"
 FLASHINFER_PHASE_A_UPSTREAM_MAIN_REVISION = "2ab910c58fdd2392914ea05e2a8714946ac0eef6"
 FLASHINFER_H12_ROUTE_REVISION = "38bf507f9c9eba6b4544bee016d2bdf9c4fed02b"
 PRESET_SCHEMA_VERSION = 1
-EVIDENCE_REPORT_SCHEMA_VERSION = 3
+EVIDENCE_REPORT_SCHEMA_VERSION = 4
 FLASH_KDA_BUILD_MANIFEST_SCHEMA_VERSION = 2
 DUAL_ARCH_PROMOTION_SCHEMA_VERSION = 2
 FROZEN_PRESET_SHA256 = (
@@ -1572,7 +1572,13 @@ def _validate_timing_summary(
         raise EvidenceSchemaError("prepared summary differs from raw public samples")
 
 
-def _require_oracle(case: dict, key: str, expected: CasePreset) -> None:
+def _require_oracle(
+    case: dict,
+    key: str,
+    expected: CasePreset,
+    *,
+    required_to_pass: bool,
+) -> None:
     correctness = case.get("correctness")
     if not isinstance(correctness, dict):
         raise EvidenceSchemaError(f"case {case.get('name')!r} lacks correctness")
@@ -1607,9 +1613,13 @@ def _require_oracle(case: dict, key: str, expected: CasePreset) -> None:
         max_allowed_abs = (
             result.get("max_allowed_abs") if isinstance(result, dict) else None
         )
+        passed = result.get("passed") if isinstance(result, dict) else None
+        mismatch_count = (
+            result.get("mismatch_count") if isinstance(result, dict) else None
+        )
         if (
             not isinstance(result, dict)
-            or result.get("passed") is not True
+            or type(passed) is not bool
             or isinstance(max_abs, bool)
             or not isinstance(max_abs, (int, float))
             or not math.isfinite(max_abs)
@@ -1618,14 +1628,16 @@ def _require_oracle(case: dict, key: str, expected: CasePreset) -> None:
             or not isinstance(max_allowed_abs, (int, float))
             or not math.isfinite(max_allowed_abs)
             or max_allowed_abs < 0
-            or max_abs > max_allowed_abs
-            or type(result.get("mismatch_count")) is not int
-            or result["mismatch_count"] != 0
+            or type(mismatch_count) is not int
+            or mismatch_count < 0
             or result.get("atol") != BF16_CORRECTNESS_ATOL
             or result.get("rtol") != BF16_CORRECTNESS_RTOL
             or result.get("compared_dtype") != "bfloat16"
             or type(result.get("compared_numel")) is not int
             or result["compared_numel"] != expected_numel[result_name]
+            or (passed and (mismatch_count != 0 or max_abs > max_allowed_abs))
+            or (not passed and mismatch_count == 0)
+            or (required_to_pass and not passed)
         ):
             raise EvidenceSchemaError(
                 f"case {case.get('name')!r} oracle {key} {result_name} "
@@ -1658,6 +1670,7 @@ def _validate_case_receipt(
         {
             *expected_identity,
             "correctness",
+            "performance_reportable",
             "timings",
             "measurement_order",
             "per_case_speedups",
@@ -1675,6 +1688,7 @@ def _validate_case_receipt(
         not isinstance(correctness, dict)
         or correctness.get("passed") is not True
         or correctness.get("public_output_and_full_final_state") is not True
+        or correctness.get("contract_oracle") != "pinned_flash_kda"
     ):
         raise EvidenceSchemaError(
             f"case {expected.name!r} lacks complete public correctness"
@@ -1684,18 +1698,38 @@ def _validate_case_receipt(
         {
             "passed",
             "public_output_and_full_final_state",
+            "contract_oracle",
+            "diagnostic_consensus",
             "independent_bf16_recurrence",
             "pinned_flash_kda",
             "fla_triton",
         },
         f"case {expected.name!r} correctness",
     )
-    for oracle in (
-        "independent_bf16_recurrence",
+    _require_oracle(
+        case,
         "pinned_flash_kda",
-        "fla_triton",
-    ):
-        _require_oracle(case, oracle, expected)
+        expected,
+        required_to_pass=True,
+    )
+    for oracle in ("independent_bf16_recurrence", "fla_triton"):
+        _require_oracle(case, oracle, expected, required_to_pass=False)
+    diagnostic_consensus = all(
+        result["passed"]
+        for oracle in (
+            correctness["independent_bf16_recurrence"],
+            correctness["fla_triton"],
+        )
+        for result in oracle.values()
+    )
+    if correctness["diagnostic_consensus"] is not diagnostic_consensus:
+        raise EvidenceSchemaError(
+            f"case {expected.name!r} diagnostic consensus is inconsistent"
+        )
+    if case.get("performance_reportable") is not True:
+        raise EvidenceSchemaError(
+            f"case {expected.name!r} pinned correctness did not gate performance"
+        )
 
     timings = case.get("timings")
     if not isinstance(timings, dict) or set(timings) != set(REQUIRED_TIMING_PATHS):
@@ -1845,6 +1879,7 @@ def validate_per_arch_receipt(
             "changed_beta_cuda_graph_test",
             "measurement",
             "cases",
+            "diagnostic_consensus",
             "complete_per_arch_denominator",
         },
         "per-architecture receipt",
@@ -2217,6 +2252,11 @@ def validate_per_arch_receipt(
             expected_case,
             expected_sample_count=expected_sample_count,
         )
+    diagnostic_consensus = all(
+        case["correctness"]["diagnostic_consensus"] for case in cases
+    )
+    if report.get("diagnostic_consensus") is not diagnostic_consensus:
+        raise EvidenceSchemaError("receipt diagnostic consensus is inconsistent")
 
     return {
         "preset_sha256": FROZEN_PRESET_SHA256,

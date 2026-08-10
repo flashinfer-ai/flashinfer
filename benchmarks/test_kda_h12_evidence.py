@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +59,18 @@ def _build_helper_path() -> Path:
 
 def _reducer_path() -> Path:
     return BENCHMARKS_DIR / "reduce_kda_h12_phase_a.py"
+
+
+def _load_runner_module():
+    spec = importlib.util.spec_from_file_location(
+        "bench_recurrent_kda_prefill_h12_phase_a",
+        _runner_path(),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_checked_in_preset_is_exact_and_per_case_only():
@@ -806,12 +819,15 @@ def _complete_per_arch_report(tmp_path, arch):
                 "correctness": {
                     "passed": True,
                     "public_output_and_full_final_state": True,
+                    "contract_oracle": "pinned_flash_kda",
+                    "diagnostic_consensus": True,
                     "independent_bf16_recurrence": json.loads(
                         json.dumps(oracle_result)
                     ),
                     "pinned_flash_kda": json.loads(json.dumps(oracle_result)),
                     "fla_triton": json.loads(json.dumps(oracle_result)),
                 },
+                "performance_reportable": True,
                 "timings": timings,
                 "measurement_order": measurement_order,
                 "per_case_speedups": {
@@ -954,9 +970,65 @@ def _complete_per_arch_report(tmp_path, arch):
             "passed": True,
         },
         "cases": cases,
+        "diagnostic_consensus": True,
         "complete_per_arch_denominator": True,
     }
     return report, candidate_commit, fla_commit, preset
+
+
+def _record_oracle_mismatch(report, oracle_name):
+    result = report["cases"][0]["correctness"][oracle_name]["output"]
+    result.update(
+        {
+            "passed": False,
+            "max_abs": 0.02,
+            "mismatch_count": 1,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "diagnostic_oracle",
+    ["independent_bf16_recurrence", "fla_triton"],
+)
+def test_per_arch_receipt_accepts_diagnostic_disagreement(
+    tmp_path,
+    diagnostic_oracle,
+):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    _record_oracle_mismatch(report, diagnostic_oracle)
+    report["cases"][0]["correctness"]["diagnostic_consensus"] = False
+    report["diagnostic_consensus"] = False
+
+    evidence.validate_per_arch_receipt(
+        report,
+        expected_arch="sm100a",
+        expected_candidate_commit=candidate_commit,
+        expected_fla_commit=fla_commit,
+        preset=preset,
+    )
+
+    assert report["cases"][0]["correctness"]["passed"] is True
+    assert report["cases"][0]["performance_reportable"] is True
+    assert report["complete_per_arch_denominator"] is True
+
+
+def test_per_arch_receipt_rejects_pinned_oracle_failure(tmp_path):
+    report, candidate_commit, fla_commit, preset = _complete_per_arch_report(
+        tmp_path, "sm100a"
+    )
+    _record_oracle_mismatch(report, "pinned_flash_kda")
+
+    with pytest.raises(evidence.EvidenceSchemaError, match="exact BF16 full-tensor"):
+        evidence.validate_per_arch_receipt(
+            report,
+            expected_arch="sm100a",
+            expected_candidate_commit=candidate_commit,
+            expected_fla_commit=fla_commit,
+            preset=preset,
+        )
 
 
 def test_dual_arch_reducer_requires_matching_complete_receipts(tmp_path):
@@ -1217,18 +1289,6 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
         "exact BF16 full-tensor",
     )
     reject(
-        lambda payload: payload["cases"][0]["correctness"][
-            "independent_bf16_recurrence"
-        ]["output"].__setitem__("mismatch_count", 1),
-        "exact BF16 full-tensor",
-    )
-    reject(
-        lambda payload: payload["cases"][0]["correctness"][
-            "independent_bf16_recurrence"
-        ]["output"].__setitem__("max_abs", 1e30),
-        "exact BF16 full-tensor",
-    )
-    reject(
         lambda payload: payload["cases"][0]["timings"]["flash_kda_raw"]["raw_samples"][
             0
         ].pop("activity_order"),
@@ -1436,6 +1496,135 @@ def test_runner_rejects_non_exact_phase_a_sampling_without_gpu_import(tmp_path):
 
     assert completed.returncode == 2
     assert "exact --warmup-iters 5 --repeat-iters 20 --blocks 2" in completed.stderr
+
+
+class _FakeTensor:
+    def __init__(self, pointer):
+        self._pointer = pointer
+
+    def data_ptr(self):
+        return self._pointer
+
+    def clone(self):
+        return self
+
+
+class _FakeCuda:
+    def synchronize(self):
+        return None
+
+
+@pytest.mark.parametrize(
+    ("failed_label", "contract_passed", "diagnostic_consensus"),
+    [
+        (None, True, True),
+        ("independent recurrence", True, False),
+        ("FLA/Triton", True, False),
+        ("pinned FlashKDA", False, True),
+    ],
+)
+def test_runner_oracle_role_matrix(
+    monkeypatch,
+    failed_label,
+    contract_passed,
+    diagnostic_consensus,
+):
+    runner = _load_runner_module()
+    events = []
+    labels = []
+    state = _FakeTensor(1)
+    runtime = SimpleNamespace(
+        candidate_reset=lambda: events.append("candidate_reset"),
+        candidate_run=lambda: (events.append("candidate_run") or (_FakeTensor(2), state)),
+        candidate_state_pool=[state],
+        flash_kda_raw_run=lambda: events.append("pinned_run"),
+        flash_kda_output=_FakeTensor(3),
+        flash_kda_final_state=_FakeTensor(4),
+        fla_run=lambda: (events.append("fla_run") or (_FakeTensor(5), _FakeTensor(6))),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_independent_bf16_recurrence",
+        lambda torch, runtime: (_FakeTensor(7), _FakeTensor(8)),
+    )
+
+    def compare(torch, *, label, actual, expected):
+        labels.append(label)
+        passed = failed_label is None or failed_label not in label
+        return {"passed": passed}
+
+    monkeypatch.setattr(runner, "_compare_bf16_close", compare)
+
+    correctness = runner._check_correctness(
+        SimpleNamespace(cuda=_FakeCuda()),
+        runtime,
+    )
+
+    assert correctness["passed"] is contract_passed
+    assert correctness["public_output_and_full_final_state"] is contract_passed
+    assert correctness["contract_oracle"] == "pinned_flash_kda"
+    assert correctness["diagnostic_consensus"] is diagnostic_consensus
+    assert len(labels) == 6
+    assert events == ["candidate_reset", "candidate_run", "pinned_run", "fla_run"]
+
+
+@pytest.mark.parametrize(
+    ("pinned_passed", "timing_called"),
+    [(True, True), (False, False)],
+)
+def test_runner_pinned_gate_alone_controls_timing(
+    monkeypatch,
+    pinned_passed,
+    timing_called,
+):
+    runner = _load_runner_module()
+    calls = []
+    runtime = SimpleNamespace(
+        metadata={"name": "case"},
+        candidate_reset=lambda: None,
+        candidate_run=lambda: None,
+        flash_kda_raw_run=lambda: None,
+        fla_run=lambda: None,
+    )
+    monkeypatch.setattr(runner, "_make_case_runtime", lambda **kwargs: runtime)
+    monkeypatch.setattr(
+        runner,
+        "_check_correctness",
+        lambda torch, runtime: {
+            "passed": pinned_passed,
+            "diagnostic_consensus": False,
+        },
+    )
+
+    def run_timing_blocks(**kwargs):
+        calls.append("timing")
+        return (
+            {
+                "flashinfer_public": {"median_gpu_span_ms": 2.0},
+                "flash_kda_raw": {"median_gpu_span_ms": 4.0},
+                "flash_kda_public_semantics_adapted": {
+                    "median_gpu_span_ms": 5.0
+                },
+                "fla_triton": {"median_gpu_span_ms": 6.0},
+            },
+            [],
+        )
+
+    monkeypatch.setattr(runner, "_run_timing_blocks", run_timing_blocks)
+    result = runner._case_result(
+        stack=SimpleNamespace(torch=SimpleNamespace(cuda=_FakeCuda())),
+        tracer=object(),
+        case=object(),
+        flash_kda=object(),
+        fla_chunk_kda=lambda: None,
+        warmup_iters=1,
+        repeat_iters=1,
+        blocks=2,
+    )
+
+    assert result["performance_reportable"] is pinned_passed
+    assert bool(calls) is timing_called
+    assert (result["timings"] is not None) is timing_called
 
 
 def test_runner_has_no_reportable_timer_fallback_or_top_level_gpu_import():
