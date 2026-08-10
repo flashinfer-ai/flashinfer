@@ -1705,6 +1705,11 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
     )
 
 
+cast(
+    Any, _trtllm_fp4_block_scale_moe_ds_routing_reference
+)._trace_reference_dependencies = (_fp4_moe_run_experts,)
+
+
 @torch.no_grad()
 def _trtllm_fp4_block_scale_moe_llama4_routing_reference(
     routing_logits,
@@ -2163,6 +2168,50 @@ def _moe_fp4_block_scale_ds_init(**kwargs):
     return out
 
 
+def _moe_fp4_block_scale_ds_shared_experts_init(
+    *,
+    seq_len: int,
+    num_fused_shared_experts: int = 1,
+    num_experts: int = 256,
+    num_weight_rows: int = 0,
+    num_local_experts: int = 0,
+    **kwargs,
+):
+    """Build FP4 shared-expert inputs with routed ``E`` and physical ``E + S``."""
+    S = int(num_fused_shared_experts)
+    if num_weight_rows:
+        routed = int(num_weight_rows) - S
+    elif num_local_experts:
+        routed = int(num_local_experts)
+    else:
+        routed = int(num_experts)
+    if routed <= 0:
+        raise ValueError(
+            f"derived routed expert count must be > 0, got {routed} "
+            f"(num_weight_rows={num_weight_rows}, num_fused_shared_experts={S})."
+        )
+    if num_weight_rows and routed != int(num_experts):
+        raise ValueError(
+            "inconsistent shared-expert definition: num_weight_rows - "
+            f"num_fused_shared_experts = {num_weight_rows} - {S} = {routed}, "
+            f"which does not match num_experts={num_experts}."
+        )
+    out = _moe_fp4_block_scale_ds_init(
+        seq_len=seq_len,
+        num_experts=num_experts,
+        num_local_experts=routed + S,
+        **kwargs,
+    )
+    out["local_num_experts"] = routed
+    out["num_fused_shared_experts"] = S
+    return out
+
+
+cast(Any, _moe_fp4_block_scale_ds_shared_experts_init)._trace_init_dependencies = (
+    _moe_fp4_block_scale_ds_init,
+)
+
+
 def _moe_fp4_block_scale_llama4_init(**kwargs):
     kwargs["routing_method_type"] = 3
     kwargs["top_k"] = 1
@@ -2257,6 +2306,70 @@ trtllm_fp4_block_scale_moe_ds_routing_trace = TraceTemplate(
     init=_moe_fp4_block_scale_ds_init,
 )
 
+
+def _fp4_shared_expert_inputs() -> dict[str, Tensor | Scalar]:
+    """Key FP4 expert-major tensors on physical ``E + S`` rows."""
+    inputs: dict[str, Tensor | Scalar] = {}
+    for name, spec in _FP4_STANDARD_INPUTS.items():
+        if isinstance(spec, Tensor):
+            inputs[name] = Tensor(
+                [
+                    "num_weight_rows" if dim == "num_local_experts" else dim
+                    for dim in spec.dim_names
+                ],
+                param=spec.param,
+                tuple_idx=spec.tuple_idx,
+                dtype=spec.dtype,
+                dtype_from=spec.dtype_from,
+                optional=spec.optional,
+                description=spec.description,
+            )
+        else:
+            inputs[name] = spec
+    inputs["num_fused_shared_experts"] = Scalar(
+        "int32",
+        description=(
+            "Number of shared experts fused into the launch. Their rows follow "
+            "the routed experts and every token routes to them at weight 1.0."
+        ),
+    )
+    return inputs
+
+
+trtllm_fp4_block_scale_moe_ds_shared_experts_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="moe_fp4_block_scale_ds_shared_experts",
+    description=(
+        "NvFP4 block-scale MoE with DeepSeekV3 routing and fused shared experts."
+    ),
+    axes={
+        "num_fused_shared_experts": Const(
+            description="Number of fused shared experts (S), applied to every token.",
+            abbrev="s",
+        ),
+        "num_weight_rows": Const(
+            description="Physical expert-major rows: routed E + shared S.",
+            abbrev="e",
+        ),
+        **{
+            name: axis
+            for name, axis in _FP4_STANDARD_AXES.items()
+            if name != "num_local_experts"
+        },
+        "n_group": Const(
+            description="Number of expert groups for group routing.", abbrev="ng"
+        ),
+        "topk_group": Const(
+            description="Number of groups selected in top-k routing.", abbrev="kg"
+        ),
+    },
+    inputs=_fp4_shared_expert_inputs(),
+    outputs=dict(_FP4_STANDARD_OUTPUTS),
+    tags=_FP4_STANDARD_TAGS,
+    reference=_trtllm_fp4_block_scale_moe_ds_routing_reference,
+    init=_moe_fp4_block_scale_ds_shared_experts_init,
+)
+
 # RoutingMethodType.Llama4 = 3 — Top1 → Sigmoid
 trtllm_fp4_block_scale_moe_llama4_routing_trace = _make_standard_fp4_moe_trace(
     name_prefix="moe_fp4_block_scale_llama4_routing",
@@ -2305,12 +2418,17 @@ def trtllm_fp4_block_scale_moe_trace_dispatch(**kwargs):
     Returns ``None`` for ``RoutingMethodType.Unspecified`` (6).
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
+    if (
+        routing_method_type == 2
+        and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+    ):
+        return trtllm_fp4_block_scale_moe_ds_shared_experts_trace
     return _FP4_MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
 
 
 trtllm_fp4_block_scale_moe_trace_dispatch.templates = list(  # type: ignore[attr-defined]
     _FP4_MOE_TRACE_BY_ROUTING_TYPE.values()
-)
+) + [trtllm_fp4_block_scale_moe_ds_shared_experts_trace]
 
 
 # ---------------------------------------------------------------------------

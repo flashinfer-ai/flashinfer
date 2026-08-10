@@ -32,8 +32,10 @@ from flashinfer.fused_moe import (
     QuantVariant,
     RoutingInputMode,
     RoutingConfig,
+    RoutingMethodType,
     TrtllmFp4Config,
     TrtllmFp4RoutedRunner,
+    trtllm_fp4_block_scale_moe,
 )
 from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
@@ -331,6 +333,124 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
         f"{variant.name}: only {pct * 100:.2f}% values within tolerance "
         f"(atol={atol:.4f})"
     )
+
+
+@pytest.mark.parametrize(
+    "variant,num_shared",
+    [
+        pytest.param(QuantVariant.NVFP4, 1, id="nvfp4-s1"),
+        pytest.param(QuantVariant.MXFP4, 2, id="mxfp4-s2"),
+        pytest.param(QuantVariant.W4A16, 1, id="w4a16-s1"),
+    ],
+)
+def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
+    """All FP4 contracts must forward routed E and physical E + S consistently."""
+    _xfail_w4a16_sm103(variant)
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    num_tokens, hidden_size, intermediate_size = 8, 1024, 512
+    num_experts, top_k = 8, 2
+    num_weight_rows = num_experts + num_shared
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    w1 = (
+        torch.randn(
+            num_weight_rows,
+            2 * intermediate_size,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    w2 = (
+        torch.randn(
+            num_weight_rows,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    hidden_states_q, hidden_states_scale = TrtllmFp4Config.prepare_activations(
+        hidden_states, variant=variant
+    )
+    view = TrtllmFp4Config.prepare_weights(
+        w1,
+        w2,
+        variant=variant,
+        num_local_experts=num_weight_rows,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for("trtllm_fp4_routed", view)
+
+    routing_logits = torch.randn(
+        num_tokens, num_experts, device=device, dtype=torch.bfloat16
+    )
+    routing_bias = torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
+    act = MoEActivationPack(
+        hidden_states_q=hidden_states_q,
+        hidden_states_scale=hidden_states_scale,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        routing_input_mode=RoutingInputMode.FromLogits,
+    )
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+        ),
+        quant=QuantConfig(variant=variant),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            num_fused_shared_experts=num_shared,
+        ),
+        activation=ActivationConfig.swiglu,
+        backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
+    )
+
+    actual = MoELayer(config, device=device)(act, weights).clone()
+    expected = trtllm_fp4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states_q,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=view["gemm1_weights"],
+        gemm1_weights_scale=view["gemm1_weights_scale"],
+        gemm1_bias=None,
+        gemm1_alpha=view.get("gemm1_alpha"),
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=view["gemm2_weights"],
+        gemm2_weights_scale=view["gemm2_weights_scale"],
+        gemm2_bias=None,
+        output1_scale_scalar=view.get("output1_scale_scalar"),
+        output1_scale_gate_scalar=view.get("output1_scale_gate_scalar"),
+        output2_scale_scalar=view.get("output2_scale_scalar"),
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=2,
+        topk_group=1,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=2.5,
+        routing_method_type=RoutingMethodType.DeepSeekV3,
+        tune_max_num_tokens=num_tokens,
+        num_fused_shared_experts=num_shared,
+    )[0]
+    torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
 
 
 @pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])

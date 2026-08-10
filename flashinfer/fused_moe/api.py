@@ -303,6 +303,11 @@ class TrtllmFp4Config:
         ``variant`` selects NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``
         (MXFP4 weights x BF16 activations).
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+
+        .. warning::
+           ``num_local_experts`` is the physical row count: ``E_local + S``
+           when fused shared experts are present. :class:`ExpertConfig` keeps
+           ``local_num_experts`` as the routed-only count ``E_local``.
         """
         from .prepare import prepare_trtllm_fp4_weights
 

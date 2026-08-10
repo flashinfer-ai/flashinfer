@@ -1056,6 +1056,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         QuantVariant.MXFP4,
         QuantVariant.W4A16,
     )
+    supports_fused_shared_experts = True
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -1094,6 +1095,8 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         experts = config.experts
         execution = config.execution
         self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._num_fused_shared_experts = experts.num_fused_shared_experts
+        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
         self._local_expert_offset = experts.local_expert_offset
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
@@ -1148,6 +1151,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             weight_layout=int(WeightLayout.MajorK),
             use_per_token_scaling=False,
             num_experts=self.config.routing.num_experts,
+            num_fused_shared_experts=self._num_fused_shared_experts,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -1240,12 +1244,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
         expected_weights = {
             "gemm1_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 2 * self._intermediate_size,
                 hidden_size // 2,
             ),
             "gemm2_weights": (
-                self._num_local_experts,
+                self._num_weight_rows,
                 hidden_size,
                 self._intermediate_size // 2,
             ),
@@ -1262,7 +1266,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             (
                 "gemm1_weights_scale",
                 (
-                    self._num_local_experts,
+                    self._num_weight_rows,
                     2 * self._intermediate_size,
                     hidden_size // sf_vec_size,
                 ),
@@ -1270,7 +1274,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             (
                 "gemm2_weights_scale",
                 (
-                    self._num_local_experts,
+                    self._num_weight_rows,
                     hidden_size,
                     self._intermediate_size // sf_vec_size,
                 ),
@@ -1324,6 +1328,14 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
 
         routing_input_mode = act.routing_input_mode
+        if (
+            self._num_fused_shared_experts > 0
+            and routing_input_mode is not RoutingInputMode.FromLogits
+        ):
+            raise NotImplementedError(
+                "Dedicated fused shared experts require FromLogits routing; "
+                "pre-routed callers must append shared ids and weights themselves."
+            )
         if routing_input_mode == RoutingInputMode.FromLogits:
             # In-kernel routing: topk_ids/expert_weights are OUTPUT buffers the kernel fills.
             # Unlike the FP8 launcher, FP4 receives routing_input_mode explicitly;
@@ -1345,14 +1357,22 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 )
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.int32
+                (
+                    num_tokens,
+                    routing.top_k + self._num_fused_shared_experts,
+                ),
+                dtype=torch.int32,
             )
             # MUST be bf16 regardless of logits dtype: the fp4 routing kernel
             # writes bf16 expert weights, so inheriting fp32 from the logits
             # mislabels the returned buffer (gh #3595 — the canonical wrapper
             # in core.py hardcodes bf16 for the same reason).
             expert_weights = routing_logits.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
+                (
+                    num_tokens,
+                    routing.top_k + self._num_fused_shared_experts,
+                ),
+                dtype=torch.bfloat16,
             )
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
             # Pre-routed: pack the host selection into (GLOBAL expert_id << 16) | bf16(weight).
@@ -1428,7 +1448,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             output2_scale_scalar=v.get("output2_scale_scalar"),
             per_token_scale=None,
             num_experts=routing.num_experts,
-            num_fused_shared_experts=0,
+            num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,

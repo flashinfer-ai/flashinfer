@@ -1117,18 +1117,16 @@ def _gen(seed):
         if variant in ("mxfp4", "w4a16", "mxint4")
         else ("fp32" if rng.random() < 0.25 else "bf16")
     )
-    # Fused shared experts: only the DeepSeekV3 routing kernel emits the
-    # appended slots, only block-FP8 forwards S through the unified runner, and
-    # only FromLogits can express it (a pre-routed caller supplies exactly top_k
-    # ids). EP is rejected outright. Roll sparsely so the axis does not crowd
-    # out the routed coverage this fuzzer mainly exists for.
+    # Fused shared experts: only the DeepSeekV3 FromLogits path emits appended
+    # slots. Block-FP8 and all TRTLLM FP4 variants forward S; EP is rejected.
+    # Roll sparsely so this axis does not crowd out routed coverage.
     num_fused_shared_experts = 0
     if (
         method == RoutingMethodType.DeepSeekV3
         and fromlogits
         and offset == 0
         and local == ne
-        and variant in ("deepseekfp8", "mxfp8")
+        and variant in ("deepseekfp8", "mxfp8", "nvfp4", "mxfp4", "w4a16")
         and rng.random() < 0.25
     ):
         # Bounded by the kernel ceilings on the FUSED totals.
@@ -1427,10 +1425,7 @@ _CURATED = [
         routing_input_mode="fromlogits",
         logits_dtype="bf16",
     ),
-    # Fused shared experts. Curated rather than left to the random roll: the
-    # axis is gated to DeepSeekV3 + FromLogits + non-EP + block-FP8, so it does
-    # not appear at all in the default seed window and would otherwise be
-    # covered only on a lucky FLASHINFER_UMOE_FUZZ_SEED.
+    # Fused shared experts. Curated rather than left to the sparse random roll.
     Cfg(
         256,
         1024,
@@ -1463,6 +1458,30 @@ _CURATED = [
         routed_scaling=2.5,
         num_fused_shared_experts=2,
     ),
+    *[
+        Cfg(
+            32,
+            1024,
+            512,
+            32,
+            8,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.DeepSeekV3,
+            routing_input_mode="fromlogits",
+            logits_dtype="bf16",
+            n_group=8,
+            topk_group=4,
+            routed_scaling=2.5,
+            num_fused_shared_experts=num_shared,
+        )
+        for variant, num_shared, seed in (
+            ("nvfp4", 1, 900_042),
+            ("mxfp4", 2, 900_043),
+            ("w4a16", 1, 900_044),
+        )
+    ],
 ]
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _curated_by_seed = {c.seed: c for c in _CURATED}

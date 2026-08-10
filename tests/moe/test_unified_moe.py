@@ -2464,7 +2464,10 @@ class TestFusedSharedExpertsBackendGating:
             for r in _BACKEND_RUNNERS.values()
             if r.supports_fused_shared_experts
         }
-        assert supporting == {"TrtllmFp8BlockRunner"}, (
+        assert supporting == {
+            "TrtllmFp4RoutedRunner",
+            "TrtllmFp8BlockRunner",
+        }, (
             "backends claiming fused shared-expert support changed; confirm the "
             f"new backend forwards num_fused_shared_experts: {supporting}"
         )
