@@ -676,9 +676,6 @@ class NVFP4QuantizePerTokenKernel:
         self.K = K
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
-        # Fold a caller-supplied scalar into the returned per-token scale. The
-        # encode path uses global_encode_scale, so this only rescales the
-        # dequant factor the GEMM later consumes as alpha.
         self.fold_out_scale = fold_out_scale
         self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
@@ -2328,7 +2325,6 @@ def nvfp4_quantize_per_token_cute_dsl(
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-    # The kernel defines every padding row's scale slots, so this needs no fill.
     scale_output = torch.empty(
         padded_m * padded_sf_cols, dtype=torch.uint8, device=input.device
     )

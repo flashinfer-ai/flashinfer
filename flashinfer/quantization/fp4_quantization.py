@@ -1377,11 +1377,9 @@ def nvfp4_quantize(
         ``1 / (448 * 6)``) and the function also returns per-token FP32
         scales.
     out_scale : torch.Tensor, optional
-        Per-token mode only, ``"cute-dsl"`` backend only.  Scalar folded into
-        the returned per-token scales, so a caller that would otherwise
-        multiply them by a constant (a weight dequant scale, say) gets the
-        product straight out of the quantize kernel.  Leaves the quantization
-        itself untouched.
+        Scalar the returned per-token scales are multiplied by.  Only for
+        ``per_token_activation=True`` with ``backend="cute-dsl"``.  Does not
+        change the quantized values.
     expanded_idx_to_permuted_idx : torch.Tensor, optional
         Optional row-remapping buffer for per-token activation
         quantization.
@@ -1406,6 +1404,8 @@ def nvfp4_quantize(
             raise ValueError(
                 "Per-token NVFP4 quantization only supports sf_vec_size=16"
             )
+        if out_scale is not None and backend != "cute-dsl":
+            raise ValueError("out_scale is only supported with backend='cute-dsl'")
 
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
@@ -1473,6 +1473,8 @@ def nvfp4_quantize(
             raise ValueError(
                 f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'."
             )
+    elif out_scale is not None:
+        raise ValueError("out_scale is only supported with per_token_activation=True")
     elif backend == "cuda":
         if expanded_idx_to_permuted_idx is not None:
             raise ValueError(
