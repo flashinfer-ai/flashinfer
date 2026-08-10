@@ -33,7 +33,7 @@ from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 _HAS_QUACK = importlib.util.find_spec("quack") is not None
 _requires_sm100 = pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
+    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="vsa_sm100_blk64 requires SM100 (Blackwell)",
 )
 
