@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_69258ae007.
-// Cake revision: c19ab7105cef1728fb84cd0012a7c2b0f47e1e77; raw SHA-256: 8e42d44baa9ee6f07c7b2161f8514e7520305a2616267ba60b324b0aad614a23.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_534260023d.
+// Cake revision: 58e48fd0e62ff4922ac43740ef044e8aa874e12c; raw SHA-256: 4324be7ec3413d3c442e4e0733e52402acbb82c79d8fa28a249d63763968986e.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -886,6 +886,23 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
                 float _tmem_load_1[16];
                 tmem_ld_x16(&_tmem_load_1[0], taddr + 224 + (unsigned int)tmem_row_base);
+                uint32_t _tmem_load_1_bf16[8];
+                #pragma unroll
+                for (int _lp = 0; _lp < 8; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                    _tmem_load_1_bf16[_lp] = *(uint32_t*)&_bf2;
+                }
+                float _tmem_load_1_bf16_f32[16];
+                #pragma unroll
+                for (int _pair = 0; _pair < 8; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&_tmem_load_1_bf16_f32[_pair * 2])[0]), "=f"((&_tmem_load_1_bf16_f32[_pair * 2])[1])
+                        : "r"(_tmem_load_1_bf16[_pair]));
+                }
                 #pragma unroll
                 for (int residual_half = 0; residual_half < 1; residual_half++) {
                     float residual_v[16];
@@ -900,17 +917,34 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
-                        sub_f32x2_inplace(&reinterpret_cast<float2*>(residual_v)[_ls], reinterpret_cast<const float2*>((_tmem_load_1 + residual_half * 16))[_ls]);
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 8; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(residual_v)[_ls], reinterpret_cast<const float2*>(residual_beta)[_ls]);
+                        sub_f32x2_inplace(&reinterpret_cast<float2*>(residual_v)[_ls], reinterpret_cast<const float2*>((_tmem_load_1_bf16_f32 + residual_half * 16))[_ls]);
                     uint32_t residual_v_bf16[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 8; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v[_lp*2 + 0], residual_v[_lp*2+1 + 0]));
                         residual_v_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    tmem_st_x8_u32(taddr + 224 + (unsigned int)tmem_row_base + (unsigned int)(residual_half * 8), (const uint32_t*)residual_v_bf16);
+                    float residual_v_bf16_f32[16];
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 8; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&residual_v_bf16_f32[_pair * 2])[0]), "=f"((&residual_v_bf16_f32[_pair * 2])[1])
+                            : "r"(residual_v_bf16[_pair]));
+                    }
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 8; _ls++)
+                        mul_f32x2_inplace(&reinterpret_cast<float2*>(residual_v_bf16_f32)[_ls], reinterpret_cast<const float2*>(residual_beta)[_ls]);
+                    uint32_t residual_v_bf16_f32_bf16[8];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 8; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(residual_v_bf16_f32[_lp*2 + 0], residual_v_bf16_f32[_lp*2+1 + 0]));
+                        residual_v_bf16_f32_bf16[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    tmem_st_x8_u32(taddr + 224 + (unsigned int)tmem_row_base + (unsigned int)(residual_half * 8), (const uint32_t*)residual_v_bf16_f32_bf16);
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
