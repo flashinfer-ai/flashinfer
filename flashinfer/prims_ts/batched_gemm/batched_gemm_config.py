@@ -268,15 +268,6 @@ class BatchedGemmConfig:
     (:attr:`use_tile256_tmem_overlap`), and the epilogue warp count.
     """
 
-    metadata_tile_n: int = 0
-    """Token width represented by one external MoE metadata entry.
-
-    ``0`` means the compute token width (:attr:`tile_n` for swap-AB,
-    :attr:`tile_m` otherwise). A larger value lets a smaller FC1 compute tile
-    consume routing metadata shared with a wider FC2 tile without materializing
-    duplicated ``tile_idx`` and ``mn_limit`` tensors.
-    """
-
     # --- Semantic dtypes ---
     dtype_a: int = int(DType.E2M1)
     """Operand A element type, as a :class:`DType` integer value.
@@ -1761,21 +1752,6 @@ class BatchedGemmConfig:
         return self.batch_mode == int(BatchMode.BATCH_N)
 
     @property
-    def compute_token_tile(self) -> int:
-        """Token rows consumed by one compute CTA."""
-        return self.tile_n if self.is_swap_ab else self.tile_m
-
-    @property
-    def metadata_token_tile(self) -> int:
-        """Token rows represented by one external routing-metadata entry."""
-        return self.metadata_tile_n or self.compute_token_tile
-
-    @property
-    def metadata_compute_tile_ratio(self) -> int:
-        """Compute CTAs represented by one routing-metadata entry."""
-        return self.metadata_token_tile // self.compute_token_tile
-
-    @property
     def has_gated_epilogue(self) -> bool:
         """True for gated activations (``SWIGLU``/``GEGLU``/``SILU``);
         the paired output dimension is halved.
@@ -2727,18 +2703,6 @@ def validate_config(
 
     if cfg.tile_n not in (8, 16, 32, 64, 128, 256):
         raise ValueError(f"tile_n must be 8/16/32/64/128/256, got {cfg.tile_n}")
-
-    compute_token_tile = cfg.compute_token_tile
-    metadata_token_tile = cfg.metadata_token_tile
-    if (
-        metadata_token_tile < compute_token_tile
-        or metadata_token_tile % compute_token_tile != 0
-    ):
-        raise ValueError(
-            "metadata_tile_n must be a positive multiple of the compute token "
-            f"tile, got metadata_tile_n={metadata_token_tile}, "
-            f"compute_token_tile={compute_token_tile}"
-        )
 
     if cfg.epi_tile_n <= 0:
         raise ValueError(f"epi_tile_n must be positive, got {cfg.epi_tile_n}")

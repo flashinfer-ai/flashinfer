@@ -19,8 +19,6 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     DType,
     RouteImpl,
     TileScheduler,
-    make_config,
-    validate_config,
 )
 from flashinfer.prims_ts.moe.config_mapper import (
     _DType,
@@ -140,32 +138,13 @@ def test_bs1_deepseek_persistent_pair_gpu_correctness(
     )
 
 
-def test_nvfp4_tile256_pair_reuses_metadata_for_tile128_fc1():
-    pair = map_trtllm_nvfp4_moe_tactic(
-        [256, 0],
-        num_tokens=8192,
-        top_k=8,
-        num_local_experts=256,
-        activation_type=int(ActivationType.Swiglu),
-    )
-
-    fc1 = pair.fc1.cfg.build()
-    fc2 = pair.fc2.cfg.build()
-    assert fc1.tile_n == 128
-    assert fc1.metadata_tile_n == 256
-    assert fc2.tile_n == 256
-    assert fc2.metadata_tile_n == 256
-    assert fc1.num_stages_a == 3
-    assert fc2.num_stages_a == 4
-
-
 def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _build_schedule_validate,
     )
 
     pair = map_trtllm_nvfp4_moe_tactic(
-        [256, 0],
+        [128, 1],
         num_tokens=8192,
         top_k=8,
         num_local_experts=256,
@@ -191,13 +170,11 @@ def test_nvfp4_tile128_fused_tmem_allocation_has_no_standalone_sf_columns():
         pytest.param(1024, int(DType.BF16), id="two-k-tiles"),
     ),
 )
-def test_nvfp4_tile256_metadata_fused_fc1_gpu_correctness(
-    problem_k, dtype_c_override
-):
+def test_nvfp4_tile128_fused_fc1_gpu_correctness(problem_k, dtype_c_override):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
 
     pair = map_trtllm_nvfp4_moe_tactic(
-        [256, 0],
+        [128, 1],
         num_tokens=8192,
         top_k=8,
         num_local_experts=256,
@@ -258,46 +235,3 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     assert fc1.use_clc_fast_drain
     assert fc2.tile_scheduler == int(TileScheduler.PERSISTENT)
     assert fc2.use_clc_fast_drain
-
-
-def test_validation_rejects_nonintegral_metadata_tile_ratio():
-    cfg = make_config(
-        dtype_a=int(DType.BF16),
-        dtype_b=int(DType.BF16),
-        dtype_c=int(DType.BF16),
-        tile_k=64,
-        mma_k=16,
-        tile_n=128,
-        metadata_tile_n=192,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="metadata_tile_n must be a positive multiple of the compute token tile",
-    ):
-        validate_config(cfg)
-
-
-def test_validation_uses_tile_m_for_non_swap_metadata_ratio():
-    from dataclasses import replace
-
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
-
-    invalid_cfg = make_config(
-        batch_mode=int(BatchMode.BATCH_M),
-        dtype_a=int(DType.BF16),
-        dtype_b=int(DType.BF16),
-        dtype_c=int(DType.BF16),
-        metadata_tile_n=16,
-        mma_k=16,
-        tile_k=64,
-        tile_m=128,
-        tile_n=8,
-        transpose_mma_output=0,
-    )
-    with pytest.raises(ValueError, match="compute_token_tile=128"):
-        validate_config(invalid_cfg)
-
-    valid_cfg = replace(invalid_cfg, metadata_tile_n=256)
-    validate_config(valid_cfg)
-    assert valid_cfg.metadata_compute_tile_ratio == 2

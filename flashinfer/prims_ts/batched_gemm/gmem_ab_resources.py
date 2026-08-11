@@ -70,16 +70,6 @@ def nonnegative_mod(value, divisor: int):
     return value % Int32(divisor)
 
 
-def metadata_token_tile(cfg, token_tile, token_rows: int):
-    """Map a compute token tile to its external routing-metadata entry."""
-
-    metadata_rows = cfg.metadata_token_tile
-    ratio = metadata_rows // token_rows
-    if ratio > 1:
-        return nonnegative_div(token_tile, ratio)
-    return token_tile
-
-
 Constexpr = cutlass.Constexpr
 
 
@@ -140,12 +130,9 @@ class GmemAResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
-        self.tile_expert_idx = self.tile_idx_view.load(
-            idx=metadata_tile, vector_size=1
-        )[0]
+        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=metadata_tile, vector_size=1)[0],
+            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
             token_tile,
             token_rows,
         )
@@ -253,12 +240,9 @@ class GmemBResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
-        self.tile_expert_idx = self.tile_idx_view.load(
-            idx=metadata_tile, vector_size=1
-        )[0]
+        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=metadata_tile, vector_size=1)[0],
+            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
             token_tile,
             token_rows,
         )

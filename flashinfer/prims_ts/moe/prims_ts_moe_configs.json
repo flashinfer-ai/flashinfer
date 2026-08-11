@@ -328,7 +328,6 @@
             "num_stages_tmem_acc": 2,
             "mma_n": 128,
             "tile_n": 128,
-            "moe_tile_n": [128, 256],
             "epi_tile_n": 32,
             "tile_k": 512,
             "num_stages_a": 3,

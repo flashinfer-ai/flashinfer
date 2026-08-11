@@ -166,10 +166,6 @@ class BatchedGemmWorkQueue(WorkQueue):
             num_non_exiting_ctas = num_non_exiting_ctas_view.load(
                 idx=cutlass.Int32(0), vector_size=1
             )[0]
-            if cutlass.const_expr(self.cfg.metadata_compute_tile_ratio > 1):
-                num_non_exiting_ctas *= cutlass.Int32(
-                    self.cfg.metadata_compute_tile_ratio
-                )
         return token_cta_idx >= num_non_exiting_ctas
 
     @cute.jit

@@ -191,16 +191,7 @@ def _launch_early_exit_max_token_ctas(
         compute_max_num_ctas_in_token_dim_for_moe,
     )
 
-    token_tile_size = int(cfg.compute_token_tile)
-    metadata_tile_size = int(cfg.metadata_token_tile)
-    if metadata_tile_size % token_tile_size != 0:
-        raise ValueError(
-            "routing metadata tile size must be a multiple of the compute "
-            f"token tile size, got {metadata_tile_size} and {token_tile_size}"
-        )
-    metadata_compute_ctas = int(metadata_token_ctas) * (
-        metadata_tile_size // token_tile_size
-    )
+    token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
     cluster_dim_in_token = 1 if cfg.is_swap_ab else int(cfg.cluster_m)
     launch_token_ctas = compute_max_num_ctas_in_token_dim_for_moe(
         num_tokens=int(num_tokens),
@@ -209,10 +200,10 @@ def _launch_early_exit_max_token_ctas(
         token_tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
     )
-    if launch_token_ctas > metadata_compute_ctas:
+    if launch_token_ctas > int(metadata_token_ctas):
         raise ValueError(
             "routing metadata capacity is smaller than the required token CTA "
-            f"launch bound: need {launch_token_ctas}, got {metadata_compute_ctas}"
+            f"launch bound: need {launch_token_ctas}, got {metadata_token_ctas}"
         )
     return launch_token_ctas
 

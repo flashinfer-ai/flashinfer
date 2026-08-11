@@ -42,11 +42,7 @@ from .batched_gemm_config import (
     SfSmemToTmemCopy,
     TMEM_SF_PACK_SIZE_BYTES,
 )
-from .gmem_ab_resources import (
-    metadata_token_tile,
-    nonnegative_div,
-    nonnegative_mod,
-)
+from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -545,9 +541,8 @@ class SmemSfGatherResource(MemoryResource):
         token_tile = coord_mn // Int32(tile_rows)
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
-            metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
+                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
@@ -987,9 +982,8 @@ class SmemSfLdgstsResource(MemoryResource):
             tile_limit_idx = nonnegative_div(coord_mn, tile_rows)
         else:
             tile_limit_idx = coord_mn
-        metadata_tile = metadata_token_tile(self.cfg, tile_limit_idx, tile_rows)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
+            self.mn_limit.load(idx=tile_limit_idx, vector_size=1)[0],
             tile_limit_idx,
             tile_rows,
         )

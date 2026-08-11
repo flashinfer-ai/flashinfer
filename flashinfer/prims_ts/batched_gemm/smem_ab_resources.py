@@ -32,11 +32,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from .batched_gemm_config import BatchedGemmConfig, DType
-from .gmem_ab_resources import (
-    metadata_token_tile,
-    nonnegative_div,
-    nonnegative_mod,
-)
+from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -628,9 +624,8 @@ class SmemGatherResource(MemoryResource):
             coord_tile = tile_coord_m * Int32(tile_rows)
             token_tile = tile_coord_m
 
-        metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
+            self.mn_limit.load(idx=token_tile, vector_size=1)[0],
             token_tile,
             tile_rows,
         )
@@ -1135,9 +1130,8 @@ class SmemTmaGatherResource(MemoryResource):
 
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
-            metadata_tile = metadata_token_tile(self.cfg, token_tile, tile_rows)
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(idx=metadata_tile, vector_size=1)[0],
+                self.mn_limit.load(idx=token_tile, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )

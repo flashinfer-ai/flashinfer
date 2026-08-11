@@ -38,11 +38,7 @@ from .batched_gemm_config import (
     DType,
     SfLayout,
 )
-from .gmem_ab_resources import (
-    metadata_token_tile,
-    nonnegative_div,
-    nonnegative_mod,
-)
+from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
 
 Constexpr = cutlass.Constexpr
@@ -627,12 +623,9 @@ class GmemCResource(MemoryResource):
         if cutlass.const_expr(self.tile_idx_view is not None):
             if cutlass.const_expr(self.cfg.is_swap_ab):
                 token_tile = tile_coord_n
-                token_rows = self.cfg.tile_n
             else:
                 token_tile = tile_coord_m
-                token_rows = self.cfg.tile_m
-            metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
-            expert_idx = self.tile_idx_view.load(idx=metadata_tile, vector_size=1)[0]
+            expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
         self.tile_expert_idx = expert_idx
         if cutlass.const_expr(self.cfg.is_swap_ab):
             token_limit = Int32(self.cfg.tile_n)
@@ -645,9 +638,8 @@ class GmemCResource(MemoryResource):
                 token_tile = tile_coord_n
             else:
                 token_tile = tile_coord_m
-            metadata_tile = metadata_token_tile(self.cfg, token_tile, token_rows)
             token_limit = self._local_tile_limit(
-                self.mn_limit_view.load(idx=metadata_tile, vector_size=1)[0],
+                self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
                 token_tile,
                 token_rows,
             )
