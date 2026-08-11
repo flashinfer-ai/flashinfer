@@ -108,6 +108,10 @@ def mxfp8_quantize_per_block_32(
     return c_fp8, sfc_e8m0
 
 
+# Mixed MXFP8/BF16 runner compatibility name from the vendor drop.
+mxfp8_quantize_per_block_32_row = mxfp8_quantize_per_block_32
+
+
 # ---------------------------------------------------------------------------
 # referench check helper
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""CuTeDSL BF16 MegaMoE backend."""
+"""CuTeDSL mixed MXFP8-weight/BF16-activation MegaMoE backend."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import torch
 from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
-from ......core.runtime import bf16_cutedsl_runtime_requirements
+from ......core.runtime import bf16_mxfp8_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
 from ......weights import MoEWeightPack
-from .config import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+from .config import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_bf16_forward_inputs
 from .weights import (
     TransformedMegaWeights,
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
-def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
+def _clamp(config: Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
     return (
         config.gate_up_clamp
         if config.gate_up_clamp is not None
@@ -32,21 +32,19 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
     )
 
 
-@register_mega_kernel(
-    "sm100_bf16_bf16_bf16_cutedsl", deprecated_aliases=("bf16_cutedsl",)
-)
-class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
+@register_mega_kernel("sm100_bf16_mxfp8_bf16_cutedsl")
+class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm100_bf16_bf16_bf16_cutedsl"
+        return "sm100_bf16_mxfp8_bf16_cutedsl"
 
-    def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
+    def __init__(self, config: Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
-        return bf16_cutedsl_runtime_requirements(bootstrap)
+        return bf16_mxfp8_cutedsl_runtime_requirements(bootstrap)
 
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
@@ -57,16 +55,13 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # The drop's own shim bound (kernel_src/cutedsl_megamoe/shim/
-            # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
-            # SF-word 128 default. 32 covers hidden here; the stricter
-            # intermediate bound is enforced below.
-            alignment=32,
         )
         if fleet_params.token_hidden_size % 32:
-            raise ValueError("BF16 MegaMoE requires hidden size divisible by 32.")
+            raise ValueError("mixed MegaMoE requires hidden size divisible by 32.")
         if self._kernel_config.intermediate_size % 64:
-            raise ValueError("BF16 MegaMoE requires intermediate size divisible by 64.")
+            raise ValueError(
+                "mixed MegaMoE requires intermediate size divisible by 64."
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -75,6 +70,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            kind=self._kernel_config.kind,
         )
 
     def validate_transformed_weights(
@@ -87,15 +83,18 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            kind=self._kernel_config.kind,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_bf16_mega_moe
+        from ......kernel_src.cutedsl_megamoe import (
+            get_symm_buffer_for_bf16_mxfp8_mega_moe,
+        )
 
         config = self._kernel_config
-        return get_symm_buffer_for_bf16_mega_moe(
+        return get_symm_buffer_for_bf16_mxfp8_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             config.top_k,
@@ -103,6 +102,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
+            kind=config.kind,
             gate_up_clamp=_clamp(config),
             in_kernel_fc2_reduce=config.in_kernel_fc2_reduce,
             token_back_mode=config.token_back_mode,
@@ -146,22 +146,11 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import bf16_mega_moe
+        from ......kernel_src.cutedsl_megamoe import bf16_mxfp8_mega_moe
 
         if self._autotune_pending:
-            from ......kernel_src.cutedsl_megamoe import autotune_bf16_mega_moe
-
-            autotune_bf16_mega_moe(
-                output,
-                transformed_weights[0],
-                transformed_weights[1],
-                workspace,
-                num_tokens=output.shape[0],
-                gate_up_clamp=_clamp(self._kernel_config),
-                activation_clamp=self._kernel_config.activation_clamp,
-            )
-            self._autotune_pending = False
-        bf16_mega_moe(
+            raise NotImplementedError("mixed MegaMoE autotuning is not implemented.")
+        bf16_mxfp8_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],
@@ -180,7 +169,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         from ......core.kernel.workspace_pool import knobs_pool_key
 
         return (
-            "sm100_bf16_bf16_bf16_cutedsl",
+            "sm100_bf16_mxfp8_bf16_cutedsl",
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -190,6 +179,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             config.top_k,
             fleet_params.token_hidden_size,
             config.intermediate_size,
+            config.kind,
             _clamp(config),
             config.in_kernel_fc2_reduce,
             config.token_back_mode,
