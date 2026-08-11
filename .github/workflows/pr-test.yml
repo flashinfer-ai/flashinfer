@@ -118,6 +118,10 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Docker tag: $TAG"
 
+      - name: Load runtime CUDA matrix
+        id: cuda-versions
+        run: echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
+
       - name: Check Skip Conditions
         id: check
         run: |
@@ -155,11 +159,12 @@ jobs:
         env:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
+          RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
-                for cuda in cu126 cu128 cu129 cu130; do
+                for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
                   jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
                     name: "AOT Build Import (\($arch), \($cuda))",
                     kind: "aot",

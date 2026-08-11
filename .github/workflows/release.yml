@@ -10,6 +10,8 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release.yml'
+      - 'ci/cuda-versions.json'
+      - 'scripts/build_flashinfer_jit_cache_whl.sh'
 
 jobs:
   setup:
@@ -18,6 +20,7 @@ jobs:
       version: ${{ steps.set-version.outputs.version }}
       release_tag: ${{ steps.set-version.outputs.release_tag }}
       is_pr: ${{ steps.set-version.outputs.is_pr }}
+      jit_cache_cuda_matrix: ${{ steps.cuda-versions.outputs.jit_cache }}
     steps:
       - name: Determine if running in PR mode
         id: check-mode
@@ -82,6 +85,10 @@ jobs:
             echo "version=${VERSION_TXT}" >> $GITHUB_OUTPUT
             echo "release_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Load CUDA wheel matrix
+        id: cuda-versions
+        run: echo "jit_cache=$(jq -c '.jit_cache' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
   build-flashinfer-python:
     needs: setup
@@ -156,11 +163,12 @@ jobs:
           retention-days: 7
 
   build-flashinfer-jit-cache:
+    name: JIT cache (${{ matrix.cuda.label }}, ${{ matrix.arch }})
     needs: setup
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["12.8", "12.9", "13.0"]
+        cuda: ${{ fromJSON(needs.setup.outputs.jit_cache_cuda_matrix) }}
         arch: ['x86_64', 'aarch64']
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
@@ -181,15 +189,15 @@ jobs:
 
       - name: Build wheel in container
         env:
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
         run: |
           # Extract CUDA major and minor versions
-          CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
-          CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
+          CUDA_MAJOR=$(echo "${{ matrix.cuda.version }}" | cut -d'.' -f1)
+          CUDA_MINOR=$(echo "${{ matrix.cuda.version }}" | cut -d'.' -f2)
           export CUDA_MAJOR
           export CUDA_MINOR
-          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
+          export FLASHINFER_LOCAL_VERSION="${{ matrix.cuda.label }}"
 
           mkdir -p ${{ github.workspace }}/ci-cache
 
@@ -197,9 +205,10 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v ${{ github.workspace }}/ci-cache:/ci-cache \
             -e FLASHINFER_CI_CACHE=/ci-cache \
-            -e CUDA_VERSION="${{ matrix.cuda }}" \
+            -e CUDA_VERSION="${{ matrix.cuda.version }}" \
             -e CUDA_MAJOR="$CUDA_MAJOR" \
             -e CUDA_MINOR="$CUDA_MINOR" \
+            -e PYTORCH_INDEX="${{ matrix.cuda.pytorch_index }}" \
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
@@ -219,8 +228,7 @@ jobs:
       - name: Create artifact name
         id: artifact-name
         run: |
-          CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
-          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+          echo "name=jit-cache-${{ matrix.cuda.label }}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload flashinfer-jit-cache artifact
         uses: actions/upload-artifact@v4
@@ -323,7 +331,7 @@ jobs:
           # Each wheel can be several GB, so we download, upload, delete, repeat
           mkdir -p dist-jit-cache
 
-          for cuda in 128 129 130; do
+          for cuda in $(jq -r '.jit_cache[].label | ltrimstr("cu")' ci/cuda-versions.json); do
             for arch in x86_64 aarch64; do
               ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
               echo "Processing ${ARTIFACT_NAME}..."

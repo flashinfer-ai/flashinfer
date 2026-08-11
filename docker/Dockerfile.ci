@@ -1,0 +1,74 @@
+ARG CUDA_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu24.04
+FROM ${CUDA_IMAGE} AS base
+
+ARG PYTORCH_INDEX=cu129
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/install/install_python.sh /install/install_python.sh
+RUN bash /install/install_python.sh /opt/conda py312
+
+WORKDIR /workspace
+
+RUN echo "source activate py312" >> /etc/bash.bashrc
+ENV PATH="/opt/conda/envs/py312/bin:/opt/conda/bin:$PATH"
+
+# Cover both CUDA-major layouts used by NVIDIA's pip packages. The path that
+# does not exist for a particular CUDA major is harmless.
+ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cu13/lib:/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH"
+ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
+
+COPY requirements.txt /install/requirements.txt
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}"
+
+RUN conda install -n py312 -y mpi4py mpich
+
+FROM base AS dev
+
+ARG USERNAME=devuser
+ARG USER_UID=1003
+ARG USER_GID=${USER_UID}
+
+USER root
+RUN apt-get update && apt-get install -y \
+    clang-format \
+    clangd-19 \
+    sudo \
+    vim \
+    zsh \
+    && groupadd --gid "${USER_GID}" "${USERNAME}" \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" -m "${USERNAME}" \
+    && echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}" \
+    && chmod 0440 "/etc/sudoers.d/${USERNAME}" \
+    && if grep ubuntu:x:1000:1000 /etc/passwd >/dev/null; then userdel -f -r ubuntu; fi \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install pre-commit
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+ENV PYTHONUSERBASE="/home/${USERNAME}/.local"
+ENV PATH="/home/${USERNAME}/.local/bin:/usr/lib/llvm-19/bin:$PATH"
+
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+RUN git clone https://github.com/zsh-users/zsh-autosuggestions "${ZSH_CUSTOM:-/home/${USERNAME}/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"
+RUN sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="fino-time"/' ~/.zshrc \
+    && sed -i 's/plugins=(git)/plugins=(git zsh-autosuggestions)/' ~/.zshrc
+
+ENV SHELL=/bin/zsh
+CMD ["zsh"]
+
+FROM base AS ci
+
+RUN mkdir -p /opt/pip-user && chmod 1777 /opt/pip-user
+ENV PYTHONUSERBASE=/opt/pip-user
+ENV PATH="/opt/pip-user/bin:$PATH"
+CMD ["bash"]
