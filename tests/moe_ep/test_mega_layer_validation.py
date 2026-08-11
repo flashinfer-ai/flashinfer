@@ -634,7 +634,7 @@ def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.comm import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         ensure_not_capturing,
     )
 

@@ -63,6 +63,7 @@ _check_dsl_perf_floor()
 
 from .comm import (
     bootstrap_dist,
+    ensure_not_capturing,
     finalize_dist,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
@@ -86,6 +87,7 @@ from .kernel_helpers import (
     to_blocked,
 )
 from .nvfp4 import (
+    COMBINE_FORMAT_NAMES,
     MegaMoENvfp4Config,
     MegaMoENvfp4Frontend,
     MegaMoENvfp4Inputs,
@@ -114,6 +116,7 @@ from . import tuner
 from .tuner import (
     CORRECTNESS_KNOBS,
     PERF_KNOBS,
+    default_knobs,
     iter_candidates,
     with_knobs,
 )
@@ -123,6 +126,8 @@ from .autotune import (
     autotune_knobs,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
+    mxfp8_candidates,
+    nvfp4_candidates,
 )
 
 # Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
@@ -135,7 +140,7 @@ from .quant_stage import (
 )
 
 # Persistent offline-tuning knob cache (pure-lookup hot path).
-from .knob_cache import lookup_knobs, record_knobs, resolve_knobs
+from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
 __all__ = [
     # paths
@@ -147,11 +152,13 @@ __all__ = [
     "note_staged_tokens",
     "staged_tokens",
     # knob_cache
+    "knob_cache_path",
     "lookup_knobs",
     "record_knobs",
     "resolve_knobs",
     # comm
     "bootstrap_dist",
+    "ensure_not_capturing",
     "finalize_dist",
     "free_sym_tensor",
     "reset_compiled_mega_workspaces",
@@ -169,6 +176,7 @@ __all__ = [
     "round_up",
     "to_blocked",
     # nvfp4
+    "COMBINE_FORMAT_NAMES",
     "MegaMoENvfp4Config",
     "MegaMoENvfp4Frontend",
     "MegaMoENvfp4Inputs",
@@ -193,10 +201,13 @@ __all__ = [
     "tuner",
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
+    "default_knobs",
     "iter_candidates",
     "with_knobs",
     # autotune
     "autotune_knobs",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "mxfp8_candidates",
+    "nvfp4_candidates",
 ]

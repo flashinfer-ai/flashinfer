@@ -1117,7 +1117,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         MegaMoENvfp4Config,
     )
 
@@ -1170,7 +1170,7 @@ def test_tuner_is_valid_quantized_combine_rules():
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         nvfp4_candidates,
     )
 

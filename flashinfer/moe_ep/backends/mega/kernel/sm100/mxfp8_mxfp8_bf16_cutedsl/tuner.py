@@ -18,9 +18,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     from ......kernel_src.cutedsl_megamoe import (
         autotune_mxfp8_mega_moe,
         create_dummy_mxfp8_inputs,
+        mxfp8_candidates,
         resolve_knobs,
     )
-    from ......kernel_src.cutedsl_megamoe.shim.autotune import mxfp8_candidates
 
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
     if live_tokens > max_tokens:

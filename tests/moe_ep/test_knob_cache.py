@@ -115,7 +115,7 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
 
 def test_resolve_falls_back_to_heuristic(monkeypatch, tmp_path):
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         default_knobs,
     )
 

@@ -279,7 +279,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         state = self._thunk_state
         if state is None or state[0] != key or key[2] is None:
-            from ......kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+            from ......kernel_src.cutedsl_megamoe import (
                 MegaMoENvfp4Inputs,
             )
 

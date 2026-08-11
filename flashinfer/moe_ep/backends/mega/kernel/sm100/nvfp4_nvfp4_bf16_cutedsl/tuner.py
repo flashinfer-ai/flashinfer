@@ -16,12 +16,12 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     from ......kernel_src.cutedsl_megamoe import (
+        COMBINE_FORMAT_NAMES,
         autotune_nvfp4_mega_moe,
         create_dummy_nvfp4_inputs,
+        nvfp4_candidates,
         resolve_knobs,
     )
-    from ......kernel_src.cutedsl_megamoe.shim.autotune import nvfp4_candidates
-    from ......kernel_src.cutedsl_megamoe.shim.nvfp4 import COMBINE_FORMAT_NAMES
 
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
     if live_tokens > max_tokens:

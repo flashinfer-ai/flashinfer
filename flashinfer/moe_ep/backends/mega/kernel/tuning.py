@@ -126,8 +126,11 @@ def run_tuning(args, tune_one: Callable[[Any, int, int, int], dict]) -> int:
     """Dist lifecycle + per-bucket sweep loop shared by the cutedsl tuners."""
     import torch
 
-    from ....kernel_src.cutedsl_megamoe import finalize_dist, init_dist
-    from ....kernel_src.cutedsl_megamoe.shim.knob_cache import _cache_path
+    from ....kernel_src.cutedsl_megamoe import (
+        finalize_dist,
+        init_dist,
+        knob_cache_path,
+    )
 
     rank, world_size = init_dist()
     try:
@@ -137,6 +140,6 @@ def run_tuning(args, tune_one: Callable[[Any, int, int, int], dict]) -> int:
     finally:
         finalize_dist()
     if rank == 0:
-        path = _cache_path()
+        path = knob_cache_path()
         print(f"[moe_ep-tune] done; cache: {path or 'DISABLED'}", flush=True)
     return 0
