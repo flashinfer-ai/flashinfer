@@ -643,7 +643,9 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"   # >= 4.5.2
+    # CuTe-DSL upgrades can leave a stale package path; reinstall it cleanly.
+    python -m pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+    python -m pip install "nvidia-cutlass-dsl[cu13]>=4.6.0"
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
