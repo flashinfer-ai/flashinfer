@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_f130d6dc38.
-// Cake revision: 1ceebb304fddd677e848d12d8ef75a97667eb5fd; raw SHA-256: f37abcc4aa498897c59c04afe256e31900dae95a66ea7d774c474939b25dcde0.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_5ec0acebab.
+// Cake revision: d1d273a6d69a49953a9927b4ca509ea9cd0eefe5; raw SHA-256: 40906a8c6e0359d6e4544ac1abb4ab044f6da5df3e32454d8180eb2a8538aae7.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -894,8 +894,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     for (int residual_col = 0; residual_col < 16; residual_col++) {
                         int token_col = residual_half * 16 + residual_col;
                         __nv_bfloat16 v_value = smem_v_all[compute_stage * 20992 + (unsigned int)(token_col * 128) + (unsigned int)state_row];
-                        float _cvt_f32_3 = __bfloat162float(v_value);
-                        residual_v[residual_col] = _cvt_f32_3;
+                        float _cvt_f32_4 = __bfloat162float(v_value);
+                        residual_v[residual_col] = _cvt_f32_4;
                         residual_beta[residual_col] = smem_prep_beta_all[compute_stage * 10496 + (unsigned int)token_col];
                     }
                     #pragma unroll
@@ -1341,7 +1341,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             beta_value = _tanh_approx_2 * 0.5f + 0.5f;
                         }
                     }
-                    smem_prep_beta_all[stage_f32 + lane] = beta_value;
+                    __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(beta_value);
+                    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_0);
+                    smem_prep_beta_all[stage_f32 + lane] = _cvt_f32_1;
                 }
                 if (prep_tid < 128) {
                     int gate_col = prep_tid;
@@ -1361,8 +1363,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         if (gate_needs_compute != 0) {
                             if (gate_token < eos_3) {
                                 __nv_bfloat16 gate_raw = smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col];
-                                float _cvt_f32_1 = __bfloat162float(gate_raw);
-                                float gate_arg = gate_rate * (_cvt_f32_1 + gate_bias);
+                                float _cvt_f32_2 = __bfloat162float(gate_raw);
+                                float gate_arg = gate_rate * (_cvt_f32_2 + gate_bias);
                                 float _tanh_approx_3;
                                 asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(gate_arg * 0.5f));
                                 float gate_sigmoid = _tanh_approx_3 * 0.5f + 0.5f;
@@ -1534,7 +1536,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     for (int elem_in_segment_1 = 0; elem_in_segment_1 < 8; elem_in_segment_1++) {
                         int col = segment * 8 + elem_in_segment_1;
                         float prefix = smem_gate_all[stage_f32 + row * 128 + col];
-                        float common_log2 = lower_bound * 1.4426950408889634f * 8.0f;
+                        float common_log2 = smem_gate_all[stage_f32 + 1024 + col];
                         float _exp2_1 = approx_exp2(prefix - common_log2);
                         float decay = _exp2_1;
                         qd_vec[elem_in_segment_1] = decay;
@@ -2044,8 +2046,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                                     if (restore_gate_token < eos_3) {
                                         __nv_bfloat16 restore_gate_raw = g[(restore_gate_token * (long long)num_heads + (long long)head_idx_2) * 128 + (long long)restore_col];
                                         float restore_gate_bias = dt_bias[head_idx_2 * 128 + restore_col];
-                                        float _cvt_f32_2 = __bfloat162float(restore_gate_raw);
-                                        float restore_gate_arg = gate_rate_1 * (_cvt_f32_2 + restore_gate_bias);
+                                        float _cvt_f32_3 = __bfloat162float(restore_gate_raw);
+                                        float restore_gate_arg = gate_rate_1 * (_cvt_f32_3 + restore_gate_bias);
                                         float _tanh_approx_4;
                                         asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(restore_gate_arg * 0.5f));
                                         float restore_gate_sigmoid = _tanh_approx_4 * 0.5f + 0.5f;

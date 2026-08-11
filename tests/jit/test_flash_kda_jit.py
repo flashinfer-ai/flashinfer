@@ -31,8 +31,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     manifest = json.loads(manifest_path.read_text())
 
     assert manifest["schema_version"] == 1
-    assert manifest["cake_revision"] == "1ceebb304fddd677e848d12d8ef75a97667eb5fd"
-    assert manifest["cake_tree"] == "26bbed7c748032fa9cf2507d8c627dfb36da5146"
+    assert manifest["cake_revision"] == "d1d273a6d69a49953a9927b4ca509ea9cd0eefe5"
+    assert manifest["cake_tree"] == "a8b50db5e7d8a921d86a9073946c33192dd7da1f"
     assert manifest["architecture_artifacts_are_separate"] is True
     assert manifest["generated_source_text_equal_across_architectures"] is True
     assert set(manifest["profiles"]) == {
@@ -52,13 +52,13 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     expected_variants = {
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
-            "f37abcc4aa498897c59c04afe256e31900dae95a66ea7d774c474939b25dcde0",
-            "e362f3b6af3f7df35e1c57332b6e3da544ee091a1424917c2ba48beef5605a77",
-            "flashkda_bf16_fused_m128_f130d6dc38",
-            145005,
+            "40906a8c6e0359d6e4544ac1abb4ab044f6da5df3e32454d8180eb2a8538aae7",
+            "bc70d70ac1adb9458b039b154f861526a518cb2d9761e4280dd27b34055ff4e3",
+            "flashkda_bf16_fused_m128_5ec0acebab",
+            145150,
             219136,
-            "1ceebb304fddd677e848d12d8ef75a97667eb5fd",
-            "26bbed7c748032fa9cf2507d8c627dfb36da5146",
+            "d1d273a6d69a49953a9927b4ca509ea9cd0eefe5",
+            "a8b50db5e7d8a921d86a9073946c33192dd7da1f",
         ),
         "n32": (
             "flashkda_bf16_fused_m128.cu",
@@ -169,8 +169,8 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
         (
             "m128_n16",
             219136,
-            "f37abcc4aa498897c59c04afe256e31900dae95a66ea7d774c474939b25dcde0",
-            "f130d6dc38",
+            "40906a8c6e0359d6e4544ac1abb4ab044f6da5df3e32454d8180eb2a8538aae7",
+            "5ec0acebab",
             True,
         ),
     ],
@@ -430,8 +430,8 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     assert sm103a.name == "flash_kda_bf16_fused_m128_9e356f6c5c_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_f130d6dc38_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_f130d6dc38_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_5ec0acebab_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_5ec0acebab_sm103a"
 
 
 @pytest.mark.parametrize(
