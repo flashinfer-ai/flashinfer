@@ -2120,6 +2120,11 @@ def gated_delta_rule_mtp(
         )
         # Kernel loads indices as int32; convert rather than reinterpret.
         if initial_state_indices.dtype != torch.int32:
+            iinfo = torch.iinfo(torch.int32)
+            assert (
+                int(initial_state_indices.min()) >= iinfo.min
+                and int(initial_state_indices.max()) <= iinfo.max
+            ), "initial_state_indices must fit in int32 before narrowing"
             initial_state_indices = initial_state_indices.to(torch.int32)
     _io_dtype = q.dtype
     HK = k.shape[2]
