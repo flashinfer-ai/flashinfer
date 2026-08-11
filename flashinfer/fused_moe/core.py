@@ -1002,6 +1002,13 @@ def cutlass_fused_moe(
             - gemm2 dequant scale
             - gemm1 input dequant scale
 
+        Humming FP8 x MXFP4 (``use_wfp4afp8_humming=True``):
+            - gemm1 folded weight block scales
+            - gemm1 per-local-expert residual scale, including the fixed ``2^6`` compensation
+            - reserved scalar or per-local-expert gemm2 activation scale
+            - gemm2 folded weight block scales
+            - gemm2 per-local-expert residual scale, including the fixed ``2^6`` compensation
+
     fc1_expert_biases : Optional[torch.Tensor]
         GEMM1 biases for each expert.
 
