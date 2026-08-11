@@ -45,10 +45,10 @@ H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.
 
 The frozen H12 N16 provenance is Cake revision
-``b89b287ca1c0c1d3d92ae56688404aabb76e5366`` at tree
-``5693e582e4315919659955f7fca747777f6f8439``. The schedule is module
-``flashkda_bf16_fused_m128_de41cb34a6`` with raw source SHA-256
-``b4ec98f5914e7f8939e18d79ed45a538c5a09e669566917325b7d08037ad4144``.
+``1ceebb304fddd677e848d12d8ef75a97667eb5fd`` at tree
+``26bbed7c748032fa9cf2507d8c627dfb36da5146``. The schedule is module
+``flashkda_bf16_fused_m128_f130d6dc38`` with raw source SHA-256
+``f37abcc4aa498897c59c04afe256e31900dae95a66ea7d774c474939b25dcde0``.
 The N32 schedule remains provenance-pinned to Cake revision
 ``691136208f24a5160fcc5940ea4064e5613db2e4`` at tree
 ``48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3`` as module

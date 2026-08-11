@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_de41cb34a6.
-// Cake revision: b89b287ca1c0c1d3d92ae56688404aabb76e5366; raw SHA-256: b4ec98f5914e7f8939e18d79ed45a538c5a09e669566917325b7d08037ad4144.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_f130d6dc38.
+// Cake revision: 1ceebb304fddd677e848d12d8ef75a97667eb5fd; raw SHA-256: f37abcc4aa498897c59c04afe256e31900dae95a66ea7d774c474939b25dcde0.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1534,7 +1534,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     for (int elem_in_segment_1 = 0; elem_in_segment_1 < 8; elem_in_segment_1++) {
                         int col = segment * 8 + elem_in_segment_1;
                         float prefix = smem_gate_all[stage_f32 + row * 128 + col];
-                        float common_log2 = smem_gate_all[stage_f32 + 1024 + col];
+                        float common_log2 = lower_bound * 1.4426950408889634f * 8.0f;
                         float _exp2_1 = approx_exp2(prefix - common_log2);
                         float decay = _exp2_1;
                         qd_vec[elem_in_segment_1] = decay;
