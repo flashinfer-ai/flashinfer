@@ -363,6 +363,7 @@ def create_trtllm_moe_runner_class(
                     kwargs["gemm1_weights"],
                     kwargs["gemm1_weights_scale"],
                     kwargs["gemm1_bias"],
+                    moe_inputs.gemm1_lora_delta,
                     kwargs["gemm1_alpha"],
                     kwargs["gemm1_beta"],
                     kwargs["gemm1_clamp_limit"],
@@ -375,6 +376,9 @@ def create_trtllm_moe_runner_class(
                     kwargs["per_token_scale"],
                     kwargs["num_experts"],
                     self.top_k,
+                    kwargs.get(
+                        "num_fused_shared_experts", self.num_fused_shared_experts
+                    ),
                     kwargs["n_group"],
                     kwargs["topk_group"],
                     self.intermediate_size,

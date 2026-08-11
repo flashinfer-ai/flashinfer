@@ -320,6 +320,8 @@ class CUDAGraphMoE:
                 "tune_max_num_tokens", TUNE_MAX_NUM_TOKENS
             ),
             "norm_topk_prob": self.config.get("norm_topk_prob", True),
+            "num_fused_shared_experts": self.config.get("num_fused_shared_experts")
+            or None,
         }
         if self.config.get("moe_gemm_backend") == MoeGemmBackend.PRIMS_TS:
             op_kwargs["weight_layout"] = self.config.get(
@@ -765,6 +767,9 @@ class FP4Moe(Moe):
         tune_max_num_tokens = kwargs.get("tune_max_num_tokens", TUNE_MAX_NUM_TOKENS)
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
         moe_gemm_backend = kwargs.get("moe_gemm_backend", MoeGemmBackend.TRTLLM)
+        num_fused_shared_experts = kwargs.get("num_fused_shared_experts", 0)
+        num_routed_experts = num_experts - num_fused_shared_experts
+        routed_top_k = top_k - num_fused_shared_experts
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         if self.quant_mode == QuantMode.FP4_NVFP4_NVFP4:
@@ -785,8 +790,9 @@ class FP4Moe(Moe):
         # Create CUDA graph configuration
         config = {
             "hidden_states_scale_global": hidden_states_scale_global,
-            "num_experts": num_experts,
-            "top_k": top_k,
+            "num_experts": num_routed_experts,
+            "top_k": routed_top_k,
+            "num_fused_shared_experts": num_fused_shared_experts,
             "n_groups": n_groups,
             "top_k_groups": top_k_groups,
             "intermediate_size": intermediate_size,
@@ -808,6 +814,51 @@ class FP4Moe(Moe):
             "expert_logits": expert_logits,
             "routing_bias": routing_bias,
         }
+
+        if kwargs.get("return_full_output", False):
+            input_quantized = self.quantize_inputs(
+                hidden_states_orig,
+                hidden_states_scale_global,
+                is_swizzling=False,
+            )
+            op_kwargs = {
+                "routing_logits": expert_logits,
+                "routing_bias": routing_bias,
+                "hidden_states": input_quantized["hidden_states"],
+                "hidden_states_scale": input_quantized["hidden_states_scale"],
+                "gemm1_weights": static_data["gemm1_weights_fp4_shuffled"],
+                "gemm1_weights_scale": static_data["gemm1_scales_fp4_shuffled"],
+                "gemm1_bias": gemm1_bias,
+                "gemm1_alpha": None,
+                "gemm1_beta": None,
+                "gemm1_clamp_limit": None,
+                "gemm2_weights": static_data["gemm2_weights_fp4_shuffled"],
+                "gemm2_weights_scale": static_data["gemm2_scales_fp4_shuffled"],
+                "gemm2_bias": gemm2_bias,
+                "output1_scale_scalar": static_data["scale_c_fc1"],
+                "output1_scale_gate_scalar": static_data["scale_gate_fc1"],
+                "output2_scale_scalar": static_data["scale_c_fc2"],
+                "num_experts": num_routed_experts,
+                "top_k": routed_top_k,
+                "n_group": n_groups,
+                "topk_group": top_k_groups,
+                "intermediate_size": intermediate_size,
+                "local_expert_offset": 0,
+                "local_num_experts": num_routed_experts,
+                "routed_scaling_factor": routed_scaling,
+                "routing_method_type": routing_method_type,
+                "activation_type": activation_type,
+                "do_finalize": False,
+                "tune_max_num_tokens": tune_max_num_tokens,
+                "norm_topk_prob": norm_topk_prob,
+                "num_fused_shared_experts": num_fused_shared_experts or None,
+            }
+            if moe_gemm_backend == MoeGemmBackend.PRIMS_TS:
+                op_kwargs["weight_layout"] = static_data.get(
+                    "weight_layout", WeightLayout.MajorK
+                )
+            with autotune(enable_autotune, tuning_buckets=autotune_tuning_buckets):
+                return moe_op(**op_kwargs)
 
         # Create, capture and launch CUDA graph in one shot
         cuda_graph = CUDAGraphMoE(self, static_data, **config)
@@ -3526,6 +3577,7 @@ def run_moe_test(
     norm_topk_prob=True,
     check_reference=True,
     check_intermediate_output=False,
+    verify_unfinalized_weight_dtype=False,
     moe_gemm_backend=MoeGemmBackend.TRTLLM,
 ):
     """Common test logic for all routing methods."""
@@ -3741,9 +3793,20 @@ def run_moe_test(
         ),
         num_fused_shared_experts=num_fused_shared_experts,
         norm_topk_prob=norm_topk_prob,
-        return_full_output=check_intermediate_output,
+        return_full_output=check_intermediate_output
+        or verify_unfinalized_weight_dtype,
         moe_gemm_backend=moe_gemm_backend,
     )
+
+    if verify_unfinalized_weight_dtype:
+        assert isinstance(output_dequant_actual, list) and len(
+            output_dequant_actual
+        ) >= 2
+        assert output_dequant_actual[1].dtype == torch.bfloat16, (
+            f"expected unfinalized expert_weights dtype bf16, got "
+            f"{output_dequant_actual[1].dtype}"
+        )
+        return output_dequant_reference, output_dequant_actual, args_dequant
 
     # When a lora delta is set, the kernel returns the post-activation FC1 output
     # exposed as the third element. Validate it.

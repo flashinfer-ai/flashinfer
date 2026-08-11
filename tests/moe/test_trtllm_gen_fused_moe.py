@@ -17,7 +17,7 @@ limitations under the License.
 import pytest
 import torch
 
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.fused_moe import (
     prims_ts_fp4_block_scale_moe,
     prims_ts_fp4_block_scale_routed_moe,

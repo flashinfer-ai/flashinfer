@@ -2121,109 +2121,128 @@ def _batched_gemm_kernel_bf16_body(
         ),
     )
 
-    # Setup
-    task_manager.setup_resources_and_tasks()
+    # Early exit for dynamic-batch kernels: a max token-CTA grid is launched
+    # for CUDA graph reuse and inactive CTAs skip execution.  The guard sits
+    # here -- below resource/task construction -- so allocator registration
+    # (trace-time layout bookkeeping) stays outside runtime control flow.
+    if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
+        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
+        num_non_exiting_ctas = num_non_exiting_ctas_view.load(
+            idx=Int32(0), vector_size=1
+        )[0]
+        block_m, block_n, _ = cute.arch.block_idx()
+        if cutlass.const_expr(cfg.is_swap_ab):
+            token_cta_idx = block_n
+        else:
+            token_cta_idx = block_m
+        is_active_cta = token_cta_idx < num_non_exiting_ctas
+    else:
+        is_active_cta = True
 
-    # Fence all mbarrier initializations before
-    # any pipeline wait/arrive.  ``PipelineConfig`` creation uses
-    # ``defer_sync=True``, so the common fence/sync has to happen here after
-    # every resource has initialized its barriers.
-    tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
-    tmem_dealloc_mbar = None
-    tmem_dealloc_mbar_ptr = None
-    if cutlass.const_expr(cfg.has_cluster):
-        tmem_dealloc_mbar = smem_allocator.get(tmem_dealloc_mbar_alloc)
-        tmem_dealloc_mbar_ptr = cute.make_ptr(
-            cutlass.Int64,
-            tmem_dealloc_mbar.data_ptr(),
+    if is_active_cta:
+        # Setup
+        task_manager.setup_resources_and_tasks()
+
+        # Fence all mbarrier initializations before
+        # any pipeline wait/arrive.  ``PipelineConfig`` creation uses
+        # ``defer_sync=True``, so the common fence/sync has to happen here after
+        # every resource has initialized its barriers.
+        tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
+        tmem_dealloc_mbar = None
+        tmem_dealloc_mbar_ptr = None
+        if cutlass.const_expr(cfg.has_cluster):
+            tmem_dealloc_mbar = smem_allocator.get(tmem_dealloc_mbar_alloc)
+            tmem_dealloc_mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                tmem_dealloc_mbar.data_ptr(),
+                cutlass.AddressSpace.smem,
+            )
+            if warp_idx == 0:
+                if prims.elect_sync():
+                    cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE)
+            cute.arch.mbarrier_init_fence()
+        tmem_ptr_smem = cute.make_ptr(
+            cutlass.Int32,
+            tmem_ptr_i32.data_ptr(),
             cutlass.AddressSpace.smem,
         )
-        if warp_idx == 0:
-            if prims.elect_sync():
-                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE)
-        cute.arch.mbarrier_init_fence()
-    tmem_ptr_smem = cute.make_ptr(
-        cutlass.Int32,
-        tmem_ptr_i32.data_ptr(),
-        cutlass.AddressSpace.smem,
-    )
-    cluster_vmnk = cute.make_layout((cfg.cluster_m, 1, 1, 1))
-    pipeline.pipeline_init_arrive(cluster_vmnk, is_relaxed=True)
-    pipeline.pipeline_init_wait(cluster_vmnk)
+        cluster_vmnk = cute.make_layout((cfg.cluster_m, 1, 1, 1))
+        pipeline.pipeline_init_arrive(cluster_vmnk, is_relaxed=True)
+        pipeline.pipeline_init_wait(cluster_vmnk)
 
-    # TMEM allocation
-    # Allocate enough columns for both the explicit TS layout and generated
-    # kernel fixed offsets. cfg.tmem_total_cols is derived from KernelTraits-style
-    # formulas and includes the tile256 max-overlap lower bound.
-    num_tmem_cols = _round_up_tmem_columns(
-        max(tmem_allocator.total_tmem_columns, cfg.tmem_total_cols)
-    )
-    if warp_idx == 0:
-        cute.arch.alloc_tmem(
-            num_tmem_cols,
-            tmem_ptr_smem,
-            is_two_cta=cfg.has_cluster,
+        # TMEM allocation
+        # Allocate enough columns for both the explicit TS layout and generated
+        # kernel fixed offsets. cfg.tmem_total_cols is derived from KernelTraits-style
+        # formulas and includes the tile256 max-overlap lower bound.
+        num_tmem_cols = _round_up_tmem_columns(
+            max(tmem_allocator.total_tmem_columns, cfg.tmem_total_cols)
         )
-        cute.arch.relinquish_tmem_alloc_permit(is_two_cta=cfg.has_cluster)
-
-    # Sync warps that need TMEM
-    prims.barrier_cta_sync()
-
-    # Run
-    task_manager.run()
-
-    # TMEM deallocation.  Only the epilogue warpgroup is synchronized
-    # before deallocating from the first epilogue warp.  For CTA_2 dealloc, the
-    # first epilogue warp from each peer CTA performs the 32-thread rendezvous
-    # before issuing the collective dealloc.
-    if cutlass.const_expr(cfg.has_cluster):
-        epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-        if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
-            warp_idx < Int32(epilogue_end)
-        ):
-            prims.barrier_cta_sync(
-                barrier_id=10,
-                thread_count=cfg.num_epilogue_warps * 32,
+        if warp_idx == 0:
+            cute.arch.alloc_tmem(
+                num_tmem_cols,
+                tmem_ptr_smem,
+                is_two_cta=cfg.has_cluster,
             )
-            if warp_idx == Int32(cfg.epilogue_warp_idx):
-                cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-                peer_cta_rank = cta_rank_in_cluster ^ 1
-                cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, peer_cta_rank)
-                cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-                tmem_ptr_raw = prims.shfl_sync(
-                    thread_mask=0xFFFFFFFF,
-                    val=Int32(tmem_ptr_i32.load()),
-                    offset=0,
-                    mask_and_clamp=0x1F,
-                    kind=prims.Shfl.IDX,
-                    return_value_and_is_valid=False,
+            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=cfg.has_cluster)
+
+        # Sync warps that need TMEM
+        prims.barrier_cta_sync()
+
+        # Run
+        task_manager.run()
+
+        # TMEM deallocation.  Only the epilogue warpgroup is synchronized
+        # before deallocating from the first epilogue warp.  For CTA_2 dealloc, the
+        # first epilogue warp from each peer CTA performs the 32-thread rendezvous
+        # before issuing the collective dealloc.
+        if cutlass.const_expr(cfg.has_cluster):
+            epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
+                warp_idx < Int32(epilogue_end)
+            ):
+                prims.barrier_cta_sync(
+                    barrier_id=10,
+                    thread_count=cfg.num_epilogue_warps * 32,
                 )
-                tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
-                prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
-    else:
-        epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-        if cutlass.const_expr(cfg.use_full_tmem_dealloc_barrier):
-            prims.barrier_cta_sync()
-        if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
-            warp_idx < Int32(epilogue_end)
-        ):
-            prims.barrier_cta_sync(
-                barrier_id=10,
-                thread_count=cfg.num_epilogue_warps * 32,
-            )
-            if warp_idx == Int32(cfg.epilogue_warp_idx):
-                tmem_ptr_raw = prims.shfl_sync(
-                    thread_mask=0xFFFFFFFF,
-                    val=Int32(tmem_ptr_i32.load()),
-                    offset=0,
-                    mask_and_clamp=0x1F,
-                    kind=prims.Shfl.IDX,
-                    return_value_and_is_valid=False,
+                if warp_idx == Int32(cfg.epilogue_warp_idx):
+                    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+                    peer_cta_rank = cta_rank_in_cluster ^ 1
+                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, peer_cta_rank)
+                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+                    tmem_ptr_raw = prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=Int32(tmem_ptr_i32.load()),
+                        offset=0,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                        return_value_and_is_valid=False,
+                    )
+                    tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
+                    prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
+        else:
+            epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            if cutlass.const_expr(cfg.use_full_tmem_dealloc_barrier):
+                prims.barrier_cta_sync()
+            if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
+                warp_idx < Int32(epilogue_end)
+            ):
+                prims.barrier_cta_sync(
+                    barrier_id=10,
+                    thread_count=cfg.num_epilogue_warps * 32,
                 )
-                tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
-                prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
+                if warp_idx == Int32(cfg.epilogue_warp_idx):
+                    tmem_ptr_raw = prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=Int32(tmem_ptr_i32.load()),
+                        offset=0,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                        return_value_and_is_valid=False,
+                    )
+                    tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
+                    prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
 
 
 @cute.kernel
@@ -2263,86 +2282,39 @@ def batched_gemm_kernel_bf16(
     if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-    if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
-        # Dynamic-batch kernels launch a max token-CTA grid for
-        # CUDA graph reuse and skip inactive CTAs before touching routing tables.
-        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
-        num_non_exiting_ctas = num_non_exiting_ctas_view.load(
-            idx=Int32(0), vector_size=1
-        )[0]
-        block_m, block_n, _ = cute.arch.block_idx()
-        if cutlass.const_expr(cfg.is_swap_ab):
-            token_cta_idx = block_n
-        else:
-            token_cta_idx = block_m
-        if token_cta_idx < num_non_exiting_ctas:
-            _batched_gemm_kernel_bf16_body(
-                tma_a_desc,
-                tma_b_desc,
-                tma_c_desc,
-                tma_sfa_desc,
-                tma_sfb_desc,
-                c_tensor,
-                sf_c_tensor,
-                bias_tensor,
-                scale_c_tensor,
-                scale_gate_tensor,
-                gemm1_alpha_tensor,
-                gemm1_beta_tensor,
-                gemm1_clamp_limit_tensor,
-                per_token_sf_a_tensor,
-                per_token_sf_b_tensor,
-                tile_idx_tensor,
-                route_map_tensor,
-                mn_limit_tensor,
-                num_non_exiting_ctas_tensor,
-                total_num_padded_tokens_tensor,
-                act_tensor,
-                sfa_gmem_tensor,
-                sfb_gmem_tensor,
-                problem_m,
-                problem_n,
-                problem_k,
-                num_tokens,
-                num_experts,
-                tile_sched_params,
-                cfg,
-                early_exit_max_token_ctas,
-            )
-    else:
-        _batched_gemm_kernel_bf16_body(
-            tma_a_desc,
-            tma_b_desc,
-            tma_c_desc,
-            tma_sfa_desc,
-            tma_sfb_desc,
-            c_tensor,
-            sf_c_tensor,
-            bias_tensor,
-            scale_c_tensor,
-            scale_gate_tensor,
-            gemm1_alpha_tensor,
-            gemm1_beta_tensor,
-            gemm1_clamp_limit_tensor,
-            per_token_sf_a_tensor,
-            per_token_sf_b_tensor,
-            tile_idx_tensor,
-            route_map_tensor,
-            mn_limit_tensor,
-            num_non_exiting_ctas_tensor,
-            total_num_padded_tokens_tensor,
-            act_tensor,
-            sfa_gmem_tensor,
-            sfb_gmem_tensor,
-            problem_m,
-            problem_n,
-            problem_k,
-            num_tokens,
-            num_experts,
-            tile_sched_params,
-            cfg,
-            early_exit_max_token_ctas,
-        )
+    _batched_gemm_kernel_bf16_body(
+        tma_a_desc,
+        tma_b_desc,
+        tma_c_desc,
+        tma_sfa_desc,
+        tma_sfb_desc,
+        c_tensor,
+        sf_c_tensor,
+        bias_tensor,
+        scale_c_tensor,
+        scale_gate_tensor,
+        gemm1_alpha_tensor,
+        gemm1_beta_tensor,
+        gemm1_clamp_limit_tensor,
+        per_token_sf_a_tensor,
+        per_token_sf_b_tensor,
+        tile_idx_tensor,
+        route_map_tensor,
+        mn_limit_tensor,
+        num_non_exiting_ctas_tensor,
+        total_num_padded_tokens_tensor,
+        act_tensor,
+        sfa_gmem_tensor,
+        sfb_gmem_tensor,
+        problem_m,
+        problem_n,
+        problem_k,
+        num_tokens,
+        num_experts,
+        tile_sched_params,
+        cfg,
+        early_exit_max_token_ctas,
+    )
 
 
 # ---------------------------------------------------------------------------

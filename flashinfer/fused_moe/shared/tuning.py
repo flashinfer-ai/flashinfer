@@ -21,6 +21,13 @@ from typing import Any, Callable, Optional
 import torch
 
 from ...autotuner import DynamicTensorSpec, TuningConfig
+from ...autotuner.initializers import (
+    autotuner_initializer_empty,
+    autotuner_initializer_ones,
+    autotuner_initializer_rand,
+    autotuner_initializer_randn,
+    autotuner_initializer_zeros,
+)
 from ...tllm_enums import Fp8QuantizationType
 from ..utils import get_hybrid_num_tokens_buckets, make_hybrid_bucket_mapper
 from .inputs import MoeRunnerInputs
@@ -43,35 +50,21 @@ def make_moe_tuning_config(
     """Build a TuningConfig for a MoE runner instance."""
 
     spec = {
-        "output": lambda shapes, dtype, device: torch.empty(
-            shapes, dtype=dtype, device=device
-        ),
-        "hidden_states": lambda shapes, dtype, device: torch.randn(
-            shapes, device=device
-        ).to(dtype),
+        "output": autotuner_initializer_empty,
+        "hidden_states": autotuner_initializer_randn,
     }
     if moe_inputs.routing_logits is not None:
-        spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
-            shapes, dtype=dtype, device=device
-        )
+        spec["routing_logits"] = autotuner_initializer_rand
     if _has_payload(moe_inputs.topk_ids):
         spec["topk_ids"] = init_packed_topk_ids
     if _has_payload(moe_inputs.expert_weights):
-        spec["expert_weights"] = lambda shapes, dtype, device: torch.ones(
-            shapes, dtype=dtype, device=device
-        )
+        spec["expert_weights"] = autotuner_initializer_ones
     if moe_inputs.hidden_states_scale is not None:
-        spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
-            shapes, device=device
-        ).to(dtype)
+        spec["hidden_states_scale"] = autotuner_initializer_ones
     if moe_inputs.gemm1_lora_delta is not None:
-        spec["gemm1_lora_delta"] = lambda shapes, dtype, device: torch.zeros(
-            shapes, dtype=dtype, device=device
-        )
+        spec["gemm1_lora_delta"] = autotuner_initializer_zeros
     if moe_inputs.per_token_scale is not None:
-        spec["per_token_scale"] = lambda shapes, dtype, device: torch.ones(
-            shapes, device=device
-        ).to(dtype)
+        spec["per_token_scale"] = autotuner_initializer_ones
 
     sorted_inputs = sorted(
         (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()

@@ -147,7 +147,20 @@ def prims_ts_fp4_block_scale_moe(
     routing_input_mode: int = RoutingInputMode.FromLogits,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
+    if num_fused_shared_experts:
+        from flashinfer.fused_moe.core import _validate_fused_shared_experts
+
+        _validate_fused_shared_experts(
+            num_fused_shared_experts,
+            local_expert_offset,
+            local_num_experts,
+            num_experts,
+            routing_method_type,
+            routing_replay_out,
+        )
+
     if hidden_states.dtype == torch.uint8:
         runner_cls = PrimsTsNvfp4MoERunner
         support_fn = is_prims_ts_nvfp4_supported

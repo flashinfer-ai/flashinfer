@@ -61,6 +61,7 @@ from ..tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
     Fp8QuantizationType,
+    RoutingMethodType,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
     trtllm_gen_dtype_has_scale,
@@ -99,9 +100,19 @@ from .utils import (
 )
 
 
+# RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
+# flashinfer.tllm_enums with the other kernel-ABI enums; it is imported above
+# and re-exported here for compatibility (``core.RoutingInputMode``).
+
+
 @functools.cache
 def _moe_topk_ids_init(num_experts: int, *, packed: bool = True):
-    """Return a stable top-k-ID initializer for a given expert count."""
+    """Return a top-k-id initializer for a given expert count.
+
+    ``PackedPrecomputed`` profiling needs ``(expert_id << 16) | bf16(weight)``,
+    while ``UnpackedPrecomputed`` profiling needs plain expert IDs. Cache the
+    closure for object identity preservation in rebuilt tuning configs.
+    """
 
     def _init(
         shapes: tuple[int, ...],
@@ -580,7 +591,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     @register_custom_op(
         "flashinfer::cutlass_fused_moe",
-        mutates_args=(""),
+        mutates_args=("output", "workspace_buffer"),
     )
     def cutlass_fused_moe(
         output: torch.Tensor,
@@ -1052,6 +1063,32 @@ def cutlass_fused_moe(
         non-associative atomics, so results are not deterministic run-to-run. Set to
         False to use the non-fused, deterministic finalize path.
 
+    profile_ids : Optional[List[int]]
+        Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
+        the runner's combined tactic list; ``-1`` keeps the default tactic for that GEMM.
+
+    workspace_buffer : Optional[torch.Tensor]
+        Pre-allocated scratch buffer reused across calls to eliminate per-call workspace
+        allocation (which can reach 10-20 GiB at large batch size). If ``None`` (default),
+        the workspace is allocated and freed on every call. To opt in:
+
+        1. Query the required size once at model-load time::
+
+               ws_bytes = cutlass_fused_moe_workspace_size(
+                   max_num_tokens, hidden_size, intermediate_size,
+                   num_experts_total, top_k, x_dtype=..., weight_dtype=...,
+                   use_fused_finalize=<same as here>, device=input.device)
+               workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=input.device)
+
+        2. Pass ``workspace_buffer=workspace`` on every forward call.
+
+        The buffer must be a 1-D ``torch.uint8`` or ``torch.int8`` tensor on the same
+        CUDA device as the input, with at least ``ws_bytes`` bytes and 128-byte-aligned
+        data pointer (``torch.empty`` on CUDA satisfies all of these). Allocate one buffer
+        per CUDA stream context; overlapping micro-batches on separate streams each need
+        their own buffer. A buffer sized for the maximum token count is valid for all
+        smaller counts on the same call.
+
     Returns
     -------
     out: torch.Tensor
@@ -1071,7 +1108,7 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    major, minor = get_compute_capability()
+    major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 
     if use_wfp4afp8_humming and device_arch != "90":
@@ -1108,42 +1145,43 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
-        output,
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc1_expert_biases,
-        fc2_expert_weights,
-        fc2_expert_biases,
-        output_dtype,
-        quant_scales,
-        input_sf,
-        swiglu_alpha,
-        swiglu_beta,
-        swiglu_limit,
-        swizzled_input_sf,
-        tp_size,
-        tp_rank,
-        ep_size,
-        ep_rank,
-        cluster_size,
-        cluster_rank,
-        use_packed_weights=use_packed_weights,
-        enable_alltoall=enable_alltoall,
-        use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=use_w4_group_scaling,
-        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        min_latency_mode=min_latency_mode,
-        tune_max_num_tokens=tune_max_num_tokens,
-        enable_pdl=enable_pdl,
-        activation_type=activation_type,
-        use_fused_finalize=use_fused_finalize,
-        use_wfp4afp8_humming=use_wfp4afp8_humming,
-        profile_ids=profile_ids,
-        workspace_buffer=workspace_buffer,
-    )
+    with torch.cuda.device(input.device):
+        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+            output,
+            input,
+            token_selected_experts,
+            token_final_scales,
+            fc1_expert_weights,
+            fc1_expert_biases,
+            fc2_expert_weights,
+            fc2_expert_biases,
+            output_dtype,
+            quant_scales,
+            input_sf,
+            swiglu_alpha,
+            swiglu_beta,
+            swiglu_limit,
+            swizzled_input_sf,
+            tp_size,
+            tp_rank,
+            ep_size,
+            ep_rank,
+            cluster_size,
+            cluster_rank,
+            use_packed_weights=use_packed_weights,
+            enable_alltoall=enable_alltoall,
+            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            use_w4_group_scaling=use_w4_group_scaling,
+            use_mxfp8_act_scaling=use_mxfp8_act_scaling,
+            min_latency_mode=min_latency_mode,
+            tune_max_num_tokens=tune_max_num_tokens,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            use_fused_finalize=use_fused_finalize,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
+            profile_ids=profile_ids,
+            workspace_buffer=workspace_buffer,
+        )
 
 
 def cutlass_fused_moe_workspace_size(
@@ -1170,7 +1208,43 @@ def cutlass_fused_moe_workspace_size(
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
 ) -> int:
-    """Return the workspace size in bytes required by :func:`cutlass_fused_moe`."""
+    """Return the workspace buffer size in bytes required by :func:`cutlass_fused_moe`.
+
+    Allocate the returned number of bytes once at model-load time (as a 1-D
+    ``torch.uint8`` tensor) and pass the buffer as ``workspace_buffer=`` on
+    every :func:`cutlass_fused_moe` call to eliminate the per-call
+    multi-GiB scratch allocation.
+
+    Parameters
+    ----------
+    max_num_tokens : int
+        Maximum ``input.shape[0]`` that will be seen at runtime.  The buffer
+        is monotonically sized by this value, so a buffer allocated for the
+        maximum shape is valid for all smaller shapes on the same call.
+    hidden_size : int
+        Logical hidden dimension.
+    intermediate_size : int
+        Logical, unpacked intermediate dimension. For packed weights this is
+        ``fc2_expert_weights.shape[2]`` multiplied by the format's packing
+        factor, not the packed storage dimension itself.
+    num_experts_total : int
+        Global expert count across all EP ranks. This must equal
+        ``fc2_expert_weights.shape[0] * ep_size``.
+    top_k : int
+        Number of selected experts per token.
+    x_dtype, weight_dtype : torch.dtype
+        Input and weight dtypes, used to select the kernel runner.
+    output_dtype : torch.dtype, optional
+        Output dtype (default: ``torch.bfloat16``).
+    device : torch.device, optional
+        CUDA device on which the workspace will be used. Defaults to the
+        current CUDA device.
+
+    Note
+    ----
+    Allocate one workspace buffer per CUDA stream context.  Overlapping
+    micro-batches on separate streams each need their own buffer.
+    """
     if max_num_tokens <= 0:
         raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
     if hidden_size <= 0:
@@ -1199,10 +1273,10 @@ def cutlass_fused_moe_workspace_size(
         device = torch.device("cuda", torch.cuda.current_device())
     else:
         device = torch.device(device)
-    if device.type != "cuda":
-        raise ValueError(f"device must be a CUDA device, got {device}")
-    if device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+        if device.type != "cuda":
+            raise ValueError(f"device must be a CUDA device, got {device}")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
 
     with torch.cuda.device(device):
         major, minor = get_compute_capability(device)
@@ -1909,6 +1983,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         per_token_scale: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -1929,13 +2004,22 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 "either topk_ids or routing_logits must be provided."
             )
             assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
-            routing_dtype = torch.bfloat16
-        else:
-            routing_dtype = routing_logits.dtype
+        # TRT-LLM Gen FP4 routing writes bfloat16 expert weights regardless of
+        # routing_logits dtype; keep the returned unfinalized tensor labeled bf16.
+        routing_dtype = torch.bfloat16
         hidden_size = hidden_states.shape[-1]
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
+        n_fused_shared = _validate_fused_shared_experts(
+            num_fused_shared_experts,
+            local_expert_offset,
+            num_local_experts,
+            num_experts,
+            routing_method_type,
+            routing_replay_out,
+        )
+        total_experts_per_token = top_k + n_fused_shared
 
         # workspace buffers required by trtllm-gen
         # For Mode 3 (UnpackedPrecomputed), topk_ids and topk_weights are user-provided INPUTS
@@ -1950,11 +2034,17 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
             if topk_ids is None:
                 topk_ids = torch.empty(
-                    num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+                    num_tokens,
+                    total_experts_per_token,
+                    dtype=torch.int32,
+                    device=hidden_states.device,
                 )
             if topk_weights is None:
                 topk_weights = torch.empty(
-                    num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
+                    num_tokens,
+                    total_experts_per_token,
+                    dtype=routing_dtype,
+                    device=hidden_states.device,
                 )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1991,6 +2081,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
+            num_fused_shared_experts=n_fused_shared,
         )
         moe_inputs = MoeRunnerInputs(
             output=output,
@@ -2007,6 +2098,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             tune_max_num_tokens=tune_max_num_tokens,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
+            routing_input_mode=routing_input_mode,
         )
 
         _, tactic = tuner.choose_one(
@@ -2016,6 +2108,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs.to_list(),
             routing_input_mode=routing_input_mode,
             num_experts=num_experts,
+            num_fused_shared_experts=n_fused_shared,
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_weights_scale=gemm1_weights_scale,
@@ -2052,6 +2145,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             gemm1_weights,
             gemm1_weights_scale,
             gemm1_bias,
+            None,  # gemm1_lora_delta
             gemm1_alpha,
             gemm1_beta,
             gemm1_clamp_limit,
@@ -2064,6 +2158,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             per_token_scale,
             num_experts,
             top_k,
+            n_fused_shared,
             n_group,
             topk_group,
             intermediate_size,
@@ -2112,6 +2207,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         per_token_scale: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -2367,6 +2463,37 @@ def _validate_routing_replay_out(
         )
     if not routing_replay_out.is_contiguous():
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
+
+
+def _validate_fused_shared_experts(
+    num_fused_shared_experts: Optional[int],
+    local_expert_offset: int,
+    local_num_experts: int,
+    num_experts: int,
+    routing_method_type: int,
+    routing_replay_out: Optional[torch.Tensor],
+) -> int:
+    n_fused_shared = num_fused_shared_experts or 0
+    if n_fused_shared <= 0:
+        return 0
+    if local_expert_offset != 0 or local_num_experts != num_experts:
+        raise ValueError(
+            "Fused shared experts (num_fused_shared_experts > 0) do not yet support "
+            "expert parallelism: require local_expert_offset == 0 and "
+            "local_num_experts == num_experts. Got "
+            f"num_fused_shared_experts={n_fused_shared}, local_expert_offset={local_expert_offset}, "
+            f"local_num_experts={local_num_experts}, num_experts={num_experts}."
+        )
+    if routing_replay_out is not None:
+        raise ValueError(
+            "routing_replay_out is not supported with num_fused_shared_experts > 0"
+        )
+    if routing_method_type != RoutingMethodType.DeepSeekV3.value:
+        raise ValueError(
+            "Fused shared experts (num_fused_shared_experts > 0) are only supported "
+            "with DeepSeekV3 routing_method_type."
+        )
+    return n_fused_shared
 
 
 def _validate_fp8_block_scale_gemm1_activation_params(
@@ -3252,20 +3379,14 @@ def trtllm_fp8_block_scale_moe(
         Final MoE output when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
-    # Fused shared experts do not yet support expert parallelism (EP). The routing
-    # kernel maps a shared expert's global id (num_experts + k) to a weight row as
-    # (global_id - local_expert_offset), which only lands at the intended local slot
-    # when local_expert_offset == 0 and local_num_experts == num_experts. Reject EP
-    # configurations explicitly instead of silently producing wrong results.
-    _nfse = num_fused_shared_experts or 0
-    if _nfse > 0 and (local_expert_offset != 0 or local_num_experts != num_experts):
-        raise ValueError(
-            "Fused shared experts (num_fused_shared_experts > 0) do not yet support "
-            "expert parallelism: require local_expert_offset == 0 and "
-            "local_num_experts == num_experts. Got "
-            f"num_fused_shared_experts={_nfse}, local_expert_offset={local_expert_offset}, "
-            f"local_num_experts={local_num_experts}, num_experts={num_experts}."
-        )
+    _nfse = _validate_fused_shared_experts(
+        num_fused_shared_experts,
+        local_expert_offset,
+        local_num_experts,
+        num_experts,
+        routing_method_type,
+        routing_replay_out,
+    )
     _validate_routing_replay_out(routing_replay_out, top_k)
     _validate_fp8_block_scale_gemm1_activation_params(
         fp8_quantization_type,
@@ -3573,6 +3694,7 @@ def trtllm_fp4_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -3685,6 +3807,14 @@ def trtllm_fp4_block_scale_moe(
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    _nfse = _validate_fused_shared_experts(
+        num_fused_shared_experts,
+        local_expert_offset,
+        local_num_experts,
+        num_experts,
+        routing_method_type,
+        routing_replay_out,
+    )
     _validate_routing_replay_out(routing_replay_out, top_k)
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
@@ -3709,6 +3839,7 @@ def trtllm_fp4_block_scale_moe(
         per_token_scale,
         num_experts,
         top_k,
+        _nfse,
         n_group,
         topk_group,
         intermediate_size,
@@ -3759,6 +3890,7 @@ def trtllm_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -3880,6 +4012,15 @@ def trtllm_fp4_block_scale_routed_moe(
         topk_weights = None
         routing_mode = RoutingInputMode.PackedPrecomputed
 
+    _nfse = _validate_fused_shared_experts(
+        num_fused_shared_experts,
+        local_expert_offset,
+        local_num_experts,
+        num_experts,
+        routing_method_type,
+        None,
+    )
+
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_mode,
         None,
@@ -3903,6 +4044,7 @@ def trtllm_fp4_block_scale_routed_moe(
         per_token_scale,
         num_experts,
         top_k,
+        _nfse,
         n_group,
         topk_group,
         intermediate_size,
