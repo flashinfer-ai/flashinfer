@@ -313,21 +313,40 @@ def _direct_micro_name(**overrides):
     )
 
 
-@pytest.mark.parametrize("param", sorted(DIRECT_MICRO_BASELINE))
-def test_direct_micro_name_varies_with_every_argument(param):
-    """Changing any single codegen argument must change the on-disk name.
+# ``max_active_ctas`` only reaches codegen through ``m1_fc2_onepass``, which
+# ``configure()`` gates on ``m == 1``. At the baseline's m=4 it is therefore
+# genuinely non-codegen (grid_x itself is a runtime argument), so it gets the
+# dedicated m=1 test below instead of a slot in the perturbation sweep.
+DIRECT_MICRO_SWEEP_PARAMS = sorted(set(DIRECT_MICRO_BASELINE) - {"max_active_ctas"})
 
-    ``max_active_ctas`` participates only through ``m1_fc2_onepass``, which is
-    exactly why it must be keyed: two SM120 parts with different SM counts
-    share the ``sm120a`` module directory, so a name that ignored it would
-    serve one part's binary to the other.
-    """
+
+@pytest.mark.parametrize("param", DIRECT_MICRO_SWEEP_PARAMS)
+def test_direct_micro_name_varies_with_every_argument(param):
+    """Changing any single codegen argument must change the on-disk name."""
     baseline = _direct_micro_name()
     perturbed = _direct_micro_name(**{param: DIRECT_MICRO_PERTURBED[param]})
     assert perturbed != baseline, (
         f"the direct micro kernel's on-disk name ignores argument {param!r}: "
         "two different kernel specializations would collide on one artifact."
     )
+
+
+def test_direct_micro_name_varies_with_max_active_ctas_at_m1():
+    """At m=1 the cluster budget reaches codegen and must be keyed.
+
+    ``m1_fc2_onepass = m == 1 and grid_x >= fc2_tasks`` is a compile-time
+    constant, and grid_x is capped by the cluster budget. With k=512 the FC2
+    task count is 512 // (2 * _K_PER_CTA) == 16, so a budget above and below
+    that flips the flag.
+
+    This is the device-dependent part of the key: two SM120 parts with
+    different SM counts resolve different budgets while sharing the ``sm120a``
+    module directory, so a name ignoring it would serve one part's binary to
+    the other.
+    """
+    onepass = _direct_micro_name(m=1, single_token=True, max_active_ctas=148)
+    multipass = _direct_micro_name(m=1, single_token=True, max_active_ctas=8)
+    assert onepass != multipass
 
 
 def test_direct_micro_name_varies_with_topk_ids_dtype():
