@@ -168,7 +168,7 @@ def _make_inputs():
 @cute_dsl_available
 @sm100_required
 class TestMxfp8Mxfp4FusedMoeEndToEnd:
-    def test_functional_and_preallocated_wrapper_agree(self, monkeypatch):
+    def test_functional_and_wrapper_agree(self, monkeypatch):
         from flashinfer import (
             CuteDslMxfp8Mxfp4MoEWrapper,
             cute_dsl_fused_moe_mxfp8_mxfp4,
@@ -207,7 +207,6 @@ class TestMxfp8Mxfp4FusedMoeEndToEnd:
             top_k=tensors["top_k"],
             hidden_size=tensors["hidden_size"],
             intermediate_size=tensors["intermediate_size"],
-            max_num_tokens=tensors["num_tokens"],
             enable_pdl=False,
         )
         monkeypatch.setattr(
@@ -221,14 +220,15 @@ class TestMxfp8Mxfp4FusedMoeEndToEnd:
             **call_args, tactic=DEFAULT_MXFP8_MXFP4_MOE_TACTIC
         )
         torch.cuda.synchronize()
-        first_ptr = wrapper_result_1.data_ptr()
         snapshot = wrapper_result_1.clone()
         wrapper_result_2 = wrapper.run(
             **call_args, tactic=DEFAULT_MXFP8_MXFP4_MOE_TACTIC
         )
         torch.cuda.synchronize()
 
-        assert wrapper_result_2.data_ptr() == first_ptr
+        # Each run owns its output, so an earlier result must survive a later
+        # one unchanged.
+        assert torch.equal(snapshot, wrapper_result_1)
         assert (
             wrapper_result_2.shape
             == functional.shape
@@ -242,8 +242,7 @@ class TestMxfp8Mxfp4FusedMoeEndToEnd:
         assert torch.allclose(snapshot, wrapper_result_2, atol=0.5, rtol=0.05)
         assert torch.allclose(functional, wrapper_result_2, atol=0.5, rtol=0.05)
 
-        # A capacity-backed wrapper must also produce correctly-sized views
-        # for smaller active batches without reallocating its output storage.
+        # A wrapper instance must handle a different batch size on a later call.
         smaller_args = dict(call_args)
         for name in (
             "x",
@@ -257,7 +256,6 @@ class TestMxfp8Mxfp4FusedMoeEndToEnd:
         )
         torch.cuda.synchronize()
         assert smaller_result.shape == (9, tensors["hidden_size"])
-        assert smaller_result.data_ptr() == first_ptr
         assert torch.isfinite(smaller_result).all()
 
         other_stream = torch.cuda.Stream()

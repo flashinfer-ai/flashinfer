@@ -20,7 +20,6 @@ does not have NVFP4's ``fc2_input_scale`` argument.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import functools
 import math
 import threading
@@ -54,9 +53,6 @@ from .mixed_tuner import (
     canonicalize_mxfp8_mxfp4_tactic,
 )
 from .moe_utils import (
-    allocate_moe_sort_buffers,
-    get_max_num_permuted_tokens,
-    get_max_num_tiles,
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
@@ -487,24 +483,18 @@ def _cute_dsl_fused_moe_mxfp8_mxfp4_impl(**kwargs: Any) -> torch.Tensor:
     return _moe_core_impl_mxfp8_mxfp4(**kwargs)
 
 
-@dataclass
-class _ScratchBuffers:
-    intermediate: torch.Tensor
-    intermediate_scale_storage: torch.Tensor
-
-
 class CuteDslMxfp8Mxfp4MoEWrapper:
     """Production wrapper for the MXFP8 x MXFP4 fused-MoE pipeline.
 
-    With ``max_num_tokens`` set, output, routing, intermediate, and scale
-    storage for both tile-size regimes are allocated in the constructor.
-    Without it, the same resources are allocated once per observed token
-    count and reused thereafter.  The returned tensor aliases wrapper-owned
-    storage and is overwritten by the next ``run``.
-    Because routing, scratch, output, stream, and event resources are reused,
-    one wrapper instance is not reentrant or safe for concurrent calls.
-    The first ``run`` binds the instance to that call's CUDA stream; create one
-    wrapper per stream.
+    With ``use_cuda_graph=True`` the wrapper holds persistent CUDA stream and
+    event resources, created outside graph capture so they can be reused
+    inside it. Workspace itself is not pre-allocated: graph capture records
+    allocations made during capture in its private pool, so pre-sizing buffers
+    for a maximum batch buys nothing but memory.
+
+    Because the stream and event resources are reused, one wrapper instance is
+    not reentrant or safe for concurrent calls. The first ``run`` binds the
+    instance to that call's CUDA stream; create one wrapper per stream.
     """
 
     @supported_compute_capability([100, 103])
@@ -515,6 +505,9 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        # Deprecated; accepted for backwards compatibility but ignored. Graph
+        # capture records allocations from its private pool, so there is no
+        # workspace to pre-size.
         max_num_tokens: Optional[int] = None,
         num_local_experts: Optional[int] = None,
         local_expert_offset: int = 0,
@@ -526,16 +519,11 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ) -> None:
-        if max_num_tokens is not None and max_num_tokens <= 0:
-            raise ValueError("max_num_tokens must be positive")
-        if use_cuda_graph and max_num_tokens is None:
-            raise ValueError("CUDA graph mode requires max_num_tokens")
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.max_num_tokens = max_num_tokens
         self.num_local_experts = (
             num_experts if num_local_experts is None else num_local_experts
         )
@@ -565,12 +553,13 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
 
-        self._aux_stream = torch.cuda.Stream(device=self.device)
-        self._main_event = torch.cuda.Event()
-        self._memset_event = torch.cuda.Event()
-        self._sort_buffers: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
-        self._scratch_buffers: Dict[int, _ScratchBuffers] = {}
-        self._outputs: Dict[int, torch.Tensor] = {}
+        # Persistent CUDA resources for async-memset / GEMM1 overlap. These are
+        # created outside graph capture (so they can be reused inside it) when
+        # ``use_cuda_graph=True``. When None, ``_moe_core_impl_mxfp8_mxfp4``
+        # falls back to the per-thread resources for the current device.
+        self._aux_stream: Optional[torch.cuda.Stream] = None
+        self._main_event: Optional[torch.cuda.Event] = None
+        self._memset_event: Optional[torch.cuda.Event] = None
         self._run_lock = threading.Lock()
         self._bound_stream_handle: Optional[int] = None
 
@@ -598,124 +587,13 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
             swiglu_limit=swiglu_limit,
         )
 
-        if max_num_tokens is not None:
-            self._allocate_capacity(max_num_tokens)
+        if use_cuda_graph:
+            self._aux_stream = torch.cuda.Stream(device=self.device)
+            self._main_event = torch.cuda.Event()
+            self._memset_event = torch.cuda.Event()
 
-    def _allocate_capacity(self, capacity: int) -> None:
-        if capacity not in self._outputs:
-            self._outputs[capacity] = torch.empty(
-                (capacity, self.hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-        if capacity not in self._scratch_buffers:
-            max_permuted_m = max(
-                get_max_num_permuted_tokens(
-                    capacity, self.top_k, self.num_local_experts, tile_size
-                )
-                for tile_size in (128, 256)
-            )
-            scale_shape = _mxfp8_scale_storage_shape(
-                max_permuted_m, self.intermediate_size
-            )
-            self._scratch_buffers[capacity] = _ScratchBuffers(
-                intermediate=torch.empty(
-                    (max_permuted_m, self.intermediate_size),
-                    dtype=torch.float8_e4m3fn,
-                    device=self.device,
-                ),
-                intermediate_scale_storage=torch.empty(
-                    math.prod(scale_shape), dtype=torch.uint8, device=self.device
-                ),
-            )
-        for tile_size in (128, 256):
-            key = (capacity, tile_size)
-            if key not in self._sort_buffers:
-                self._sort_buffers[key] = allocate_moe_sort_buffers(
-                    num_tokens=capacity,
-                    num_experts=self.num_experts,
-                    top_k=self.top_k,
-                    num_local_experts=self.num_local_experts,
-                    tile_tokens_dim=tile_size,
-                    device=str(self.device),
-                )
-
-    def _capacity_for(self, num_tokens: int) -> int:
-        if self.max_num_tokens is not None:
-            if num_tokens > self.max_num_tokens:
-                raise ValueError(
-                    f"num_tokens={num_tokens} exceeds max_num_tokens="
-                    f"{self.max_num_tokens}"
-                )
-            return self.max_num_tokens
-        return num_tokens
-
-    def _get_output(self, num_tokens: int) -> torch.Tensor:
-        capacity = self._capacity_for(num_tokens)
-        self._allocate_capacity(capacity)
-        return self._outputs[capacity][:num_tokens]
-
-    def _build_workspace_slices(
-        self, num_tokens: int, tile_size: int
-    ) -> Tuple[
-        Dict[str, torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        capacity = self._capacity_for(num_tokens)
-        self._allocate_capacity(capacity)
-        source = self._sort_buffers[(capacity, tile_size)]
-        max_num_tiles = get_max_num_tiles(
-            num_tokens, self.top_k, self.num_local_experts, tile_size
-        )
-        permuted_m = max_num_tiles * tile_size
-        sort_views = {
-            "out_tile_idx_to_expert_idx": source["out_tile_idx_to_expert_idx"][
-                :max_num_tiles
-            ],
-            "out_tile_idx_to_mn_limit": source["out_tile_idx_to_mn_limit"][
-                :max_num_tiles
-            ],
-            "out_expanded_idx_to_permuted_idx": source[
-                "out_expanded_idx_to_permuted_idx"
-            ][:num_tokens],
-            "out_permuted_idx_to_expanded_idx": source[
-                "out_permuted_idx_to_expanded_idx"
-            ][:permuted_m],
-            "out_total_num_padded_tokens": source["out_total_num_padded_tokens"],
-            "out_num_non_exiting_tiles": source["out_num_non_exiting_tiles"],
-        }
-        scratch = self._scratch_buffers[capacity]
-        intermediate = scratch.intermediate[:permuted_m]
-        scale_shape = _mxfp8_scale_storage_shape(permuted_m, self.intermediate_size)
-        intermediate_scale = scratch.intermediate_scale_storage[
-            : math.prod(scale_shape)
-        ].view(scale_shape)
-        return (
-            sort_views,
-            intermediate,
-            intermediate_scale,
-        )
-
-    def _forward_with_tactic(
-        self,
-        *,
-        tile_size: int,
-        moe_output: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        num_tokens = kwargs["x"].shape[0]
-        (
-            sort_buffers,
-            intermediate,
-            intermediate_scale,
-        ) = self._build_workspace_slices(num_tokens, tile_size)
+    def _forward_with_tactic(self, **kwargs: Any) -> torch.Tensor:
         return _moe_core_impl_mxfp8_mxfp4(
-            tile_size=tile_size,
-            moe_sort_buffers=sort_buffers,
-            gemm1_out=intermediate,
-            gemm1_out_scale=intermediate_scale,
-            moe_output=moe_output,
             aux_stream=self._aux_stream,
             main_event=self._main_event,
             memset_event=self._memset_event,
@@ -745,8 +623,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         scales must already be in the MMA layout returned by
         ``convert_sf_to_mma_layout(..., sf_vec_size=32)``.
 
-        The returned tensor aliases wrapper-owned storage and remains valid
-        only until the next call on this wrapper.
+        The returned tensor is freshly allocated and owned by the caller.
         """
 
         _validate_mixed_inputs(
@@ -769,7 +646,11 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
         )
-        output = self._get_output(x.shape[0])
+        output = torch.empty(
+            (x.shape[0], self.hidden_size),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
         inputs = [
             x,
             x_sf,
