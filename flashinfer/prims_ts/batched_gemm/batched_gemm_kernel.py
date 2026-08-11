@@ -1734,11 +1734,6 @@ def _batched_gemm_kernel_bf16_body(
             cfg.use_early_exit
             and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
         ):
-            if cutlass.const_expr(_pdl_wait_completed_before_tasks(cfg)):
-                # Gather FC1 directly consumes routing output.  Delay its
-                # single global wait until immediately before the first count
-                # load so descriptor and resource setup can overlap routing.
-                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
             num_non_exiting_ctas_view = cutlass.make_array_view(
                 num_non_exiting_ctas_tensor
             )
@@ -2323,7 +2318,8 @@ def batched_gemm_kernel_bf16(
     early_exit_max_token_ctas: cutlass.Int32,
 ) -> None:
     if cutlass.const_expr(
-        cfg.do_pdl_wait_for_num_non_exiting_ctas and not cfg.is_persistent
+        cfg.do_pdl_wait_for_num_non_exiting_ctas
+        and (not cfg.is_persistent or cfg.has_gather)
     ):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
