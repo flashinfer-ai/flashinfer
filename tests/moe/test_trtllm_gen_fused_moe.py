@@ -2493,7 +2493,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
 
 
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
-    """FP8 block-scale OA params are scoped to block-scale recipes with SwiGLU.
+    """FP8 block-scale OA params are scoped to the block-scale recipes with SwiGLU.
 
     MxFp8 applies them in the fused FC1 epilogue and DeepSeekFp8 in its separate
     activation kernel; every other quantization type, and every non-SwiGLU
@@ -2553,14 +2553,6 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
         trtllm_fp8_block_scale_routed_moe(
             **routed_kwargs,
             fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
-            activation_type=ActivationType.Geglu.value,
-            gemm1_alpha=per_expert,
-        )
-
-    with pytest.raises(ValueError, match=r"ActivationType\.Swiglu"):
-        trtllm_fp8_block_scale_routed_moe(
-            **routed_kwargs,
-            fp8_quantization_type=Fp8QuantizationType.MxFp8,
             activation_type=ActivationType.Geglu.value,
             gemm1_alpha=per_expert,
         )

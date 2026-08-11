@@ -1,6 +1,7 @@
 # Bot command handler for CI permissions
 # Authorized users (ci-users team) can comment to control CI:
-#   @flashinfer-bot run          - Add run-ci label to trigger CI
+#   @flashinfer-bot run          - Apply run-ci label to start CI on the current
+#                                  commit; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
@@ -85,6 +86,19 @@ jobs:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
+
+          # Re-applying a label the PR already has emits no event, so remove it
+          # first. Removing an absent label errors, hence the check - and a failed
+          # removal must not be ignored, or the add below silently does nothing.
+          HAS_RUN_CI=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json labels -q '[.labels[].name] | index("run-ci") != null')
+
+          if [ "$HAS_RUN_CI" = "true" ]; then
+            gh pr edit ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --remove-label "run-ci"
+          fi
 
           # Add run-ci label
           gh pr edit ${{ github.event.issue.number }} \
@@ -211,7 +225,8 @@ jobs:
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."
-              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+              gh run cancel "$run_id" --repo ${{ github.repository }} \
+                || echo "::error::Cancel failed for $run_id"
               CANCEL_COUNT=$((CANCEL_COUNT + 1))
             fi
           done

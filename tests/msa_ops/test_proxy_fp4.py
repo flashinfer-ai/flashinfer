@@ -178,6 +178,132 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
     assert mean_overlap > 0.8, f"mean topk overlap {mean_overlap} too low"
 
 
+def _paged_fp4_k(k, seqs_k, Hkv):
+    """Scatter a flat varlen K into shuffled pages and quantize page-major, so
+    the SF row order matches the paged kernel's ``(page*Hkv + kv_head)*128 +
+    token``. A ragged final page keeps its zero-filled tail.
+
+    Returns ``(k_pg, k_pg_scale, inv_k, page_table, per-request dequantized K)``.
+    """
+    from flashinfer import nvfp4_quantize
+
+    dev = k.device
+    npg = [-(-s // BLK_KV) for s in seqs_k]
+    total_pages = sum(npg)
+    perm = torch.randperm(total_pages)
+    k_pg_bf16 = torch.zeros(
+        total_pages, Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev
+    )
+    ptab = torch.full((len(seqs_k), max(npg)), -1, dtype=torch.int32, device=dev)
+    base, pi = 0, 0
+    for b, sk in enumerate(seqs_k):
+        for blk in range(npg[b]):
+            pg = int(perm[pi])
+            pi += 1
+            ptab[b, blk] = pg
+            lo = base + blk * BLK_KV
+            hi = min(lo + BLK_KV, base + sk)
+            k_pg_bf16[pg, :, : hi - lo] = k[lo:hi].transpose(0, 1)
+        base += sk
+    gsf_k = (448.0 * 6.0) / k.float().abs().max()
+    inv_k = 1.0 / float(gsf_k)
+    kq, ksf = nvfp4_quantize(
+        k_pg_bf16.reshape(-1, 128), gsf_k.reshape(1).to(dev), sf_vec_size=16
+    )
+    k_pg = kq.view(torch.uint8).reshape(total_pages, Hkv, BLK_KV, 64)
+    k_pg_scale = ksf.view(torch.uint8).reshape(-1)
+
+    # Dequantize page-major, then gather each request's logical K for the oracle.
+    pg_deq = (
+        _dequant_128x4(
+            k_pg.reshape(-1, 64).cpu(),
+            k_pg_scale.cpu(),
+            1.0,
+            total_pages * Hkv * BLK_KV,
+        )
+        .reshape(total_pages, Hkv, BLK_KV, 128)
+        .to(torch.bfloat16)
+    )
+    k_deqs = []
+    for b, sk in enumerate(seqs_k):
+        rows = torch.empty(sk, Hkv, 128, dtype=torch.bfloat16)
+        for blk in range(npg[b]):
+            lo, hi = blk * BLK_KV, min((blk + 1) * BLK_KV, sk)
+            rows[lo:hi] = pg_deq[int(ptab[b, blk])].transpose(0, 1)[: hi - lo]
+        k_deqs.append(rows)
+    return k_pg, k_pg_scale, inv_k, ptab, k_deqs
+
+
+@pytest.mark.parametrize(
+    "Hq,Hkv,seqs_q",
+    [
+        (8, 2, [160, 33, 96]),  # q_len > 32 at group 4 -> general fp4-MMA schedule
+        (32, 2, [8, 3, 1]),  # q_len <= 8 at group 16 -> packed decode schedule
+    ],
+)
+def test_proxy_fp4_paged_varlen(Hq, Hkv, seqs_q):
+    """Paged fp4 over a heterogeneous batch.
+
+    ``seqused_k`` reaches the kernel as per-request lengths rather than a prefix
+    sum; at batch 1 the two forms are indistinguishable, so only B >= 2 with
+    distinct lengths separates them. Covers both fp4 schedules, a ragged final
+    page, and (unlike the B=1 paged tests) multi-kv-head SF row indexing.
+    """
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
+
+    torch.manual_seed(99 + Hq)
+    dev = "cuda"
+    group_size = Hq // Hkv
+    seqs_k = [1024, 300, 1536]
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), sum(seqs_k)
+    seqused = torch.tensor(seqs_k, dtype=torch.int32, device=dev)
+
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_pg, k_pg_scale, inv_k, ptab, k_deqs = _paged_fp4_k(k, seqs_k, Hkv)
+
+    out = msa_proxy_score_fp4(
+        q_fp4,
+        k_pg,
+        q_scale,
+        k_pg_scale,
+        inv_q,
+        inv_k,
+        cu_q,
+        page_table=ptab,
+        seqused_k=seqused,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+    mkt = max(-(-s // BLK_KV) for s in seqs_k)
+    assert out.shape == (Hq, mkt, total_q)
+
+    q_deq = (
+        _dequant_128x4(
+            q_fp4.reshape(-1, 64).cpu(), q_scale.cpu(), inv_q * inv_k, total_q * Hq
+        )
+        .reshape(total_q, Hq, 128)
+        .to(torch.bfloat16)
+    )
+    # Blocks past a request's own extent stay -inf, so build the padded oracle.
+    ref = torch.full((Hq, mkt, total_q), -float("inf"), dtype=torch.float32)
+    for b, sk in enumerate(seqs_k):
+        qlo, qhi = int(cu_q[b]), int(cu_q[b + 1])
+        sub = _ref_proxy_fp4(q_deq[qlo:qhi], k_deqs[b], qhi - qlo, sk, group_size, True)
+        ref[:, : sub.shape[1], qlo:qhi] = sub
+    got = out.float().cpu()
+    finite = torch.isfinite(ref)
+    assert (torch.isfinite(got) == finite).all(), "finite/-inf mask mismatch"
+    rel = ((got[finite] - ref[finite]).abs() / ref[finite].abs().clamp_min(1.0)).max()
+    assert rel < 5e-2, f"paged varlen max rel err {rel}"
+
+
 def test_proxy_fp4_paged():
     """group_size 4 dispatches the general, non-packed fp4-MMA schedule."""
     _skip_if_unsupported()

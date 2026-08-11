@@ -140,7 +140,7 @@ allreduce_fusion_trace = TraceTemplate(
             description=(
                 "AllReduceFusionPattern enum: 0=AllReduce, "
                 "1=AR+Residual+RMSNorm, 2..5=with FP8/FP4 quant, "
-                "6..7=MoE reduction/finalize (trtllm-only)."
+                "6=MoE reduction, 7=MoE finalize."
             ),
         ),
         "residual_in": Tensor(

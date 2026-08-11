@@ -31,12 +31,14 @@ Two levels of checking
 
 How to add a new template
 --------------------------
-When you add ``@flashinfer_api(trace=my_trace)`` to a function, add an
-entry to ``_TEMPLATE_FUNC_PAIRS`` and optionally a targeted end-to-end test.
-See the docstring in ``flashinfer/trace/templates/__init__.py`` for the full
-how-to guide.
+When you add ``@flashinfer_api(trace=my_trace)`` to a function, ensure its
+module is imported by the collector below and optionally add a targeted
+end-to-end test. See the docstring in ``flashinfer/trace/templates/__init__.py``
+for the full how-to guide.
 """
 
+import ast
+from collections import Counter
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -325,6 +327,8 @@ def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
     """
     # Trigger @flashinfer_api decorators by importing all modules that use them.
     import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
+    import flashinfer.attention.prims_ts.decode  # PrimTS FMHA decode APIs
+    import flashinfer.attention.prims_ts.mla_decode  # PrimTS MLA decode APIs
     import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
     import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
     import flashinfer.gdn_prefill  # chunk_gated_delta_rule
@@ -345,6 +349,34 @@ _ALL_PAIRS = _collect_template_func_pairs()
 _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
 
 
+_EXPECTED_PRIMTS_TRACE_VARIANTS = {
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "batch_decode_with_paged_kv_cache",
+    ): 12,
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "prims_ts_batch_decode_with_kv_cache",
+    ): 12,
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "BatchDecodePagedTSWrapper.run",
+    ): 12,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "batch_decode_mla_with_paged_kv_cache",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "prims_ts_batch_decode_with_kv_cache_mla",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "BatchMLADecodePagedTSWrapper.run",
+    ): 4,
+}
+
+
 # ---------------------------------------------------------------------------
 # Parameterized structural tests (no GPU required)
 # ---------------------------------------------------------------------------
@@ -360,6 +392,192 @@ def test_template_signature_consistency(func, template, label):
 def test_template_axes_covered(func, template, label):
     """Every Const axis must be reachable from at least one input tensor, scalar, or function param."""
     assert_template_axes_covered(template, label=label, func=func)
+
+
+def test_attention_ts_trace_registry_coverage():
+    """All six public decode surfaces register their complete variant sets."""
+
+    discovered = Counter(
+        (func.__module__, func.__qualname__)
+        for func, _, _ in _ALL_PAIRS
+        if func.__module__.startswith("flashinfer.attention.prims_ts")
+    )
+    assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
+    assert sum(discovered.values()) == 48
+
+
+def test_attention_ts_trace_constraints_match_cache_axes():
+    """PrimTS cache constraints are valid expressions over defined axes."""
+    from flashinfer.trace.templates.attention import (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+
+    fmha_dispatches = (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+    mla_dispatches = (
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+    for dispatch in (*fmha_dispatches, *mla_dispatches):
+        for template in dispatch.templates:
+            for constraint in template.constraints:
+                tree = ast.parse(constraint, mode="eval")
+                referenced_names = {
+                    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+                }
+                allowed_names = set(template.axes) | set(template.inputs) | {"max"}
+                assert referenced_names <= allowed_names, (
+                    f"{template.name_prefix}: constraint {constraint!r} references "
+                    f"undeclared names {sorted(referenced_names - allowed_names)}"
+                )
+
+    for dispatch in fmha_dispatches:
+        for template in dispatch.templates:
+            if "kv_layout" in template.inputs:
+                assert "kv_layout == 'HND'" in template.constraints
+            assert ("kv_planes == 2" in template.constraints) == (
+                "kv_planes" in template.axes
+            )
+            if "_multi_q" in template.name_prefix:
+                assert "seq_len_q >= 2" in template.constraints
+            assert "seq_len_q in (2, 4, 8)" not in template.constraints
+            assert "max_seq_len <= 16384" not in template.constraints
+    for dispatch in mla_dispatches:
+        for template in dispatch.templates:
+            assert ("kv_pad_dim == 1" in template.constraints) == (
+                "kv_pad_dim" in template.axes
+            )
+
+
+def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
+    """Resolve a realistic causal SQ4 trace through all six public surfaces."""
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper,
+        batch_decode_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_decode_mla_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache_mla,
+    )
+    from flashinfer.fi_trace import fi_trace
+
+    batch_size, seq_len_q, seq_len_k = 4, 4, 2048
+    page_size, num_q_heads, num_kv_heads, head_dim = 32, 32, 4, 128
+    pages_per_request = seq_len_k // page_size
+    num_pages = batch_size * pages_per_request
+    q = torch.empty(batch_size, seq_len_q, num_q_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.empty(
+        num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16
+    )
+    v_cache = torch.empty_like(k_cache)
+    kv_indptr = torch.arange(
+        0,
+        num_pages + 1,
+        pages_per_request,
+        dtype=torch.int32,
+    )
+    kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
+    workspace = torch.empty(4096, dtype=torch.uint8)
+
+    fmha_kwargs = {
+        "q": q,
+        "paged_kv_cache": (k_cache, v_cache),
+        "paged_kv_indptr": kv_indptr,
+        "paged_kv_indices": kv_indices,
+        "paged_kv_last_page_len": last_page_len,
+        "seq_len_q": seq_len_q,
+        "mask_type": "causal",
+    }
+    fmha_standalone_kwargs = {
+        "query": q,
+        "kv_cache": (k_cache, v_cache),
+        "workspace_buffer": workspace,
+        "paged_kv_indptr": kv_indptr,
+        "paged_kv_indices": kv_indices,
+        "seq_lens": seq_lens,
+        "max_seq_len": seq_len_k,
+        "seq_len_q": seq_len_q,
+        "mask_type": "causal",
+        "kv_layout": "HND",
+    }
+
+    fmha_wrapper = BatchDecodePagedTSWrapper()
+    fmha_wrapper._planned = True
+    fmha_wrapper._use_packed_q = False
+    fmha_wrapper._output_dtype = torch.bfloat16
+    fmha_definitions = (
+        batch_decode_with_paged_kv_cache.fi_trace(**fmha_kwargs),
+        prims_ts_batch_decode_with_kv_cache.fi_trace(**fmha_standalone_kwargs),
+        fi_trace(
+            fmha_wrapper.run,
+            q=q,
+            paged_kv_cache=(k_cache, v_cache),
+            mask_type="causal",
+        ),
+    )
+
+    mla_heads, mla_head_dim, kv_lora_rank, rope_dim = 128, 576, 512, 64
+    mla_q = torch.empty(
+        batch_size, seq_len_q, mla_heads, mla_head_dim, dtype=torch.bfloat16
+    )
+    mla_cache = torch.empty(num_pages, page_size, mla_head_dim, dtype=torch.bfloat16)
+    block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(
+        batch_size, pages_per_request
+    )
+    mla_common = {
+        "query": mla_q,
+        "kv_cache": mla_cache,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": rope_dim,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "mask_type": "causal",
+    }
+    mla_wrapper = BatchMLADecodePagedTSWrapper()
+    mla_wrapper._planned = True
+    mla_wrapper._packed_query = False
+    mla_definitions = (
+        batch_decode_mla_with_paged_kv_cache.fi_trace(**mla_common),
+        prims_ts_batch_decode_with_kv_cache_mla.fi_trace(
+            **mla_common,
+            workspace_buffer=workspace,
+            max_seq_len=seq_len_k,
+        ),
+        fi_trace(
+            mla_wrapper.run,
+            query=mla_q,
+            kv_cache=mla_cache,
+            mask_type="causal",
+        ),
+    )
+
+    expected_names = (
+        "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
+        "prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048",
+        "prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32",
+        "prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4",
+        "prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4",
+        "prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4",
+    )
+    definitions = (*fmha_definitions, *mla_definitions)
+    assert tuple(definition["name"] for definition in definitions) == expected_names
+    for definition in definitions:
+        assert definition["axes"].get("seq_len_q", {}).get("value") == seq_len_q
+        assert definition["inputs"]["mask_type"]["optional"] is True
+        assert "unknown" not in str(definition["outputs"])
 
 
 # ---------------------------------------------------------------------------
