@@ -45,13 +45,13 @@ H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.
 
 The frozen M128 provenance is Cake revision
-``600583dab4705976911a9384c59aeaed9d354979`` at tree
-``4fe94713724464c0f6e877a3131eda55b823059f``. The H12 N16 schedule is module
-``flashkda_bf16_fused_m128_8672e4378b`` with raw source SHA-256
-``5419508467bf64918d3b517950235ab4e943836fd4717da81475d94fc1f3ae98``.
-The N32 schedule remains byte-identical as module
-``flashkda_bf16_fused_m128_c0c5dc1a67`` with raw source SHA-256
-``d92ddc58b2f07d95a85d7de25950e1f1722af35fcf511ffc0ed22faf4ffff2c9``.
+``691136208f24a5160fcc5940ea4064e5613db2e4`` at tree
+``48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3``. The H12 N16 schedule is module
+``flashkda_bf16_fused_m128_8b12e502af`` with raw source SHA-256
+``a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a``.
+The N32 schedule remains frozen as module
+``flashkda_bf16_fused_m128_9e356f6c5c`` with raw source SHA-256
+``b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d``.
 
 Fixed input omits ``cu_seqlens``. Packed input has ``B=1`` and accepts a
 contiguous CUDA int32 or int64 ``cu_seqlens``. The frozen binding consumes

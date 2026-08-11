@@ -1,7 +1,7 @@
 {
   "architecture_artifacts_are_separate": true,
-  "cake_revision": "600583dab4705976911a9384c59aeaed9d354979",
-  "cake_tree": "4fe94713724464c0f6e877a3131eda55b823059f",
+  "cake_revision": "691136208f24a5160fcc5940ea4064e5613db2e4",
+  "cake_tree": "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
   "generated_invariants": [
     "six fence.proxy.tensormap::generic.acquire.sys operations",
     "CTA barrier after tensor-map acquisition"
@@ -22,28 +22,28 @@
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n16-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-      "profile_sha256": "3cdce6701d885181a9a949fd06523437f43da0d3c320438edaf06a849f627508",
+      "profile_sha256": "1f7b28eee656c8679add1de604af18d7895287e2a04a80291da6ea092ff04c8e",
       "variant": "n16"
     },
     "sm100_n32": {
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n32-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm100.json",
-      "profile_sha256": "5640b0929f3783217cc975ddad20ae18120d3d4862d5589366b807f2901a4558",
+      "profile_sha256": "aad3052837acc33386a91784cf16005b6f9be4858b4b9337bd51c42a0e4f8b02",
       "variant": "n32"
     },
     "sm103_n16": {
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n16-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-      "profile_sha256": "4edfa4e5fd99ff23c192f419f0af18d81fe7cbea162254252785aad11de5d399",
+      "profile_sha256": "c1ce51903b29e87421eeccdd37b51864618ee46676240ea804097b7b639781cc",
       "variant": "n16"
     },
     "sm103_n32": {
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n32-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm103.json",
-      "profile_sha256": "32636b365198719e7217c3d83af29a3884a5516f3a4f83ab40d136693de2fedd",
+      "profile_sha256": "9270f97dbee79da85f662205ebb198c148f8838c9ab28c947988d4be424c8b42",
       "variant": "n32"
     }
   },
@@ -53,19 +53,19 @@
     "n16": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
-      "frozen_sha256": "0cc6044310e93de97aa7aecdd34d9b7b720aa4876da6a0506d07c705e052c4cc",
-      "module_ident": "flashkda_bf16_fused_m128_8672e4378b",
-      "raw_bytes": 140769,
-      "raw_sha256": "5419508467bf64918d3b517950235ab4e943836fd4717da81475d94fc1f3ae98",
+      "frozen_sha256": "10b63ee92e514d3e42cb997dfd1deda0d77505a13f61a7cb1921747c6ae4e4bb",
+      "module_ident": "flashkda_bf16_fused_m128_8b12e502af",
+      "raw_bytes": 140826,
+      "raw_sha256": "a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a",
       "smem_bytes": 219136
     },
     "n32": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128.cu",
-      "frozen_sha256": "d4088d550de8a656c362aabad02eb20ace520c69cde7ba1bd19086415808a380",
-      "module_ident": "flashkda_bf16_fused_m128_c0c5dc1a67",
-      "raw_bytes": 160983,
-      "raw_sha256": "d92ddc58b2f07d95a85d7de25950e1f1722af35fcf511ffc0ed22faf4ffff2c9",
+      "frozen_sha256": "e938d3fc7f079909e8a784ea937712c63863706cc17f46cc2065ee24008805d1",
+      "module_ident": "flashkda_bf16_fused_m128_9e356f6c5c",
+      "raw_bytes": 161055,
+      "raw_sha256": "b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
       "smem_bytes": 227328
     }
   }

@@ -49,8 +49,8 @@ _FLASH_KDA_TARGET_DEFINE = {
 # prevents an installed JIT/AOT cache containing the previous N32 body from
 # satisfying either refreshed schedule after an in-place package upgrade.
 _FLASH_KDA_M128_MODULE_IDENTS = {
-    "m128": "c0c5dc1a67",
-    "m128_n16": "8672e4378b",
+    "m128": "9e356f6c5c",
+    "m128_n16": "8b12e502af",
 }
 
 

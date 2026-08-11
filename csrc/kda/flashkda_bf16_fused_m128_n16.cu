@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_8672e4378b.
-// Cake revision: 600583dab4705976911a9384c59aeaed9d354979; raw SHA-256: 5419508467bf64918d3b517950235ab4e943836fd4717da81475d94fc1f3ae98.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_8b12e502af.
+// Cake revision: 691136208f24a5160fcc5940ea4064e5613db2e4; raw SHA-256: a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1246,10 +1246,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
             unsigned int _phase_raw_inputs_free = 1;
             unsigned int _phase_gate_raw_full = 0;
             unsigned int _phase_smem_free = 1;
+            unsigned int _phase_v_free = 1;
             unsigned int _phase_qk_raw_full = 0;
             unsigned int _phase_prep_diag_ready = 0;
             unsigned int _phase_prep_inv16_ready = 0;
-            unsigned int _phase_v_free = 1;
             #pragma unroll 1
             for (int prep_iter = 0; prep_iter < num_prep_iters; prep_iter++) {
                 int chunk_idx_2 = prep_iter * 5 + prep_instance;
@@ -1305,6 +1305,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     }
                 }
                 mbarrier_wait(smem_free_addr + (prep_stage) * 8, _phase_smem_free);
+                mbarrier_wait(v_free_addr + (prep_stage) * 8, _phase_v_free);
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
@@ -1534,7 +1535,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     for (int elem_in_segment_1 = 0; elem_in_segment_1 < 8; elem_in_segment_1++) {
                         int col = segment * 8 + elem_in_segment_1;
                         float prefix = smem_gate_all[stage_f32 + row * 128 + col];
-                        float common_log2 = lower_bound * 1.4426950408889634f * 8.0f;
+                        float common_log2 = smem_gate_all[stage_f32 + 1024 + col];
                         float _exp2_2 = approx_exp2(prefix - common_log2);
                         float decay = _exp2_2;
                         qd_vec[elem_in_segment_1] = decay;
@@ -1927,13 +1928,18 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 {
                     if (prep_local_warp >= 2) {
                         int stage_f32_0 = prep_stage * 10496;
-                        float restore_scale = smem_restore_factor_all[stage_f32_0 + 128];
+                        float restore_scale[8];
                         float restore_factor[8];
                         int restore_segment = lane & 15;
                         #pragma unroll
                         for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
                             int restore_col = restore_segment * 8 + restore_elem;
-                            restore_factor[restore_elem] = smem_restore_factor_all[stage_f32_0 + restore_col];
+                            float anchor_log2 = smem_gate_all[stage_f32_0 + 1024 + restore_col];
+                            float total_log2_2 = smem_gt_prefix_all[stage_f32_0 + restore_col];
+                            float _exp2_4 = approx_exp2(total_log2_2 - anchor_log2);
+                            restore_factor[restore_elem] = _exp2_4;
+                            float _exp2_5 = approx_exp2(anchor_log2);
+                            restore_scale[restore_elem] = _exp2_5;
                         }
                         #pragma unroll 1
                         for (int restore_pass = 0; restore_pass < 4; restore_pass++) {
@@ -2002,15 +2008,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             #pragma unroll
                             for (int restore_elem_1 = 0; restore_elem_1 < 8; restore_elem_1++) {
                                 restore_kr_values[restore_elem_1] = restore_ki_values[restore_elem_1] * restore_factor[restore_elem_1];
+                                restore_qd_values[restore_elem_1] = restore_qd_values[restore_elem_1] * restore_scale[restore_elem_1];
+                                restore_kd_values[restore_elem_1] = restore_kd_values[restore_elem_1] * restore_scale[restore_elem_1];
                             }
-                            const float2 _scale2_7 = {restore_scale, restore_scale};
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], _scale2_7);
-                            const float2 _scale2_8 = {restore_scale, restore_scale};
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kd_values)[_ls], _scale2_8);
                             unsigned int packed_2_1[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
@@ -2124,6 +2124,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     }
                 }
                 if (prep_local_warp < 2) {
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(prep_diag_ready_addr + (prep_stage) * 8);
                     }
@@ -2164,10 +2165,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
                                 : "=f"(dc_acc[0]), "=f"(dc_acc[1]), "=f"(dc_acc[2]), "=f"(dc_acc[3])
                                 : "r"(d_frag[0]), "r"(d_frag[1]), "r"(c_frag[0]));
-                            const float2 _scale2_9 = {-1.0f, -1.0f};
+                            const float2 _scale2_7 = {-1.0f, -1.0f};
                             #pragma unroll
                             for (int _ls = 0; _ls < 2; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(dc_acc)[_ls], _scale2_9);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(dc_acc)[_ls], _scale2_7);
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(dc_acc[_lp*2 + 0], dc_acc[_lp*2+1 + 0]));
@@ -2188,11 +2189,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             int byte_off_4 = (int)prep_stage * 41984 + (8 + lane_row) * 128;
                             int swizzled_off_5 = byte_off_4 ^ (byte_off_4 >> 7 & 7) << 4;
                             int o_addr = smem_inv_work_addr + (unsigned int)swizzled_off_5;
-                            uint32_t _stmatrix_addr_10 = static_cast<uint32_t>((unsigned long long)o_addr);
+                            uint32_t _stmatrix_addr_8 = static_cast<uint32_t>((unsigned long long)o_addr);
                             asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n"
-                                :: "r"(_stmatrix_addr_10), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))
+                                :: "r"(_stmatrix_addr_8), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))
                                 : "memory");
                         }
+                        __syncwarp();
                         if (elect_sync()) {
                             mbarrier_arrive(prep_inv16_ready_addr + (prep_stage) * 8);
                         }
@@ -2212,9 +2214,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             : "r"(inv16_addr)
                             : "memory");
                         int inv16_publish_addr = (smem_inv_addr + prep_stage * 41984 + (unsigned int)(lane_col / 16 * 512 + lane_row_1 * 32 + lane_col % 16 * 2 ^ (lane_col / 16 * 512 + lane_row_1 * 32 + lane_col % 16 * 2 >> 7 & 1) << 4));
-                        uint32_t _stmatrix_addr_11 = static_cast<uint32_t>((unsigned long long)inv16_publish_addr);
+                        uint32_t _stmatrix_addr_9 = static_cast<uint32_t>((unsigned long long)inv16_publish_addr);
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                            :: "r"(_stmatrix_addr_11), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[3]))
+                            :: "r"(_stmatrix_addr_9), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[3]))
                             : "memory");
                     }
                 }
@@ -2225,7 +2227,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         mbarrier_arrive(qk_full_addr + (prep_stage) * 8);
                     }
                 }
-                mbarrier_wait(v_free_addr + (prep_stage) * 8, _phase_v_free);
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
@@ -2257,7 +2258,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 }
                 for (int _advance = 0; _advance < 5; _advance++) {
                     prep_stage += 1;
-                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_qk_raw_full ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; _phase_v_free ^= 1; }
+                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_v_free ^= 1; _phase_qk_raw_full ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; }
                 }
             }
         }
