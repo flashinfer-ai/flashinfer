@@ -25,19 +25,17 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
 )
-
-
-def _is_sm100_family() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_properties(0).major == 10
+from flashinfer.utils import is_sm100a_supported
 
 
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuTeDSL is not available"
 )
+# The marker is evaluated at import time, so short-circuit on CPU-only hosts:
+# is_sm100a_supported queries the current device.
 sm100_required = pytest.mark.skipif(
-    not _is_sm100_family(), reason="Requires an SM100-family GPU"
+    not (torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))),
+    reason="Requires an SM100-family GPU with CUDA 12.8+",
 )
 
 
@@ -264,7 +262,9 @@ class TestMxfp8Mxfp4CanImplement:
         ]:
             assert can_implement(mma_tiler_mn=mma_tiler_mn, n=n)
 
-        # The 128x4 E8M0 scale layout requires complete 128-row groups.
+        # N must cover whole 128-element groups: the B scale-factor layout tiles
+        # the N extent into 128x4 E8M0 atoms, so a partial group would
+        # under-describe the weight scales.
         assert not can_implement(mma_tiler_mn=(128, 64), n=192)
         # A partial trailing N tile is allowed: the finalize epilogue clamps the
         # bulk-reduce size to the remaining columns.

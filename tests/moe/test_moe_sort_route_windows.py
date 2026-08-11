@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+from flashinfer.utils import is_sm100a_supported
 
 # Must match kContiguousRouteWindowMinTokens in csrc/moe_utils_binding.cu.
 CONTIGUOUS_WINDOW_MIN_TOKENS = 65536
@@ -42,9 +43,11 @@ LOCAL_EXPERTS = 32
 LOCAL_EXPERT_OFFSET = 0
 HIDDEN_SIZE = 6144
 
+# The marker is evaluated at import time, so short-circuit on CPU-only hosts:
+# is_sm100a_supported queries the current device.
 sm100_required = pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_properties(0).major == 10),
-    reason="Requires an SM100-family GPU",
+    not (torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))),
+    reason="Requires an SM100-family GPU with CUDA 12.8+",
 )
 
 

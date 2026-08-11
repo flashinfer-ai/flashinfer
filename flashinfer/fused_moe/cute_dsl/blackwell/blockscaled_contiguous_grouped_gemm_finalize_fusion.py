@@ -2738,9 +2738,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         ):
             return False
 
-        # The wrapper exposes B scales in complete 128-row layout atoms, so a
-        # partial atom would silently under-describe the weight scales. The
-        # epilogue itself predicates the N tail via valid_columns.
+        # The wrapper tiles the B scale factors over the N extent in complete
+        # 128x4 layout atoms, so an N that leaves a partial group would silently
+        # under-describe the weight scales. This is separate from the N tail
+        # within a tile, which the epilogue predicates via valid_columns.
         if n % 128 != 0:
             return False
 

@@ -6,19 +6,16 @@ import pytest
 import torch
 
 from flashinfer.cute_dsl import is_cute_dsl_available
-
-
-def _is_sm100_family() -> bool:
-    return bool(
-        torch.cuda.is_available() and torch.cuda.get_device_properties(0).major == 10
-    )
-
+from flashinfer.utils import is_sm100a_supported
 
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuTeDSL is not available"
 )
+# The marker is evaluated at import time, so short-circuit on CPU-only hosts:
+# is_sm100a_supported queries the current device.
 sm100_required = pytest.mark.skipif(
-    not _is_sm100_family(), reason="Requires an SM100-family GPU"
+    not (torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))),
+    reason="Requires an SM100-family GPU with CUDA 12.8+",
 )
 
 

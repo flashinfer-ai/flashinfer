@@ -63,13 +63,26 @@ from .moe_utils import (
 )
 
 
-_mixed_functional_resources: Dict[Tuple[str, Optional[int]], Dict[str, Any]] = {}
+# Per-thread, per-device async-memset resources. These must not be shared
+# across host threads: recording a CUDA event overwrites its previous capture,
+# so two threads reusing one event can have one thread's `memset_event.wait()`
+# satisfied by the other thread's record and start its GEMM2 before its own
+# memset retired -- the fused finalize then atomically accumulates into a
+# buffer that was never zeroed. The wrapper API serializes its own runs, but
+# the functional API is free-threaded, so it gets one set per thread.
+_mixed_functional_resources = threading.local()
 
 
 def _get_mixed_functional_resources(device: torch.device) -> Dict[str, Any]:
-    """Return persistent async-memset resources owned by ``device``."""
+    """Return per-thread async-memset resources owned by ``device``."""
+    by_device: Optional[Dict[Tuple[str, Optional[int]], Dict[str, Any]]] = getattr(
+        _mixed_functional_resources, "by_device", None
+    )
+    if by_device is None:
+        by_device = {}
+        _mixed_functional_resources.by_device = by_device
     key = (device.type, device.index)
-    resources = _mixed_functional_resources.get(key)
+    resources = by_device.get(key)
     if resources is None:
         with torch.cuda.device(device):
             resources = {
@@ -77,7 +90,7 @@ def _get_mixed_functional_resources(device: torch.device) -> Dict[str, Any]:
                 "memset_event": torch.cuda.Event(),
                 "aux_stream": torch.cuda.Stream(device=device),
             }
-        _mixed_functional_resources[key] = resources
+        by_device[key] = resources
     return resources
 
 

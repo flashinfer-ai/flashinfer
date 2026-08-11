@@ -367,15 +367,22 @@ class CuteDslFusedMoEMxfp8Mxfp4Runner(TunableRunner):
                 valid_tactics.append(tactic)
 
         if not valid_tactics:
+            # DEFAULT_MXFP8_MXFP4_MOE_TACTIC is a member of
+            # ALL_MXFP8_MXFP4_MOE_TACTICS, so an empty list means even the
+            # default fails can_implement -- do not fall back to it
+            # unvalidated (gh #3957, same reasoning as the NVFP4 runner).
+            # Returning empty lets the autotuner skip a bucket it cannot
+            # profile; the kernel wrappers re-validate can_implement at launch
+            # and raise, so an unvalidated tactic still cannot reach the device.
             logger.warning(
-                "No valid MXFP8 x MXFP4 tactics for tokens=%d, hidden=%d, "
-                "intermediate=%d, experts=%d; falling back to the default tactic",
+                "No valid MXFP8 x MXFP4 tactics for problem dims "
+                "(tokens=%d, hidden=%d, intermediate=%d, experts=%d, top_k=%d).",
                 num_tokens,
                 hidden_size,
                 intermediate_size,
                 num_local_experts,
+                self.top_k,
             )
-            return [DEFAULT_MXFP8_MXFP4_MOE_TACTIC]
         return valid_tactics
 
     def forward(  # type: ignore[override]
