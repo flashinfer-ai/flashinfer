@@ -275,6 +275,7 @@ def prims_ts_fp4_block_scale_moe(
         norm_topk_prob=norm_topk_prob,
         routing_replay_out=routing_replay_out,
         routing_input_mode=routing_input_mode,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
     moe_runner.set_cache_key_static_extras(**common_kwargs)
     ok, reason = support_fn(moe_runner, moe_inputs, [-1, -1], **common_kwargs)
