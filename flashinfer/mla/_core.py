@@ -2932,11 +2932,11 @@ def _mla_decode_tuning_config(
 ) -> TuningConfig:
     """One TuningConfig and stable initializer set per key.
 
-    Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
-    ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
-    its hash with all previous ones (``DynamicTensorSpec.__hash__`` skips
-    ``tensor_initializers``) but never compares equal (closures compare by
-    identity), so would result in a leak.
+    Memoized so equivalent dispatcher calls reuse a single config object (and
+    its initializer closures) instead of rebuilding them every call. The
+    initializer closures no longer participate in ``AutoTuner``'s nearest-profile
+    cache key (it keys only on the dynamic-tensor specs and constraints), so this
+    memoization is a host-overhead optimization rather than a leak guard.
 
     The DynamicTensorSpec sweeps batch dim across ``query``, ``block_tables``,
     ``seq_lens``, ``out``, plus one optional fifth tensor — the sparse top-k
@@ -2979,11 +2979,12 @@ def _mla_decode_tuning_config(
         fifth_init = None
 
     input_idx = (0, 1, 2, 3, 4) if fifth_init is not None else (0, 1, 2, 3)
-    tensor_initializers = (
-        (None, init_block_tables, init_seq_lens, None, fifth_init)
-        if fifth_init is not None
-        else (None, init_block_tables, init_seq_lens, None)
-    )
+    tensor_initializers = [
+        (1, init_block_tables),
+        (2, init_seq_lens),
+    ]
+    if fifth_init is not None:
+        tensor_initializers.append((4, fifth_init))
 
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -2992,9 +2993,9 @@ def _mla_decode_tuning_config(
                 dim_idx=(0,) * len(input_idx),
                 gen_tuning_buckets=buckets,
                 map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=False),
-                tensor_initializers=tensor_initializers,
             ),
         ),
+        tensor_initializers=tuple(tensor_initializers),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

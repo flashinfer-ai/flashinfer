@@ -4730,8 +4730,9 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     quant_6_size = num_experts_per_node * sizeof(float);
   } else if (is_native_wfp4afp8_family) {
     quant_1_size = sizeof(float);
-    quant_2_size = getOffsetWeightSF(num_experts_per_node, inter_size, hidden_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+    quant_2_size =
+        getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
+        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
     quant_3_size = num_experts_per_node * sizeof(float);
     quant_4_size = sizeof(float);
     quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
@@ -5034,12 +5035,30 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
   } else if (mDType == nvinfer1::DataType::kFP8 &&
              (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64)) {
     TLLM_CHECK(quant_1 && quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
-    mQuantParams = QuantParams::FP8MXFP4(
-        static_cast<float const*>(quant_1),
-        static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_2),
-        static_cast<float const*>(quant_3), static_cast<float const*>(quant_4),
-        static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
-        static_cast<float const*>(quant_6));
+    if (mUseMxfp8ActScaling) {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+      // Normalize the profiler's fabricated weight block scale factors to UE8M0 unity so tactic
+      // timing is not driven by random exponents from the workspace.
+      TLLM_CUDA_CHECK(cudaMemsetAsync(const_cast<void*>(quant_2), 0x7F,
+                                      workspaces.at("quant_2").first, stream));
+      TLLM_CUDA_CHECK(cudaMemsetAsync(const_cast<void*>(quant_5), 0x7F,
+                                      workspaces.at("quant_5").first, stream));
+      mQuantParams = QuantParams::MXFP8MXFP4(
+          static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_2),
+          static_cast<float const*>(quant_3),
+          static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
+          static_cast<float const*>(quant_6));
+#else
+      TLLM_CHECK_WITH_INFO(false, "MXFP8 x MXFP4 profiling requires OSS Cutlass MoE GEMM");
+#endif
+    } else {
+      mQuantParams = QuantParams::FP8MXFP4(
+          static_cast<float const*>(quant_1),
+          static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_2),
+          static_cast<float const*>(quant_3), static_cast<float const*>(quant_4),
+          static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
+          static_cast<float const*>(quant_6));
+    }
   } else if ((mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
              (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64)) {
     // nvllm still uses int64 because torch doesn't have fp4 yet.

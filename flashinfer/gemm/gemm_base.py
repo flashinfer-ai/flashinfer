@@ -6960,6 +6960,11 @@ def _check_bmm_fp8_problem_size(
     return True
 
 
+# One-shot guard so the SM12x cuDNN-skip warning fires once per process, not
+# on every ``bmm_fp8(backend="auto")`` call (the heuristic runs per-call).
+_CUDNN_SM12X_SKIP_LOGGED: set = set()
+
+
 def _heuristic_func_bmm_fp8(
     suitable_backends: List[str],
     A: torch.Tensor,
@@ -6986,7 +6991,20 @@ def _heuristic_func_bmm_fp8(
     if "cublas" in suitable_backends:
         heuristic_backends.append("cublas")
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
-        heuristic_backends.append("cudnn")
+        # On SM12x without override_shape (cuDNN backend < 9.23.1), cuDNN's
+        # per-shape ``policy=ALL`` graph build is unbounded host-side work at
+        # serving time and its async CUDA fault escapes #3707's synchronous
+        # fallback. Gate it out; keep cublas/cutlass. See RFC #3920 rule 6.
+        if is_sm120_supported and not _is_cudnn_override_shape_available():
+            if "sm12x" not in _CUDNN_SM12X_SKIP_LOGGED:
+                _CUDNN_SM12X_SKIP_LOGGED.add("sm12x")
+                logger.warning(
+                    "Skipping cuDNN in bmm_fp8 auto candidates on SM12x: "
+                    "override_shape unavailable (cuDNN backend < 9.23.1); "
+                    "policy=ALL per-shape build is unbounded at serving time."
+                )
+        else:
+            heuristic_backends.append("cudnn")
     return heuristic_backends
 
 
