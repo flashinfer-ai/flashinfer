@@ -444,6 +444,10 @@ def gated_delta_product_mtp(
     else:
         expanded_ssm_state_indices = None
 
+    if initial_state_indices.data_ptr() % 16 != 0:
+        # GDN kernel requires 16-byte alignment on the index tensor
+        initial_state_indices = initial_state_indices.clone()
+
     _, state = gated_delta_rule_mtp(
         expanded_q,
         k,
