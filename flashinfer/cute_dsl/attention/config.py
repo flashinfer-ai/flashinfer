@@ -167,6 +167,25 @@ class AttentionConfig:
         return self.mma_tiler[1] // self.page_size
 
     @property
+    def load_pt_stages(self) -> int | None:
+        """Depth of the page-table SMEM ring, or None to read ids in-loop.
+
+        At 16+ pages per KV tile the loader's in-loop id loads dominate
+        its issue cadence (one global-latency load feeding each TMA copy,
+        twice per tile across the K and V loops).  A dedicated producer
+        warp then pays for itself: it stages each tile's ids into an SMEM
+        ring ahead of the loader, which reads them back at LDS latency
+        (the MLA-decode pt-loader design).  Below that copy count the
+        ring's handshake costs more than the id loads it removes (the
+        handshake is a fixed per-tile cost; the savings scale with the
+        copy count — measured on both sides of the crossover), so the
+        loader keeps the direct path.
+        """
+        if self.page_size is not None and self.pages_per_kv_tile >= 16:
+            return 4
+        return None
+
+    @property
     def tile_bounds(self) -> TileBounds:
         """Derive tile bounds from head mapping."""
         if self.head_mapping == HeadMapping.MMA_M and self.num_heads > 0:

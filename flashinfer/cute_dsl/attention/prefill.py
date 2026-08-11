@@ -21,6 +21,7 @@ from .roles.softmax import SoftmaxRole
 from .roles.correction import CorrectionRole
 from .roles.epilogue import EpilogueRole
 from .roles.loader_tma import LoaderRole
+from .roles.pt_loader import PageTableLoaderRole
 from .roles.mma import MmaRole
 from .compat import get_current_arch as _get_current_arch
 
@@ -277,6 +278,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         self.epilogue_role = EpilogueRole(self.config)
         self.loader_role = LoaderRole(self.config)
+        self.pt_loader_role = (
+            PageTableLoaderRole(self.config)
+            if self.config.load_pt_stages is not None
+            else None
+        )
         self.mma_role = MmaRole(
             self.config,
             tmem_alloc_cols=self.tmem.alloc_cols,
@@ -501,6 +507,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         s0_s1_sequence_producer, s0_s1_sequence_consumer = pipes["s0_s1_sequence"]
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
 
+        # Page-table ring (empty-warp pt producer -> loader)
+        load_pt_producer = load_pt_consumer = None
+        if cutlass.const_expr(self.config.load_pt_stages is not None):
+            load_pt_producer, load_pt_consumer = pipes["load_pt"]
+
         # Standard path pipelines (correction warp)
         s0_corr_producer = s0_corr_consumer = None
         s1_corr_producer = s1_corr_consumer = None
@@ -559,6 +570,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                 ),
                 v_smem_layout_for_tma.outer,
             )
+        sPT = None
+        if cutlass.const_expr(self.config.load_pt_stages is not None):
+            sPT = storage.smem_page_table.get_tensor(
+                cute.make_layout(
+                    (self.config.pages_per_kv_tile, self.config.load_pt_stages)
+                )
+            )
         (
             qk_thr_mma,
             pv_thr_mma,
@@ -586,10 +604,24 @@ class BlackwellFusedMultiHeadAttentionForward:
             number_of_threads=self.schedule.threads_per_cta,
         )
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
+        #  EMPTY (page-table producer when the pt ring is enabled)
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.empty_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_empty)
+            if cutlass.const_expr(self.config.load_pt_stages is not None):
+                self.pt_loader_role.run(
+                    mQ_qdl.shape[0],
+                    mK_kdl.shape[0],
+                    cum_seqlen_q,
+                    cum_seqlen_k,
+                    window_left,
+                    window_right,
+                    load_pt_producer,
+                    kv_page_table,
+                    kv_page_indptr,
+                    sPT,
+                    tile_sched_params,
+                )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -619,6 +651,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 sV_tma,
                 kv_page_table,
                 kv_page_indptr,
+                load_pt_consumer,
+                sPT,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////

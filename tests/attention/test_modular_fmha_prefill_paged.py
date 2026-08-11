@@ -246,9 +246,26 @@ def test_paged_identity_table():
     run_paged_vs_ragged([512, 512], [512, 512], True, 16, scramble=False)
 
 
+@pytest.mark.parametrize("page_size", [8, 16])
+def test_paged_d64_windowed_null_block(page_size):
+    """head_dim 64 (single-slice TMA box geometry) x window clamp x NaN
+    null blocks — the paged geometry the d128 cases don't reach."""
+    _skip_unless_sm100()
+    run_paged_vs_ragged(
+        [1291],
+        [1547],
+        True,
+        page_size,
+        pool_fill=float("nan"),
+        window_left=127,
+        null_below_window=True,
+        d=64,
+    )
+
+
 @pytest.mark.parametrize(
     "causal,page_size",
-    [(True, 16), (False, 64)],
+    [(True, 8), (True, 16), (False, 64)],
 )
 def test_paged_nan_pool_tail_clamp(causal, page_size):
     """Unreferenced pool pages NaN: the tail -1 clamp must keep them out."""
@@ -262,6 +279,7 @@ def test_paged_nan_pool_tail_clamp(causal, page_size):
     "sq,sk,causal,page_size,window_left",
     [
         ([1024], [1024], False, 16, 255),
+        ([1024], [1024], True, 8, 255),
         ([1291], [1547], True, 64, 511),
     ],
 )
@@ -277,6 +295,7 @@ def test_paged_windowed(sq, sk, causal, page_size, window_left):
         ([300], [1500], False, 16, 127),
         ([1291], [1547], True, 64, 511),
         ([7, 300, 1291], [23, 300, 1547], True, 16, 127),
+        ([7, 300, 1291], [23, 300, 1547], True, 8, 127),
     ],
 )
 def test_paged_null_block_window_clamp(sq, sk, causal, page_size, window_left):
@@ -454,7 +473,8 @@ def test_paged_wrapper_lse():
     assert lse.shape == (q.shape[0], 8) and torch.isfinite(lse).all().item()
 
 
-def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper():
+@pytest.mark.parametrize("page_size", [8, 16])
+def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper(page_size):
     """Uniform fp8 paged vs fp8 ragged, both on the modular kernel via a
     windowed plan — bitwise, no tolerance calibration needed."""
     _skip_unless_sm100()
@@ -462,7 +482,7 @@ def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper():
 
     dt = torch.float8_e4m3fn
     (q, k_rag, v_rag, cache, qo, kv_tok, kv_pg, ids, lpl) = _build_wrapper_problem(
-        [300, 1291], [300, 1547], 16, dt=torch.bfloat16
+        [300, 1291], [300, 1547], page_size, dt=torch.bfloat16
     )
     q8, k8, v8 = q.to(dt), k_rag.to(dt), v_rag.to(dt)
     cache8 = cache.to(dt)
@@ -475,7 +495,7 @@ def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper():
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim_qk=128,
-        page_size=16,
+        page_size=page_size,
         causal=True,
         window_left=511,
         q_data_type=dt,
@@ -503,7 +523,8 @@ def test_paged_wrapper_fp8_bitwise_vs_ragged_wrapper():
     assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
 
 
-def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
+@pytest.mark.parametrize("page_size", [8, 16])
+def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged(page_size):
     """Mixed-dtype paged cache: bf16 Q/K with an fp8 V cache (tuple form).
 
     The ragged route already serves mixed V as a run()-time property; the
@@ -513,7 +534,7 @@ def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
     _skip_unless_sm100()
 
     (q, k_rag, v_rag, cache, qo, kv_tok, kv_pg, ids, lpl) = _build_wrapper_problem(
-        [300, 1291], [300, 1547], 16
+        [300, 1291], [300, 1547], page_size
     )
     plan_kw = dict(
         num_qo_heads=8,
@@ -533,7 +554,7 @@ def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
     )
 
     w = _paged_wrapper()
-    w.plan(qo, kv_pg, ids, lpl, page_size=16, **plan_kw)
+    w.plan(qo, kv_pg, ids, lpl, page_size=page_size, **plan_kw)
     if not _dsl_supports_expected_tx():
         # Pre-4.6 DSL: mixed V must be rejected with an actionable error
         # (this asserts the version gate itself).
@@ -564,8 +585,9 @@ def test_paged_wrapper_mixed_v_dtype_bitwise_vs_ragged():
     assert torch.equal(out_paged.view(torch.int16), out_rag.view(torch.int16))
 
 
+@pytest.mark.parametrize("page_size", [8, 16])
 @pytest.mark.parametrize("variant_name", ["sigmoid", "alibi", "sink"])
-def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name):
+def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name, page_size):
     """Attention variants must compose with paged KV.
 
     The loader is the only stage that differs between the paged and ragged
@@ -584,7 +606,7 @@ def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name):
     )
 
     (q, k_rag, v_rag, cache, qo, kv_tok, kv_pg, ids, lpl) = _build_wrapper_problem(
-        [300, 1291], [300, 1547], 16
+        [300, 1291], [300, 1547], page_size
     )
     h_q = 8
 
@@ -612,7 +634,7 @@ def test_paged_wrapper_variants_bitwise_vs_ragged(variant_name):
     w_paged = BatchPrefillCuteDSLWrapper(ws)
     w_paged.plan(
         qo,
-        page_size=16,
+        page_size=page_size,
         paged_kv_indptr=kv_pg,
         paged_kv_indices=ids,
         paged_kv_last_page_len=lpl,

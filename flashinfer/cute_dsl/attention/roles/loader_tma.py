@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
-from cutlass.pipeline import PipelineProducer
+from cutlass.pipeline import PipelineConsumer, PipelineProducer
 
 from ..config import AttentionConfig
 from ..fusion.mask import get_kv_block_range
@@ -43,6 +43,10 @@ class LoaderRole:
         # TMA copy count, both compile-time.
         self.page_size = config.page_size
         self.pages_per_kv_tile = config.pages_per_kv_tile
+        # With the page-table ring, the empty warp stages pre-clamped ids
+        # into SMEM and this warp reads them back at LDS latency; without
+        # it, ids come from the global table inside the copy loop.
+        self.use_pt_ring = config.load_pt_stages is not None
         # Populated by set_v_tx_bytes() once dtypes are known at __call__
         # time.  None means K and V have the same width (plain acquires).
         self.v_tx_bytes = None
@@ -76,15 +80,15 @@ class LoaderRole:
     ):
         """Issue one K or V tile's per-page TMA copies.
 
-        The loop is kept (nearly) rolled rather than unrolled: the four
+        The loop is kept rolled rather than unrolled: the four
         warp-group code regions share instruction fetch, and a fully
-        unrolled body is large enough to stall them all on fetch.  The
-        one exception is 16+ pages per tile (page_size 8), where the
-        per-iteration id-load latency dominates instead; unrolling by 2
-        keeps two id loads in flight without giving back the fetch win.
-        Deeper unrolling measured slower on both counts.  K and V run
-        separate loops and re-read the ids — fusing the loops or
-        staging ids across them measured worse.
+        unrolled body is large enough to stall them all on fetch.  K and
+        V run separate loops and re-read the ids — fusing the loops or
+        staging ids across them measured worse.  At 16+ pages per tile
+        (page_size 8) the in-loop id loads themselves dominate the
+        loader's cadence and the build routes to the page-table ring
+        instead (``config.load_pt_stages``, ``_load_paged_tile_ring``),
+        so this loop only serves page_size >= 16.
 
         A page id of -1 puts the TMA coordinate out of bounds: the copy
         writes zeros to smem and still credits the barrier with the full
@@ -103,8 +107,7 @@ class LoaderRole:
         which plan() enforces by rejecting zero-length KV items.
         """
         logical0 = kv_tile * self.pages_per_kv_tile
-        unroll = 2 if self.pages_per_kv_tile >= 16 else 1
-        for p in cutlass.range(self.pages_per_kv_tile, unroll=unroll):
+        for p in cutlass.range(self.pages_per_kv_tile, unroll=1):
             logical_page = logical0 + p
             safe_page = cutlass.min(logical_page, num_pages_kv - 1)
             page_idx = kv_page_table[table_base + safe_page]
@@ -113,6 +116,51 @@ class LoaderRole:
             else:
                 in_range = logical_page < num_pages_kv
             page_idx = cutlass.select_(in_range, page_idx, Int32(-1))
+            if cutlass.const_expr(is_k):
+                cute.copy(
+                    tma_atom,
+                    tGg[None, page_idx],
+                    tGs[None, p, 0, stage_index],
+                    tma_bar_ptr=barrier,
+                )
+            else:
+                cute.copy(
+                    tma_atom,
+                    tGg[None, page_idx],
+                    tGs[None, 0, p, stage_index],
+                    tma_bar_ptr=barrier,
+                )
+
+    @cute.jit
+    def _load_paged_tile_ring(
+        self,
+        tma_atom,
+        tGg,
+        tGs,
+        stage_index,
+        barrier,
+        sPT,
+        pt_stage,
+        is_k: cutlass.Constexpr,
+    ):
+        """Issue one K or V tile's per-page TMA copies, ids from the ring.
+
+        The pt producer already applied the tail and window clamps (-1 =
+        TMA OOB zero-fill; see ``PageTableLoaderRole``), so each
+        iteration is just an LDS and a copy.  unroll=2 overlaps two
+        id-read chains without growing the text past what the four
+        warp-group regions' shared instruction fetch absorbs; the
+        measured-worse alternatives were a rolled loop (serializes the
+        chains on K-arrival-bound shapes), vectorized LDS.128 id reads
+        feeding 4 copies each (wide-load dependency + text growth), and
+        deeper unrolling (fetch pressure).  The pipeline wait/release
+        for ``pt_stage`` stays in run(): K and V read the same stage,
+        and the caller releases it after V's copies are issued — the ids
+        are baked into the issued copies, so the producer may overwrite
+        the stage while the TMAs are still in flight.
+        """
+        for p in cutlass.range(self.pages_per_kv_tile, unroll=2):
+            page_idx = sPT[p, pt_stage]
             if cutlass.const_expr(is_k):
                 cute.copy(
                     tma_atom,
@@ -259,6 +307,8 @@ class LoaderRole:
         sV_tma: cute.Tensor | None,
         kv_page_table: cute.Tensor | None,
         kv_page_indptr: cute.Tensor | None,
+        load_pt_consumer: PipelineConsumer | None,
+        sPT: cute.Tensor | None,
     ):
         """Loader warp orchestration loop (prefill-specific).
 
@@ -266,7 +316,10 @@ class LoaderRole:
         (``config.page_size`` set), K/V TMA boxes shrink to one page, each
         tile issues ``pages_per_kv_tile`` copies indexed by runtime page
         ids from ``kv_page_table``, and ``sK_tma``/``sV_tma`` are the
-        per-page-divided views of the same K/V smem ring.
+        per-page-divided views of the same K/V smem ring.  With the
+        page-table ring on top (``config.load_pt_stages``), ids come
+        pre-clamped from ``sPT`` — one ``load_pt_consumer`` stage per KV
+        tile, waited before K's copies and released after V's.
         """
         tile_sched = create_fmha_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -399,7 +452,19 @@ class LoaderRole:
                 )
                 kv_coord = kv_block_start
                 k_handle_producer = load_kv_producer.acquire_and_advance()
-                if cutlass.const_expr(self.page_size is not None):
+                if cutlass.const_expr(self.use_pt_ring):
+                    pt_handle = load_pt_consumer.wait_and_advance()
+                    self._load_paged_tile_ring(
+                        tma_atom_k,
+                        tKgK,
+                        tKsK,
+                        k_handle_producer.index,
+                        k_handle_producer.barrier,
+                        sPT,
+                        pt_handle.index,
+                        True,
+                    )
+                elif cutlass.const_expr(self.page_size is not None):
                     self._load_paged_tile(
                         tma_atom_k,
                         tKgK,
@@ -442,7 +507,19 @@ class LoaderRole:
                     v_handle = load_kv_producer.acquire_and_advance(
                         expected_tx=self.v_tx_bytes
                     )
-                if cutlass.const_expr(self.page_size is not None):
+                if cutlass.const_expr(self.use_pt_ring):
+                    self._load_paged_tile_ring(
+                        tma_atom_v,
+                        tVgV,
+                        tVsV,
+                        v_handle.index,
+                        v_handle.barrier,
+                        sPT,
+                        pt_handle.index,
+                        False,
+                    )
+                    pt_handle.release()
+                elif cutlass.const_expr(self.page_size is not None):
                     self._load_paged_tile(
                         tma_atom_v,
                         tVgV,
@@ -470,7 +547,19 @@ class LoaderRole:
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                     # Ki
                     k_handle_producer = load_kv_producer.acquire_and_advance()
-                    if cutlass.const_expr(self.page_size is not None):
+                    if cutlass.const_expr(self.use_pt_ring):
+                        pt_handle = load_pt_consumer.wait_and_advance()
+                        self._load_paged_tile_ring(
+                            tma_atom_k,
+                            tKgK,
+                            tKsK,
+                            k_handle_producer.index,
+                            k_handle_producer.barrier,
+                            sPT,
+                            pt_handle.index,
+                            True,
+                        )
+                    elif cutlass.const_expr(self.page_size is not None):
                         self._load_paged_tile(
                             tma_atom_k,
                             tKgK,
@@ -499,7 +588,19 @@ class LoaderRole:
                         v_handle = load_kv_producer.acquire_and_advance(
                             expected_tx=self.v_tx_bytes
                         )
-                    if cutlass.const_expr(self.page_size is not None):
+                    if cutlass.const_expr(self.use_pt_ring):
+                        self._load_paged_tile_ring(
+                            tma_atom_v,
+                            tVgV,
+                            tVsV,
+                            v_handle.index,
+                            v_handle.barrier,
+                            sPT,
+                            pt_handle.index,
+                            False,
+                        )
+                        pt_handle.release()
+                    elif cutlass.const_expr(self.page_size is not None):
                         self._load_paged_tile(
                             tma_atom_v,
                             tVgV,

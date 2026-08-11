@@ -268,6 +268,15 @@ def build_fmha_launch_params(
     )
     s0_epi_stages = mainloop.epi_stage if mainloop.has_logits_transform else 1
 
+    # Page-table ring (empty-warp pt producer).  Zero-length fields at the
+    # end of the struct keep every other offset and the total size
+    # bit-identical for builds without the ring.
+    pt_stages = mainloop.config.load_pt_stages
+    pt_barrier_slots = 2 * pt_stages if pt_stages is not None else 0
+    pt_ring_slots = (
+        pt_stages * mainloop.config.pages_per_kv_tile if pt_stages is not None else 0
+    )
+
     @cute.struct
     class SharedStorage:
         load_q_mbar_ptr: cute.struct.MemRange[Int64, mainloop.q_stages * 2]
@@ -297,6 +306,8 @@ def build_fmha_launch_params(
             cute.struct.MemRange[k_dtype, sK_cosize],
             align,
         ]
+        load_pt_mbar_ptr: cute.struct.MemRange[Int64, pt_barrier_slots]
+        smem_page_table: cute.struct.MemRange[cutlass.Int32, pt_ring_slots]
 
         @classmethod
         def size_in_bytes(cls) -> int: ...  # noqa: F811
