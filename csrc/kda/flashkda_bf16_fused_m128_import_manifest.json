@@ -1,7 +1,7 @@
 {
   "architecture_artifacts_are_separate": true,
-  "cake_revision": "691136208f24a5160fcc5940ea4064e5613db2e4",
-  "cake_tree": "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
+  "cake_revision": "87d38d39ec51eaedbb5c287f634de99141bd90cf",
+  "cake_tree": "b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22",
   "generated_invariants": [
     "six fence.proxy.tensormap::generic.acquire.sys operations",
     "CTA barrier after tensor-map acquisition"
@@ -22,7 +22,7 @@
       "arch": "sm_100a",
       "profile": "flashkda-bf16-fused-m128-n16-sm100",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-      "profile_sha256": "1f7b28eee656c8679add1de604af18d7895287e2a04a80291da6ea092ff04c8e",
+      "profile_sha256": "df8a5ee4e8d5a48a0773cfc2f8ba916bb21e8deb685e8be6ccec4045c6ea200f",
       "variant": "n16"
     },
     "sm100_n32": {
@@ -36,7 +36,7 @@
       "arch": "sm_103a",
       "profile": "flashkda-bf16-fused-m128-n16-sm103",
       "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-      "profile_sha256": "c1ce51903b29e87421eeccdd37b51864618ee46676240ea804097b7b639781cc",
+      "profile_sha256": "1cba455cc06e65515e41036863351a899d20d34fafb20deb04284fccc9abeb87",
       "variant": "n16"
     },
     "sm103_n32": {
@@ -52,15 +52,19 @@
   "variants": {
     "n16": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
+      "cake_revision": "87d38d39ec51eaedbb5c287f634de99141bd90cf",
+      "cake_tree": "b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
-      "frozen_sha256": "10b63ee92e514d3e42cb997dfd1deda0d77505a13f61a7cb1921747c6ae4e4bb",
-      "module_ident": "flashkda_bf16_fused_m128_8b12e502af",
-      "raw_bytes": 140826,
-      "raw_sha256": "a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a",
+      "frozen_sha256": "c827d032a53f4a0ae18806306a862a61b187329f3fe6318cb992b8957390d516",
+      "module_ident": "flashkda_bf16_fused_m128_b3a8571118",
+      "raw_bytes": 140760,
+      "raw_sha256": "91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925",
       "smem_bytes": 219136
     },
     "n32": {
       "binding_path": "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
+      "cake_revision": "691136208f24a5160fcc5940ea4064e5613db2e4",
+      "cake_tree": "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
       "frozen_path": "csrc/kda/flashkda_bf16_fused_m128.cu",
       "frozen_sha256": "e938d3fc7f079909e8a784ea937712c63863706cc17f46cc2065ee24008805d1",
       "module_ident": "flashkda_bf16_fused_m128_9e356f6c5c",

@@ -31,8 +31,8 @@ from pathlib import Path
 import sys
 
 
-CAKE_REVISION = "691136208f24a5160fcc5940ea4064e5613db2e4"
-CAKE_TREE = "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3"
+CAKE_REVISION = "87d38d39ec51eaedbb5c287f634de99141bd90cf"
+CAKE_TREE = "b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22"
 SEMANTIC_BASELINE = "2396fef3d7132a8c6b49a962f2864c83fff29155"
 
 LICENSE_HEADER = """/*
@@ -61,6 +61,8 @@ class Variant:
     key: str
     frozen_filename: str
     binding_filename: str
+    cake_revision: str
+    cake_tree: str
     module_ident: str
     raw_sha256: str
     raw_bytes: int
@@ -72,15 +74,19 @@ VARIANTS = {
         key="n16",
         frozen_filename="flashkda_bf16_fused_m128_n16.cu",
         binding_filename="flashkda_bf16_fused_m128_n16_binding.cu",
-        module_ident="flashkda_bf16_fused_m128_8b12e502af",
-        raw_sha256="a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a",
-        raw_bytes=140826,
+        cake_revision=CAKE_REVISION,
+        cake_tree=CAKE_TREE,
+        module_ident="flashkda_bf16_fused_m128_b3a8571118",
+        raw_sha256="91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925",
+        raw_bytes=140760,
         smem_bytes=219136,
     ),
     "n32": Variant(
         key="n32",
         frozen_filename="flashkda_bf16_fused_m128.cu",
         binding_filename="flashkda_bf16_fused_m128_binding.cu",
+        cake_revision="691136208f24a5160fcc5940ea4064e5613db2e4",
+        cake_tree="48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3",
         module_ident="flashkda_bf16_fused_m128_9e356f6c5c",
         raw_sha256="b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d",
         raw_bytes=161055,
@@ -93,14 +99,14 @@ PROFILES = {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-n16-sm100",
         "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-        "profile_sha256": "1f7b28eee656c8679add1de604af18d7895287e2a04a80291da6ea092ff04c8e",
+        "profile_sha256": "df8a5ee4e8d5a48a0773cfc2f8ba916bb21e8deb685e8be6ccec4045c6ea200f",
         "variant": "n16",
     },
     "sm103_n16": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-n16-sm103",
         "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-        "profile_sha256": "c1ce51903b29e87421eeccdd37b51864618ee46676240ea804097b7b639781cc",
+        "profile_sha256": "1cba455cc06e65515e41036863351a899d20d34fafb20deb04284fccc9abeb87",
         "variant": "n16",
     },
     "sm100_n32": {
@@ -201,7 +207,7 @@ def _freeze(raw: bytes, variant: Variant) -> bytes:
         "// Frozen Cake export; do not edit by hand.\n"
         "// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; "
         f"module {variant.module_ident}.\n"
-        f"// Cake revision: {CAKE_REVISION}; raw SHA-256: {variant.raw_sha256}.\n"
+        f"// Cake revision: {variant.cake_revision}; raw SHA-256: {variant.raw_sha256}.\n"
     )
     return (
         LICENSE_HEADER
@@ -218,6 +224,8 @@ def _manifest(frozen: dict[str, bytes]) -> bytes:
     for key, variant in VARIANTS.items():
         variants[key] = {
             "binding_path": f"csrc/kda/{variant.binding_filename}",
+            "cake_revision": variant.cake_revision,
+            "cake_tree": variant.cake_tree,
             "frozen_path": f"csrc/kda/{variant.frozen_filename}",
             "frozen_sha256": _sha256(frozen[key]),
             "module_ident": variant.module_ident,

@@ -31,8 +31,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     manifest = json.loads(manifest_path.read_text())
 
     assert manifest["schema_version"] == 1
-    assert manifest["cake_revision"] == "691136208f24a5160fcc5940ea4064e5613db2e4"
-    assert manifest["cake_tree"] == "48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3"
+    assert manifest["cake_revision"] == "87d38d39ec51eaedbb5c287f634de99141bd90cf"
+    assert manifest["cake_tree"] == "b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22"
     assert manifest["architecture_artifacts_are_separate"] is True
     assert manifest["generated_source_text_equal_across_architectures"] is True
     assert set(manifest["profiles"]) == {
@@ -52,8 +52,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     expected_variants = {
         "n16": (
             "flashkda_bf16_fused_m128_n16.cu",
-            "a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a",
-            "flashkda_bf16_fused_m128_8b12e502af",
+            "91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925",
+            "flashkda_bf16_fused_m128_b3a8571118",
             219136,
         ),
         "n32": (
@@ -74,6 +74,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         assert record["raw_sha256"] == raw_sha256
         assert record["module_ident"] == module_ident
         assert record["smem_bytes"] == smem_bytes
+        assert len(record["cake_revision"]) == 40
+        assert len(record["cake_tree"]) == 40
         assert record["frozen_path"] == f"csrc/kda/{filename}"
         assert (
             hashlib.sha256(frozen.read_bytes()).hexdigest() == record["frozen_sha256"]
@@ -102,6 +104,8 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
     for variant_name, variant in namespace["VARIANTS"].items():
         record = manifest["variants"][variant_name]
         assert variant.module_ident == record["module_ident"]
+        assert variant.cake_revision == record["cake_revision"]
+        assert variant.cake_tree == record["cake_tree"]
         assert variant.raw_sha256 == record["raw_sha256"]
         assert variant.raw_bytes == record["raw_bytes"]
         assert variant.smem_bytes == record["smem_bytes"]
@@ -151,8 +155,8 @@ def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
         (
             "m128_n16",
             219136,
-            "a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a",
-            "8b12e502af",
+            "91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925",
+            "b3a8571118",
             True,
         ),
     ],
@@ -412,8 +416,8 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     assert sm103a.name == "flash_kda_bf16_fused_m128_9e356f6c5c_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_8b12e502af_sm100a"
-    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_8b12e502af_sm103a"
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_b3a8571118_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_b3a8571118_sm103a"
 
 
 @pytest.mark.parametrize(

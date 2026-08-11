@@ -45,10 +45,10 @@ H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
 12.9 or newer.
 
 The frozen M128 provenance is Cake revision
-``691136208f24a5160fcc5940ea4064e5613db2e4`` at tree
-``48dc9b734fb1bcfad99d01c9a42d2bf72839ceb3``. The H12 N16 schedule is module
-``flashkda_bf16_fused_m128_8b12e502af`` with raw source SHA-256
-``a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a``.
+``87d38d39ec51eaedbb5c287f634de99141bd90cf`` at tree
+``b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22``. The H12 N16 schedule is module
+``flashkda_bf16_fused_m128_b3a8571118`` with raw source SHA-256
+``91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925``.
 The N32 schedule remains frozen as module
 ``flashkda_bf16_fused_m128_9e356f6c5c`` with raw source SHA-256
 ``b49cd729e6e9670c075da669cc83ed83cd917b1a3ec31a3c47d94720721ec62d``.

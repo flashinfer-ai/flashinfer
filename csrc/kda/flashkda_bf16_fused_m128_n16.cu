@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_8b12e502af.
-// Cake revision: 691136208f24a5160fcc5940ea4064e5613db2e4; raw SHA-256: a5791a51cf3fff19611790cfd1d7102325066ec03640b9c3e8473c485f99f84a.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_b3a8571118.
+// Cake revision: 87d38d39ec51eaedbb5c287f634de99141bd90cf; raw SHA-256: 91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1379,12 +1379,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 }
                 if (prep_tid < 128) {
                     float total_log2 = smem_gt_prefix_all[stage_f32 + prep_tid];
-                    float _exp2_0 = approx_exp2(total_log2 - lower_bound * 1.4426950408889634f * 8.0f);
-                    smem_restore_factor_all[stage_f32 + prep_tid] = _exp2_0;
+                    smem_restore_factor_all[stage_f32 + prep_tid] = smem_gate_all[stage_f32 + 1024 + prep_tid];
                 }
                 if (prep_tid == 0) {
-                    float _exp2_1 = approx_exp2(lower_bound * 1.4426950408889634f * 8.0f);
-                    smem_restore_factor_all[stage_f32 + 128] = _exp2_1;
+                    float _exp2_0 = approx_exp2(lower_bound * 1.4426950408889634f * 8.0f);
+                    smem_restore_factor_all[stage_f32 + 128] = _exp2_0;
                 }
                 #pragma unroll 1
                 for (int work_pass = 0; work_pass < 2; work_pass++) {
@@ -1536,8 +1535,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         int col = segment * 8 + elem_in_segment_1;
                         float prefix = smem_gate_all[stage_f32 + row * 128 + col];
                         float common_log2 = smem_gate_all[stage_f32 + 1024 + col];
-                        float _exp2_2 = approx_exp2(prefix - common_log2);
-                        float decay = _exp2_2;
+                        float _exp2_1 = approx_exp2(prefix - common_log2);
+                        float decay = _exp2_1;
                         qd_vec[elem_in_segment_1] = decay;
                         kd_vec[elem_in_segment_1] = decay;
                         ki_vec[elem_in_segment_1] = k_raw_vec[elem_in_segment_1] / decay;
@@ -1922,8 +1921,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
                 if (prep_tid < 128) {
                     float total_log2_1 = smem_gt_prefix_all[stage_f32 + prep_tid];
-                    float _exp2_3 = approx_exp2(total_log2_1);
-                    smem_gt_all[stage_f32 + prep_tid] = _exp2_3;
+                    float _exp2_2 = approx_exp2(total_log2_1);
+                    smem_gt_all[stage_f32 + prep_tid] = _exp2_2;
                 }
                 {
                     if (prep_local_warp >= 2) {
@@ -1934,12 +1933,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         #pragma unroll
                         for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
                             int restore_col = restore_segment * 8 + restore_elem;
-                            float anchor_log2 = smem_gate_all[stage_f32_0 + 1024 + restore_col];
+                            float anchor_log2 = smem_restore_factor_all[stage_f32_0 + restore_col];
                             float total_log2_2 = smem_gt_prefix_all[stage_f32_0 + restore_col];
-                            float _exp2_4 = approx_exp2(total_log2_2 - anchor_log2);
-                            restore_factor[restore_elem] = _exp2_4;
-                            float _exp2_5 = approx_exp2(anchor_log2);
-                            restore_scale[restore_elem] = _exp2_5;
+                            float _exp2_3 = approx_exp2(total_log2_2 - anchor_log2);
+                            restore_factor[restore_elem] = _exp2_3;
+                            float _exp2_4 = approx_exp2(anchor_log2);
+                            restore_scale[restore_elem] = _exp2_4;
                         }
                         #pragma unroll 1
                         for (int restore_pass = 0; restore_pass < 4; restore_pass++) {
