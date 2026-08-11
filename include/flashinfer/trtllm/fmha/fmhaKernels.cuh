@@ -271,6 +271,13 @@ class TllmGenFmhaKernel {
     // Prepare the kernel parameters.
     auto kernelParams = KernelParams::setKernelParams(
         params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+    // Static-context cubins consume the logical launch grid from KernelParams.
+    // Match TensorRT-LLM's native host path, which passes grid[0:3] to
+    // KernelParamsSetup::setKernelParams.  Persistent kernels do not expose the
+    // missing initialization because their scheduler derives work dynamically.
+    kernelParams.logicalGridDimX = ctaLaunchParams.mNumCtasX;
+    kernelParams.logicalGridDimY = ctaLaunchParams.mNumCtasY;
+    kernelParams.logicalGridDimZ = ctaLaunchParams.mNumCtasZ;
 
     // Override SageAttention parameters.
     auto sageParamEncode = [](int blockSize) -> int32_t {
@@ -330,6 +337,9 @@ class TllmGenFmhaKernel {
         // which changed when switching from CgaSmemReduction to GmemReduction kernel.
         kernelParams = KernelParams::setKernelParams(
             params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+        kernelParams.logicalGridDimX = ctaLaunchParams.mNumCtasX;
+        kernelParams.logicalGridDimY = ctaLaunchParams.mNumCtasY;
+        kernelParams.logicalGridDimZ = ctaLaunchParams.mNumCtasZ;
         buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
         setNonPortableClusterIfNeeded(func, ctaLaunchParams);
       }

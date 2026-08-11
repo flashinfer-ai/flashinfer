@@ -81,3 +81,12 @@ selectors: `FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT={separate,packed}` and
 SeparateQkv/Persistent. Packed mode additionally proves that Q, K, and V are
 the exact head-major subviews of one fused allocation before setting `qkvPtr`;
 it therefore cannot silently reinterpret unrelated tensors.
+
+The public FlashInfer host wrapper must also populate
+`KernelParams.logicalGridDim{X,Y,Z}` from the actual launch grid. TensorRT-LLM
+7801d34 passes these values to `KernelParamsSetup::setKernelParams`; its Static
+context cubins consume them to map CTAs to logical tiles. FlashInfer previously
+left all three zero after value-initializing `KernelParams`, which is invisible
+to Persistent scheduling but makes Static output invalid. Both the initial
+kernel selection and the Cga-to-Gmem fallback parameter rebuild now copy the
+resolved CTA grid dimensions before launch.
