@@ -2555,6 +2555,13 @@ def _cache_key_config(backend_cfg, variant, **overrides):
     )
 
 
+def _cache_key_runner(runner_cls, config):
+    """Build a config-only runner without loading architecture-specific modules."""
+    runner = runner_cls.__new__(runner_cls)
+    runner.config = config
+    return runner
+
+
 # Dimensions that change which tactics are legal but are NOT recoverable from
 # the profiled tensor shapes. Each must move both cache keys.
 _DIMENSIONS = [
@@ -2575,10 +2582,9 @@ def test_tactic_dimension_changes_both_cache_keys(
     runner_cls, backend_cfg, variant, alt_variant, dimension, override
 ):
     """A tactic-relevant dimension must separate memory *and* file cache keys."""
-    device = torch.device("cuda")
-    base = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
-    other = runner_cls(
-        _cache_key_config(backend_cfg, variant, **override), device=device
+    base = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
+    other = _cache_key_runner(
+        runner_cls, _cache_key_config(backend_cfg, variant, **override)
     )
 
     assert hash(base) != hash(other), (
@@ -2598,9 +2604,8 @@ def test_quant_variant_changes_both_cache_keys(
 ):
     if alt_variant is None:
         pytest.skip(f"{runner_cls.__name__} supports a single quant variant")
-    device = torch.device("cuda")
-    base = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
-    other = runner_cls(_cache_key_config(backend_cfg, alt_variant), device=device)
+    base = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
+    other = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, alt_variant))
     assert hash(base) != hash(other)
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([]))
 
@@ -2614,9 +2619,8 @@ def test_identical_config_shares_cache_key(
     Guards the opposite failure: over-keying (e.g. folding in object identity)
     would make every layer re-tune from scratch.
     """
-    device = torch.device("cuda")
-    a = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
-    b = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    a = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
+    b = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
     assert hash(a) == hash(b)
     assert str(a.get_cache_key_extras([])) == str(b.get_cache_key_extras([]))
 
@@ -2629,8 +2633,7 @@ def test_cache_key_extras_are_str_stable(runner_cls, backend_cfg, variant, alt_v
     and is written to disk, so an element whose repr embeds an address (or
     otherwise varies per process) would never match on reload.
     """
-    device = torch.device("cuda")
-    runner = runner_cls(_cache_key_config(backend_cfg, variant), device=device)
+    runner = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
     extras = runner.get_cache_key_extras([])
     assert isinstance(extras, tuple)
     rendered = str(extras)
@@ -2677,16 +2680,15 @@ def test_profiling_cache_key_file_key_separates_configs():
     still differs. ``file_key`` drops ``runner_hash``, so this is the check
     that the in-memory assertions above cannot make.
     """
-    device = torch.device("cuda")
-    base = TrtllmFp8BlockRunner(
+    base = _cache_key_runner(
+        TrtllmFp8BlockRunner,
         _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
-        device=device,
     )
-    other = TrtllmFp8BlockRunner(
+    other = _cache_key_runner(
+        TrtllmFp8BlockRunner,
         _cache_key_config(
             TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, intermediate_size=512
         ),
-        device=device,
     )
     shared_profile = ((64, 256), (64, 2))
 
@@ -2715,10 +2717,9 @@ def test_fused_shared_experts_change_both_cache_keys():
     extras an S=0 layer and an S>0 layer in the same process would share one
     tuned tactic -- and the persisted cache would reuse it across runs.
     """
-    device = torch.device("cuda")
-    base = TrtllmFp8BlockRunner(
+    base = _cache_key_runner(
+        TrtllmFp8BlockRunner,
         _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
-        device=device,
     )
     keys = {0: (hash(base), str(base.get_cache_key_extras([])))}
     for num_shared in (1, 2):
@@ -2729,7 +2730,7 @@ def test_fused_shared_experts_change_both_cache_keys():
                 cfg.experts, num_fused_shared_experts=num_shared
             ),
         )
-        runner = TrtllmFp8BlockRunner(cfg, device=device)
+        runner = _cache_key_runner(TrtllmFp8BlockRunner, cfg)
         keys[num_shared] = (hash(runner), str(runner.get_cache_key_extras([])))
 
     assert len({h for h, _ in keys.values()}) == 3, (
@@ -2780,16 +2781,15 @@ def _cache_key_config_with(backend_cfg, variant, **overrides):
     "dimension,override", _SOFT_DIMENSIONS, ids=[d[0] for d in _SOFT_DIMENSIONS]
 )
 def test_ranking_relevant_dimension_changes_both_cache_keys(dimension, override):
-    device = torch.device("cuda")
-    base = TrtllmFp8BlockRunner(
+    base = _cache_key_runner(
+        TrtllmFp8BlockRunner,
         _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
-        device=device,
     )
-    other = TrtllmFp8BlockRunner(
+    other = _cache_key_runner(
+        TrtllmFp8BlockRunner,
         _cache_key_config_with(
             TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, **override
         ),
-        device=device,
     )
     assert hash(base) != hash(other), f"{dimension} does not change runner_hash"
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([])), (
