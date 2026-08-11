@@ -8,7 +8,10 @@ cores, targeting tiny decode batches.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Tuple
 
 import cutlass
@@ -19,10 +22,15 @@ from cutlass import BFloat16, Float32, Uint32
 from cutlass.cutlass_dsl import Int32, Int64
 
 from flashinfer.cute_dsl.utils import (
-    current_cuda_stream,
     get_num_sm,
     get_max_active_clusters,
     make_ptr,
+)
+from flashinfer.jit.cute_dsl_core import (
+    build_and_load_cute_dsl_kernel,
+    cute_dsl_cache_disabled,
+    cute_dsl_module_dir,
+    sanitize_symbol_name,
 )
 from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
@@ -4944,31 +4952,41 @@ class MoEDirectMicroKernel:
         m: int,
         grid_x: int,
     ):
-        def ptr(dt, t):
-            return make_ptr(dt, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-
-        ids_dtype = cutlass.Int64 if topk_ids.dtype == torch.int64 else cutlass.Int32
-        stream = current_cuda_stream()
-
+        # TVM-FFI ABI (see ``compile_direct_micro_kernel``): pointer arguments
+        # are raw ``data_ptr()`` ints, fixed-shape arguments stay torch
+        # tensors, and scalars are plain Python ints. No stream argument --
+        # the kernel compiles against
+        # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI
+        # supplies the caller's current stream and the parameter is absent
+        # from the compiled signature. Matches the static/micro/dynamic launch
+        # sites in ``moe_dispatch.py``.
+        #
+        # ``.view(dtype)`` is dropped with the typed pointers: a dtype view
+        # shares its source's address, so ``data_ptr()`` is identical either
+        # way. The element type is fixed at compile time (``topk_ids_dtype``
+        # is part of the kernel's cache key).
+        #
+        # TODO: verify on sm12x hardware. This mirrors the argument marshalling
+        # the three MMA kernels already use post-#4331, but the direct micro
+        # signature has not been executed under the TVM-FFI ABI.
         compiled_fn(
-            ptr(cutlass.BFloat16, x),
-            ptr(cutlass.Uint8, w1_fp4),
-            ptr(cutlass.Uint8, w1_blockscale.view(torch.uint8)),
-            ptr(cutlass.Float32, w1_alphas),
-            ptr(cutlass.Float32, a1_gscale),
-            ptr(cutlass.Float32, a2_gscale),
-            ptr(cutlass.Uint32, inter_fp32.view(torch.uint32)),
-            ptr(cutlass.Uint8, w2_fp4),
-            ptr(cutlass.Uint8, w2_blockscale.view(torch.uint8)),
-            ptr(cutlass.Float32, w2_alphas),
-            ptr(ids_dtype, topk_ids),
-            ptr(cutlass.Float32, topk_weights),
-            ptr(cutlass.BFloat16, out),
+            x.data_ptr(),
+            w1_fp4.data_ptr(),
+            w1_blockscale.data_ptr(),
+            w1_alphas.data_ptr(),
+            a1_gscale.data_ptr(),
+            a2_gscale.data_ptr(),
+            inter_fp32.data_ptr(),
+            w2_fp4.data_ptr(),
+            w2_blockscale.data_ptr(),
+            w2_alphas.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weights.data_ptr(),
+            out.data_ptr(),
             barrier_count,
             barrier_epoch,
-            Int32(m),
-            Int32(grid_x),
-            stream,
+            m,
+            grid_x,
         )
 
 
@@ -5034,15 +5052,106 @@ def build_direct_micro_kernel(
     return kernel
 
 
+# ---------------------------------------------------------------------------
+# On-disk kernel cache
+#
+# The direct micro kernel is compiled through the shared on-disk CuTe-DSL cache
+# (#3874, #4029; docs/design_docs/cute_dsl_kernel_cache.md), as the three MMA
+# kernels in moe_dispatch.py already are (#4331), so a fresh process JITLinks an
+# exported ``.o`` instead of re-running the MLIR pipeline.
+#
+# Deliberately a *separate* module from moe_dispatch's ``b12x_moe``: the module
+# ``meta.json`` carries one ``source_sha256`` for every kernel in its directory
+# and a mismatch wipes the whole directory. Sharing the module while hashing a
+# different source list would make the two adopters alternately invalidate each
+# other on every call -- strictly worse than no cache at all.
+_CUTE_DSL_MODULE = "b12x_moe_direct_micro"
+
+# Sidecar recording whether a persisted kernel can launch its configured block
+# dim. See ``compiled_direct_micro_accepts_block_dim`` for why this cannot be
+# recomputed after a reload.
+_PROBE_SUFFIX = ".launch_probe.json"
+
+
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache.
+
+    Every module contributing device code to this kernel: its own body, the
+    shared activation and FP4 device helpers, and the CuTe-DSL utilities the
+    host entry is built from.
+    """
+    from flashinfer.cute_dsl import fp4_common
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+
+    from . import moe_activation
+
+    return (
+        __file__,
+        moe_activation.__file__,
+        cute_dsl_utils.__file__,
+        fp4_common.__file__,
+    )
+
+
+def _probe_path(kernel_name: str) -> Path:
+    return cute_dsl_module_dir(_CUTE_DSL_MODULE) / (
+        sanitize_symbol_name(kernel_name) + _PROBE_SUFFIX
+    )
+
+
+def _read_probe(kernel_name: str) -> bool | None:
+    """The recorded probe result, or None when absent/unreadable."""
+    try:
+        with open(_probe_path(kernel_name)) as f:
+            value = json.load(f).get("accepts_block_dim")
+    except Exception:
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _write_probe(kernel_name: str, accepts: bool) -> None:
+    """Record a probe result beside its artifact (best effort).
+
+    Written after ``build_and_load_cute_dsl_kernel`` has committed the ``.o``,
+    so it is not covered by that build's module lock. The write is atomic and
+    the value is a pure function of the artifact, so a concurrent writer can
+    only produce the identical file; a reader that arrives in between sees no
+    sidecar and falls back to the MMA micro kernel for that launch.
+    """
+    path = _probe_path(kernel_name)
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"accepts_block_dim": accepts}, f)
+        os.replace(tmp, path)
+    except Exception:
+        # Losing the sidecar costs the direct micro backend on the next
+        # process, not correctness: a missing probe reads as "cannot launch"
+        # and the dispatch falls back to the MMA micro kernel.
+        pass
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def compile_direct_micro_kernel(
     kernel: MoEDirectMicroKernel,
     *,
     topk_ids_dtype: torch.dtype = torch.int32,
     options: str | None = None,
+    disk_kernel_name: str | None = None,
 ):
     """cute.compile a configured direct micro kernel against fake pointers.
 
-    Returns the compiled callable; launch via ``MoEDirectMicroKernel.launch``.
+    Returns ``(compiled, accepts_block_dim)``. Launch via
+    ``MoEDirectMicroKernel.launch`` when ``accepts_block_dim`` is True.
+
+    When ``disk_kernel_name`` is given the compile goes through the shared
+    on-disk CuTe-DSL cache under that specialization name, and the launchable
+    block-dim probe is persisted alongside the artifact. Without it the kernel
+    is compiled in-process only (the pre-#4331 behavior), which callers outside
+    the dispatch layer can still use for one-off compiles.
     """
 
     def dummy(dt):
@@ -5054,47 +5163,122 @@ def compile_direct_micro_kernel(
         (1,),
         assumed_align=4,
     )
-    compile_kwargs = {}
-    if options:
-        compile_kwargs["options"] = options
+    # --enable-tvm-ffi is mandatory, not a tuning choice: JitSpecCuteDsl
+    # exports with ``export_to_c()`` and reloads with
+    # ``load_module(..., enable_tvm_ffi=True)``, so a kernel compiled without
+    # it cannot round-trip through the disk cache.
+    resolved_options = options or "--opt-level 2 --enable-tvm-ffi"
+    if "--enable-tvm-ffi" not in resolved_options:
+        resolved_options = f"{resolved_options} --enable-tvm-ffi"
     compile_m = int(kernel.m_const) if int(kernel.m_const) != 0 else 8
-    return cute.compile(
-        kernel,
-        dummy(cutlass.BFloat16),  # x_ptr
-        dummy(cutlass.Uint8),  # w1_ptr
-        dummy(cutlass.Uint8),  # w1s_ptr
-        dummy(cutlass.Float32),  # w1a_ptr
-        dummy(cutlass.Float32),  # a1_ptr
-        dummy(cutlass.Float32),  # a2_ptr
-        dummy(cutlass.Uint32),  # inter_ptr
-        dummy(cutlass.Uint8),  # w2_ptr
-        dummy(cutlass.Uint8),  # w2s_ptr
-        dummy(cutlass.Float32),  # w2a_ptr
-        dummy(ids_dtype),  # tid_ptr
-        dummy(cutlass.Float32),  # tw_ptr
-        dummy(cutlass.BFloat16),  # out_ptr
-        barrier_fake,  # barrier_count
-        barrier_fake,  # barrier_epoch
-        Int32(compile_m),  # m_val
-        Int32(1),  # grid_x
-        current_cuda_stream(),  # stream
-        **compile_kwargs,
+    # A fake stream rather than ``current_cuda_stream()``: a live stream handle
+    # baked into an exported .o is meaningless to the process that reloads it.
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    def compile_fn():
+        return cute.compile(
+            kernel,
+            dummy(cutlass.BFloat16),  # x_ptr
+            dummy(cutlass.Uint8),  # w1_ptr
+            dummy(cutlass.Uint8),  # w1s_ptr
+            dummy(cutlass.Float32),  # w1a_ptr
+            dummy(cutlass.Float32),  # a1_ptr
+            dummy(cutlass.Float32),  # a2_ptr
+            dummy(cutlass.Uint32),  # inter_ptr
+            dummy(cutlass.Uint8),  # w2_ptr
+            dummy(cutlass.Uint8),  # w2s_ptr
+            dummy(cutlass.Float32),  # w2a_ptr
+            dummy(ids_dtype),  # tid_ptr
+            dummy(cutlass.Float32),  # tw_ptr
+            dummy(cutlass.BFloat16),  # out_ptr
+            barrier_fake,  # barrier_count
+            barrier_fake,  # barrier_epoch
+            Int32(compile_m),  # m_val
+            Int32(1),  # grid_x
+            stream_fake,  # stream
+            options=resolved_options,
+        )
+
+    block_dim = int(kernel.launch_block_dim)
+    if disk_kernel_name is None or cute_dsl_cache_disabled():
+        compiled = compile_fn()
+        return compiled, compiled_direct_micro_accepts_block_dim(compiled, block_dim)
+
+    # The probe reads compile-time internals, so it can only run on a fresh
+    # compile. Capture it from inside the closure: on a cache hit the closure
+    # never runs and the recorded value is read back instead.
+    probed: dict[str, bool] = {}
+
+    def compile_and_probe():
+        compiled = compile_fn()
+        probed["accepts"] = compiled_direct_micro_accepts_block_dim(compiled, block_dim)
+        return compiled
+
+    compiled = build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        disk_kernel_name,
+        compile_and_probe,
+        extra_key_files=_kernel_source_files(),
     )
+    if "accepts" in probed:
+        _write_probe(disk_kernel_name, probed["accepts"])
+        return compiled, probed["accepts"]
+    recorded = _read_probe(disk_kernel_name)
+    # A missing sidecar means "unknown", which must read as "cannot launch":
+    # guessing True risks a CUDA launch failure, while False costs only the
+    # fallback to the MMA micro kernel.
+    return compiled, bool(recorded)
 
 
 _PROBE_FAILURE_WARNED = False
 
 
+def _compiled_cuda_library(compiled):
+    """The ``cudaLibrary_t`` backing a freshly compiled kernel.
+
+    Two object shapes reach this. A ``--enable-tvm-ffi`` compile returns a
+    ``TVMFFIJitCompiledFunctionWithKwargs`` whose ``.to(None).jit_module`` is
+    None, so the legacy chain below raises; it exposes the library through the
+    public ``.library`` property instead (which lazily materializes it and
+    raises RuntimeError for a host-only compile). Older non-TVM-FFI compiles
+    only have the ``.to(None).jit_module.cuda_library`` chain, kept so a
+    caller passing explicit ``options`` is not broken.
+    """
+    # TODO: verify on sm12x hardware. The attribute surface was confirmed on a
+    # T4 (a --enable-tvm-ffi compile exposes `.library`, and the old
+    # `.to(None).jit_module` is None there), but the full
+    # cudaLibraryGetKernel + cuKernelGetAttribute round-trip has not been run
+    # against a real direct-micro compile on SM120/SM121.
+    library = getattr(compiled, "library", None)
+    if library is not None:
+        return library
+
+    executor = compiled.to(None)
+    jit_module = getattr(executor, "jit_module", None)
+    cuda_library = getattr(jit_module, "cuda_library", None)
+    if isinstance(cuda_library, (list, tuple)):
+        cuda_library = cuda_library[0] if cuda_library else None
+    if cuda_library is None:
+        cuda_library = getattr(executor, "kernel", None)
+    return cuda_library
+
+
 def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     """Return whether the compiled direct micro kernel can launch ``block_dim``
     threads (register pressure can cap CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
-    below the 512-thread CTA the fused body wants). Callers should cache the
-    result per compiled kernel."""
+    below the 512-thread CTA the fused body wants).
+
+    Only meaningful for a *freshly compiled* kernel. A kernel reloaded from the
+    disk cache is a bare ``tvm_ffi.Function`` -- ``ExternalBinaryModule``
+    returns ``tvm_ffi.Function.__from_extern_c__(...)`` on its TVM-FFI path,
+    which carries none of the DSL introspection this needs -- so the result is
+    recorded at build time and read back instead of re-probed. See
+    ``compile_direct_micro_kernel``.
+    """
     global _PROBE_FAILURE_WARNED
     try:
         from cuda.bindings import driver, runtime
 
-        executor = compiled.to(None)
         kernel_info = getattr(compiled, "kernel_info", None) or {}
         kernel_name = next(iter(kernel_info.keys()), None)
         if kernel_name is None and hasattr(compiled, "_get_name"):
@@ -5104,12 +5288,7 @@ def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
         if kernel_name is None:
             raise RuntimeError("compiled micro kernel did not expose a kernel name")
 
-        jit_module = getattr(executor, "jit_module", None)
-        cuda_library = getattr(jit_module, "cuda_library", None)
-        if isinstance(cuda_library, (list, tuple)):
-            cuda_library = cuda_library[0] if cuda_library else None
-        if cuda_library is None:
-            cuda_library = getattr(executor, "kernel", None)
+        cuda_library = _compiled_cuda_library(compiled)
         if cuda_library is None:
             raise RuntimeError("compiled micro kernel did not expose a CUDA library")
 

@@ -38,6 +38,7 @@ pytest.importorskip("cutlass")
 import torch  # noqa: E402
 
 from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (  # noqa: E402
+    _direct_micro_kernel_cache_key,
     _disk_kernel_name,
     _dynamic_kernel_cache_key,
     _get_dynamic_kernel,
@@ -255,3 +256,153 @@ def test_kernel_types_do_not_collide():
         for label, _, key_fn, baseline, _ in ADOPTERS
     }
     assert len(names) == len(ADOPTERS)
+
+
+# ---------------------------------------------------------------------------
+# Direct micro kernel
+#
+# Deliberately not an ADOPTERS row. The three MMA kernels key on their getter's
+# arguments, so a key function can be introspected against the getter's
+# signature. The direct micro kernel keys on what ``configure()`` *derived*
+# from those arguments (``_ShapeConfig``, ``m_const``, ``m1_fc2_onepass``),
+# so the contract is checked by building real kernels and perturbing inputs.
+#
+# ``max_active_ctas`` is passed explicitly throughout: it is the only part of
+# ``configure()`` that would otherwise query the current device, so these stay
+# CPU-only tests of the naming contract.
+# ---------------------------------------------------------------------------
+
+DIRECT_MICRO_BASELINE = {
+    "weight_E": 64,
+    "m": 4,
+    "k": 512,
+    "n": 256,
+    "num_topk": 2,
+    "activation": "silu",
+    "share_input_across_experts": False,
+    "share_expert_scales": False,
+    "single_token": False,
+    "max_active_ctas": 148,
+}
+
+DIRECT_MICRO_PERTURBED = {
+    "weight_E": 32,
+    "m": 1,
+    "k": 1024,
+    "n": 512,
+    "num_topk": 4,
+    "activation": "relu2",
+    "share_input_across_experts": True,
+    "share_expert_scales": True,
+    "single_token": True,
+    "max_active_ctas": 84,
+}
+
+
+def _direct_micro_name(**overrides):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_direct_micro_kernel import (
+        build_direct_micro_kernel,
+    )
+
+    kwargs = dict(DIRECT_MICRO_BASELINE)
+    kwargs.update(overrides)
+    topk_ids_dtype = kwargs.pop("topk_ids_dtype", torch.int32)
+    kernel = build_direct_micro_kernel(**kwargs)
+    return _disk_kernel_name(
+        "direct_micro", _direct_micro_kernel_cache_key(kernel, topk_ids_dtype)
+    )
+
+
+@pytest.mark.parametrize("param", sorted(DIRECT_MICRO_BASELINE))
+def test_direct_micro_name_varies_with_every_argument(param):
+    """Changing any single codegen argument must change the on-disk name.
+
+    ``max_active_ctas`` participates only through ``m1_fc2_onepass``, which is
+    exactly why it must be keyed: two SM120 parts with different SM counts
+    share the ``sm120a`` module directory, so a name that ignored it would
+    serve one part's binary to the other.
+    """
+    baseline = _direct_micro_name()
+    perturbed = _direct_micro_name(**{param: DIRECT_MICRO_PERTURBED[param]})
+    assert perturbed != baseline, (
+        f"the direct micro kernel's on-disk name ignores argument {param!r}: "
+        "two different kernel specializations would collide on one artifact."
+    )
+
+
+def test_direct_micro_name_varies_with_topk_ids_dtype():
+    """topk_ids dtype is a compile-time pointer type, not a runtime value."""
+    assert _direct_micro_name(topk_ids_dtype=torch.int64) != _direct_micro_name()
+
+
+def test_direct_micro_name_ignores_fast_math():
+    """``fast_math`` is accept-and-ignore for this kernel.
+
+    ``MoEDirectMicroKernel.__init__`` does a literal ``del fast_math``, so it
+    reaches no codegen decision. Pinning that here means the day it starts
+    mattering, this test fails instead of the cache silently serving the wrong
+    binary.
+    """
+    assert _direct_micro_name(fast_math=True) == _direct_micro_name(fast_math=False)
+
+
+def test_direct_micro_name_is_symbol_safe():
+    assert re.fullmatch(r"[0-9A-Za-z_]+", _direct_micro_name())
+
+
+def test_direct_micro_name_is_stable_for_equal_keys():
+    """Two identically configured kernels must map to one artifact name.
+
+    ``__cache_key__`` holds a ``_ShapeConfig`` dataclass; this fails if it ever
+    grows a field whose repr is address-based, which would make every process
+    miss the cache it just populated.
+    """
+    assert _direct_micro_name() == _direct_micro_name()
+
+
+def test_direct_micro_does_not_collide_with_mma_kernels():
+    """The direct micro artifact must not share a name with the MMA kernels."""
+    mma_names = {
+        _disk_kernel_name(label, key_fn(**baseline))
+        for label, _, key_fn, baseline, _ in ADOPTERS
+    }
+    assert _direct_micro_name() not in mma_names
+
+
+def test_direct_micro_uses_a_separate_disk_module():
+    """Direct micro must not share moe_dispatch's ``b12x_moe`` module.
+
+    The module ``meta.json`` records one ``source_sha256`` for every kernel in
+    its directory and a mismatch wipes the directory. Two adopters sharing a
+    module while hashing different source lists would invalidate each other on
+    every call, so this guards the separation rather than the name itself.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_direct_micro_kernel as dm,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    assert dm._CUTE_DSL_MODULE != moe_dispatch._CUTE_DSL_MODULE
+    assert dm.__file__ in dm._kernel_source_files()
+
+
+def test_direct_micro_probe_roundtrip(tmp_path, monkeypatch):
+    """The persisted probe result must survive a process boundary.
+
+    The launchable-block-dim probe reads ``cute.compile`` internals that a
+    TVM-FFI ``.o`` reload does not expose, so a warm start reads this sidecar
+    instead of re-probing. If it did not round-trip, every process after the
+    first would fall back to the MMA micro kernel -- a silent perf regression
+    that the naming tests above cannot see.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_direct_micro_kernel as dm,
+    )
+
+    monkeypatch.setattr(dm, "_probe_path", lambda name: tmp_path / f"{name}.json")
+
+    assert dm._read_probe("kernel_a") is None  # absent reads as unknown
+    dm._write_probe("kernel_a", True)
+    assert dm._read_probe("kernel_a") is True
+    dm._write_probe("kernel_b", False)
+    assert dm._read_probe("kernel_b") is False

@@ -30,7 +30,6 @@ from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
     build_direct_micro_kernel,
     compile_direct_micro_kernel,
-    compiled_direct_micro_accepts_block_dim,
 )
 from .moe_dynamic_kernel import (
     _MAX_SHARED_INPUT_TOPK,
@@ -1346,6 +1345,23 @@ _DIRECT_MICRO_LAUNCH_CACHE: Dict[Tuple, Tuple] = {}
 _DIRECT_MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
+def _direct_micro_kernel_cache_key(
+    kernel: MoEDirectMicroKernel,
+    topk_ids_dtype: torch.dtype,
+) -> Tuple:
+    """The direct micro kernel's cache key (see :func:`_static_kernel_cache_key`).
+
+    Unlike the three MMA kernels, the codegen parameters are not the getter's
+    arguments but what ``configure()`` derived from them, so the key is taken
+    from the configured kernel's own ``__cache_key__`` rather than rebuilt
+    here. That tuple deliberately omits ``grid_x`` (a runtime argument, which
+    is what lets m=2..8 share one artifact) and ``fast_math`` (the constructor
+    discards it); everything else reaching codegen, including the
+    device-dependent ``m1_fc2_onepass``, is present.
+    """
+    return ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
+
+
 def _get_direct_micro_kernel(
     weight_E: int,
     m: int,
@@ -1409,16 +1425,19 @@ def _get_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
         device=device,
     )
-    compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
+    compile_key = _direct_micro_kernel_cache_key(kernel, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
     if entry is None:
-        compiled = compile_direct_micro_kernel(kernel, topk_ids_dtype=topk_ids_dtype)
-        # Register pressure can cap the launchable CTA below the fused body's
-        # 512 threads; probe once per compiled kernel.
-        accepts = compiled_direct_micro_accepts_block_dim(
-            compiled, kernel.launch_block_dim
+        # Returns (compiled, accepts_block_dim): register pressure can cap the
+        # launchable CTA below the fused body's 512 threads, so the compile
+        # probes once and persists the answer with the on-disk artifact.
+        entry = compile_direct_micro_kernel(
+            kernel,
+            topk_ids_dtype=topk_ids_dtype,
+            disk_kernel_name=_disk_kernel_name(
+                f"direct_micro_m{m}_k{k}_n{n}_t{num_topk}", compile_key
+            ),
         )
-        entry = (compiled, accepts)
         _DIRECT_MICRO_KERNEL_CACHE[compile_key] = entry
     compiled, accepts = entry
     cached = (compiled, kernel.grid_x, accepts)
