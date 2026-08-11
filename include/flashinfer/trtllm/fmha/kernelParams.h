@@ -23,6 +23,7 @@
 
 #include <cutlass/cutlass.h>
 
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -41,18 +42,18 @@ using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
 using Dtype = Data_type;
 
 struct KernelParams {
+  // The immutable 158f6fa trtllm-gen artifact pack consumes these descriptors by byte offset.
+  // Keep the order in sync with FlashInfer 9035311e, the commit that introduced that exact pack.
   // TMA descriptor for Q.
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
-  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
-  CUtensorMap tmaKSlidingWindowKvPool_;
-  // TMA descriptor for V.
-  CUtensorMap tmaV_;
   // The descriptor for O.
   CUtensorMap tmaO_;
-
-  // For FP4 KV cache, additional scaling factors are needed.
+  // TMA descriptor for V.
+  CUtensorMap tmaV_;
+  // TMA descriptor for output scaling factor.
+  CUtensorMap tmaOSf_;
   // TMA descriptor for K scaling factor.
   CUtensorMap tmaKSf_;
   // TMA descriptor for V scaling factor.
@@ -127,8 +128,12 @@ struct KernelParams {
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
 
-  // The variable sparseMla topK lengths with shape of [numTokensQ].
-  int32_t const* ptrSparseMlaTopKLens;
+  // The 158f6fa pack reserves eight bytes here.  Keep a pointer alias solely so the reduction
+  // source continues to compile; launches that would consume it are rejected in setKernelParams.
+  union {
+    int32_t mReservedAttentionWindowState[2];
+    int32_t const* ptrSparseMlaTopKLens;
+  };
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -750,12 +755,9 @@ struct KernelParams {
     bool const useSparseMlaSlidingWindowKvPool = options.mHasSlidingWindowKvPool &&
                                                  options.isSparseMla() &&
                                                  options.slidingWindowKvPoolPtr != nullptr;
-    if (useSparseMlaSlidingWindowKvPool) {
-      params.tmaKSlidingWindowKvPool_ =
-          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
-                               const_cast<void*>(options.slidingWindowKvPoolPtr),
-                               /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
-    }
+    FLASHINFER_CHECK(!useSparseMlaSlidingWindowKvPool,
+                     "The pinned 158f6fa trtllm-gen artifact ABI has no sliding-window K "
+                     "descriptor slot");
 
     params.tmaV_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
@@ -821,7 +823,9 @@ struct KernelParams {
 
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
-    params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
+    FLASHINFER_CHECK(options.sparseMlaTopKLensPtr == nullptr,
+                     "The pinned 158f6fa trtllm-gen artifact ABI has no dynamic sparse-MLA "
+                     "top-K pointer slot");
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
@@ -894,3 +898,19 @@ struct KernelParams {
     return params;
   }
 };
+
+// CUtensorMap is an opaque 128-byte launch descriptor.  These byte offsets are the public
+// 158f6fa artifact ABI, not an implementation preference: StaticContext reads tmaO_ at slot 2.
+static_assert(sizeof(CUtensorMap) == 128, "Unexpected CUDA tensor-map ABI");
+static_assert(offsetof(KernelParams, tmaQ_) == 0, "158f6fa ABI: Q must be descriptor slot 0");
+static_assert(offsetof(KernelParams, tmaK_) == 128, "158f6fa ABI: K must be descriptor slot 1");
+static_assert(offsetof(KernelParams, tmaO_) == 256, "158f6fa ABI: O must be descriptor slot 2");
+static_assert(offsetof(KernelParams, tmaV_) == 384, "158f6fa ABI: V must be descriptor slot 3");
+static_assert(offsetof(KernelParams, tmaOSf_) == 512,
+              "158f6fa ABI: O scale must be descriptor slot 4");
+static_assert(offsetof(KernelParams, tmaKSf_) == 640,
+              "158f6fa ABI: K scale must be descriptor slot 5");
+static_assert(offsetof(KernelParams, tmaVSf_) == 768,
+              "158f6fa ABI: V scale must be descriptor slot 6");
+static_assert(offsetof(KernelParams, logicalGridDimX) == 896,
+              "158f6fa ABI: descriptor block must occupy exactly 896 bytes");

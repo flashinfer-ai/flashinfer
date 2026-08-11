@@ -90,3 +90,34 @@ left all three zero after value-initializing `KernelParams`, which is invisible
 to Persistent scheduling but makes Static output invalid. Both the initial
 kernel selection and the Cga-to-Gmem fallback parameter rebuild now copy the
 resolved CTA grid dimensions before launch.
+
+## Immutable 158f descriptor ABI
+
+The same artifact path was introduced by FlashInfer commit
+`9035311e975a6aeb2d229f5162e999dfb7c9a733`. That commit changed the artifact
+path and `KernelParams` together because the cubins consume the structure by
+value. Its descriptor byte layout is:
+
+| slot | byte offset | size | field |
+| ---: | ---: | ---: | --- |
+| 0 | 0 | 128 | `tmaQ_` |
+| 1 | 128 | 128 | `tmaK_` |
+| 2 | 256 | 128 | `tmaO_` |
+| 3 | 384 | 128 | `tmaV_` |
+| 4 | 512 | 128 | `tmaOSf_` |
+| 5 | 640 | 128 | `tmaKSf_` |
+| 6 | 768 | 128 | `tmaVSf_` |
+
+`logicalGridDimX` begins at byte 896. Compile-time `sizeof`/`offsetof`
+assertions now enforce every entry. FlashInfer commit `9c76c994` later changed
+slots 2 and 4 to sliding-window K and O, respectively, while leaving the
+158f6fa artifact path and checksum unchanged. That mismatch is invisible to
+the Persistent H3 cubin's direct output store, but the Static H3 cubin reads
+slot 2 as its O TMA descriptor. The H3 branch therefore restores the immutable
+pack's descriptor order and rejects sliding-window-K and dynamic sparse-MLA
+launches that require the newer host ABI.
+
+The patched header SHA-256 is
+`3f33fdd122e5f7d81cba3d2a1ad2c3a3e2771e8d99a31f469fc5dcfbd876626d`.
+The target Static BF16 cubin remains immutable at
+`7bb1c7081725d4884296c6071705d9744768f0b4eb909cce4d7f5e2932727c3a`.
