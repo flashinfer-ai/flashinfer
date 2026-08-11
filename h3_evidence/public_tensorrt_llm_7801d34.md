@@ -79,8 +79,9 @@ For this diagnostic only, the ragged launcher accepts two fail-closed runtime
 selectors: `FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT={separate,packed}` and
 `FLASHINFER_TRTLLM_RAGGED_TILE_SCHEDULER={static,persistent}`. Defaults remain
 SeparateQkv/Persistent. Packed mode additionally proves that Q, K, and V are
-the exact head-major subviews of one fused allocation before setting `qkvPtr`;
-it therefore cannot silently reinterpret unrelated tensors.
+the exact interleaved subviews of one fused allocation before selecting three
+explicit descriptor bases; it therefore cannot silently reinterpret unrelated
+tensors.
 
 The public FlashInfer host wrapper must also populate
 `KernelParams.logicalGridDim{X,Y,Z}` from the actual launch grid. TensorRT-LLM
@@ -159,3 +160,8 @@ explicit bases. Descriptor construction repeats the exact shape/stride checks
 immediately before encoding. Any layout drift fails before launch. C48 must
 still prove that the Packed cubin is descriptor-generic; otherwise this route
 is rejected without timing.
+
+For the Packed-v2 branch, the full-ABI header SHA-256 is
+`bb69c686adb2fe364f236dbb144f0853451e2d4fbc4d45fdc7fd6483d98d32c5`
+and the launcher SHA-256 is
+`07bf11db03fb33c64642ce51bacd0ba6760d2a26d031cb4de944454cc075b006`.
