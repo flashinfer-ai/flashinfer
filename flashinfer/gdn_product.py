@@ -384,12 +384,6 @@ def gated_delta_product_mtp(
 
     expanded_q[:, num_householder - 1 :: num_householder] = q
 
-    if a.dtype != torch.float32:
-        raise ValueError(
-            f"a must be float32 (g/beta are always fp32 in this API, "
-            f"unlike q/k/v); got {a.dtype}"
-        )
-
     if expanded_a is None:
         expanded_a = torch.full(
             (a.size(0), a.size(1) * num_householder, *a.shape[2:]),
@@ -399,11 +393,8 @@ def gated_delta_product_mtp(
         )
     elif expanded_a.shape != (a.size(0), a.size(1) * num_householder, *a.shape[2:]):
         raise ValueError("expanded_a shape must be [B, T*n_h, num_sab_heads]")
-    elif expanded_a.dtype != torch.float32:
-        raise ValueError(
-            f"expanded_a must be float32 (a/beta are always fp32 in this API, "
-            f"unlike q/k/v); got {expanded_a.dtype}"
-        )
+    elif expanded_a.dtype != a.dtype:
+        raise ValueError(f"expanded_a dtype must match a dtype ({a.dtype})")
     expanded_a[:, ::num_householder] = a
 
     if expanded_output is None:

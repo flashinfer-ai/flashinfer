@@ -55,6 +55,9 @@ def gates_from_logits(A_log, a, dt_bias, b):
     this bridge. Keep it in lockstep with the kernel or the tests measure the
     wrong thing.
     """
+    # a/b arrive in the MODEL dtype (fp16/bf16); the kernel promotes internally,
+    # so the host-side twin has to as well or it measures a different function.
+    a, b = a.float(), b.float()
     x = a + dt_bias
     bx = SOFTPLUS_BETA * x
     softplus_x = torch.where(
@@ -92,17 +95,28 @@ def _gen_decode_inputs(B, T, n_h, num_q_heads, num_v_heads, K, V, dtype, device,
     torch.cuda.manual_seed(seed)
     HV = num_v_heads
     with device:
-        q = torch.randn(B, T, num_q_heads, K, dtype=dtype) * 0.25
-        k = torch.randn(B, T, n_h, num_q_heads, K, dtype=dtype) * 0.25
-        v = torch.randn(B, T, n_h, HV, V, dtype=dtype) * 0.25
-        k = torch.nn.functional.normalize(k.float(), dim=-1).to(dtype)
+        # Magnitudes and dtypes mirror the house MTP test
+        # (test_decode_delta_rule.py::test_gated_delta_rule_mtp). Two of these
+        # are load-bearing, not cosmetic:
+        #
+        #  * `a` and `b` are the MODEL dtype, not fp32. They are raw logits the
+        #    kernel converts internally. Only A_log and dt_bias are fp32. This
+        #    is the opposite of prefill, where `g`/`beta` are consumed directly
+        #    and must be fp32 -- generalising the prefill rule to decode makes
+        #    the gate wrong from the very first token.
+        #  * everything is scaled to ~0.1 (state ~0.01). Unscaled randn drives
+        #    softplus(a + dt_bias) into a range where alpha swings hard, which
+        #    is numerically far nastier than anything the kernel is tuned for.
+        q = torch.randn(B, T, num_q_heads, K, dtype=dtype) * 0.1
+        k = torch.randn(B, T, n_h, num_q_heads, K, dtype=dtype) * 0.1
+        v = torch.randn(B, T, n_h, HV, V, dtype=dtype) * 0.1
 
-        A_log = torch.rand(HV, dtype=torch.float32) * 2.0 - 1.0
-        dt_bias = torch.rand(HV, dtype=torch.float32) * 2.0 - 1.0
-        a = torch.randn(B, T, HV, dtype=torch.float32)
-        b = torch.randn(B, T, n_h, HV, dtype=torch.float32)
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        a = torch.randn(B, T, HV, dtype=dtype) * 0.1
+        b = torch.randn(B, T, n_h, HV, dtype=dtype) * 0.1
 
-        pool = torch.randn(1 + B + B * T + B, HV, V, K, dtype=torch.float32) * 0.1
+        pool = torch.randn(1 + B + B * T + B, HV, V, K, dtype=torch.float32) * 0.01
         initial = torch.arange(1, 1 + B, dtype=torch.int32)
         ssm = torch.arange(1 + B, 1 + B + B * T, dtype=torch.int32).reshape(B, T)
         scratch = torch.arange(1 + B + B * T, 1 + B + B * T + B, dtype=torch.int32)
