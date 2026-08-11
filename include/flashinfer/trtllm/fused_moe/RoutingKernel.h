@@ -128,6 +128,8 @@ struct DataBase {
   // Records the selected expert IDs per token for replay
   // NOTE: placed at end of struct to preserve field offsets for existing routing kernels
   int16_t* mPtrRoutingReplayOut{nullptr};
+  // optional: final token count for each expert, separate from histogram scratch
+  int32_t* mPtrNumTokensPerExpert{nullptr};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -172,6 +174,8 @@ struct KernelParamsBase {
   int16_t* mPtrRoutingReplayOut = nullptr;
   // See DataBase::mUseContiguousRouteWindows. Appended for the same reason.
   bool mUseContiguousRouteWindows = false;
+  // Optional final token count for each expert, separate from histogram scratch.
+  int32_t* mPtrNumTokensPerExpert = nullptr;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
@@ -191,6 +195,7 @@ struct KernelParamsBase {
     mPtrTopKIds = static_cast<int32_t*>(data.mPtrTopKIds);
     mPtrScores = (InputT const*)data.mPtrScores;
     mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
+    mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;
@@ -207,6 +212,47 @@ struct KernelParamsBase {
     mTotalExpertsPerToken = data.mTotalExpertsPerToken;
   }
 };
+
+namespace routingPrecomputed {
+
+/// Maximum number of tile-specific metadata outputs fused into one routing launch.
+inline constexpr int32_t kMaxRoutingMetadataTiles = 8;
+
+/// Storage representation supplied to the fused precomputed-routing launch.
+enum class ExpertIdType : int32_t { Packed = 0, Int16 = 1, Int32 = 2 };
+
+/// Routing-method-neutral input for materializing permutation metadata from precomputed top-k.
+struct Data : public DataBase {
+  tg::Dtype mDtypeOutput{tg::Dtype::Bfloat16};
+  void const* mPtrPrecomputedExpertIds{nullptr};
+  ExpertIdType mExpertIdType{ExpertIdType::Packed};
+};
+
+/// Kernel parameters specialized only by routing-weight and bounded problem sizes.
+template <typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
+struct KernelParams : public KernelParamsBase<float, OutputT_, MaxNumExperts_, MaxNumTopExperts_> {
+  using OutputT = OutputT_;
+
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
+  trtllm::dev::IntFastDiv mTopK;
+
+  /// Convert one framework-independent routing descriptor into device kernel parameters.
+  static KernelParams setKernelParams(Data const& data) {
+    KernelParams params;
+    params.setBaseParams(data);
+    params.mPtrTopKPacked = static_cast<PackedScoreIdx<OutputT>*>(data.mPtrTopKPacked);
+    params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
+    return params;
+  }
+};
+
+/// Return the largest token count accepted by the fused multi-tile cluster topology.
+int32_t maxTokensMultiTileCluster(int32_t numExperts);
+
+/// Materialize metadata for all tile descriptors with one CUDA kernel launch.
+void runMultiTileCluster(Data* data, int32_t numTiles, void* stream);
+
+}  // namespace routingPrecomputed
 
 namespace routingDeepSeek {
 

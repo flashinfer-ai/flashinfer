@@ -260,10 +260,12 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
-          int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false>
+          int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
+          typename PrecomputedExpertId = int32_t>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
-                                   int32_t const warpIdx, uint32_t const clusterBlockRank) {
+                                   int32_t const warpIdx, uint32_t const clusterBlockRank,
+                                   PrecomputedExpertId const* precomputedExpertIds = nullptr) {
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
 
@@ -319,7 +321,10 @@ __device__ void routingPermutation(KernelParams params,
   auto loopBody = [&](int ii, int expandedIdx) {
     TypePacked scoreIdx;
     if constexpr (LoadExpertIdxFromGlobal) {
-      if (params.mPtrTopKIds != nullptr) {
+      if (precomputedExpertIds != nullptr) {
+        scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                              static_cast<int16_t>(precomputedExpertIds[expandedIdx])};
+      } else if (params.mPtrTopKIds != nullptr) {
         scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
                               static_cast<int16_t>(params.mPtrTopKIds[expandedIdx])};
       } else {
@@ -338,7 +343,8 @@ __device__ void routingPermutation(KernelParams params,
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
                          (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
-    if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr) {
+    if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr &&
+        precomputedExpertIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
     }
   };
@@ -435,6 +441,11 @@ __device__ void routingPermutation(KernelParams params,
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
     if (expert < params.mNumExperts) {
+      // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
+      // count producer. Publish once per cluster because every cluster block sees the same count.
+      if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
+        params.mPtrNumTokensPerExpert[expert] = count[e];
+      }
       // Strided loop to share this work between blocks.
       for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
         const int32_t localExpertIdx =
@@ -1105,6 +1116,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
   // Get total count for this expert.
   int32_t count = (threadIdx.x < params.mNumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+  // DA needs the live per-expert histogram for selection and tile-specific body metadata. Reuse
+  // this routing pass's authoritative count so capture keeps one routing producer instead of
+  // adding a second histogram kernel; ordinary callers pass null and preserve their write set.
+  if (threadIdx.x < params.mNumExperts && params.mPtrNumTokensPerExpert != nullptr) {
+    params.mPtrNumTokensPerExpert[threadIdx.x] = count;
+  }
 
   int32_t numCta;
   if (params.mIsPow2) {

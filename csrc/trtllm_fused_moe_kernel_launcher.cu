@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "flashinfer/fused_moe/da_moe.cuh"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
@@ -49,6 +50,784 @@ enum class RoutingInputMode {
   PackedPrecomputed,   // Mode 2: Pre-computed with packed (score << 16 | id) format
   UnpackedPrecomputed  // Mode 3: Pre-computed with separate topk_ids and topk_weights
 };
+
+/** Typed storage for one tile of graph-stable routing metadata. */
+struct RoutingMetadataBuffers {
+  // Stable FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.tensors.
+  static constexpr int64_t kNumTensors = 9;
+  // FFI[0] live padded size.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.total_num_padded_tokens.
+  Tensor total_num_padded_tokens;
+  // FFI[1] expanded-to-permuted map.
+  // Sync with
+  // flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expanded_idx_to_permuted_idx.
+  Tensor expanded_idx_to_permuted_idx;
+  // FFI[2] permuted-to-token map.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.permuted_idx_to_token_idx.
+  Tensor permuted_idx_to_token_idx;
+  // FFI[3] routing weights.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expert_weights.
+  Tensor expert_weights;
+  // FFI[4] histogram scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expert_count_histogram.
+  Tensor expert_count_histogram;
+  // FFI[5] expert counts.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.num_tokens_per_expert.
+  Tensor num_tokens_per_expert;
+  // FFI[6] CTA batch map.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.cta_idx_xy_to_batch_idx.
+  Tensor cta_idx_xy_to_batch_idx;
+  // FFI[7] CTA limits.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.cta_idx_xy_to_mn_limit.
+  Tensor cta_idx_xy_to_mn_limit;
+  // FFI[8] live CTA count.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.num_non_exiting_ctas.
+  Tensor num_non_exiting_ctas;
+
+  /** Decode one exact stable nine-tensor routing ABI. */
+  static RoutingMetadataBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "Routing metadata requires exactly nine tensors.";
+    return from_flat_ffi(tensors, 0);
+  }
+
+  /** Decode one routing record from a flattened multi-tile FFI array. */
+  static RoutingMetadataBuffers from_flat_ffi(Array<Tensor> const& tensors, int64_t offset) {
+    TVM_FFI_ICHECK_GE(offset, 0) << "Routing metadata offset must be nonnegative.";
+    TVM_FFI_ICHECK_GE(tensors.size(), offset + kNumTensors)
+        << "Routing metadata requires nine tensors at the requested offset.";
+    return {tensors[offset],     tensors[offset + 1], tensors[offset + 2],
+            tensors[offset + 3], tensors[offset + 4], tensors[offset + 5],
+            tensors[offset + 6], tensors[offset + 7], tensors[offset + 8]};
+  }
+
+  /** Encode one typed routing record in the existing public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {total_num_padded_tokens, expanded_idx_to_permuted_idx, permuted_idx_to_token_idx,
+            expert_weights,          expert_count_histogram,       num_tokens_per_expert,
+            cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit,       num_non_exiting_ctas};
+  }
+
+  /** Bind this routing record to a concrete MoE workspace and tile geometry. */
+  template <typename Workspace>
+  void bind(Workspace& workspace, int64_t tile_tokens_dim) const {
+    workspace.total_num_padded_tokens = static_cast<int32_t*>(total_num_padded_tokens.data_ptr());
+    workspace.permuted_idx_size = workspace.total_num_padded_tokens;
+    workspace.total_max_padded_tokens = static_cast<int32_t>(permuted_idx_to_token_idx.size(0) - 1);
+    workspace.ProjUpTileN = static_cast<int32_t>(tile_tokens_dim);
+    workspace.expanded_idx_to_permuted_idx =
+        static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    workspace.permuted_idx_to_token_idx =
+        static_cast<int32_t*>(permuted_idx_to_token_idx.data_ptr());
+    workspace.permuted_idx_to_expanded_idx = nullptr;
+    workspace.expert_weights = expert_weights.data_ptr();
+    workspace.cta_idx_xy_to_batch_idx = static_cast<int32_t*>(cta_idx_xy_to_batch_idx.data_ptr());
+    workspace.cta_idx_xy_to_mn_limit = static_cast<int32_t*>(cta_idx_xy_to_mn_limit.data_ptr());
+    workspace.num_non_exiting_ctas = static_cast<int32_t*>(num_non_exiting_ctas.data_ptr());
+  }
+};
+
+/** Typed storage used to canonicalize live routing logits. */
+struct CanonicalRoutingBuffers {
+  // Stable FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.tensors.
+  static constexpr int64_t kNumTensors = 11;
+  // FFI[0] native int16 replay IDs produced by the ordinary router.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.routing_replay_ids.
+  Tensor routing_replay_ids;
+  // FFI[1] canonical weights.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.expert_weights.
+  Tensor expert_weights;
+  // FFI[2] conventional packed scratch required by the ordinary router ABI.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.packed_router_scratch.
+  Tensor packed_scratch;
+  // FFI[3] expert counts.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor num_tokens_per_expert;
+  // FFI[4] padded size.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor total_num_padded_tokens;
+  // FFI[5] expanded-to-permuted map.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor expanded_idx_to_permuted_idx;
+  // FFI[6] permuted-to-token map.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor permuted_idx_to_token_idx;
+  // FFI[7] histogram scratch.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor expert_count_histogram;
+  // FFI[8] CTA batch map.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor cta_idx_xy_to_batch_idx;
+  // FFI[9] CTA limits.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor cta_idx_xy_to_mn_limit;
+  // FFI[10] live CTA count.
+  // Sync with flashinfer/fused_moe/core.py:TRTLLMCanonicalRouting.scratch.
+  Tensor num_non_exiting_ctas;
+
+  /** Decode the stable canonical-routing FFI tensor order. */
+  static CanonicalRoutingBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "Canonical routing requires eleven stable tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5],
+            tensors[6], tensors[7], tensors[8], tensors[9], tensors[10]};
+  }
+
+  /** Encode canonical-routing storage in its existing public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {routing_replay_ids,        expert_weights,          packed_scratch,
+            num_tokens_per_expert,     total_num_padded_tokens, expanded_idx_to_permuted_idx,
+            permuted_idx_to_token_idx, expert_count_histogram,  cta_idx_xy_to_batch_idx,
+            cta_idx_xy_to_mn_limit,    num_non_exiting_ctas};
+  }
+};
+
+/** Typed graph-stable buffers for the BF16 body ABI. */
+struct BF16DABodyBuffers {
+  // Stable BF16 FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 4;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[2] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[3] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode a BF16 body from the public FFI order. */
+  static BF16DABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "A BF16 DA body requires four prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3]};
+  }
+
+  /** Encode a BF16 body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Bind BF16 body buffers to the BF16 runner workspace ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace) const {
+    workspace.hidden_states_scale_linear = nullptr;
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = nullptr;
+    workspace.activation_output = nullptr;
+    workspace.activation_output_scale = nullptr;
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output_scale = nullptr;
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed graph-stable buffers for the FP8 per-tensor body ABI. */
+struct FP8PerTensorDABodyBuffers {
+  // Stable FP8-per-tensor FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 5;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC1 scale.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output_scale;
+  // FFI[2] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[3] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[4] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode an FP8 per-tensor body from the public FFI order. */
+  static FP8PerTensorDABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "An FP8 per-tensor DA body requires five prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4]};
+  }
+
+  /** Encode an FP8 per-tensor body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm1_output_scale, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Bind FP8 per-tensor buffers to their concrete runner workspace ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace) const {
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed graph-stable buffers for the DeepSeek FP8 block-scale body ABI. */
+struct DeepSeekFP8DABodyBuffers {
+  // Stable DeepSeek-FP8 FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 7;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC1 scale.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output_scale;
+  // FFI[2] activation output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor activation_output;
+  // FFI[3] activation scale.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor activation_output_scale;
+  // FFI[4] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[5] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[6] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode a DeepSeek FP8 body from the public FFI order. */
+  static DeepSeekFP8DABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "A DeepSeek FP8 DA body requires seven prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6]};
+  }
+
+  /** Encode a DeepSeek FP8 body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm1_output_scale, activation_output, activation_output_scale,
+            gemm2_output, workspace_fc1,      workspace_fc2};
+  }
+
+  /** Bind DeepSeek FP8 buffers to the DeepSeek block-scale runner ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace) const {
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.activation_output = activation_output.data_ptr();
+    workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed graph-stable buffers for the MXFP8 block-scale body ABI. */
+struct MXFP8DABodyBuffers {
+  // Stable MXFP8 FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 5;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC1 scale.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output_scale;
+  // FFI[2] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[3] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[4] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode an MXFP8 body from the public FFI order. */
+  static MXFP8DABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "An MXFP8 DA body requires five prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4]};
+  }
+
+  /** Encode an MXFP8 body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm1_output_scale, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Bind MXFP8 buffers to the MXFP8 block-scale runner ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace) const {
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.activation_output = nullptr;
+    workspace.activation_output_scale = nullptr;
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed graph-stable buffers for the FP4 body ABI. */
+struct FP4DABodyBuffers {
+  // Stable FP4 FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 7;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC1 scale.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output_scale;
+  // FFI[2] activation output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor activation_output;
+  // FFI[3] FC2 token scales.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor per_token_scales_fc2;
+  // FFI[4] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[5] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[6] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode an FP4 body from the public FFI order. */
+  static FP4DABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "An FP4 DA body requires seven prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3], tensors[4], tensors[5], tensors[6]};
+  }
+
+  /** Encode an FP4 body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm1_output_scale, activation_output, per_token_scales_fc2,
+            gemm2_output, workspace_fc1,      workspace_fc2};
+  }
+
+  /** Bind FP4 buffers and optional live token scales to the FP4 runner ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace, Optional<TensorView> const& per_token_scales) const {
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = gemm1_output_scale.numel() == 0
+                                       ? nullptr
+                                       : static_cast<float*>(gemm1_output_scale.data_ptr());
+    workspace.activation_output =
+        activation_output.numel() == 0 ? nullptr : activation_output.data_ptr();
+    workspace.activation_output_scale = workspace.gemm1_output_scale;
+    workspace.token_scales =
+        per_token_scales.has_value() ? per_token_scales.value().data_ptr() : nullptr;
+    workspace.token_scales_fc2 =
+        per_token_scales_fc2.numel() == 0 ? nullptr : per_token_scales_fc2.data_ptr();
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output_scale = nullptr;
+    workspace.hidden_states_scale_linear = nullptr;
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed graph-stable buffers for the MXINT4 body ABI. */
+struct MXINT4DABodyBuffers {
+  // Stable MXINT4 FFI width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  static constexpr int64_t kNumTensors = 4;
+  // FFI[0] FC1 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm1_output;
+  // FFI[1] FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor gemm2_output;
+  // FFI[2] FC1 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc1;
+  // FFI[3] FC2 scratch.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaBodyWorkspace.tensors.
+  Tensor workspace_fc2;
+
+  /** Decode an MXINT4 body from the public FFI order. */
+  static MXINT4DABodyBuffers from_ffi(Array<Tensor> const& tensors) {
+    TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
+        << "An MXINT4 DA body requires four prepared tensors.";
+    return {tensors[0], tensors[1], tensors[2], tensors[3]};
+  }
+
+  /** Encode an MXINT4 body in the public FFI order. */
+  Array<Tensor> to_ffi() const {
+    return {gemm1_output, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Bind MXINT4 buffers to the MXINT4 runner workspace ABI. */
+  template <typename Workspace>
+  void bind(Workspace& workspace) const {
+    workspace.hidden_states_scale_linear = nullptr;
+    workspace.gemm1_output = gemm1_output.data_ptr();
+    workspace.gemm1_output_scale = nullptr;
+    workspace.activation_output = nullptr;
+    workspace.activation_output_scale = nullptr;
+    workspace.gemm2_output = gemm2_output.data_ptr();
+    workspace.gemm2_output_scale = nullptr;
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+};
+
+/** Typed result of one ordinary MoE launch before TVM-FFI result encoding. */
+struct MoeRunResultBuffers {
+  // FFI[0] final or FC2 output.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  Tensor primary_output;
+  // Optional routing weights.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  Optional<Tensor> expert_weights;
+  // Optional next FFI item, layout map.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  Optional<Tensor> expanded_to_permuted_indices;
+  // Optional activation output.
+  // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
+  Optional<Tensor> activation_output;
+
+  /** Encode the typed launch result in the existing public FFI tensor order. */
+  Array<Tensor> to_ffi() const {
+    Array<Tensor> tensors{primary_output};
+    if (expert_weights.has_value()) {
+      tensors.push_back(expert_weights.value());
+    }
+    if (expanded_to_permuted_indices.has_value()) {
+      tensors.push_back(expanded_to_permuted_indices.value());
+    }
+    if (activation_output.has_value()) {
+      tensors.push_back(activation_output.value());
+    }
+    return tensors;
+  }
+};
+
+/** Typed CUDA-owned state carried across the two TVM-FFI SWITCH capture calls. */
+struct DASwitchCaptureState {
+  // Native FFI capture-ID slot.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  static constexpr int64_t kCaptureIdIndex = 0;
+  // Native FFI SWITCH-node slot.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  static constexpr int64_t kConditionalNodeIndex = 1;
+  // Native FFI preamble-node slot.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  static constexpr int64_t kParallelWorkNodeIndex = 2;
+  // Native FFI selector-node slot.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  static constexpr int64_t kSelectorNodeIndex = 3;
+  // Native FFI body-count slot.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.BODY_COUNT_INDEX.
+  static constexpr int64_t kBodyCountIndex = 4;
+  // Native FFI fixed header width.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.HEADER_SIZE.
+  static constexpr int64_t kHeaderSize = 5;
+  // Minimum SWITCH fanout.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.MINIMUM_BODY_COUNT.
+  static constexpr int64_t kMinimumBodyCount = 2;
+
+  // Native FFI[0] capture generation.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  unsigned long long capture_id;
+  // Native FFI[1] installed SWITCH node.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  cudaGraphNode_t conditional_node;
+  // Native FFI[2] live preamble node.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  cudaGraphNode_t parallel_work_node;
+  // Native FFI[3] device selector node.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.native.
+  cudaGraphNode_t selector_node;
+  // Native FFI[5:] child graphs.
+  // Sync with flashinfer/fused_moe/core.py:TrtllmDaSwitchCaptureState.body_graph_handles.
+  std::vector<cudaGraph_t> body_graphs;
+
+  /** Decode and validate the stable integer-handle FFI representation. */
+  static DASwitchCaptureState from_ffi(Array<int64_t> const& state) {
+    TVM_FFI_ICHECK_GE(state.size(), kHeaderSize + kMinimumBodyCount)
+        << "DA SWITCH capture state is incomplete.";
+    int64_t const body_count = state[kBodyCountIndex];
+    TVM_FFI_ICHECK_GE(body_count, kMinimumBodyCount)
+        << "DA SWITCH capture state requires at least two body graphs.";
+    TVM_FFI_ICHECK_LE(body_count, da_moe::kDAMaxBodies)
+        << "DA SWITCH capture state exceeds immutable body capacity.";
+    TVM_FFI_ICHECK_EQ(state.size(), body_count + kHeaderSize)
+        << "DA SWITCH body graph state has an invalid length.";
+
+    std::vector<cudaGraph_t> body_graphs;
+    body_graphs.reserve(body_count);
+    for (int64_t body_index = 0; body_index < body_count; ++body_index) {
+      body_graphs.push_back(reinterpret_cast<cudaGraph_t>(state[kHeaderSize + body_index]));
+    }
+    return {static_cast<unsigned long long>(state[kCaptureIdIndex]),
+            reinterpret_cast<cudaGraphNode_t>(state[kConditionalNodeIndex]),
+            reinterpret_cast<cudaGraphNode_t>(state[kParallelWorkNodeIndex]),
+            reinterpret_cast<cudaGraphNode_t>(state[kSelectorNodeIndex]), std::move(body_graphs)};
+  }
+
+  /** Encode named CUDA graph handles in the stable public FFI order. */
+  Array<int64_t> to_ffi() const {
+    Array<int64_t> state{
+        static_cast<int64_t>(capture_id), reinterpret_cast<int64_t>(conditional_node),
+        reinterpret_cast<int64_t>(parallel_work_node), reinterpret_cast<int64_t>(selector_node),
+        static_cast<int64_t>(body_graphs.size())};
+    for (auto body_graph : body_graphs) {
+      state.push_back(reinterpret_cast<int64_t>(body_graph));
+    }
+    return state;
+  }
+};
+
+/// Return log2(value) for powers of two and -1 for arbitrary positive tile sizes.
+inline int32_t computeRoutingLog2(int64_t value) {
+  int64_t n = value;
+  int32_t out = 0;
+  while (n >>= 1) {
+    ++out;
+  }
+  return (int64_t{1} << out) == value ? out : -1;
+}
+
+/// Validate the public, graph-stable input contract shared by allocation and population.
+template <typename OptionalWeights>
+inline RoutingInputMode validateMultiTileRoutingInputs(
+    TensorView const& topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
+    int64_t local_num_experts, Array<int64_t> const& tile_tokens_dims, int64_t routing_input_mode,
+    OptionalWeights const& topk_weights) {
+  // First constrain immutable tile capacity and the caller-visible routing tensor geometry.
+  TVM_FFI_ICHECK_GT(tile_tokens_dims.size(), 0) << "tile_tokens_dims must be non-empty.";
+  TVM_FFI_ICHECK_LE(tile_tokens_dims.size(),
+                    moe::dev::routing::routingPrecomputed::kMaxRoutingMetadataTiles)
+      << "tile_tokens_dims exceeds the compiled fused routing capacity.";
+  for (int64_t tile_tokens_dim : tile_tokens_dims) {
+    TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dims entries must be positive.";
+  }
+  TVM_FFI_ICHECK_EQ(topk_ids.device().device_type, kDLCUDA) << "topk_ids must be a CUDA tensor.";
+  TVM_FFI_ICHECK_EQ(topk_ids.ndim(), 2) << "topk_ids must be 2D.";
+  TVM_FFI_ICHECK(topk_ids.IsContiguous()) << "topk_ids must be contiguous.";
+  TVM_FFI_ICHECK_GT(topk_ids.size(0), 0) << "topk_ids must contain at least one token.";
+  TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
+  TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive.";
+  TVM_FFI_ICHECK_LE(top_k, 8) << "fused multi-tile routing supports top_k <= 8.";
+  TVM_FFI_ICHECK_GE(num_experts, top_k) << "num_experts must be at least top_k.";
+  TVM_FFI_ICHECK_LE(num_experts, da_moe::kDAMaxExperts)
+      << "fused multi-tile routing supports num_experts <= " << da_moe::kDAMaxExperts << ".";
+  TVM_FFI_ICHECK(local_num_experts > 0 && local_num_experts <= num_experts)
+      << "local_num_experts must be between 1 and num_experts.";
+  TVM_FFI_ICHECK(local_expert_offset >= 0 && local_expert_offset + local_num_experts <= num_experts)
+      << "the local expert range must lie within num_experts.";
+  TVM_FFI_ICHECK_LE(topk_ids.size(0),
+                    moe::dev::routing::routingPrecomputed::maxTokensMultiTileCluster(num_experts))
+      << "the token count exceeds the fused multi-tile cluster topology.";
+
+  // Decode the routing representation once, then validate only the corresponding weight ABI.
+  auto const input_mode = static_cast<RoutingInputMode>(routing_input_mode);
+  TVM_FFI_ICHECK(input_mode == RoutingInputMode::PackedPrecomputed ||
+                 input_mode == RoutingInputMode::UnpackedPrecomputed)
+      << "multi-tile routing requires packed or unpacked precomputed routing.";
+  if (input_mode == RoutingInputMode::UnpackedPrecomputed) {
+    TVM_FFI_ICHECK(topk_ids.dtype() == dl_int16 || topk_ids.dtype() == dl_int32)
+        << "unpacked topk_ids must be int16 or int32.";
+    TVM_FFI_ICHECK(topk_weights.has_value())
+        << "unpacked precomputed routing requires topk_weights.";
+    auto const& weights = topk_weights.value();
+    TVM_FFI_ICHECK(weights.dtype() == dl_bfloat16 || weights.dtype() == dl_float32)
+        << "topk_weights must be bfloat16 or float32.";
+    TVM_FFI_ICHECK_EQ(weights.ndim(), 2) << "topk_weights must be 2D.";
+    TVM_FFI_ICHECK_EQ(weights.size(0), topk_ids.size(0))
+        << "topk_weights dim0 must match topk_ids.";
+    TVM_FFI_ICHECK_EQ(weights.size(1), top_k) << "topk_weights dim1 must match top_k.";
+    TVM_FFI_ICHECK(weights.IsContiguous()) << "topk_weights must be contiguous.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_type, kDLCUDA)
+        << "topk_weights must be a CUDA tensor.";
+    TVM_FFI_ICHECK_EQ(weights.device().device_id, topk_ids.device().device_id)
+        << "topk_weights and topk_ids must be on the same device.";
+  } else {
+    TVM_FFI_ICHECK_EQ(topk_ids.dtype(), dl_int32) << "packed topk_ids must be int32.";
+    TVM_FFI_ICHECK(!topk_weights.has_value())
+        << "packed precomputed routing carries weights inside topk_ids.";
+  }
+
+  // The clustered preamble is admitted only on the architecture family it was compiled for.
+  int major = 0;
+  int minor = 0;
+  CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                          topk_ids.device().device_id));
+  CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                                          topk_ids.device().device_id));
+  TVM_FFI_ICHECK_EQ(major, 10) << "fused multi-tile routing requires SM10.x; got SM" << major
+                               << minor << ".";
+  return input_mode;
+}
+
+/// Validate one tile's metadata storage against its exact routing geometry.
+inline void validateRoutingMetadata(RoutingMetadataBuffers const& metadata, int64_t num_tokens,
+                                    int64_t top_k, int64_t num_experts, int64_t tile_tokens_dim,
+                                    DLDevice device, DLDataType expert_weights_dtype) {
+  // Recompute exact extent bounds from the body tile so a mismatched FFI record fails early.
+  int32_t const max_num_padded_tokens =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+          num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t const max_num_ctas =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+          num_tokens, top_k, num_experts, tile_tokens_dim);
+  int64_t const histogram_size = std::max<int64_t>(num_experts * 2, 256 * 2);
+
+  auto check_1d = [device](Tensor const& tensor, DLDataType dtype, int64_t min_size,
+                           char const* name) {
+    TVM_FFI_ICHECK_EQ(tensor.ndim(), 1) << name << " must be 1D.";
+    TVM_FFI_ICHECK_GE(tensor.size(0), min_size) << name << " is too small.";
+    TVM_FFI_ICHECK_EQ(tensor.dtype(), dtype) << name << " has incorrect dtype.";
+    TVM_FFI_ICHECK_EQ(tensor.device().device_type, device.device_type)
+        << name << " is on the wrong device type.";
+    TVM_FFI_ICHECK_EQ(tensor.device().device_id, device.device_id)
+        << name << " is on the wrong device.";
+    TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous.";
+  };
+  check_1d(metadata.total_num_padded_tokens, dl_int32, 1, "total_num_padded_tokens");
+  check_1d(metadata.expanded_idx_to_permuted_idx, dl_int32, num_tokens * top_k,
+           "expanded_idx_to_permuted_idx");
+  check_1d(metadata.permuted_idx_to_token_idx, dl_int32, max_num_padded_tokens + 1,
+           "permuted_idx_to_token_idx");
+  check_1d(metadata.expert_count_histogram, dl_int32, histogram_size, "expert_count_histogram");
+  check_1d(metadata.num_tokens_per_expert, dl_int32, num_experts, "num_tokens_per_expert");
+  check_1d(metadata.cta_idx_xy_to_batch_idx, dl_int32, max_num_ctas, "cta_idx_xy_to_batch_idx");
+  check_1d(metadata.cta_idx_xy_to_mn_limit, dl_int32, max_num_ctas, "cta_idx_xy_to_mn_limit");
+  check_1d(metadata.num_non_exiting_ctas, dl_int32, 1, "num_non_exiting_ctas");
+
+  // Weight storage is the only two-dimensional field and preserves the caller's numeric dtype.
+  Tensor const& expert_weights = metadata.expert_weights;
+  TVM_FFI_ICHECK_EQ(expert_weights.ndim(), 2) << "expert_weights must be 2D.";
+  TVM_FFI_ICHECK_EQ(expert_weights.size(0), num_tokens)
+      << "expert_weights dim0 must match num_tokens.";
+  TVM_FFI_ICHECK_EQ(expert_weights.size(1), top_k) << "expert_weights dim1 must match top_k.";
+  TVM_FFI_ICHECK_EQ(expert_weights.dtype(), expert_weights_dtype)
+      << "expert_weights has incorrect dtype.";
+  TVM_FFI_ICHECK_EQ(expert_weights.device().device_type, device.device_type)
+      << "expert_weights is on the wrong device type.";
+  TVM_FFI_ICHECK_EQ(expert_weights.device().device_id, device.device_id)
+      << "expert_weights is on the wrong device.";
+  TVM_FFI_ICHECK(expert_weights.IsContiguous()) << "expert_weights must be contiguous.";
+}
+
+/// Build the framework-independent descriptor consumed by the fused routing kernel.
+inline moe::dev::routing::routingPrecomputed::Data makePrecomputedRoutingData(
+    TensorView const& topk_ids, RoutingInputMode input_mode, int64_t num_experts, int64_t top_k,
+    int64_t local_expert_offset, int64_t local_num_experts, int64_t tile_tokens_dim,
+    RoutingMetadataBuffers const& metadata) {
+  // Bind the representation-specific input pointer while keeping every output tile-local.
+  moe::dev::routing::routingPrecomputed::Data data;
+  data.mDtypeOutput =
+      metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+  data.mUsePdl = false;
+  data.mPtrTopKPacked = input_mode == RoutingInputMode::PackedPrecomputed
+                            ? const_cast<void*>(topk_ids.data_ptr())
+                            : nullptr;
+  data.mPtrTopKIds = nullptr;
+  data.mPtrPrecomputedExpertIds =
+      input_mode == RoutingInputMode::UnpackedPrecomputed ? topk_ids.data_ptr() : nullptr;
+  data.mExpertIdType = input_mode == RoutingInputMode::PackedPrecomputed
+                           ? moe::dev::routing::routingPrecomputed::ExpertIdType::Packed
+                       : topk_ids.dtype() == dl_int16
+                           ? moe::dev::routing::routingPrecomputed::ExpertIdType::Int16
+                           : moe::dev::routing::routingPrecomputed::ExpertIdType::Int32;
+  data.mPtrExpertCounts = static_cast<int32_t*>(metadata.expert_count_histogram.data_ptr());
+  data.mPtrPermutedIdxSize = static_cast<int32_t*>(metadata.total_num_padded_tokens.data_ptr());
+  data.mPtrExpandedIdxToPermutedIdx =
+      static_cast<int32_t*>(metadata.expanded_idx_to_permuted_idx.data_ptr());
+  data.mPtrPermutedIdxToExpandedIdx = nullptr;
+  data.mPtrPermutedIdxToTokenIdx =
+      static_cast<int32_t*>(metadata.permuted_idx_to_token_idx.data_ptr());
+  data.mPtrTopKWeights = metadata.expert_weights.data_ptr();
+  data.mPtrCtaIdxXyToBatchIdx = static_cast<int32_t*>(metadata.cta_idx_xy_to_batch_idx.data_ptr());
+  data.mPtrCtaIdxXyToMnLimit = static_cast<int32_t*>(metadata.cta_idx_xy_to_mn_limit.data_ptr());
+  data.mPtrNumNonExitingCtas = static_cast<int32_t*>(metadata.num_non_exiting_ctas.data_ptr());
+  data.mPtrNumTokensPerExpert = static_cast<int32_t*>(metadata.num_tokens_per_expert.data_ptr());
+  data.mPtrScores = nullptr;
+  // Copy shape and expert-partition values that must agree across all fused tile descriptors.
+  data.mNumTokens = topk_ids.size(0);
+  data.mNumExperts = num_experts;
+  data.mNumFusedSharedExperts = 0;
+  data.mTopK = top_k;
+  data.mTotalExpertsPerToken = top_k;
+  data.mPaddingLog2 = computeRoutingLog2(tile_tokens_dim);
+  data.mTileTokensDim = tile_tokens_dim;
+  data.mLocalExpertsStartIdx = local_expert_offset;
+  data.mLocalExpertsStrideLog2 = 0;
+  data.mNumLocalExperts = local_num_experts;
+  return data;
+}
+
+/** Decode the flattened public multi-tile routing ABI into typed records once. */
+inline std::vector<RoutingMetadataBuffers> routingMetadataFromFfi(
+    Array<Tensor> const& flat_routing_metadata, int64_t num_tiles) {
+  TVM_FFI_ICHECK_EQ(flat_routing_metadata.size(), num_tiles * RoutingMetadataBuffers::kNumTensors)
+      << "Flat routing metadata must contain nine tensors per tile.";
+  std::vector<RoutingMetadataBuffers> records;
+  records.reserve(num_tiles);
+  for (int64_t tile_index = 0; tile_index < num_tiles; ++tile_index) {
+    records.push_back(RoutingMetadataBuffers::from_flat_ffi(
+        flat_routing_metadata, tile_index * RoutingMetadataBuffers::kNumTensors));
+  }
+  return records;
+}
+
+/** Encode typed multi-tile routing records into the existing flattened FFI ABI. */
+inline Array<Tensor> routingMetadataToFfi(
+    std::vector<RoutingMetadataBuffers> const& routing_metadata) {
+  Array<Tensor> flat;
+  for (RoutingMetadataBuffers const& record : routing_metadata) {
+    for (Tensor const& tensor : record.to_ffi()) {
+      flat.push_back(tensor);
+    }
+  }
+  return flat;
+}
+
+/// Validate and materialize host launch descriptors for all prepared routing tiles.
+inline std::vector<moe::dev::routing::routingPrecomputed::Data> makeMultiTileRoutingData(
+    TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
+    int64_t local_num_experts, Array<int64_t> const& tile_tokens_dims,
+    std::vector<RoutingMetadataBuffers> const& routing_metadata, RoutingInputMode input_mode,
+    Optional<TensorView> const& topk_weights, cudaStream_t stream) {
+  TVM_FFI_ICHECK_EQ(routing_metadata.size(), tile_tokens_dims.size())
+      << "Routing metadata must contain one typed record per tile.";
+  int64_t const num_tokens = topk_ids.size(0);
+  DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
+                                              ? topk_weights.value().dtype()
+                                              : dl_bfloat16;
+
+  // Validate and bind each typed record independently because output extents depend on tile-N.
+  std::vector<moe::dev::routing::routingPrecomputed::Data> routing_data;
+  routing_data.reserve(tile_tokens_dims.size());
+  for (int64_t tile_index = 0; tile_index < tile_tokens_dims.size(); ++tile_index) {
+    int64_t const tile_tokens_dim = tile_tokens_dims[tile_index];
+    RoutingMetadataBuffers const& metadata = routing_metadata[tile_index];
+    validateRoutingMetadata(metadata, num_tokens, top_k, num_experts, tile_tokens_dim,
+                            topk_ids.device(), expert_weights_dtype);
+
+    // Preserve stable metadata addresses while refreshing caller-owned unpacked weights in place.
+    if (input_mode == RoutingInputMode::UnpackedPrecomputed &&
+        metadata.expert_weights.data_ptr() != topk_weights.value().data_ptr()) {
+      auto const& weights = topk_weights.value();
+      size_t const num_bytes = static_cast<size_t>(weights.numel()) * weights.dtype().bits / 8;
+      CHECK_CUDA_ERROR(cudaMemcpyAsync(metadata.expert_weights.data_ptr(), weights.data_ptr(),
+                                       num_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+    routing_data.push_back(makePrecomputedRoutingData(topk_ids, input_mode, num_experts, top_k,
+                                                      local_expert_offset, local_num_experts,
+                                                      tile_tokens_dim, metadata));
+  }
+  return routing_data;
+}
 
 // Validate routing_replay_out tensor properties.
 // NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer
@@ -558,7 +1337,8 @@ class FusedMoeLauncher {
   // Non-owning; points into the thread-local runner cache in prepare_moe_common().
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner* moe_runner{nullptr};
 
-  void prepare_moe_common(int64_t& moe_tactic) {
+  /** Resolve and retain the typed MoE runner for one complete tactic. */
+  void prepare_moe_runner(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
     bool usePerTokenScalingGemm1 = per_token_scales.has_value() || args->mUseRoutingScalesOnInput;
     // FIXME(siyuan): currently only nvfp4 x nvfp4 uses per-token scaling in both FC1 and FC2
@@ -631,12 +1411,21 @@ class FusedMoeLauncher {
                      "Invalid MoE tactic ", moe_tactic, " for tile_N=", tile_tokens_dim,
                      ". This often indicates a stale or mismatched autotuner cache entry.");
     this->moe_tactic = moe_tactic;
+  }
 
+  /** Allocate the FC workspaces required by the resolved complete tactic. */
+  void prepare_moe_common(int64_t& moe_tactic) {
+    prepare_moe_runner(moe_tactic);
     auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
     workspace_fc1 = alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+
+  /** Bind one tile's graph-stable routing metadata to the common MoE workspace. */
+  void bind_routing_metadata(RoutingMetadataBuffers const& metadata) {
+    metadata.bind(workspace, tile_tokens_dim);
   }
 
  public:
@@ -664,9 +1453,10 @@ class FusedMoeLauncher {
   // `expanded_idx_to_permuted_idx` is appended whenever a permuted-layout
   // tensor (`gemm2_output` or `gemm1_output`) is returned, so the caller can
   // always unpermute back to (token, slot) order.
-  virtual Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                            bool use_routing_scales_on_input = false,
-                            bool use_deep_seek_fp8 = false, bool return_activation_output = false) {
+  virtual MoeRunResultBuffers run(int64_t moe_tactic, bool enable_pdl = true,
+                                  bool use_routing_scales_on_input = false,
+                                  bool use_deep_seek_fp8 = false,
+                                  bool return_activation_output = false) {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
@@ -706,20 +1496,20 @@ class FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
+    MoeRunResultBuffers result;
     if (args->do_finalize) {
-      result.push_back(output);
+      result.primary_output = output;
     } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      result.primary_output = gemm2_output;
+      result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     // Always surface the permutation map when the caller gets any
     // permuted-layout buffer back, so gemm1/gemm2 outputs can be reordered.
     if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
+      result.expanded_to_permuted_indices = expanded_idx_to_permuted_idx;
     }
     if (return_activation_output) {
-      result.push_back(gemm1_output);
+      result.activation_output = gemm1_output;
     }
     return result;
   }
@@ -900,6 +1690,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
         << "the second dimension of weights must be a multiple of 128.";
   }
 
+  /** Allocate and bind one ordinary BF16 MoE body workspace. */
   void prepare_moe(int64_t& moe_tactic) override {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
@@ -941,6 +1732,37 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
                                   ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
                                   : nullptr;
+  }
+
+  /** Allocate graph-stable BF16 body buffers without launching routing or GEMMs. */
+  BF16DABodyBuffers prepare_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                    int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "BF16 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    check_moe();
+    prepare_moe(moe_tactic);
+    return {gemm1_output, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Launch one BF16 body from prepared routing metadata and exact ABI buffers. */
+  void run_da_body(RoutingMetadataBuffers const& routing_metadata,
+                   BF16DABodyBuffers const& prepared, int64_t moe_tactic, bool enable_pdl) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "BF16 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    prepare_moe_runner(moe_tactic);
+    prepared.bind(workspace);
+    args->gemm1_alpha = nullptr;
+    args->gemm1_beta = nullptr;
+    args->gemm1_clamp_limit = nullptr;
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -1129,6 +1951,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         << "FP8 MoE: gemm2_weights must be float8_e4m3fn.";
   }
 
+  /** Allocate and bind one ordinary FP8 per-tensor MoE body workspace. */
   void prepare_moe(int64_t& moe_tactic) override {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
@@ -1172,6 +1995,46 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
   }
 
+  /** Allocate graph-stable FP8 per-tensor buffers for one exact routed body. */
+  FP8PerTensorDABodyBuffers prepare_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                            int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "FP8 per-tensor DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    check_moe();
+    prepare_moe(moe_tactic);
+    return {gemm1_output, gemm1_output_scale, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Launch one exact FP8 per-tensor body from prepared routing metadata. */
+  void run_da_body(RoutingMetadataBuffers const& routing_metadata,
+                   FP8PerTensorDABodyBuffers const& prepared, int64_t moe_tactic, bool enable_pdl) {
+    // Rebind the selected tile's routing record before resolving the complete body tactic.
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "FP8 per-tensor DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    prepare_moe_runner(moe_tactic);
+    workspace.hidden_states_scale_linear = nullptr;
+    workspace.activation_output = nullptr;
+    workspace.activation_output_scale = nullptr;
+    workspace.gemm2_output_scale = nullptr;
+    prepared.bind(workspace);
+    TVM_FFI_ICHECK(output1_scales_scalar.has_value());
+    TVM_FFI_ICHECK(output1_scales_gate_scalar.has_value());
+    TVM_FFI_ICHECK(output2_scales_scalar.has_value());
+    args->output1_scales_scalar = static_cast<float*>(output1_scales_scalar.value().data_ptr());
+    args->output1_scales_gate_scalar =
+        static_cast<float*>(output1_scales_gate_scalar.value().data_ptr());
+    args->output2_scales_scalar = static_cast<float*>(output2_scales_scalar.value().data_ptr());
+    // Preserve Llama4's routing-scale convention while launching through the typed FP8 ABI.
+    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+      workspace.token_scales = workspace.expert_weights;
+    }
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
+  }
+
  private:
   Optional<TensorView> expert_indices;  // packed pre-computed routing; empty => route from logits
   bool use_routing_scales_on_input;
@@ -1180,9 +2043,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
  public:
   // Override to handle pre-computed (packed) routing in addition to routing from logits.
-  Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                    bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
-                    bool return_activation_output = false) override {
+  MoeRunResultBuffers run(int64_t moe_tactic, bool enable_pdl = true,
+                          bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
+                          bool return_activation_output = false) override {
     check_routing();
     prepare_routing();
 
@@ -1221,18 +2084,18 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
+    MoeRunResultBuffers result;
     if (args->do_finalize) {
-      result.push_back(output);
+      result.primary_output = output;
     } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      result.primary_output = gemm2_output;
+      result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
+      result.expanded_to_permuted_indices = expanded_idx_to_permuted_idx;
     }
     if (return_activation_output) {
-      result.push_back(gemm1_output);
+      result.activation_output = gemm1_output;
     }
     return result;
   }
@@ -1615,6 +2478,92 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
   }
 
+  /** Allocate graph-stable buffers for one exact DeepSeek FP8 body. */
+  DeepSeekFP8DABodyBuffers prepare_deepseek_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                                    int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8);
+    TVM_FFI_ICHECK(args->do_finalize) << "DeepSeek FP8 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    args->mUseDeepSeekFp8 = true;
+    check_moe();
+    prepare_moe(moe_tactic);
+    return {gemm1_output, gemm1_output_scale, activation_output, activation_output_scale,
+            gemm2_output, workspace_fc1,      workspace_fc2};
+  }
+
+  /** Allocate graph-stable buffers for one exact MXFP8 body. */
+  MXFP8DABodyBuffers prepare_mxfp8_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                           int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+    TVM_FFI_ICHECK(args->do_finalize) << "MXFP8 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    args->mUseDeepSeekFp8 = false;
+    check_moe();
+    prepare_moe(moe_tactic);
+    return {gemm1_output, gemm1_output_scale, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Launch one exact DeepSeek FP8 body from its typed prepared buffers. */
+  void run_deepseek_da_body(RoutingMetadataBuffers const& routing_metadata,
+                            DeepSeekFP8DABodyBuffers const& prepared, int64_t moe_tactic,
+                            bool enable_pdl) {
+    // Resolve the DeepSeek routing-weight ABI before binding the lane-owned maximum workspace.
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8);
+    TVM_FFI_ICHECK(args->do_finalize) << "DeepSeek FP8 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    args->mUseDeepSeekFp8 = true;
+    prepare_moe_runner(moe_tactic);
+    workspace.hidden_states_scale_linear = nullptr;
+    prepared.bind(workspace);
+    workspace.gemm2_output_scale = nullptr;
+    args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
+    args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
+    args->gemm1_alpha = nullptr;
+    args->gemm1_beta = nullptr;
+    args->gemm1_clamp_limit = nullptr;
+    args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
+    // Launch the complete body after every dtype-specific scale pointer is bound.
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
+  }
+
+  /** Launch one exact MXFP8 body from its typed prepared buffers. */
+  void run_mxfp8_da_body(RoutingMetadataBuffers const& routing_metadata,
+                         MXFP8DABodyBuffers const& prepared, int64_t moe_tactic, bool enable_pdl) {
+    // Resolve the MXFP8 routing-weight ABI before binding the lane-owned maximum workspace.
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+    TVM_FFI_ICHECK(args->do_finalize) << "MXFP8 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    args->mUseDeepSeekFp8 = false;
+    prepare_moe_runner(moe_tactic);
+    workspace.hidden_states_scale_linear = nullptr;
+    prepared.bind(workspace);
+    workspace.gemm2_output_scale = nullptr;
+    args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
+    args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
+    args->gemm1_alpha = nullptr;
+    args->gemm1_beta = nullptr;
+    args->gemm1_clamp_limit = nullptr;
+    args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
+    // Launch the complete body after every dtype-specific scale pointer is bound.
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
+  }
+
  private:
   TensorView hidden_states_scale;
   TensorView gemm1_weights_scale;
@@ -1630,9 +2579,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
  public:
   // Override to handle pre-computed routing.
-  Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                    bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
-                    bool return_activation_output = false) override {
+  MoeRunResultBuffers run(int64_t moe_tactic, bool enable_pdl = true,
+                          bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
+                          bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
@@ -1673,22 +2622,22 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
+    MoeRunResultBuffers result;
     if (args->do_finalize) {
-      result.push_back(output);
+      result.primary_output = output;
     } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      result.primary_output = gemm2_output;
+      result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
+      result.expanded_to_permuted_indices = expanded_idx_to_permuted_idx;
     }
     if (return_activation_output) {
       // For DSFp8, gemm1_output is the pre-activation FC1 output (shape [M, 2*I])
       // and the post-activation tensor lives in activation_output (shape [M, I]).
       // MxFp8 fuses SwiGLU into FC1 so gemm1_output IS already post-activation.
-      result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output
-                                                                             : gemm1_output);
+      result.activation_output =
+          quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output : gemm1_output;
     }
     return result;
   }
@@ -1896,6 +2845,40 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
     // prepare_moe_common() when gated activation is used
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
+  }
+
+  /** Allocate graph-stable MXINT4 buffers for one exact routed body. */
+  MXINT4DABodyBuffers prepare_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                      int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "MXINT4 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    check_moe();
+    prepare_moe(moe_tactic);
+    return {gemm1_output, gemm2_output, workspace_fc1, workspace_fc2};
+  }
+
+  /** Launch one exact MXINT4 body from prepared routing metadata. */
+  void run_da_body(RoutingMetadataBuffers const& routing_metadata,
+                   MXINT4DABodyBuffers const& prepared, int64_t moe_tactic, bool enable_pdl) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    TVM_FFI_ICHECK(args->do_finalize) << "MXINT4 DA bodies require finalized output.";
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    prepare_moe_runner(moe_tactic);
+    prepared.bind(workspace);
+    args->hidden_states_scale = nullptr;
+    args->gemm1_weights_scale = gemm1_weights_scale.data_ptr();
+    args->gemm1_alpha = nullptr;
+    args->gemm1_beta = nullptr;
+    args->gemm1_clamp_limit = nullptr;
+    args->gemm2_weights_scale = gemm2_weights_scale.data_ptr();
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
   }
 
  private:
@@ -2117,7 +3100,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     }
   }
 
-  void prepare_moe(int64_t& moe_tactic) override {
+  /** Bind the exact FP4 launcher inputs to the common typed runner arguments. */
+  void configure_moe_args() {
     args->hidden_states = hidden_states.data_ptr();
     args->hidden_states_scale =
         hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
@@ -2148,6 +3132,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         output2_scales_scalar.has_value()
             ? static_cast<float*>(output2_scales_scalar.value().data_ptr())
             : nullptr;
+  }
+
+  /** Allocate and bind one ordinary FP4 MoE body workspace. */
+  void prepare_moe(int64_t& moe_tactic) override {
+    configure_moe_args();
 
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
@@ -2206,6 +3195,45 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
   }
 
+  /** Allocate the graph-stable buffers for one FP4 body without launching it. */
+  FP4DABodyBuffers prepare_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                   int64_t moe_tactic) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    check_moe();
+    prepare_moe(moe_tactic);
+
+    Tensor empty = alloc_tensor({0}, dl_uint8, hidden_states.device());
+    return {gemm1_output,
+            gemm1_output_scale.has_value() ? gemm1_output_scale.value() : empty,
+            activation_output.defined() ? activation_output : empty,
+            per_token_scales_fc2.defined() ? per_token_scales_fc2 : empty,
+            gemm2_output,
+            workspace_fc1,
+            workspace_fc2};
+  }
+
+  /** Launch one FP4 body from precomputed routing metadata and prepared buffers. */
+  void run_da_body(RoutingMetadataBuffers const& routing_metadata, FP4DABodyBuffers const& prepared,
+                   int64_t moe_tactic, bool enable_pdl) {
+    ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+    configure_moe_args();
+    bind_routing_metadata(routing_metadata);
+    args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+    prepare_moe_runner(moe_tactic);
+    prepared.bind(workspace, per_token_scales);
+
+    cudaStream_t stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                    enable_pdl);
+  }
+
+  /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
+  Tensor finalized_da_output() const { return output; }
+
  private:
   Optional<TensorView> hidden_states_scale;
   TensorView gemm1_weights_scale;
@@ -2221,9 +3249,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   TensorView topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing weights
 
  public:
-  Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
-                    bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
-                    bool return_activation_output = false) override {
+  MoeRunResultBuffers run(int64_t moe_tactic, bool enable_pdl = true,
+                          bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
+                          bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
     prepare_routing();
@@ -2286,18 +3314,18 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    Array<Tensor> result;
+    MoeRunResultBuffers result;
     if (args->do_finalize) {
-      result.push_back(output);
+      result.primary_output = output;
     } else {
-      result.push_back(gemm2_output);
-      result.push_back(FusedMoeLauncher::expert_weights);
+      result.primary_output = gemm2_output;
+      result.expert_weights = FusedMoeLauncher::expert_weights;
     }
     if (!args->do_finalize || return_activation_output) {
-      result.push_back(expanded_idx_to_permuted_idx);
+      result.expanded_to_permuted_indices = expanded_idx_to_permuted_idx;
     }
     if (return_activation_output) {
-      result.push_back(gemm1_output);
+      result.activation_output = gemm1_output;
     }
     return result;
   }
@@ -2352,7 +3380,8 @@ Array<Tensor> trtllm_bf16_moe(
     int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
     bool use_shuffled_weight, int64_t weight_layout, bool do_finalize, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -2428,10 +3457,27 @@ Array<Tensor> trtllm_bf16_moe(
                    "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA preparation cannot consume an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = BF16DABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    return {};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "Ordinary BF16 MoE cannot consume a DA body workspace.";
+
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl,
-                                /*use_routing_scales_on_input=*/false,
-                                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value());
+  return selected_launcher
+      ->run(config, enable_pdl,
+            /*use_routing_scales_on_input=*/false,
+            /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
+      .to_ffi();
 }
 
 Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
@@ -2443,7 +3489,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -2518,8 +3565,23 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA preparation cannot consume an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = FP8PerTensorDABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    return {};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "Ordinary FP8 per-tensor MoE cannot consume a DA body workspace.";
+
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
+  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
 // Pre-routed variant of trtllm_fp8_per_tensor_scale_moe.
@@ -2532,7 +3594,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
   // Basic type validation
   auto const dtype = hidden_states.dtype();
   auto const activation = validateAndCastActivationType(activation_type);
@@ -2622,8 +3685,23 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA preparation cannot consume an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = FP8PerTensorDABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    return {};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "Ordinary routed FP8 per-tensor MoE cannot consume a DA body workspace.";
+
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
+  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
 Array<Tensor> trtllm_fp8_block_scale_moe(
@@ -2638,7 +3716,9 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
-    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace,
+    bool is_da_body_preparation) {
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
@@ -2772,11 +3852,35 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
                    "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA preparation cannot consume an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+      return selected_launcher->prepare_deepseek_da_body(routing, config).to_ffi();
+    }
+    return selected_launcher->prepare_mxfp8_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+      auto const body = DeepSeekFP8DABodyBuffers::from_ffi(da_body_workspace);
+      selected_launcher->run_deepseek_da_body(routing, body, config, enable_pdl);
+    } else {
+      auto const body = MXFP8DABodyBuffers::from_ffi(da_body_workspace);
+      selected_launcher->run_mxfp8_da_body(routing, body, config, enable_pdl);
+    }
+    return {};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "Ordinary FP8 block-scale MoE cannot consume a DA body workspace.";
+
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return selected_launcher->run(
-      config, enable_pdl, false /* use_routing_scales_on_input */,
-      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */,
-      gemm1_lora_delta.has_value());
+  return selected_launcher
+      ->run(config, enable_pdl, false /* use_routing_scales_on_input */,
+            quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */,
+            gemm1_lora_delta.has_value())
+      .to_ffi();
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -2794,7 +3898,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t act_type,
     TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -2936,10 +4041,30 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA body preparation does not accept an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = FP4DABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    if (do_finalize) {
+      return {selected_launcher->finalized_da_output()};
+    }
+    return {body.gemm2_output, routing.expert_weights, routing.expanded_idx_to_permuted_idx};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "A DA body workspace requires routing metadata.";
+
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl,
-                                /*use_routing_scales_on_input=*/false,
-                                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value());
+  return selected_launcher
+      ->run(config, enable_pdl,
+            /*use_routing_scales_on_input=*/false,
+            /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
+      .to_ffi();
 }
 
 Array<Tensor> trtllm_mxint4_block_scale_moe(
@@ -2952,7 +4077,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -3041,10 +4167,27 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
                    "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  if (is_da_body_preparation) {
+    TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+        << "DA preparation cannot consume an existing body workspace.";
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+  }
+  if (!da_routing_metadata.empty()) {
+    auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
+    auto const body = MXINT4DABodyBuffers::from_ffi(da_body_workspace);
+    selected_launcher->run_da_body(routing, body, config, enable_pdl);
+    return {};
+  }
+  TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
+      << "Ordinary MXINT4 MoE cannot consume a DA body workspace.";
+
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl,
-                                /*use_routing_scales_on_input=*/false,
-                                /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value());
+  return selected_launcher
+      ->run(config, enable_pdl,
+            /*use_routing_scales_on_input=*/false,
+            /*use_deep_seek_fp8=*/false, gemm1_lora_delta.has_value())
+      .to_ffi();
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
@@ -3120,6 +4263,437 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   return Array<Array<int64_t>>();
 }
 
+/// Return valid complete tactics decomposed into tile-N, FC1, FC2, and anchor coordinates.
+Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
+    int64_t const dtype_act_, int64_t const dtype_weights_,
+    Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
+    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const act_type,
+    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
+    int64_t const num_tokens, bool has_gemm1_lora_delta) {
+  // Start from complete valid tactics so every factorized coordinate remains executable.
+  auto const completeTactics = trtllm_get_valid_moe_configs(
+      dtype_act_, dtype_weights_, fp8_quantization_type, top_k, hidden_size, intermediate_size,
+      num_local_experts, act_type, use_shuffled_weight, weight_layout, use_per_token_scaling,
+      num_tokens, has_gemm1_lora_delta);
+  auto const dtypeAct = static_cast<btg::Dtype>(dtype_act_);
+  auto const dtypeWeights = static_cast<btg::Dtype>(dtype_weights_);
+  auto const activationType = validateAndCastActivationType(act_type);
+  auto const matrixLayout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
+  auto const gemm1BiasType =
+      has_gemm1_lora_delta ? batchedGemm::gemm::BiasType::Mn : batchedGemm::gemm::BiasType::None;
+  bool const useDeepSeekFp8 = fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8;
+  bool const usePerTokenScalingGemm2 = use_per_token_scaling && dtypeAct == btg::Dtype::E2m1;
+  bool const useWeightsOnlyConstructor = dtypeAct == btg::Dtype::E4m3 &&
+                                         dtypeWeights == btg::Dtype::E4m3 && useDeepSeekFp8 &&
+                                         gemm1BiasType == batchedGemm::gemm::BiasType::None;
+
+  // Reuse one dtype-correct runner per tile while decomposing tactics into FC coordinates.
+  std::map<int64_t, std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>> runners;
+  Array<Array<int64_t>> result;
+  for (auto const& completeTactic : completeTactics) {
+    TVM_FFI_ICHECK_EQ(completeTactic.size(), 2);
+    int64_t const tileN = completeTactic[0];
+    int64_t const configIndex = completeTactic[1];
+    auto runnerIt = runners.find(tileN);
+    if (runnerIt == runners.end()) {
+      std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> runner;
+      if (useWeightsOnlyConstructor) {
+        runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+            dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), use_shuffled_weight,
+            matrixLayout, use_per_token_scaling, usePerTokenScalingGemm2, false, false);
+      } else {
+        runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+            dtypeAct, dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), activationType,
+            use_shuffled_weight, matrixLayout, gemm1BiasType, use_per_token_scaling,
+            usePerTokenScalingGemm2, false, false);
+      }
+      runnerIt = runners.emplace(tileN, std::move(runner)).first;
+    }
+    auto const components = runnerIt->second->getConfigComponents(configIndex);
+    auto const anchorIndex = runnerIt->second->getDefaultValidConfigIndex(
+        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens);
+    result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
+                      configIndex == anchorIndex ? 1 : 0});
+  }
+  return result;
+}
+
+/** Allocate stable native replay outputs and scratch for one live-logits router launch. */
+Array<Tensor> trtllm_moe_allocate_canonical_routing(TensorView routing_logits, int64_t top_k,
+                                                    int64_t tile_tokens_dim) {
+  // Validate the public router geometry before deriving any graph-stable allocation extents.
+  ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
+  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be two-dimensional.";
+  TVM_FFI_ICHECK(routing_logits.dtype() == dl_bfloat16 || routing_logits.dtype() == dl_float32)
+      << "routing_logits must be bfloat16 or float32.";
+  int64_t const num_tokens = routing_logits.size(0);
+  int64_t const num_experts = routing_logits.size(1);
+  TVM_FFI_ICHECK(top_k > 0 && top_k <= num_experts) << "top_k must be between one and num_experts.";
+  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "tile_tokens_dim must be positive.";
+  int32_t const max_num_padded_tokens =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+          num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t const max_num_ctas =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+          num_tokens, top_k, num_experts, tile_tokens_dim);
+  int64_t const histogram_size = std::max<int64_t>(num_experts * 2, 256 * 2);
+  // Allocate the complete typed record once so later capture only mutates tensor contents.
+  CanonicalRoutingBuffers buffers{
+      alloc_tensor({num_tokens, top_k}, dl_int16, routing_logits.device()),
+      alloc_tensor({num_tokens, top_k}, dl_bfloat16, routing_logits.device()),
+      alloc_tensor({num_tokens, top_k}, dl_int32, routing_logits.device()),
+      alloc_tensor({num_experts}, dl_int32, routing_logits.device()),
+      alloc_tensor({1}, dl_int32, routing_logits.device()),
+      alloc_tensor({num_tokens * top_k}, dl_int32, routing_logits.device()),
+      alloc_tensor({max_num_padded_tokens + 1}, dl_int32, routing_logits.device()),
+      alloc_tensor({histogram_size}, dl_int32, routing_logits.device()),
+      alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device()),
+      alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device()),
+      alloc_tensor({1}, dl_int32, routing_logits.device())};
+  return buffers.to_ffi();
+}
+
+/** Launch the real TRTLLM router once and retain both conventional and replay outputs. */
+void trtllm_moe_canonicalize_routing(
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
+    Array<Tensor> canonical, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    int64_t routing_method_type, bool use_routing_scales_on_input, bool use_deep_seek_fp8,
+    bool norm_topk_prob, bool enable_pdl, int64_t tile_tokens_dim) {
+  // Decode the public tensor array once and retain named fields through routing.
+  ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
+  CanonicalRoutingBuffers const buffers = CanonicalRoutingBuffers::from_ffi(canonical);
+  int64_t const num_tokens = routing_logits.size(0);
+  int64_t const num_experts = routing_logits.size(1);
+  TVM_FFI_ICHECK_EQ(hidden_states.size(0), num_tokens)
+      << "hidden_states and routing_logits must have the same token count.";
+  TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset + local_num_experts <= num_experts)
+      << "the local expert range must lie within routing_logits.";
+
+  btg::Dtype dtype_elt;
+  if (hidden_states.dtype() == dl_float16) {
+    dtype_elt = btg::Dtype::Fp16;
+  } else if (hidden_states.dtype() == dl_bfloat16) {
+    dtype_elt = btg::Dtype::Bfloat16;
+  } else if (hidden_states.dtype() == dl_float8_e4m3fn) {
+    dtype_elt = btg::Dtype::E4m3;
+  } else {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "Unsupported activation dtype for canonical routing.";
+  }
+  btg::Dtype const routing_bias_dtype =
+      routing_bias.has_value() && routing_bias.value().dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                             : btg::Dtype::Bfloat16;
+  btg::Dtype const routing_logits_dtype =
+      routing_logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+
+  // Run the production router into graph-stable storage, including its native int16 replay IDs.
+  tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+  cudaStream_t stream = get_stream(routing_logits.device());
+  routing_runner.run(
+      const_cast<void*>(routing_logits.data_ptr()),
+      routing_bias.has_value() ? const_cast<void*>(routing_bias.value().data_ptr()) : nullptr,
+      num_tokens, num_experts, top_k, 0, n_group.value_or(0), topk_group.value_or(0),
+      local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
+      static_cast<int*>(buffers.packed_scratch.data_ptr()),
+      static_cast<int*>(buffers.expert_count_histogram.data_ptr()),
+      static_cast<int*>(buffers.total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(buffers.expanded_idx_to_permuted_idx.data_ptr()), nullptr,
+      static_cast<int*>(buffers.permuted_idx_to_token_idx.data_ptr()), nullptr,
+      buffers.expert_weights.data_ptr(),
+      static_cast<int*>(buffers.num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(buffers.cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(buffers.cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(buffers.num_non_exiting_ctas.data_ptr()), dtype_elt, routing_bias_dtype,
+      use_routing_scales_on_input, use_deep_seek_fp8,
+      static_cast<RoutingMethodType>(routing_method_type), stream, routing_logits_dtype,
+      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), enable_pdl);
+}
+
+/// Allocate graph-stable routing metadata storage for each requested tile without launching work.
+Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
+    TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
+    int64_t local_num_experts, Array<int64_t> tile_tokens_dims, int64_t routing_input_mode,
+    Optional<Tensor> topk_weights) {
+  // Validate shared routing inputs once before allocating tile-dependent output records.
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
+  auto const input_mode = validateMultiTileRoutingInputs(
+      topk_ids, num_experts, top_k, local_expert_offset, local_num_experts, tile_tokens_dims,
+      routing_input_mode, topk_weights);
+  int64_t const num_tokens = topk_ids.size(0);
+  int64_t const histogram_size = std::max<int64_t>(num_experts * 2, 256 * 2);
+  DLDataType const expert_weights_dtype = input_mode == RoutingInputMode::UnpackedPrecomputed
+                                              ? topk_weights.value().dtype()
+                                              : dl_bfloat16;
+
+  // Allocate one typed record per tile while preserving borrowed unpacked routing weights.
+  std::vector<RoutingMetadataBuffers> routing_metadata;
+  routing_metadata.reserve(tile_tokens_dims.size());
+  for (int64_t tile_tokens_dim : tile_tokens_dims) {
+    int32_t const max_num_padded_tokens =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+            num_tokens, top_k, num_experts, tile_tokens_dim);
+    int32_t const max_num_ctas =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+            num_tokens, top_k, num_experts, tile_tokens_dim);
+
+    RoutingMetadataBuffers metadata{
+        alloc_tensor({1}, dl_int32, topk_ids.device()),
+        alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device()),
+        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, topk_ids.device()),
+        input_mode == RoutingInputMode::UnpackedPrecomputed
+            ? topk_weights.value()
+            : alloc_tensor({num_tokens, top_k}, dl_bfloat16, topk_ids.device()),
+        alloc_tensor({histogram_size}, dl_int32, topk_ids.device()),
+        alloc_tensor({num_experts}, dl_int32, topk_ids.device()),
+        alloc_tensor({max_num_ctas}, dl_int32, topk_ids.device()),
+        alloc_tensor({max_num_ctas}, dl_int32, topk_ids.device()),
+        alloc_tensor({1}, dl_int32, topk_ids.device())};
+    validateRoutingMetadata(metadata, num_tokens, top_k, num_experts, tile_tokens_dim,
+                            topk_ids.device(), expert_weights_dtype);
+    routing_metadata.push_back(std::move(metadata));
+  }
+  return routingMetadataToFfi(routing_metadata);
+}
+
+/// Return the exact native token bound for the fused multi-tile DA preamble.
+int64_t trtllm_moe_max_da_multi_tile_tokens(int64_t num_experts) {
+  TVM_FFI_ICHECK_GT(num_experts, 0) << "num_experts must be positive.";
+  TVM_FFI_ICHECK_LE(num_experts, da_moe::kDAMaxExperts)
+      << "num_experts exceeds the compiled DA capacity.";
+  return moe::dev::routing::routingPrecomputed::maxTokensMultiTileCluster(num_experts);
+}
+
+/// Populate all preallocated tile metadata with one routing-method-neutral CUDA kernel launch.
+void trtllm_moe_populate_routing_metadata_multi_tile(
+    TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
+    int64_t local_num_experts, Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata,
+    int64_t routing_input_mode, Optional<TensorView> topk_weights) {
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
+  auto const input_mode = validateMultiTileRoutingInputs(
+      topk_ids, num_experts, top_k, local_expert_offset, local_num_experts, tile_tokens_dims,
+      routing_input_mode, topk_weights);
+  cudaStream_t stream = get_stream(topk_ids.device());
+  auto const routing_metadata =
+      routingMetadataFromFfi(flat_routing_metadata, tile_tokens_dims.size());
+  auto routing_data = makeMultiTileRoutingData(topk_ids, num_experts, top_k, local_expert_offset,
+                                               local_num_experts, tile_tokens_dims,
+                                               routing_metadata, input_mode, topk_weights, stream);
+
+  moe::dev::routing::routingPrecomputed::runMultiTileCluster(
+      routing_data.data(), static_cast<int32_t>(routing_data.size()), stream);
+}
+
+/// Inspect whether the active outer capture may safely reuse one workspace lane.
+Array<int64_t> trtllm_moe_inspect_da_workspace_lane(TensorView device_anchor,
+                                                    int64_t expected_capture_id,
+                                                    int64_t previous_conditional_node_handle) {
+  ffi::CUDADeviceGuard device_guard(device_anchor.device().device_id);
+  cudaStream_t stream = get_stream(device_anchor.device());
+  da_moe::ActiveCaptureContext context{};
+  CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &context));
+  TVM_FFI_ICHECK(context.status == cudaStreamCaptureStatusActive && context.graph != nullptr)
+      << "DA workspace-lane inspection requires an active outer CUDA Graph capture.";
+  bool is_serialized = false;
+  CHECK_CUDA_ERROR(da_moe::ValidateWorkspaceLaneSequence(
+      context, static_cast<unsigned long long>(expected_capture_id),
+      reinterpret_cast<cudaGraphNode_t>(previous_conditional_node_handle), &is_serialized));
+  return {static_cast<int64_t>(context.capture_id), static_cast<int64_t>(is_serialized)};
+}
+
+/// Inject parallel multi-tile routing, selector, and an empty SWITCH into an outer capture.
+Array<int64_t> trtllm_moe_begin_da_switch_capture(
+    TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
+    int64_t local_num_experts, Array<int64_t> tile_tokens_dims, Array<Tensor> flat_routing_metadata,
+    int64_t routing_input_mode, Optional<TensorView> topk_weights, TensorView exemplar_spectra,
+    TensorView exemplar_body_indices, int64_t num_selector_exemplars, TensorView selected_body,
+    int64_t num_bodies, int64_t expected_capture_id, int64_t previous_conditional_node_handle) {
+  // Reject invalid plan capacity before mutating the caller's active outer graph.
+  ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
+  TVM_FFI_ICHECK_GT(num_bodies, 1) << "A DA SWITCH requires at least two bodies.";
+  TVM_FFI_ICHECK_LE(num_bodies, da_moe::kDAMaxBodies)
+      << "DA body count exceeds immutable SWITCH capacity.";
+  TVM_FFI_ICHECK_GT(num_selector_exemplars, 0) << "A DA selector requires at least one exemplar.";
+  TVM_FFI_ICHECK_LE(num_selector_exemplars, da_moe::kDAMaxExemplars)
+      << "DA selector exemplar count exceeds immutable capacity.";
+
+  auto const input_mode = validateMultiTileRoutingInputs(
+      topk_ids, num_experts, top_k, local_expert_offset, local_num_experts, tile_tokens_dims,
+      routing_input_mode, topk_weights);
+  cudaStream_t stream = get_stream(topk_ids.device());
+  da_moe::ActiveCaptureContext original{};
+  CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &original));
+  TVM_FFI_ICHECK(original.status == cudaStreamCaptureStatusActive && original.graph != nullptr)
+      << "DA SWITCH injection requires an active outer CUDA Graph capture.";
+  bool is_workspace_lane_serialized = false;
+  CHECK_CUDA_ERROR(da_moe::ValidateWorkspaceLaneSequence(
+      original, static_cast<unsigned long long>(expected_capture_id),
+      reinterpret_cast<cudaGraphNode_t>(previous_conditional_node_handle),
+      &is_workspace_lane_serialized));
+  TVM_FFI_ICHECK(is_workspace_lane_serialized)
+      << "DA workspace lane is not ordered after its previous invocation.";
+
+  // Dispatch the fused preamble first, then rewind the capture frontier to create a sibling root.
+  auto const routing_metadata =
+      routingMetadataFromFfi(flat_routing_metadata, tile_tokens_dims.size());
+  auto routing_data = makeMultiTileRoutingData(topk_ids, num_experts, top_k, local_expert_offset,
+                                               local_num_experts, tile_tokens_dims,
+                                               routing_metadata, input_mode, topk_weights, stream);
+  moe::dev::routing::routingPrecomputed::runMultiTileCluster(
+      routing_data.data(), static_cast<int32_t>(routing_data.size()), stream);
+  da_moe::ActiveCaptureContext after_parallel_work{};
+  CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &after_parallel_work));
+  CHECK_CUDA_ERROR(da_moe::SetCaptureDependencies(stream, original.dependencies.data(),
+                                                  original.dependencies.size()));
+
+  // Dispatch the device selector from the original frontier using the routing representation ABI.
+  cudaGraphConditionalHandle conditional_handle = 0;
+  CHECK_CUDA_ERROR(cudaGraphConditionalHandleCreate(&conditional_handle, original.graph, 0,
+                                                    cudaGraphCondAssignDefault));
+  int64_t const assignment_numel = topk_ids.numel();
+  bool const packed_ids = input_mode == RoutingInputMode::PackedPrecomputed;
+  if (packed_ids) {
+    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, true>
+        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            static_cast<float const*>(exemplar_spectra.data_ptr()),
+            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+            static_cast<int>(num_selector_exemplars), conditional_handle,
+            static_cast<int32_t*>(selected_body.data_ptr()));
+  } else if (topk_ids.dtype() == dl_int16) {
+    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
+        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+            static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            static_cast<float const*>(exemplar_spectra.data_ptr()),
+            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+            static_cast<int>(num_selector_exemplars), conditional_handle,
+            static_cast<int32_t*>(selected_body.data_ptr()));
+  } else {
+    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false>
+        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            static_cast<float const*>(exemplar_spectra.data_ptr()),
+            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+            static_cast<int>(num_selector_exemplars), conditional_handle,
+            static_cast<int32_t*>(selected_body.data_ptr()));
+  }
+  CHECK_CUDA_ERROR(cudaPeekAtLastError());
+  da_moe::ActiveCaptureContext after_selector{};
+  CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &after_selector));
+
+  // Join both independent roots at one conditional node whose child graphs are populated later.
+  std::vector<cudaGraphNode_t> switch_dependencies = after_parallel_work.dependencies;
+  switch_dependencies.insert(switch_dependencies.end(), after_selector.dependencies.begin(),
+                             after_selector.dependencies.end());
+  cudaGraphNodeParams conditional_params{};
+  conditional_params.type = cudaGraphNodeTypeConditional;
+  conditional_params.conditional.handle = conditional_handle;
+  conditional_params.conditional.type = cudaGraphCondTypeSwitch;
+  conditional_params.conditional.size = static_cast<unsigned int>(num_bodies);
+  cudaGraphNode_t conditional_node = nullptr;
+  CHECK_CUDA_ERROR(da_moe::AddGraphNode(&conditional_node, original.graph,
+                                        switch_dependencies.data(), switch_dependencies.size(),
+                                        &conditional_params));
+
+  DASwitchCaptureState state{original.capture_id,
+                             conditional_node,
+                             after_parallel_work.dependencies.back(),
+                             after_selector.dependencies.back(),
+                             {}};
+  state.body_graphs.reserve(num_bodies);
+  for (int64_t body_index = 0; body_index < num_bodies; ++body_index) {
+    state.body_graphs.push_back(conditional_params.conditional.phGraph_out[body_index]);
+  }
+  return state.to_ffi();
+}
+
+/// Begin direct stream capture into one CUDA-owned conditional body graph.
+void trtllm_moe_begin_da_body_capture(int64_t device_id, int64_t auxiliary_stream_handle,
+                                      int64_t body_graph_handle) {
+  ffi::CUDADeviceGuard device_guard(device_id);
+  auto stream = reinterpret_cast<cudaStream_t>(auxiliary_stream_handle);
+  auto graph = reinterpret_cast<cudaGraph_t>(body_graph_handle);
+  CHECK_CUDA_ERROR(cudaStreamBeginCaptureToGraph(stream, graph, nullptr, nullptr, 0,
+                                                 cudaStreamCaptureModeRelaxed));
+}
+
+/// Create one private nonblocking stream for direct conditional-body capture.
+int64_t trtllm_moe_create_da_body_capture_stream(int64_t device_id) {
+  ffi::CUDADeviceGuard device_guard(device_id);
+  cudaStream_t stream = nullptr;
+  CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  return reinterpret_cast<int64_t>(stream);
+}
+
+/// Destroy one private conditional-body capture stream after its Python owner expires.
+void trtllm_moe_destroy_da_body_capture_stream(int64_t device_id, int64_t stream_handle) {
+  ffi::CUDADeviceGuard device_guard(device_id);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+  CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
+}
+
+/// End direct stream capture and require CUDA to return the requested body graph.
+void trtllm_moe_end_da_body_capture(int64_t device_id, int64_t auxiliary_stream_handle,
+                                    int64_t body_graph_handle) {
+  ffi::CUDADeviceGuard device_guard(device_id);
+  auto stream = reinterpret_cast<cudaStream_t>(auxiliary_stream_handle);
+  auto expected_graph = reinterpret_cast<cudaGraph_t>(body_graph_handle);
+  cudaGraph_t captured_graph = nullptr;
+  CHECK_CUDA_ERROR(cudaStreamEndCapture(stream, &captured_graph));
+  TVM_FFI_ICHECK_EQ(captured_graph, expected_graph)
+      << "CUDA returned a different DA conditional body graph.";
+}
+
+/// Join the populated SWITCH to the outer capture and return inspected topology facts.
+Array<int64_t> trtllm_moe_finish_da_switch_capture(TensorView device_anchor, Array<int64_t> state) {
+  // Rehydrate the named CUDA handles and prove this is still the same active capture generation.
+  ffi::CUDADeviceGuard device_guard(device_anchor.device().device_id);
+  auto const capture_state = DASwitchCaptureState::from_ffi(state);
+  int64_t const body_count = capture_state.body_graphs.size();
+  cudaStream_t stream = get_stream(device_anchor.device());
+  da_moe::ActiveCaptureContext context{};
+  CHECK_CUDA_ERROR(da_moe::GetActiveCaptureContext(stream, &context));
+  TVM_FFI_ICHECK_EQ(context.capture_id, capture_state.capture_id)
+      << "DA SWITCH capture generation changed before body completion.";
+  auto conditional_node = capture_state.conditional_node;
+  CHECK_CUDA_ERROR(da_moe::SetCaptureDependencies(stream, &conditional_node, 1));
+
+  // Inspect the completed outer topology only after joining the SWITCH into the stream frontier.
+  size_t outer_node_count = 0;
+  size_t outer_edge_count = 0;
+  CHECK_CUDA_ERROR(cudaGraphGetNodes(context.graph, nullptr, &outer_node_count));
+  CHECK_CUDA_ERROR(da_moe::GetGraphEdgeCount(context.graph, &outer_edge_count));
+  auto parallel_node = capture_state.parallel_work_node;
+  auto selector_node = capture_state.selector_node;
+  std::vector<cudaGraphNode_t> parallel_dependencies;
+  std::vector<cudaGraphNode_t> selector_dependencies;
+  CHECK_CUDA_ERROR(da_moe::GetGraphNodeDependencies(parallel_node, &parallel_dependencies));
+  CHECK_CUDA_ERROR(da_moe::GetGraphNodeDependencies(selector_node, &selector_dependencies));
+
+  // Encode the stable inspection ABI, followed by one node count per conditional child body.
+  Array<int64_t> topology;
+  topology.push_back(static_cast<int64_t>(capture_state.capture_id));
+  topology.push_back(static_cast<int64_t>(outer_node_count));
+  topology.push_back(static_cast<int64_t>(outer_edge_count));
+  topology.push_back(1);
+  topology.push_back(body_count);
+  topology.push_back(static_cast<int64_t>(selector_dependencies.size()));
+  topology.push_back(static_cast<int64_t>(parallel_dependencies.size()));
+  topology.push_back(
+      da_moe::HaveSameGraphDependencies(selector_dependencies, parallel_dependencies) ? 1 : 0);
+  // Native preflight proved this invocation is ordered after the lane's prior conditional.
+  topology.push_back(1);
+  // This finish call contributes exactly one serial invocation to the cumulative topology.
+  topology.push_back(1);
+  for (int64_t body_index = 0; body_index < body_count; ++body_index) {
+    size_t node_count = 0;
+    auto body_graph = capture_state.body_graphs[body_index];
+    CHECK_CUDA_ERROR(cudaGraphGetNodes(body_graph, nullptr, &node_count));
+    topology.push_back(static_cast<int64_t>(node_count));
+  }
+  return topology;
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -3132,5 +4706,28 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_factorizations,
+                              trtllm_get_valid_moe_factorizations);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_allocate_canonical_routing,
+                              trtllm_moe_allocate_canonical_routing);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_canonicalize_routing, trtllm_moe_canonicalize_routing);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_allocate_routing_metadata_multi_tile,
+                              trtllm_moe_allocate_routing_metadata_multi_tile);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_max_da_multi_tile_tokens,
+                              trtllm_moe_max_da_multi_tile_tokens);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_populate_routing_metadata_multi_tile,
+                              trtllm_moe_populate_routing_metadata_multi_tile);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_begin_da_switch_capture,
+                              trtllm_moe_begin_da_switch_capture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_inspect_da_workspace_lane,
+                              trtllm_moe_inspect_da_workspace_lane);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_create_da_body_capture_stream,
+                              trtllm_moe_create_da_body_capture_stream);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_destroy_da_body_capture_stream,
+                              trtllm_moe_destroy_da_body_capture_stream);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_begin_da_body_capture, trtllm_moe_begin_da_body_capture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_end_da_body_capture, trtllm_moe_end_da_body_capture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_finish_da_switch_capture,
+                              trtllm_moe_finish_da_switch_capture);
 
 }  // namespace flashinfer
