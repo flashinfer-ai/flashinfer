@@ -23,6 +23,7 @@ import torch
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
+    RoutingInputMode,
     alloc_trtllm_moe_output,
     unpack_trtllm_moe_output,
 )
@@ -45,6 +46,7 @@ def register_trtllm_bf16_moe_op(moe_op, MoERunner):
         mutates_args=("routing_replay_out",),
     )
     def trtllm_bf16_moe_op(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
@@ -144,6 +146,7 @@ def register_trtllm_bf16_moe_op(moe_op, MoERunner):
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
@@ -171,9 +174,11 @@ def register_trtllm_bf16_moe_op(moe_op, MoERunner):
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
             activation_type=activation_type,
+            routing_input_mode=routing_input_mode,
         )
 
         intermediate_output = moe_op.trtllm_bf16_moe(
+            routing_input_mode,
             routing_logits,
             routing_bias,
             topk_ids,
@@ -211,6 +216,7 @@ def register_trtllm_bf16_moe_op(moe_op, MoERunner):
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
     def _fake_trtllm_bf16_moe(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],

@@ -193,6 +193,7 @@ def create_trtllm_moe_runner_class(
 
             if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
                 moe_op.trtllm_bf16_moe(
+                    kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
                     routing_logits,
                     kwargs["routing_bias"],
                     topk_ids,
@@ -252,6 +253,7 @@ def create_trtllm_moe_runner_class(
                         )
 
                     moe_op.trtllm_fp8_block_scale_moe(
+                        kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
                         routing_logits,
                         topk_ids,
                         topk_weights,

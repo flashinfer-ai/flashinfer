@@ -2143,7 +2143,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_input_mode=RoutingInputMode(routing_input_mode),
             use_cold_l2_cache=True,
             use_cuda_graph=True,
-            routing_input_mode=routing_input_mode,
         )
 
         _, tactic = tuner.choose_one(
@@ -2220,12 +2219,22 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             norm_topk_prob,
             routing_replay_out,
         )
-        result = _unpack_trtllm_moe_output(
+        if not do_finalize and topk_weights.numel() > 0:
+            if gemm1_lora_delta is None:
+                return [
+                    torch.from_dlpack(intermediate_output[0]),
+                    topk_weights,
+                    torch.from_dlpack(intermediate_output[2]),
+                ]
+            return [
+                torch.from_dlpack(intermediate_output[0]),
+                topk_weights,
+                torch.from_dlpack(intermediate_output[2]),
+                torch.from_dlpack(intermediate_output[3]),
+            ]
+        return _unpack_trtllm_moe_output(
             intermediate_output, output, do_finalize, gemm1_lora_delta
         )
-        if not do_finalize and topk_weights.numel() > 0:
-            result[1] = topk_weights
-        return result
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(

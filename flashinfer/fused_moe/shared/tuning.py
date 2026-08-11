@@ -91,7 +91,7 @@ def make_moe_tuning_config(
         return MoeRunnerInputs._DYNAMIC_DIM[name]
 
     dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
-    initializers = [init for _, _, init in sorted_inputs]
+    tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
 
     return TuningConfig(
         dynamic_tensor_specs=(
@@ -100,8 +100,8 @@ def make_moe_tuning_config(
                 dim_idx,
                 get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                 make_hybrid_bucket_mapper(tune_max_num_tokens),
-                initializers,
             ),
         ),
+        tensor_initializers=tensor_initializers,
         **kwargs,
     )
