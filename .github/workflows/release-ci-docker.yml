@@ -39,13 +39,17 @@ jobs:
         run: echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
   build:
-    name: CI image (${{ matrix.cuda.label }}, ${{ matrix.arch }})
+    name: Build and test CI image (${{ matrix.cuda.label }}, ${{ matrix.arch }})
     runs-on: [self-hosted, linux, x64, cpu, on-demand]
     needs: generate-tag
+    timeout-minutes: 360
     strategy:
+      fail-fast: false
       matrix:
         cuda: ${{ fromJSON(needs.generate-tag.outputs.runtime_cuda_matrix) }}
         arch: [amd64, arm64]
+    env:
+      IMAGE_TAG: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,7 +66,7 @@ jobs:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ${{ matrix.cuda.label }} ${{ matrix.arch }} image
+      - name: Build and load ${{ matrix.cuda.label }} ${{ matrix.arch }} image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -72,13 +76,28 @@ jobs:
             CUDA_IMAGE=${{ matrix.cuda.image }}
             PYTORCH_INDEX=${{ matrix.cuda.pytorch_index }}
           platforms: linux/${{ matrix.arch }}
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
           pull: true  # Always pull the latest base image
           no-cache: true  # Disable all caching
-          tags: |
-            flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
+          tags: ${{ env.IMAGE_TAG }}
           provenance: false
           sbom: false
+
+      - name: Test candidate image before publishing
+        run: |
+          docker image inspect "${IMAGE_TAG}" >/dev/null
+          docker run --rm --pull=never --platform "linux/${{ matrix.arch }}" -i \
+            "${IMAGE_TAG}" \
+            bash -s -- "${{ matrix.cuda.version }}" "${{ matrix.arch }}" \
+            < docker/test_ci_image.sh
+
+      - name: Push tested image
+        if: github.event_name != 'pull_request'
+        run: docker push "${IMAGE_TAG}"
+
+      - name: Remove candidate image
+        if: always()
+        run: docker image rm "${IMAGE_TAG}" || true
 
   create-manifests:
     name: CI manifest (${{ matrix.cuda.label }})
