@@ -42,6 +42,9 @@ Usage:
     python bench_moe_deepseek.py --functional-api  # atomic fused (default)
     python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
 
+    # Apply routing weights to the FC2 input
+    python bench_moe_deepseek.py --apply-router-weight-on-input
+
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
@@ -279,6 +282,7 @@ def bench_cute_dsl(
     use_fused_finalize=True,
     profile_cuda=False,
     profile_iters=10,
+    apply_router_weight_on_input=False,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -300,6 +304,8 @@ def bench_cute_dsl(
         profile_cuda: Capture steady-state CUDA graph replays between
             cudaProfilerStart/Stop instead of benchmarking.
         profile_iters: Number of cold-L2 graph replays to capture.
+        apply_router_weight_on_input: Apply routing weights after the expert
+            activation, on the FC2 input, instead of after GEMM2.
     """
     import contextlib
 
@@ -417,6 +423,7 @@ def bench_cute_dsl(
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -480,6 +487,7 @@ def bench_cute_dsl(
                 quant_mode=quant_mode,
                 per_token_scale=per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -856,6 +864,7 @@ def run_benchmark(
     profile_cuda=False,
     profile_iters=10,
     profile_backend=None,
+    apply_router_weight_on_input=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -894,6 +903,8 @@ def run_benchmark(
         profile_cuda: Capture one backend for an external CUDA profiler.
         profile_iters: Number of cold-L2 graph replays to capture.
         profile_backend: Backend to run when profile_cuda is enabled.
+        apply_router_weight_on_input: Apply routing weights after the expert
+            activation, on the FC2 input, instead of after GEMM2.
 
     Returns:
         List of BenchResult objects
@@ -932,6 +943,7 @@ def run_benchmark(
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
             profile_backend=profile_backend,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -951,6 +963,7 @@ def run_benchmark(
             use_per_token_activation=use_per_token_activation,
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
@@ -976,6 +989,7 @@ def _benchmark_single(
     profile_cuda=False,
     profile_iters=10,
     profile_backend=None,
+    apply_router_weight_on_input=False,
 ):
     """Benchmark all backends for a single token count.
 
@@ -1009,6 +1023,7 @@ def _benchmark_single(
             use_fused_finalize=use_fused_finalize,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
     if run_cute_dsl_w4a16:
         lat["CuteDSL W4A16"] = bench_cute_dsl(
@@ -1027,6 +1042,7 @@ def _benchmark_single(
             use_fused_finalize=use_fused_finalize,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
+            apply_router_weight_on_input=apply_router_weight_on_input,
         )
     if run_cutlass and not use_per_token_activation:
         lat["CUTLASS"] = bench_cutlass(
@@ -1082,6 +1098,7 @@ def _print_header(
     use_per_token_activation=False,
     include_activation_quant=False,
     use_fused_finalize=True,
+    apply_router_weight_on_input=False,
 ):
     """Print benchmark header."""
     table_width = 120 if use_per_token_activation else 159
@@ -1123,6 +1140,10 @@ def _print_header(
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
+    )
+    print(
+        "CuteDSL router weight placement: "
+        f"{'input' if apply_router_weight_on_input else 'output'}"
     )
     if use_per_token_activation:
         print("CUTLASS omitted: it does not consume the per-token activation scale.")
@@ -1358,6 +1379,11 @@ def main():
         help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
     )
     parser.add_argument(
+        "--apply-router-weight-on-input",
+        action="store_true",
+        help="Apply routing weights to the CuTe DSL FC2 input instead of after GEMM2.",
+    )
+    parser.add_argument(
         "--profile-cuda",
         action="store_true",
         help="Capture steady-state iterations between cudaProfilerStart/Stop.",
@@ -1418,6 +1444,10 @@ def main():
         "CuteDSL finalize: "
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
     )
+    print(
+        "CuteDSL router weight placement: "
+        f"{'input' if args.apply_router_weight_on_input else 'output'}"
+    )
 
     run_benchmark(
         token_counts=tokens,
@@ -1437,6 +1467,7 @@ def main():
         profile_cuda=args.profile_cuda,
         profile_iters=args.profile_iters,
         profile_backend=args.profile_backend,
+        apply_router_weight_on_input=args.apply_router_weight_on_input,
     )
 
     return 0

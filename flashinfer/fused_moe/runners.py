@@ -218,6 +218,7 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+    supports_apply_router_weight_on_input: ClassVar[bool] = False
 
     config: MoEConfig
 
@@ -227,6 +228,14 @@ class MoERunner(TunableRunner):
         if variant not in self.supported_quant_variants:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
+            )
+        if (
+            self.config.execution.apply_router_weight_on_input
+            and not self.supports_apply_router_weight_on_input
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support "
+                "apply_router_weight_on_input=True."
             )
 
     def build(self) -> None:
@@ -726,6 +735,7 @@ class CuteDslNvfp4Runner(MoERunner):
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
+    supports_apply_router_weight_on_input = True
 
     def check_support(self) -> None:
         super().check_support()
@@ -768,6 +778,9 @@ class CuteDslNvfp4Runner(MoERunner):
                 enable_pdl=enable_pdl,
                 activation_type=int(config.activation.type),
                 use_per_token_activation=bool(config.quant.per_token_scale),
+                apply_router_weight_on_input=(
+                    config.execution.apply_router_weight_on_input
+                ),
             )
         elif config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
@@ -778,6 +791,9 @@ class CuteDslNvfp4Runner(MoERunner):
                 use_fused_finalize=config.execution.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 activation_type=int(config.activation.type),
+                apply_router_weight_on_input=(
+                    config.execution.apply_router_weight_on_input
+                ),
             )
         else:
             raise NotImplementedError(

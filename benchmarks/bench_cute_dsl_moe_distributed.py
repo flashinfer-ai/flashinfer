@@ -116,6 +116,8 @@ def _profile_worker_arguments(args, num_tokens):
     ]
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
+    if args.apply_router_weight_on_input:
+        arguments.append("--apply-router-weight-on-input")
     if not args.use_fused_finalize:
         arguments.append("--no-fused-finalize")
     if not args.enable_pdl:
@@ -451,6 +453,7 @@ def _distributed_moe_config(
             enable_pdl=args.enable_pdl,
             tune_max_num_tokens=tune_max_num_tokens,
             use_fused_finalize=args.use_fused_finalize,
+            apply_router_weight_on_input=args.apply_router_weight_on_input,
         ),
     )
 
@@ -1267,6 +1270,10 @@ def _run_distributed_benchmark(args, token_counts):
             )
         if rank == 0:
             print("\nDeepSeek-V3 distributed CuTe DSL MoE benchmark")
+            print(
+                "CuTe DSL router weight placement: "
+                f"{'input' if args.apply_router_weight_on_input else 'output'}"
+            )
 
         selected_mode = None
         selected_variant_name = None
@@ -1336,6 +1343,13 @@ def main():
         action="store_false",
         dest="use_fused_finalize",
         help="Use deterministic two-stage finalize.",
+    )
+    parser.add_argument(
+        "--apply-router-weight-on-input",
+        action="store_true",
+        help=(
+            "Apply routing weights to the CuTe DSL FC2 input instead of after GEMM2."
+        ),
     )
     parser.add_argument(
         "--no-pdl",

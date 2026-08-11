@@ -424,6 +424,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        apply_router_weight_on_input: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -482,11 +483,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param gated: Whether GEMM1 output is split into up/gate halves. If
             False, the epilogue computes non-gated ReLU^2.
         :type gated: bool
+        :param apply_router_weight_on_input: Whether to multiply the expert
+            activation output by each route's weight before the FC2-input store.
+        :type apply_router_weight_on_input: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
+        self.apply_router_weight_on_input = apply_router_weight_on_input
         self.topk = topk
         self.gated = gated
         self.out_n_factor = 2 if gated else 1
@@ -796,6 +801,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        token_final_scales: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -858,6 +864,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             shape (orig_m,). Indexed by the original token ID decoded from
             token_id_mapping_tensor. Only used when use_a_per_token_scale is true.
         :type a_per_token_scale: Optional[cute.Tensor]
+        :param token_final_scales: Optional routing weights, flattened from
+            shape (orig_m, topk). Used when apply_router_weight_on_input is true.
+        :type token_final_scales: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -1133,6 +1142,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            token_final_scales,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1220,6 +1230,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        token_final_scales: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2560,7 +2571,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
-            if cutlass.const_expr(self.use_a_per_token_scale):
+            if cutlass.const_expr(
+                self.use_a_per_token_scale or self.apply_router_weight_on_input
+            ):
                 tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -2583,13 +2596,21 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha[expert_idx]
-                if cutlass.const_expr(self.use_a_per_token_scale):
+                router_weight = cutlass.Float32(1.0)
+                if cutlass.const_expr(
+                    self.use_a_per_token_scale or self.apply_router_weight_on_input
+                ):
                     tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                     permuted_row = tile_m_start + epi_tidx
                     if permuted_row < tile_info[4]:
                         expanded_idx = token_id_mapping_tensor[permuted_row]
-                        token_idx = expanded_idx // self.topk
-                        alpha_val = alpha_val * a_per_token_scale[token_idx]
+                        if cutlass.const_expr(self.use_a_per_token_scale):
+                            token_idx = expanded_idx // self.topk
+                            alpha_val = alpha_val * a_per_token_scale[token_idx]
+                        if cutlass.const_expr(self.apply_router_weight_on_input):
+                            router_weight = cutlass.Float32(
+                                token_final_scales[expanded_idx]
+                            )
 
                 #
                 # Slice to per mma tile index
@@ -2976,6 +2997,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     * (up_clamped + swiglu_beta)
                                 )
 
+                    if cutlass.const_expr(self.apply_router_weight_on_input):
+                        # Apply the route in FP32 after the expert activation
+                        # and before the FC2-input store or quantization.
+                        if cutlass.const_expr(self.vectorized_f32):
+                            for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                                (
+                                    tCompute[i],
+                                    tCompute[i + 1],
+                                ) = cute.arch.mul_packed_f32x2(
+                                    (tCompute[i], tCompute[i + 1]),
+                                    (router_weight, router_weight),
+                                )
+                        else:
+                            for i in cutlass.range_constexpr(cute.size(tCompute)):
+                                tCompute[i] = tCompute[i] * router_weight
+
                     if cutlass.const_expr(self.generate_sfc):
                         #
                         # Quantization path for Float4E2M1FN output:
@@ -3155,7 +3192,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
-                if cutlass.const_expr(self.use_a_per_token_scale):
+                if cutlass.const_expr(
+                    self.use_a_per_token_scale or self.apply_router_weight_on_input
+                ):
                     tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
@@ -3833,6 +3872,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        token_final_scales_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -3883,6 +3923,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        token_final_scales = (
+            cute.make_tensor(
+                token_final_scales_ptr, layout=cute.make_layout((orig_m * self.topk,))
+            )
+            if cutlass.const_expr(token_final_scales_ptr is not None)
+            else None
+        )
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -3916,6 +3963,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            token_final_scales,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,

@@ -129,6 +129,7 @@ def _get_compiled_kernel(
     swiglu_beta: float,
     swiglu_limit: float,
     use_fused_finalize: bool,
+    apply_router_weight_on_input: bool,
     enable_pdl: bool,
     use_clc_scheduler: bool,
     mma_tiler_mnk: Tuple[int, int, int],
@@ -147,6 +148,7 @@ def _get_compiled_kernel(
         swiglu_beta,
         swiglu_limit,
         use_fused_finalize,
+        apply_router_weight_on_input,
         enable_pdl,
         use_clc_scheduler,
         mma_tiler_m,
@@ -171,6 +173,7 @@ def _get_compiled_kernel(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             use_fused_finalize=use_fused_finalize,
+            apply_router_weight_on_input=apply_router_weight_on_input,
             enable_pdl=enable_pdl,
             use_clc_scheduler=use_clc_scheduler,
             raster_along_m=raster_along_m,
@@ -215,6 +218,7 @@ def _run_grouped_gemm(
     swiglu_beta: float,
     swiglu_limit: float,
     use_fused_finalize: bool,
+    apply_router_weight_on_input: bool,
     permuted_idx_to_expanded_idx: Optional[torch.Tensor],
     token_final_scales: Optional[torch.Tensor],
     enable_pdl: bool,
@@ -307,7 +311,9 @@ def _run_grouped_gemm(
         if token_final_scales is not None
         else None
     )
-    num_tokens = int(output.size(0)) if use_fused_finalize else 0
+    num_tokens = (
+        int(token_final_scales.size(0)) if token_final_scales is not None else 0
+    )
     top_k = int(token_final_scales.size(1)) if token_final_scales is not None else 0
     compiled = _get_compiled_kernel(
         num_local_experts,
@@ -333,6 +339,7 @@ def _run_grouped_gemm(
         swiglu_beta,
         swiglu_limit,
         use_fused_finalize,
+        apply_router_weight_on_input,
         enable_pdl,
         use_clc_scheduler,
         mma_tiler_mnk,
@@ -381,6 +388,7 @@ def launch_w4a16_moe(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     tactic: Optional[W4A16MoeTactic] = None,
     workspace_cache: Optional[Dict[Tuple, _W4A16Workspace]] = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
@@ -463,8 +471,13 @@ def launch_w4a16_moe(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         use_fused_finalize=False,
-        permuted_idx_to_expanded_idx=None,
-        token_final_scales=None,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        permuted_idx_to_expanded_idx=(
+            permuted_idx_to_expanded_idx if apply_router_weight_on_input else None
+        ),
+        token_final_scales=(
+            token_final_scales if apply_router_weight_on_input else None
+        ),
         enable_pdl=enable_pdl,
         tactic=gemm1_tactic,
     )
@@ -486,6 +499,7 @@ def launch_w4a16_moe(
         swiglu_beta=DEFAULT_SWIGLU_BETA,
         swiglu_limit=DEFAULT_SWIGLU_LIMIT,
         use_fused_finalize=use_fused_finalize,
+        apply_router_weight_on_input=apply_router_weight_on_input,
         permuted_idx_to_expanded_idx=(
             permuted_idx_to_expanded_idx if use_fused_finalize else None
         ),
@@ -501,6 +515,7 @@ def launch_w4a16_moe(
             topk_scales=token_final_scales,
             num_tokens=int(x.size(0)),
             top_k=top_k,
+            apply_topk_scales=not apply_router_weight_on_input,
             enable_pdl=enable_pdl,
         )
     return moe_output

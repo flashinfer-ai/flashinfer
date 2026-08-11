@@ -156,7 +156,8 @@ INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_PERMUTE
 
-template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock>
+template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock,
+          bool ApplyTopKScales>
 __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* output,
                                    int32_t const* expanded_idx_to_permuted_idx,
                                    TopKScaleType const* topk_scales, int32_t const hidden_size,
@@ -190,11 +191,18 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
       auto const* src_ptr =
           reinterpret_cast<ElemCopyType const*>(permuted_input) + input_idx * kCopyPerToken;
       *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
-      TopKScaleType const scale = topk_scales[expanded_idx];
 
+      if constexpr (ApplyTopKScales) {
+        TopKScaleType const scale = topk_scales[expanded_idx];
 #pragma unroll
-      for (int32_t j = 0; j < kElemPerCopy; j++) {
-        rmemAccum[j] += static_cast<AccumType>(rmem[j]) * static_cast<AccumType>(scale);
+        for (int32_t j = 0; j < kElemPerCopy; j++) {
+          rmemAccum[j] += static_cast<AccumType>(rmem[j]) * static_cast<AccumType>(scale);
+        }
+      } else {
+#pragma unroll
+        for (int32_t j = 0; j < kElemPerCopy; j++) {
+          rmemAccum[j] += static_cast<AccumType>(rmem[j]);
+        }
       }
     }
 #pragma unroll
@@ -213,7 +221,8 @@ template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output,
                   int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales,
                   int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
-                  bool input_is_expanded, bool enable_pdl, cudaStream_t stream) {
+                  bool input_is_expanded, bool apply_topk_scales, bool enable_pdl,
+                  cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.",
@@ -221,8 +230,6 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
 
   int32_t const blocks = num_tokens;
   int32_t const threads = kThreadsPerBlock;
-
-  auto kernel = &moeUnpermuteKernel<InputType, TopKScaleType, kThreadsPerBlock>;
 
   cudaLaunchConfig_t config;
   config.gridDim = blocks;
@@ -234,8 +241,15 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
-  cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx,
-                     topk_scales, hidden_size, top_k, input_is_expanded);
+  if (apply_topk_scales) {
+    auto kernel = &moeUnpermuteKernel<InputType, TopKScaleType, kThreadsPerBlock, true>;
+    cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx,
+                       topk_scales, hidden_size, top_k, input_is_expanded);
+  } else {
+    auto kernel = &moeUnpermuteKernel<InputType, TopKScaleType, kThreadsPerBlock, false>;
+    cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx,
+                       topk_scales, hidden_size, top_k, input_is_expanded);
+  }
 }
 
 #define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                          \
@@ -243,7 +257,7 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
       InputType const* permuted_input, InputType* output,                            \
       int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales, \
       int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,      \
-      bool input_is_expanded, bool enable_pdl, cudaStream_t stream)
+      bool input_is_expanded, bool apply_topk_scales, bool enable_pdl, cudaStream_t stream)
 
 INSTANTIATE_MOE_UNPERMUTE(half, float);
 INSTANTIATE_MOE_UNPERMUTE(half, half);

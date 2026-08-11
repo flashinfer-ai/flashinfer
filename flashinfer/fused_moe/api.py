@@ -205,12 +205,16 @@ class ExecutionConfig:
         Token budget hint for autotuner / CUDA graph capture.
     use_fused_finalize : bool
         Whether supported backends reduce routed outputs in the GEMM2 epilogue.
+    apply_router_weight_on_input : bool
+        Whether supported backends apply routing weights after the expert
+        activation, on the FC2 input, instead of after GEMM2.
     """
 
     do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
     use_fused_finalize: bool = True
+    apply_router_weight_on_input: bool = False
 
     def __repr__(self) -> str:
         parts = []
@@ -222,6 +226,10 @@ class ExecutionConfig:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
         if not self.use_fused_finalize:
             parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        if self.apply_router_weight_on_input:
+            parts.append(
+                f"apply_router_weight_on_input={self.apply_router_weight_on_input!r}"
+            )
         return f"ExecutionConfig({', '.join(parts)})"
 
 

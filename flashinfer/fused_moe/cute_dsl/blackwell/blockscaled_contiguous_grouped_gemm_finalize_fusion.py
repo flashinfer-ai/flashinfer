@@ -364,6 +364,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        apply_router_weight_on_input: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -387,6 +388,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.apply_router_weight_on_input = apply_router_weight_on_input
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -1964,11 +1966,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     topk_idx = safe_idx % topK
                     is_valid_row = cutlass.Int32(permuted_row < tile_info[4])
                     gather_tok = token_idx * is_valid_row
-                    token_scale = token_final_scales[(gather_tok, topk_idx)]
-                    output_idx = token_idx
-                    if cutlass.const_expr(not self.use_fused_finalize):
-                        token_scale = self.final_scale_dtype(1.0)
-                        output_idx = safe_idx
+                    token_scale = self.final_scale_dtype(1.0)
+                    output_idx = safe_idx
+                    if cutlass.const_expr(self.use_fused_finalize):
+                        output_idx = token_idx
+                        if cutlass.const_expr(not self.apply_router_weight_on_input):
+                            token_scale = token_final_scales[(gather_tok, topk_idx)]
                     if cutlass.const_expr(self.use_a_per_token_scale):
                         token_scale = cutlass.Float32(token_scale) * cutlass.Float32(
                             a_per_token_scale[permuted_row]

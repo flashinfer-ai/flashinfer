@@ -126,28 +126,29 @@ void moe_unpermute_fp16_float_scale(int64_t permuted_input_ptr, int64_t output_p
                                     int64_t expanded_idx_to_permuted_idx_ptr,
                                     int64_t topk_scales_ptr, int32_t num_tokens,
                                     int32_t hidden_size, int32_t top_k, bool input_is_expanded,
-                                    bool enable_pdl, int64_t cuda_stream_ptr) {
+                                    bool apply_topk_scales, bool enable_pdl,
+                                    int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
-  moeUnpermute<half, float>(reinterpret_cast<half const*>(permuted_input_ptr),
-                            reinterpret_cast<half*>(output_ptr),
-                            reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
-                            reinterpret_cast<float const*>(topk_scales_ptr), num_tokens,
-                            hidden_size, top_k, input_is_expanded, enable_pdl, stream);
+  moeUnpermute<half, float>(
+      reinterpret_cast<half const*>(permuted_input_ptr), reinterpret_cast<half*>(output_ptr),
+      reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
+      reinterpret_cast<float const*>(topk_scales_ptr), num_tokens, hidden_size, top_k,
+      input_is_expanded, apply_topk_scales, enable_pdl, stream);
 }
 
 void moe_unpermute_fp16_half_scale(int64_t permuted_input_ptr, int64_t output_ptr,
                                    int64_t expanded_idx_to_permuted_idx_ptr,
                                    int64_t topk_scales_ptr, int32_t num_tokens, int32_t hidden_size,
-                                   int32_t top_k, bool input_is_expanded, bool enable_pdl,
-                                   int64_t cuda_stream_ptr) {
+                                   int32_t top_k, bool input_is_expanded, bool apply_topk_scales,
+                                   bool enable_pdl, int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moeUnpermute<half, half>(reinterpret_cast<half const*>(permuted_input_ptr),
                            reinterpret_cast<half*>(output_ptr),
                            reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
                            reinterpret_cast<half const*>(topk_scales_ptr), num_tokens, hidden_size,
-                           top_k, input_is_expanded, enable_pdl, stream);
+                           top_k, input_is_expanded, apply_topk_scales, enable_pdl, stream);
 }
 
 #ifdef ENABLE_BF16
@@ -155,7 +156,8 @@ void moe_unpermute_bf16_float_scale(int64_t permuted_input_ptr, int64_t output_p
                                     int64_t expanded_idx_to_permuted_idx_ptr,
                                     int64_t topk_scales_ptr, int32_t num_tokens,
                                     int32_t hidden_size, int32_t top_k, bool input_is_expanded,
-                                    bool enable_pdl, int64_t cuda_stream_ptr) {
+                                    bool apply_topk_scales, bool enable_pdl,
+                                    int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moeUnpermute<__nv_bfloat16, float>(
@@ -163,14 +165,14 @@ void moe_unpermute_bf16_float_scale(int64_t permuted_input_ptr, int64_t output_p
       reinterpret_cast<__nv_bfloat16*>(output_ptr),
       reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
       reinterpret_cast<float const*>(topk_scales_ptr), num_tokens, hidden_size, top_k,
-      input_is_expanded, enable_pdl, stream);
+      input_is_expanded, apply_topk_scales, enable_pdl, stream);
 }
 
 void moe_unpermute_bf16_bf16_scale(int64_t permuted_input_ptr, int64_t output_ptr,
                                    int64_t expanded_idx_to_permuted_idx_ptr,
                                    int64_t topk_scales_ptr, int32_t num_tokens, int32_t hidden_size,
-                                   int32_t top_k, bool input_is_expanded, bool enable_pdl,
-                                   int64_t cuda_stream_ptr) {
+                                   int32_t top_k, bool input_is_expanded, bool apply_topk_scales,
+                                   bool enable_pdl, int64_t cuda_stream_ptr) {
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moeUnpermute<__nv_bfloat16, __nv_bfloat16>(
@@ -178,7 +180,7 @@ void moe_unpermute_bf16_bf16_scale(int64_t permuted_input_ptr, int64_t output_pt
       reinterpret_cast<__nv_bfloat16*>(output_ptr),
       reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
       reinterpret_cast<__nv_bfloat16 const*>(topk_scales_ptr), num_tokens, hidden_size, top_k,
-      input_is_expanded, enable_pdl, stream);
+      input_is_expanded, apply_topk_scales, enable_pdl, stream);
 }
 #endif
 
