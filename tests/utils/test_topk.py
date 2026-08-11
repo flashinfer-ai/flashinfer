@@ -1617,7 +1617,7 @@ def test_top_k_algorithms(algo, batch_size, vocab_size, k, dtype, set_topk_algo)
     )
 
 
-@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
 @pytest.mark.parametrize("num_rows", [1, 8])
 @pytest.mark.parametrize("max_len", [4096, 8192])
 @pytest.mark.parametrize("k", [256, 512])
@@ -3178,412 +3178,126 @@ def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
     assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
 
 
-# ===================== CUB DeviceBatchedTopK (top_k_cub) Tests =====================
+# ===================== CUB DeviceBatchedTopK backend Tests =====================
+# The CUB backend serves top_k_page_table_transform through the dispatcher, so the general
+# transform test grid above already exercises it (and the "cub" entries in the algorithm
+# parametrizations force it explicitly). The tests here cover only what is unique to the
+# CUB backend: its lengths <= 0 semantics, its tie-break modes, and its binding-level
+# workspace contract.
 
 
-def _require_cub_support(seq_len: int = 0, tie_break=flashinfer.TopKTieBreak.NONE):
-    """Skip configurations that need CUB's cluster backend (SM90+).
+def _require_cub_tie_break_support():
+    """CUB tie-break requirement configs need SM90+ on any tier."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
 
-    Pre-SM90 only the single-block backend exists: seq_len <= 8192 and no
-    tie-break. On SM90+ everything up to 2^21 is supported.
+
+def test_cub_page_table_transform_nonpositive_lengths(set_topk_algo):
+    """lengths[i] <= 0 is a valid empty row for the CUB backend (all -1 outputs).
+
+    The lengths bounds declared to CUB span the full int32 range, so zero and negative
+    values clamp to an empty segment instead of being undefined behavior. Forced to the
+    CUB backend: negative lengths are UB for the native kernels, so there is no native
+    reference to compare against.
     """
-    if get_compute_capability(torch.device("cuda"))[0] >= 9:
-        return
-    if seq_len > 8192 or tie_break != flashinfer.TopKTieBreak.NONE:
-        pytest.skip(
-            "requires SM90+ (CUB cluster backend) for seq_len > 8192 or tie_break"
+    set_topk_algo("cub")
+    torch.manual_seed(3)
+    num_rows, d, k = 6, 4096, 256
+    scores = torch.randn(num_rows, d, device="cuda")
+    pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
+    lengths = torch.tensor(
+        [d, 0, 100, -1, -(2**31), 1], dtype=torch.int32, device="cuda"
+    )
+
+    out = flashinfer.top_k_page_table_transform(scores, pt, lengths, k)
+    torch.cuda.synchronize()
+
+    for i, length in enumerate(lengths.tolist()):
+        valid = min(k, max(length, 0))
+        assert torch.all(out[i, valid:] == -1), (
+            f"row {i} (length={length}): bad -1 padding"
         )
-
-
-@pytest.mark.parametrize("batch_size", [1, 16, 64])
-@pytest.mark.parametrize("seq_len", [4096, 8192, 65536])
-@pytest.mark.parametrize("k", [256, 2048])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_cub(batch_size, seq_len, k, dtype):
-    """top_k_cub returns correct values and int32 indices."""
-    _require_cub_support(seq_len)
-    if dtype == torch.bfloat16:
-        _require_sm80_for_bf16()
-
-    torch.manual_seed(42)
-    logits = torch.randn(batch_size, seq_len, device="cuda", dtype=dtype)
-
-    values, indices = flashinfer.top_k_cub(logits, k)
-
-    assert values.shape == (batch_size, k)
-    assert indices.shape == (batch_size, k)
-    assert values.dtype == dtype
-    assert indices.dtype == torch.int32
-
-    # Values match the gathered indices, and indices are unique per row.
-    torch.testing.assert_close(values, torch.gather(logits, -1, indices.long()))
-    for i in range(batch_size):
-        assert torch.unique(indices[i]).numel() == k
-
-    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
-    accuracy = compute_topk_accuracy(indices.long(), ref_indices, batch_size, k)
-    assert accuracy >= 0.97, f"Accuracy {accuracy:.4f} < 0.97"
+        if valid > 0:
+            _, ref_idx = torch.topk(scores[i, :length], valid)
+            ref = pt[i][ref_idx]
+            assert sorted(out[i, :valid].tolist()) == sorted(ref.tolist())
 
 
 @pytest.mark.parametrize(
     "tie_break", [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE]
 )
-@pytest.mark.parametrize("seq_len", [4096, 65536])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_cub_tie_break_semantics(tie_break, seq_len, dtype):
-    """tie_break selects boundary ties by the documented index rule, exactly.
+def test_cub_page_table_transform_tie_break(tie_break, set_topk_algo):
+    """Tie-break through the CUB backend pins the selected set by index rule.
 
-    The constructed input is exact in every dtype: the tie region is zeros, and
-    the strictly-greater values are spaced wider than bf16's ulp at that
-    magnitude, so no dtype introduces additional ties.
+    Constructed boundary ties: k-1 distinct large scores plus a tied group straddling the
+    k-th boundary. With an identity page table (page_size=1, pt[i] = arange), the output
+    indices are the selected positions themselves, so the expected set is exact.
     """
-    _require_cub_support(seq_len, tie_break)
-    if dtype == torch.bfloat16:
-        _require_sm80_for_bf16()
+    _require_cub_tie_break_support()
+    set_topk_algo("cub")
+    num_rows, d, k, ties = 4, 4096, 256, 8
+    scores = torch.zeros(num_rows, d, device="cuda")
+    # Positions [0, k-1) get distinct high scores; positions [1000, 1000+ties) all tie at
+    # a value that puts exactly one of them on the k-th boundary.
+    scores[:, : k - 1] = torch.linspace(100.0, 50.0, k - 1, device="cuda")
+    tie_positions = torch.arange(1000, 1000 + ties, device="cuda")
+    scores[:, tie_positions] = 10.0
+    pt = (
+        torch.arange(d, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .repeat(num_rows, 1)
+    )
+    lengths = torch.full((num_rows,), d, dtype=torch.int32, device="cuda")
 
-    torch.manual_seed(7)
-    num_rows, k, gt_count = 4, 256, 64
-    logits = torch.zeros(num_rows, seq_len, device="cuda", dtype=dtype)
-    expected_sets = []
+    out = flashinfer.top_k_page_table_transform(
+        scores, pt, lengths, k, tie_break=tie_break
+    )
+    torch.cuda.synchronize()
+
+    if tie_break == flashinfer.TopKTieBreak.SMALL:
+        expected_tie = tie_positions[:1].tolist()
+    else:
+        expected_tie = tie_positions[-1:].tolist()
+    expected = set(range(k - 1)) | set(expected_tie)
     for i in range(num_rows):
-        gt_positions = torch.randperm(seq_len, device="cuda")[:gt_count]
-        logits[i, gt_positions] = torch.linspace(
-            100.0, 50.0, gt_count, device="cuda", dtype=dtype
-        )
-        # The k - gt_count remaining slots are ties among all zero-valued
-        # positions; the rule picks the smallest (or largest) indices.
-        zero_positions = torch.ones(seq_len, dtype=torch.bool, device="cuda")
-        zero_positions[gt_positions] = False
-        zero_idx = torch.nonzero(zero_positions).flatten()
-        if tie_break == flashinfer.TopKTieBreak.SMALL:
-            tie_winners = zero_idx[: k - gt_count]
-        else:
-            tie_winners = zero_idx[-(k - gt_count) :]
-        expected_sets.append(torch.cat([gt_positions, tie_winners]).sort().values)
-
-    values, indices = flashinfer.top_k_cub(logits, k, tie_break=tie_break)
-    values2, indices2 = flashinfer.top_k_cub(logits, k, tie_break=tie_break)
-
-    for i in range(num_rows):
-        got = indices[i].long().sort().values
-        assert torch.equal(got, expected_sets[i]), f"row {i}: wrong tie set"
-        # The selected set is repeatable across runs.
-        assert torch.equal(got, indices2[i].long().sort().values)
-    torch.testing.assert_close(values, torch.gather(logits, -1, indices.long()))
+        assert set(out[i].tolist()) == expected, f"row {i}: tie set mismatch"
 
 
-def test_top_k_cub_matches_radix_set():
-    """The exact-equality correctness test: zero tolerance, cross-backend.
-
-    The shuffled-arange input makes every value distinct, so the top-k set is
-    mathematically unique and any deviation between backends is a bug -- unlike
-    the randn-based tests, whose accuracy thresholds must absorb legitimate
-    tie splits. fp32 only by necessity: fp16/bf16 cannot represent this many
-    distinct integers (exact only up to 2048 / 256), and casting would create
-    the very ties the exactness depends on excluding.
-    """
-    torch.manual_seed(3)
-    num_rows, seq_len, k = 8, 8192, 512
-    # A shuffled arange guarantees all values are distinct -> unique top-k set.
-    logits = torch.stack(
-        [torch.randperm(seq_len, device="cuda").float() for _ in range(num_rows)]
-    )
-
-    _, cub_idx = flashinfer.top_k_cub(logits, k)
-    _, radix_idx = flashinfer.top_k(logits, k)
-    assert torch.equal(
-        cub_idx.long().sort(dim=-1).values, radix_idx.sort(dim=-1).values
-    )
-
-
-def test_top_k_cub_error_contract():
-    """Unsupported flags and out-of-envelope shapes fail loudly."""
-    logits = torch.randn(4, 1024, device="cuda")
-
-    with pytest.raises(NotImplementedError):
-        flashinfer.top_k_cub(logits, 64, sorted=True)
-    with pytest.raises(NotImplementedError):
-        flashinfer.top_k_cub(logits, 64, deterministic=True)
-    with pytest.raises(TypeError):
-        flashinfer.top_k_cub(logits, 64, dsa_graph_safe=True)
-
-    # k out of range (launcher ICHECK).
-    with pytest.raises(RuntimeError):
-        flashinfer.top_k_cub(logits, 2048)
-    with pytest.raises(RuntimeError):
-        flashinfer.top_k_cub(logits, 0)
-
-    # d above DeviceBatchedTopK's per-segment cap (2^21).
-    too_wide = torch.randn(1, (1 << 21) + 8, device="cuda")
-    with pytest.raises(RuntimeError):
-        flashinfer.top_k_cub(too_wide, 64)
-
-    # Unsupported input dtypes fail in the dispatch, not silently.
-    for bad_dtype in (torch.int32, torch.float64):
-        bad = torch.zeros(4, 1024, dtype=bad_dtype, device="cuda")
-        with pytest.raises(RuntimeError):
-            flashinfer.top_k_cub(bad, 64)
-
-
-def test_top_k_cub_pre_sm90_envelope():
-    """Below SM90, seq_len > 8192 and tie_break are rejected at runtime."""
-    if get_compute_capability(torch.device("cuda"))[0] >= 9:
-        pytest.skip("pre-SM90 rejection paths; this device supports them")
-
-    with pytest.raises(RuntimeError):
-        flashinfer.top_k_cub(torch.randn(4, 16384, device="cuda"), 64)
-    with pytest.raises(RuntimeError):
-        flashinfer.top_k_cub(
-            torch.randn(4, 4096, device="cuda"),
-            64,
-            tie_break=flashinfer.TopKTieBreak.SMALL,
-        )
-
-
-@pytest.mark.parametrize("seq_len", [4096, 65536])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_cub_varlen(seq_len, dtype):
-    """top_k_cub with per-row lengths: windows and -1 padding.
-
-    fp32 asserts exact per-row set equality (float32 randn is effectively
-    tie-free at these sizes); fp16/bf16 use an accuracy threshold like the
-    other tests, because rounding onto the 16-bit grids creates genuine value
-    ties whose boundary members may legitimately differ between backends.
-    """
-    _require_cub_support(seq_len)
-    if dtype == torch.bfloat16:
-        _require_sm80_for_bf16()
-
-    torch.manual_seed(11)
-    num_rows, k = 16, 512
-    scores = torch.randn(num_rows, seq_len, device="cuda", dtype=dtype)
-    lengths = torch.randint(
-        1, seq_len + 1, (num_rows,), dtype=torch.int32, device="cuda"
-    )
-    # Force some short rows (lengths < k) to exercise the -1 padding, and one
-    # empty row (lengths == 0 is a valid empty segment: all indices come back -1).
-    lengths[::3] = torch.randint(
-        1, k, (len(lengths[::3]),), dtype=torch.int32, device="cuda"
-    )
-    lengths[1] = 0
-
-    values, indices = flashinfer.top_k_cub(scores, k, lengths)
-    assert indices.dtype == torch.int32 and values.dtype == dtype
-
-    exact = dtype == torch.float32
-    matched = 0
-    valid = 0
-    for i in range(num_rows):
-        length = int(lengths[i])
-        kk = min(k, length)
-        row = indices[i]
-        if kk < k:
-            # Padding is dtype-independent and always exact.
-            assert torch.all(row[kk:] == -1), f"row {i}: bad -1 padding"
-        _, ref_idx = torch.topk(scores[i, :length].float(), kk)
-        got = set(row[:kk].tolist())
-        ref = set(ref_idx.tolist())
-        matched += len(got & ref)
-        valid += kk
-        if exact:
-            assert got == ref, f"row {i}: set mismatch (length={length})"
-    if not exact:
-        accuracy = matched / valid
-        assert accuracy >= 0.97, f"Accuracy {accuracy:.4f} < 0.97"
-
-    if exact:
-        # lengths=None is equivalent to lengths == seq_len for every row. Exact
-        # comparison is only meaningful without 16-bit value ties.
-        full_lengths = torch.full(
-            (num_rows,), seq_len, dtype=torch.int32, device="cuda"
-        )
-        _, idx_uniform = flashinfer.top_k_cub(scores, k)
-        _, idx_full = flashinfer.top_k_cub(scores, k, full_lengths)
-        assert torch.equal(
-            idx_uniform.long().sort(dim=-1).values,
-            idx_full.long().sort(dim=-1).values,
-        )
-
-
-def test_top_k_cub_strided_input():
-    """A last-dim-contiguous view (row pitch != row width) gives the same result."""
-    torch.manual_seed(5)
-    num_rows, wide, d, k = 8, 8192, 4096, 256
-    buffer = torch.randn(num_rows, wide, device="cuda")
-    view = buffer[:, :d]
-    assert not view.is_contiguous() and view.stride(0) == wide
-
-    v_view, i_view = flashinfer.top_k_cub(view, k)
-    v_copy, i_copy = flashinfer.top_k_cub(view.contiguous(), k)
-    assert torch.equal(
-        i_view.long().sort(dim=-1).values, i_copy.long().sort(dim=-1).values
-    )
-    torch.testing.assert_close(v_view, torch.gather(view, -1, i_view.long()))
-
-
-def test_cub_topk_workspace_paths():
+def test_cub_page_table_transform_workspace_paths(set_topk_algo):
     """No workspace falls back to internal allocation; a too-small one raises.
 
-    Deliberately wrapper-level: the public API does not expose the workspace
-    argument, and nothing else exercises the launcher's cudaMallocAsync
-    fallback or its workspace-size ICHECK.
+    Deliberately binding-level: the dispatcher always passes the cached workspace, so
+    nothing else exercises the launcher's cudaMallocAsync fallback or its workspace-size
+    ICHECK.
     """
-    from flashinfer.topk import get_topk_module
+    from flashinfer.jit.topk import gen_topk_module
 
-    module = get_topk_module()
+    module = gen_topk_module().build_and_load()
     torch.manual_seed(9)
-    num_rows, seq_len, k = 8, 4096, 256
-    scores = torch.randn(num_rows, seq_len, device="cuda")
+    num_rows, d, k = 8, 4096, 256
+    scores = torch.randn(num_rows, d, device="cuda")
+    pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
+    lengths = torch.full((num_rows,), d, dtype=torch.int32, device="cuda")
+    out = torch.full((num_rows, k), -1, dtype=torch.int32, device="cuda")
 
     # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
-    vals, idx = module.cub_topk(scores, k, 0, None, None)
-    torch.testing.assert_close(vals, torch.gather(scores, -1, idx.long()))
+    module.cub_topk_page_table_transform(scores, out, pt, lengths, None, None, k, 0, 1)
+    torch.cuda.synchronize()
+    _, ref_idx = torch.topk(scores, k)
+    for i in range(num_rows):
+        assert sorted(out[i].tolist()) == sorted(pt[i][ref_idx[i]].tolist())
 
     # A too-small workspace must raise, not corrupt.
-    needed = int(module.cub_topk_workspace_size(scores, None, k, 0))
+    needed = int(
+        module.cub_topk_page_table_transform_workspace_size(
+            scores, lengths, k, 0, False
+        )
+    )
     if needed > 1:
         tiny = torch.empty(1, dtype=torch.uint8, device="cuda")
         with pytest.raises(RuntimeError, match="workspace too small"):
-            module.cub_topk(scores, k, 0, None, tiny)
-
-
-def test_top_k_cub_edge_cases():
-    """k == d (select-all), k == 1, and empty batch."""
-    torch.manual_seed(13)
-    d = 2048
-    logits = torch.randn(8, d, device="cuda")
-
-    # k == d: every index selected once.
-    values, indices = flashinfer.top_k_cub(logits, d)
-    for i in range(8):
-        assert torch.equal(
-            indices[i].long().sort().values, torch.arange(d, device="cuda")
-        )
-    torch.testing.assert_close(values, torch.gather(logits, -1, indices.long()))
-
-    # k == 1: the argmax.
-    values, indices = flashinfer.top_k_cub(logits, 1)
-    assert torch.equal(indices.long().flatten(), logits.argmax(dim=-1))
-
-    # Empty batch: shape-correct empties, no launch.
-    values, indices = flashinfer.top_k_cub(torch.randn(0, d, device="cuda"), 64)
-    assert values.shape == (0, 64) and indices.shape == (0, 64)
-
-
-def _canonicalize_topk(values, indices):
-    """Sort an unordered top-k result by value (descending) for comparison."""
-    sorted_values, order = torch.sort(values, dim=-1, descending=True, stable=True)
-    return sorted_values, torch.gather(indices, -1, order)
-
-
-@pytest.mark.parametrize("d", [8192, 65536])
-@pytest.mark.parametrize(
-    "tie_break", [flashinfer.TopKTieBreak.NONE, flashinfer.TopKTieBreak.SMALL]
-)
-def test_top_k_cub_cuda_graph_replay(d, tie_break):
-    """top_k_cub must be capturable into a CUDA graph and correct on replay.
-
-    Captures once with a static input buffer, then replays with fresh data and
-    compares against an eager call on identical data. fp32 randn makes ties
-    measure-zero, so the top-k set is unique and canonicalized comparison is
-    exact (tie_break then never changes the set; the parametrization exercises
-    the gpu_to_gpu kernel configurations under capture). d = 8192 runs on every
-    architecture; d = 65536 and the tie modes exercise the cluster backend's
-    capture surface (cudaLaunchKernelEx with cluster dimensions) on SM90+.
-    """
-    _require_cub_support(d, tie_break)
-    torch.manual_seed(0)
-    num_rows, k = 32, 1024
-    static_input = torch.randn(num_rows, d, device="cuda")
-
-    # Warmup on a side stream (required before capture; also populates the
-    # cached workspace so no allocation happens during capture).
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            flashinfer.top_k_cub(static_input, k, tie_break=tie_break)
-    torch.cuda.current_stream().wait_stream(stream)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_values, captured_indices = flashinfer.top_k_cub(
-            static_input, k, tie_break=tie_break
-        )
-
-    for _ in range(5):
-        fresh = torch.randn(num_rows, d, device="cuda")
-        static_input.copy_(fresh)
-        graph.replay()
-        torch.cuda.synchronize()
-
-        # Replayed output is self-consistent with the replay-time data.
-        assert torch.equal(
-            torch.gather(fresh, -1, captured_indices.long()), captured_values
-        )
-        # And matches an eager call on the same data (set + values).
-        eager_values, eager_indices = flashinfer.top_k_cub(
-            fresh, k, tie_break=tie_break
-        )
-        graph_v, graph_i = _canonicalize_topk(captured_values, captured_indices)
-        eager_v, eager_i = _canonicalize_topk(eager_values, eager_indices)
-        assert torch.equal(graph_v, eager_v)
-        assert torch.equal(
-            graph_i.long().sort(dim=-1).values, eager_i.long().sort(dim=-1).values
-        )
-
-
-@pytest.mark.parametrize("max_len", [4096, 65536])
-def test_top_k_cub_varlen_cuda_graph_replay(max_len):
-    """top_k_cub's variable-length path must be replay-correct.
-
-    Fixed physical shape, dynamism through data (the FlashInfer graph idiom):
-    capture with a static lengths tensor, replay with mutated length values --
-    including rows with lengths[i] < k -- and check the selected sets and the
-    -1 tail padding against a torch reference. Goes through the public API so
-    the cached-workspace path is exercised under capture. max_len = 65536
-    exercises the cluster backend's deferred path under capture on SM90+.
-    """
-    _require_cub_support(max_len)
-    torch.manual_seed(1)
-    num_rows, k = 16, 512
-    static_scores = torch.randn(num_rows, max_len, device="cuda")
-    static_lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device="cuda")
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            flashinfer.top_k_cub(static_scores, k, static_lengths)
-    torch.cuda.current_stream().wait_stream(stream)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out_values, out_indices = flashinfer.top_k_cub(static_scores, k, static_lengths)
-
-    for trial in range(3):
-        fresh = torch.randn(num_rows, max_len, device="cuda")
-        new_lengths = torch.randint(
-            1, max_len + 1, (num_rows,), dtype=torch.int32, device="cuda"
-        )
-        # Force some short rows (lengths < k) to exercise the -1 padding.
-        new_lengths[::4] = torch.randint(
-            1, k, (len(new_lengths[::4]),), dtype=torch.int32, device="cuda"
-        )
-        static_scores.copy_(fresh)
-        static_lengths.copy_(new_lengths)
-        graph.replay()
-        torch.cuda.synchronize()
-
-        for i in range(num_rows):
-            length = int(new_lengths[i])
-            kk = min(k, length)
-            row = out_indices[i]
-            if kk < k:
-                assert torch.all(row[kk:] == -1), f"trial {trial} row {i}: bad padding"
-            _, ref_idx = torch.topk(fresh[i, :length], kk)
-            assert torch.equal(row[:kk].long().sort().values, ref_idx.sort().values), (
-                f"trial {trial} row {i}: set mismatch (length={length})"
+            module.cub_topk_page_table_transform(
+                scores, out, pt, lengths, None, tiny, k, 0, 1
             )
 
 

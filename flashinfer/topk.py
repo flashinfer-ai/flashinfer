@@ -354,62 +354,61 @@ def get_topk_module():
     ) -> None:
         pass
 
-    @register_custom_op("flashinfer::cub_topk", mutates_args=("workspace_buffer",))
-    def cub_topk(
+    @register_custom_op(
+        "flashinfer::cub_topk_page_table_transform",
+        mutates_args=("workspace_buffer", "out", "out_raw_indices"),
+    )
+    def cub_topk_page_table_transform(
         input: torch.Tensor,
         top_k: int,
         tie_break: int,
-        lengths: Optional[torch.Tensor],
+        page_size: int,
+        lengths: torch.Tensor,
+        src_page_table: torch.Tensor,
+        out: torch.Tensor,
+        out_raw_indices: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = input.size(0)
-        output_values = torch.empty(
-            batch_size, top_k, dtype=input.dtype, device=input.device
-        )
-
-        if lengths is not None:
-            # The binding leaves output positions past a short row's valid count
-            # untouched; pre-fill with -1 so the padding contract holds.
-            output_indices = torch.full(
-                (batch_size, top_k), -1, dtype=torch.int32, device=input.device
-            )
-        else:
-            output_indices = torch.empty(
-                batch_size, top_k, dtype=torch.int32, device=input.device
-            )
-
-        module.cub_topk(
+    ) -> torch.Tensor:
+        # The binding leaves short rows' output tails untouched; pre-fill with -1
+        # so the padding contract matches the native fused transforms. The fill
+        # kernels are issued here so they are captured with the call under CUDA
+        # graphs.
+        out.fill_(-1)
+        if out_raw_indices is not None:
+            out_raw_indices.fill_(-1)
+        module.cub_topk_page_table_transform(
             input,
-            output_indices,
-            output_values,
+            out,
+            src_page_table,
             lengths,
+            out_raw_indices,
             workspace_buffer,
             top_k,
             tie_break,
+            page_size,
         )
+        return out
 
-        return output_values, output_indices
-
-    @register_fake_op("flashinfer::cub_topk")
-    def _fake_cub_topk(
+    @register_fake_op("flashinfer::cub_topk_page_table_transform")
+    def _fake_cub_topk_page_table_transform(
         input: torch.Tensor,
         top_k: int,
         tie_break: int,
-        lengths: Optional[torch.Tensor],
+        page_size: int,
+        lengths: torch.Tensor,
+        src_page_table: torch.Tensor,
+        out: torch.Tensor,
+        out_raw_indices: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = input.size(0)
-        return (
-            torch.empty(batch_size, top_k, dtype=input.dtype, device=input.device),
-            torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device),
-        )
+    ) -> torch.Tensor:
+        return out
 
     return SimpleNamespace(
         radix_topk=radix_topk,
         radix_topk_page_table_transform=radix_topk_page_table_transform,
         radix_topk_ragged_transform=radix_topk_ragged_transform,
-        cub_topk=cub_topk,
-        cub_topk_workspace_size=module.cub_topk_workspace_size,
+        cub_topk_page_table_transform=cub_topk_page_table_transform,
+        cub_topk_page_table_transform_workspace_size=module.cub_topk_page_table_transform_workspace_size,
         can_implement_filtered_topk=module.can_implement_filtered_topk,
         fast_topk_clusters_exact=_fast_topk_clusters_exact,
         fast_topk_clusters_exact_page_table_transform=_fast_topk_clusters_exact_page_table_transform,
@@ -568,6 +567,26 @@ def can_use_clusters_topk(device, deterministic, tie_break, dsa_graph_safe):
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     cap = get_compute_capability(device)
     return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
+
+
+def can_use_cub_topk(input, tie_break):
+    """Whether the CUB (DeviceBatchedTopK) backend can serve this call."""
+
+    algo = os.environ.get("FLASHINFER_TOPK_ALGO")
+    if algo is not None and algo != "cub":
+        return False  # user forced another backend
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    d = input.size(1)
+    if d > (1 << 21):
+        return False  # DeviceBatchedTopK per-segment limit
+    # Pre-SM90 devices only have the single-block backend (d <= 8192) and no
+    # tie-break support (the tie-break requirement configs need SM90+).
+    if (d > 8192 or tie_break != TopKTieBreak.NONE) and (
+        get_compute_capability(input.device)[0] < 9
+    ):
+        return False
+    return True
 
 
 @flashinfer_api
@@ -872,6 +891,37 @@ def top_k_page_table_transform(
         )
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
+
+    if (
+        can_use_cub_topk(input, tie_break)
+        and row_to_batch is None
+        and row_starts is None
+        and page_table_row_starts is None
+        and not deterministic
+    ):
+        topk_module = get_topk_module()
+        # Host-side size query (launches nothing); the workspace is cached per device
+        # so repeated calls (including under CUDA graph capture) reuse a stable
+        # allocation.
+        workspace_bytes = topk_module.cub_topk_page_table_transform_workspace_size(
+            input, lengths, k, int(tie_break), out_raw_indices is not None
+        )
+        workspace_buffer: torch.Tensor = _get_cache_buf(
+            f"cub_topk_workspace_{device}", workspace_bytes, device
+        )
+        if out is None:
+            out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+        return topk_module.cub_topk_page_table_transform(
+            input,
+            k,
+            int(tie_break),
+            page_size,
+            lengths,
+            src_page_table,
+            out,
+            out_raw_indices,
+            workspace_buffer,
+        )
 
     if (
         can_use_clusters_topk(

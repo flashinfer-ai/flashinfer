@@ -11,7 +11,6 @@ Optional comparison with SGLang's sgl_kernel implementation.
 """
 
 import argparse
-import functools
 import math
 import os
 from contextlib import contextmanager
@@ -141,143 +140,72 @@ CUB_TOPK_MAX_LEN = (
 CUB_TOPK_PRE_SM90_MAX_LEN = 8192  # ceiling below SM90 (CUB's single-block backend)
 
 
-@functools.cache
-def _cub_topk_module():
-    """Lazily JIT-build/load the topk module exposing the CUB-backed entry points."""
-    from flashinfer.jit.topk import gen_topk_module
-
-    return gen_topk_module().build_and_load()
-
-
-@functools.cache
-def _cuda_compute_major() -> int:
-    return get_compute_capability(torch.device("cuda"))[0]
-
-
-def cub_top_k_supported(
-    seq_len: int,
-    k: int,
-    dtype: torch.dtype,
-    deterministic: bool,
-    tie_break: TopKTieBreak,
+def cub_backend_supported(
+    scores: torch.Tensor, tie_break: TopKTieBreak = TopKTieBreak.NONE
 ) -> bool:
-    """Whether csrc/cub_topk.cu covers this configuration on the current device.
+    """Whether the dispatcher's CUB backend would serve this page-table transform call.
 
-    The CUB backend provides set-level guarantees only, so deterministic=True (repeatable
-    output ordering) is not supported at all.
-    Pre-SM90 only CUB's single-block backend exists: seq_len <= 8192, no tie-break. SM90+
-    adds the cluster backend: seq_len <= 2^21 and the tie-break modes.
+    Mirrors flashinfer.topk.can_use_cub_topk. A forced-cub measurement where the rung
+    declines would silently time the radix path relabeled, so gate host-side.
     """
-    if deterministic:
+    if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
-    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    d = scores.size(1)
+    if d > CUB_TOPK_MAX_LEN:
         return False
-    if not 0 < k <= seq_len:
+    if (d > CUB_TOPK_PRE_SM90_MAX_LEN or tie_break != TopKTieBreak.NONE) and (
+        get_compute_capability(torch.device("cuda"))[0] < 9
+    ):
         return False
-    if _cuda_compute_major() >= 9:
-        return seq_len <= CUB_TOPK_MAX_LEN
-    return seq_len <= CUB_TOPK_PRE_SM90_MAX_LEN and tie_break == TopKTieBreak.NONE
+    return True
 
 
-def bench_cub_top_k_ms(
+def cub_page_table_metrics(
+    run,
     scores: torch.Tensor,
-    k: int,
-    deterministic: bool,
-    tie_break: TopKTieBreak,
-    lengths: torch.Tensor | None = None,
-) -> float | None:
-    """Median ms for the CUB-backed top-k, or None when the configuration is unsupported.
-
-    deterministic=True is never sent to the CUB backend; it is used solely to gate.
-    The workspace is pre-sized outside the timed region, mirroring graph-safe usage.
-    """
-    num_rows, seq_len = scores.shape
-    if not cub_top_k_supported(seq_len, k, scores.dtype, deterministic, tie_break):
-        return None
-    mod = _cub_topk_module()
-    tie = int(tie_break)
-
-    if lengths is not None and lengths.dtype != torch.int32:
-        lengths = lengths.to(torch.int32)
-
-    # The binding leaves short rows' output tails untouched (sentinel padding is the
-    # caller's responsibility), so pre-fill once outside the timed region: lengths are
-    # fixed across iterations, so the -1 tails never need re-establishing.
-    out_idx = torch.full((num_rows, k), -1, dtype=torch.int32, device=scores.device)
-    out_vals = torch.empty(num_rows, k, dtype=scores.dtype, device=scores.device)
-    ws_bytes = mod.cub_topk_workspace_size(scores, lengths, k, tie)
-    workspace = torch.empty(
-        max(int(ws_bytes), 1), dtype=torch.uint8, device=scores.device
-    )
-
-    return bench_median_ms(
-        lambda: mod.cub_topk(scores, out_idx, out_vals, lengths, workspace, k, tie)
-    )
-
-
-def cub_topk_metrics(
-    scores: torch.Tensor,
-    k: int,
     deterministic: bool,
     compare_tie_break: bool,
     fi_ms: float,
-    lengths: torch.Tensor | None = None,
 ) -> dict:
+    """Time the same fused page-table transform call forced to the CUB backend.
+
+    ``run(tie_break)`` must invoke ``flashinfer.top_k_page_table_transform``. Skipped
+    for deterministic mode (the CUB rung declines it) and unsupported configurations.
+    """
     metrics: dict[str, float] = {}
-    cub_ms = bench_cub_top_k_ms(
-        scores, k, deterministic, TopKTieBreak.NONE, lengths=lengths
-    )
-
-    if cub_ms is not None:
-        metrics["cub_us"] = cub_ms * 1e3
-        metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
-
+    if deterministic or not cub_backend_supported(scores):
+        return metrics
+    set_topk_algo("cub")
+    cub_ms = bench_median_ms(lambda: run(TopKTieBreak.NONE))
+    metrics["cub_us"] = cub_ms * 1e3
+    metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
     if compare_tie_break:
         for suffix, tie_break in TIE_BREAK_VARIANTS:
-            tie_ms = bench_cub_top_k_ms(
-                scores, k, deterministic, tie_break, lengths=lengths
-            )
-            if tie_ms is not None:
+            if cub_backend_supported(scores, tie_break):
+                tie_ms = bench_median_ms(lambda: run(tie_break))
                 metrics[f"cub_tie_{suffix}_us"] = tie_ms * 1e3
-
+    set_topk_algo("auto")
     return metrics
 
 
-def append_cub_header(
-    header: str, tie_break_enabled: bool, selection_only: bool = False
-) -> str:
-    # In the transform tables the CUB column omits the gather / offset-add work that the
-    # FlashInfer column includes, so its header says so; plain top_k has no transform on
-    # either side.
-    cub_label = "CUB (selection only, no transform)" if selection_only else "CUB"
-    width = _cub_column_width(selection_only)
-    header += f" {cub_label:>{width}} {'CUBvsFI':>10}"
+def append_cub_header(header: str, tie_break_enabled: bool) -> str:
+    header += f" {'CUB':>12} {'CUBvsFI':>10}"
     if tie_break_enabled:
         header += f" {'CUB(tie-small)':>15} {'CUB(tie-large)':>15}"
     return header
 
 
-def _cub_column_width(selection_only: bool) -> int:
-    return 34 if selection_only else 12
-
-
-def append_cub_columns(
-    line: str, result: dict, tie_break_enabled: bool, selection_only: bool = False
-) -> str:
-    width = _cub_column_width(selection_only)
+def append_cub_columns(line: str, result: dict, tie_break_enabled: bool) -> str:
     if "cub_us" in result:
         line += (
-            f" {result['cub_us']:>{width - 2}.2f}us "
-            f"{result['speedup_cub_vs_flashinfer']:>9.2f}x"
+            f" {result['cub_us']:>10.2f}us {result['speedup_cub_vs_flashinfer']:>9.2f}x"
         )
     else:
-        line += f" {'n/a':>{width}} {'n/a':>10}"
-
+        line += f" {'n/a':>12} {'n/a':>10}"
     if tie_break_enabled:
         for suffix in ("small", "large"):
             cub_tie = result.get(f"cub_tie_{suffix}_us")
             line += f" {cub_tie:>13.2f}us" if cub_tie is not None else f" {'n/a':>15}"
-
     return line
 
 
@@ -362,9 +290,6 @@ def bench_top_k_from_scores(
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
-
-    # CUB DeviceBatchedTopK, same flags as the FlashInfer selected mode.
-    result.update(cub_topk_metrics(scores, k, deterministic, compare_tie_break, fi_ms))
 
     return result
 
@@ -648,8 +573,18 @@ def bench_page_table_transform(
             )
         )
 
-    # CUB selection over the same rows (uniform lengths == seq_len), selection only.
-    result.update(cub_topk_metrics(scores, k, deterministic, compare_tie_break, fi_ms))
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_page_table_metrics(
+            lambda tie_break: flashinfer.top_k_page_table_transform(
+                scores, src_page_table, lengths, k, tie_break=tie_break
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+        )
+    )
 
     return result
 
@@ -731,9 +666,6 @@ def bench_ragged_transform(
                 baseline_ms,
             )
         )
-
-    # CUB selection over the same rows (uniform lengths == seq_len), selection only.
-    result.update(cub_topk_metrics(scores, k, deterministic, compare_tie_break, fi_ms))
 
     return result
 
@@ -1074,13 +1006,19 @@ def bench_varlen_transform(
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
-    # CUB selection over the same variable lengths, same flags. Selection only: the
-    # FlashInfer columns also do the transform.
-    result.update(
-        cub_topk_metrics(
-            scores, k, deterministic, compare_tie_break, fi_ms, lengths=lengths
+    # The same fused call forced to the CUB backend. Only page_table rows without
+    # row_to_batch: the ragged transform has no CUB rung, and the rung declines
+    # row_to_batch (a forced-cub call it declines would time radix relabeled).
+    if transform == "page_table" and row_to_batch is None:
+        result.update(
+            cub_page_table_metrics(
+                lambda tie_break: run(False, tie_break),
+                scores,
+                deterministic,
+                compare_tie_break,
+                fi_ms,
+            )
         )
-    )
 
     return result
 
@@ -1317,13 +1255,6 @@ def main():
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
             "stress cases beyond the original grid"
         )
-        print(
-            "NOTE: CUB columns time cub::DeviceBatchedTopK. "
-            "It performs only the selection. "
-            "n/a marks configurations the CUB path cannot run: deterministic mode "
-            "(on any device), seq_len > 8192 or tie-break on pre-SM90 devices, and "
-            "seq_len > 2^21 on any device."
-        )
         print("=" * 100)
 
         if show_det_or_tie:
@@ -1344,7 +1275,6 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1408,7 +1338,6 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
-                line = append_cub_columns(line, result, args.tie_break)
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1574,11 +1503,10 @@ def main():
                 "slowdowns use the non-deterministic baseline"
             )
         print(
-            "NOTE: CUB columns time cub::DeviceBatchedTopK. "
-            "It performs only the selection (no transform). "
-            "n/a marks configurations the CUB path cannot run: "
-            "deterministic mode (on any device), seq_len > 8192 or tie-break on "
-            "pre-SM90 devices, and seq_len > 2^21 on any device."
+            "NOTE: CUB = the same fused call forced to the CUB backend "
+            "(cub::DeviceBatchedTopK with the page-table translation fused into its "
+            "output iterators). n/a when the CUB rung would decline: deterministic "
+            "mode, seq_len > 8192 or tie-break on pre-SM90 devices, seq_len > 2^21."
         )
         print("=" * 100)
 
@@ -1592,7 +1520,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break, selection_only=True)
+        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1655,9 +1583,7 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
-                        line = append_cub_columns(
-                            line, result, args.tie_break, selection_only=True
-                        )
+                        line = append_cub_columns(line, result, args.tie_break)
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1689,13 +1615,6 @@ def main():
                 f"NOTE: tie-break columns use deterministic={args.deterministic}; "
                 "slowdowns use the non-deterministic baseline"
             )
-        print(
-            "NOTE: CUB columns time cub::DeviceBatchedTopK. "
-            "It performs only the selection (no transform). "
-            "n/a marks configurations the CUB path cannot run: "
-            "deterministic mode (on any device), seq_len > 8192 or tie-break on "
-            "pre-SM90 devices, and seq_len > 2^21 on any device."
-        )
         print("=" * 100)
 
         if show_det_or_tie:
@@ -1708,7 +1627,6 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
-        header = append_cub_header(header, args.tie_break, selection_only=True)
         print(header)
         print("-" * len(header))
 
@@ -1771,9 +1689,6 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
-                        line = append_cub_columns(
-                            line, result, args.tie_break, selection_only=True
-                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1850,11 +1765,11 @@ def main():
                 f"column on this device (SM{cap[0]}{cap[1]})"
             )
         print(
-            "NOTE: CUB columns time cub::DeviceBatchedTopK. "
-            "It performs only the selection (no transform). "
-            "n/a marks configurations the CUB path cannot run: deterministic mode "
-            "(on any device), seq_len > 8192 or tie-break on pre-SM90 devices, and "
-            "seq_len > 2^21 on any device."
+            "NOTE: CUB = the same fused call forced to the CUB backend (page-table "
+            "translation fused into its output iterators). Only page_table rows: the "
+            "ragged transform has no CUB backend. n/a also when the rung would "
+            "decline: deterministic mode, max_len > 8192 or tie-break on pre-SM90 "
+            "devices, max_len > 2^21."
         )
         print("=" * 100)
 
@@ -1875,7 +1790,7 @@ def main():
             if show_clusters:
                 header += f" {'Clusters':>12} {'vsClusters':>10}"
             header += f" {'torch(mask)':>13} {'Speedup':>9}"
-        header = append_cub_header(header, args.tie_break, selection_only=True)
+        header = append_cub_header(header, args.tie_break)
         print(header)
         print("-" * len(header))
 
@@ -1946,9 +1861,7 @@ def main():
                             f" {result['torch_us']:>11.2f}us "
                             f"{result['speedup_vs_torch']:>8.2f}x"
                         )
-                    line = append_cub_columns(
-                        line, result, args.tie_break, selection_only=True
-                    )
+                    line = append_cub_columns(line, result, args.tie_break)
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)
