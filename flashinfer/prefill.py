@@ -2405,7 +2405,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
                 slopes = ALiBiAttention.get_slopes(num_qo_heads)
                 cute_variant = ALiBiAttention(
-                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                    torch.tensor(slopes, dtype=torch.float32, device=self.device)
                 )
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 from .cute_dsl.attention import SoftCappingAttention
@@ -2426,8 +2426,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # All paged plans use the modular kernel — the vendored FMHA
             # artifacts (the ragged wrapper's dense/causal route) have no
             # paged variant.
+            # Consume the wrapper-owned buffers (populated above) rather
+            # than the raw arguments: they are the stable-address contract
+            # for CUDA-graph mode and the single normalized copy otherwise.
             self._cute_dsl_wrapper.plan(
-                qo_indptr,
+                self._qo_indptr_buf,
                 None,
                 num_qo_heads,
                 num_kv_heads,
@@ -2440,9 +2443,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left=window_left,
                 variant=cute_variant,
                 page_size=page_size,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
-                paged_kv_last_page_len=paged_kv_last_page_len,
+                paged_kv_indptr=self._paged_kv_indptr_buf,
+                paged_kv_indices=self._paged_kv_indices_buf,
+                paged_kv_last_page_len=self._paged_kv_last_page_len_buf,
                 kv_layout=self._kv_layout,
             )
         elif self._jit_module is not None:
@@ -3591,7 +3594,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
                 slopes = ALiBiAttention.get_slopes(num_qo_heads)
                 variant = ALiBiAttention(
-                    torch.tensor(slopes, dtype=torch.float32, device=qo_indptr.device)
+                    torch.tensor(slopes, dtype=torch.float32, device=self.device)
                 )
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 from .cute_dsl.attention import SoftCappingAttention
@@ -3619,11 +3622,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 variant is None and head_dim_qk == 128 and window_left < 0
             )
             if self._cute_dsl_use_fmha:
-                q_lens = qo_indptr[1:] - qo_indptr[:-1]
-                k_lens = kv_indptr[1:] - kv_indptr[:-1]
+                # Wrapper-owned buffers (populated above): stable addresses
+                # for CUDA-graph mode, single normalized copy otherwise.
+                q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+                k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
                 self._cute_dsl_fmha_plan = {
-                    "qo_indptr": qo_indptr,
-                    "kv_indptr": kv_indptr,
+                    "qo_indptr": self._qo_indptr_buf,
+                    "kv_indptr": self._kv_indptr_buf,
                     "seq_lens": k_lens.to(torch.int32),
                     "batch_size": qo_indptr.shape[0] - 1,
                     "max_q_len": int(q_lens.max().item()),
@@ -3644,8 +3649,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         f"kv_data_type, got {q_data_type} and {kv_data_type}"
                     )
                 self._cute_dsl_wrapper.plan(
-                    qo_indptr,
-                    kv_indptr,
+                    self._qo_indptr_buf,
+                    self._kv_indptr_buf,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim_qk,

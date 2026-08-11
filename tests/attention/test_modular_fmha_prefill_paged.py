@@ -232,7 +232,7 @@ SHAPES = [
 
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("page_size", [16, 64, 128])
+@pytest.mark.parametrize("page_size", [8, 16, 64, 128])
 @pytest.mark.parametrize("shapes", SHAPES)
 def test_paged_bitwise_vs_ragged(causal, page_size, shapes):
     _skip_unless_sm100()
