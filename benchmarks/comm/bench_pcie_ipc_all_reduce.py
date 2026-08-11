@@ -50,11 +50,21 @@ at 8 ranks differs between the pack and staged kernels. Naming a switch
 explicitly is still allowed, and rows it does not historically fit are marked
 SYNTHETIC.
 
+To measure the launch configuration rather than read it from the table:
+
+    torchrun --standalone --nproc_per_node=8 \\
+        benchmarks/comm/bench_pcie_ipc_all_reduce.py --tune --json bench_tuned.json
+
+Rows whose configuration tuning changed are annotated with what the table would
+have chosen. The result is persisted, so a later run without --tune reuses it.
+
 Options:
     --hidden N        Hidden size (default: 6144 at 8 ranks, 4096 at 4, 2048 at 2)
     --batches a,b,c   Batch sizes to sweep
     --dtype           bfloat16 (default) or float16
     --json FILE       Write results to JSON
+    --tune            Measure the launch configuration instead of reading it
+    --tune-cache FILE Where --tune persists its result
 """
 
 import argparse
@@ -67,6 +77,7 @@ import torch.distributed as dist
 
 import flashinfer.comm as comm
 from flashinfer.comm import pcie_ipc_ar
+from flashinfer.comm.pcie_ipc_policy import IpcVariant
 from flashinfer.jit.comm import gen_pcie_ipc_comm_debug_module
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -78,7 +89,10 @@ _DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32, 64, 128]
 # times to call it deadlocks.
 _BENCH_KWARGS = dict(
     use_cuda_graph=True,
-    num_iters_within_graph=10,
+    # Each replay carries a fixed cost -- the launch plus the event pair timing
+    # it -- that the reported number amortises over the iterations in the graph,
+    # so anything compared against these numbers must use the same count.
+    num_iters_within_graph=20,
     dry_run_iters=5,
     repeat_iters=20,
     # The timed callables close over their tensors rather than taking them as
@@ -143,6 +157,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     p.add_argument("--json", type=str, default=None)
     p.add_argument(
+        "--tune",
+        action="store_true",
+        help=(
+            "Measure the launch configuration instead of reading it from the "
+            "table, then report against NCCL. Collective and slow (a few "
+            "seconds per batch bucket); pin clocks first."
+        ),
+    )
+    p.add_argument(
+        "--tune-cache",
+        type=str,
+        default=None,
+        help="Where --tune persists its result. Defaults to the workspace dir.",
+    )
+    p.add_argument(
         "--protocol-ab",
         choices=[
             "auto",
@@ -169,16 +198,20 @@ def _historical_switch(world_size, config):
     """Which A/B switch actually rebuilds what this shape used to run.
 
     The kernels do not share one history. TP2 and TP4 always double-buffered by
-    per-block parity, so ``per-block-epoch`` restores their past. The two staged
-    TP8 kernels never had an epoch at all -- their scratch was pinned to half 0
-    and reused across calls, which is what ``no-block-epoch`` rebuilds. The TP8
-    pack kernel did have per-block parity, like TP2/TP4.
+    per-block parity, so ``per-block-epoch`` restores their past. The two
+    topology-staged TP8 kernels never had an epoch at all -- their scratch was
+    pinned to half 0 and reused across calls, which is what ``no-block-epoch``
+    rebuilds. The TP8 pack kernel did have per-block parity, like TP2/TP4, and
+    so does ``FLAT_STAGED``: it is the same generic template TP4 runs.
 
     Running the other switch is not wrong, it just measures a protocol that
     never shipped, so rows are labelled rather than refused.
     """
-    tp8_staged = world_size == 8 and config.stream_mode
-    return "no-block-epoch" if tp8_staged else "per-block-epoch"
+    tp8_topo_staged = world_size == 8 and config.variant in (
+        IpcVariant.STAGED,
+        IpcVariant.STAGED_RING,
+    )
+    return "no-block-epoch" if tp8_topo_staged else "per-block-epoch"
 
 
 # The two switches that rebuild an *epoch* protocol. Which of them is faithful
@@ -430,8 +463,7 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
                 "synthetic_baseline": not is_historical,
                 "blocks": config.blocks,
                 "threads": config.threads,
-                "stream_mode": config.stream_mode,
-                "ring_push": config.ring_push,
+                "variant": config.variant.name,
                 "with_fix_us": with_fix,
                 "with_fix_rank0_us": with_fix_rank0,
                 "timed": timed,
@@ -528,6 +560,18 @@ def main() -> None:
     workspace = comm.PcieIpcAllReduceWorkspace(
         group=group, max_numel=hidden * max(batches), dtype=dtype
     )
+    table_configs = {}
+    if args.tune:
+        # Record what the table would have chosen before overwriting it, so the
+        # report shows what tuning actually changed rather than just the result.
+        for batch in batches:
+            probe = torch.empty(batch, hidden, dtype=dtype, device=device)
+            table_configs[batch] = workspace.launch_config(probe)
+        if rank == 0:
+            print(f"tuning {len(batches)} batch buckets at hidden {hidden} ...")
+        torch.cuda.synchronize()
+        workspace.rebind_stream()
+        workspace.tune([hidden], dtype=dtype, cache=args.tune_cache)
     if rank == 0:
         print(f"world_size={world_size} hidden={hidden} dtype={args.dtype}")
         print(f"profile={workspace.profile} ({workspace.profile_reason})")
@@ -536,7 +580,9 @@ def main() -> None:
     rows: List[Dict[str, object]] = []
     for batch in batches:
         inp = torch.randn(batch, hidden, dtype=dtype, device=device)
-        config = workspace.launch_config(inp)
+        # The tuned answer, so the reported configuration is the one the timed
+        # call below actually runs.
+        config = workspace.tuned_launch_config(inp)
         if config is None:
             if rank == 0:
                 print(
@@ -580,16 +626,19 @@ def main() -> None:
                 "speedup": nccl_us / ours_us,
                 "blocks": config.blocks,
                 "threads": config.threads,
-                "stream_mode": config.stream_mode,
-                "ring_push": config.ring_push,
+                "variant": config.variant.name,
             }
         )
         if rank == 0:
             print(
                 f"{batch:>7} {ours_us:>10.2f} {nccl_us:>10.2f} "
                 f"{nccl_us / ours_us:>8.2f}x  blocks={config.blocks} "
-                f"threads={config.threads} stream={int(config.stream_mode)} "
-                f"ring={int(config.ring_push)}"
+                f"threads={config.threads} variant={config.variant.name}"
+                + (
+                    ""
+                    if not args.tune or table_configs.get(batch) == config
+                    else f"  (table: {table_configs[batch]})"
+                )
             )
 
     if rank == 0 and args.json:

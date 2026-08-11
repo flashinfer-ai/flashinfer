@@ -36,6 +36,7 @@ no staging) is the worst direction on a switch-free fabric.
 """
 
 from dataclasses import dataclass, replace
+from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
@@ -46,12 +47,25 @@ from .pcie_ipc_topology import PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR
 MAX_BLOCKS = 128
 
 
+class IpcVariant(IntEnum):
+    """Which kernel to launch; mirrors ``fi::Variant`` in the header.
+
+    Values cross the FFI boundary as integers, so they are append-only.
+    ``FLAT_STAGED`` is accepted at world size 8 only -- at 4 it would name the
+    same kernel as ``STAGED``, and at 2 there is no staged-vs-flat distinction.
+    """
+
+    UNSTAGED = 0
+    STAGED = 1
+    STAGED_RING = 2
+    FLAT_STAGED = 3
+
+
 @dataclass(frozen=True)
 class IpcLaunchConfig:
     blocks: int
     threads: int
-    stream_mode: bool
-    ring_push: bool
+    variant: IpcVariant
 
 
 def _tp2(batch: int) -> Optional[IpcLaunchConfig]:
@@ -59,26 +73,26 @@ def _tp2(batch: int) -> Optional[IpcLaunchConfig]:
     # there is no all-to-all pattern to fix and the switch makes no difference.
     # At large batch this already sits at the link ceiling.
     if batch <= 1:
-        return IpcLaunchConfig(32, 64, False, False)
+        return IpcLaunchConfig(32, 64, IpcVariant.UNSTAGED)
     if batch <= 2:
-        return IpcLaunchConfig(128, 64, False, False)
+        return IpcLaunchConfig(128, 64, IpcVariant.UNSTAGED)
     if batch <= 4:
-        return IpcLaunchConfig(64, 128, True, False)
+        return IpcLaunchConfig(64, 128, IpcVariant.STAGED)
     if batch <= 8:
-        return IpcLaunchConfig(96, 64, True, False)
+        return IpcLaunchConfig(96, 64, IpcVariant.STAGED)
     if batch <= 12:
-        return IpcLaunchConfig(16, 64, False, False)
+        return IpcLaunchConfig(16, 64, IpcVariant.UNSTAGED)
     if batch <= 16:
-        return IpcLaunchConfig(64, 128, False, False)
+        return IpcLaunchConfig(64, 128, IpcVariant.UNSTAGED)
     if batch <= 28:
-        return IpcLaunchConfig(16, 64, False, False)
+        return IpcLaunchConfig(16, 64, IpcVariant.UNSTAGED)
     if batch <= 32:
-        return IpcLaunchConfig(64, 64, True, False)
+        return IpcLaunchConfig(64, 64, IpcVariant.STAGED)
     if batch <= 44:
-        return IpcLaunchConfig(16, 128, False, False)
+        return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
     if batch <= 48:
-        return IpcLaunchConfig(32, 128, True, False)
-    return IpcLaunchConfig(16, 128, False, False)
+        return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
+    return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
 
 
 def _rootcplx(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
@@ -88,56 +102,57 @@ def _rootcplx(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchCon
         if batch <= 4:
             # Too little payload to amortise the staged kernel's 2*(N-1)
             # barriers, so keep the unstaged push.
-            return IpcLaunchConfig(1, 128, True, False)
+            return IpcLaunchConfig(1, 128, IpcVariant.STAGED)
         # Neighbour-ordered staging trades all-to-all writes for neighbour
         # writes; with the contention gone, more blocks start to pay again.
         if batch <= 8:
-            return IpcLaunchConfig(1, 256, True, True)
+            return IpcLaunchConfig(1, 256, IpcVariant.STAGED_RING)
         if batch <= 64:
-            return IpcLaunchConfig(2, 256, True, True)
-        return IpcLaunchConfig(4, 256, True, True)
+            return IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
+        return IpcLaunchConfig(4, 256, IpcVariant.STAGED_RING)
     if world_size == 8 and hidden >= 6144:
         if batch <= 1:
             # Barrier-free pack kernel; below this the staged kernel's six
             # island barriers cost more than the traffic they save.
-            return IpcLaunchConfig(32, 128, False, False)
-        if batch == 2:
-            # Unsupported on purpose: this shape loses to NCCL at every
-            # launch configuration and its latency is unstable, so the caller
-            # is better served by the fallback. The table's rule is to claim
-            # only what it beats. Revisit if the instability is explained.
-            return None
+            return IpcLaunchConfig(32, 128, IpcVariant.UNSTAGED)
+        if batch <= 3:
+            # Ownership follows the data index, so a single CTA spans one or
+            # two adjacent owners: the pushes stage without the six island
+            # barriers the topology kernels pay for the same effect. Above this
+            # a CTA spans enough owners that the staging stops happening and
+            # the explicit barriers win instead.
+            return IpcLaunchConfig(1, 128, IpcVariant.FLAT_STAGED)
         # Staged intra-island push, which beats the block kernel because that
         # one pushes to all three island peers at once instead of one at a
         # time. Staging also lifts the blocks % 4 constraint, and the low block
         # counts that frees up are most of the win.
         if batch <= 4:
-            return IpcLaunchConfig(1, 128, True, True)
+            return IpcLaunchConfig(1, 128, IpcVariant.STAGED_RING)
         if batch <= 44:
-            return IpcLaunchConfig(1, 256, True, True)
-        return IpcLaunchConfig(2, 256, True, True)
+            return IpcLaunchConfig(1, 256, IpcVariant.STAGED_RING)
+        return IpcLaunchConfig(2, 256, IpcVariant.STAGED_RING)
     return None
 
 
 def _switchpair(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
     if world_size == 4 and hidden == 4096:
         if batch <= 1:
-            return IpcLaunchConfig(8, 128, False, False)
+            return IpcLaunchConfig(8, 128, IpcVariant.UNSTAGED)
         if batch <= 4:
-            return IpcLaunchConfig(64, 128, False, False)
+            return IpcLaunchConfig(64, 128, IpcVariant.UNSTAGED)
         if batch <= 8:
-            return IpcLaunchConfig(96, 128, False, False)
+            return IpcLaunchConfig(96, 128, IpcVariant.UNSTAGED)
         if batch <= 16:
-            return IpcLaunchConfig(16, 128, False, False)
+            return IpcLaunchConfig(16, 128, IpcVariant.UNSTAGED)
         if batch <= 40:
-            return IpcLaunchConfig(16, 128, True, False)
-        return IpcLaunchConfig(32, 128, True, False)
+            return IpcLaunchConfig(16, 128, IpcVariant.STAGED)
+        return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
     if world_size == 8 and hidden >= 6144:
         if batch <= 4:
-            return IpcLaunchConfig(12, 256, False, False)
+            return IpcLaunchConfig(12, 256, IpcVariant.UNSTAGED)
         if batch <= 32:
-            return IpcLaunchConfig(32, 128, True, False)
-        return IpcLaunchConfig(8, 512, True, False)
+            return IpcLaunchConfig(32, 128, IpcVariant.STAGED)
+        return IpcLaunchConfig(8, 512, IpcVariant.STAGED)
     return None
 
 
@@ -151,14 +166,20 @@ def _is_launchable(world_size: int, config: IpcLaunchConfig, max_blocks: int) ->
         return False
     if not world_size <= config.threads <= 1024:
         return False
-    if world_size == 2 and config.ring_push:
+    # One configuration must name exactly one kernel, so the pairs the header
+    # does not dispatch are rejected rather than aliased onto a neighbour.
+    if world_size == 2 and config.variant not in (
+        IpcVariant.UNSTAGED,
+        IpcVariant.STAGED,
+    ):
+        return False
+    if config.variant == IpcVariant.FLAT_STAGED and world_size != 8:
         return False
     # The block-partitioned TP8 kernel derives its chunk from blockIdx.x & 3.
-    # The staged (ring) and pack kernels use flat grid-stride loops.
+    # Every other kernel uses flat grid-stride loops.
     if (
         world_size == 8
-        and config.stream_mode
-        and not config.ring_push
+        and config.variant == IpcVariant.STAGED
         and config.blocks % 4 != 0
     ):
         return False

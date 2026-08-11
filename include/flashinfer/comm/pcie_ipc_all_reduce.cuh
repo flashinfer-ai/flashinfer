@@ -48,34 +48,36 @@ namespace pcie_ipc {
 constexpr int kMaxWorldSize = 8;
 constexpr int kSignalPhases = 8;
 
-enum class CustomAlgo : int {
-  kOneshot = 0,
-  kTwostageFast = 1,
-  kTree = 2,
-  kRsag = 3,
-  kTopoTree = 4,
-  kTopoRsag = 5,
-  kTp2Oneshot = 6,
-  kFastOneshot = 7,
-  kTopoTreeFastFinal = 8,
-  kTopoRsagFastFinal = 9,
-  kTopoRsagPush = 10,
-  kTopoRsagWide2 = 11,
-  kTopoRsagWide4 = 12,
-  kTopoRsagPipelined = 13,
-  kTopoRsagPipelinedDirect = 14,
-  kTopoRsagPipelinedCrossPush = 15,
-  kTopoRsagPipelinedWide2 = 16,
-  kTopoRsagPipelinedChunks8 = 17,
-  kTopoRsagPipelinedGatherStart = 18,
-  kTopoRsagPipelinedAgPush = 19,
-  kTopoRsagPipelinedAgPushSplit = 20,
-  kTp2OneshotPairFast = 21,
-  kPushOneshot = 22,
-  kTp2RemotePush = 23,
-  kTp2RemotePushStream = 24,
-  kTp2RemotePushWindow4 = 25,
+// Which kernel all_reduce() launches, together with world_size. Values are
+// part of the FFI signature, so they are explicit and append-only.
+//
+// kFlatStaged is accepted at world_size 8 only: at 4 it would name the same
+// kernel as kStaged, and at 2 there is no staged-vs-flat distinction.
+enum class Variant : int {
+  kUnstaged = 0,    // push to every peer at once
+  kStaged = 1,      // staged pushes; island-decomposed at world_size 8
+  kStagedRing = 2,  // staged pushes in neighbour order; world_size 4 and 8
+  kFlatStaged = 3,  // staged pushes without the island decomposition
 };
+
+constexpr int kVariantCount = 4;
+
+// Which staging area a kernel uses. The kernels come in two protocol families
+// and a region may hold only one of them.
+//
+// Sentinel kernels poll for +0.0 meaning "not yet written", sanitise real zeros
+// out of the payload, and store +0.0 back once a poll succeeds. Barrier kernels
+// are content-blind: they publish raw payload and leave it there. Nothing else
+// sweeps the workspace -- the host zeroes it once at init and never again.
+//
+// So a sentinel kernel landing on a barrier kernel's leftovers reads stale
+// payload, and its all-gather poll, which watches a single slot, exits on it
+// immediately: wrong output, not a hang. The epoch double buffer does not
+// substitute for this -- it guarantees the other half is quiescent, not clean.
+//
+// At world_size 8 that puts the two topology kernels in kBlock and both
+// sentinel kernels in kPack.
+enum class ScratchRegion : int { kBlock = 0, kPack = 1 };
 
 template <typename T, int N>
 struct alignas(sizeof(T) * N) Vec {
@@ -466,8 +468,9 @@ __device__ __forceinline__ int flag_offset(int block, int max_blocks, int world_
 // backs the per-block barrier flags: every rank runs the same sequence of
 // collectives, so every rank is on the same call parity.
 __host__ __device__ __forceinline__ int scratch_state_offset(int max_blocks, int world_size,
-                                                             bool block_region) {
-  return max_blocks + kSignalPhases * max_blocks * world_size + max_blocks + (block_region ? 0 : 2);
+                                                             ScratchRegion region) {
+  return max_blocks + kSignalPhases * max_blocks * world_size + max_blocks +
+         2 * static_cast<int>(region);
 }
 
 // Debug only: pin every call to half 0, i.e. the pre-double-buffer behaviour.
@@ -2046,7 +2049,7 @@ inline WorkspaceLayout compute_workspace_layout(int world_size, int64_t max_nume
   const size_t barrier_slots = static_cast<size_t>(kSignalPhases) *
                                static_cast<size_t>(max_blocks) * static_cast<size_t>(world_size);
   const size_t flag_slots = static_cast<size_t>(max_blocks);
-  // {epoch, arrival} per scratch region -- block first, then pack. Appended at
+  // {epoch, arrival} per scratch region, in ScratchRegion order. Appended at
   // the tail so phase_offset() and flag_offset(), both anchored at the front,
   // are unchanged. See scratch_state_offset().
   const size_t scratch_state_slots = 2 * 2;
@@ -2114,29 +2117,30 @@ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t str
   return cudaGetLastError();
 }
 
-// Kernel selection. `stream_mode` and `ring_push` come from the caller's tuning
-// table rather than from a threshold here, because the crossovers depend on the
-// fabric and are measured per machine.
+// Kernel selection. `variant` comes from the caller's tuning table rather than
+// from a threshold here, because the crossovers depend on the fabric and are
+// measured per machine.
 //
-//   world  stream  ring   kernel
-//     2      any    -     ipc_tp2_remote_push_kernel        (block scratch)
-//     4      false  -     push_oneshot_param_kernel         (pack  scratch)
-//     4      true   false ipc_rsag_push_param_kernel<4>     (block scratch)
-//     4      true   true  ipc_rsag_ring_push_param_kernel<4>(block scratch)
-//     8      false  -     ipc_topo_rsag8_push_param_kernel  (pack  scratch)
-//     8      true   false ipc_topo_rsag8_block_param_kernel (block scratch)
-//     8      true   true  ipc_topo_rsag8_ring_push_param_kernel (block scratch)
+//   world  variant       kernel
+//     2    kUnstaged     ipc_tp2_remote_push_kernel<false>     (block scratch)
+//     2    kStaged       ipc_tp2_remote_push_kernel<true>      (block scratch)
+//     4    kUnstaged     push_oneshot_param_kernel             (pack  scratch)
+//     4    kStaged       ipc_rsag_push_param_kernel<4>         (block scratch)
+//     4    kStagedRing   ipc_rsag_ring_push_param_kernel<4>    (block scratch)
+//     8    kUnstaged     ipc_topo_rsag8_push_param_kernel      (pack  scratch)
+//     8    kStaged       ipc_topo_rsag8_block_param_kernel     (block scratch)
+//     8    kStagedRing   ipc_topo_rsag8_ring_push_param_kernel (block scratch)
+//     8    kFlatStaged   ipc_rsag_push_param_kernel<8>         (pack  scratch)
 //
-// Preconditions the caller must have validated: world_size in {2,4,8};
-// 0 < blocks <= max_blocks; 0 < threads <= 1024; numel and max_numel both
-// divisible by the 16-byte pack width; numel * elem_size <= max_payload_bytes;
-// and blocks % 4 == 0 whenever the block-partitioned TP8 kernel is selected
-// (world_size 8 and not ring_push), since it derives its chunk from
-// blockIdx.x & 3.
+// Preconditions the caller must have validated: world_size in {2,4,8}; the
+// (world_size, variant) pair appears above; 0 < blocks <= max_blocks;
+// 0 < threads <= 1024; numel and max_numel both divisible by the 16-byte pack
+// width; numel * elem_size <= max_payload_bytes; and blocks % 4 == 0 for
+// (8, kStaged), since that kernel derives its chunk from blockIdx.x & 3.
 template <typename T>
 cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews& views, int rank,
                        int world_size, int max_blocks, int64_t max_numel, int blocks, int threads,
-                       bool stream_mode, bool ring_push, bool use_pdl, cudaStream_t stream) {
+                       Variant variant, bool use_pdl, cudaStream_t stream) {
   using Traits = PackTraits<T>;
   const int num_packs = static_cast<int>(numel / Traits::kPackElems);
   const int rank_stride_packs = static_cast<int>(max_numel / Traits::kPackElems);
@@ -2150,30 +2154,35 @@ cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews
     params.input = input;
     params.output = output;
     params.epoch_slots = views.self_signal;
-    // TP2 stages through views.block regardless of stream_mode, so it shares
-    // the block region's counter -- nominal here, since it is the only TP2
-    // kernel, but the state must follow the region it actually writes.
-    params.scratch_state = views.self_signal + scratch_state_offset(max_blocks, 2, true);
+    // TP2 stages through views.block under either variant, so it shares the
+    // block region's counter -- nominal here, since it is the only TP2 kernel,
+    // but the state must follow the region it actually writes.
+    params.scratch_state =
+        views.self_signal + scratch_state_offset(max_blocks, 2, ScratchRegion::kBlock);
     params.num_packs = num_packs;
     params.rank_stride_packs = rank_stride_packs;
     params.rank = rank;
+    const bool staged = variant == Variant::kStaged;
     if (use_pdl) {
-      return stream_mode ? launch(ipc_tp2_remote_push_kernel<T, true, true>, grid, cta, stream,
-                                  true, params)
-                         : launch(ipc_tp2_remote_push_kernel<T, false, true>, grid, cta, stream,
-                                  true, params);
+      return staged ? launch(ipc_tp2_remote_push_kernel<T, true, true>, grid, cta, stream, true,
+                             params)
+                    : launch(ipc_tp2_remote_push_kernel<T, false, true>, grid, cta, stream, true,
+                             params);
     }
-    return stream_mode ? launch(ipc_tp2_remote_push_kernel<T, true, false>, grid, cta, stream,
-                                false, params)
-                       : launch(ipc_tp2_remote_push_kernel<T, false, false>, grid, cta, stream,
-                                false, params);
+    return staged ? launch(ipc_tp2_remote_push_kernel<T, true, false>, grid, cta, stream, false,
+                           params)
+                  : launch(ipc_tp2_remote_push_kernel<T, false, false>, grid, cta, stream, false,
+                           params);
   }
 
   PushOneshotParamData<T> params{};
-  // Region and counter are chosen together: a kernel reading the pack region
-  // while advancing the block region's epoch would corrupt both.
-  const bool block_region = stream_mode;
-  const uint64_t* scratch = block_region ? views.block : views.pack;
+  // Region and counter are chosen together: a kernel reading one region while
+  // advancing another's epoch would corrupt both. Which kernels may share a
+  // region is a protocol question, not a partitioning one -- see ScratchRegion.
+  const ScratchRegion region = (variant == Variant::kUnstaged || variant == Variant::kFlatStaged)
+                                   ? ScratchRegion::kPack
+                                   : ScratchRegion::kBlock;
+  const uint64_t* scratch = region == ScratchRegion::kPack ? views.pack : views.block;
   for (int peer = 0; peer < world_size; ++peer) {
     params.tmp_ptrs[peer] = scratch[peer];
     params.signal_ptrs[peer] = views.signal[peer];
@@ -2181,8 +2190,7 @@ cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews
   params.input = input;
   params.output = output;
   params.epoch_slots = views.self_signal;
-  params.scratch_state =
-      views.self_signal + scratch_state_offset(max_blocks, world_size, block_region);
+  params.scratch_state = views.self_signal + scratch_state_offset(max_blocks, world_size, region);
   params.num_packs = num_packs;
   params.rank_stride_packs = rank_stride_packs;
   params.epoch_stride_packs = world_size * rank_stride_packs;
@@ -2191,20 +2199,31 @@ cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews
 
 #define FI_PCIE_IPC_LAUNCH(KERNEL_EXPR, PDL) launch(KERNEL_EXPR, grid, cta, stream, PDL, params)
 
-#define FI_PCIE_IPC_SELECT(PDL)                                                                   \
-  do {                                                                                            \
-    if (!stream_mode) {                                                                           \
-      if (world_size == 8) {                                                                      \
-        return FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_push_param_kernel<T, PDL>), PDL);               \
-      }                                                                                           \
-      return FI_PCIE_IPC_LAUNCH((push_oneshot_param_kernel<T, 4, PDL, false>), PDL);              \
-    }                                                                                             \
-    if (world_size == 8) {                                                                        \
-      return ring_push ? FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_ring_push_param_kernel<T, PDL>), PDL) \
-                       : FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_block_param_kernel<T, PDL>), PDL);    \
-    }                                                                                             \
-    return ring_push ? FI_PCIE_IPC_LAUNCH((ipc_rsag_ring_push_param_kernel<T, 4, PDL>), PDL)      \
-                     : FI_PCIE_IPC_LAUNCH((ipc_rsag_push_param_kernel<T, 4, PDL>), PDL);          \
+#define FI_PCIE_IPC_SELECT(PDL)                                                            \
+  do {                                                                                     \
+    if (world_size == 8) {                                                                 \
+      switch (variant) {                                                                   \
+        case Variant::kUnstaged:                                                           \
+          return FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_push_param_kernel<T, PDL>), PDL);      \
+        case Variant::kStaged:                                                             \
+          return FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_block_param_kernel<T, PDL>), PDL);     \
+        case Variant::kStagedRing:                                                         \
+          return FI_PCIE_IPC_LAUNCH((ipc_topo_rsag8_ring_push_param_kernel<T, PDL>), PDL); \
+        case Variant::kFlatStaged:                                                         \
+          return FI_PCIE_IPC_LAUNCH((ipc_rsag_push_param_kernel<T, 8, PDL>), PDL);         \
+      }                                                                                    \
+      return cudaErrorInvalidValue;                                                        \
+    }                                                                                      \
+    switch (variant) {                                                                     \
+      case Variant::kUnstaged:                                                             \
+        return FI_PCIE_IPC_LAUNCH((push_oneshot_param_kernel<T, 4, PDL, false>), PDL);     \
+      case Variant::kStaged:                                                               \
+        return FI_PCIE_IPC_LAUNCH((ipc_rsag_push_param_kernel<T, 4, PDL>), PDL);           \
+      case Variant::kStagedRing:                                                           \
+        return FI_PCIE_IPC_LAUNCH((ipc_rsag_ring_push_param_kernel<T, 4, PDL>), PDL);      \
+      default:                                                                             \
+        return cudaErrorInvalidValue;                                                      \
+    }                                                                                      \
   } while (false)
 
   if (use_pdl) {

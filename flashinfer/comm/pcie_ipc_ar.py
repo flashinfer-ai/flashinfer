@@ -15,8 +15,11 @@ limitations under the License.
 """
 
 import functools
+import hashlib
+import os
+import warnings
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -29,6 +32,18 @@ from ..utils import register_custom_op
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
 from .pcie_ipc_topology import resolve_pcie_ipc_profile
+from .pcie_ipc_tuning import (
+    PCIE_IPC_CUSTOM_OP,
+    TUNE_BATCHES,
+    TUNE_REPEAT,
+    TUNE_WARMUP,
+    PcieIpcAllReduceRunner,
+    default_cache_path,
+    pack_config,
+    pcie_ipc_tuning_config,
+    resolve_tuned_config,
+    tuned_batches_for,
+)
 
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # float32 is deliberately absent. The kernels handle it, but the tuning tables
@@ -71,12 +86,11 @@ def get_pcie_ipc_comm_module():
         out: torch.Tensor,
         blocks: int,
         threads: int,
-        stream_mode: bool,
-        ring_push: bool,
+        variant: int,
         enable_pdl: bool,
     ) -> None:
         module.pcie_ipc_all_reduce(
-            handle, inp, out, blocks, threads, stream_mode, ring_push, enable_pdl
+            handle, inp, out, blocks, threads, variant, enable_pdl
         )
 
     return SimpleNamespace(
@@ -136,12 +150,21 @@ class PcieIpcAllReduceWorkspace:
         probing the interconnect. Probing is collective and runs before any
         allocation.
 
+    Launch configurations come from a table measured on one machine. To measure
+    them on this one instead, tune once and the result is persisted; later
+    processes pick it up when the workspace is built. Tuning never changes which
+    shapes are supported, only which kernel a supported shape runs.
+
     Examples
     --------
-    >>> ws = PcieIpcAllReduceWorkspace(group=group, max_numel=128 * 6144)
+    >>> ws = PcieIpcAllReduceWorkspace(group=tp_group, max_numel=max_tokens * hidden)
     >>> if ws.supports(x):
     ...     out = ws.all_reduce(x)
     >>> ws.destroy()
+
+    Tuning, once per machine:
+
+    >>> ws.tune([hidden])  # collective; every rank calls it
     """
 
     def __init__(
@@ -151,6 +174,7 @@ class PcieIpcAllReduceWorkspace:
         dtype: torch.dtype = torch.bfloat16,
         max_blocks: int = 128,
         profile: Optional[str] = None,
+        tune_batches: Sequence[int] = TUNE_BATCHES,
     ) -> None:
         # Construction is a staged transaction. Every rank must execute the same
         # sequence of collectives, so a rank that finds a problem does NOT raise
@@ -170,6 +194,13 @@ class PcieIpcAllReduceWorkspace:
         self.max_blocks = max_blocks
         self.profile = ""
         self.profile_reason = ""
+        # Resolved launch configurations, keyed exactly. Consulted before any
+        # AutoTuner call because even a pure cache lookup there takes a global
+        # lock, which is real overhead at this operator's scale.
+        self._tuned: Dict[Tuple[int, int, torch.dtype], IpcLaunchConfig] = {}
+        self._runner: Optional[PcieIpcAllReduceRunner] = None
+        self._tune_group: Optional[ProcessGroup] = None
+        self._tune_batches = tuple(int(b) for b in tune_batches)
 
         # --- stage 1: local validation, encoded rather than raised -----------
         error: Optional[str] = None
@@ -203,6 +234,9 @@ class PcieIpcAllReduceWorkspace:
             "elem_size": self.elem_size,
             "max_blocks": max_blocks,
             "profile": profile,
+            # Buckets pick which shape a tuned entry is reused for, so ranks
+            # that disagree would resolve different configurations.
+            "tune_batches": self._tune_batches,
         }
         self._joint_check(local, "validating arguments")
 
@@ -244,6 +278,16 @@ class PcieIpcAllReduceWorkspace:
         # barriers, so one rank must never enter it alone.
         try:
             self._joint_check({"error": bind_error}, "binding the workspace")
+        except Exception:
+            self.destroy()
+            raise
+
+        # --- stage 4: tuned configurations, if any have been persisted -------
+        # Loaded once, here, and never reloaded: a rank that picks up a file
+        # update its peers have not seen would choose a different kernel, and
+        # the group hangs rather than erroring.
+        try:
+            self._init_tuning()
         except Exception:
             self.destroy()
             raise
@@ -376,8 +420,114 @@ class PcieIpcAllReduceWorkspace:
 
         Raises the same way :meth:`launch_config` does on a device mismatch --
         that is a caller bug, not an untuned shape.
+
+        Autotuning never changes this answer: it only picks a faster
+        configuration for a shape the table already claims.
         """
         return self.launch_config(inp) is not None
+
+    def _init_tuning(self) -> None:
+        """Build the runner and load any persisted configurations. Collective."""
+        self._runner = PcieIpcAllReduceRunner(self)
+        path = default_cache_path(self.world_size)
+        exists = os.path.isfile(path)
+        # Whether the file is there has to be a group fact before anyone acts
+        # on it: half a group running tuned configurations and half running the
+        # table is a hang, not a slowdown.
+        self._joint_check({"error": None, "cache": exists}, "checking the tune cache")
+        if exists:
+            from ..autotuner import AutoTuner
+
+            AutoTuner.get().load_configs(path)
+        self._joint_check(
+            {"error": None, "digest": self._cache_digest()}, "loading the tune cache"
+        )
+
+    def _cache_digest(self) -> str:
+        """Fingerprint of the tuned entries this rank will actually use.
+
+        ``load_configs`` silently drops entries whose metadata does not match
+        the machine, so "we all read the same file" is not the same as "we all
+        hold the same table".
+        """
+        from ..autotuner import AutoTuner
+
+        prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
+        tuner = AutoTuner.get()
+        entries = sorted(
+            (key, repr(value))
+            for key, value in tuner._file_configs.items()
+            if key.startswith(prefix)
+        )
+        return hashlib.sha256(repr(entries).encode()).hexdigest()[:16]
+
+    def tuned_launch_config(self, inp: torch.Tensor) -> Optional[IpcLaunchConfig]:
+        """Launch configuration for ``inp``, measured if one has been persisted.
+
+        The table is asked first and its answer is final on admission: a shape
+        it declines returns ``None`` here too, whatever the cache holds.
+
+        Inside an ``autotune(True)`` context this runs the search; outside one
+        it is a lookup. Same split as the other tunable ops in this library.
+        """
+        table = self.launch_config(inp)
+        if table is None:
+            return None
+        from ..autotuner import AutoTuner
+
+        tuner = AutoTuner.get()
+        key = (inp.numel(), inp.shape[-1], inp.dtype)
+        # The hot cache is skipped while tuning, so a search that has more
+        # shapes to cover is not short-circuited by an earlier answer.
+        if not tuner.is_tuning_mode:
+            cached = self._tuned.get(key)
+            if cached is not None:
+                return cached
+        config = self._resolve_tuned(inp, table, tuner)
+        self._tuned[key] = config
+        return config
+
+    def _resolve_tuned(
+        self, inp: torch.Tensor, table: IpcLaunchConfig, tuner
+    ) -> IpcLaunchConfig:
+        """Cold path: search or look up, then make the group agree."""
+        hidden = inp.shape[-1]
+        batch = inp.numel() // hidden
+        tuning_config = pcie_ipc_tuning_config(self._tune_batches)
+        if tuner.is_tuning_mode:
+            _, tactic = tuner.choose_one(
+                PCIE_IPC_CUSTOM_OP, [self._runner], tuning_config, [inp]
+            )
+        else:
+            _, _, tactic, _ = tuner.search_cache(
+                PCIE_IPC_CUSTOM_OP,
+                [self._runner],
+                ((batch, hidden),),
+                tuning_config,
+                inputs=[inp],
+            )
+        config = resolve_tuned_config(table, tactic, self.world_size, self.max_blocks)
+
+        # Unconditional, even when the cache missed and `config is table`. The
+        # ranks would otherwise have to agree on whether to run this collective
+        # before running it, and disagreeing about that is the hang it exists
+        # to prevent. It costs one small reduction per distinct shape.
+        packed = pack_config(config)
+        bounds = torch.tensor([packed, -packed], dtype=torch.int64, device=self.device)
+        dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=self.group)
+        if int(bounds[0]) != -int(bounds[1]):
+            # Fall back rather than raise: the table is a pure function, so it
+            # is agreed by construction and the group stays alive.
+            warnings.warn(
+                "ranks resolved different tuned configurations for shape "
+                f"{tuple(inp.shape)}; falling back to the tuning table. The "
+                "tune cache is inconsistent across ranks -- delete "
+                f"{default_cache_path(self.world_size)} and re-tune.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return table
+        return config
 
     @flashinfer_api(trace=pcie_ipc_all_reduce_trace)
     def all_reduce(
@@ -419,7 +569,7 @@ class PcieIpcAllReduceWorkspace:
             :meth:`supports` first and fall back to another backend.
         """
         if config is None:
-            config = self.launch_config(inp)
+            config = self.tuned_launch_config(inp)
             if config is None:
                 raise ValueError(
                     f"no tuned configuration for shape {tuple(inp.shape)} "
@@ -440,17 +590,236 @@ class PcieIpcAllReduceWorkspace:
                 f"output is on {out.device} but the workspace was built on "
                 f"{self.device}"
             )
+        self._launch(inp, out, config, enable_pdl)
+        return out
+
+    def _launch(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        config: IpcLaunchConfig,
+        enable_pdl: bool = False,
+    ) -> None:
+        """Issue one collective with an explicit configuration.
+
+        The launch without the admission, device and stream checks around it.
+        Callers that have already done those -- the tuner, which sweeps many
+        configurations over one validated pair of buffers -- use this so the
+        checks do not run once per candidate.
+        """
         get_pcie_ipc_comm_module().all_reduce(
             self.handle,
             inp,
             out,
             config.blocks,
             config.threads,
-            config.stream_mode,
-            config.ring_push,
+            int(config.variant),
             enable_pdl,
         )
-        return out
+
+    def tune(
+        self,
+        hiddens: Sequence[int],
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        cache: Optional[str] = None,
+        tune_group=None,
+        warmup: int = TUNE_WARMUP,
+        repeat: int = TUNE_REPEAT,
+    ) -> Dict[Tuple[int, int], IpcLaunchConfig]:
+        """Measure the launch configuration for every tuned shape. Collective.
+
+        A convenience wrapper around the library's usual tuning idiom::
+
+            with flashinfer.autotune(True, cache=path):
+                for batch in batches:
+                    ws.all_reduce(sample(batch))
+
+        which also works, and does the same thing. This adds what a collective
+        needs on top of it: a gloo subgroup for the timing reduction so every
+        rank picks the same kernel, longer timing runs than the library default
+        (the library defaults resolve too little at this scale), a check that
+        every rank agrees on the arguments, and a single writer for the result
+        file.
+
+        Every rank must call this with identical arguments, and clocks should be
+        pinned first (``nvidia-smi -lgc``): boost drift is larger than the
+        differences being ranked.
+
+        Parameters
+        ----------
+        hiddens : Sequence[int]
+            Hidden sizes to tune -- the ones this job will actually run. There
+            is no default: the tables claim open-ended ranges (8 ranks covers
+            every hidden from 6144 up), so there is no finite set to enumerate,
+            and guessing would quietly tune a shape nobody uses.
+
+            The **batch** dimension is not here. It comes from ``tune_batches``
+            on the constructor, because the buckets have to be the same on the
+            tuning side and the lookup side, which makes them a property of the
+            workspace rather than of one call.
+        dtype : torch.dtype
+            Which of the two supported dtypes to measure. Both are 2 bytes so
+            the traffic is identical, but they take different conversion paths.
+        cache : str, optional
+            Where to persist results. Defaults to
+            ``FLASHINFER_AUTOTUNE_DIR``/``FLASHINFER_WORKSPACE_DIR``.
+        tune_group : ProcessGroup, optional
+            Group used to reduce per-candidate timings so every rank picks the
+            same winner. Built here as a gloo subgroup when the workspace spans
+            the default process group; must be supplied otherwise, because
+            ``new_group`` is collective over the *default* group and building
+            one here would hang a job whose workspace is a strict subgroup.
+        warmup, repeat : int
+            Untimed and timed iterations per candidate. The library defaults
+            time too short a span to resolve candidates for a collective this
+            fast, so these default higher.
+
+        Returns
+        -------
+        dict
+            ``{(hidden, batch): config}`` for every shape that was measured, so
+            the caller can see what tuning actually covered and what it chose.
+
+        Raises
+        ------
+        ValueError
+            If none of ``hiddens`` is a shape the table claims -- otherwise the
+            call is a silent no-op.
+        """
+        from ..autotuner import (
+            AutoTuner,
+            autotune,
+            get_autotune_process_group,
+            set_autotune_process_group,
+        )
+
+        hiddens = tuple(int(h) for h in hiddens)
+        path = cache or default_cache_path(self.world_size)
+        # Everything the collective profiling contract requires to match, in
+        # one gather. A blocklist set on one rank alone silently shortens that
+        # rank's candidate list, and the timing reduction then deadlocks on the
+        # first divergence.
+        self._joint_check(
+            {
+                "error": None,
+                "hiddens": hiddens,
+                "dtype": str(dtype),
+                "cache": path,
+                "warmup": warmup,
+                "repeat": repeat,
+                "tune_batches": self._tune_batches,
+                "blocklist": os.environ.get("FLASHINFER_TACTICS_BLOCKLIST", ""),
+                "digest": self._cache_digest(),
+            },
+            "starting a tuning run",
+        )
+
+        if tune_group is None:
+            tune_group = self._make_tune_group()
+        elif dist.get_world_size(tune_group) != self.world_size:
+            raise ValueError(
+                f"tune_group spans {dist.get_world_size(tune_group)} ranks but "
+                f"the workspace spans {self.world_size}"
+            )
+
+        tuner = AutoTuner.get()
+        previous_group = get_autotune_process_group()
+        previous_counts = (tuner.warmup, tuner.repeat)
+        set_autotune_process_group(tune_group)
+        # The library defaults time too short a span to resolve candidates at
+        # this operator's scale.
+        tuner.warmup, tuner.repeat = warmup, repeat
+        covered: List[Tuple[int, int]] = []
+        skipped: List[int] = []
+        try:
+            for hidden in hiddens:
+                batches = [
+                    b
+                    for b in tuned_batches_for(
+                        hidden, self._tune_batches, self.max_numel
+                    )
+                    if self.launch_config(
+                        torch.empty((b, hidden), dtype=dtype, device=self.device)
+                    )
+                    is not None
+                ]
+                if not batches:
+                    # Recorded rather than skipped silently: the call would
+                    # otherwise return cleanly having measured nothing.
+                    skipped.append(hidden)
+                    continue
+                torch.cuda.synchronize(self.device)
+                self.rebind_stream()
+                with autotune(True, tuning_buckets=tuple(batches), round_up=False):
+                    for batch in batches:
+                        inp = torch.randint(
+                            0,
+                            16,
+                            (batch, hidden),
+                            dtype=torch.int32,
+                            device=self.device,
+                        ).to(dtype)
+                        tuner.choose_one(
+                            PCIE_IPC_CUSTOM_OP,
+                            [self._runner],
+                            pcie_ipc_tuning_config(self._tune_batches),
+                            [inp],
+                        )
+                        covered.append((hidden, batch))
+        finally:
+            tuner.warmup, tuner.repeat = previous_counts
+            # Restore rather than clear: a caller may be tuning something else
+            # around this.
+            set_autotune_process_group(previous_group)
+
+        if skipped:
+            message = (
+                f"tune() measured nothing for hidden {skipped} at "
+                f"{self.world_size} ranks (profile {self.profile}): the table "
+                "does not claim those shapes, and tuning does not widen what "
+                "is supported."
+            )
+            if not covered:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+        # Winners live in the in-memory cache now, so drop anything this
+        # workspace resolved from the older table.
+        self._tuned.clear()
+        dist.barrier(group=self.group)
+        if self.rank == 0:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tuner.save_configs(path)
+        # Nobody leaves before the file is on disk: a peer that rebuilt its
+        # workspace first would load a half-written table.
+        dist.barrier(group=self.group)
+        return {
+            (hidden, batch): self.tuned_launch_config(
+                torch.empty((batch, hidden), dtype=dtype, device=self.device)
+            )
+            for hidden, batch in covered
+        }
+
+    def _make_tune_group(self):
+        """A gloo subgroup for reducing candidate timings.
+
+        gloo because the reduction carries one float64 and an NCCL collective
+        immediately after a spin-waiting IPC kernel is exactly the interference
+        a timing loop does not want.
+        """
+        if self._tune_group is not None:
+            return self._tune_group
+        ranks = dist.get_process_group_ranks(self.group)
+        if len(ranks) != dist.get_world_size():
+            raise ValueError(
+                "tune() cannot build its own reduction group for a workspace "
+                "that spans a strict subgroup: new_group() is collective over "
+                "the default process group, so every process would have to "
+                "call it. Pass tune_group= built by all ranks instead."
+            )
+        self._tune_group = dist.new_group(ranks=ranks, backend="gloo")
+        return self._tune_group
 
     def destroy(self) -> None:
         """Release the handle and the shared slab.
@@ -471,6 +840,10 @@ class PcieIpcAllReduceWorkspace:
         if self._ipc_ptrs is not None:
             free_shared_buffer(self._ipc_ptrs, group=self.group)
             self._ipc_ptrs = None
+        if self._tune_group is not None:
+            dist.destroy_process_group(self._tune_group)
+            self._tune_group = None
+        self._tuned.clear()
 
     def __enter__(self) -> "PcieIpcAllReduceWorkspace":
         return self

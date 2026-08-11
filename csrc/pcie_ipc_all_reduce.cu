@@ -113,12 +113,12 @@ void pcie_ipc_dispose(fptr_t handle) { delete reinterpret_cast<PcieIpcHandle*>(h
 /*!
  * \brief Out-of-place all-reduce over the shared workspace.
  *
- * \param blocks,threads,stream_mode,ring_push Launch configuration chosen by
- *        the caller's tuning table; see the kernel selection table in
- *        pcie_ipc_all_reduce.cuh.
+ * \param blocks,threads,variant Launch configuration chosen by the caller's
+ *        tuning table; \c variant is a fi::Variant and the (world_size,
+ *        variant) pairs that dispatch are listed in pcie_ipc_all_reduce.cuh.
  */
 void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t blocks,
-                         int64_t threads, bool stream_mode, bool ring_push, bool enable_pdl) {
+                         int64_t threads, int64_t variant, bool enable_pdl) {
   auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
   ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
@@ -155,10 +155,20 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   TVM_FFI_ICHECK(!enable_pdl)
       << "enable_pdl is not supported yet: in the TP8 block kernel the launch-completion "
          "trigger precedes the island ack and barrier flag stores";
+  TVM_FFI_ICHECK(variant >= 0 && variant < fi::kVariantCount)
+      << "variant must be in [0, " << fi::kVariantCount << "), got " << variant;
+  const auto algo = static_cast<fi::Variant>(variant);
+  // Reject rather than silently alias, so one configuration always names one
+  // kernel.
+  TVM_FFI_ICHECK(
+      !(h->world_size == 2 && algo != fi::Variant::kUnstaged && algo != fi::Variant::kStaged))
+      << "world_size 2 accepts only kUnstaged and kStaged, got variant " << variant;
+  TVM_FFI_ICHECK(!(algo == fi::Variant::kFlatStaged && h->world_size != 8))
+      << "kFlatStaged is world_size 8 only, got " << h->world_size;
   // Only the block-partitioned TP8 kernel needs this: it derives its chunk
-  // from blockIdx.x & 3. The staged (ring) and pack kernels use flat
-  // grid-stride loops and accept any block count.
-  if (h->world_size == 8 && stream_mode && !ring_push) {
+  // from blockIdx.x & 3. Every other kernel uses flat grid-stride loops and
+  // accepts any block count.
+  if (h->world_size == 8 && algo == fi::Variant::kStaged) {
     TVM_FFI_ICHECK_EQ(blocks % 4, 0)
         << "the TP8 topology kernel requires blocks divisible by 4, got " << blocks;
   }
@@ -169,14 +179,14 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
       err = fi::all_reduce<nv_bfloat16>(static_cast<const nv_bfloat16*>(inp.data_ptr()),
                                         static_cast<nv_bfloat16*>(out.data_ptr()), numel, h->views,
                                         h->rank, h->world_size, h->max_blocks, h->max_numel,
-                                        static_cast<int>(blocks), static_cast<int>(threads),
-                                        stream_mode, ring_push, enable_pdl, stream);
+                                        static_cast<int>(blocks), static_cast<int>(threads), algo,
+                                        enable_pdl, stream);
       break;
     case float16_code:
       err = fi::all_reduce<half>(
           static_cast<const half*>(inp.data_ptr()), static_cast<half*>(out.data_ptr()), numel,
           h->views, h->rank, h->world_size, h->max_blocks, h->max_numel, static_cast<int>(blocks),
-          static_cast<int>(threads), stream_mode, ring_push, enable_pdl, stream);
+          static_cast<int>(threads), algo, enable_pdl, stream);
       break;
     default:
       // The kernels are dtype-generic but the tuning table is not keyed on

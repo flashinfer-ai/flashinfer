@@ -30,6 +30,8 @@ import pytest
 
 from flashinfer.comm.pcie_ipc_policy import (
     MAX_BLOCKS,
+    IpcLaunchConfig,
+    IpcVariant,
     _is_launchable,
     get_pcie_ipc_launch_config,
 )
@@ -77,25 +79,73 @@ def test_table_is_a_pure_function(profile: str) -> None:
                 )
 
 
-def test_tp8_rootcplx_batch2_falls_back() -> None:
-    """Batch 2 at 8 ranks is reported unsupported on purpose.
+def test_tp8_rootcplx_flat_staged_window() -> None:
+    """Batches 2-3 at 8 ranks select ``FLAT_STAGED``, and nothing else does.
 
-    This is a deliberate divergence from the table this was ported from, which
-    runs the pack kernel here. Measured on 8x L40S, every sample of this shape
-    loses to NCCL (0.67x-0.95x) and the latency is unstable, 39-61 us, while
-    batch 1 -- same kernel, same 32 blocks -- holds 30.5-32.2 us. All twelve
-    launchable configurations were measured; none is better.
-
-    Pinned as a test because the natural instinct on seeing a hole in a tuning
-    table is to fill it back in.
+    It is a two-point window between two other kernels -- pack below it, the
+    topology ring above -- so a change that widens or narrows it silently
+    retunes a boundary that was measured.
     """
-    assert get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, 2) is None
-    # Exactly one point, not a range: its neighbours stay supported.
-    assert get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, 1) is not None
-    assert get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, 3) is not None
-    # Only the profile that was measured. The switch-paired table came from a
-    # different machine and has no measurement backing a change here.
-    assert get_pcie_ipc_launch_config(PROFILE_SWITCHPAIR, 8, 6144, 2) is not None
+    for batch in (2, 3):
+        config = get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, batch)
+        assert config is not None
+        assert config.variant is IpcVariant.FLAT_STAGED, batch
+        # One CTA is the point: ownership follows the data index, so a small
+        # grid is what stages the pushes.
+        assert config.blocks == 1, batch
+    for batch in (1, 4):
+        neighbour = get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, batch)
+        assert neighbour is not None
+        assert neighbour.variant is not IpcVariant.FLAT_STAGED, batch
+    # Only the profile this was measured on. The switch-paired table came from
+    # a different machine and has no measurement backing a change here.
+    for batch in (2, 3):
+        switchpair = get_pcie_ipc_launch_config(PROFILE_SWITCHPAIR, 8, 6144, batch)
+        assert switchpair is not None
+        assert switchpair.variant is not IpcVariant.FLAT_STAGED
+
+
+def test_flat_staged_is_never_selected_outside_world_size_eight() -> None:
+    """It would name the same kernel as ``STAGED`` at 4 ranks, and none at 2."""
+    for profile in (PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR):
+        for world_size, hidden in ((2, 2048), (4, 4096)):
+            for batch in _BATCHES:
+                config = get_pcie_ipc_launch_config(profile, world_size, hidden, batch)
+                assert config is None or config.variant is not IpcVariant.FLAT_STAGED
+    # And the launchability check refuses it even if a table ever returned it.
+    bad = IpcLaunchConfig(1, 128, IpcVariant.FLAT_STAGED)
+    assert not _is_launchable(4, bad, MAX_BLOCKS)
+    assert not _is_launchable(2, bad, MAX_BLOCKS)
+    assert _is_launchable(8, bad, MAX_BLOCKS)
+
+
+def test_every_dispatchable_variant_is_reachable_from_the_table() -> None:
+    """A variant the dispatch can launch but no shape selects is invisible.
+
+    This is the direction ``test_every_returned_config_is_launchable`` does not
+    cover. A kernel that nothing selects is either dead code or an unexplored
+    region of the launch space, and the two are indistinguishable from outside
+    -- which is how the flat-staged kernel stayed unreachable for a whole
+    tuning round.
+    """
+    expected = {
+        2: {IpcVariant.UNSTAGED, IpcVariant.STAGED},
+        4: {IpcVariant.UNSTAGED, IpcVariant.STAGED, IpcVariant.STAGED_RING},
+        8: {
+            IpcVariant.UNSTAGED,
+            IpcVariant.STAGED,
+            IpcVariant.STAGED_RING,
+            IpcVariant.FLAT_STAGED,
+        },
+    }
+    seen = {2: set(), 4: set(), 8: set()}
+    for profile in (PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR):
+        for world_size, hidden in _SHAPES:
+            for batch in _BATCHES:
+                config = get_pcie_ipc_launch_config(profile, world_size, hidden, batch)
+                if config is not None:
+                    seen[world_size].add(config.variant)
+    assert seen == expected
 
 
 def test_untuned_shapes_report_unsupported() -> None:
@@ -121,7 +171,7 @@ def test_tp8_block_kernel_always_gets_a_multiple_of_four(profile: str) -> None:
     for hidden in (6144, 8192):
         for batch in _BATCHES:
             config = get_pcie_ipc_launch_config(profile, 8, hidden, batch)
-            if config is None or not config.stream_mode or config.ring_push:
+            if config is None or config.variant is not IpcVariant.STAGED:
                 continue
             assert config.blocks % 4 == 0, f"{profile} batch={batch} -> {config}"
 
@@ -143,12 +193,12 @@ def _load_benchmark_module():
 def test_protocol_ab_picks_the_right_history_per_kernel() -> None:
     """The A/B baseline must match what each kernel actually used to run.
 
-    The kernels do not share one history: TP2, TP4 and the TP8 pack kernel
-    double-buffered by per-block parity, while the two staged TP8 kernels had no
-    epoch at all. Comparing against the wrong one measures a protocol that never
-    shipped, which is not a performance result -- and the tuning table decides
-    which kernel a shape lands on, so a table edit could silently flip a row's
-    label. Pinned here for that reason.
+    The kernels do not share one history: TP2, TP4, the TP8 pack kernel and the
+    flat-staged kernel double-buffered by per-block parity, while the two
+    topology-staged TP8 kernels had no epoch at all. Comparing against the wrong
+    one measures a protocol that never shipped, which is not a performance
+    result -- and the tuning table decides which kernel a shape lands on, so a
+    table edit could silently flip a row's label. Pinned here for that reason.
     """
     bench = _load_benchmark_module()
     pick = bench._historical_switch
@@ -160,8 +210,11 @@ def test_protocol_ab_picks_the_right_history_per_kernel() -> None:
                 if config is None:
                     continue
                 got = pick(world_size, config)
-                staged_tp8 = world_size == 8 and config.stream_mode
-                want = "no-block-epoch" if staged_tp8 else "per-block-epoch"
+                topo_staged_tp8 = world_size == 8 and config.variant in (
+                    IpcVariant.STAGED,
+                    IpcVariant.STAGED_RING,
+                )
+                want = "no-block-epoch" if topo_staged_tp8 else "per-block-epoch"
                 assert got == want, (
                     f"{profile} ws={world_size} batch={batch} -> {config}: "
                     f"baseline {got}, expected {want}"
@@ -208,20 +261,23 @@ def test_protocol_ab_plan_partitions_shapes_by_history() -> None:
     shapes = _shape_config(PROFILE_ROOTCPLX, 8, 6144, batches)
     plan = plan_of(8, shapes, "auto")
     assert set(plan) == {"per-block-epoch", "no-block-epoch"}
-    pack = plan["per-block-epoch"]
-    staged = plan["no-block-epoch"]
-    assert pack, "the pack kernel must still be covered"
-    assert staged, "the staged kernels must still be covered"
-    assert not set(pack) & set(staged), "a shape may only run under its own history"
-    assert sorted(pack + staged) == sorted(shapes), "every tuned shape must run once"
-    for batch in pack:
-        assert not shapes[batch].stream_mode
-    for batch in staged:
-        assert shapes[batch].stream_mode
+    per_block = plan["per-block-epoch"]
+    no_epoch = plan["no-block-epoch"]
+    assert per_block, "the pack and flat-staged kernels must still be covered"
+    assert no_epoch, "the topology-staged kernels must still be covered"
+    assert not set(per_block) & set(no_epoch), (
+        "a shape may only run under its own history"
+    )
+    assert sorted(per_block + no_epoch) == sorted(shapes), (
+        "every tuned shape must run once"
+    )
+    for batch in per_block:
+        assert shapes[batch].variant in (IpcVariant.UNSTAGED, IpcVariant.FLAT_STAGED)
+    for batch in no_epoch:
+        assert shapes[batch].variant in (IpcVariant.STAGED, IpcVariant.STAGED_RING)
 
-    # The one shape deliberately handed back to NCCL runs in neither leg.
-    assert get_pcie_ipc_launch_config(PROFILE_ROOTCPLX, 8, 6144, 2) is None
-    assert 2 not in pack and 2 not in staged
+    # Batch 2 runs the flat-staged kernel, whose history is per-block parity.
+    assert 2 in per_block
 
     # An explicit switch is a request for that exact comparison, so it keeps
     # every shape and reports the mismatched ones rather than dropping them.

@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import multiprocessing as mp
+import os
 import socket
 import time
 from typing import Any
@@ -24,10 +25,10 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig
+from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from flashinfer.comm.pcie_ipc_topology import PCIE_IPC_PROFILES
 
-# (world_size, hidden, batch, blocks, threads, stream_mode, ring_push)
+# (world_size, hidden, batch, blocks, threads, variant)
 #
 # Between them these cases select every kernel the header can dispatch to.
 # Most mirror what the tuning table picks on a switch-free PCIe machine; the
@@ -36,17 +37,18 @@ from flashinfer.comm.pcie_ipc_topology import PCIE_IPC_PROFILES
 _JOIN_TIMEOUT_S = 600
 
 _CASES = [
-    (2, 2048, 1, 32, 64, False, False),  # tp2, unstaged
-    (2, 2048, 8, 96, 64, True, False),  # tp2, staged
-    (2, 2048, 128, 16, 128, False, False),
-    (4, 4096, 1, 1, 128, True, False),  # rsag push
-    (4, 4096, 8, 1, 256, True, True),  # rsag ring push
-    (4, 4096, 128, 4, 256, True, True),
-    (4, 4096, 16, 8, 256, False, False),  # coverage: one-shot push
-    (8, 6144, 1, 32, 128, False, False),  # topo pack (blocks % 4 == 0)
-    (8, 6144, 8, 1, 256, True, True),  # topo ring push
-    (8, 6144, 128, 2, 256, True, True),
-    (8, 6144, 16, 8, 256, True, False),  # coverage: topo block (blocks % 4 == 0)
+    (2, 2048, 1, 32, 64, IpcVariant.UNSTAGED),  # tp2, unstaged
+    (2, 2048, 8, 96, 64, IpcVariant.STAGED),  # tp2, staged
+    (2, 2048, 128, 16, 128, IpcVariant.UNSTAGED),
+    (4, 4096, 1, 1, 128, IpcVariant.STAGED),  # rsag push
+    (4, 4096, 8, 1, 256, IpcVariant.STAGED_RING),  # rsag ring push
+    (4, 4096, 128, 4, 256, IpcVariant.STAGED_RING),
+    (4, 4096, 16, 8, 256, IpcVariant.UNSTAGED),  # coverage: one-shot push
+    (8, 6144, 1, 32, 128, IpcVariant.UNSTAGED),  # topo pack
+    (8, 6144, 2, 1, 128, IpcVariant.FLAT_STAGED),  # generic rsag at 8 ranks
+    (8, 6144, 8, 1, 256, IpcVariant.STAGED_RING),  # topo ring push
+    (8, 6144, 128, 2, 256, IpcVariant.STAGED_RING),
+    (8, 6144, 16, 8, 256, IpcVariant.STAGED),  # coverage: topo block (blocks % 4 == 0)
 ]
 
 
@@ -137,7 +139,7 @@ def _correctness_worker(
         # a valid profile was resolved; which one is a property of the machine.
         assert ws.profile in PCIE_IPC_PROFILES, ws.profile_reason
 
-        for _, hidden, batch, blocks, threads, stream_mode, ring_push in cases:
+        for _, hidden, batch, blocks, threads, variant in cases:
             shape = (batch, hidden)
             # Small integers so the reduction is exact in every dtype and the
             # comparison can use a zero tolerance; the kernel sums in a
@@ -161,7 +163,7 @@ def _correctness_worker(
             # The explicit config then pins the kernel this case exists for.
             out = ws.all_reduce(
                 inp,
-                config=IpcLaunchConfig(blocks, threads, stream_mode, ring_push),
+                config=IpcLaunchConfig(blocks, threads, variant),
             )
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
@@ -435,8 +437,8 @@ def _single_block_epoch_worker(world_size: int, rank: int, port: int) -> None:
         ws = comm.PcieIpcAllReduceWorkspace(
             group=group, max_numel=hidden * 8, dtype=torch.bfloat16, profile="rootcplx"
         )
-        one = IpcLaunchConfig(1, 256, True, True)
-        many = IpcLaunchConfig(4, 256, True, True)
+        one = IpcLaunchConfig(1, 256, IpcVariant.STAGED_RING)
+        many = IpcLaunchConfig(4, 256, IpcVariant.STAGED_RING)
         payloads = [
             torch.randint(1, 16, (8, hidden), dtype=torch.int32, device=device).to(
                 torch.bfloat16
@@ -508,7 +510,7 @@ def _switchpair_region_worker(world_size: int, rank: int, port: int) -> None:
                 torch.empty(b, hidden, dtype=torch.bfloat16, device=device)
             )
             assert cfg is not None, f"batch {b} unexpectedly untuned"
-            seen_regions.add(cfg.stream_mode)
+            seen_regions.add(cfg.variant != IpcVariant.UNSTAGED)
             x = (
                 torch.randint(1, 16, (b, hidden), dtype=torch.int32, device=device).to(
                     torch.bfloat16
@@ -540,6 +542,87 @@ def test_pcie_ipc_switchpair_region_alternation(world_size: int) -> None:
     if world_size > torch.cuda.device_count():
         pytest.skip("not enough GPUs")
     multi_process_parallel(world_size, _switchpair_region_worker)
+
+
+# Every TP8 variant at several launch configurations. The table interleaves
+# these as the batch changes, so this is a sequence a caller can produce.
+#
+# The order is not arbitrary. Each call flips its region's epoch, so a sequence
+# that alternates strictly between the sentinel and topology kernels locks each
+# of them onto one half and the sentinel kernel never meets the other's
+# leftovers -- it passes whatever region they are in. Two topology calls in a
+# row dirty both halves, and two sentinel calls in a row then have to read both.
+_MIXED_TP8 = [
+    IpcLaunchConfig(32, 128, IpcVariant.UNSTAGED),
+    IpcLaunchConfig(4, 128, IpcVariant.STAGED),
+    IpcLaunchConfig(1, 128, IpcVariant.STAGED_RING),
+    IpcLaunchConfig(1, 128, IpcVariant.FLAT_STAGED),
+    IpcLaunchConfig(2, 256, IpcVariant.FLAT_STAGED),
+    IpcLaunchConfig(12, 256, IpcVariant.UNSTAGED),
+    IpcLaunchConfig(8, 256, IpcVariant.STAGED),
+    IpcLaunchConfig(1, 512, IpcVariant.FLAT_STAGED),
+]
+# The owner partition is derived from the pack count, so the batch has to move
+# too: a fixed shape only ever exercises one set of chunk boundaries.
+_MIXED_TP8_BATCHES = [1, 2, 3, 5, 8]
+
+
+def _mixed_variant_worker(world_size: int, rank: int, port: int) -> None:
+    """Every TP8 variant interleaved on one workspace, across several shapes.
+
+    Sentinel kernels and barrier kernels cannot share a scratch region (see
+    ScratchRegion in pcie_ipc_all_reduce.cuh). A violation is wrong output on a
+    subset of ranks, not a hang, which is why this asserts group-wide.
+
+    Distinct payloads per call are essential. With one payload reused, a stale
+    read returns the value the call would have computed anyway and the whole
+    sequence passes while proving nothing.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        hidden = 6144
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=hidden * max(_MIXED_TP8_BATCHES),
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+        )
+        call = 0
+        for batch in _MIXED_TP8_BATCHES:
+            for config in _MIXED_TP8:
+                inp = torch.randint(
+                    0, 16, (batch, hidden), dtype=torch.int32, device=device
+                ).to(torch.bfloat16) + float(call % 11)
+                ref = inp.clone()
+                dist.all_reduce(ref, group=group)
+                out = ws.all_reduce(inp, config=config)
+                # Group-wide: the hazard corrupts a subset of ranks, so a
+                # rank-local assertion can pass on rank 0 while the collective
+                # is wrong elsewhere.
+                wrong = torch.tensor([int((out != ref).sum().item())], device=device)
+                dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+                assert int(wrong.item()) == 0, (
+                    f"call {call} (batch {batch}, {config}) produced "
+                    f"{int(wrong.item())} wrong elements: a variant is reading "
+                    "scratch another variant left dirty"
+                )
+                call += 1
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_mixed_variants_share_no_scratch(world_size: int) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(world_size, _mixed_variant_worker)
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -613,3 +696,403 @@ def test_pcie_ipc_unsupported_shapes(world_size: int) -> None:
     if world_size > torch.cuda.device_count():
         pytest.skip("not enough GPUs")
     multi_process_parallel(world_size, _unsupported_shape_worker)
+
+
+_TUNE_HIDDEN = 6144
+_TUNE_BATCHES = (1, 2, 4)
+
+
+def _tune_cache_path(tmpdir: str) -> str:
+    return os.path.join(tmpdir, "pcie_ipc_tune.json")
+
+
+def _tune_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
+    """Tune, then check the group agrees, the answer is right, and it persists.
+
+    Autotuning a collective is only safe if every rank ends up on the same
+    kernel. Nothing in the kernels checks that -- they spin without a timeout --
+    so the agreement is asserted here rather than assumed.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        path = _tune_cache_path(tmpdir)
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * max(_TUNE_BATCHES),
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=_TUNE_BATCHES,
+        )
+        before = {b: ws.supports(_tune_input(b, device)) for b in _TUNE_BATCHES}
+        ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
+
+        resolved = {}
+        for batch in _TUNE_BATCHES:
+            inp = _tune_input(batch, device)
+            # Tuning must not change which shapes are claimed: admission needs a
+            # comparison against the caller's fallback, and that fallback is not
+            # one of the candidates.
+            assert ws.supports(inp) == before[batch], batch
+            config = ws.tuned_launch_config(inp)
+            assert config is not None
+            resolved[batch] = repr(config)
+
+            ref = inp.clone()
+            dist.all_reduce(ref, group=group)
+            wrong = torch.tensor(
+                [int((ws.all_reduce(inp) != ref).sum().item())], device=device
+            )
+            dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+            assert int(wrong.item()) == 0, (
+                f"batch {batch} is wrong after tuning with {config}"
+            )
+
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, resolved, group=group)
+        assert all(g == gathered[0] for g in gathered), (
+            f"ranks resolved different configurations: {gathered}"
+        )
+        if rank == 0:
+            assert os.path.isfile(path), "rank 0 must persist the tuned table"
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+def _tune_input(batch: int, device: torch.device) -> torch.Tensor:
+    return torch.randint(
+        0, 16, (batch, _TUNE_HIDDEN), dtype=torch.int32, device=device
+    ).to(torch.bfloat16)
+
+
+def _tune_reuse_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
+    """A second process must reuse the persisted table without re-tuning.
+
+    Loading has to be eager and identical on every rank. A rank that picked up
+    the file later than its peers -- or dropped entries the others kept --
+    would run a different kernel, and the group hangs rather than errors.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        from flashinfer.autotuner import AutoTuner
+
+        AutoTuner.get().clear_cache()
+        AutoTuner.get().load_configs(_tune_cache_path(tmpdir))
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * max(_TUNE_BATCHES),
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=_TUNE_BATCHES,
+        )
+        assert not AutoTuner.get().is_tuning_mode, (
+            "reuse must not enter tuning mode; a collective sweep here would be "
+            "a several-second stall in a serving process"
+        )
+        resolved, differs = {}, 0
+        for batch in _TUNE_BATCHES:
+            inp = _tune_input(batch, device)
+            config = ws.tuned_launch_config(inp)
+            resolved[batch] = repr(config)
+            if config != ws.launch_config(inp):
+                differs += 1
+            ref = inp.clone()
+            dist.all_reduce(ref, group=group)
+            wrong = torch.tensor(
+                [int((ws.all_reduce(inp) != ref).sum().item())], device=device
+            )
+            dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+            assert int(wrong.item()) == 0, batch
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, resolved, group=group)
+        assert all(g == gathered[0] for g in gathered), gathered
+        # If the reloaded table never disagreed with the hand table, the test
+        # would pass while proving nothing about persistence.
+        assert differs > 0, (
+            "the persisted table resolved to the hand-written configuration "
+            "everywhere, so this test did not exercise the cache"
+        )
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+def _tune_cardinality_worker(
+    world_size: int, rank: int, port: int, tmpdir: str
+) -> None:
+    """Every rank must issue the identical number of launches while tuning.
+
+    The whole search is a chain of unsynchronised collectives. One rank issuing
+    a different number of them -- because it screened a different candidate set,
+    or returned early -- leaves the rest spinning with no timeout. Counting is
+    the only way to observe it from outside.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * 2,
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=(1, 2),
+        )
+        launches = 0
+        original = ws._launch
+
+        def counting(*args, **kwargs):
+            nonlocal launches
+            launches += 1
+            return original(*args, **kwargs)
+
+        ws._launch = counting
+        try:
+            ws.tune([_TUNE_HIDDEN], cache=_tune_cache_path(tmpdir), warmup=2, repeat=5)
+        finally:
+            ws._launch = original
+
+        counts = [None] * world_size
+        dist.all_gather_object(counts, launches, group=group)
+        assert len(set(counts)) == 1, (
+            f"ranks issued different numbers of launches while tuning: {counts}"
+        )
+        assert counts[0] > 0
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+def _tune_gate_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
+    """A candidate that computes the wrong answer must not survive screening.
+
+    The autotuner ranks purely on time, and this protocol's failure mode is a
+    sentinel poll returning stale data -- wrong *and* fast. The corruption is
+    injected in Python rather than by rebuilding a broken kernel: the point is
+    to test the gate, and a genuinely broken build can spin instead of finish.
+    """
+    ws = None
+    group = None
+    tune_group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        from flashinfer.autotuner import set_autotune_process_group
+
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * 2,
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=(1, 2),
+        )
+        # Screening only runs when a real search is safe, so install the group
+        # the search would have.
+        tune_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+        set_autotune_process_group(tune_group)
+        from flashinfer.comm.pcie_ipc_tuning import candidate_tactics, tactic_to_config
+
+        poisoned = tactic_to_config(candidate_tactics(world_size, ws.max_blocks)[3])
+        original = ws._launch
+
+        def sabotage(inp, out, config, enable_pdl=False):
+            original(inp, out, config, enable_pdl)
+            if config == poisoned:
+                out.add_(1)
+
+        ws._launch = sabotage
+        try:
+            inp = _tune_input(2, device)
+            survivors = ws._runner.get_valid_tactics([inp], None)
+        finally:
+            ws._launch = original
+            set_autotune_process_group(None)
+
+        from flashinfer.comm.pcie_ipc_tuning import config_to_tactic
+
+        assert config_to_tactic(poisoned) not in survivors, (
+            f"{poisoned} computed the wrong answer but survived screening"
+        )
+        assert len(survivors) > 1, "screening must not reject everything"
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if tune_group is not None:
+            dist.destroy_process_group(tune_group)
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_tune_cardinality(world_size: int, tmp_path) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(
+        world_size, _tune_cardinality_worker, (str(tmp_path),), timeout_s=900
+    )
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_tune_gate_excludes_wrong_candidates(
+    world_size: int, tmp_path
+) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(
+        world_size, _tune_gate_worker, (str(tmp_path),), timeout_s=600
+    )
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_tune_end_to_end(world_size: int, tmp_path) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    tmpdir = str(tmp_path)
+    multi_process_parallel(world_size, _tune_worker, (tmpdir,), timeout_s=1200)
+    multi_process_parallel(world_size, _tune_reuse_worker, (tmpdir,), timeout_s=600)
+
+
+def _standard_idiom_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
+    """The library's usual ``with autotune(True)`` idiom must work here too.
+
+    ``tune()`` is a convenience, not the only entry point -- a caller who knows
+    FlashInfer should not have to learn a second way to tune one operator.
+    """
+    ws = None
+    group = None
+    tune_group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        from flashinfer.autotuner import (
+            AutoTuner,
+            autotune,
+            set_autotune_process_group,
+        )
+
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * 2,
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=(1, 2),
+        )
+        path = os.path.join(tmpdir, "idiom.json")
+        tune_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+        set_autotune_process_group(tune_group)
+        try:
+            with autotune(True, cache=path):
+                for _ in range(2):
+                    for batch in (1, 2):
+                        ws.all_reduce(_tune_input(batch, device))
+        finally:
+            set_autotune_process_group(None)
+
+        resolved = {}
+        for batch in (1, 2):
+            inp = _tune_input(batch, device)
+            ref = inp.clone()
+            dist.all_reduce(ref, group=group)
+            wrong = torch.tensor(
+                [int((ws.all_reduce(inp) != ref).sum().item())], device=device
+            )
+            dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+            assert int(wrong.item()) == 0, batch
+            resolved[batch] = repr(ws.tuned_launch_config(inp))
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, resolved, group=group)
+        assert all(g == gathered[0] for g in gathered), gathered
+        assert AutoTuner.get().stats.tuned_op_successful_configs.get(
+            comm.PCIE_IPC_CUSTOM_OP
+        ), "the standard idiom must actually have profiled something"
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if tune_group is not None:
+            dist.destroy_process_group(tune_group)
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+def _stray_tuning_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
+    """A tuning session that forgot the reduction group must degrade, not hang.
+
+    Tuning mode is process-global, so a caller tuning its GEMMs sweeps this
+    operator too. Without a reduction over the candidate timings every rank
+    would argmin independently and they would not agree on a kernel -- which
+    this protocol does not survive. The search has to notice and decline.
+    """
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        from flashinfer.autotuner import autotune, get_autotune_process_group
+
+        assert get_autotune_process_group() is None
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * 2,
+            dtype=torch.bfloat16,
+            profile="rootcplx",
+            tune_batches=(1, 2),
+        )
+        with pytest.warns(RuntimeWarning, match="no matching"), autotune(True):
+            for batch in (1, 2):
+                inp = _tune_input(batch, device)
+                ref = inp.clone()
+                dist.all_reduce(ref, group=group)
+                wrong = torch.tensor(
+                    [int((ws.all_reduce(inp) != ref).sum().item())], device=device
+                )
+                dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+                assert int(wrong.item()) == 0, batch
+                # The table's answer, unchanged: nothing was searched.
+                assert ws.tuned_launch_config(inp) == ws.launch_config(inp)
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_tune_via_standard_idiom(world_size: int, tmp_path) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(
+        world_size, _standard_idiom_worker, (str(tmp_path),), timeout_s=900
+    )
+
+
+@pytest.mark.parametrize("world_size", [8])
+def test_pcie_ipc_stray_tuning_session_degrades(world_size: int, tmp_path) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(
+        world_size, _stray_tuning_worker, (str(tmp_path),), timeout_s=300
+    )
