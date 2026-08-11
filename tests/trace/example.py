@@ -76,8 +76,6 @@ rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_nvfp4_quantize_k16384.json
-top_k_cub_k128.json
-top_k_cub_k256.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -186,17 +184,6 @@ flashinfer.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 # ── sampling (Qwen3 vocab=151936) ─────────────────────────────────────────────
 probs = torch.rand(64, 151936, dtype=torch.float32, device=device)
 flashinfer.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
-
-# ── batched top-k selection via CUB (Llama vocab=32000) ──────────────────────
-# d > 8192 routes to the cluster backend (SM90+); the trace JSON dumps before
-# the kernel launches, so the JSON appears on any GPU.
-logits = torch.randn(64, 32000, dtype=torch.float32, device=device)
-with contextlib.suppress(Exception):
-    flashinfer.top_k_cub(logits, 256)
-# Variable-length rows: top-k over logits[i, :lengths[i]].
-cub_lengths = torch.randint(1, 32001, (64,), dtype=torch.int32, device=device)
-with contextlib.suppress(Exception):
-    flashinfer.top_k_cub(logits, 128, cub_lengths)
 
 # ── Activation functions (LLaMA/Mistral FFN, hidden=8192 gate+up) ─────────────
 # Input shape is [T, 2*H] where H is the output (post-gate) hidden dim.

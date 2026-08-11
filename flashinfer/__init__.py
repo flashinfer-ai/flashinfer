@@ -229,7 +229,6 @@ from .tllm_enums import (
 )
 from . import topk as topk
 from .topk import top_k as top_k
-from .topk import top_k_cub as top_k_cub
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
 from .topk import TopKTieBreak as TopKTieBreak
