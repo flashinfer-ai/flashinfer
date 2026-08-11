@@ -412,7 +412,8 @@ def gated_delta_product_mtp(
             expanded_q.size(1),
             max(q.size(2), v.size(2)),
             q.size(3),
-            dtype=output.dtype if output is not None else q.dtype,
+            # kernel hardcodes bf16...
+            dtype=torch.bfloat16,
             device=output.device if output is not None else q.device,
         )
     elif expanded_output.shape != (
@@ -475,4 +476,4 @@ def gated_delta_product_mtp(
     else:
         output = expanded_output[:, num_householder - 1 :: num_householder].clone()
 
-    return output, state
+    return output.to(q.dtype), state
