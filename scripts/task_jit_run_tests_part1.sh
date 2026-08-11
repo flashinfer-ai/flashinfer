@@ -13,6 +13,13 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
+# Print the resolved TVM-FFI version right before tests (traceability for the
+# pre-release verification in PR #2599; the override itself is applied by
+# setup_test_env.sh sourced above).
+echo "Checking TVM-FFI version before tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
 # Run each test file separately to isolate CUDA memory issues
 # moe_ep unit subset: host-only + single-GPU (multirank/mega auto-skip via
 # markers; see tests/moe_ep/run_tests.sh and docs/design_docs/moe_ep_runbook.md)
