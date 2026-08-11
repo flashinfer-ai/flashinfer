@@ -281,9 +281,15 @@ class TllmGenFmhaKernel {
 
     // Override SageAttention parameters.
     auto sageParamEncode = [](int blockSize) -> int32_t {
+      if (blockSize == -1) {
+        return 32;
+      }
+      if (blockSize == 0) {
+        return -1;
+      }
       FLASHINFER_CHECK((blockSize & (blockSize - 1)) == 0,
                        "SageAttention block size must be a power of 2.");
-      return blockSize == 0 ? 0 : __builtin_ctz(static_cast<unsigned int>(blockSize));
+      return __builtin_ctz(static_cast<unsigned int>(blockSize));
     };
     kernelParams.ptrSageAttnSfsQ = params.ptrSageAttnSfsQ;
     kernelParams.ptrSageAttnSfsK = params.ptrSageAttnSfsK;

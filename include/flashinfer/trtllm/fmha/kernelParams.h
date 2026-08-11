@@ -203,7 +203,7 @@ struct KernelParams {
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
   static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ,
-                                  bool groupsTokensHeadsQ, int32_t tileSizeQ,
+                                  bool groupsTokensHeadsQ, int32_t tileSizeQ, int32_t stepQ,
                                   int32_t numEltsInClampedHeadDimQ) {
     //
     // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
@@ -275,7 +275,10 @@ struct KernelParams {
     auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1,
                                             static_cast<uint32_t>(tileSizeQ)};
     // The number of tokensQ per CTA.
-    int32_t numTokensPerCtaQ{tileSizeQ};
+    // stepQ includes all Q instructions issued by one CTA.  The cubin's static scheduler consumes
+    // mNumTokensPerCtaQ, so using only tileSizeQ here makes the host launch ABI disagree with
+    // TensorRT-LLM whenever NumInstsQ > 1 (the H3 public cubin is 128 * 2 = 256).
+    int32_t numTokensPerCtaQ{stepQ};
     // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
     if (groupsHeadsQ) {
       if (groupsTokensHeadsQ) {
@@ -285,7 +288,7 @@ struct KernelParams {
         // this in the future.
         numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
       } else {
-        numGroupedHeads = tileSizeQ;
+        numGroupedHeads = stepQ;
         numTokensPerCtaQ = 1;
       }
       tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
@@ -299,47 +302,20 @@ struct KernelParams {
   // Create the TMA shape/stride for O.
   template <class FmhaOptions>
   static auto makeTmaShapeStrideO(FmhaOptions const& options) {
-    //
-    // TODO: refactor this as makeTmaShapeStrideQ when removing cutlass tma copy.
-    //
-
-    // The number of tokens.
-    int32_t numTokens{options.mSumOfSeqLensQ};
-
-    // The number of heads per K/V head.
-    int32_t numHeadsQPerKv{options.mNumHeadsQPerKv};
-
-    // The batch dimension.
-    int32_t batchSize{1};
-
-    // The cute tensor shape for Q/O: (numTokens, headDim, ((numHeadsKv, numHeadsQPerKv),
-    // batchSize)). This maps to flattened TMA shape for Q/O: (headDim, numTokens, numHeadsKv.
-    // numHeadsQPerKv, batchSize). Note that TMA descriptor expects the first dimension's stride to
-    // be 1, so swap the first two dimension so that the headDim dimension comes first.
+    // Match the public TensorRT-LLM cubin ABI exactly.  O is flattened as
+    // [batch, token, q_head, head_dim], with head_dim as the descriptor's innermost dimension.
+    int32_t numTokens{options.mSupportsVarSeqLens ? options.mSumOfSeqLensQ : options.mMaxSeqLenQ};
+    int32_t batchSize{options.mSupportsVarSeqLens ? 1 : options.mBatchSize};
     auto shape = std::vector<uint64_t>{
-        static_cast<uint64_t>(options.mHeadDimV), static_cast<uint64_t>(numTokens),
-        static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(numHeadsQPerKv),
-        static_cast<uint64_t>(batchSize)};
+        static_cast<uint64_t>(options.mHeadDimV), static_cast<uint64_t>(options.mNumHeadsQ),
+        static_cast<uint64_t>(numTokens), static_cast<uint64_t>(batchSize)};
 
-    // The hidden dimension.
-    int32_t const hiddenDimO{options.mNumHeadsQ * options.mHeadDimV};
-
-    // The stride between tokens.
-    int32_t strideTokens{hiddenDimO};
-
-    // The stride between Q heads.
-    int32_t strideHeadsQ{options.mNumHeadsKv * options.mHeadDimV};
-
-    // The stride between sequences.
-    int32_t strideBatch{0};
-
-    // The stride in between K/V heads.
-    int32_t strideHeadsKv{options.mHeadDimV};
-    // Assemble the stride (strideTokens, 1, ((strideHeadsKv, strideHeadsQ), strideBatch)).
-    // Swap the first two dimension as mentioned before.
-    auto stride = std::vector<uint64_t>{
-        1, static_cast<uint64_t>(strideTokens), static_cast<uint64_t>(strideHeadsKv),
-        static_cast<uint64_t>(strideHeadsQ), static_cast<uint64_t>(strideBatch)};
+    std::vector<uint64_t> stride(4, uint64_t{0});
+    stride[0] = 1;
+    stride[1] = stride[0] * options.mHeadDimV;
+    stride[2] = stride[1] * options.mNumHeadsQ;
+    stride[3] = options.mSupportsVarSeqLens ? uint64_t{0}
+                                            : stride[2] * options.mMaxSeqLenQ;
 
     return std::make_tuple(shape, stride);
   }
@@ -686,7 +662,8 @@ struct KernelParams {
     // Shape/stride for gmem tensor Q.
     auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] =
         makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
-                            kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+                            kernelMeta.mTileSizeQ, kernelMeta.mStepQ,
+                            numEltsInClampedHeadDimQ);
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));
@@ -819,7 +796,7 @@ struct KernelParams {
     // The tileShapes for O.
     std::vector<uint32_t> tileShapeO(shapeO.size(), 1);
     tileShapeO[0] = numEltsInClampedHeadDimQ;
-    tileShapeO[1] = kernelMeta.mTileSizeQ;
+    tileShapeO[2] = kernelMeta.mTileSizeQ;
     params.tmaO_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO,
                                         const_cast<void*>(options.oPtr));
 
@@ -897,7 +874,7 @@ struct KernelParams {
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
     params.mNumHeadsQPerKvDivisor = FastModDivInt32(options.mNumHeadsQPerKv);
-    params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
+    params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimV;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
