@@ -10,7 +10,7 @@ from ...weights import MoEWeightPack
 if TYPE_CHECKING:
     import torch
 
-    from ...algo_knobs import FleetAlgoKnobQuantization
+    from ...algo_knobs import FleetAlgoKnobFaultTolerance, FleetAlgoKnobQuantization
 
 
 _NIXL_EP_SUPPORTED_HIDDEN_SIZES = frozenset(
@@ -229,6 +229,25 @@ def validate_mega_arch() -> None:
         )
 
 
+def validate_mega_arch_sm90() -> None:
+    """Arch gate for the SM90 (Hopper) mega kernels.
+
+    The Hopper FP8 CuTeDSL mega kernel is compiled for sm_90 exactly (WGMMA
+    warp specialization; the fork is 1-CTA-only and does not target Blackwell
+    — Blackwell hosts use the sm_100 tree's kernels instead).
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc != (9, 0):
+        raise MoEEpArchError(
+            f"sm90_pull_fp8 mega kernel requires sm_90 (Hopper); host has "
+            f"sm_{cc[0]}{cc[1]}"
+        )
+
+
 def validate_fleet_weights(
     weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:
@@ -356,8 +375,18 @@ def validate_fleet_params(
     world_size: int,
     quant: "FleetAlgoKnobQuantization | None" = None,
     topology_capacity: int | None = None,
+    fault_tolerance: "FleetAlgoKnobFaultTolerance | None" = None,
 ) -> None:
     import torch
+
+    if fault_tolerance is not None and fault_tolerance.enabled:
+        if params.algorithm is not EpAlgorithm.LOW_LATENCY:
+            raise MoEEpConfigError(
+                f"{backend}: fault tolerance (FleetAlgoKnobFaultTolerance) requires "
+                "algorithm=LOW_LATENCY. nccl_ep leaves the mask buffer NULL under "
+                "HIGH_THROUGHPUT and the mask APIs then abort the process; nixl_ep "
+                "has no HT mask support at all."
+            )
 
     if backend == "nixl_ep":
         if params.algorithm is not EpAlgorithm.LOW_LATENCY:
@@ -374,6 +403,14 @@ def validate_fleet_params(
         if cap <= 0:
             raise MoEEpConfigError(
                 f"nixl_ep: topology capacity ({cap}) must be positive"
+            )
+        if cap < world_size:
+            # Buffer.update_memory_buffers sizes every per-rank array (RDMA,
+            # mask, sync) to the capacity, so a capacity below the live world
+            # indexes out of bounds inside the transport rather than here.
+            raise MoEEpConfigError(
+                f"nixl_ep: topology capacity ({cap}) must be >= world_size "
+                f"({world_size})"
             )
         if params.num_experts % cap != 0:
             raise MoEEpConfigError(

@@ -1,3 +1,5 @@
+import functools
+import math
 from enum import IntEnum
 
 import torch
@@ -8,12 +10,19 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu import warpgroup
 
+from ...utils import (
+    _get_cache_buf,
+    get_compute_capability,
+    get_device_name,
+    get_device_sm_count,
+)
 from .alpha import AlphaProcessor
 from .collective_inverse_hmma import CollectiveInverse
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import (
     KeyedCompileMixin,
     cached_compile,
+    get_cached_compile,
     sm12x_compile_options,
 )
 from .helpers import (
@@ -37,6 +46,16 @@ from .varlen_helper import (
 )
 from .delta_rule_sm120 import _FullyFusedDeltaRuleSm120
 from .schedule import WorkDesc
+
+
+@functools.cache
+def _sm120_compile_options(device):
+    return (cute.EnableTVMFFI(True),) + sm12x_compile_options(device)
+
+
+def _get_cp_workspace(name, shape, dtype, device):
+    nbytes = math.prod(shape) * dtype.itemsize
+    return _get_cache_buf(name, nbytes, device)[:nbytes].view(dtype).view(shape)
 
 
 class NamedBarrier(IntEnum):
@@ -63,13 +82,17 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
         self,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
         self.inverse_dtype = cutlass.Float16
         self.BLK = 64
         self.D = 128
-        self.manual_cache_key("dtype", "acc_dtype", "inverse_dtype", "BLK", "D")
+        self.manual_cache_key(
+            "dtype", "acc_dtype", "cu_seqlens_dtype", "inverse_dtype", "BLK", "D"
+        )
 
     @cute.jit
     def load_k_tile_tma(
@@ -454,6 +477,11 @@ class CPDeltaRuleTPrecomputeSm120(KeyedCompileMixin):
             beta_pipeline.consumer_release(beta_consumer_state)
 
 
+@functools.cache
+def _get_t_precompute_kernel(kernel_dtype):
+    return CPDeltaRuleTPrecomputeSm120(kernel_dtype)
+
+
 def cp_delta_rule_t_precompute_dsl_sm120(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -462,6 +490,8 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Precompute signed, beta-folded CP T tiles for the SM120 CP path.
 
@@ -472,9 +502,9 @@ def cp_delta_rule_t_precompute_dsl_sm120(
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
@@ -522,8 +552,11 @@ def cp_delta_rule_t_precompute_dsl_sm120(
                 raise RuntimeError(f"{name} must be contiguous")
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     max_t_blocks_per_seq = max_num_chunks_host(max_seqlen, 64)
-    t = torch.empty(
-        (total_t_blocks, num_sab_heads, 64, 64), dtype=k.dtype, device=k.device
+    t = _get_cp_workspace(
+        "gdn_cp_sm120_t",
+        (total_t_blocks, num_sab_heads, 64, 64),
+        k.dtype,
+        device,
     )
     if total_t_blocks == 0:
         return t
@@ -537,32 +570,44 @@ def cp_delta_rule_t_precompute_dsl_sm120(
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    compile_options = _sm120_compile_options(device)
+    kernel = _get_t_precompute_kernel(kernel_dtype)
+    compiled = get_cached_compile(kernel, compile_options)
+    if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    kernel = CPDeltaRuleTPrecomputeSm120(kernel_dtype)
-    kernel_args = (
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(t.view(-1), assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(total_t_blocks),
-        cutlass.Int32(max_t_blocks_per_seq),
-        cutlass.Int32(num_seqs),
+        kernel_args = (
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(t.view(-1), assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(total_t_blocks),
+            cutlass.Int32(max_t_blocks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
+    compiled(
+        k_tma,
+        beta.reshape(-1),
+        t.view(-1),
+        cu_seqlens,
+        num_k_heads,
+        num_sab_heads,
+        total_t_blocks,
+        max_t_blocks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options(k.device)
-    )
-    compiled(*kernel_args)
     return t
 
 
@@ -1579,6 +1624,11 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
                 )
 
 
+@functools.cache
+def _get_mn_precompute_kernel(kernel_dtype):
+    return CPDeltaRuleMNPrecomputeSm120(kernel_dtype)
+
+
 def cp_delta_rule_mn_precompute_dsl_sm120(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1590,6 +1640,8 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     max_seqlen: int | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Run the SM120 CP preprocess kernel and return its native output layout.
 
@@ -1600,9 +1652,9 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     Inputs must already be contiguous. This wrapper validates that contract but
     does not materialize contiguous copies.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
             raise RuntimeError(
@@ -1690,11 +1742,12 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
             num_sab_heads * 64 * 64,
         ),
     )
-    transfer_t = torch.empty(
-        (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
+    workspace_shape = (total_cp_chunks, num_sab_heads, d, d)
+    transfer_t = _get_cp_workspace(
+        "gdn_cp_sm120_local_transfer", workspace_shape, torch.float32, device
     )
-    state_t = torch.empty(
-        (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
+    state_t = _get_cp_workspace(
+        "gdn_cp_sm120_local_state", workspace_shape, torch.float32, device
     )
     if total_cp_chunks == 0:
         return transfer_t, state_t
@@ -1704,37 +1757,54 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    compile_options = _sm120_compile_options(device)
+    kernel = _get_mn_precompute_kernel(kernel_dtype)
+    compiled = get_cached_compile(kernel, compile_options)
+    if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    kernel = CPDeltaRuleMNPrecomputeSm120(kernel_dtype)
-    kernel_args = (
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(alpha.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(transfer_t.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(state_t.view(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(max_cp_chunks_per_seq),
-        cutlass.Int32(num_seqs),
+        kernel_args = (
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(alpha.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(transfer_t.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(state_t.view(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(max_cp_chunks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
+    compiled(
+        k_tma,
+        v_tma,
+        t_tma,
+        alpha.view(-1),
+        transfer_t.view(-1),
+        state_t.view(-1),
+        cu_seqlens,
+        cp_chunk_len,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        total_cp_chunks,
+        max_cp_chunks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options(k.device)
-    )
-    compiled(*kernel_args)
     return transfer_t, state_t
 
 
@@ -1743,8 +1813,23 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         LOAD = 0
         MATH = 1
 
-    def __init__(self, needs_initial_state: bool = False):
+    def __init__(
+        self,
+        needs_initial_state: bool = False,
+        store_final_state: bool = False,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        use_state_indices: bool = False,
+        store_initial_state: bool = False,
+    ):
         self.needs_initial_state = needs_initial_state
+        self.store_final_state = store_final_state
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.use_state_indices = use_state_indices
+        self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = 64
         self.row_ctas = 2
@@ -1760,6 +1845,12 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         self.use_3xtf32 = False
         self.manual_cache_key(
             "needs_initial_state",
+            "store_final_state",
+            "initial_state_dtype",
+            "state_dtype",
+            "cu_seqlens_dtype",
+            "use_state_indices",
+            "store_initial_state",
             "D",
             "rows_per_cta",
             "row_ctas",
@@ -1833,10 +1924,13 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         n_consumer_state,
         gFixedState: cute.Tensor,
         gInitialState: cute.Tensor,
+        gInitialStateWorkspace: cute.Tensor,
+        gOutputState: cute.Tensor,
         num_chunks: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
         chunk_start: cutlass.Int32,
         seq_idx: cutlass.Int32,
+        state_idx: cutlass.Int32,
         head_idx: cutlass.Int32,
         row_cta_idx: cutlass.Int32,
         math_tidx: cutlass.Int32,
@@ -1876,7 +1970,19 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         )
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_warp = cute.local_tile(
-                gInitialState[None, None, head_idx, seq_idx],
+                gInitialState[None, None, head_idx, state_idx],
+                (16, self.D),
+                (global_row_base // 16, 0),
+            )
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace_warp = cute.local_tile(
+                gInitialStateWorkspace[None, None, head_idx, seq_idx],
+                (16, self.D),
+                (global_row_base // 16, 0),
+            )
+        if cutlass.const_expr(self.store_final_state):
+            gOutputState_warp = cute.local_tile(
+                gOutputState[None, None, head_idx, state_idx],
                 (16, self.D),
                 (global_row_base // 16, 0),
             )
@@ -1884,6 +1990,12 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         tSMgFixedState = thr_store_C.partition_D(gFixedState_warp)
         if cutlass.const_expr(self.needs_initial_state):
             tSMgInitialState = thr_copy_C.partition_S(gInitialState_warp)
+        if cutlass.const_expr(self.store_initial_state):
+            tSMgInitialStateWorkspace = thr_store_C.partition_D(
+                gInitialStateWorkspace_warp
+            )
+        if cutlass.const_expr(self.store_final_state):
+            tSMgOutputState = thr_store_C.partition_D(gOutputState_warp)
 
         start = cutlass.Int32(0)
         if cutlass.const_expr(not self.needs_initial_state):
@@ -1910,7 +2022,16 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             start = cutlass.Int32(0)
 
             # init tSMrState from initial_state
-            cute.autovec_copy(tSMgInitialState, tSMrState_cv)
+            tSMrState_cv.store(tSMgInitialState.load().to(cutlass.Float32))
+            if cutlass.const_expr(self.store_initial_state):
+                tSMrInitialState = cute.make_tensor(
+                    tSMrState_store.iterator.align(8), tSMrState_store.layout
+                )
+                tSMgInitialStateWorkspace = cute.make_tensor(
+                    tSMgInitialStateWorkspace.iterator.align(8),
+                    tSMgInitialStateWorkspace.layout,
+                )
+                cute.autovec_copy(tSMrInitialState, tSMgInitialStateWorkspace)
 
         for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
             TF32.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)
@@ -1954,6 +2075,12 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
                 tiled_store_C, tSMrState_store, tSMgFixedState, chunk_start + chunk_idx
             )
 
+        if cutlass.const_expr(self.store_final_state):
+            tSMrOutputState = cute.make_rmem_tensor_like(tSMrState, self.state_dtype)
+            tSMrOutputState.store(tSMrState.load().to(self.state_dtype))
+            tSMrOutputState_store = thr_store_C.retile(tSMrOutputState)
+            cute.autovec_copy(tSMrOutputState_store, tSMgOutputState)
+
         return m_consumer_state, n_consumer_state
 
     @cute.jit
@@ -1962,7 +2089,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
+        g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -1997,7 +2127,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             g_transfer_t,
             g_local_state_t,
             g_initial_state_t,
+            g_initial_state_workspace_t,
             g_fixed_state_t,
+            g_output_state_t,
+            g_state_indices_t,
             g_cu_seqlens,
             chunk_len,
             total_cp_chunks,
@@ -2017,7 +2150,10 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
+        g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2074,12 +2210,55 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             (self.D, self.D, num_heads, num_seqs),
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
+        state_idx = seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
-            gInitialState = cute.make_tensor(
-                g_initial_state_t.iterator, fixed_state_layout
-            )
+            if cutlass.const_expr(self.use_state_indices):
+                initial_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    stride=(
+                        g_initial_state_t.stride[2],
+                        g_initial_state_t.stride[3],
+                        g_initial_state_t.stride[1],
+                        g_initial_state_t.stride[0],
+                    ),
+                )
+                gInitialState = cute.make_tensor(
+                    g_initial_state_t.iterator, initial_state_layout
+                )
+            else:
+                gInitialState = cute.make_tensor(
+                    g_initial_state_t.iterator, fixed_state_layout
+                )
         else:
             gInitialState = gFixedState
+        if cutlass.const_expr(self.store_final_state):
+            if cutlass.const_expr(self.use_state_indices):
+                output_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    stride=(
+                        g_output_state_t.stride[2],
+                        g_output_state_t.stride[3],
+                        g_output_state_t.stride[1],
+                        g_output_state_t.stride[0],
+                    ),
+                )
+                gOutputState = cute.make_tensor(
+                    g_output_state_t.iterator, output_state_layout
+                )
+            else:
+                gOutputState = cute.make_tensor(
+                    g_output_state_t.iterator, fixed_state_layout
+                )
+        else:
+            gOutputState = gFixedState
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace = cute.make_tensor(
+                g_initial_state_workspace_t.iterator, fixed_state_layout
+            )
+        else:
+            gInitialStateWorkspace = gFixedState
 
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=128
@@ -2242,10 +2421,13 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
                     n_consumer_state,
                     gFixedState,
                     gInitialState,
+                    gInitialStateWorkspace,
+                    gOutputState,
                     num_chunks,
                     total_cp_chunks,
                     chunk_start,
                     seq_idx,
+                    state_idx,
                     head_idx,
                     row_cta_idx,
                     math_tidx,
@@ -2257,8 +2439,20 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self,
         needs_initial_state: bool = False,
         rows_per_cta: int = 4,
+        store_final_state: bool = False,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
+        use_state_indices: bool = False,
+        store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
+        self.store_final_state = store_final_state
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.use_state_indices = use_state_indices
+        self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = rows_per_cta
         self.row_ctas = self.D // self.rows_per_cta
@@ -2268,6 +2462,12 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self.registers_per_thread = 256
         self.manual_cache_key(
             "needs_initial_state",
+            "store_final_state",
+            "initial_state_dtype",
+            "state_dtype",
+            "cu_seqlens_dtype",
+            "use_state_indices",
+            "store_initial_state",
             "D",
             "rows_per_cta",
             "row_ctas",
@@ -2284,12 +2484,16 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         gFixedState: cute.Tensor,
         gLocalState: cute.Tensor,
         gInitialState: cute.Tensor,
+        gInitialStateWorkspace: cute.Tensor,
         col: cutlass.Int32,
     ) -> cutlass.Int32:
         start = cutlass.Int32(0)
         if cutlass.const_expr(self.needs_initial_state):
             for i in cutlass.range_constexpr(self.rows_per_cta):
-                sState[i, col] = gInitialState[i, col]
+                value = gInitialState[i, col].to(cutlass.Float32)
+                sState[i, col] = value
+                if cutlass.const_expr(self.store_initial_state):
+                    gInitialStateWorkspace[i, col] = value
         else:
             start = cutlass.Int32(1)
             for i in cutlass.range_constexpr(self.rows_per_cta):
@@ -2417,7 +2621,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
+        g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2438,7 +2645,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             g_transfer_t,
             g_local_state_t,
             g_initial_state_t,
+            g_initial_state_workspace_t,
             g_fixed_state_t,
+            g_output_state_t,
+            g_state_indices_t,
             g_cu_seqlens,
             chunk_len,
             total_cp_chunks,
@@ -2458,7 +2668,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         g_transfer_t: cute.Tensor,
         g_local_state_t: cute.Tensor,
         g_initial_state_t: cute.Tensor,
+        g_initial_state_workspace_t: cute.Tensor,
         g_fixed_state_t: cute.Tensor,
+        g_output_state_t: cute.Tensor,
+        g_state_indices_t: cute.Tensor,
         g_cu_seqlens: cute.Tensor,
         chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
@@ -2501,12 +2714,63 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             (self.D, self.D, num_heads, num_seqs),
             stride=(self.D, 1, self.D * self.D, self.D * self.D * num_heads),
         )
+        state_idx = seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
-            gInitialState = cute.make_tensor(
-                g_initial_state_t.iterator, fixed_state_layout
-            )
+            if cutlass.const_expr(self.use_state_indices):
+                initial_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
+                    stride=(
+                        g_initial_state_t.stride[2],
+                        g_initial_state_t.stride[3],
+                        g_initial_state_t.stride[1],
+                        g_initial_state_t.stride[0],
+                    ),
+                )
+                gInitialState = cute.make_tensor(
+                    g_initial_state_t.iterator, initial_state_layout
+                )
+            else:
+                gInitialState = cute.make_tensor(
+                    g_initial_state_t.iterator, fixed_state_layout
+                )
         else:
             gInitialState = gFixedState
+        if cutlass.const_expr(self.store_final_state):
+            if cutlass.const_expr(self.use_state_indices):
+                output_state_layout = cute.make_layout(
+                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
+                    stride=(
+                        g_output_state_t.stride[2],
+                        g_output_state_t.stride[3],
+                        g_output_state_t.stride[1],
+                        g_output_state_t.stride[0],
+                    ),
+                )
+                gOutputState = cute.make_tensor(
+                    g_output_state_t.iterator, output_state_layout
+                )
+            else:
+                gOutputState = cute.make_tensor(
+                    g_output_state_t.iterator, fixed_state_layout
+                )
+            gOutputState_cta = cute.local_tile(
+                gOutputState[None, None, head_idx, state_idx],
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
+            )
+        if cutlass.const_expr(self.store_initial_state):
+            gInitialStateWorkspace = cute.make_tensor(
+                g_initial_state_workspace_t.iterator, fixed_state_layout
+            )
+            gInitialStateWorkspace_cta = cute.local_tile(
+                gInitialStateWorkspace[None, None, head_idx, seq_idx],
+                (self.rows_per_cta, self.D),
+                (row_cta_idx, 0),
+            )
+        else:
+            gInitialStateWorkspace_cta = gFixedState
 
         sState = storage.smem_state.get_tensor(state_layout)
         gTransfer_head = gTransfer[None, None, head_idx, None]
@@ -2525,7 +2789,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         gFixedState_seq = cute.domain_offset((0, 0, chunk_start), gFixedState_cta)
         if cutlass.const_expr(self.needs_initial_state):
             gInitialState_cta = cute.local_tile(
-                gInitialState[None, None, head_idx, seq_idx],
+                gInitialState[None, None, head_idx, state_idx],
                 (self.rows_per_cta, self.D),
                 (row_cta_idx, 0),
             )
@@ -2540,6 +2804,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
                 gFixedState_seq,
                 gLocalState_seq,
                 gInitialState_cta,
+                gInitialStateWorkspace_cta,
                 col,
             )
             cute.arch.sync_threads()
@@ -2552,8 +2817,22 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
                 col,
                 start,
             )
+            if cutlass.const_expr(self.store_final_state):
+                for i in cutlass.range_constexpr(self.rows_per_cta):
+                    gOutputState_cta[i, col] = sState[i, col].to(self.state_dtype)
         gFixedState_gap = cute.domain_offset((0, 0, gap_start), gFixedState_cta)
         self.zero_invalid_slots(gFixedState_gap, gap_end - gap_start, col)
+
+
+@functools.cache
+def _get_fixup_kernel(needs_initial_state, kernel_kind):
+    if kernel_kind == "simt_row4":
+        return CPDeltaRuleFixupSimtSm120(needs_initial_state, 4)
+    if kernel_kind == "simt_row8":
+        return CPDeltaRuleFixupSimtSm120(needs_initial_state, 8)
+    if kernel_kind == "hmma":
+        return CPDeltaRuleFixupHmmaSm120(needs_initial_state)
+    raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
 
 
 def cp_delta_rule_fixup_dsl_sm120(
@@ -2566,6 +2845,8 @@ def cp_delta_rule_fixup_dsl_sm120(
     *,
     _skip_check: bool = False,
     _kernel_kind: str | None = None,
+    _device=None,
+    _stream=None,
 ):
     """Fix CP precompute chunk artifacts into global chunk-boundary states.
 
@@ -2573,9 +2854,9 @@ def cp_delta_rule_fixup_dsl_sm120(
     `(total_cp_chunks, num_heads, DimV, DimK)` layout produced by
     `cp_delta_rule_mn_precompute_dsl_sm120`.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = local_transfer.device if _device is None else _device
     if not _skip_check:
         if local_transfer.ndim != 4:
             raise RuntimeError(
@@ -2640,12 +2921,17 @@ def cp_delta_rule_fixup_dsl_sm120(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = torch.empty_like(local_state)
+    fixed_state = _get_cp_workspace(
+        "gdn_cp_sm120_fixed_state", local_state.shape, local_state.dtype, device
+    )
     if total_cp_chunks == 0:
         return fixed_state
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
     d = local_transfer.shape[-1]
     local_transfer_tma = local_transfer.as_strided(
         (d, d, num_heads, total_cp_chunks),
@@ -2656,18 +2942,7 @@ def cp_delta_rule_fixup_dsl_sm120(
         (d, 1, d * d, num_heads * d * d),
     )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-
     needs_initial_state = initial_state is not None
-    initial_state_cute = (
-        from_dlpack(initial_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_initial_state
-        else None
-    )
     if _kernel_kind is None:
         # NCU on SM120 shows row4 is best for H <= 8 and row8 wins for H = 16.
         # HMMA remains the fallback above that.
@@ -2677,36 +2952,57 @@ def cp_delta_rule_fixup_dsl_sm120(
             _kernel_kind = "simt_row8"
         else:
             _kernel_kind = "hmma"
-    if _kernel_kind == "simt_row4":
-        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 4)  # type: ignore
-    elif _kernel_kind == "simt_row8":
-        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 8)  # type: ignore
-    elif _kernel_kind == "hmma":
-        kernel = CPDeltaRuleFixupHmmaSm120(needs_initial_state)  # type: ignore
-    else:
-        raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
-    kernel_args = (
-        from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
-            leading_dim=1
-        ),
-        from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
-            leading_dim=1
-        ),
-        initial_state_cute,
-        from_dlpack(fixed_state.reshape(-1), assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(num_seqs),
-        cutlass.Int32(num_heads),
+    compile_options = _sm120_compile_options(device)
+    kernel = _get_fixup_kernel(needs_initial_state, _kernel_kind)
+    compiled = get_cached_compile(kernel, compile_options)
+    if compiled is None:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
+        initial_state_cute = (
+            from_dlpack(
+                initial_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_initial_state
+            else None
+        )
+        kernel_args = (
+            from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            initial_state_cute,
+            None,
+            from_dlpack(
+                fixed_state.reshape(-1), assumed_align=128
+            ).mark_layout_dynamic(),
+            None,
+            None,
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(num_seqs),
+            cutlass.Int32(num_heads),
+            stream,
+        )
+        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
+    compiled(
+        local_transfer_tma,
+        local_state_tma,
+        initial_state.reshape(-1) if needs_initial_state else None,
+        None,
+        fixed_state.reshape(-1),
+        None,
+        None,
+        cu_seqlens,
+        cp_chunk_len,
+        total_cp_chunks,
+        num_seqs,
+        num_heads,
         stream,
     )
-    compiled = cached_compile(
-        kernel,
-        *kernel_args,
-        compile_options=sm12x_compile_options(local_transfer.device),
-    )
-    compiled(*kernel_args)
     return fixed_state
 
 
@@ -2738,6 +3034,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
         needs_initial_state: bool = False,
+        store_final_state: bool = True,
     ):
         self.needs_alpha = True
         self.dtype = dtype
@@ -2746,6 +3043,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         self.BLK_KV = 64
         self.D = 128
         self.needs_initial_state = needs_initial_state
+        self.store_final_state = store_final_state
         self.q_stage = 1
         self.k_stage = 1
         self.v_stage = 1
@@ -2757,6 +3055,7 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         self.manual_cache_key(
             "needs_alpha",
             "needs_initial_state",
+            "store_final_state",
             "dtype",
             "acc_dtype",
             "BLK_Q",
@@ -4015,8 +4314,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-        if store_state:
-            self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+        if cutlass.const_expr(self.store_final_state):
+            if store_state:
+                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
     @cute.jit
     def __call__(
@@ -4603,9 +4903,18 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
                     )
 
 
+@functools.cache
+def _get_prefill_kernel(kernel_dtype, needs_initial_state, store_final_state):
+    return CPDeltaRulePrefillSm120(
+        kernel_dtype,
+        needs_initial_state=needs_initial_state,
+        store_final_state=store_final_state,
+    )
+
+
 def cp_delta_rule_prefill_dsl_sm120(
     o: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4620,6 +4929,8 @@ def cp_delta_rule_prefill_dsl_sm120(
     initial_state: torch.Tensor | None = None,
     *,
     _skip_check: bool = False,
+    _device=None,
+    _stream=None,
 ):
     """Run CP main prefill with precomputed T and fixed-up chunk states.
 
@@ -4627,9 +4938,9 @@ def cp_delta_rule_prefill_dsl_sm120(
     workspaces. `state` is the public per-sequence final state in native
     `(DimV, DimK)` layout.
     """
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = q.device if _device is None else _device
     if not _skip_check:
         if q.ndim != 3:
             raise RuntimeError(
@@ -4704,14 +5015,14 @@ def cp_delta_rule_prefill_dsl_sm120(
             )
         expected_fixed_state_shape = (total_cp_chunks, num_sab_heads, d, d)
         expected_state_shape = (num_seqs, num_sab_heads, d, d)
-        if (
-            fixed_state.shape != expected_fixed_state_shape
-            or state.shape != expected_state_shape
+        if fixed_state.shape != expected_fixed_state_shape or (
+            state is not None and state.shape != expected_state_shape
         ):
             raise RuntimeError(
                 "fixed_state/state must have shapes "
                 f"{expected_fixed_state_shape} and {expected_state_shape}, "
-                f"got {tuple(fixed_state.shape)} and {tuple(state.shape)}"
+                f"got {tuple(fixed_state.shape)} and "
+                f"{None if state is None else tuple(state.shape)}"
             )
         if initial_state is not None and initial_state.shape != expected_state_shape:
             raise RuntimeError(
@@ -4792,58 +5103,87 @@ def cp_delta_rule_prefill_dsl_sm120(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    workspace_size = get_device_sm_count(device) * 128
+    tensormaps_t = _get_cache_buf(
+        "gdn_cp_sm120_prefill_tensormaps", workspace_size, device
+    )
+    stream = (
+        _stream
+        if _stream is not None
+        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+    )
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    needs_initial_state = initial_state is not None
+    store_final_state = state is not None
+    kernel = _get_prefill_kernel(kernel_dtype, needs_initial_state, store_final_state)
+    state_arg = state if store_final_state else fixed_state
+    compile_options = _sm120_compile_options(device)
+    compiled = get_cached_compile(kernel, compile_options)
+    if compiled is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    needs_initial_state = initial_state is not None
-    initial_state_cute = (
-        from_dlpack(initial_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_initial_state
-        else None
-    )
-    kernel = CPDeltaRulePrefillSm120(
-        kernel_dtype, needs_initial_state=needs_initial_state
-    )
-    kernel_args = (
-        from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-        from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        from_dlpack(fixed_state.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-        initial_state_cute,
-        from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
-        from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-        cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(cp_chunk_len),
-        cutlass.Int32(total_cp_chunks),
-        cutlass.Int32(max_cp_chunks_per_seq),
-        cutlass.Int32(num_seqs),
+        initial_state_cute = (
+            from_dlpack(
+                initial_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic()
+            if needs_initial_state
+            else None
+        )
+        kernel_args = (
+            from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(state_arg.reshape(-1), assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(
+                fixed_state.reshape(-1), assumed_align=16
+            ).mark_layout_dynamic(),
+            initial_state_cute,
+            from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Float32(scale),
+            cutlass.Int32(num_q_heads),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(cp_chunk_len),
+            cutlass.Int32(total_cp_chunks),
+            cutlass.Int32(max_cp_chunks_per_seq),
+            cutlass.Int32(num_seqs),
+            stream,
+        )
+        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
+    compiled(
+        q_tma,
+        k_tma,
+        v_tma,
+        t_tma,
+        o_tma,
+        alpha.reshape(-1),
+        state_arg.reshape(-1),
+        fixed_state.reshape(-1),
+        initial_state.reshape(-1) if needs_initial_state else None,
+        tensormaps_t,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        cp_chunk_len,
+        total_cp_chunks,
+        max_cp_chunks_per_seq,
+        num_seqs,
         stream,
     )
-    compiled = cached_compile(
-        kernel, *kernel_args, compile_options=sm12x_compile_options(q.device)
-    )
-    compiled(*kernel_args)
 
 
 def cp_delta_rule_dsl_sm120(
     o: torch.Tensor,
-    state: torch.Tensor,
+    state: torch.Tensor | None,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4863,6 +5203,14 @@ def cp_delta_rule_dsl_sm120(
     prefill path. Internal T, M, N, and fixed-state tensors use the varlen
     workspace layout.
     """
+    import cuda.bindings.driver as cuda_driver
+
+    device = q.device
+    device_name = get_device_name(device)
+    device_capability = get_compute_capability(device)
+    num_sms = get_device_sm_count(device)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
     total_seqlen = q.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
     if max_seqlen is None and num_seqs == 1:
@@ -4873,15 +5221,15 @@ def cp_delta_rule_dsl_sm120(
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     if cp_chunk_len is None:
         num_heads = max(q.shape[1], v.shape[1])
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         cp_chunk_len = choose_cp_chunk_len_host(
             max_seqlen,
             num_heads,
             num_sms,
             chunk_len_granularity=cp_chunk_len_granularity,
-            device_capability=torch.cuda.get_device_capability(q.device),
+            device_capability=device_capability,
             total_seqlen=total_seqlen,
-            device_name=torch.cuda.get_device_properties(q.device).name,
+            num_seqs=num_seqs,
+            device_name=device_name,
         )
     if q.ndim != 3:
         raise RuntimeError(
@@ -4936,7 +5284,7 @@ def cp_delta_rule_dsl_sm120(
             f"of k heads, got q={num_q_heads}, k={num_k_heads}, v={num_v_heads}"
         )
     expected_state_shape = (num_seqs, num_sab_heads, d, d)
-    if state.shape != expected_state_shape:
+    if state is not None and state.shape != expected_state_shape:
         raise RuntimeError(
             f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
         )
@@ -4979,7 +5327,14 @@ def cp_delta_rule_dsl_sm120(
             raise RuntimeError(f"{name} must be contiguous")
 
     t = cp_delta_rule_t_precompute_dsl_sm120(
-        k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen, _skip_check=True
+        k,
+        beta,
+        cu_seqlens,
+        total_seqlen,
+        max_seqlen=max_seqlen,
+        _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm120(
         k,
@@ -4991,6 +5346,8 @@ def cp_delta_rule_dsl_sm120(
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
     fixed_state = cp_delta_rule_fixup_dsl_sm120(
         local_transfer,
@@ -5000,6 +5357,8 @@ def cp_delta_rule_dsl_sm120(
         cp_chunk_len=cp_chunk_len,
         initial_state=initial_state,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )
 
     cp_delta_rule_prefill_dsl_sm120(
@@ -5018,4 +5377,6 @@ def cp_delta_rule_dsl_sm120(
         max_seqlen=max_seqlen,
         initial_state=initial_state,
         _skip_check=True,
+        _device=device,
+        _stream=stream,
     )

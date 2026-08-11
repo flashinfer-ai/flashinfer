@@ -17,6 +17,7 @@
 #pragma once
 // clang-format off
 #include <cstdint>
+#include <type_traits>
 
 #include <cute/config.hpp>
 #include <cute/layout.hpp>
@@ -73,14 +74,12 @@ constexpr int get_num_1d_blocks_per_group() {
 
 template <GemmType kGemmType, int BlockM, int BlockN>
 struct Scheduler {
-  static_assert(
-      kGemmType == GemmType::Normal || kGemmType == GemmType::Batched ||
-          kGemmType == GemmType::MGroupedContiguous ||
-          kGemmType == GemmType::MGroupedContiguousWithPsumLayout ||
-          kGemmType == GemmType::MGroupedContiguousWithZeroPadding ||
-          kGemmType == GemmType::MGroupedMasked,
-      "Scheduler supports Normal, Batched, MGroupedContiguous, "
-      "MGroupedContiguousWithPsumLayout, MGroupedContiguousWithZeroPadding, MGroupedMasked.");
+  static_assert(kGemmType == GemmType::Normal || kGemmType == GemmType::Batched ||
+                    kGemmType == GemmType::MGroupedContiguous ||
+                    kGemmType == GemmType::MGroupedContiguousWithPsumLayout ||
+                    kGemmType == GemmType::MGroupedMasked,
+                "Scheduler supports Normal, Batched, MGroupedContiguous, "
+                "MGroupedContiguousWithPsumLayout, MGroupedMasked.");
 
   static constexpr int kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BlockM, BlockN>();
 
@@ -166,29 +165,6 @@ struct Scheduler {
       auto remain_blocks = next_block_idx - current_m_block_cumsum * num_n_blocks;
       get_swizzled_block_idx_local(remain_blocks, num_m_blocks, m_block_idx, n_block_idx);
       return true;
-    } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithZeroPadding) {
-      // ZeroPadding MoE: unpadded raw grouped_layout interpreted as
-      // token_offset[E+1] int32 cumsum WITH leading 0 (= [0, m0, m0+m1, ..., M_total]),
-      // plain row-major (no L2 swizzle).
-      while (true) {
-        if (current_group_idx >= num_groups) return false;
-
-        prev_psum_m = grouped_layout[current_group_idx];
-        current_psum_m = grouped_layout[current_group_idx + 1];
-        int32_t shape_m_cur = current_psum_m - prev_psum_m;
-        num_m_blocks = (shape_m_cur + BlockM - 1) / BlockM;
-
-        int32_t next_cumsum = current_m_block_cumsum + num_m_blocks;
-        if (next_block_idx < next_cumsum * num_n_blocks) break;
-
-        ++current_group_idx;
-        current_m_block_cumsum = next_cumsum;
-      }
-
-      auto remain_blocks = next_block_idx - current_m_block_cumsum * num_n_blocks;
-      m_block_idx = remain_blocks / num_n_blocks;
-      n_block_idx = remain_blocks % num_n_blocks;
-      return true;
     } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
       while (true) {
         // End of the task
@@ -231,6 +207,12 @@ struct Scheduler {
     return current_group_idx;
   }
 };
+
+// SwapAB-aware Scheduler selection shared by every non-ZeroPadding kernel:
+// logical tiles swap with the operands.
+template <GemmType kGemmType, bool kSwapAB, int TileM, int TileN>
+using SelectedScheduler = std::conditional_t<kSwapAB, Scheduler<kGemmType, TileN, TileM>,
+                                             Scheduler<kGemmType, TileM, TileN>>;
 
 }  // namespace sm120_common
 }  // namespace flashinfer::gemm::mxfp8_cute_sm120

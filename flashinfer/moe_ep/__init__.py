@@ -18,10 +18,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .errors import MoEEpNotBuiltError
+from .errors import (
+    MoEEpFaultToleranceUnsupportedError,
+    MoEEpNotBuiltError,
+    MoEEpRankEvictedError,
+    MoEEpTransportError,
+)
 from .algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
+    FleetAlgoKnobFaultTolerance,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -43,6 +49,10 @@ from .backends.mega.kernel.mxfp8_cutedsl import (
 from .backends.mega.kernel.nvfp4_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.sm90_pull_fp8 import (
+    Sm90PullFp8MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
 )
 from .config import (
     BootstrapConfig,
@@ -117,6 +127,7 @@ __all__ = [
     "EpLayout",
     "Fleet",
     "FleetAlgoKnobAllocator",
+    "FleetAlgoKnobFaultTolerance",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",
@@ -134,10 +145,13 @@ __all__ = [
     "MegaConfig",
     "MoEEpArchError",
     "MoEEpConfigError",
+    "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
     "MoEEpNotBuiltError",
+    "MoEEpRankEvictedError",
     "MoEEpSplitLayer",
+    "MoEEpTransportError",
     "MoEEpTensors",
     "MoEWeightPack",
     "PrequantizedMoEWeights",
@@ -148,6 +162,7 @@ __all__ = [
     "Nvfp4CutedslMegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm90PullFp8MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
@@ -166,7 +181,9 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm90_pull_fp8_mega_weights",
     "run_split_kernel",
+    "supports_fault_tolerance",
     "validate_arch_for_backend",
     "validate_bootstrap_process_group_ready",
     "validate_bootstrap_world_size",
@@ -227,6 +244,40 @@ def available_backends() -> list[str]:
     if have_nixl_ep():
         out.append("nixl_ep")
     return out
+
+
+def supports_fault_tolerance(backend: str) -> bool:
+    """True when ``backend`` is built AND can serve the Fleet FT API here.
+
+    Rank masking needs more than the backend being present:
+
+    * ``nccl_ep`` also needs an nccl4py whose ``GroupConfig`` carries
+      ``enable_mask`` and a libnccl exporting the ``ncclEpMask*`` symbols.
+      Both are feature-detected, never version-pinned.
+    * ``nixl_ep``'s mask buffer is allocated unconditionally by
+      ``update_memory_buffers``, so a staged backend always supports it.
+
+    Never raises — safe to call on a host with no transport at all.
+    """
+    if backend == "nccl_ep":
+        if not have_nccl_ep():
+            return False
+        try:
+            import dataclasses
+
+            import nccl.ep
+
+            from .backends.split.comm.nccl_ep._mask_ffi import mask_ffi
+
+            has_field = "enable_mask" in {
+                f.name for f in dataclasses.fields(nccl.ep.GroupConfig)
+            }
+            return has_field and mask_ffi().available
+        except Exception:
+            return False
+    if backend == "nixl_ep":
+        return have_nixl_ep()
+    return False
 
 
 def _require_built(backend: str) -> None:
