@@ -286,7 +286,8 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
 
     Only knobs the config declares are set; ``token_back_mode`` is translated to
     the MXFP8 config's ``token_back_by_dispatch`` bool.  ``config`` is any of the
-    frontend config dataclasses (NVFP4 / MXFP8).  Passing ``knobs=None`` returns
+    frontend config dataclasses (NVFP4 / MXFP8 / BF16 — knobs a dtype's config
+    does not expose are silently dropped).  Passing ``knobs=None`` returns
     the config unchanged.
     """
     if not knobs:

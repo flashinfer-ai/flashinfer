@@ -43,10 +43,10 @@ from `src/` via sys.path (`shim/_paths.bootstrap_paths`).
 
 Layer isolation (enforce on every drop — grep before/after):
 - `shim/` is the **only** layer that imports `src/` packages (`common`,
-  `moe_nvfp4_swapab`, `moe_mxfp8_glu`, `src`).
-- FI backends (`backends/mega/kernel/sm100/{nvfp4_nvfp4,mxfp8_mxfp8}_bf16_cutedsl/`) import kernel
-  helpers/constants/launch entry points **only** from the package `__init__`,
-  never from `src/` directly.
+  `moe_nvfp4_swapab`, `moe_mxfp8_glu`, `moe_bf16_glu`, `src`).
+- FI backends (`backends/mega/kernel/sm100/{nvfp4_nvfp4,mxfp8_mxfp8,bf16_bf16}_bf16_cutedsl/`)
+  import kernel helpers/constants/launch entry points **only** from the
+  package `__init__`, never from `src/` directly.
 - `modes/` talk to backends only; `core/` never imports the kernel drop (its
   only reference is a `sys.modules` lookup in `core/kernel/base.py` for
   fused-stage memo eviction — a no-op when this shim was never loaded).
@@ -87,9 +87,10 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    `tester/solvers/inference_solver.py` (`_correctness_knobs` / `_perf_knobs` /
    `filter_invalid`).
 
-4. **Audit shim compatibility** — `shim/nvfp4.py` and `shim/mxfp8.py` call into `common`,
-   `moe_nvfp4_swapab`, `moe_mxfp8_glu`, and `src` via sys.path imports. Check these
-   entrypoints after updating src/:
+4. **Audit shim compatibility** — `shim/nvfp4.py`, `shim/mxfp8.py`, and
+   `shim/bf16.py` call into `common`, `moe_nvfp4_swapab`, `moe_mxfp8_glu`,
+   `moe_bf16_glu`, and `src` via sys.path imports. Check these entrypoints
+   after updating src/:
 
    | Shim import | Kernel src file |
    |---|---|
@@ -98,6 +99,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    | `from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel` | `src/moe_nvfp4_swapab/megamoe_kernel.py` |
    | `from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue` | `src/moe_nvfp4_swapab/epilogue_refactor.py` |
    | `from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel` | `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py` |
+   | `from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel` (lazy, `shim/bf16.py`) | `src/moe_bf16_glu/megamoe_kernel_bf16.py` |
    | `from src.sym_buffer import SymBufferHost` | `src/src/sym_buffer.py` |
    | `from src.bootstrap import finalize_dist_and_nvshmem` | `src/src/bootstrap.py` |
 
@@ -126,8 +128,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 - `__init__.py` / `shim/` — our adapter layer. The public surface moe_ep depends on
   is `__init__.py`; keep it stable across kernel drops.
-- `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/` and `mxfp8_mxfp8_bf16_cutedsl/` — those are the FI backend
-  wrappers; they import from the package (`__init__.py`) but are not part of this drop.
+- `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`, `mxfp8_mxfp8_bf16_cutedsl/`,
+  and `bf16_bf16_bf16_cutedsl/` — those are the FI backend wrappers; they
+  import from the package (`__init__.py`) but are not part of this drop.
 - `core/runtime/bootstrap.py` — initializes NVSHMEM without touching this
   package (each tree's shim bootstraps its own `src/` paths at import; core
   must never import a specific kernel tree, or it would trip the sm90/sm100
