@@ -31,8 +31,8 @@ from pathlib import Path
 import sys
 
 
-CAKE_REVISION = "87d38d39ec51eaedbb5c287f634de99141bd90cf"
-CAKE_TREE = "b456fd9a6ba29c8c5b24f8c6cbb7cd5ab9493b22"
+CAKE_REVISION = "b89b287ca1c0c1d3d92ae56688404aabb76e5366"
+CAKE_TREE = "5693e582e4315919659955f7fca747777f6f8439"
 SEMANTIC_BASELINE = "2396fef3d7132a8c6b49a962f2864c83fff29155"
 
 LICENSE_HEADER = """/*
@@ -76,9 +76,9 @@ VARIANTS = {
         binding_filename="flashkda_bf16_fused_m128_n16_binding.cu",
         cake_revision=CAKE_REVISION,
         cake_tree=CAKE_TREE,
-        module_ident="flashkda_bf16_fused_m128_b3a8571118",
-        raw_sha256="91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925",
-        raw_bytes=140760,
+        module_ident="flashkda_bf16_fused_m128_de41cb34a6",
+        raw_sha256="b4ec98f5914e7f8939e18d79ed45a538c5a09e669566917325b7d08037ad4144",
+        raw_bytes=145002,
         smem_bytes=219136,
     ),
     "n32": Variant(
@@ -99,14 +99,14 @@ PROFILES = {
         "arch": "sm_100a",
         "profile": "flashkda-bf16-fused-m128-n16-sm100",
         "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
-        "profile_sha256": "df8a5ee4e8d5a48a0773cfc2f8ba916bb21e8deb685e8be6ccec4045c6ea200f",
+        "profile_sha256": "af6c75606b14cfe0f5f1a3468dec9afb598a48f727f3d5e988295ceb0919bf44",
         "variant": "n16",
     },
     "sm103_n16": {
         "arch": "sm_103a",
         "profile": "flashkda-bf16-fused-m128-n16-sm103",
         "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
-        "profile_sha256": "1cba455cc06e65515e41036863351a899d20d34fafb20deb04284fccc9abeb87",
+        "profile_sha256": "224eee52dfeabadc770311dbbd2274045e2cdebd46829ba76b63b6396c1af057",
         "variant": "n16",
     },
     "sm100_n32": {

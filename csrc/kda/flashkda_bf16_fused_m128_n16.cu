@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_b3a8571118.
-// Cake revision: 87d38d39ec51eaedbb5c287f634de99141bd90cf; raw SHA-256: 91d36e93677abf4ec49b5cfcde616af12ea27df7baeba08de3b231cf2b9ae925.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_de41cb34a6.
+// Cake revision: b89b287ca1c0c1d3d92ae56688404aabb76e5366; raw SHA-256: b4ec98f5914e7f8939e18d79ed45a538c5a09e669566917325b7d08037ad4144.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -894,8 +894,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     for (int residual_col = 0; residual_col < 16; residual_col++) {
                         int token_col = residual_half * 16 + residual_col;
                         __nv_bfloat16 v_value = smem_v_all[compute_stage * 20992 + (unsigned int)(token_col * 128) + (unsigned int)state_row];
-                        float _cvt_f32_2 = __bfloat162float(v_value);
-                        residual_v[residual_col] = _cvt_f32_2;
+                        float _cvt_f32_3 = __bfloat162float(v_value);
+                        residual_v[residual_col] = _cvt_f32_3;
                         residual_beta[residual_col] = smem_prep_beta_all[compute_stage * 10496 + (unsigned int)token_col];
                     }
                     #pragma unroll
@@ -1927,118 +1927,183 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                 {
                     if (prep_local_warp >= 2) {
                         int stage_f32_0 = prep_stage * 10496;
-                        float restore_scale[8];
-                        float restore_factor[8];
                         int restore_segment = lane & 15;
-                        #pragma unroll
-                        for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
-                            int restore_col = restore_segment * 8 + restore_elem;
-                            float anchor_log2 = smem_restore_factor_all[stage_f32_0 + restore_col];
-                            float total_log2_2 = smem_gt_prefix_all[stage_f32_0 + restore_col];
-                            float _exp2_3 = approx_exp2(total_log2_2 - anchor_log2);
-                            restore_factor[restore_elem] = _exp2_3;
-                            float _exp2_4 = approx_exp2(anchor_log2);
-                            restore_scale[restore_elem] = _exp2_4;
-                        }
+                        float gate_rate_1 = smem_gate_rate_all[stage_f32_0];
                         #pragma unroll 1
                         for (int restore_pass = 0; restore_pass < 4; restore_pass++) {
                             int restore_row = (prep_local_warp - 2) * 8 + restore_pass * 2 + (lane >> 4);
+                            long long restore_token = bos_3 + (long long)(chunk_idx_2 * 16 + restore_row);
+                            int restore_valid = ((restore_token < eos_3) ? 1 : 0);
+                            long long restore_gmem_base = (restore_token * (long long)num_heads + (long long)head_idx_2) * 128 + (long long)(restore_segment * 8);
+                            float restore_q_raw[8];
+                            float restore_k_raw[8];
+                            restore_q_raw[0] = 0.0f;
+                            restore_q_raw[1] = 0.0f;
+                            restore_q_raw[2] = 0.0f;
+                            restore_q_raw[3] = 0.0f;
+                            restore_q_raw[4] = 0.0f;
+                            restore_q_raw[5] = 0.0f;
+                            restore_q_raw[6] = 0.0f;
+                            restore_q_raw[7] = 0.0f;
+                            restore_k_raw[0] = 0.0f;
+                            restore_k_raw[1] = 0.0f;
+                            restore_k_raw[2] = 0.0f;
+                            restore_k_raw[3] = 0.0f;
+                            restore_k_raw[4] = 0.0f;
+                            restore_k_raw[5] = 0.0f;
+                            restore_k_raw[6] = 0.0f;
+                            restore_k_raw[7] = 0.0f;
+                            if (restore_valid != 0) {
+                                {
+                                    const uint4* _vptr_7 = reinterpret_cast<const uint4*>(q + restore_gmem_base);
+                                    uint4 _vld_7[1];
+                                    #pragma unroll
+                                    for (int _blk = 0; _blk < 1; _blk++) {
+                                        _vld_7[_blk] = _vptr_7[_blk];
+                                        uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
+                                        #pragma unroll
+                                        for (int _pair = 0; _pair < 4; _pair++) {
+                                            asm volatile(
+                                                "{\n\t"
+                                                "shl.b32 %0, %2, 16;\n\t"
+                                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                                "}\n"
+                                                : "=f"((&restore_q_raw[0 + _blk * 8 + _pair * 2])[0]), "=f"((&restore_q_raw[0 + _blk * 8 + _pair * 2])[1])
+                                                : "r"(_vpairs_7[_pair]));
+                                        }
+                                    }
+                                }
+                                {
+                                    const uint4* _vptr_8 = reinterpret_cast<const uint4*>(k + restore_gmem_base);
+                                    uint4 _vld_8[1];
+                                    #pragma unroll
+                                    for (int _blk = 0; _blk < 1; _blk++) {
+                                        _vld_8[_blk] = _vptr_8[_blk];
+                                        uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
+                                        #pragma unroll
+                                        for (int _pair = 0; _pair < 4; _pair++) {
+                                            asm volatile(
+                                                "{\n\t"
+                                                "shl.b32 %0, %2, 16;\n\t"
+                                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                                "}\n"
+                                                : "=f"((&restore_k_raw[0 + _blk * 8 + _pair * 2])[0]), "=f"((&restore_k_raw[0 + _blk * 8 + _pair * 2])[1])
+                                                : "r"(_vpairs_8[_pair]));
+                                        }
+                                    }
+                                }
+                            }
+                            float restore_q_sum = 0.0f;
+                            float restore_k_sum = 0.0f;
+                            #pragma unroll
+                            for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
+                                float restore_q_value = restore_q_raw[restore_elem];
+                                float restore_k_value = restore_k_raw[restore_elem];
+                                float _fma_2 = __fmaf_rn(restore_q_value, restore_q_value, restore_q_sum);
+                                restore_q_sum = _fma_2;
+                                float _fma_3 = __fmaf_rn(restore_k_value, restore_k_value, restore_k_sum);
+                                restore_k_sum = _fma_3;
+                            }
+                            float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, restore_q_sum, 8);
+                            restore_q_sum += _shfl_xor_8;
+                            float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, restore_k_sum, 8);
+                            restore_k_sum += _shfl_xor_9;
+                            float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, restore_q_sum, 4);
+                            restore_q_sum += _shfl_xor_10;
+                            float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, restore_k_sum, 4);
+                            restore_k_sum += _shfl_xor_11;
+                            float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, restore_q_sum, 2);
+                            restore_q_sum += _shfl_xor_12;
+                            float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, restore_k_sum, 2);
+                            restore_k_sum += _shfl_xor_13;
+                            float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, restore_q_sum, 1);
+                            restore_q_sum += _shfl_xor_14;
+                            float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, restore_k_sum, 1);
+                            restore_k_sum += _shfl_xor_15;
+                            float _rsqrt_2 = rsqrtf(restore_q_sum + 1e-06f);
+                            const float2 _scale2_9 = {_rsqrt_2, _rsqrt_2};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_q_raw)[_ls], _scale2_9);
+                            float _rsqrt_3 = rsqrtf(restore_k_sum + 1e-06f);
+                            const float2 _scale2_10 = {_rsqrt_3, _rsqrt_3};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_k_raw)[_ls], _scale2_10);
                             float restore_qd_values[8];
                             float restore_kd_values[8];
-                            float restore_ki_values[8];
-                            unsigned int packed_2[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 3]))
-                                : "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
-                            float packed_f32_1[8];
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&packed_f32_1[_pair * 2])[0]), "=f"((&packed_f32_1[_pair * 2])[1])
-                                    : "r"(packed_2[_pair]));
-                            }
-                            #pragma unroll
-                            for (int value_idx_2 = 0; value_idx_2 < 8; value_idx_2++) {
-                                restore_qd_values[value_idx_2] = packed_f32_1[value_idx_2];
-                            }
-                            unsigned int packed_0_2[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_0_2[(0) + 3]))
-                                : "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
-                            float packed_0_f32_1[8];
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&packed_0_f32_1[_pair * 2])[0]), "=f"((&packed_0_f32_1[_pair * 2])[1])
-                                    : "r"(packed_0_2[_pair]));
-                            }
-                            #pragma unroll
-                            for (int value_idx_3 = 0; value_idx_3 < 8; value_idx_3++) {
-                                restore_kd_values[value_idx_3] = packed_0_f32_1[value_idx_3];
-                            }
-                            unsigned int packed_1_2[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_1_2[(0) + 3]))
-                                : "r"((smem_ki_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
-                            float packed_1_f32[8];
-                            #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                asm volatile(
-                                    "{\n\t"
-                                    "shl.b32 %0, %2, 16;\n\t"
-                                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                                    "}\n"
-                                    : "=f"((&packed_1_f32[_pair * 2])[0]), "=f"((&packed_1_f32[_pair * 2])[1])
-                                    : "r"(packed_1_2[_pair]));
-                            }
-                            #pragma unroll
-                            for (int value_idx_4 = 0; value_idx_4 < 8; value_idx_4++) {
-                                restore_ki_values[value_idx_4] = packed_1_f32[value_idx_4];
-                            }
                             float restore_kr_values[8];
                             #pragma unroll
                             for (int restore_elem_1 = 0; restore_elem_1 < 8; restore_elem_1++) {
-                                restore_kr_values[restore_elem_1] = restore_ki_values[restore_elem_1] * restore_factor[restore_elem_1];
-                                restore_qd_values[restore_elem_1] = restore_qd_values[restore_elem_1] * restore_scale[restore_elem_1];
-                                restore_kd_values[restore_elem_1] = restore_kd_values[restore_elem_1] * restore_scale[restore_elem_1];
+                                int restore_col = restore_segment * 8 + restore_elem_1;
+                                float restore_prefix = 0.0f;
+                                #pragma unroll 1
+                                for (int restore_gate_row = 0; restore_gate_row < restore_row + 1; restore_gate_row++) {
+                                    long long restore_gate_token = bos_3 + (long long)(chunk_idx_2 * 16 + restore_gate_row);
+                                    float restore_gate_log2 = 0.0f;
+                                    if (restore_gate_token < eos_3) {
+                                        __nv_bfloat16 restore_gate_raw = g[(restore_gate_token * (long long)num_heads + (long long)head_idx_2) * 128 + (long long)restore_col];
+                                        float restore_gate_bias = dt_bias[head_idx_2 * 128 + restore_col];
+                                        float _cvt_f32_2 = __bfloat162float(restore_gate_raw);
+                                        float restore_gate_arg = gate_rate_1 * (_cvt_f32_2 + restore_gate_bias);
+                                        float _tanh_approx_4;
+                                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(restore_gate_arg * 0.5f));
+                                        float restore_gate_sigmoid = _tanh_approx_4 * 0.5f + 0.5f;
+                                        restore_gate_log2 = lower_bound * 1.4426950408889634f * restore_gate_sigmoid;
+                                    }
+                                    restore_prefix += restore_gate_log2;
+                                }
+                                float restore_total = smem_gt_prefix_all[stage_f32_0 + restore_col];
+                                float _exp2_3 = approx_exp2(restore_prefix);
+                                float restore_forward = _exp2_3;
+                                float _exp2_4 = approx_exp2(restore_total - restore_prefix);
+                                float restore_reverse = _exp2_4;
+                                restore_qd_values[restore_elem_1] = restore_forward;
+                                restore_kd_values[restore_elem_1] = restore_forward;
+                                restore_kr_values[restore_elem_1] = restore_reverse;
                             }
-                            unsigned int packed_2_1[4];
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], reinterpret_cast<const float2*>(restore_q_raw)[_ls]);
+                            const float2 _scale2_11 = {scale, scale};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], _scale2_11);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kd_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kr_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
+                            unsigned int packed_2[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_qd_values[_lp*2 + 0], restore_qd_values[_lp*2+1 + 0]));
-                                packed_2_1[_lp] = *(uint32_t*)&_bf2;
+                                packed_2[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int word_3 = 0; word_3 < 4; word_3++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_3 * 4)), "r"((packed_2_1[word_3])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_qd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_3 * 4)), "r"((packed_2[word_3])));
                             }
-                            unsigned int packed_3[4];
+                            unsigned int packed_0_2[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_kd_values[_lp*2 + 0], restore_kd_values[_lp*2+1 + 0]));
-                                packed_3[_lp] = *(uint32_t*)&_bf2;
+                                packed_0_2[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int word_4 = 0; word_4 < 4; word_4++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_4 * 4)), "r"((packed_3[word_4])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_4 * 4)), "r"((packed_0_2[word_4])));
                             }
-                            unsigned int packed_4[4];
+                            unsigned int packed_1_2[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(restore_kr_values[_lp*2 + 0], restore_kr_values[_lp*2+1 + 0]));
-                                packed_4[_lp] = *(uint32_t*)&_bf2;
+                                packed_1_2[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int word_5 = 0; word_5 < 4; word_5++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kr_trans_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_5 * 4)), "r"((packed_4[word_5])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"((smem_kr_trans_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4)) + (unsigned int)(word_5 * 4)), "r"((packed_1_2[word_5])));
                             }
                         }
                     }
@@ -2058,13 +2123,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         inv_row[6] = 0.0f;
                         inv_row[7] = 0.0f;
                         if (inverse_row < 16) {
-                            unsigned int packed_5[4];
+                            unsigned int packed_3[4];
                             int byte_off_1 = (int)prep_stage * 41984 + inverse_row * 128 + diag_block * 8 * 2;
                             int swizzled_off_1 = byte_off_1 ^ (byte_off_1 >> 7 & 7) << 4;
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_5[(0) + 3]))
+                                : "=r"(*reinterpret_cast<uint32_t*>(&packed_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_3[(0) + 3]))
                                 : "r"(smem_inv_work_addr + (unsigned int)swizzled_off_1));
-                            float packed_f32_2[8];
+                            float packed_f32_1[8];
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
                                 asm volatile(
@@ -2072,12 +2137,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                                     "shl.b32 %0, %2, 16;\n\t"
                                     "and.b32 %1, %2, 0xffff0000;\n\t"
                                     "}\n"
-                                    : "=f"((&packed_f32_2[_pair * 2])[0]), "=f"((&packed_f32_2[_pair * 2])[1])
-                                    : "r"(packed_5[_pair]));
+                                    : "=f"((&packed_f32_1[_pair * 2])[0]), "=f"((&packed_f32_1[_pair * 2])[1])
+                                    : "r"(packed_3[_pair]));
                             }
                             #pragma unroll
-                            for (int value_idx_5 = 0; value_idx_5 < 8; value_idx_5++) {
-                                inv_row[value_idx_5] = packed_f32_2[value_idx_5];
+                            for (int value_idx_2 = 0; value_idx_2 < 8; value_idx_2++) {
+                                inv_row[value_idx_2] = packed_f32_1[value_idx_2];
                             }
                         }
                     }
@@ -2097,8 +2162,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             float _shfl_0 = __shfl_sync(0xFFFFFFFF, inv_row[prev_col], pivot_lane);
                             float pivot = _shfl_0;
                             if (lane_in_diag > src_row) {
-                                float _fma_2 = __fmaf_rn(row_scale, pivot, inv_row[prev_col]);
-                                inv_row[prev_col] = _fma_2;
+                                float _fma_4 = __fmaf_rn(row_scale, pivot, inv_row[prev_col]);
+                                inv_row[prev_col] = _fma_4;
                             }
                         }
                         if (lane_in_diag > src_row) {
@@ -2107,17 +2172,17 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                     }
                     {
                         if (inverse_row < 16) {
-                            unsigned int packed_6[4];
+                            unsigned int packed_4[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(inv_row[_lp*2 + 0], inv_row[_lp*2+1 + 0]));
-                                packed_6[_lp] = *(uint32_t*)&_bf2;
+                                packed_4[_lp] = *(uint32_t*)&_bf2;
                             }
                             int byte_off_2 = (int)prep_stage * 41984 + inverse_row * 128 + diag_block * 8 * 2;
                             int swizzled_off_2 = byte_off_2 ^ (byte_off_2 >> 7 & 7) << 4;
                             #pragma unroll
                             for (int word_6 = 0; word_6 < 4; word_6++) {
-                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_inv_work_addr + (unsigned int)swizzled_off_2 + (unsigned int)(word_6 * 4)), "r"((packed_6[word_6])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_inv_work_addr + (unsigned int)swizzled_off_2 + (unsigned int)(word_6 * 4)), "r"((packed_4[word_6])));
                             }
                         }
                     }
@@ -2164,10 +2229,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
                                 : "=f"(dc_acc[0]), "=f"(dc_acc[1]), "=f"(dc_acc[2]), "=f"(dc_acc[3])
                                 : "r"(d_frag[0]), "r"(d_frag[1]), "r"(c_frag[0]));
-                            const float2 _scale2_7 = {-1.0f, -1.0f};
+                            const float2 _scale2_12 = {-1.0f, -1.0f};
                             #pragma unroll
                             for (int _ls = 0; _ls < 2; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(dc_acc)[_ls], _scale2_7);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(dc_acc)[_ls], _scale2_12);
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(dc_acc[_lp*2 + 0], dc_acc[_lp*2+1 + 0]));
@@ -2188,9 +2253,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             int byte_off_4 = (int)prep_stage * 41984 + (8 + lane_row) * 128;
                             int swizzled_off_5 = byte_off_4 ^ (byte_off_4 >> 7 & 7) << 4;
                             int o_addr = smem_inv_work_addr + (unsigned int)swizzled_off_5;
-                            uint32_t _stmatrix_addr_8 = static_cast<uint32_t>((unsigned long long)o_addr);
+                            uint32_t _stmatrix_addr_13 = static_cast<uint32_t>((unsigned long long)o_addr);
                             asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n"
-                                :: "r"(_stmatrix_addr_8), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))
+                                :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))
                                 : "memory");
                         }
                         __syncwarp();
@@ -2213,9 +2278,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             : "r"(inv16_addr)
                             : "memory");
                         int inv16_publish_addr = (smem_inv_addr + prep_stage * 41984 + (unsigned int)(lane_col / 16 * 512 + lane_row_1 * 32 + lane_col % 16 * 2 ^ (lane_col / 16 * 512 + lane_row_1 * 32 + lane_col % 16 * 2 >> 7 & 1) << 4));
-                        uint32_t _stmatrix_addr_9 = static_cast<uint32_t>((unsigned long long)inv16_publish_addr);
+                        uint32_t _stmatrix_addr_14 = static_cast<uint32_t>((unsigned long long)inv16_publish_addr);
                         asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                            :: "r"(_stmatrix_addr_9), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[3]))
+                            :: "r"(_stmatrix_addr_14), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv16_frag[3]))
                             : "memory");
                     }
                 }
