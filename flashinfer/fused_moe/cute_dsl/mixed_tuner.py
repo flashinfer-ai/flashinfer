@@ -82,28 +82,6 @@ DEFAULT_MXFP8_MXFP4_MOE_TACTIC = (
     ((128, 128), (1, 1), False),
 )
 
-# Current B200 EP8/DP8 winners.  These are only used as the no-autotune
-# fallback for the exact target shape; every other shape uses the conservative
-# N=128 default above.  Autotuning remains authoritative whenever enabled.
-_TARGET_SMALL_TACTIC = (
-    128,
-    # NCU shows that N=256 halves the FC1 grid and redundant A/SFA LDGSTS
-    # work at the exact DP256 target.  Two randomized paired B200 runs
-    # measured a 0.59-0.94% full-pipeline GPU improvement over N=128.
-    ((128, 256), (1, 1), False),
-    ((128, 192), (1, 2), False),
-)
-_TARGET_MEDIUM_TACTIC = (
-    128,
-    ((128, 256), (1, 1), False),
-    ((128, 192), (1, 1), False),
-)
-_TARGET_LARGE_TACTIC = (
-    256,
-    ((256, 256), (2, 1), False),
-    ((256, 256), (2, 1), False),
-)
-
 
 def canonicalize_mxfp8_mxfp4_tactic(tactic: Any) -> Tuple[Any, ...]:
     """Recursively turn a JSON/list tactic representation into tuples."""
@@ -275,25 +253,6 @@ class CuteDslFusedMoEMxfp8Mxfp4Runner(TunableRunner):
             self.swiglu_limit,
         )
 
-    def _fallback_tactic(self, inputs: List[torch.Tensor]) -> Tuple[Any, ...]:
-        x, w1_weight, w2_weight = inputs[0], inputs[4], inputs[7]
-        is_target_shape = (
-            self.gated
-            and self.num_experts == 256
-            and self.top_k == 8
-            and self.num_local_experts == 32
-            and tuple(x.shape[1:]) == (6144,)
-            and tuple(w1_weight.shape) == (32, 4096, 3072)
-            and tuple(w2_weight.shape) == (32, 6144, 1024)
-        )
-        if not is_target_shape:
-            return DEFAULT_MXFP8_MXFP4_MOE_TACTIC
-        if x.shape[0] <= 2048:
-            return _TARGET_SMALL_TACTIC
-        if x.shape[0] <= 4096:
-            return _TARGET_MEDIUM_TACTIC
-        return _TARGET_LARGE_TACTIC
-
     def get_valid_tactics(  # type: ignore[override]
         self,
         inputs: List[torch.Tensor],
@@ -393,7 +352,7 @@ class CuteDslFusedMoEMxfp8Mxfp4Runner(TunableRunner):
         **kwargs: Any,
     ) -> torch.Tensor:
         if tactic is None or tactic == -1:
-            tactic = self._fallback_tactic(inputs)
+            tactic = DEFAULT_MXFP8_MXFP4_MOE_TACTIC
         else:
             tactic = canonicalize_mxfp8_mxfp4_tactic(tactic)
         params = _extract_tactic_params(tactic)

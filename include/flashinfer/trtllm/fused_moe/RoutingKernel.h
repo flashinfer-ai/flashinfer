@@ -44,10 +44,10 @@ struct DataBase {
   // range of expanded indices instead of a grid stride. Rows of an expert then
   // arrive in a few narrow token windows, so a downstream grouped-GEMM tile
   // gathers from a bounded slice of the activation tensor instead of the whole
-  // token range. Measured on B200 (hidden 6144, 256 experts, top_k 8, 32 local,
-  // tile 256): distinct 2 MiB pages touched per GEMM1 tile drops from 190 to 30
-  // at 128K tokens, making GEMM1 1.33-1.42x faster and the fused-MoE pipeline
-  // 1.15-1.17x faster. The effect only appears once the gather working set
+  // token range. Measured on B200 with a large-expert-count MoE: the distinct
+  // 2 MiB pages touched per GEMM1 tile drop by roughly 6x at 128K tokens,
+  // making GEMM1 1.33-1.42x faster and the fused-MoE pipeline 1.15-1.17x
+  // faster. The effect only appears once the gather working set
   // outgrows the uTLB, so callers should enable it only for large batches; it
   // is neutral-to-negative below ~64K tokens. Only the cooperative kernel
   // honours this flag -- the block, cluster and multi-kernel paths ignore it.
