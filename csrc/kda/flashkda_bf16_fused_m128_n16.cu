@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_0b49c30a71.
-// Cake revision: 62658b2e51a87b65a355422b771ba47117c93fe8; raw SHA-256: 563b45c03737f47c80da2e58c4619ab9a9091d3955c682dbc13224d32855c0f0.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_4f4cea874f.
+// Cake revision: 3b1ac3c6497544a6c7db26770ef7fb0ef6452eb8; raw SHA-256: 78926df03a87058862411d1e523c5e22de402253f568c21c0bf9a24d6e95184b.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1931,14 +1931,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                         int stage_f32_0 = prep_stage * 10496;
                         int restore_segment = lane & 15;
                         float gate_rate_1 = smem_gate_rate_all[stage_f32_0];
-                        float restore_factor[8];
+                        float restore_scale[8];
                         #pragma unroll
                         for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
                             int restore_col = restore_segment * 8 + restore_elem;
                             float anchor_log2 = smem_restore_factor_all[stage_f32_0 + restore_col];
-                            float total_log2_2 = smem_gt_prefix_all[stage_f32_0 + restore_col];
-                            float _exp2_3 = approx_exp2(total_log2_2 - anchor_log2);
-                            restore_factor[restore_elem] = _exp2_3;
+                            float _exp2_3 = approx_exp2(anchor_log2);
+                            restore_scale[restore_elem] = _exp2_3;
                         }
                         #pragma unroll 1
                         for (int restore_pass = 0; restore_pass < 4; restore_pass++) {
@@ -2047,7 +2046,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             unsigned int packed_2[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed_2[(0) + 3]))
-                                : "r"((smem_ki_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
+                                : "r"((smem_kd_addr + prep_stage * 41984 + (unsigned int)(restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 ^ (restore_segment * 8 / 64 * 2048 + restore_row * 128 + restore_segment * 8 % 64 * 2 >> 7 & 7) << 4))));
                             float packed_f32_1[8];
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2061,7 +2060,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                             }
                             #pragma unroll
                             for (int value_idx_2 = 0; value_idx_2 < 8; value_idx_2++) {
-                                restore_kr_values[value_idx_2] = packed_f32_1[value_idx_2];
+                                restore_kd_values[value_idx_2] = packed_f32_1[value_idx_2];
                             }
                             #pragma unroll
                             for (int restore_elem_2 = 0; restore_elem_2 < 8; restore_elem_2++) {
@@ -2085,8 +2084,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                                 }
                                 float _exp2_4 = approx_exp2(restore_prefix);
                                 float restore_forward = _exp2_4;
+                                float restore_total = smem_gt_prefix_all[stage_f32_0 + restore_col_1];
+                                float _exp2_5 = approx_exp2(restore_total - restore_prefix);
+                                float restore_reverse = _exp2_5;
                                 restore_qd_values[restore_elem_2] = restore_forward;
-                                restore_kd_values[restore_elem_2] = restore_forward;
+                                restore_kr_values[restore_elem_2] = restore_reverse;
                             }
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
@@ -2097,10 +2099,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_qd_values)[_ls], _scale2_11);
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kd_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kd_values)[_ls], reinterpret_cast<const float2*>(restore_scale)[_ls]);
                             #pragma unroll
                             for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kr_values)[_ls], reinterpret_cast<const float2*>(restore_factor)[_ls]);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(restore_kr_values)[_ls], reinterpret_cast<const float2*>(restore_k_raw)[_ls]);
                             unsigned int packed_0_2[4];
                             #pragma unroll
                             for (int _lp = 0; _lp < 4; _lp++) {
