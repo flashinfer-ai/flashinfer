@@ -47,6 +47,8 @@ import cuda.tile as ct
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from ._tune_select import rank_measurements
+
 
 def make_bmm_bf16_tune_cache() -> dict:
     """Create a fresh tune cache for :func:`bmm_bf16_cutile`.
@@ -247,6 +249,20 @@ def _bmm_bf16_autotune_configs(device=None):
                     )
 
 
+def _config_sort_key(cfg):
+    """Deterministic tie-break order: prefer the config that launches the
+    fewest CTAs, then the smallest tile. Extra occupancy only adds no-op
+    CTAs when the tile count already covers the grid."""
+    return (
+        cfg.occupancy,
+        cfg.num_ctas,
+        cfg.BLOCK_M * cfg.BLOCK_N,
+        cfg.BLOCK_M,
+        cfg.BLOCK_K,
+        cfg.GROUP_SIZE_M,
+    )
+
+
 def _bmm_bf16_autotune_and_launch(
     stream,
     a_flat,  # (B*M, K) row-major bf16
@@ -329,9 +345,10 @@ def _bmm_bf16_autotune_and_launch(
         )
 
         # exhaustive_search ranks configs by latency only — verify correctness
-        # (no NaN, no Inf) by re-running each ranked config in order and
-        # accepting the first one whose output is finite. Mirrors gemm.py.
-        ranked = sorted(result.successes, key=lambda m: m.mean_us)
+        # (no NaN, no Inf) by re-running each ranked config in order (fastest
+        # first, statistical ties broken deterministically) and accepting the
+        # first one whose output is finite. Mirrors gemm.py.
+        ranked = rank_measurements(result.successes, _config_sort_key)
         best_cfg = None
         for measure in ranked:
             trial_cfg = measure.config
@@ -348,8 +365,8 @@ def _bmm_bf16_autotune_and_launch(
             break
         if best_cfg is None:
             # All autotune candidates produced NaN/Inf or failed; fall back to
-            # exhaustive_search's nominal best so we still launch something.
-            best_cfg = result.best.config
+            # the top-ranked config so we still launch something.
+            best_cfg = ranked[0].config
 
         tune_cache[cache_key] = (
             best_cfg,
