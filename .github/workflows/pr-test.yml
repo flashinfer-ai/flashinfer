@@ -105,6 +105,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Get Docker Tag
         id: get-tag
@@ -265,6 +266,10 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+          # Self-hosted runners keep the workspace between jobs, so the token
+          # must not be left behind in .git/config. Nothing here uses git after
+          # checkout, and submodules authenticate during the checkout itself.
+          persist-credentials: false
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -310,6 +315,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Check skip patterns for unauthorized PRs
         if: needs.gate.outputs.authorized != 'true'
@@ -377,6 +383,16 @@ jobs:
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # A failed setup leaves the tests skipped and skip_build empty, which
+          # would otherwise reach the "skipped counts as passed" branch below
+          # and report success for a run where nothing was tested.
+          SETUP="${{ needs.setup.result }}"
+          if [ "$SETUP" != "success" ]; then
+            echo "Setup did not succeed (result: $SETUP), so no tests ran" >> $GITHUB_STEP_SUMMARY
+            echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
 
           if [ "${{ needs.setup.outputs.skip_build }}" == "true" ]; then
             echo "Build skipped (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
