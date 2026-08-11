@@ -297,6 +297,10 @@ struct TllmGenFmhaRunnerParams {
   int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
   // The batch size.
   int mBatchSize;
+  // Whether Q/KV use cumulative sequence lengths and flattened token storage.
+  // This mirrors the public TensorRT-LLM FmhaOptions field consumed by the
+  // cubin's Q/O TMA descriptor ABI.
+  bool mSupportsVarSeqLens;
   // The max sequence length in the contiguous Kv cache.
   int mMaxSeqLenCacheKv;
   // The max q sequence length.

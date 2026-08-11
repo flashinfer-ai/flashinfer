@@ -141,6 +141,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mNumHeadsKv = num_kv_heads;
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
+  runner_params.mSupportsVarSeqLens = cum_seq_lens_q != nullptr;
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mMaxNumPagesPerSeqKv = max_num_blocks_per_seq;
   runner_params.mNumTokensPerPage = page_size;
@@ -618,6 +619,7 @@ void trtllm_ragged_attention_launcher(
   runner_params.mNumHeadsKv = num_kv_heads;
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
+  runner_params.mSupportsVarSeqLens = true;
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mQkvLayout = QkvLayout::SeparateQkv;
   if (char const* layout = std::getenv("FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT")) {
