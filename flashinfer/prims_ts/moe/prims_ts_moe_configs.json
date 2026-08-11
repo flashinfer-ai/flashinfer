@@ -791,22 +791,6 @@
             ]
         },
         {
-            "_comment": "MxFp4xMxFp8_FC2_GptOssMidBatch",
-            "_template": "BatchedGemmMxE2m1MxE4m3LowLatency",
-            "route_act": false,
-            "fused_act": false,
-            "dtype_c": "bf16",
-            "use_unroll_loop_2x_for_mma": true,
-            "use_clc_fast_drain": true,
-            "use_work_throttle": true,
-            "mma_m,mma_n,tile_n,epi_tile_n,tile_k,cluster_m,num_stages_a,num_stages_b,num_stages_smem_sfa,num_stages_smem_sfb,num_stages_tmem_sfa,num_stages_tmem_sfb": [
-                [256, 16, 16, 16, 256, 2, 6, 6, 6, 6, 6, 6],
-                [256, 32, 32, 32, 256, 2, 5, 5, 5, 5, 5, 5]
-            ],
-            "tile_scheduler": "persistent",
-            "num_stages_tmem_acc": 2
-        },
-        {
             "_comment": "MxFp4xMxFp8_FC2_HighThroughput",
             "_template": "BatchedGemmMxE2m1MxE4m3HighThroughput",
             "route_act": false,

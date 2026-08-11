@@ -206,7 +206,6 @@ def _gemm1_oa_flags_from_kwargs(kwargs: dict) -> dict[str, bool]:
 def _gemm_config_flags_from_static_extras(runner) -> dict[str, bool]:
     static_extras = dict(getattr(runner, "_cache_key_static_extras", ()))
     return {
-        "enable_pdl": bool(static_extras.get("enable_pdl", False)),
         "fc1_has_bias": bool(static_extras.get("gemm1_bias", False)),
         "fc2_has_bias": bool(static_extras.get("gemm2_bias", False)),
         "has_gemm1_alpha": bool(static_extras.get("gemm1_alpha", False)),

@@ -32,12 +32,8 @@ from flashinfer.prims_ts.moe.config_mapper import (
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
     valid_prims_ts_mxfp8_mxfp8_moe_tactics,
 )
-from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.moe import support
-from flashinfer.prims_ts.moe.runner import (
-    PrimsTsMxfp4Mxfp8MoERunner,
-    _filter_valid_moe_tactics,
-)
+from flashinfer.prims_ts.moe.runner import _filter_valid_moe_tactics
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -113,12 +109,6 @@ def _fc1_comments(tactics, **pair_kwargs):
         ).comment
         for tactic in tactics
     }
-
-
-def _flat_moe_inputs(num_tokens, hidden_size=3072):
-    inputs = [None] * 8
-    inputs[4] = torch.empty((num_tokens, hidden_size), device="meta")
-    return inputs
 
 
 def test_config_mapper_loads_local_prims_ts_json():
@@ -294,45 +284,6 @@ def test_config_mapper_exposes_gpt_oss_low_latency_fc1():
     pytest.fail("GPT-OSS low-latency MXFP4xMXFP8 FC1 config is missing")
 
 
-@pytest.mark.parametrize(
-    ("num_tokens", "tile_n", "num_stages"),
-    [
-        (256, 16, 6),
-        (1024, 32, 5),
-    ],
-)
-def test_config_mapper_exposes_gpt_oss_mid_batch_fc2(num_tokens, tile_n, num_stages):
-    kwargs = dict(
-        activation_type=int(ActivationType.Swiglu),
-        num_tokens=num_tokens,
-        top_k=4,
-        num_local_experts=128,
-        fc1_has_bias=True,
-        fc2_has_bias=True,
-        enable_pdl=True,
-    )
-
-    for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**kwargs):
-        if tactic[0] != tile_n:
-            continue
-        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **kwargs)
-        fc2 = pair.fc2.cfg.kwargs
-        if not (
-            fc2["tile_k"] == 256
-            and fc2["num_stages_a"] == num_stages
-            and fc2["use_unroll_loop_2x_for_mma"]
-        ):
-            continue
-
-        assert fc2["tile_scheduler"] == 1
-        assert fc2["num_stages_tmem_acc"] == 2
-        assert fc2["use_clc_fast_drain"] == 1
-        assert fc2["use_work_throttle"] == 1
-        return
-
-    pytest.fail(f"GPT-OSS mid-batch MXFP4xMXFP8 FC2 tile-N{tile_n} config is missing")
-
-
 @pytest.mark.parametrize("num_tokens", [256, 1024])
 def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
     kwargs = dict(
@@ -383,25 +334,6 @@ def test_mxfp4_mxfp8_fast_drain_fc1_is_a_generic_autotune_candidate(num_tokens):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 256])
-def test_gpt_oss_legacy_tactic_maps_to_expected_configs(num_tokens):
-    tactics = valid_prims_ts_mxfp4_mxfp8_moe_tactics(
-        activation_type=int(ActivationType.Swiglu),
-        num_tokens=num_tokens,
-        top_k=4,
-        num_local_experts=128,
-        enable_pdl=True,
-    )
-
-    assert [32, 155] in tactics
-    pair = _mxfp4_mxfp8_json_pair([32, 155], enable_pdl=True)
-    fc1_json = _json_config_by_global_index(pair.fc1.prims_ts_gemm_config_index)
-    fc2_json = _json_config_by_global_index(pair.fc2.prims_ts_gemm_config_index)
-    assert fc1_json.comment == "MxFp4xMxFp8_FC1_LowLatency"
-    assert fc2_json.comment == "MxFp4xMxFp8_FC2_GptOssMidBatch"
-    assert pair.fc1.cfg.kwargs["use_clc_fast_drain"] == 0
-
-
 def test_mxfp4_mxfp8_fast_drain_fc1_is_not_visible_to_mxfp8_moe():
     tactics = valid_prims_ts_mxfp8_mxfp8_moe_tactics(
         activation_type=int(ActivationType.Swiglu),
@@ -419,36 +351,7 @@ def test_mxfp4_mxfp8_fast_drain_fc1_is_not_visible_to_mxfp8_moe():
     )
 
 
-def test_mxfp4_mxfp8_runner_passes_generic_flags_to_tactic_mapper(monkeypatch):
-    captured = {}
-
-    def _capture_valid_tactics(**kwargs):
-        captured.update(kwargs)
-        return []
-
-    monkeypatch.setattr(
-        runner_module,
-        "valid_prims_ts_mxfp4_mxfp8_moe_tactics",
-        _capture_valid_tactics,
-    )
-    monkeypatch.setattr(PrimsTsMxfp4Mxfp8MoERunner, "valid_tactics_dict", {})
-    runner = PrimsTsMxfp4Mxfp8MoERunner(
-        None,
-        top_k=4,
-        num_local_experts=128,
-        hidden_size=3072,
-        intermediate_size=3072,
-    )
-    runner.set_cache_key_static_extras(enable_pdl=True)
-    inputs = _flat_moe_inputs(1024)
-
-    assert runner.get_valid_tactics(inputs, None) == [-1]
-    assert captured["enable_pdl"] is True
-    assert "hidden_size" not in captured
-    assert "intermediate_size" not in captured
-
-
-def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
+def _gpt_oss_high_throughput_pair():
     kwargs = dict(
         activation_type=int(ActivationType.Swiglu),
         num_tokens=8192,
@@ -475,29 +378,36 @@ def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
         ):
             continue
 
-        assert fc1["route_sfs_act"] == 2
-        assert fc1["num_stages_tmem_sfa"] == 1
-        assert fc1["fuse_operand_sf_loads"] == 1
-        assert fc2["use_unroll_loop_2x_for_mma"] == 1
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-            build_batched_gemm_task_manager,
-        )
-
-        manager = build_batched_gemm_task_manager(
-            num_experts=128,
-            num_tokens=8192,
-            top_k=4,
-            verbose=False,
-            **fc1,
-        )
-        assert {task.name for task in manager.tasks} >= {
-            "MmaTask0",
-            "FusedGatherSfBTask",
-            "WorkScheduleTask",
-        }
-        return
+        return pair
 
     pytest.fail("GPT-OSS high-throughput MXFP4xMXFP8 config pair is missing")
+
+
+def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        build_batched_gemm_task_manager,
+    )
+
+    pair = _gpt_oss_high_throughput_pair()
+    fc1 = pair.fc1.cfg.kwargs
+    fc2 = pair.fc2.cfg.kwargs
+    assert fc1["route_sfs_act"] == 2
+    assert fc1["num_stages_tmem_sfa"] == 1
+    assert fc1["fuse_operand_sf_loads"] == 1
+    assert fc2["use_unroll_loop_2x_for_mma"] == 1
+
+    manager = build_batched_gemm_task_manager(
+        num_experts=128,
+        num_tokens=8192,
+        top_k=4,
+        verbose=False,
+        **fc1,
+    )
+    assert {task.name for task in manager.tasks} >= {
+        "MmaTask0",
+        "FusedGatherSfBTask",
+        "WorkScheduleTask",
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
@@ -509,15 +419,7 @@ def test_config_mapper_exposes_gpt_oss_high_throughput_pair():
 def test_gpt_oss_high_throughput_fused_fc1_gpu_correctness():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
 
-    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
-        [128, 6],
-        activation_type=int(ActivationType.Swiglu),
-        num_tokens=8192,
-        top_k=4,
-        num_local_experts=128,
-        fc1_has_bias=True,
-        fc2_has_bias=True,
-    )
+    pair = _gpt_oss_high_throughput_pair()
 
     assert reference_check(
         num_experts=2,
@@ -734,11 +636,10 @@ def test_support_accepts_nvfp4_per_token_scale_local_config(monkeypatch):
             dtype_act=DtypeTrtllmGen.E2m1,
             dtype_weights=DtypeTrtllmGen.E2m1,
             weight_layout=WeightLayout.BlockMajorK,
-            hidden_size=256,
             use_per_token_scaling=True,
         ),
         _inputs(
-            hidden_states=torch.empty((4, 128), dtype=torch.uint8),
+            hidden_states=torch.empty((4, 64), dtype=torch.uint8),
             hidden_states_scale=torch.empty((4, 4), dtype=torch.float8_e4m3fn),
             per_token_scale=torch.ones((4,), dtype=torch.float32),
         ),

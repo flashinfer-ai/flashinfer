@@ -2302,8 +2302,10 @@ def reference_check(
     print("Compiling kernel...")
     compiled_fn = _compile_for_launch(ref_io, stream)
     print("Launching kernel...")
-    repeat_outputs = []
-    repeat_scales = []
+    first_output = None
+    first_scale = None
+    outputs_deterministic = True
+    scales_deterministic = True
     for _ in range(repeat_launches):
         compiled_fn(*_launch_arg_tuple(ref_io, stream))
         torch.cuda.synchronize()
@@ -2313,9 +2315,14 @@ def reference_check(
                 if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
                 else c_torch
             )
-            repeat_outputs.append(output_tensor.detach().clone())
-            if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
-                repeat_scales.append(sf_c_torch.detach().clone())
+            if first_output is None:
+                first_output = output_tensor.detach().clone()
+                if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
+                    first_scale = sf_c_torch.detach().clone()
+            else:
+                outputs_deterministic &= torch.equal(first_output, output_tensor)
+                if first_scale is not None:
+                    scales_deterministic &= torch.equal(first_scale, sf_c_torch)
     # Unload the per-check CUDA library at a deterministic point after the
     # launch is synchronized. Letting Python GC do this later can overlap
     # library unload with the next clustered persistent compile/launch.
@@ -2403,12 +2410,6 @@ def reference_check(
             return result, c_logical.detach().clone()
         return result
 
-    outputs_deterministic = all(
-        torch.equal(repeat_outputs[0], output) for output in repeat_outputs[1:]
-    )
-    scales_deterministic = all(
-        torch.equal(repeat_scales[0], scale) for scale in repeat_scales[1:]
-    )
     if not outputs_deterministic or not scales_deterministic:
         print(
             "FAIL: repeated launches are nondeterministic "
