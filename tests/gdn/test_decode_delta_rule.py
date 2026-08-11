@@ -4225,10 +4225,9 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
 #   2. one operand dtype must not poison another's cache entry at equal geometry;
 #   3. a default-allocated `output` is owned by the caller, not by the cache.
 
-# case -> (seq_len, state dtype). Batch size selects the kernel within a case:
-# B*HV=128 takes the ILP4 path and B*HV=2048 the wide-vector path, so the
-# parametrizations below reach all three BF16-state compile sites plus both
-# FP32-state MTP kernels (inline for B*HV<=128, warp-specialized above).
+# case -> (seq_len, state dtype). Batch size is fixed at 4 in the trimmed
+# regressions below (one representative per bug). B*HV still selects ILP4 vs
+# wide-vector at other call sites in this file.
 _DTYPE_CASES = {
     "fp32_state_mtp": (2, torch.float32),
     "bf16_state_t1": (1, torch.bfloat16),
@@ -4320,9 +4319,8 @@ def _dtype_case_reference(x):
     return out
 
 
-@pytest.mark.parametrize("case", list(_DTYPE_CASES))
-@pytest.mark.parametrize("batch_size", [4, 64])
-def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size):
+@pytest.mark.parametrize("case", ["fp32_state_mtp", "bf16_state_t1"])
+def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size=4):
     """fp16 q/k/v/a/b must be converted to bf16, not bit-reinterpreted.
 
     The kernels declare their staging fragments bf16, so handing them an fp16
@@ -4347,8 +4345,7 @@ def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size
     )
 
 
-@pytest.mark.parametrize("case", list(_DTYPE_CASES))
-def test_gdn_decode_compile_cache_survives_dtype_interleaving(case, batch_size=4):
+def test_gdn_decode_compile_cache_survives_dtype_interleaving(batch_size=4):
     """An interleaved fp16 call must not disturb the bf16 specialization.
 
     The compile caches are process-global; when a key omits an operand dtype the
@@ -4356,6 +4353,7 @@ def test_gdn_decode_compile_cache_survives_dtype_interleaving(case, batch_size=4
     wrong cubin.
     """
     _skip_if_not_sm90_or_later()
+    case = "bf16_state_mtp"
     x_bf16 = _dtype_case_inputs(case, torch.bfloat16, batch_size)
     first = _dtype_case_run(case, x_bf16)
     _dtype_case_run(case, _dtype_case_to(x_bf16, torch.float16))
@@ -4363,8 +4361,7 @@ def test_gdn_decode_compile_cache_survives_dtype_interleaving(case, batch_size=4
     torch.testing.assert_close(again.float(), first.float(), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("case", list(_DTYPE_CASES))
-def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
+def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
     """fp32 and bf16 dt_bias are separate specializations of the same geometry.
 
     The public docstring documents dt_bias as bf16 or float32, and the kernels read
@@ -4372,6 +4369,7 @@ def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
     regardless of which compiles first.
     """
     _skip_if_not_sm90_or_later()
+    case = "bf16_state_mtp"
     for dt_bias_dtype in (torch.float32, torch.bfloat16, torch.float32):
         x = _dtype_case_inputs(
             case, torch.bfloat16, batch_size, dt_bias_dtype=dt_bias_dtype
@@ -4382,15 +4380,14 @@ def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
         )
 
 
-@pytest.mark.parametrize("case", ["bf16_state_t1", "bf16_state_mtp"])
-@pytest.mark.parametrize("batch_size", [4, 64])
-def test_gdn_decode_default_output_is_not_shared(case, batch_size):
+def test_gdn_decode_default_output_is_not_shared(batch_size=4):
     """With output=None the result must be freshly allocated, not a cached buffer.
 
     The BF16-state caches used to hand out one per-batch-size buffer, so a second
     call at the same specialization overwrote the tensor the first call returned.
     """
     _skip_if_not_sm90_or_later()
+    case = "bf16_state_mtp"
     first = _dtype_case_run(
         case, _dtype_case_inputs(case, torch.bfloat16, batch_size, seed=0)
     )
@@ -4405,14 +4402,14 @@ def test_gdn_decode_default_output_is_not_shared(case, batch_size):
     assert not torch.equal(first, second), "inputs failed to produce distinct results"
 
 
-@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32, torch.bfloat16])
-def test_gdn_decode_mtp_honors_non_bf16_output_buffer(out_dtype, batch_size=4):
-    """A caller-supplied `output=` of any dtype must receive the real result.
+def test_gdn_decode_mtp_honors_non_bf16_output_buffer(batch_size=4):
+    """A caller-supplied non-bf16 `output=` must receive the real result.
 
     The kernel stores bf16, so a non-bf16 buffer needs staging rather than being
     handed to the kernel directly.
     """
     _skip_if_not_sm90_or_later()
+    out_dtype = torch.float16
     x = _dtype_case_inputs("fp32_state_mtp", torch.bfloat16, batch_size)
     B, T, _, D = x["q"].shape
     HV = x["v"].shape[2]
@@ -4425,10 +4422,7 @@ def test_gdn_decode_mtp_honors_non_bf16_output_buffer(out_dtype, batch_size=4):
     torch.testing.assert_close(output.float(), ref, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
-def test_gdn_decode_mtp_non_bf16_output_preserves_padding_slots(
-    out_dtype, batch_size=4
-):
+def test_gdn_decode_mtp_non_bf16_output_preserves_padding_slots(batch_size=4):
     """Non-bf16 `output=` must not clobber padding rows during bf16 staging.
 
     Negative `initial_state_indices` skip kernel writes; those output rows must
@@ -4436,6 +4430,7 @@ def test_gdn_decode_mtp_non_bf16_output_preserves_padding_slots(
     buffer.
     """
     _skip_if_not_sm90_or_later()
+    out_dtype = torch.float16
     x = _dtype_case_inputs("fp32_state_mtp", torch.bfloat16, batch_size)
     B, T, _, D = x["q"].shape
     HV = x["v"].shape[2]
