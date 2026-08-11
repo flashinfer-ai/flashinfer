@@ -19,7 +19,8 @@ gate.
 
 All cases use H=12, K=V=128, BF16 inputs and state, a provided initial state,
 in-kernel Q/K L2 normalization, gate calculation, and beta sigmoid, with
-`lower_bound=-5.0`.
+`lower_bound=-5.0`. Candidate execution must observe exactly the dedicated
+`m128_n16` workspace variant; missing or mixed descriptor variants fail closed.
 
 | Case | Layout and sequence lengths | Seed |
 | --- | --- | ---: |
@@ -39,12 +40,22 @@ not produced.
 ## Correctness contract
 
 For every case, the harness checks both the public output and the complete
-final state at BF16 `atol=rtol=1e-2` against:
+final state at BF16 `atol=rtol=1e-2`. The pinned MoonshotAI/FlashKDA
+implementation is the sole hard Phase-A contract oracle: its result alone sets
+`correctness.passed`, gates reportable timing, and controls per-architecture
+completion.
 
-1. an independent direct token-by-token recurrence with a BF16 state store
-   after every token;
-2. the pinned MoonshotAI/FlashKDA implementation; and
-3. FLA's Triton implementation.
+Two additional comparisons are mandatory diagnostics: an independent direct
+token-by-token recurrence with a BF16 state store after every token, and FLA's
+Triton implementation. Both must execute and produce full output/final-state
+receipts for all six cases. Their agreement is recorded as
+`diagnostic_consensus`; a numerical disagreement does not override a passing
+pinned-oracle result or suppress timing.
+
+The smaller repository H12 smoke tests use a clean-room chunk-16 recurrence:
+the FP32 carrier is rounded through BF16 between 16-token chunks and each
+token projects its unrounded updated state. That helper is diagnostic only and
+is explicitly not a substitute for the pinned six-case contract.
 
 The FlashKDA checkout must be exactly
 `1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b`, with its CUTLASS submodule at
@@ -66,8 +77,8 @@ FLA is required and never impersonated. Before importing FLA, the runner sets
 comparison uses the default Triton implementation. Its package version, source
 paths, source hashes, and Git facts are reported. Missing FLA, prior FLA import,
 a non-Git install, or any tracked/nonignored-untracked FLA change fails closed.
-Every one of the six cases must include FLA output and full-final-state
-correctness plus raw CUPTI timing; the path is never omitted.
+Every one of the six cases must include the FLA output/full-final-state
+diagnostic plus raw CUPTI timing; the path is never omitted.
 
 ## Timing contract
 
@@ -99,18 +110,22 @@ python -m pytest -q \
   tests/kda/test_recurrent_kda_prefill.py::test_frozen_prefill_non_aligned_heads_graph_refreshes_beta
 ```
 
-This is the H6/H12 changed-beta CUDA Graph regression at source lines 981–1042.
-The receipt records the command, node, parameterization, source hash, return
-code, stdout, and stderr. A failure writes a non-complete receipt and stops the
-evidence run.
+This is the H6/H12 changed-beta CUDA Graph regression at source lines
+1034–1108. It compares a captured replay bitwise against an independent eager
+launch with separate tensors and a separate workspace, for both output and full
+final state, and proves that changing beta changes the replayed result. The
+receipt records the exact source line range, command, node, parameterization,
+source hash, return code, stdout, and stderr. A failure writes a non-complete
+receipt and stops the evidence run.
 
 A successful single-GPU receipt sets only
 `complete_per_arch_denominator=true`. It is not a promotion claim. The reducer
 requires exactly one SM100a and one SM103a receipt with matching frozen preset,
 FlashInfer commit/source hashes, pinned FlashKDA source/package identity, clean
-FLA commit/source hashes, graph-test source, all six ordered cases, all three
-output/full-state oracles, and all four CUPTI timing paths. Only then does it
-emit `promotion_complete_dual_arch=true`. It computes no cross-shape aggregate.
+FLA commit/source hashes, graph-test source, all six ordered cases, the pinned
+output/full-state oracle, both mandatory diagnostic receipts, and all four
+CUPTI timing paths. Only then does it emit
+`promotion_complete_dual_arch=true`. It computes no cross-shape aggregate.
 
 ## Running and reviewing
 
@@ -170,9 +185,10 @@ python benchmarks/reduce_kda_h12_phase_a.py \
   --json /outside/checkouts/h12-phase-a-dual-arch.json
 ```
 
-A missing case, oracle, timing path, graph receipt, provenance rejection,
-activity-route rejection, identity mismatch, or absent architecture is a named
-gap rather than evidence that may be filled by averaging another shape or GPU.
+A missing case, pinned oracle, diagnostic receipt, timing path, graph receipt,
+provenance rejection, activity-route rejection, identity mismatch, or absent
+architecture is a named gap rather than evidence that may be filled by
+averaging another shape or GPU.
 Build manifests, per-architecture receipts, and the dual-architecture reduction
 are written by same-directory temporary file, `fsync`, and atomic replace so a
 preempted job cannot leave a reportable partial JSON file.

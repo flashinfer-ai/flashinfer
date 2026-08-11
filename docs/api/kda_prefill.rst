@@ -5,7 +5,8 @@ flashinfer.kda_prefill
 
 Optimized recurrent Kimi Delta Attention (KDA) prefill support. The
 :func:`flashinfer.kda.recurrent_kda` facade dispatches a strict ordinary
-multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
+multi-token prefill subset to frozen FlashKDA-compatible exact-SM100a and
+exact-SM103a kernels.
 
 .. currentmodule:: flashinfer.kda_prefill
 
@@ -14,8 +15,8 @@ multi-token prefill subset to frozen FlashKDA-compatible SM100-family kernels.
 
     RecurrentKDAPrefillWorkspace
 
-Optimized SM100-family prefill subset
--------------------------------------
+Optimized Blackwell prefill subset
+-----------------------------------
 
 ``flashinfer.kda.recurrent_kda`` uses the frozen prefill backend only when
 every condition below holds:
@@ -36,13 +37,12 @@ every condition below holds:
 Calls outside that subset retain the existing CuTe-DSL path. In particular,
 T=1 decode and speculative decode are not rerouted.
 
-With CUDA 12.9 or newer, JIT and AOT use one ``sm_100f`` URI, JIT
-specification, and cubin target per M64/M128 variant for both CC 10.0 and CC
-10.3. FlashInfer can still place a built copy in a compilation-context-specific
-workspace; the shared logical target does not promise one physical cache path
-across device contexts. The binding accepts only the two validated family
-members. CUDA 12.8 predates ``sm_100f``, so B200 retains one exact ``sm_100a``
-module per variant. CC 10.3 requires CUDA 12.9 or newer.
+JIT and AOT keep CC 10.0 and CC 10.3 as separate artifacts. B200 uses exact
+``sm_100a`` URIs, JIT specifications, and cubins; B300 uses distinct exact
+``sm_103a`` identities. The two M128 cache keys also include their frozen Loom
+module identities so an older N32 module cannot satisfy the refreshed N32 or
+H12 N16 request. CUDA 12.8 is sufficient for CC 10.0; CC 10.3 requires CUDA
+12.9 or newer.
 
 Fixed input omits ``cu_seqlens``. Packed input has ``B=1`` and accepts a
 contiguous CUDA int32 or int64 ``cu_seqlens``. The frozen binding consumes
@@ -62,9 +62,10 @@ is a permutation of ``[0, N)``. Ordering sequences by decreasing length
 reduces the final partial wave. FlashInfer validates dtype, device, rank, and
 size without synchronizing the device to inspect permutation values.
 
-When ``seq_order=None``, a cached identity order is used. Fixed ``B=1,H=64``
-selects the two-CTA M64 value-split kernel; every packed input and every other
-head count selects M128.
+When ``seq_order=None``, a cached identity order is used. H12 selects the
+dedicated M128 schedule with a 16-token recurrence chunk for both fixed and
+packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64 value-split kernel;
+all remaining eligible inputs select the general 32-token M128 schedule.
 
 State and graph semantics
 -------------------------
@@ -86,8 +87,9 @@ be used during CUDA graph capture.
 CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
-state, beta padding, and separate 768-byte M64 and M128 TMA descriptor blocks.
-It binds to the device and CUDA stream of its first ``recurrent_kda`` call.
+state, beta padding, and separate 768-byte M64, M128-N32, and M128-N16 TMA
+descriptor blocks. It binds to the device and CUDA stream of its first
+``recurrent_kda`` call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
 beta, and output tensors, then synchronize that stream before capture. Packed
 graphs must also pass preallocated int64 ``cu_seqlens`` and int32

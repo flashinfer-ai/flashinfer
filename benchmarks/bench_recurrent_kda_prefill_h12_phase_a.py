@@ -465,6 +465,15 @@ def _make_state_pool(initial_state, rotations: int):
     return initial_state.unsqueeze(0).expand(rotations, *initial_state.shape).clone()
 
 
+def _require_h12_candidate_variant(workspace) -> None:
+    observed = set(workspace._descriptor_signatures)
+    if observed != {"m128_n16"}:
+        raise AssertionError(
+            "Phase-A H12 candidate must dispatch exactly m128_n16; "
+            f"observed descriptor variants {sorted(observed)!r}"
+        )
+
+
 def _make_case_runtime(
     *,
     stack: SimpleNamespace,
@@ -562,10 +571,12 @@ def _make_case_runtime(
                 f"candidate state rotations exhausted: {state_index} >= {rotations}"
             )
         candidate_cursor[0] += 1
-        return stack.recurrent_kda(
+        result = stack.recurrent_kda(
             **candidate_kwargs,
             initial_state=candidate_state_pool[state_index],
         )
+        _require_h12_candidate_variant(candidate_workspace)
+        return result
 
     def candidate_reset() -> None:
         candidate_state_pool.copy_(initial_state_seed.unsqueeze(0))
@@ -683,7 +694,7 @@ def _make_case_runtime(
             "dtype": "bfloat16",
             "initial_state": "provided_bfloat16",
             "seed": case.seed,
-            "variant": "m128",
+            "variant": "m128_n16",
         },
         tensors=tensors,
         initial_state_seed=initial_state_seed,

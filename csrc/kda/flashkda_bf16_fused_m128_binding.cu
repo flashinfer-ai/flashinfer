@@ -23,7 +23,13 @@
 #define uint64_t flashkda_generated_uint64_t
 #define int32_t flashkda_generated_int32_t
 #define int16_t flashkda_generated_int16_t
+#define LoomTensorMap flashkda_generated_LoomTensorMap
+#define LoomTensorMapPack flashkda_generated_LoomTensorMapPack
+#define CUtensorMap flashkda_generated_CUtensorMap
 #include "flashkda_bf16_fused_m128.cu"
+#undef CUtensorMap
+#undef LoomTensorMapPack
+#undef LoomTensorMap
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -67,21 +73,28 @@ void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView 
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(THREADS, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128>(q, k, v, g, beta_tma, out, descriptor_storage,
-                                                 prepare_descriptors, stream);
+  const TmaPointers tma = EncodeTmaPointers<128, 32>(q, k, v, g, beta_tma, out,
+                                                     descriptor_storage, prepare_descriptors,
+                                                     stream);
   PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(q.data_ptr()), tma.q,
-      reinterpret_cast<__nv_bfloat16*>(k.data_ptr()), tma.k,
-      reinterpret_cast<__nv_bfloat16*>(v.data_ptr()), tma.v,
-      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), tma.g,
-      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), tma.beta,
+      reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.q),
+      reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.k),
+      reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.v),
+      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.g),
+      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.beta),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), tma.out,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<flashkda_generated_LoomTensorMap const*>(tma.out),
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound));

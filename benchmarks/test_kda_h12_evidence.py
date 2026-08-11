@@ -99,6 +99,23 @@ def test_checked_in_preset_is_exact_and_per_case_only():
     assert len(preset.sha256) == 64
 
 
+def test_candidate_provenance_binds_exact_n16_import_surface():
+    required = set(evidence.REQUIRED_CANDIDATE_SOURCE_PATHS)
+    assert {
+        "flashinfer/aot.py",
+        "flashinfer/jit/__init__.py",
+        "flashinfer/jit/flash_kda.py",
+        "flashinfer/kda_prefill.py",
+        "csrc/kda/flashkda_bf16_fused_m64_binding.cu",
+        "csrc/kda/flashkda_bf16_fused_m128.cu",
+        "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
+        "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
+        "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
+        "csrc/kda/flashkda_bf16_fused_m128_import_manifest.json",
+        "tools/import-cake-flashkda-prefill",
+    } <= required
+
+
 def test_preset_rejects_cross_shape_aggregation(tmp_path):
     payload = (
         _preset_path()
@@ -622,8 +639,8 @@ def test_runner_validate_only_is_cpu_safe_and_reports_frozen_identities():
         "requires_force_rebuild": True,
     }
     assert payload["changed_beta_cuda_graph_test"]["source_line_range"] == [
-        981,
-        1042,
+        1034,
+        1108,
     ]
     assert payload["changed_beta_cuda_graph_test"]["parameterization"] == {
         "num_heads": [6, 12]
@@ -815,7 +832,7 @@ def _complete_per_arch_report(tmp_path, arch):
                 "head_dim_vo": 128,
                 "dtype": "bfloat16",
                 "initial_state": "provided_bfloat16",
-                "variant": "m128",
+                "variant": "m128_n16",
                 "correctness": {
                     "passed": True,
                     "public_output_and_full_final_state": True,
@@ -1379,6 +1396,10 @@ def test_per_arch_reducer_rejects_phase_a_contract_mutations(tmp_path):
         "initial_state must be",
     )
     reject(
+        lambda payload: payload["cases"][0].__setitem__("variant", "m128"),
+        "variant must be 'm128_n16'",
+    )
+    reject(
         lambda payload: payload["candidate_provenance"]["source_sha256"].pop(
             "flashinfer/kda.py"
         ),
@@ -1512,6 +1533,20 @@ class _FakeTensor:
 class _FakeCuda:
     def synchronize(self):
         return None
+
+
+def test_runner_requires_exact_observed_h12_candidate_variant():
+    runner = _load_runner_module()
+    runner._require_h12_candidate_variant(
+        SimpleNamespace(_descriptor_signatures={"m128_n16": object()})
+    )
+
+    for variants in ((), ("m128",), ("m128", "m128_n16")):
+        workspace = SimpleNamespace(
+            _descriptor_signatures={variant: object() for variant in variants}
+        )
+        with pytest.raises(AssertionError, match="dispatch exactly m128_n16"):
+            runner._require_h12_candidate_variant(workspace)
 
 
 @pytest.mark.parametrize(

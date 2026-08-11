@@ -149,6 +149,59 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     return out.reshape_as(q), state
 
 
+def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
+    """Clean-room H12 smoke reference; not the Phase-A contract authority.
+
+    The recurrent carrier stays in FP32 within each 16-token chunk.  A BF16
+    snapshot becomes the next chunk's carrier, while each output projects the
+    unrounded FP32 state for its token.  The pinned FlashKDA implementation is
+    the sole hard Phase-A correctness oracle.
+    """
+
+    q = inputs["q"]
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    scale = head_dim**-0.5 if scale is None else scale
+    q_flat = F.normalize(q.float(), dim=-1).reshape(-1, num_heads, head_dim)
+    k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(
+        -1, num_heads, head_dim
+    )
+    v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
+    g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
+    beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))
+    gate = lower_bound * torch.sigmoid(
+        torch.exp(inputs["A_log"]).reshape(1, num_heads, 1)
+        * (g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim))
+    )
+    decay = torch.exp(gate)
+    if inputs["cu_seqlens"] is None:
+        offsets = [index * seq_len for index in range(batch_size + 1)]
+    else:
+        offsets = [int(value) for value in inputs["cu_seqlens"].tolist()]
+    if inputs["initial_state"] is None:
+        state = torch.zeros(
+            (len(offsets) - 1, num_heads, head_dim, head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+    else:
+        state = inputs["initial_state"].clone()
+    out = torch.empty_like(q_flat)
+    for sequence in range(len(offsets) - 1):
+        carrier = state[sequence].float()
+        for local_token, token in enumerate(
+            range(offsets[sequence], offsets[sequence + 1]), start=1
+        ):
+            decayed = carrier * decay[token].unsqueeze(1)
+            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
+            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
+            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
+            state[sequence] = updated.to(torch.bfloat16)
+            projected = torch.einsum("hk,hvk->hv", q_flat[token], updated)
+            out[token] = (scale * projected).to(torch.bfloat16)
+            carrier = state[sequence].float() if local_token % 16 == 0 else updated
+    return out.reshape_as(q), state
+
+
 @pytest.fixture
 def cuda_device():
     if not torch.cuda.is_available():
@@ -170,9 +223,9 @@ def flash_kda_device(cuda_device):
     ("compute_capability", "cuda_version", "expected_target", "error_match"),
     [
         ((10, 0), "12.8", "sm100a", None),
-        ((10, 0), "12.9", "sm100f", None),
+        ((10, 0), "12.9", "sm100a", None),
         ((10, 3), "12.8", None, "10.3 requires CUDA 12.9"),
-        ((10, 3), "12.9", "sm100f", None),
+        ((10, 3), "12.9", "sm103a", None),
         ((12, 0), "13.0", None, "requires compute capability 10.0"),
         ((10, 0), "12.7", None, "10.0 requires CUDA 12.8"),
     ],
@@ -284,12 +337,12 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
         (False, 64, "m64"),
         (True, 64, "m128"),
         (True, 2, "m128"),
-        (False, 12, "m128"),
+        (False, 12, "m128_n16"),
     ],
 )
 @pytest.mark.parametrize(
     ("compute_capability", "expected_target"),
-    [((10, 0), "sm100f"), ((10, 3), "sm100f")],
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
 )
 def test_frozen_route_and_ffi_abi(
     cuda_device,
@@ -794,7 +847,7 @@ def test_frozen_prefill_h12_tma_chunks_match_reference(flash_kda_device, seq_len
         **inputs,
         "initial_state": inputs["initial_state"].clone(),
     }
-    expected_output, expected_state = _reference(reference_inputs)
+    expected_output, expected_state = _chunk16_debug_reference(reference_inputs)
     output = torch.empty_like(inputs["q"])
 
     actual_output, actual_state = recurrent_kda(
@@ -831,7 +884,7 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
         **inputs,
         "initial_state": inputs["initial_state"].clone(),
     }
-    expected_output, expected_state = _reference(reference_inputs)
+    expected_output, expected_state = _chunk16_debug_reference(reference_inputs)
     output = torch.empty_like(inputs["q"])
 
     actual_output, actual_state = recurrent_kda(
@@ -1010,36 +1063,49 @@ def test_frozen_prefill_non_aligned_heads_graph_refreshes_beta(
     with torch.cuda.graph(graph, stream=capture_stream):
         captured_output, captured_state = recurrent_kda(**call_kwargs)
 
+    # Establish an original-beta replay result before mutating graph inputs.
+    with torch.cuda.stream(capture_stream):
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    original_output = captured_output.clone()
+    original_state = captured_state.clone()
+
+    # The captured public call must repack the changed beta values on replay.
     with torch.cuda.stream(capture_stream):
         inputs["beta"].fill_(2.0)
         inputs["initial_state"].copy_(initial_state_seed)
         output.fill_(float("nan"))
     capture_stream.synchronize()
-    expected_output, expected_state = _reference(
-        {
-            **inputs,
-            "initial_state": initial_state_seed,
-        }
-    )
+    graph.replay()
     torch.cuda.synchronize()
 
-    graph.replay()
+    # Compare against a separate eager launch with distinct tensors/workspace.
+    eager_inputs = {
+        name: value.clone() if value is not None else None
+        for name, value in inputs.items()
+    }
+    eager_inputs["initial_state"] = initial_state_seed.clone()
+    eager_output_storage = torch.empty_like(output)
+    eager_workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    eager_output, eager_state = recurrent_kda(
+        **_strict_prefill_kwargs(eager_inputs),
+        output=eager_output_storage,
+        output_final_state=True,
+        prefill_workspace=eager_workspace,
+    )
     torch.cuda.synchronize()
 
     assert captured_output.data_ptr() == output.data_ptr()
     assert captured_state is inputs["initial_state"]
-    torch.testing.assert_close(
-        captured_output.float(),
-        expected_output.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        captured_state.float(),
-        expected_state.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    assert eager_output.data_ptr() == eager_output_storage.data_ptr()
+    assert eager_state is eager_inputs["initial_state"]
+    assert torch.equal(captured_output, eager_output)
+    assert torch.equal(captured_state, eager_state)
+    assert not torch.equal(captured_output, original_output)
+    assert not torch.equal(captured_state, original_state)
 
 
 def test_frozen_prefill_cuda_graph_workspaces_are_isolated(flash_kda_device):

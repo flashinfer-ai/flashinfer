@@ -65,6 +65,7 @@ from .jit.flash_kda import (
     FlashKDATarget,
     gen_flash_kda_m64_module,
     gen_flash_kda_m128_module,
+    gen_flash_kda_m128_n16_module,
 )
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
@@ -516,8 +517,8 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
-    has_flash_kda_prefill_sm100f = sm_capabilities.get(
-        "flash_kda_prefill_sm100f", False
+    has_flash_kda_prefill_sm103a = sm_capabilities.get(
+        "flash_kda_prefill_sm103a", False
     )
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
         "flash_kda_decode_sm100a_legacy", False
@@ -556,12 +557,11 @@ def gen_all_modules(
     )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
-    # CUDA 12.8 predates the sm_100f target and therefore retains one exact
-    # B200 cubin per variant. CUDA 12.9+ registers only one family cubin per
-    # variant even when both CC 10.0 and CC 10.3 are requested.
+    # Prefill cubins are exact-architecture artifacts. Keep independent B200
+    # and B300 modules even when both targets are requested in one AOT build.
     flash_kda_targets: tuple[tuple[FlashKDATarget, bool], ...] = (
         ("sm100a", has_flash_kda_prefill_sm100a),
-        ("sm100f", has_flash_kda_prefill_sm100f),
+        ("sm103a", has_flash_kda_prefill_sm103a),
     )
     for flash_kda_target, enabled in flash_kda_targets:
         if enabled:
@@ -569,6 +569,7 @@ def gen_all_modules(
                 [
                     gen_flash_kda_m64_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
+                    gen_flash_kda_m128_n16_module(flash_kda_target),
                 ]
             )
 
@@ -1050,12 +1051,6 @@ def detect_sm_capabilities():
     # all support cp.async, which the SSU MTP-simple kernel requires.
     has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     cuda_version = get_cuda_version()
-    flash_kda_prefill_family_arches = {
-        (10, "0a"),
-        (10, "0f"),
-        (10, "3a"),
-        (10, "3f"),
-    }
     flash_kda_decode_family_arches = {
         (10, "0a"),
         (10, "0f"),
@@ -1071,12 +1066,10 @@ def detect_sm_capabilities():
         and cuda_version >= Version("12.8"),
         "flash_kda_prefill_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
-            and Version("12.8") <= cuda_version < Version("12.9")
+            and cuda_version >= Version("12.8")
         ),
-        "flash_kda_prefill_sm100f": (
-            bool(
-                flash_kda_prefill_family_arches & compilation_context.TARGET_CUDA_ARCHS
-            )
+        "flash_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
         ),
         "sm100f": has_sm("compute_100", "12.9"),

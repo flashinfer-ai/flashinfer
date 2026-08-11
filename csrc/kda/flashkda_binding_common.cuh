@@ -121,17 +121,16 @@ inline void CheckNoPartialOverlapOrExactAlias(const TensorView& lhs, const char*
       << " must either be disjoint or exactly alias the same storage";
 }
 
-#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR) == defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
-#error "exactly one FlashKDA target must be defined by the JIT/AOT spec"
+#if !defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
+#error "FLASHINFER_FLASH_KDA_TARGET_MINOR must be defined by the JIT/AOT spec"
+#endif
+#if defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
+#error "FlashKDA prefill requires an exact-SM target, not a family target"
 #endif
 
-#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
 constexpr int kFlashKDATargetMinor = FLASHINFER_FLASH_KDA_TARGET_MINOR;
-static_assert(kFlashKDATargetMinor == 0, "legacy FlashKDA target must be exact SM100a");
-#else
-constexpr int kFlashKDATargetFamily = FLASHINFER_FLASH_KDA_TARGET_FAMILY;
-static_assert(kFlashKDATargetFamily == 100, "FlashKDA family target must be SM100f");
-#endif
+static_assert(kFlashKDATargetMinor == 0 || kFlashKDATargetMinor == 3,
+              "FlashKDA target must be exact SM100a or exact SM103a");
 
 inline void CheckFlashKDATarget(int32_t device_id) {
   int major = 0;
@@ -140,16 +139,9 @@ inline void CheckFlashKDATarget(int32_t device_id) {
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-#if defined(FLASHINFER_FLASH_KDA_TARGET_MINOR)
   TVM_FFI_ICHECK(major == 10 && minor == kFlashKDATargetMinor)
       << "this FlashKDA module was compiled for exact compute capability 10."
       << kFlashKDATargetMinor << ", got " << major << "." << minor;
-#else
-  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
-      << "this FlashKDA sm_100f module supports compute capability 10.0 or "
-         "10.3, got "
-      << major << "." << minor;
-#endif
 }
 
 inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const TensorView& v,
@@ -249,9 +241,6 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
     CheckNoOverlap(beta_tma, "beta_tma", dt_bias, "dt_bias");
     CheckNoOverlap(beta_tma, "beta_tma", cu_seqlens, "cu_seqlens");
     CheckNoOverlap(beta_tma, "beta_tma", seq_order, "seq_order");
-    if (use_initial_state != 0) {
-      CheckNoOverlap(beta_tma, "beta_tma", initial_state, "initial_state");
-    }
   }
   TVM_FFI_ICHECK(A_log.numel() == num_heads) << "A_log must contain H elements";
   TVM_FFI_ICHECK(dt_bias.numel() == num_heads * kHeadDim)
@@ -294,6 +283,16 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   CheckNoOverlap(descriptor_storage, "descriptor_storage", seq_order, "seq_order");
   CheckNoOverlap(descriptor_storage, "descriptor_storage", out, "out");
   if (use_initial_state != 0) {
+    CheckNoOverlap(initial_state, "initial_state", q, "q");
+    CheckNoOverlap(initial_state, "initial_state", k, "k");
+    CheckNoOverlap(initial_state, "initial_state", v, "v");
+    CheckNoOverlap(initial_state, "initial_state", g, "g");
+    CheckNoOverlap(initial_state, "initial_state", beta, "beta");
+    CheckNoOverlap(initial_state, "initial_state", beta_tma, "beta_tma");
+    CheckNoOverlap(initial_state, "initial_state", A_log, "A_log");
+    CheckNoOverlap(initial_state, "initial_state", dt_bias, "dt_bias");
+    CheckNoOverlap(initial_state, "initial_state", cu_seqlens, "cu_seqlens");
+    CheckNoOverlap(initial_state, "initial_state", seq_order, "seq_order");
     CheckNoOverlap(out, "out", initial_state, "initial_state");
     CheckNoOverlap(descriptor_storage, "descriptor_storage", initial_state, "initial_state");
   }
@@ -338,7 +337,9 @@ inline void PackBetaForTmaIfNeeded(const TensorView& beta, const TensorView& bet
   CheckCuda(cudaGetLastError(), "PackBetaForTmaKernel launch");
 }
 
+template <int ChunkTokens>
 inline CUtensorMap EncodeQkTma(const TensorView& tensor, const char* name) {
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
   TVM_FFI_ICHECK(tensor.ndim() >= 2) << name << " must have at least two dimensions";
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
@@ -347,11 +348,11 @@ inline CUtensorMap EncodeQkTma(const TensorView& tensor, const char* name) {
   uint64_t global_dim[4] = {64, static_cast<uint64_t>(outer2), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(d1 / 64)};
   TVM_FFI_ICHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] >= 1 && global_dim[3] >= 2)
-      << name << " cannot encode the (64, 32, 1, 2) TMA box";
+      << name << " cannot encode the (64, " << ChunkTokens << ", 1, 2) TMA box";
   uint64_t global_strides[3] = {static_cast<uint64_t>(d2 * d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[4] = {64, 32, 1, 2};
+  uint32_t box_dim[4] = {64, ChunkTokens, 1, 2};
   uint32_t elem_strides[4] = {1, 1, 1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -364,19 +365,20 @@ inline CUtensorMap EncodeQkTma(const TensorView& tensor, const char* name) {
   return tensor_map;
 }
 
-template <int ValueRows>
+template <int ValueRows, int ChunkTokens>
 inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   static_assert(ValueRows == 64 || ValueRows == 128);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
   TVM_FFI_ICHECK(global_dim[0] >= ValueRows && global_dim[1] >= 1 && global_dim[2] > 0)
-      << "v cannot encode the (" << ValueRows << ", 1, 32) TMA box";
+      << "v cannot encode the (" << ValueRows << ", 1, " << ChunkTokens << ") TMA box";
   uint64_t global_strides[2] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(d1 * d2 * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[3] = {ValueRows, 1, 32};
+  uint32_t box_dim[3] = {ValueRows, 1, ChunkTokens};
   uint32_t elem_strides[3] = {1, 1, 1};
   CUtensorMap tensor_map{};
   constexpr CUtensorMapSwizzle swizzle =
@@ -390,17 +392,19 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   return tensor_map;
 }
 
+template <int ChunkTokens>
 inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
   TVM_FFI_ICHECK(global_dim[0] >= 128 && global_dim[1] >= 1 && global_dim[2] > 0)
-      << "g cannot encode the (128, 1, 32) TMA box";
+      << "g cannot encode the (128, 1, " << ChunkTokens << ") TMA box";
   uint64_t global_strides[2] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(d1 * d2 * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[3] = {128, 1, 32};
+  uint32_t box_dim[3] = {128, 1, ChunkTokens};
   uint32_t elem_strides[3] = {1, 1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -413,14 +417,16 @@ inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
   return tensor_map;
 }
 
+template <int ChunkTokens>
 inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t outer1 = tensor.numel() / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
-  TVM_FFI_ICHECK(global_dim[0] >= 8 && global_dim[1] >= 32)
-      << "beta_tma cannot encode the (8, 32) TMA box";
+  TVM_FFI_ICHECK(global_dim[0] >= 8 && global_dim[1] >= ChunkTokens)
+      << "beta_tma cannot encode the (8, " << ChunkTokens << ") TMA box";
   uint64_t global_strides[1] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[2] = {8, 32};
+  uint32_t box_dim[2] = {8, ChunkTokens};
   uint32_t elem_strides[2] = {1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -433,9 +439,10 @@ inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
   return tensor_map;
 }
 
-template <int ValueRows>
+template <int ValueRows, int ChunkTokens>
 inline CUtensorMap EncodeOutputTma(const TensorView& tensor) {
   static_assert(ValueRows == 64 || ValueRows == 128);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32);
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
@@ -445,11 +452,12 @@ inline CUtensorMap EncodeOutputTma(const TensorView& tensor) {
   constexpr uint32_t value_splits = ValueRows / 64;
   TVM_FFI_ICHECK(global_dim[0] >= 64 && global_dim[1] > 0 && global_dim[2] >= 1 &&
                  global_dim[3] >= value_splits)
-      << "out cannot encode the (64, 32, 1, " << value_splits << ") TMA box";
+      << "out cannot encode the (64, " << ChunkTokens << ", 1, " << value_splits
+      << ") TMA box";
   uint64_t global_strides[3] = {static_cast<uint64_t>(d2 * d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
                                 static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[4] = {64, 32, 1, value_splits};
+  uint32_t box_dim[4] = {64, ChunkTokens, 1, value_splits};
   uint32_t elem_strides[4] = {1, 1, 1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -483,7 +491,7 @@ static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords s
   }
 }
 
-template <int ValueRows>
+template <int ValueRows, int ChunkTokens = 32>
 inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, const TensorView& v,
                                      const TensorView& g, const TensorView& beta_tma,
                                      const TensorView& out, const TensorView& descriptor_storage,
@@ -497,8 +505,9 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
            "this exact workspace and tensor signature before capture";
 
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
-        EncodeQkTma(q, "q"), EncodeQkTma(k, "k"),     EncodeValueTma<ValueRows>(v),
-        EncodeGateTma(g),    EncodeBetaTma(beta_tma), EncodeOutputTma<ValueRows>(out),
+        EncodeQkTma<ChunkTokens>(q, "q"), EncodeQkTma<ChunkTokens>(k, "k"),
+        EncodeValueTma<ValueRows, ChunkTokens>(v), EncodeGateTma<ChunkTokens>(g),
+        EncodeBetaTma<ChunkTokens>(beta_tma), EncodeOutputTma<ValueRows, ChunkTokens>(out),
     };
     static_assert(sizeof(host_maps) == kDescriptorStorageBytes);
     TensorMapWords words{};

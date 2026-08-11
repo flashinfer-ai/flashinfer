@@ -1,0 +1,72 @@
+{
+  "architecture_artifacts_are_separate": true,
+  "cake_revision": "3e3e3a7e1fb610f4292ca389647118b36eb42b81",
+  "cake_tree": "81b7df574f628e0abf5df9b82543116eb564b5f2",
+  "generated_invariants": [
+    "six fence.proxy.tensormap::generic.acquire.sys operations",
+    "CTA barrier after tensor-map acquisition"
+  ],
+  "generated_source_text_equal_across_architectures": true,
+  "integration_patches": [
+    {
+      "id": "allow_exact_state_alias",
+      "reason": "the public recurrent API permits initial_state and final_state to alias exactly",
+      "scope": [
+        "initial_state restrict qualifier",
+        "final_state restrict qualifier"
+      ]
+    }
+  ],
+  "profiles": {
+    "sm100_n16": {
+      "arch": "sm_100a",
+      "profile": "flashkda-bf16-fused-m128-n16-sm100",
+      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm100.json",
+      "profile_sha256": "d1a391e0322f81e7a295269688fee02238ac9ffa98388bb8a2f5e10f3e734dbf",
+      "variant": "n16"
+    },
+    "sm100_n32": {
+      "arch": "sm_100a",
+      "profile": "flashkda-bf16-fused-m128-n32-sm100",
+      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm100.json",
+      "profile_sha256": "5640b0929f3783217cc975ddad20ae18120d3d4862d5589366b807f2901a4558",
+      "variant": "n32"
+    },
+    "sm103_n16": {
+      "arch": "sm_103a",
+      "profile": "flashkda-bf16-fused-m128-n16-sm103",
+      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_n16_sm103.json",
+      "profile_sha256": "33b461c8b36a229e5e30d9fd00dedf0abe64e2fb9625b17e561222ae248be048",
+      "variant": "n16"
+    },
+    "sm103_n32": {
+      "arch": "sm_103a",
+      "profile": "flashkda-bf16-fused-m128-n32-sm103",
+      "profile_path": "loom/export/profiles/flashkda_bf16_fused_m128_sm103.json",
+      "profile_sha256": "32636b365198719e7217c3d83af29a3884a5516f3a4f83ab40d136693de2fedd",
+      "variant": "n32"
+    }
+  },
+  "schema_version": 1,
+  "semantic_baseline_revision": "2396fef3d7132a8c6b49a962f2864c83fff29155",
+  "variants": {
+    "n16": {
+      "binding_path": "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
+      "frozen_path": "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
+      "frozen_sha256": "172ba2c7f75958bdd4affc866317729448e6bf41485649a441bc71e7c9506411",
+      "module_ident": "flashkda_bf16_fused_m128_4bcf5545f6",
+      "raw_bytes": 140769,
+      "raw_sha256": "945db8ca7de704ea0c4c6e454a0525028fca115ee70472775f6e6e7558877b46",
+      "smem_bytes": 219136
+    },
+    "n32": {
+      "binding_path": "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
+      "frozen_path": "csrc/kda/flashkda_bf16_fused_m128.cu",
+      "frozen_sha256": "3d5a01deff0fa075422d5a3d1060dc6a9127715609342d5e8f8ec28e730e4e80",
+      "module_ident": "flashkda_bf16_fused_m128_c0c5dc1a67",
+      "raw_bytes": 160983,
+      "raw_sha256": "d92ddc58b2f07d95a85d7de25950e1f1722af35fcf511ffc0ed22faf4ffff2c9",
+      "smem_bytes": 227328
+    }
+  }
+}

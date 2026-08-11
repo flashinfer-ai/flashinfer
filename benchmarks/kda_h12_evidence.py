@@ -52,7 +52,7 @@ SUPPORTED_ARCHITECTURES = {(10, 0): "sm100a", (10, 3): "sm103a"}
 REQUIRED_ARCHITECTURES = ("sm100a", "sm103a")
 
 GRAPH_TEST_SOURCE = "tests/kda/test_recurrent_kda_prefill.py"
-GRAPH_TEST_SOURCE_LINE_RANGE = (981, 1042)
+GRAPH_TEST_SOURCE_LINE_RANGE = (1034, 1108)
 GRAPH_TEST_NODE_ID = (
     "tests/kda/test_recurrent_kda_prefill.py::"
     "test_frozen_prefill_non_aligned_heads_graph_refreshes_beta"
@@ -78,9 +78,17 @@ REQUIRED_CANDIDATE_IMPORTED_MODULES = (
 REQUIRED_CANDIDATE_SOURCE_PATHS = (
     "flashinfer/kda.py",
     "flashinfer/kda_prefill.py",
+    "flashinfer/jit/__init__.py",
+    "flashinfer/jit/flash_kda.py",
+    "flashinfer/aot.py",
     "csrc/kda/flashkda_binding_common.cuh",
+    "csrc/kda/flashkda_bf16_fused_m64_binding.cu",
     "csrc/kda/flashkda_bf16_fused_m128_binding.cu",
     "csrc/kda/flashkda_bf16_fused_m128.cu",
+    "csrc/kda/flashkda_bf16_fused_m128_n16_binding.cu",
+    "csrc/kda/flashkda_bf16_fused_m128_n16.cu",
+    "csrc/kda/flashkda_bf16_fused_m128_import_manifest.json",
+    "tools/import-cake-flashkda-prefill",
     "benchmarks/bench_recurrent_kda_prefill_h12_phase_a.py",
     "benchmarks/build_flash_kda_phase_a.py",
     "benchmarks/kda_h12_evidence.py",
@@ -1663,7 +1671,7 @@ def _validate_case_receipt(
         "head_dim_vo": 128,
         "dtype": "bfloat16",
         "initial_state": "provided_bfloat16",
-        "variant": "m128",
+        "variant": "m128_n16",
     }
     _require_exact_keys(
         case,

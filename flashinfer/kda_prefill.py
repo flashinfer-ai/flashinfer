@@ -59,7 +59,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            for variant in ("m64", "m128")
+            for variant in ("m64", "m128", "m128_n16")
         }
         self._descriptor_signatures: dict[str, tuple] = {}
         self._bound_stream_ptr: Optional[int] = None
@@ -74,8 +74,8 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. The
     workspace owns optional final-state scratch for calls without an initial
-    state, beta padding, and M64/M128 TMA descriptor storage for the lifetime
-    of the graph.
+    state, beta padding, and schedule-specific M64/M128-N32/M128-N16 TMA
+    descriptor storage for the lifetime of the graph.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -245,6 +245,8 @@ def _flash_kda_prefill_is_eligible(
 def _select_flash_kda_prefill_variant(
     *, fixed_layout: bool, num_sequences: int, num_heads: int
 ) -> "FlashKDAVariant":
+    if num_heads == 12:
+        return "m128_n16"
     if fixed_layout and num_sequences == 1 and num_heads == 64:
         return "m64"
     return "m128"
@@ -539,14 +541,14 @@ def _select_flash_kda_prefill_target(device: torch.device) -> "FlashKDATarget":
             "(SM100a; B200/GB200) or 10.3 (SM103a; B300/GB300); got "
             f"{compute_capability[0]}.{compute_capability[1]}"
         )
-    if _is_cuda_version_at_least("12.9"):
-        return "sm100f"
     if compute_capability == (10, 0) and _is_cuda_version_at_least("12.8"):
         return "sm100a"
+    if compute_capability == (10, 3) and _is_cuda_version_at_least("12.9"):
+        return "sm103a"
     if compute_capability == (10, 3):
         raise RuntimeError(
             "frozen recurrent-KDA prefill on compute capability 10.3 requires "
-            "CUDA 12.9 or newer for the sm_100f family target"
+            "CUDA 12.9 or newer for the exact sm_103a target"
         )
     raise RuntimeError(
         "frozen recurrent-KDA prefill on compute capability 10.0 requires "
