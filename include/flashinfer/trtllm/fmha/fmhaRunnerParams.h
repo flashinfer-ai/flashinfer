@@ -301,7 +301,7 @@ struct TllmGenFmhaRunnerParams {
   // TensorRT-LLM 7801d34 sets the corresponding FmhaOptions field for the
   // ragged host path; the static-context cubin consumes it through the O TMA
   // descriptor shape and strides.
-  bool mSupportsVarSeqLens;
+  bool mSupportsVarSeqLens{false};
   // The max sequence length in the contiguous Kv cache.
   int mMaxSeqLenCacheKv;
   // The max q sequence length.
