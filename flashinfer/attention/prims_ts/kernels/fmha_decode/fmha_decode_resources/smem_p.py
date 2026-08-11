@@ -314,7 +314,7 @@ class SmemPResource(DecodeGenResourceBase):
         """Convert one KV256 K32 score fragment and publish its TMEM P slice."""
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
-        assert cfg.use_bf16_qkv and cfg.uses_two_inst_tmem_p
+        assert not cfg.use_fp8_qkv and cfg.uses_two_inst_tmem_p
         assert cfg.softmax_score_fragment_regs == 32
 
         new_max = new_max_arr[0]

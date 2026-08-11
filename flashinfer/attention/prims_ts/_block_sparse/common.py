@@ -51,7 +51,7 @@ def _canonical_block_sparse_q_tile_size(q_block_size: int) -> int:
 
 
 def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
-    """Return the independently addressable fragment used in a KV128 route.
+    """Return the independently addressable fragment used in a prepared route.
 
     This is route-metadata granularity, not the TMA load tile. Coarse BSR
     blocks use KV64 fragments so either half can be addressed independently.
@@ -68,7 +68,7 @@ def _block_sparse_kv_atom_size(kv_block_size: int) -> int:
 
 def _prepared_kv_routes_are_block_aligned(
     kv_block_size: int,
-    kv_route_size: int = _PREPARED_KV_ROUTE_SIZE,
+    kv_route_size: int,
 ) -> bool:
     """Return whether each prepared route stays within one semantic BSR block."""
 

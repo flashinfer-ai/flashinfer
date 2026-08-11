@@ -41,13 +41,9 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ...._block_sparse.common import (
-    _PREPARED_KV_ROUTE_SIZE,
-    _block_sparse_kv_atom_size,
-)
 from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_FULL_FLAG,
-    _PreparedBlockSparseLayout,
+    _BlockSparseRouteLayout,
 )
 from ...placeholder_helpers import _placeholder_smem_array
 from ...stage import FmhaStage
@@ -57,6 +53,7 @@ from .helpers_common import (
     _TASK_CACHE_KV_REQUEST_BEGIN,
     _TASK_CACHE_SEQ_LEN_KV,
     _TASK_CACHE_WARP_IDX,
+    _TASK_CACHE_WARP_GRP_THREAD_IDX,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
@@ -66,10 +63,10 @@ from .helpers_common import (
 )
 
 
-# Keeps staging uses bits 0/1 for structural KV64 validity. Bit 2 carries the
-# conservative prepared summary that token masking can be skipped; structural,
-# tail, and causal masking remain independent.
-_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 2
+# Keeps staging uses the low four bits for structural KV64 validity. Bit 4
+# carries the conservative prepared summary that token masking can be skipped;
+# structural, tail, and causal masking remain independent.
+_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
 
 # B8 SWAP origins are eight-token aligned, so bit 0 is free while the route is
 # in Softmax's private staging payload. Reusing it avoids adding a word to every
@@ -94,13 +91,13 @@ def _swaps_forwards_packed_route_full(cfg: FmhaDecodeConfig) -> bool:
     )
 
 
-def _kv_retained_route_words(route_layout: _PreparedBlockSparseLayout) -> int:
+def _kv_retained_route_words(route_layout: _BlockSparseRouteLayout) -> int:
     """Return the aligned SMEM words retained from K issue through V.
 
-    Every route retains its origin prefix. A two-fragment route additionally
+    Every route retains its origin prefix. A two-origin route additionally
     keeps the atom-valid mask used to choose one KV128 or two KV64 TensorMaps;
-    fine routes retain one word per atom and normalize invalid entries to the
-    K/V TensorMap's OOB coordinate when the route is stored.
+    wider lane-distributed routes retain one word per atom and normalize
+    invalid entries to the K/V TensorMap's OOB coordinate when stored.
     """
 
     payload_words = route_layout.origins_per_route
@@ -113,21 +110,18 @@ def _kv_retained_route_words(route_layout: _PreparedBlockSparseLayout) -> int:
 class _BlockSparseSoftmaxStagingLayout:
     """Layout of the staged cross-warp Softmax metadata payload.
 
-    Keeps retains ``origin0, origin1, flags, padding[, token_words[4]]``.
-    The words are staged unconditionally; the route-full flag lets Softmax
-    skip token-mask setup and the substantially more expensive per-score
-    predicate. SWAP stores execution-ordered origins followed by optional
-    logical K32 token words, one for each consumer warp. Its noncausal Q8/B8
-    profile without token bits packs route-full into the otherwise-zero low
-    bit of each warp's first aligned origin.
+    Keeps retains all route origins, a flags word, alignment padding, and the
+    optional K32 token words. KV256 consumers then select the four words owned
+    by their spatial half. SWAP stores execution-ordered origins followed by
+    optional logical K32 token words, one for each consumer warp. Its
+    noncausal Q8/B8 profile without token bits packs route-full into the
+    otherwise-zero low bit of each warp's first aligned origin.
     """
 
-    # Physical-origin scalars staged for the complete logical KV128 route.
+    # Physical-origin scalars staged for one complete logical KV route.
     num_origin_words: int
-    # Origins consumed by one Softmax warp for its logical K32 slice.
+    # SWAP origins consumed by one Softmax warp; Keeps retains all origins.
     origins_per_warp: int
-    origin0_word_offset: int
-    origin1_word_offset: int
     route_flags_word_offset: int | None
     token_words_word_offset: int | None
     stage_stride_words: int
@@ -143,31 +137,36 @@ class _BlockSparseSoftmaxStagingLayout:
     def create(
         *,
         use_keeps_mma_ab: bool,
-        kv_block_size: int,
-        has_token_bits: bool,
+        route_layout: _BlockSparseRouteLayout,
         num_stages: int,
     ) -> "_BlockSparseSoftmaxStagingLayout":
         """Build a stage-count-dependent layout for Softmax metadata."""
 
-        atom_size = _block_sparse_kv_atom_size(kv_block_size)
+        kv_route_size = route_layout.kv_route_size
+        atom_size = route_layout.atom_size
+        has_token_bits = route_layout.has_token_bits
         if use_keeps_mma_ab:
-            num_origin_words = 2
-            origins_per_warp = 2
-            route_flags_word_offset = 2
-            token_words_word_offset = 4 if has_token_bits else None
-            stage_stride_words = 8 if has_token_bits else 4
+            num_origin_words = kv_route_size // atom_size
+            origins_per_warp = num_origin_words
+            route_flags_word_offset = num_origin_words
+            aligned_payload_words = ((route_flags_word_offset + 1 + 3) // 4) * 4
+            token_words_word_offset = aligned_payload_words if has_token_bits else None
+            token_words = kv_route_size // 32 if has_token_bits else 0
+            stage_stride_words = (
+                (aligned_payload_words + token_words + 3) // 4
+            ) * 4
         else:
             softmax_atom_size = min(atom_size, 32)
-            num_origin_words = _PREPARED_KV_ROUTE_SIZE // softmax_atom_size
+            num_origin_words = kv_route_size // softmax_atom_size
             origins_per_warp = 32 // softmax_atom_size
             route_flags_word_offset = None
             token_words_word_offset = num_origin_words if has_token_bits else None
-            stage_stride_words = num_origin_words + (4 if has_token_bits else 0)
+            stage_stride_words = num_origin_words + (
+                kv_route_size // 32 if has_token_bits else 0
+            )
         return _BlockSparseSoftmaxStagingLayout(
             num_origin_words=num_origin_words,
             origins_per_warp=origins_per_warp,
-            origin0_word_offset=0,
-            origin1_word_offset=1,
             route_flags_word_offset=route_flags_word_offset,
             token_words_word_offset=token_words_word_offset,
             stage_stride_words=stage_stride_words,
@@ -205,7 +204,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     inst_id: Constexpr[int] = 0
     route_metadata: cute.Pointer | None = None
-    route_layout: Constexpr[_PreparedBlockSparseLayout | None] = None
+    route_layout: Constexpr[_BlockSparseRouteLayout | None] = None
     tma_oob_origin: Int32 = None
     _retained_route_words: Constexpr[int] = 0
     _alloc: Constexpr[SmemAllocation | None] = None
@@ -287,7 +286,7 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
     def resolve_route(
         self, stage_info: StageInfo, *, section: Constexpr[FmhaStage]
     ) -> tuple[Int32, Int32, Int32, Int32]:
-        """Load this resource instance's real or dummy prepared KV128 route."""
+        """Load this resource instance's real or dummy prepared KV route."""
 
         assert self.route_metadata is not None
         task_cache = _decode_gen_task_cache(stage_info)
@@ -357,8 +356,8 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
                 )
             return origin0, origin1, atom_valid_mask, route_record_word_offset
 
-        # Fine routes stay lane-distributed: each active lane carries only its
-        # own origin and validity through the existing three-scalar K/V ABI.
+        # Wider routes stay lane-distributed: each active lane carries only
+        # its origin and validity through the existing three-scalar K/V ABI.
         valid = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
             atom_valid_mask = _warp_broadcast_i32(
@@ -430,12 +429,10 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     ``inst_id`` identifies which of the two Softmax pipelines owns this
     resource. Route resolution belongs to the paired K/V resource, so the
     producer passes the resolved payload explicitly instead of recomputing it.
-    For Keeps, all four token words move through SMEM without a data-dependent
-    branch. A runtime route-full bit skips copying the routed words into the
-    local predicate array and applying per-score token predicates, while
-    leaving structural masking independent. Q64 still selects its two
-    lane-local words before that guard because this schedule benchmarks faster
-    than extending both loaded fragments' live ranges.
+    For Keeps, every route token word moves through SMEM without a
+    data-dependent branch; each consumer receives at most four words through
+    the stable task-local ABI. A runtime route-full bit can skip per-score token
+    predicates while leaving structural masking independent.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -476,7 +473,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     inst_id: Constexpr[int] = 0
     route_metadata: cute.Pointer | None = None
     staging_layout: Constexpr[_BlockSparseSoftmaxStagingLayout | None] = None
-    route_layout: Constexpr[_PreparedBlockSparseLayout | None] = None
+    route_layout: Constexpr[_BlockSparseRouteLayout | None] = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _smem_words: cutlass.Array = None
     softmax_origin0_slot: Constexpr[TaskLocalVariable] = (
@@ -507,8 +504,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         assert self.route_layout is not None
         self.staging_layout = _BlockSparseSoftmaxStagingLayout.create(
             use_keeps_mma_ab=self.cfg.use_keeps_mma_ab,
-            kv_block_size=self.cfg.kv_block_size,
-            has_token_bits=self.cfg.use_kv_valid_bits,
+            route_layout=self.route_layout,
             num_stages=self.pipeline_config.num_stages,
         )
         super().__post_init__()
@@ -682,17 +678,23 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     ) -> None:
         """Stage a Keeps route and its already prepared token metadata.
 
-        All four token words move branch-free for both Q64 and Q128. The
-        route-full summary is forwarded to guard Softmax mask setup and
-        per-score application, not metadata movement.
+        Origins and token words are lane-distributed, so KV128 and KV256 use
+        the same producer shape. The consumer later selects the two KV64
+        origins and K32 words owned by its KV256 spatial half.
         """
 
         assert self.staging_layout.route_flags_word_offset is not None
-        origin0 = Int32(resolved_origin0)
-        origin1 = Int32(resolved_origin1)
-        route_flags = Int32(resolved_atom_validity)
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         route_record_is_valid = route_record_word_offset >= Int32(0)
+        num_origins = self.route_layout.origins_per_route
+        route_flags = Int32(resolved_atom_validity)
+        if cutlass.const_expr(num_origins > 2):
+            route_flags = Int32(
+                cute.arch.vote_ballot_sync(
+                    lane_idx < Int32(num_origins)
+                    and resolved_atom_validity != Int32(0)
+                )
+            )
         token_word = Uint32(0)
         route_token_mask_is_full = cutlass.Boolean(False)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
@@ -707,8 +709,8 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     ]
                 )
             gmem_route_flags = _warp_broadcast_i32(gmem_route_flags, 0)
-            # Prepared bit 0 summarizes the whole route. Staged bits 0/1 are
-            # already fragment validity, so remap the summary to bit 2.
+            # Prepared bit 0 summarizes the whole route. Staged low bits are
+            # already fragment validity, so remap the summary above them.
             route_token_mask_is_full = cutlass.Boolean(
                 (gmem_route_flags & Int32(_PREPARED_ROUTE_IS_FULL_FLAG))
                 != Int32(0)
@@ -726,13 +728,14 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 )
 
         stage_base = self._producer_stage_base(stage_info)
+        if cutlass.const_expr(num_origins == 2):
+            if lane_idx == Int32(0):
+                self._smem_words[stage_base] = Int32(resolved_origin0)
+                self._smem_words[stage_base + Int32(1)] = Int32(resolved_origin1)
+        else:
+            if lane_idx < Int32(num_origins):
+                self._smem_words[stage_base + lane_idx] = Int32(resolved_origin0)
         if lane_idx == Int32(0):
-            self._smem_words[
-                stage_base + Int32(self.staging_layout.origin0_word_offset)
-            ] = origin0
-            self._smem_words[
-                stage_base + Int32(self.staging_layout.origin1_word_offset)
-            ] = origin1
             if cutlass.const_expr(self.cfg.use_kv_valid_bits):
                 route_flags = route_flags | (
                     Int32(route_token_mask_is_full)
@@ -743,7 +746,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             ] = route_flags
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
             assert self.staging_layout.token_words_word_offset is not None
-            if lane_idx < Int32(4):
+            if lane_idx < Int32(self.route_layout.token_words_per_route):
                 self._smem_words[
                     stage_base
                     + Int32(self.staging_layout.token_words_word_offset)
@@ -790,7 +793,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         ``origin0..3`` are absolute physical KV-token atom bases assigned to
         this Softmax warp's logical K32 slice; unused or invalid origins are
         negative. To preserve the shared seven-slot task ABI, origin 2/3
-        subsequently travel through the legacy route-flags/token-word-0 slots.
+        subsequently travel through the shared route-flags/token-word-0 slots.
         Token-word 1 carries the logical K32 mask, token-word 2 carries
         route-full, and token-word 3 is unused.
         """
@@ -869,28 +872,57 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 
         assert self.staging_layout.route_flags_word_offset is not None
         stage_base = self._consumer_stage_base()
-        origin0 = Int32(
-            self._smem_words[
-                stage_base + Int32(self.staging_layout.origin0_word_offset)
-            ]
-        )
-        origin1 = Int32(
-            self._smem_words[
-                stage_base + Int32(self.staging_layout.origin1_word_offset)
-            ]
-        )
-        route_flags = Int32(
+        stored_route_flags = Int32(
             self._smem_words[
                 stage_base + Int32(self.staging_layout.route_flags_word_offset)
             ]
         )
+        origin0_idx = Int32(0)
+        origin1_idx = Int32(1)
+        route_flags = stored_route_flags
+        if cutlass.const_expr(self.route_layout.kv_route_size == 256):
+            # KV256 threads [0, 64) and [64, 128) own alternating KV64
+            # origins: (0, 2) and (1, 3), respectively. Remap their validity
+            # bits into the existing two-origin task-local ABI.
+            assert self.route_layout.atom_size == 64
+            warp_grp_thread_idx = Int32(
+                _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+            )
+            spatial = warp_grp_thread_idx >> Int32(6)
+            origin0_idx = spatial
+            origin1_idx = spatial + Int32(2)
+            valid0 = (stored_route_flags >> origin0_idx) & Int32(1)
+            valid1 = (stored_route_flags >> origin1_idx) & Int32(1)
+            route_flags = valid0 | (valid1 << Int32(1))
+            if cutlass.const_expr(self.cfg.use_kv_valid_bits):
+                route_flags = route_flags | (
+                    stored_route_flags & Int32(_SOFTMAX_TOKEN_MASK_IS_FULL_FLAG)
+                )
+        origin0 = Int32(self._smem_words[stage_base + origin0_idx])
+        origin1 = Int32(self._smem_words[stage_base + origin1_idx])
         token_word0 = Uint32(0xFFFFFFFF)
         token_word1 = Uint32(0xFFFFFFFF)
         token_word2 = Uint32(0xFFFFFFFF)
         token_word3 = Uint32(0xFFFFFFFF)
         if cutlass.const_expr(self.cfg.use_kv_valid_bits):
             assert self.staging_layout.token_words_word_offset is not None
-            if cutlass.const_expr(self.cfg.tile_size_q == 64):
+            if cutlass.const_expr(self.route_layout.kv_route_size == 256):
+                token_base = Int32(self.staging_layout.token_words_word_offset)
+                word0_idx = origin0_idx * Int32(2)
+                word1_idx = origin1_idx * Int32(2)
+                token_word0 = Uint32(
+                    self._smem_words[stage_base + token_base + word0_idx]
+                )
+                token_word1 = Uint32(
+                    self._smem_words[stage_base + token_base + word0_idx + Int32(1)]
+                )
+                token_word2 = Uint32(
+                    self._smem_words[stage_base + token_base + word1_idx]
+                )
+                token_word3 = Uint32(
+                    self._smem_words[stage_base + token_base + word1_idx + Int32(1)]
+                )
+            elif cutlass.const_expr(self.cfg.tile_size_q == 64):
                 lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
                 local_word_base = _keeps_col_base(
                     self.cfg,

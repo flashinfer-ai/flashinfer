@@ -22,8 +22,6 @@ from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
-from .prepared import _PreparedBlockSparseLayout
-
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -71,8 +69,8 @@ class _BlockSparsePlanState:
     and in range. Plan-owned row offsets describe capacity slices rather than
     live BSR boundaries. Mutable route scratch, the dummy mask, and the event
     are also state-owned.
-    Policy and the route layout are immutable after publication; the
-    cached compiled adapter is shared read-only.
+    Policy is immutable after publication; the cached compiled adapter is
+    shared read-only.
 
     One revision owns one mutable route workspace. Ordered runs on one
     stream, or externally synchronized cross-stream runs, are valid. Unordered
@@ -103,11 +101,10 @@ class _BlockSparsePlanState:
     kv_valid_bits: torch.Tensor
 
     # Immutable row capacities and mutable per-run route payload.
-    route_layout: _PreparedBlockSparseLayout
     row_route_offsets: torch.Tensor
     route_workspace: torch.Tensor
     # Optional semantic row bound; unlike route capacity, this distinguishes
-    # two B64 blocks packed into one prepared KV128 record.
+    # multiple semantic blocks packed into one prepared route.
     max_blocks_per_row: int | None
 
     policy: tuple[tuple[str, object], ...]

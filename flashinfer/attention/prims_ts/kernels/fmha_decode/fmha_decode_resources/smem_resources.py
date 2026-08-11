@@ -468,8 +468,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     tma_desc_k: cutlass.Pointer | None = None
     tma_desc_v: cutlass.Pointer | None = None
-    tma_desc_k_64: cutlass.Pointer | None = None
-    tma_desc_v_64: cutlass.Pointer | None = None
+    tma_desc_k_atom: cutlass.Pointer | None = None
+    tma_desc_v_atom: cutlass.Pointer | None = None
     sparse_kv_metadata: "SmemBlockSparseKvMetadataResource | None" = None
     page_offsets_kv: "SmemPageOffsetsKvResource | None" = None
     seqlens_kv: cute.Pointer | None = None
@@ -674,16 +674,16 @@ class SmemKvTileResource(DecodeGenResourceBase):
 
         if cutlass.const_expr(cfg.use_block_sparse):
             assert self.sparse_kv_metadata is not None
-            assert self.tma_desc_k_64 is not None
-            assert self.tma_desc_v_64 is not None
+            assert self.tma_desc_k_atom is not None
+            assert self.tma_desc_v_atom is not None
             # The positional TensorMaps keep the decode ABI stable. The
             # primary K/V descriptors are KV128 for coarse routes and one atom
-            # for fine routes. The legacy ``_64`` slots always expose the atom
+            # for fine routes. The auxiliary slots always expose the atom
             # descriptor and alias the primary descriptor for fine routes.
             tma_desc_atom = (
-                self.tma_desc_v_64
+                self.tma_desc_v_atom
                 if cutlass.const_expr(self.kv_kind == KV_KIND_V)
-                else self.tma_desc_k_64
+                else self.tma_desc_k_atom
             )
             kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
@@ -1395,6 +1395,10 @@ class SmemKvResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     tma_desc_k: cutlass.Pointer | None = None
     tma_desc_v: cutlass.Pointer | None = None
+    tma_desc_k_atom: cutlass.Pointer | None = None
+    tma_desc_v_atom: cutlass.Pointer | None = None
+    sparse_kv_metadata0: "SmemBlockSparseKvMetadataResource | None" = None
+    sparse_kv_metadata1: "SmemBlockSparseKvMetadataResource | None" = None
     page_offsets_kv: SmemPageOffsetsKvResource | None = None
     seqlens_kv: cute.Pointer | None = None
     max_seq_len_kv: Int32 = None
@@ -1650,6 +1654,11 @@ class SmemKvResource(DecodeGenResourceBase):
         head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
 
         if cutlass.const_expr(cfg.tile_size_kv == 256):
+            sparse_kv_metadata = (
+                self.sparse_kv_metadata0
+                if cutlass.const_expr(inst_id == KV_INST0)
+                else self.sparse_kv_metadata1
+            )
             self._producer_load_kv_tile_256(
                 stage_info,
                 tma_desc,
@@ -1658,6 +1667,7 @@ class SmemKvResource(DecodeGenResourceBase):
                 logical_b_idx,
                 kv_kind,
                 cached_page_ids,
+                sparse_kv_metadata,
             )
         elif cutlass.const_expr(cfg.use_paged_kv):
             # Paged-KV path: LoadTask consumes pre-staged page IDs and issues
@@ -1793,17 +1803,23 @@ class SmemKvResource(DecodeGenResourceBase):
         logical_b_idx: Int32,
         kv_kind: Constexpr[int],
         cached_page_ids: cutlass.Array | None,
+        sparse_kv_metadata: "SmemBlockSparseKvMetadataResource | None",
     ) -> None:
         """Stage one KV256 tile in the physical 2x2-datapath layout.
 
         The public decode TensorMaps expose KV64 (or one smaller page)
         fragments. K places semantic KV64 blocks in physical order
         ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent D64
-        halves. This is the only layout difference from the shared KV128 load
-        workflow; runtime tile clamping and page-ID selection remain common.
+        halves. Dense and paged profiles derive those fragments from one
+        contiguous tile; block-sparse profiles consume four prepared KV64
+        origins retained by the instruction-local metadata resource.
         """
         cfg = self.cfg
-        grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
+        grouped_tile_idx = Int32(0)
+        if cutlass.const_expr(not cfg.use_block_sparse):
+            grouped_tile_idx = self._maybe_runtime_tile_idx(
+                stage_info, local_tile_idx
+            )
         stage_base = self._stage_base(stage_info)
 
         if prims.elect_sync():
@@ -1814,6 +1830,15 @@ class SmemKvResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.use_paged_kv and cached_page_ids is None):
                 page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
             for semantic_block in cutlass.range_constexpr(4):
+                atom_origin = Int32(0)
+                if cutlass.const_expr(cfg.use_block_sparse):
+                    assert sparse_kv_metadata is not None
+                    # Invalid origins were normalized to the TensorMap OOB
+                    # coordinate when the route was retained, so K and V use
+                    # the same straight-line four-atom issue sequence.
+                    atom_origin = Int32(
+                        sparse_kv_metadata.route_origin(Int32(semantic_block))
+                    )
                 physical_block = semantic_block
                 if cutlass.const_expr(kv_kind == KV_KIND_K):
                     physical_block = KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM[
@@ -1831,7 +1856,25 @@ class SmemKvResource(DecodeGenResourceBase):
                             + dim_half * 64 * 64
                         )
 
-                    if cutlass.const_expr(cfg.use_paged_kv):
+                    if cutlass.const_expr(cfg.use_block_sparse):
+                        sparse_tma_desc = (
+                            self.tma_desc_v_atom
+                            if cutlass.const_expr(kv_kind == KV_KIND_V)
+                            else self.tma_desc_k_atom
+                        )
+                        assert sparse_tma_desc is not None
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            stage_base.subview(block_base),
+                            sparse_tma_desc,
+                            (
+                                Int32(dim_half * 64),
+                                atom_origin,
+                                logical_h_k_idx,
+                                logical_b_idx,
+                            ),
+                            stage_info.barrier,
+                        )
+                    elif cutlass.const_expr(cfg.use_paged_kv):
                         fragment_tokens = min(cfg.num_tokens_per_page, 64)
                         fragments_per_block = 64 // fragment_tokens
                         for fragment in cutlass.range_constexpr(

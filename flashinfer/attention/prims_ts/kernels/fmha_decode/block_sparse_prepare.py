@@ -22,14 +22,13 @@ CTA.
 
 ``row_route_offsets`` is a separate plan-owned immutable Int32 tensor.
 ``route_workspace`` contains only mutable row counts and route metadata
-described by ``_PreparedBlockSparseLayout``. Payload outside each live row
+described by ``_BlockSparseRouteLayout``. Payload outside each live row
 count is intentionally stale. ``max_blocks_per_row`` is a run-time Int32
 scalar: ``-1`` disables the semantic bound, while a non-negative value keeps a
 declared BSR-block limit distinct from packed-route capacity.
 """
 
 import math
-from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -38,7 +37,7 @@ from cutlass.experimental import primitives as prims
 
 from ..._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_FULL_FLAG,
-    _PreparedBlockSparseLayout,
+    _BlockSparseRouteLayout,
 )
 from .fmha_decode_resources.helpers_common import _warp_broadcast_i32
 
@@ -224,14 +223,13 @@ class _PrepareBlockSparseRoutes:
         kv_route_size: int,
         has_token_bits: bool,
     ) -> None:
-        self.batch_size = batch_size
         self.num_kv_heads = num_kv_heads
         self.seq_len_kv = seq_len_kv
         self.kv_block_size = kv_block_size
         self.has_token_bits = has_token_bits
         self.num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         self.num_rows = batch_size * num_kv_heads * self.num_q_block_rows
-        layout = _PreparedBlockSparseLayout.create(
+        layout = _BlockSparseRouteLayout.create(
             kv_route_size=kv_route_size,
             kv_block_size=kv_block_size,
             has_token_bits=has_token_bits,
@@ -261,7 +259,7 @@ class _PrepareBlockSparseRoutes:
         self,
         block_indptr: cute.Tensor,
         block_indices: cute.Tensor,
-        kv_valid_bits: Optional[cute.Tensor],
+        kv_valid_bits: cute.Tensor,
         row_route_offsets: cute.Tensor,
         route_workspace: cute.Tensor,
         max_blocks_per_row: cutlass.Int32,
@@ -287,7 +285,7 @@ class _PrepareBlockSparseRoutes:
         self,
         block_indptr: cute.Tensor,
         block_indices: cute.Tensor,
-        kv_valid_bits: Optional[cute.Tensor],
+        kv_valid_bits: cute.Tensor,
         row_route_offsets: cute.Tensor,
         route_workspace: cute.Tensor,
         max_blocks_per_row: cutlass.Int32,
@@ -417,7 +415,6 @@ class _PrepareBlockSparseRoutes:
             )
             route_is_full = structural_route_is_full
             if cutlass.const_expr(self.has_token_bits):
-                assert kv_valid_bits is not None
                 assert self.token_words_word_offset is not None
                 token_word = cutlass.Uint32(0)
                 if cutlass.const_expr(self.atom_size <= 32):

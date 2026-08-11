@@ -1841,6 +1841,7 @@ def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128
 
 def _make_contiguous_kv256_config(
     *,
+    dtype=BFloat16,
     persistent: bool | None = None,
     config_args: dict[str, object] | None = None,
     split_kv_mode: str = "disabled",
@@ -1866,8 +1867,8 @@ def _make_contiguous_kv256_config(
         batch_size=1,
         num_heads_q=32,
         num_heads_kv=32,
-        qkv_dtype=BFloat16,
-        o_dtype=BFloat16,
+        qkv_dtype=dtype,
+        o_dtype=dtype,
         qkv_layout="contiguousKv",
         split_kv_mode=split_kv_mode,
         splits_kv=splits_kv,
@@ -2052,8 +2053,9 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check(
-) -> None:
+def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
+    None
+):
     """Keep structural validation enabled when TS cannot model P barriers."""
 
     cfg = _make_contiguous_kv256_config(persistent=False)
@@ -2073,41 +2075,40 @@ def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check(
 
 
 @pytest.mark.parametrize(
-    "config_args",
-    tuple(
-        {field: expected + 1}
-        for field, expected in (
-            ("softmax0_warp_idx", 0),
-            ("softmax0_num_warps", 4),
-            ("softmax1_warp_idx", 4),
-            ("softmax1_num_warps", 4),
-            ("correction_warp_idx", 8),
-            ("correction_num_warps", 4),
-            ("mma_warp_idx", 12),
-            ("mma_num_warps", 1),
-            ("load_warp_idx", 13),
-            ("load_num_warps", 1),
-            ("page_offsets_warp_idx", 14),
-            ("page_offsets_num_warps", 1),
-            ("padding_warp_idx", 14),
-            ("padding_num_warps", 2),
-            ("scheduler_warp_idx", 13),
-            ("scheduler_num_warps", 1),
-            ("clc_load_warp_idx", 15),
-            ("clc_padding_warp_idx", 14),
-            ("clc_padding_num_warps", 1),
-            ("clc_tail_padding_warp_idx", 12),
-            ("clc_tail_padding_num_warps", 0),
-        )
+    ("field_name", "invalid_value", "message"),
+    (
+        pytest.param(
+            "mma_tile_n_bmm1",
+            128,
+            "mma_tile_n_bmm1",
+            id="mma-geometry",
+        ),
+        pytest.param("kv_stages", 2, "kv_stages", id="pipeline-depth"),
+        pytest.param(
+            "load_warp_idx",
+            14,
+            "qualified Q64 FP16/BF16/D128",
+            id="static-load-role",
+        ),
+        pytest.param(
+            "clc_load_warp_idx",
+            16,
+            "qualified Q64 FP16/BF16/D128",
+            id="persistent-load-role",
+        ),
     ),
 )
-def test_attention_ts_decode_kv256_rejects_invalid_warp_topology(
-    config_args: dict[str, object],
+def test_attention_ts_decode_kv256_rejects_incompatible_profile_overrides(
+    field_name: str,
+    invalid_value: int,
+    message: str,
 ) -> None:
-    """Reject every explicit override of the qualified KV256 role layout."""
+    """Reject representative conflicts with the fixed KV256 physical ABI."""
 
-    with pytest.raises(ValueError, match="qualified Q64 BF16/D128"):
-        _make_contiguous_kv256_config(config_args=config_args)
+    with pytest.raises(ValueError, match=message):
+        _make_contiguous_kv256_config(
+            config_args={field_name: invalid_value},
+        )
 
 
 def test_attention_ts_decode_kv256_rotates_compact_direct_exchange() -> None:
@@ -2166,6 +2167,7 @@ def test_attention_ts_decode_kv256_split_uses_compact_exchange(
     )
 
     cfg = _make_contiguous_kv256_config(
+        dtype=Float16,
         split_kv_mode=split_kv_mode,
         splits_kv=2,
     )
@@ -2185,8 +2187,9 @@ def test_attention_ts_decode_kv256_split_uses_compact_exchange(
     assert exchange_alloc.size_bytes == 35_840
 
 
-def test_attention_ts_decode_rotating_exchange_is_a_storage_agnostic_capability(
-) -> None:
+def test_attention_ts_decode_rotating_exchange_is_a_storage_agnostic_capability() -> (
+    None
+):
     """Select rotation by physical topology, not contiguous versus paged K/V."""
 
     contiguous = _make_contiguous_kv256_config(persistent=True)
@@ -2219,9 +2222,7 @@ def test_attention_ts_decode_rotating_exchange_is_a_storage_agnostic_capability(
     assert not replace(
         contiguous, use_persistent_scheduler=False
     ).uses_rotating_kv256_exchange
-    assert not replace(
-        contiguous, use_split_kv=True
-    ).uses_rotating_kv256_exchange
+    assert not replace(contiguous, use_split_kv=True).uses_rotating_kv256_exchange
     assert not replace(
         contiguous, use_attention_sinks=True
     ).uses_rotating_kv256_exchange
@@ -2717,12 +2718,15 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
     return fmha_decode_config.make_decode_config(**{**kwargs, **overrides})
 
 
-def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch):
-    """KV256 participates in the ordinary auto selection."""
+@pytest.mark.parametrize("dtype", (BFloat16, Float16))
+def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
+    """Both qualified 16-bit dtypes participate in ordinary auto selection."""
 
-    cfg = _make_auto_kv_tile_config(monkeypatch)
+    dtype_args = {"qkv_dtype": dtype, "o_dtype": dtype}
+    cfg = _make_auto_kv_tile_config(monkeypatch, **dtype_args)
     explicit_reference = _make_auto_kv_tile_config(
         monkeypatch,
+        **dtype_args,
         args={
             "use_keeps_mma_ab": True,
             "tile_size_q": 64,
@@ -2770,12 +2774,12 @@ def test_attention_ts_decode_auto_config_selection_is_device_agnostic(monkeypatc
 @pytest.mark.parametrize(
     "overrides",
     (
-        pytest.param(
-            {"qkv_dtype": Float16, "o_dtype": Float16},
-            id="fp16",
-        ),
         pytest.param({"headdim": 64}, id="head-dim-64"),
         pytest.param({"args": {"tile_size_kv": 128}}, id="explicit-kv128"),
+        pytest.param(
+            {"qkv_dtype": Float16, "o_dtype": BFloat16},
+            id="mixed-16-bit-io",
+        ),
     ),
 )
 def test_attention_ts_decode_auto_config_falls_back_to_kv128(
@@ -2813,7 +2817,7 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
     # Keep this launch-mode unit test on the generic KV128 profile. The
-    # BF16/D128 auto candidate uses Q64/KV256 and changes the number of physical
+    # The 16-bit D128 auto candidate uses Q64/KV256 and changes the physical
     # Q CTAs used by the wave boundary below.
     config_args: dict[str, object] = {"tile_size_kv": 128}
     if packed_q:
@@ -3376,14 +3380,15 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("num_qo_heads", "num_kv_heads"),
+    ("qkv_dtype", "num_qo_heads", "num_kv_heads", "mask_type"),
     (
-        pytest.param(32, 32, id="mha"),
-        pytest.param(64, 8, id="gqa"),
+        pytest.param(torch.bfloat16, 32, 32, "dense", id="bf16-mha-dense"),
+        pytest.param(torch.bfloat16, 64, 8, "causal", id="bf16-gqa-causal"),
+        pytest.param(torch.float16, 32, 32, "dense", id="fp16-mha-dense"),
     ),
 )
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 def test_attention_ts_decode_q64_kv256_auto_launch(
+    qkv_dtype: torch.dtype,
     num_qo_heads: int,
     num_kv_heads: int,
     mask_type: str,
@@ -3397,8 +3402,8 @@ def test_attention_ts_decode_q64_kv256_auto_launch(
         head_dim=128,
         seq_len_q=64,
         page_size=16,
-        qkv_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
+        qkv_dtype=qkv_dtype,
+        output_dtype=qkv_dtype,
         cache_form="combined",
         mask_type=mask_type,
         device="cuda",
@@ -3410,22 +3415,59 @@ def test_attention_ts_decode_q64_kv256_auto_launch(
     assert policy["tile_size_q"] == 64
     assert policy["tile_size_kv"] == 256
     assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["use_split_kv"] is False
 
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("kv_len", "num_heads"),
+    ("qkv_dtype", "kv_len", "num_heads", "forced_mode", "expect_separate"),
     (
-        pytest.param(8192, 32, id="multi-head"),
-        pytest.param(65536, 1, id="long-kv"),
+        pytest.param(
+            torch.float16,
+            8192,
+            32,
+            None,
+            True,
+            id="fp16-separate-multi-head",
+        ),
+        pytest.param(
+            torch.float16,
+            8192,
+            16,
+            "gmem_reduction",
+            False,
+            id="fp16-fused",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            65536,
+            1,
+            None,
+            True,
+            id="bf16-separate-long-kv",
+        ),
     ),
 )
 def test_attention_ts_decode_q64_kv256_split_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    qkv_dtype: torch.dtype,
     kv_len: int,
     num_heads: int,
+    forced_mode: str | None,
+    expect_separate: bool,
 ) -> None:
-    """Exercise automatic KV256 split-KV across distinct fanout shapes."""
+    """Exercise KV256 split-KV across distinct reducers and fanout shapes."""
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    if forced_mode is not None:
+        monkeypatch.setattr(
+            fmha_decode_config,
+            "select_split_kv_modes",
+            lambda **_kwargs: (forced_mode,),
+        )
 
     case = _make_decode_case(
         kv_lens=(kv_len,),
@@ -3434,18 +3476,25 @@ def test_attention_ts_decode_q64_kv256_split_launch(
         head_dim=128,
         seq_len_q=64,
         page_size=128,
-        qkv_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
+        qkv_dtype=qkv_dtype,
+        output_dtype=qkv_dtype,
         cache_form="combined",
         mask_type="dense",
         device="cuda",
         seed=20260805,
     )
 
-    policy = _exercise_auto_case(case)
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    decode_module._get_compiled_decode.cache_clear()
+    try:
+        policy = _exercise_auto_case(case)
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+        decode_module._get_compiled_decode.cache_clear()
 
     assert policy["tile_size_kv"] == 256
     assert policy["use_split_kv"] is True
+    assert policy["use_separate_reduction_kernel"] is expect_separate
 
 
 @pytest.mark.arch_blackwell

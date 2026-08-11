@@ -128,7 +128,7 @@ from .smem_block_sparse_metadata import (
 from .tmem_corr import TmemCorrResource
 from .tmem_o import TmemOResource
 from .smem_p import SmemPResource
-from .tmem_s import TmemSBlockSparseResource, TmemSResource
+from .tmem_s import TmemSResource
 from .tmem_softmax_stats import (
     TmemStatsDoneResource,
     TmemSoftmaxGlobalResource,
@@ -147,7 +147,6 @@ __all__ = [
     "SmemBlockSparseSoftmaxMetadataResource",
     "TmemCorrResource",
     "TmemOResource",
-    "TmemSBlockSparseResource",
     "TmemSResource",
     "TmemStatsDoneResource",
     "TmemSoftmaxGlobalResource",

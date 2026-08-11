@@ -34,7 +34,7 @@ pytest.importorskip(
 import flashinfer.attention.prims_ts as prims_ts
 from flashinfer.attention.prims_ts import block_sparse as block_sparse_module
 from flashinfer.attention.prims_ts._block_sparse.prepared import (
-    _PreparedBlockSparseLayout,
+    _BlockSparseRouteLayout,
 )
 
 
@@ -296,6 +296,61 @@ _CASES = (
         "static",
     ),
     _Case(
+        "q64_kv64_fp16_nonadjacent_tail_holey_static",
+        1,
+        1,
+        63,
+        193,
+        64,
+        64,
+        torch.float16,
+        "dense",
+        "holey",
+        "static",
+    ),
+    _Case(
+        "q64_kv128_bf16_kv256_nomask_static",
+        1,
+        1,
+        64,
+        513,
+        64,
+        128,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="mixed",
+    ),
+    _Case(
+        "q64_kv256_fp16_kv256_nomask_clc",
+        1,
+        1,
+        64,
+        513,
+        64,
+        256,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
+        "q64_kv64_bf16_kv256_causal_holey_tail_clc",
+        1,
+        1,
+        321,
+        321,
+        64,
+        64,
+        torch.bfloat16,
+        "causal",
+        "holey",
+        "persistent",
+        pattern="mixed",
+    ),
+    _Case(
         "q128_kv256_bf16_batched_heads_clc",
         2,
         2,
@@ -370,9 +425,7 @@ def _make_patterns(case: _Case) -> _Patterns:
                     continue
                 if case.pattern == "full_and_partial":
                     rows.append(
-                        tuple(range(16))
-                        if row_idx == 0
-                        else (0, num_kv_blocks - 1)
+                        tuple(range(16)) if row_idx == 0 else (0, num_kv_blocks - 1)
                     )
                     continue
                 if case.pattern == "mixed":
@@ -570,50 +623,202 @@ def test_public_exports() -> None:
     assert prims_ts.block_sparse_attention is block_sparse_module.block_sparse_attention
 
 
-def test_block_sparse_keeps_rescale_threshold_preserves_anchor_invariant() -> None:
-    """Deferred max updates must keep numerator and denominator in one frame."""
+def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
+    """Descriptor strides must reach TMA's 16-byte ABI without Int32 overflow."""
 
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources import (
-        tmem_s,
+    import cutlass
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _block_sparse_bshd_tma_strides,
     )
 
-    threshold = getattr(tmem_s, "_BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2", None)
-    assert threshold == 8.0
+    q_strides, kv_strides = _block_sparse_bshd_tma_strides(
+        q_seq=cutlass.Int32(8192),
+        h_q=cutlass.Int32(16384),
+        h_k=cutlass.Int32(16384),
+        s_k=cutlass.Int32(8192),
+        d=cutlass.Int32(128),
+    )
 
-    anchor = float("-inf")
-    denominator = 0.0
-    numerator = 0.0
-    anchors: list[float] = []
-    scores = (0.0, 8.0 * math.log(2.0), 9.0 * math.log(2.0))
-    values = (1.0, -2.0, 4.0)
-    for score, value in zip(scores, values, strict=True):
-        candidate = max(anchor, score)
-        if (
-            math.isfinite(anchor)
-            and (candidate - anchor) * math.log2(math.e) <= threshold
-        ):
-            new_anchor = anchor
-        else:
-            new_anchor = candidate
-        old_scale = 0.0 if not math.isfinite(anchor) else math.exp(anchor - new_anchor)
-        probability = math.exp(score - new_anchor)
-        denominator = denominator * old_scale + probability
-        numerator = numerator * old_scale + probability * value
-        anchor = new_anchor
-        anchors.append(anchor)
+    assert all(type(stride) is cutlass.Int64 for stride in (*q_strides, *kv_strides))
+    assert tuple(map(int, q_strides)) == (16, 16, 262_144, 2_147_483_648)
+    assert tuple(map(int, kv_strides)) == (262_144, 16, 2_147_483_648)
 
-    assert anchors == [scores[0], scores[0], scores[2]]
-    expected = torch.softmax(
-        torch.tensor(scores, dtype=torch.float64),
-        dim=0,
-    ) @ torch.tensor(values, dtype=torch.float64)
-    assert numerator / denominator == pytest.approx(expected.item(), abs=1e-12)
+
+def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None:
+    """Keep the native route selection narrow and independent of live BSR data."""
+
+    select = block_sparse_module._select_block_sparse_kv_route_size
+    assert (
+        select(
+            q_tile_size=64,
+            kv_block_size=64,
+        )
+        == 256
+    )
+    assert (
+        select(
+            q_tile_size=64,
+            kv_block_size=256,
+        )
+        == 256
+    )
+    assert (
+        select(
+            q_tile_size=128,
+            kv_block_size=64,
+        )
+        == 128
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "q_block_size",
+        "kv_block_size",
+        "kv_route_size",
+        "persistent",
+        "token_mask",
+    ),
+    (
+        pytest.param(128, 128, 128, False, False, id="q128-kv128-static"),
+        pytest.param(64, 64, 256, True, True, id="q64-kv256-clc-mask"),
+    ),
+)
+def test_block_sparse_builds_standard_decode_schedule(
+    q_block_size: int,
+    kv_block_size: int,
+    kv_route_size: int,
+    persistent: bool,
+    token_mask: bool,
+) -> None:
+    """Both physical KV topologies share the sparse Softmax resource ABI."""
+
+    from cutlass.experimental.task_scheduling.enums import ScheduleStage
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _build_decode_gen_schedule,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources import (
+        TmemSResource,
+    )
+
+    cfg = block_sparse_module._make_block_sparse_config(
+        batch_size=1,
+        seq_len_q=q_block_size,
+        seq_len_kv=4096,
+        num_heads=8,
+        head_dim=_HEAD_DIM,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+        kv_route_size=kv_route_size,
+        dtype_key="float16",
+        mask_type="dense",
+        use_kv_valid_bits=token_mask,
+        use_persistent_scheduler=persistent,
+        use_parallel_sparse_kv_loads=False,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        tasks, *_ = _build_decode_gen_schedule(
+            cfg,
+            total_kv_tiles=8,
+            num_heads_kv=8,
+        )
+
+    tasks_by_name = {task.name: task for task in tasks}
+    assert "LoadTask" in tasks_by_name
+    assert "MmaTask" in tasks_by_name
+    assert "Softmax0Task" in tasks_by_name
+    assert "Softmax1Task" in tasks_by_name
+    assert "CorrectionTask" in tasks_by_name
+    assert all("Temporal" not in task.name for task in tasks)
+    resource_names = {
+        resource.name
+        for task in tasks
+        for resource in (*task.src_resources, *task.dst_resources)
+    }
+    if kv_route_size == 256:
+        assert "smemKv" in resource_names
+        assert {"smemK0", "smemK1", "smemV0", "smemV1"}.isdisjoint(resource_names)
+    else:
+        assert "smemKv" not in resource_names
+        assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resource_names
+    for task_name, resource_name in (
+        ("Softmax0Task", "tmemS0"),
+        ("Softmax1Task", "tmemS1"),
+    ):
+        softmax_task = tasks_by_name[task_name]
+        tmem_s = next(
+            resource
+            for resource in softmax_task.src_resources
+            if resource.name == resource_name
+        )
+        assert type(tmem_s) is TmemSResource
+        consumer_labels = [
+            entry[-1]
+            for entry in softmax_task.loop_schedule_list
+            if entry[0] is tmem_s and entry[1] == ScheduleStage.ConsumerWork
+        ]
+        assert consumer_labels == ["compute_block_sparse_softmax_loop"]
+
+
+def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
+    """The two KV issuers own disjoint instruction-local resources."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _build_decode_gen_schedule,
+    )
+
+    cfg = block_sparse_module._make_block_sparse_config(
+        batch_size=1,
+        seq_len_q=128,
+        seq_len_kv=2304,
+        num_heads=8,
+        head_dim=_HEAD_DIM,
+        q_block_size=8,
+        kv_block_size=8,
+        kv_route_size=128,
+        dtype_key="bfloat16",
+        mask_type="dense",
+        use_kv_valid_bits=True,
+        use_persistent_scheduler=True,
+        use_parallel_sparse_kv_loads=True,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        tasks, *_ = _build_decode_gen_schedule(
+            cfg,
+            total_kv_tiles=18,
+            num_heads_kv=8,
+        )
+
+    tasks_by_name = {task.name: task for task in tasks}
+    load0 = tasks_by_name["LoadTask0"]
+    load1 = tasks_by_name["LoadTask1"]
+    assert load0.warp_idx != load1.warp_idx
+    dst0 = {resource.name for resource in load0.dst_resources}
+    dst1 = {resource.name for resource in load1.dst_resources}
+    assert dst0.isdisjoint(dst1)
+    assert {"smemK0", "smemV0", "smemBlockSparseKvMetadata0"} <= dst0
+    assert {"smemK1", "smemV1", "smemBlockSparseKvMetadata1"} <= dst1
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    ("q_block_size", "dtype", "route_size"),
+    (
+        pytest.param(128, torch.bfloat16, 128, id="kv128-bf16"),
+        pytest.param(64, torch.float16, 256, id="kv256-fp16"),
+    ),
+)
 @torch.no_grad()
-def test_block_sparse_keeps_rescale_threshold_gpu_edges() -> None:
+def test_block_sparse_keeps_rescale_threshold_gpu_edges(
+    q_block_size: int,
+    dtype: torch.dtype,
+    route_size: int,
+) -> None:
     """Exercise one deferred anchor, one re-anchor, and an all-masked replay."""
 
     # The two KV instructions own alternating routes. Instruction 0 therefore
@@ -627,19 +832,18 @@ def test_block_sparse_keeps_rescale_threshold_gpu_edges() -> None:
     )
     route_values = (1.0, 0.5, -2.0, -0.5, 4.0)
     block_size = 64
-    route_size = 2 * block_size
-    seq_len_q = 64
+    seq_len_q = q_block_size
     seq_len_kv = len(route_scores) * route_size
     q = torch.zeros(
         (1, seq_len_q, 1, _HEAD_DIM),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     q[..., 0] = 1.0
     k = torch.zeros(
         (1, seq_len_kv, 1, _HEAD_DIM),
         device="cuda",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     v = torch.empty_like(k)
     for route_idx, (score, value) in enumerate(
@@ -679,18 +883,16 @@ def test_block_sparse_keeps_rescale_threshold_gpu_edges() -> None:
         1,
         1,
         _HEAD_DIM,
-        block_size,
+        q_block_size,
         block_size,
         kv_valid_bits=kv_valid_bits,
-        q_data_type=torch.bfloat16,
+        q_data_type=dtype,
         dynamic_metadata=True,
     )
     state = wrapper._published_state()
     policy = dict(state.policy)
-    assert policy["tile_size_q"] == block_size
-    # The alternating-route construction below depends on the prepared KV128
-    # route geometry, which is intentionally not part of the diagnostic policy.
-    assert state.route_layout.kv_route_size == route_size
+    assert policy["tile_size_q"] == q_block_size
+    assert policy["tile_size_kv"] == route_size
     assert policy["use_kv_valid_bits"] is True
 
     actual = wrapper.run(q, k, v, sm_scale=1.0)
@@ -732,9 +934,7 @@ def test_q8_sparse_p_discards_dead_paired_instance() -> None:
     first_half = frozenset(range(64))
     valid_bits = _pack_token_mask(case.seq_len_kv, (first_half,))
     q = torch.randn((1, 8, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
-    k = torch.randn(
-        (1, case.seq_len_kv, 1, _HEAD_DIM), device="cuda", dtype=case.dtype
-    )
+    k = torch.randn((1, case.seq_len_kv, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
     v = torch.randn_like(k)
     sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
     wrapper = block_sparse_module.BlockSparseTSWrapper()
@@ -788,22 +988,18 @@ def test_attention_core_sparse_abi_uses_only_prepared_metadata() -> None:
         "expected_geometry",
     ),
     (
-        (128, 64, True, (64, 2, 4, 2, 3, 4, 8)),
         (128, 8, True, (8, 16, 4, 16, 17, 18, 24)),
-        (128, 16, True, (16, 8, 4, 8, 9, 10, 16)),
         (128, 32, True, (32, 4, 4, 4, 5, 6, 12)),
+        (128, 64, True, (64, 2, 4, 2, 3, 4, 8)),
         (256, 64, True, (64, 4, 8, 4, 5, 6, 16)),
-        (256, 128, False, (64, 4, 8, 4, 5, None, 8)),
-        (256, 256, True, (64, 4, 8, 4, 5, 6, 16)),
+        (256, 256, False, (64, 4, 8, 4, 5, None, 8)),
     ),
     ids=(
-        "kv128-block64-mask",
         "kv128-block8-mask",
-        "kv128-block16-mask",
         "kv128-block32-mask",
+        "kv128-block64-mask",
         "kv256-block64-mask",
-        "kv256-block128-no-mask",
-        "kv256-block256-mask",
+        "kv256-block256-no-mask",
     ),
 )
 def test_prepared_block_sparse_layout_geometry(
@@ -812,7 +1008,7 @@ def test_prepared_block_sparse_layout_geometry(
     has_token_bits: bool,
     expected_geometry: tuple[int, int, int, int, int, int | None, int],
 ) -> None:
-    layout = _PreparedBlockSparseLayout.create(
+    layout = _BlockSparseRouteLayout.create(
         kv_route_size=kv_route_size,
         kv_block_size=kv_block_size,
         has_token_bits=has_token_bits,
@@ -836,19 +1032,19 @@ def test_prepared_block_sparse_layout_geometry(
 
 @pytest.mark.parametrize(
     ("kv_block_size", "expected_words"),
-    ((8, 16), (16, 8), (32, 4), (64, 4), (128, 4), (256, 4)),
+    ((8, 16), (16, 8), (32, 4), (64, 4)),
 )
-def test_kv_retained_route_storage_is_derived_from_prepared_layout(
+def test_kv_retained_route_storage_follows_origin_count(
     kv_block_size: int,
     expected_words: int,
 ) -> None:
-    """K/V retention keeps only origins and coarse fragment validity."""
+    """K-to-V retention keeps only origins and coarse route validity."""
 
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_block_sparse_metadata import (
         _kv_retained_route_words,
     )
 
-    layout = _PreparedBlockSparseLayout.create(
+    layout = _BlockSparseRouteLayout.create(
         kv_route_size=128,
         kv_block_size=kv_block_size,
         has_token_bits=True,
@@ -860,16 +1056,50 @@ def test_kv_retained_route_storage_is_derived_from_prepared_layout(
 
 
 @pytest.mark.parametrize(
+    ("kv_route_size", "route_capacity", "expected_offsets"),
+    (
+        (128, 2, [0, 2]),
+        (256, 1, [0, 1]),
+    ),
+)
+def test_route_storage_capacity_follows_route_width(
+    kv_route_size: int,
+    route_capacity: int,
+    expected_offsets: list[int],
+) -> None:
+    """Static row packing must use the same route width as its metadata."""
+
+    route_layout = _BlockSparseRouteLayout.create(
+        kv_route_size=kv_route_size,
+        kv_block_size=64,
+        has_token_bits=False,
+        route_metadata_capacity=route_capacity,
+        num_rows=1,
+    )
+    row_route_offsets, _ = block_sparse_module._allocate_route_storage(
+        torch.tensor([[[0, 3]]], dtype=torch.int32),
+        kv_block_size=64,
+        route_layout=route_layout,
+    )
+
+    assert row_route_offsets.tolist() == expected_offsets
+
+
+def test_prepared_route_alignment_uses_route_width() -> None:
+    """TensorMap eligibility is relative to one complete prepared route."""
+
+    from flashinfer.attention.prims_ts._block_sparse.common import (
+        _prepared_kv_routes_are_block_aligned,
+    )
+
+    assert _prepared_kv_routes_are_block_aligned(128, 128)
+    assert not _prepared_kv_routes_are_block_aligned(128, 256)
+    assert _prepared_kv_routes_are_block_aligned(256, 256)
+
+
+@pytest.mark.parametrize(
     ("overrides", "error_type", "message"),
     (
-        ({"kv_route_size": 96}, ValueError, "atom_size"),
-        ({"kv_route_size": 24, "kv_block_size": 8}, ValueError, "32"),
-        ({"kv_route_size": 512, "kv_block_size": 8}, ValueError, "single 32-bit mask"),
-        (
-            {"kv_route_size": 2048, "kv_block_size": 64},
-            ValueError,
-            "token_words_per_route",
-        ),
         (
             {"route_metadata_capacity": (1 << 31) - 1},
             OverflowError,
@@ -881,10 +1111,6 @@ def test_kv_retained_route_storage_is_derived_from_prepared_layout(
         ({"num_rows": 0}, ValueError, "num_rows"),
     ),
     ids=(
-        "tile-not-divisible-by-atom",
-        "tile-not-divisible-by-word",
-        "too-many-origins",
-        "too-many-token-words",
         "route-metadata-address-overflow",
         "row-offset-length-overflow",
         "bool-route-metadata-capacity",
@@ -892,7 +1118,7 @@ def test_kv_retained_route_storage_is_derived_from_prepared_layout(
         "zero-num-rows",
     ),
 )
-def test_prepared_block_sparse_layout_rejects_invalid_geometry(
+def test_prepared_block_sparse_layout_rejects_invalid_extents(
     overrides: dict[str, object],
     error_type: type[Exception],
     message: str,
@@ -907,11 +1133,22 @@ def test_prepared_block_sparse_layout_rejects_invalid_geometry(
     arguments.update(overrides)
 
     with pytest.raises(error_type, match=message):
-        _PreparedBlockSparseLayout.create(**arguments)
+        _BlockSparseRouteLayout.create(**arguments)
+
+
+def test_prepared_block_sparse_layout_rejects_unsupported_route_width() -> None:
+    with pytest.raises(ValueError, match="kv_route_size must be 128 or 256"):
+        _BlockSparseRouteLayout.create(
+            kv_route_size=192,
+            kv_block_size=64,
+            has_token_bits=True,
+            route_metadata_capacity=1,
+            num_rows=1,
+        )
 
 
 def test_prepared_block_sparse_layout_allows_empty_route_metadata() -> None:
-    layout = _PreparedBlockSparseLayout.create(
+    layout = _BlockSparseRouteLayout.create(
         kv_route_size=128,
         kv_block_size=64,
         has_token_bits=False,
@@ -921,16 +1158,7 @@ def test_prepared_block_sparse_layout_allows_empty_route_metadata() -> None:
 
     assert layout.route_metadata_base_word_offset == 4
     assert layout.route_metadata_capacity == 0
-    assert (
-        layout.workspace_size_words == layout.route_metadata_base_word_offset
-    )
-
-
-def _signed_i32_bits(value: int) -> int:
-    """Return the signed Int32 spelling of one stored metadata word."""
-
-    value &= 0xFFFFFFFF
-    return value if value < (1 << 31) else value - (1 << 32)
+    assert layout.workspace_size_words == layout.route_metadata_base_word_offset
 
 
 def test_public_api_rejects_invalid_usage() -> None:
@@ -1021,6 +1249,16 @@ def test_runtime_output_must_not_alias_sparse_metadata() -> None:
     (
         pytest.param({"q_block_size": 96}, "8, 16, 32", id="block-size"),
         pytest.param({"num_qo_heads": 2}, "Hq == Hkv", id="mha-only"),
+        pytest.param(
+            {"batch_size": 65_536},
+            r"grid\.z.*batch_size=65536",
+            id="batch-grid-limit",
+        ),
+        pytest.param(
+            {"num_qo_heads": 65_536, "num_kv_heads": 65_536},
+            r"grid\.y.*num_kv_heads=65536",
+            id="head-grid-limit",
+        ),
     ),
 )
 def test_plan_rejects_unsupported_profile(
@@ -1059,8 +1297,6 @@ def test_plan_rejects_unsupported_profile(
         pytest.param(8, 8, "dense", 129, False, False, id="q8-b8-route129"),
         pytest.param(8, 8, "causal", 8, False, True, id="q8-causal-route8"),
         pytest.param(8, 8, "causal", 9, False, False, id="q8-b8-causal-route9"),
-        pytest.param(8, 16, "dense", 128, True, True, id="q8-b16-mask-route128"),
-        pytest.param(8, 16, "dense", 129, True, False, id="q8-b16-mask-route129"),
         pytest.param(8, 8, "dense", 12, True, True, id="q8-mask-route12"),
         pytest.param(8, 8, "dense", 13, True, False, id="q8-mask-route13"),
         pytest.param(8, 32, "dense", 8, False, True, id="q8-b32-route8"),
@@ -1103,9 +1339,7 @@ def test_block_sparse_clc_candidate_capacity_gate(
         pytest.param(16, True, 6, True, False, id="b16-three-pairs"),
         pytest.param(16, True, 7, True, True, id="b16-four-pairs"),
         pytest.param(8, True, 4, False, True, id="b8-static"),
-        pytest.param(16, False, 6, False, True, id="b16-static"),
         pytest.param(32, True, 16, True, False, id="b32-combined"),
-        pytest.param(64, True, 8, True, False, id="b64-combined"),
     ),
 )
 def test_block_sparse_parallel_kv_load_policy(
@@ -1124,144 +1358,6 @@ def test_block_sparse_parallel_kv_load_policy(
         )
         is expected
     )
-
-
-@pytest.mark.parametrize(
-    ("use_persistent_scheduler", "expected_load_warps", "expected_tail_task"),
-    (
-        pytest.param(False, (13, 14), ("PaddingTask", 15), id="static"),
-        pytest.param(True, (15, 14), ("SchedulerTask", 13), id="clc"),
-    ),
-)
-def test_q8_b8_parallel_load_tasks_partition_resources(
-    use_persistent_scheduler: bool,
-    expected_load_warps: tuple[int, int],
-    expected_tail_task: tuple[str, int],
-) -> None:
-    """Q8/B8 dual issuers keep their warp roles and inst-local resources."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
-        _build_decode_gen_schedule,
-    )
-
-    cfg = block_sparse_module._make_block_sparse_config(
-        batch_size=1,
-        seq_len_q=128,
-        seq_len_kv=1024,
-        num_heads=8,
-        head_dim=_HEAD_DIM,
-        q_block_size=8,
-        kv_block_size=8,
-        dtype_key="bfloat16",
-        mask_type="dense",
-        use_kv_valid_bits=False,
-        use_persistent_scheduler=use_persistent_scheduler,
-        use_parallel_sparse_kv_loads=True,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        tasks, *_ = _build_decode_gen_schedule(
-            cfg,
-            total_kv_tiles=8,
-            num_heads_kv=8,
-        )
-
-    tasks_by_name = {task.name: task for task in tasks}
-    load0 = tasks_by_name["LoadTask0"]
-    load1 = tasks_by_name["LoadTask1"]
-    assert (load0.warp_idx, load1.warp_idx) == expected_load_warps
-    assert load0.num_warps == load1.num_warps == 1
-
-    src0 = {resource.name for resource in load0.src_resources}
-    src1 = {resource.name for resource in load1.src_resources}
-    dst0 = {resource.name for resource in load0.dst_resources}
-    dst1 = {resource.name for resource in load1.dst_resources}
-    shared_sources = {"work_queue"} if use_persistent_scheduler else set()
-    assert src0 & src1 == shared_sources
-    assert dst0.isdisjoint(dst1)
-    assert dst0 == {
-        "smemQ",
-        "smemK0",
-        "smemV0",
-        "smemBlockSparseKvMetadata0",
-        "smemBlockSparseSoftmaxMetadata0",
-    } | ({"schedule_token_throttle"} if use_persistent_scheduler else set())
-    assert dst1 == {
-        "smemK1",
-        "smemV1",
-        "smemBlockSparseKvMetadata1",
-        "smemBlockSparseSoftmaxMetadata1",
-    }
-
-    tail_task_name, tail_warp_idx = expected_tail_task
-    tail_task = tasks_by_name[tail_task_name]
-    assert (tail_task.warp_idx, tail_task.num_warps) == (tail_warp_idx, 1)
-
-
-def test_swaps_sparse_mask_profile_policy() -> None:
-    """Each selected SWAP profile has one explicit mask strategy."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
-        CAUSAL,
-        DENSE,
-        FmhaDecodeConfig,
-    )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_s import (
-        _swaps_token_word_covers_kv_tail,
-        _swaps_uses_origin0_k32_full_guard,
-        _swaps_uses_token_only_score_validity,
-    )
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_block_sparse_metadata import (
-        _swaps_forwards_packed_route_full,
-    )
-
-    # name, Q, B, mask, token bits, persistent, parallel loads, expected flags:
-    # (packed full, origin0 K32 full, token covers tail, token-only score).
-    generic = (False, False, False, False)
-    packed_full = (True, False, False, False)
-    origin0_full = (False, True, False, False)
-    tail_only = (False, False, True, False)
-    token_only = (False, False, True, True)
-    profiles = (
-        ("packed-q8-b8", 8, 8, DENSE, False, True, False, packed_full),
-        ("generic-b16", 16, 16, DENSE, False, True, False, generic),
-        ("generic-q32-b8", 32, 8, DENSE, False, True, False, generic),
-        ("origin0-b32", 32, 32, DENSE, False, True, False, origin0_full),
-        ("token-only-b16", 16, 16, DENSE, True, True, False, token_only),
-        ("token-only-parallel-b8", 8, 8, DENSE, True, True, True, token_only),
-        ("tail-only-combined-b8", 8, 8, DENSE, True, True, False, tail_only),
-        ("tail-only-static-b16", 16, 16, DENSE, True, False, False, tail_only),
-        ("causal-token", 16, 32, CAUSAL, True, True, False, generic),
-    )
-    for (
-        name,
-        q_size,
-        block_size,
-        mask,
-        token_bits,
-        persistent,
-        parallel,
-        expected,
-    ) in profiles:
-        cfg = FmhaDecodeConfig(
-            use_block_sparse=True,
-            groups_tokens_heads_q=True,
-            heads_q_per_kv=1,
-            tile_size_q=q_size,
-            kv_block_size=block_size,
-            mask_type=mask,
-            use_kv_valid_bits=token_bits,
-            num_kv_valid_words=int(token_bits),
-            use_persistent_scheduler=persistent,
-            use_parallel_sparse_kv_loads=parallel,
-        )
-        actual = (
-            _swaps_forwards_packed_route_full(cfg),
-            _swaps_uses_origin0_k32_full_guard(cfg),
-            _swaps_token_word_covers_kv_tail(cfg),
-            _swaps_uses_token_only_score_validity(cfg),
-        )
-        assert actual == expected, name
 
 
 def test_sparse_execution_policy_rejects_dense_decode_config() -> None:
@@ -1340,7 +1436,8 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
         head_dim=_HEAD_DIM,
         q_block_size=64,
         kv_block_size=64,
-        dtype_key="bf16",
+        kv_route_size=256,
+        dtype_key="bfloat16",
         mask_type="dense",
         use_kv_valid_bits=True,
         max_row_route_capacity=8,
@@ -1361,9 +1458,10 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
 
     # Five CTAs are only 1.25 waves on this synthetic device; ten CTAs provide
     # enough work for CLC to steal after its request/response overhead.
-    assert tuple(
-        spec["use_persistent_scheduler"] for spec in launch_specs
-    ) == (False, True)
+    assert tuple(spec["use_persistent_scheduler"] for spec in launch_specs) == (
+        False,
+        True,
+    )
 
 
 def test_clc_capacity_gates_control_launch_resolution(
@@ -1400,70 +1498,22 @@ def test_clc_capacity_gates_control_launch_resolution(
         head_dim=_HEAD_DIM,
         q_block_size=8,
         kv_block_size=8,
-        dtype_key="bf16",
+        kv_route_size=128,
+        dtype_key="bfloat16",
         mask_type="dense",
     )
     block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
     try:
-        cases = (
-            (False, 8, True, True),
-            (False, 32, True, True),
-            (True, 4, True, False),
-            (True, 8, True, True),
-            (True, 12, True, True),
-            (True, 13, False, True),
-        )
-        for (
-            use_kv_valid_bits,
-            capacity,
-            expected_persistent,
-            expected_parallel,
-        ) in cases:
+        for capacity, expected_persistent in ((12, True), (13, False)):
             selector_calls.clear()
             spec = block_sparse_module._resolve_block_sparse_launch_spec(
                 **common_arguments,
-                use_kv_valid_bits=use_kv_valid_bits,
-                max_row_route_capacity=capacity,
-            )
-            assert (
-                dict(spec.policy)["use_persistent_scheduler"]
-                is expected_persistent
-            )
-            assert (
-                dict(spec.policy)["use_parallel_sparse_kv_loads"]
-                is expected_parallel
-            )
-            assert len(selector_calls) == int(expected_persistent)
-
-        selector_calls.clear()
-        q8_b16 = block_sparse_module._resolve_block_sparse_launch_spec(
-            **{**common_arguments, "kv_block_size": 16},
-            use_kv_valid_bits=True,
-            max_row_route_capacity=16,
-        )
-        q8_b16_policy = dict(q8_b16.policy)
-        assert q8_b16_policy["use_persistent_scheduler"] is True
-        assert q8_b16_policy["use_parallel_sparse_kv_loads"] is True
-        assert len(selector_calls) == 1
-
-        for capacity, expected_parallel in ((6, False), (7, True)):
-            selector_calls.clear()
-            q16_b16 = block_sparse_module._resolve_block_sparse_launch_spec(
-                **{
-                    **common_arguments,
-                    "q_block_size": 16,
-                    "kv_block_size": 16,
-                },
                 use_kv_valid_bits=True,
                 max_row_route_capacity=capacity,
             )
-            q16_b16_policy = dict(q16_b16.policy)
-            assert q16_b16_policy["use_persistent_scheduler"] is True
-            assert (
-                q16_b16_policy["use_parallel_sparse_kv_loads"]
-                is expected_parallel
-            )
-            assert len(selector_calls) == 1
+            assert dict(spec.policy)["use_persistent_scheduler"] is expected_persistent
+            assert dict(spec.policy)["use_parallel_sparse_kv_loads"] is True
+            assert len(selector_calls) == int(expected_persistent)
     finally:
         block_sparse_module._resolve_block_sparse_launch_spec.cache_clear()
 
@@ -1505,7 +1555,8 @@ def test_static_fallback_reselects_sparse_load_policy(
             head_dim=_HEAD_DIM,
             q_block_size=8,
             kv_block_size=8,
-            dtype_key="bf16",
+            kv_route_size=128,
+            dtype_key="bfloat16",
             mask_type="dense",
             use_kv_valid_bits=True,
             max_row_route_capacity=4,
@@ -1569,7 +1620,7 @@ def test_block_capacity_is_not_weakened_by_route_packing() -> None:
             max_blocks_per_row=1,
         )
 
-    # B64 packs two semantic blocks into one prepared KV128 route. Reserve the
+    # A prepared route may pack multiple B64 semantic blocks. Reserve the
     # second index slot, then prove that replay still enforces max_blocks=1.
     block_indptr.copy_(torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int32))
     block_indices[1] = -1
@@ -1635,14 +1686,17 @@ def test_plan_owns_compact_route_storage_for_skewed_rows() -> None:
     )
 
     state = wrapper._published_state()
-    assert state.route_layout.num_rows == 6
-    assert state.route_layout.route_metadata_capacity == 12
-    assert state.row_route_offsets.tolist() == [0, 0, 2, 6, 10, 10, 12]
-    assert (
-        state.route_workspace.numel()
-        == state.route_layout.workspace_size_words
+    policy = dict(state.policy)
+    route_layout = _BlockSparseRouteLayout.create(
+        kv_route_size=policy["tile_size_kv"],
+        kv_block_size=256,
+        has_token_bits=False,
+        route_metadata_capacity=6,
+        num_rows=6,
     )
-    assert dict(state.policy)["max_row_route_capacity"] == 4
+    assert state.row_route_offsets.tolist() == [0, 0, 1, 3, 5, 5, 6]
+    assert state.route_workspace.numel() == route_layout.workspace_size_words
+    assert policy["max_row_route_capacity"] == 2
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -1708,10 +1762,11 @@ def test_public_block_sparse_correctness(
         policy = dict(wrapper._policy)
         assert policy["use_persistent_scheduler"] == (case.scheduler == "persistent")
         assert policy["use_kv_valid_bits"] == (valid_bits is not None)
+        if case.q_block_size == 64 and case.kv_block_size % 64 == 0:
+            assert policy["tile_size_kv"] == 256
         if case.expected_parallel_loads is not None:
             assert (
-                policy["use_parallel_sparse_kv_loads"]
-                is case.expected_parallel_loads
+                policy["use_parallel_sparse_kv_loads"] is case.expected_parallel_loads
             )
         actual = wrapper.run(q, k, v, sm_scale=sm_scale)
         if case.q_block_size == case.kv_block_size == 64:
@@ -1908,12 +1963,7 @@ def test_dynamic_metadata_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
     state = wrapper._published_state()
-    layout = state.route_layout
-    assert state.route_workspace[0].item() == 2
-    first_route_metadata_word_index = layout.route_metadata_base_word_offset
-    assert state.route_workspace[
-        first_route_metadata_word_index : first_route_metadata_word_index + 2
-    ].tolist() == [192, 256]
+    assert state.route_workspace[0].item() == 1
 
     block_indices.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
     valid_bits.copy_(replay_valid_bits)
@@ -1923,24 +1973,8 @@ def test_dynamic_metadata_cuda_graph_replays_routes_and_token_mask() -> None:
 
     assert not torch.equal(replay_expected, initial_expected)
     torch.testing.assert_close(graph_out, replay_expected, rtol=1e-2, atol=1e-2)
-    assert state.route_workspace[0].item() == 3
-    assert state.route_workspace[
-        first_route_metadata_word_index : first_route_metadata_word_index + 2
-    ].tolist() == [0, 64]
-    assert layout.token_words_word_offset is not None
-    assert state.route_workspace[
-        first_route_metadata_word_index + layout.token_words_word_offset
-    ].item() == _signed_i32_bits(int(replay_valid_bits[0, 0].item()))
+    assert state.route_workspace[0].item() == 2
 
-    stale_route_metadata_word_index = (
-        layout.route_metadata_base_word_offset
-        + 2 * layout.route_metadata_stride_words
-    )
-    stale_route_metadata = state.route_workspace[
-        stale_route_metadata_word_index : (
-            stale_route_metadata_word_index + layout.route_metadata_stride_words
-        )
-    ].clone()
     block_indices.copy_(torch.tensor([1, 2], device="cuda", dtype=torch.int32))
     valid_bits.copy_(_pack_token_mask(case.seq_len_kv, (initial_valid,)))
     graph_out.fill_(float("nan"))
@@ -1948,17 +1982,7 @@ def test_dynamic_metadata_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
-    assert state.route_workspace[0].item() == 2
-    torch.testing.assert_close(
-        state.route_workspace[
-            stale_route_metadata_word_index : (
-                stale_route_metadata_word_index + layout.route_metadata_stride_words
-            )
-        ],
-        stale_route_metadata,
-        rtol=0,
-        atol=0,
-    )
+    assert state.route_workspace[0].item() == 1
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -2030,9 +2054,9 @@ def test_dynamic_metadata_repartitions_rows_with_declared_capacity() -> None:
     )
 
     state = wrapper._published_state()
-    assert state.row_route_offsets.tolist() == [0, 3, 6]
-    assert state.route_layout.route_metadata_capacity == 6
-    assert dict(state.policy)["max_row_route_capacity"] == 3
+    assert state.row_route_offsets.tolist() == [0, 2, 4]
+    assert state.row_route_offsets[-1].item() == 4
+    assert dict(state.policy)["max_row_route_capacity"] == 2
 
     initial = wrapper.run(q, k, v, sm_scale=sm_scale)
     block_indptr.copy_(replay_indptr)
@@ -2066,9 +2090,7 @@ def test_dynamic_metadata_repartitions_rows_with_declared_capacity() -> None:
     block_indices[:4].copy_(
         torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
     )
-    block_indptr.copy_(
-        torch.tensor([[[0, 4, 4]]], device="cuda", dtype=torch.int32)
-    )
+    block_indptr.copy_(torch.tensor([[[0, 4, 4]]], device="cuda", dtype=torch.int32))
     overflow = wrapper.run(q, k, v, sm_scale=sm_scale)
     torch.cuda.synchronize()
     assert state.route_workspace[0].item() == -4

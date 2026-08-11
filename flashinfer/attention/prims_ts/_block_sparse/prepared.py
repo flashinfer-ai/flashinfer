@@ -22,6 +22,7 @@ from .common import _SIGNED_INT32_MAX, _block_sparse_kv_atom_size
 
 _SECTION_ALIGNMENT_WORDS = 4
 _PREPARED_ROUTE_IS_FULL_FLAG = 1 << 0
+_SUPPORTED_KV_ROUTE_SIZES = (128, 256)
 
 
 def _validate_int(value: object, name: str, *, allow_zero: bool) -> int:
@@ -44,7 +45,7 @@ def _validate_i32_address(value: int, name: str) -> int:
 
 
 @dataclass(frozen=True)
-class _PreparedBlockSparseLayout:
+class _BlockSparseRouteLayout:
     """Immutable word layout for compact, prepared sparse routes.
 
     A separate immutable tensor holds the plan-generated ``num_rows + 1``
@@ -83,12 +84,13 @@ class _PreparedBlockSparseLayout:
 
     @staticmethod
     def create(
+        *,
         kv_route_size: int,
         kv_block_size: int,
         has_token_bits: bool,
         route_metadata_capacity: int,
         num_rows: int,
-    ) -> "_PreparedBlockSparseLayout":
+    ) -> "_BlockSparseRouteLayout":
         """Build aligned workspace-section and per-route metadata geometry."""
 
         kv_route_size = _validate_int(
@@ -96,22 +98,10 @@ class _PreparedBlockSparseLayout:
             "kv_route_size",
             allow_zero=False,
         )
+        if kv_route_size not in _SUPPORTED_KV_ROUTE_SIZES:
+            raise ValueError("kv_route_size must be 128 or 256")
         atom_size = _block_sparse_kv_atom_size(kv_block_size)
-        if kv_route_size % atom_size != 0:
-            raise ValueError(
-                "kv_route_size must be divisible by "
-                f"atom_size ({atom_size}), got {kv_route_size}"
-            )
-        if kv_route_size % 32 != 0:
-            raise ValueError(
-                f"kv_route_size must be divisible by 32, got {kv_route_size}"
-            )
         origins_per_route = kv_route_size // atom_size
-        if origins_per_route > 32:
-            raise ValueError(
-                "origins_per_route must fit in a single 32-bit mask, "
-                f"got {origins_per_route}"
-            )
         if not isinstance(has_token_bits, bool):
             raise TypeError("has_token_bits must be a bool")
         route_metadata_capacity = _validate_int(
@@ -122,11 +112,6 @@ class _PreparedBlockSparseLayout:
         num_rows = _validate_int(num_rows, "num_rows", allow_zero=False)
 
         token_words_per_route = kv_route_size // 32
-        if has_token_bits and token_words_per_route > 32:
-            raise ValueError(
-                "token_words_per_route must fit one prepare warp, "
-                f"got {token_words_per_route}"
-            )
         route_metadata_stride_words = round_up(
             origins_per_route + 2 + (token_words_per_route if has_token_bits else 0),
             _SECTION_ALIGNMENT_WORDS,
@@ -146,7 +131,7 @@ class _PreparedBlockSparseLayout:
             "workspace_size_words",
         )
 
-        return _PreparedBlockSparseLayout(
+        return _BlockSparseRouteLayout(
             kv_route_size=kv_route_size,
             atom_size=atom_size,
             has_token_bits=has_token_bits,
@@ -197,5 +182,5 @@ class _PreparedBlockSparseLayout:
 
 __all__ = [
     "_PREPARED_ROUTE_IS_FULL_FLAG",
-    "_PreparedBlockSparseLayout",
+    "_BlockSparseRouteLayout",
 ]

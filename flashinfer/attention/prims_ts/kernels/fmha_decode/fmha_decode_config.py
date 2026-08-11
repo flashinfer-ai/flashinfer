@@ -506,17 +506,15 @@ class FmhaDecodeConfig:
     tile_size_kv: int = 128
     # Select a block-sparse launch. Q and KV block sizes are independently
     # chosen from 8/16/32 or positive multiples of 64. Semantic KV blocks are
-    # assembled into fixed KV128 routes.
+    # assembled into a profile-selected fixed KV128 or KV256 route.
     use_block_sparse: bool = False
     q_block_size: int = 0
     kv_block_size: int = 0
-    # Optional batch-wide physical-token validity metadata. When enabled,
-    # num_kv_valid_words is the packed-word stride for one full KV sequence;
-    # the bitset is shared by every head and sparse row in that batch item.
-    # Keeps profiles derive their route-full fast path from these words at run
-    # time; it is intentionally not a separate plan/config specialization.
+    # Optional batch-wide physical-token validity metadata shared by every head
+    # and sparse row in that batch item. Keeps profiles derive their route-full
+    # fast path from these words at run time; it is intentionally not a separate
+    # plan/config specialization.
     use_kv_valid_bits: bool = False
-    num_kv_valid_words: int = 0
     # Let independent warps issue the two fine-route K/V instruction streams.
     # The wrapper resolves this from immutable route capacity; the kernel does
     # not inspect live BSR morphology to select its task topology.
@@ -1110,8 +1108,8 @@ class FmhaDecodeConfig:
         packed 32-bit register slot per TMEM column. Therefore its footprint is
         ``num_s_regs_per_thread / values_per_reg == num_packed_p_regs``, rather
         than a function of the complete logical KV tile width. Q128/KV128 and
-        Q64/KV256 both own 128 BF16 P values per lane and need 64 columns per
-        instance.
+        Q64/KV256 both own 128 packed 16-bit P values per lane and need 64
+        columns per instance.
         """
         if self.uses_two_inst_tmem_p:
             return self.num_packed_p_regs
@@ -1230,8 +1228,17 @@ class FmhaDecodeConfig:
             raise ValueError("block-sparse requires groups_tokens_heads_q=True")
         if self.headdim != 128:
             raise ValueError("block-sparse requires headdim=128")
-        if self.tile_size_kv != 128:
-            raise ValueError("block-sparse requires tile_size_kv=128")
+        if self.tile_size_kv not in (128, 256):
+            raise ValueError("block-sparse requires tile_size_kv in (128, 256)")
+        if self.tile_size_kv == 256 and not (
+            self.tile_size_q == 64
+            and kv_block_size % 64 == 0
+            and not self.use_parallel_sparse_kv_loads
+        ):
+            raise ValueError(
+                "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
+                "profile with coarse KV blocks and one load task"
+            )
         if self.tile_size_q != canonical_q_tile:
             raise ValueError("raw q_block_size requires its canonical tile_size_q")
         uses_fine_q_tile = canonical_q_tile < 64
@@ -1264,23 +1271,6 @@ class FmhaDecodeConfig:
             or self.use_separate_reduction_kernel
         ):
             raise ValueError("block-sparse does not support split-KV reduction")
-
-        if not isinstance(self.num_kv_valid_words, int) or isinstance(
-            self.num_kv_valid_words, bool
-        ):
-            raise TypeError(
-                "num_kv_valid_words must be an int, got "
-                f"{type(self.num_kv_valid_words).__name__}"
-            )
-        if self.use_kv_valid_bits:
-            if self.num_kv_valid_words <= 0:
-                raise ValueError(
-                    "num_kv_valid_words must be positive when use_kv_valid_bits=True"
-                )
-        elif self.num_kv_valid_words != 0:
-            raise ValueError(
-                "num_kv_valid_words must be 0 when use_kv_valid_bits=False"
-            )
 
     @property
     def uses_q_desc_ref(self) -> bool:
@@ -1748,9 +1738,8 @@ class FmhaDecodeConfig:
                 or not self.groups_tokens_heads_q
                 or self.tile_size_q != 64
                 or self.headdim != 128
-                or self.q_dtype != BFloat16
-                or self.kv_dtype != BFloat16
-                or self.out_dtype != BFloat16
+                or self.q_dtype not in (Float16, BFloat16)
+                or not (self.q_dtype == self.kv_dtype == self.out_dtype)
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -2061,6 +2050,12 @@ def _finalize_static_decode_config(
             # the complete physical ABI as one qualified profile rather than
             # accepting incompatible tuning fields and validating them later.
             for field_name, value in _KV_TILE_256_PHYSICAL_CONFIG.items():
+                current_value = getattr(cfg, field_name)
+                if field_name in explicit_fields and current_value != value:
+                    raise ValueError(
+                        f"KV256 requires {field_name}={value}, got "
+                        f"{current_value}"
+                    )
                 setattr(cfg, field_name, value)
             explicit_fields.difference_update(_KV_TILE_256_PHYSICAL_CONFIG)
         else:
@@ -2106,7 +2101,7 @@ def _finalize_static_decode_config(
         cfg.use_persistent_scheduler = False
     if cfg.tile_size_kv == 256 and not cfg.supports_grouped_keeps:
         raise ValueError(
-            "KV256 currently supports only the qualified Q64 BF16/D128 "
+            "KV256 currently supports only the qualified Q64 FP16/BF16/D128 "
             "grouped Keeps profile"
         )
 
@@ -2768,9 +2763,8 @@ def _try_apply_auto_kv256_profile(
         and cfg.use_paged_kv
         and cfg.groups_tokens_heads_q
         and cfg.headdim == 128
-        and cfg.q_dtype == BFloat16
-        and cfg.kv_dtype == BFloat16
-        and cfg.out_dtype == BFloat16
+        and cfg.q_dtype in (Float16, BFloat16)
+        and cfg.q_dtype == cfg.kv_dtype == cfg.out_dtype
         and num_heads_q // num_heads_kv <= 64
     )
     if not profile_is_auto_selectable:
@@ -3399,7 +3393,7 @@ def _validate_profile_support(
         cfg.tile_size_kv == 256 and supports_grouped_keeps
     ):
         raise ValueError(
-            "wide KeepsMmaAb is enabled only for the qualified BF16/D128 "
+            "wide KeepsMmaAb is enabled only for the qualified FP16/BF16/D128 "
             "KV256 native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
@@ -3666,9 +3660,9 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. An unpinned BF16/D128 paged launch first selects the
-       native Q64/KV256 profile; unsupported dtypes and explicit policies retain
-       KV128. For an unpinned fixed multi-Q paged-causal
+       KV stage count. An unpinned FP16/BF16 D128 paged launch first selects
+       the native Q64/KV256 profile; unsupported dtypes and explicit policies
+       retain KV128. For an unpinned fixed multi-Q paged-causal
        page-32 launch, enumerate full Swaps8/16/32 and Keeps64/128 tiles and
        every useful direct/split recipe through the first capacity-crossing
        fanout. Production-valid recipes minimize the empirical TileQ

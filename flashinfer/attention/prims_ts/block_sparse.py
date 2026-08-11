@@ -41,7 +41,7 @@ from ._block_sparse.common import (
     _validate_sparse_block_size,
 )
 from ._block_sparse.inspection import _inspect_block_sparse_bsr
-from ._block_sparse.prepared import _PreparedBlockSparseLayout
+from ._block_sparse.prepared import _BlockSparseRouteLayout
 from ._block_sparse.plan import (
     _BlockSparsePlanState,
     _allocate_dummy_kv_valid_bits,
@@ -66,27 +66,20 @@ if TYPE_CHECKING:
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
-# Prepared metadata remains a KV128 ABI even when a future compute kernel
-# consumes multiple records per MMA tile. The current attention core consumes
-# one record per KV128 compute tile.
-_BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE = 128
+# KV128 is the general prepared-route geometry. The qualified Q64/D128
+# 16-bit profiles consume one native KV256 route for coarse KV blocks.
+_BLOCK_SPARSE_DEFAULT_KV_ROUTE_SIZE = _PREPARED_KV_ROUTE_SIZE
+_BLOCK_SPARSE_KV256_ROUTE_SIZE = 256
 # CLC work stealing needs roughly two waves of independent sparse rows to
 # amortize its request/response path.  Below that point, a direct static grid
 # avoids scheduler overhead without sacrificing useful device parallelism.
 _BLOCK_SPARSE_CLC_MIN_WAVES = 2
-# CLC task dequeue overhead is visible for short sparse causal launches. In a
-# B200 FP16 Q128/KV64 probe, fixed-top-7 latency CLC/static is 1.522 at 2.6
-# waves and 0.879 at 5.2, while short rows with at most three routes remain
-# 1.107 at 5.2 waves. Causal CLC is therefore selected only when waves > 5 and
-# the maximum retained row has at least four routes; correctness is independent
-# of this launch-policy threshold.
+_CUDA_GRID_YZ_MAX = 65_535
+# Causal CLC needs more work per launch and per row to amortize dequeue cost.
+# These B200-qualified thresholds affect scheduling only, not correctness.
 _CAUSAL_CLC_WAVE_THRESHOLD = 5
 _CAUSAL_CLC_MIN_MAX_ROW_ROUTES = 4
-# Q8/B8 no-mask and Q8/B16 with either token policy remain CLC-qualified
-# through the measured R128 range. Masked Q8/B8 is different: its CLC profile
-# is 7.3% faster at R12, while static is 3.4% faster at R16. Beyond R128 and
-# for other unmeasured Q8 cross-geometries, prefer the qualified static path
-# rather than extrapolating a low-margin scheduler result.
+# Fine-Q CLC limits are conservative outside the measured B8/B16 geometries.
 _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES = 8
 _Q8_B8_MASKED_CLC_MAX_ROW_ROUTES = 12
 _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES = 128
@@ -99,21 +92,24 @@ _B8_MASKED_MIN_PARALLEL_ROUTE_PAIRS = 3
 _B16_MIN_PARALLEL_ROUTE_PAIRS = 4
 
 
-_BlockSparseCompileKey = tuple[
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    str,
-    Literal["dense", "causal"],
-    bool,
-    bool,
-    bool,
-]
+@dataclass(frozen=True)
+class _BlockSparseCompileKey:
+    """Named, hashable inputs that determine one compiled adapter."""
+
+    device_index: int
+    batch_size: int
+    seq_len_q: int
+    seq_len_kv: int
+    num_heads: int
+    head_dim: int
+    q_block_size: int
+    kv_block_size: int
+    kv_route_size: int
+    dtype_key: str
+    mask_type: Literal["dense", "causal"]
+    use_kv_valid_bits: bool
+    use_persistent_scheduler: bool
+    use_parallel_sparse_kv_loads: bool
 
 
 @dataclass(frozen=True)
@@ -132,6 +128,18 @@ class _BlockSparseExecutionPolicy:
     use_parallel_sparse_kv_loads: bool
 
 
+def _select_block_sparse_kv_route_size(
+    *,
+    q_tile_size: int,
+    kv_block_size: int,
+) -> int:
+    """Choose a route width from the immutable compile-time profile."""
+
+    if q_tile_size == 64 and kv_block_size % 64 == 0:
+        return _BLOCK_SPARSE_KV256_ROUTE_SIZE
+    return _BLOCK_SPARSE_DEFAULT_KV_ROUTE_SIZE
+
+
 def _should_consider_clc(
     *,
     q_tile_size: int,
@@ -145,20 +153,14 @@ def _should_consider_clc(
     if q_tile_size != 8:
         return True
     if mask_type == "causal":
-        return max_row_route_capacity <= _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
-    if kv_block_size == 8:
-        if use_kv_valid_bits:
-            return (
-                max_row_route_capacity <= _Q8_B8_MASKED_CLC_MAX_ROW_ROUTES
-            )
-        return (
-            max_row_route_capacity <= _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES
-        )
-    if kv_block_size == 16:
-        return (
-            max_row_route_capacity <= _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES
-        )
-    return max_row_route_capacity <= _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
+        max_qualified_routes = _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
+    elif kv_block_size == 8 and use_kv_valid_bits:
+        max_qualified_routes = _Q8_B8_MASKED_CLC_MAX_ROW_ROUTES
+    elif kv_block_size in (8, 16):
+        max_qualified_routes = _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES
+    else:
+        max_qualified_routes = _Q8_CONSERVATIVE_CLC_MAX_ROW_ROUTES
+    return max_row_route_capacity <= max_qualified_routes
 
 
 def _select_parallel_sparse_kv_loads(
@@ -213,16 +215,13 @@ def _validate_matching_dtypes(
     kv_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ) -> str:
-    dtype_key = _dtype_key(q_dtype)
-    _dtype_key(kv_dtype)
-    _dtype_key(output_dtype)
     if not (q_dtype == kv_dtype == output_dtype):
         raise ValueError("block-sparse requires matching Q, K/V, and output dtypes")
     if q_dtype not in _SUPPORTED_DTYPES:
         raise NotImplementedError(
             "block-sparse supports only torch.float16 and torch.bfloat16"
         )
-    return dtype_key
+    return _dtype_key(q_dtype)
 
 
 def _validate_metadata_tensor(
@@ -302,7 +301,7 @@ def _allocate_route_storage(
     block_indptr: torch.Tensor,
     *,
     kv_block_size: int,
-    route_layout: _PreparedBlockSparseLayout,
+    route_layout: _BlockSparseRouteLayout,
     uniform_row_route_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate plan-owned row offsets and mutable route scratch.
@@ -390,6 +389,7 @@ def _make_block_sparse_config(
     head_dim: int,
     q_block_size: int,
     kv_block_size: int,
+    kv_route_size: int,
     dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
@@ -410,13 +410,12 @@ def _make_block_sparse_config(
     config_args: dict[str, object] = {
         "use_keeps_mma_ab": use_keeps_mma_ab,
         "tile_size_q": q_tile_size,
-        "tile_size_kv": _BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE,
+        "tile_size_kv": kv_route_size,
         "groups_tokens_heads_q": True,
         "use_block_sparse": True,
         "q_block_size": q_block_size,
         "kv_block_size": kv_block_size,
         "use_kv_valid_bits": use_kv_valid_bits,
-        "num_kv_valid_words": (ceil_div(seq_len_kv, 32) if use_kv_valid_bits else 0),
         "use_parallel_sparse_kv_loads": use_parallel_sparse_kv_loads,
     }
     if use_persistent_scheduler:
@@ -449,6 +448,7 @@ def _resolve_block_sparse_launch_spec(
     head_dim: int,
     q_block_size: int,
     kv_block_size: int,
+    kv_route_size: int,
     dtype_key: str,
     mask_type: Literal["dense", "causal"],
     use_kv_valid_bits: bool,
@@ -465,9 +465,7 @@ def _resolve_block_sparse_launch_spec(
     from .kernels.fmha_decode.fmha_decode_config import _select_auto_launch_mode
 
     q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
-    scheduler_kv_capacity_tokens = (
-        max_row_route_capacity * _PREPARED_KV_ROUTE_SIZE
-    )
+    scheduler_kv_capacity_tokens = max_row_route_capacity * kv_route_size
     mode = "static"
     if _should_consider_clc(
         q_tile_size=q_tile_size,
@@ -482,7 +480,7 @@ def _resolve_block_sparse_launch_spec(
                 num_heads_kv=num_heads,
                 seq_len_kv=scheduler_kv_capacity_tokens,
                 num_q_tiles=ceil_div(seq_len_q, q_tile_size),
-                tile_size_kv=_BLOCK_SPARSE_COMPUTE_KV_TILE_SIZE,
+                tile_size_kv=kv_route_size,
                 persistent_min_waves=(
                     _CAUSAL_CLC_WAVE_THRESHOLD
                     if mask_type == "causal"
@@ -512,6 +510,7 @@ def _resolve_block_sparse_launch_spec(
             head_dim=head_dim,
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
+            kv_route_size=kv_route_size,
             dtype_key=dtype_key,
             mask_type=mask_type,
             use_kv_valid_bits=use_kv_valid_bits,
@@ -529,35 +528,32 @@ def _resolve_block_sparse_launch_spec(
             raise
         execution_policy = resolve_execution_policy(False)
         validate_profile(execution_policy)
-
-    compile_key: _BlockSparseCompileKey = (
-        device_index,
-        batch_size,
-        seq_len_q,
-        seq_len_kv,
-        num_heads,
-        head_dim,
-        q_block_size,
-        kv_block_size,
-        dtype_key,
-        mask_type,
-        use_kv_valid_bits,
-        execution_policy.use_persistent_scheduler,
-        execution_policy.use_parallel_sparse_kv_loads,
+    compile_key = _BlockSparseCompileKey(
+        device_index=device_index,
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+        kv_route_size=kv_route_size,
+        dtype_key=dtype_key,
+        mask_type=mask_type,
+        use_kv_valid_bits=use_kv_valid_bits,
+        use_persistent_scheduler=execution_policy.use_persistent_scheduler,
+        use_parallel_sparse_kv_loads=(
+            execution_policy.use_parallel_sparse_kv_loads
+        ),
     )
     policy: tuple[tuple[str, object], ...] = (
         ("tile_size_q", q_tile_size),
+        ("tile_size_kv", kv_route_size),
         (
             "use_persistent_scheduler",
             execution_policy.use_persistent_scheduler,
         ),
         ("max_row_route_capacity", max_row_route_capacity),
-        # Deprecated diagnostic alias retained for existing benchmark parsers.
-        ("max_execution_tiles", max_row_route_capacity),
-        # Preserve the public diagnostic key for existing benchmark schemas.
-        # It reports conservative scheduler capacity, not current visibility.
-        ("visible_kv_tokens", scheduler_kv_capacity_tokens),
-        ("execution_path", "prepared_bsr_decode"),
         ("use_kv_valid_bits", use_kv_valid_bits),
         (
             "use_parallel_sparse_kv_loads",
@@ -565,26 +561,14 @@ def _resolve_block_sparse_launch_spec(
         ),
     )
     return _BlockSparseLaunchSpec(
-        policy,
-        compile_key,
+        policy=policy,
+        compile_key=compile_key,
     )
 
 
 @functools.cache
 def _get_compiled_block_sparse(
-    device_index: int,
-    batch_size: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    num_heads: int,
-    head_dim: int,
-    q_block_size: int,
-    kv_block_size: int,
-    dtype_key: str,
-    mask_type: Literal["dense", "causal"],
-    use_kv_valid_bits: bool,
-    use_persistent_scheduler: bool,
-    use_parallel_sparse_kv_loads: bool,
+    key: _BlockSparseCompileKey,
 ) -> Callable[..., object]:
     """Compile and cache one prepare-plus-attention TVM-FFI adapter."""
 
@@ -600,11 +584,15 @@ def _get_compiled_block_sparse(
         fmha_block_sparse_launch,
     )
 
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-    }
-    dtype = dtype_map[dtype_key]
+    device_index = key.device_index
+    batch_size = key.batch_size
+    seq_len_q = key.seq_len_q
+    seq_len_kv = key.seq_len_kv
+    num_heads = key.num_heads
+    head_dim = key.head_dim
+    q_block_size = key.q_block_size
+    kv_block_size = key.kv_block_size
+    kv_route_size = key.kv_route_size
     config = _make_block_sparse_config(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -613,12 +601,14 @@ def _get_compiled_block_sparse(
         head_dim=head_dim,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        dtype_key=dtype_key,
-        mask_type=mask_type,
-        use_kv_valid_bits=use_kv_valid_bits,
-        use_persistent_scheduler=use_persistent_scheduler,
-        use_parallel_sparse_kv_loads=use_parallel_sparse_kv_loads,
+        kv_route_size=kv_route_size,
+        dtype_key=key.dtype_key,
+        mask_type=key.mask_type,
+        use_kv_valid_bits=key.use_kv_valid_bits,
+        use_persistent_scheduler=key.use_persistent_scheduler,
+        use_parallel_sparse_kv_loads=key.use_parallel_sparse_kv_loads,
     )
+    dtype = config.q_dtype
     prepare_routes = _PrepareBlockSparseRoutes(
         batch_size=batch_size,
         num_kv_heads=num_heads,
@@ -626,8 +616,8 @@ def _get_compiled_block_sparse(
         seq_len_kv=seq_len_kv,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        kv_route_size=_PREPARED_KV_ROUTE_SIZE,
-        has_token_bits=use_kv_valid_bits,
+        kv_route_size=kv_route_size,
+        has_token_bits=key.use_kv_valid_bits,
     )
     Int32 = cutlass.Int32
     Float32 = cutlass.Float32
@@ -829,8 +819,9 @@ class BlockSparseTSWrapper:
         Q8/Q16/Q32 SWAPAB tile. Coarse Q blocks divisible by 128 use Q128
         KeepsAB, and the remaining coarse sizes use Q64 KeepsAB. Fine KV blocks
         currently require a fine SWAPAB Q tile. Every run prepares canonical
-        BSR into compact KV128 route metadata, and the attention core consumes
-        only that metadata. This remains true when every KV block is selected;
+        BSR into compact, profile-selected fixed-width route metadata, and the
+        attention core consumes only that metadata. This remains true when
+        every KV block is selected;
         callers that know a pattern is dense should choose the dense FMHA API
         explicitly.
 
@@ -878,6 +869,16 @@ class BlockSparseTSWrapper:
         num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
         num_kv_heads = _validate_positive_int(num_kv_heads, "num_kv_heads")
         head_dim = _validate_positive_int(head_dim, "head_dim")
+        # Direct and CLC launches both preserve heads/batch in grid Y/Z.
+        for dimension, argument, extent in (
+            ("y", "num_kv_heads", num_kv_heads),
+            ("z", "batch_size", batch_size),
+        ):
+            if extent > _CUDA_GRID_YZ_MAX:
+                raise ValueError(
+                    f"block-sparse grid.{dimension} exceeds the CUDA limit "
+                    f"{_CUDA_GRID_YZ_MAX} ({argument}={extent})"
+                )
         if not isinstance(dynamic_metadata, bool):
             raise TypeError("dynamic_metadata must be a bool")
         q_tile_size = _canonical_block_sparse_q_tile_size(q_block_size)
@@ -910,6 +911,10 @@ class BlockSparseTSWrapper:
             kv_data_type,
             o_data_type,
         )
+        kv_route_size = _select_block_sparse_kv_route_size(
+            q_tile_size=q_tile_size,
+            kv_block_size=kv_block_size,
+        )
         device, device_index = _validate_plan_metadata(
             block_indptr,
             block_indices,
@@ -931,7 +936,7 @@ class BlockSparseTSWrapper:
             seq_len_kv=seq_len_kv,
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
-            kv_route_size=_PREPARED_KV_ROUTE_SIZE,
+            kv_route_size=kv_route_size,
             stream=plan_stream,
         )
         # Mask values are run-time data. Full routes are detected from current
@@ -948,15 +953,15 @@ class BlockSparseTSWrapper:
                 )
             declared_route_capacity = ceil_div(
                 max_blocks_per_row * kv_block_size,
-                _PREPARED_KV_ROUTE_SIZE,
+                kv_route_size,
             )
             max_row_route_capacity = declared_route_capacity
         num_rows = batch_size * num_kv_heads * ceil_div(seq_len_q, q_block_size)
         total_route_capacity = inspection.total_route_capacity
         if dynamic_metadata:
             total_route_capacity = num_rows * max_row_route_capacity
-        route_layout = _PreparedBlockSparseLayout.create(
-            kv_route_size=_PREPARED_KV_ROUTE_SIZE,
+        route_layout = _BlockSparseRouteLayout.create(
+            kv_route_size=kv_route_size,
             kv_block_size=kv_block_size,
             has_token_bits=use_token_mask,
             route_metadata_capacity=total_route_capacity,
@@ -964,25 +969,26 @@ class BlockSparseTSWrapper:
         )
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             spec = _resolve_block_sparse_launch_spec(
-                device_index,
-                batch_size,
-                seq_len_q,
-                seq_len_kv,
-                num_qo_heads,
-                head_dim,
-                q_block_size,
-                kv_block_size,
-                dtype_key,
-                mask_type,
-                use_token_mask,
-                max_row_route_capacity,
+                device_index=device_index,
+                batch_size=batch_size,
+                seq_len_q=seq_len_q,
+                seq_len_kv=seq_len_kv,
+                num_heads=num_qo_heads,
+                head_dim=head_dim,
+                q_block_size=q_block_size,
+                kv_block_size=kv_block_size,
+                kv_route_size=kv_route_size,
+                dtype_key=dtype_key,
+                mask_type=mask_type,
+                use_kv_valid_bits=use_token_mask,
+                max_row_route_capacity=max_row_route_capacity,
             )
             policy = (
                 *spec.policy,
                 ("dynamic_metadata", dynamic_metadata),
                 ("max_blocks_per_row", max_blocks_per_row),
             )
-            compiled = _get_compiled_block_sparse(*spec.compile_key)
+            compiled = _get_compiled_block_sparse(spec.compile_key)
             effective_kv_valid_bits = (
                 kv_valid_bits
                 if use_token_mask
@@ -1018,7 +1024,6 @@ class BlockSparseTSWrapper:
             block_indptr=block_indptr,
             block_indices=block_indices,
             kv_valid_bits=effective_kv_valid_bits,
-            route_layout=route_layout,
             row_route_offsets=row_route_offsets,
             route_workspace=route_workspace,
             max_blocks_per_row=max_blocks_per_row,

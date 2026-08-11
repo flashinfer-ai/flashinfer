@@ -70,6 +70,7 @@ from .helpers_common import (
     _keeps_row_idx,
     _keeps_score_col,
     _keeps_tcgen05_ld,
+    _keeps_tcgen05_st,
     _logical_q_group_idx,
     _mma_k_step,
     _mma_kind_for_qkv,
@@ -105,8 +106,8 @@ from .helpers_softmax import (
 # A block-sparse route often changes the exact row maximum without changing it
 # enough to justify rescaling the live O tile. Keeping the prior anchor within
 # this bound makes the correction scale exactly one and bounds FP16/BF16 P by
-# 2**8. As in the FlashInfer/TRT-LLM policy, this assumes normal model tensor
-# ranges rather than adversarial values near the BF16 finite limit.
+# 2**8. As in the FlashInfer/TRT-LLM policy, this assumes normal model logits
+# rather than adversarial values outside the qualified probability bound.
 _BLOCK_SPARSE_RESCALE_THRESHOLD_LOG2 = 8.0
 
 
@@ -180,6 +181,39 @@ def _can_skip_sparse_keeps_structural_mask(
     return can_skip
 
 
+@cute.jit
+def _sparse_k32_effective_keep_word(
+    q_row_is_valid: Boolean,
+    fragment_origin: Int32,
+    fragment_valid: Int32,
+    token_word: Uint32,
+    seq_len_kv: Int32,
+    causal_end: Int32,
+    *,
+    apply_causal_mask: cutlass.Constexpr[bool],
+    apply_token_mask: cutlass.Constexpr[bool],
+) -> Uint32:
+    """Fold route, KV-tail, causal, and token predicates for one K32 fragment."""
+
+    keep_word = Uint32(0)
+    if q_row_is_valid and fragment_valid != Int32(0):
+        visible_end = seq_len_kv
+        if cutlass.const_expr(apply_causal_mask):
+            visible_end = cute.math.min(visible_end, causal_end)
+        visible_tokens = visible_end - fragment_origin
+        if visible_tokens >= Int32(32):
+            keep_word = Uint32(0xFFFFFFFF)
+            if cutlass.const_expr(apply_token_mask):
+                keep_word = token_word
+        elif visible_tokens > Int32(0):
+            # Keep the shift strictly below 32; shifting a 32-bit value by its
+            # width is undefined in PTX and LLVM.
+            keep_word = (Uint32(1) << visible_tokens) - Uint32(1)
+            if cutlass.const_expr(apply_token_mask):
+                keep_word = keep_word & token_word
+    return keep_word
+
+
 def _qk_mma_operand_contract_for_config(
     cfg: FmhaDecodeConfig,
 ) -> tuple[bool, int, int]:
@@ -228,7 +262,6 @@ class TmemSResource(DecodeGenResourceBase):
     seq_len_q: Int32 = None
     h_r: Int32 | None = None
     q_group_idx: Int32 | None = None
-    b_idx: Int32 | None = None
     q_ref: Constexpr[MemoryResource | None] = None
     _p_local_sum_arr: cutlass.Array | None = None
     _global_sum_arr: cutlass.Array | None = None
@@ -1437,8 +1470,8 @@ class TmemSResource(DecodeGenResourceBase):
             new_max = cute.math.max(old_max, tile_max, ftz=True)
             if old_max != _neg_max_f32():
                 # Keeping the previous reference max avoids an in-place O
-                # rescale when the new tile raises it only modestly. BF16 P
-                # can represent the resulting probabilities above one; the
+                # rescale when the new tile raises it only modestly. The
+                # 16-bit P path can represent the bounded values above one; the
                 # numerator and denominator remain in the same scale frame.
                 # Large jumps still rebase to keep P comfortably in range.
                 max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
@@ -1585,6 +1618,12 @@ class TmemSResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
     ) -> cutlass.Array:
         """Reload and mask one KV256 K32 fragment for P materialization."""
+        if cutlass.const_expr(self.cfg.use_block_sparse):
+            return self._load_block_sparse_softmax_p_fragment(
+                stage_info,
+                fragment_idx=fragment_idx,
+                s_arr=s_arr,
+            )
         (
             seq_len_kv,
             logical_q_group_idx,
@@ -2322,19 +2361,204 @@ class TmemSResource(DecodeGenResourceBase):
                 sum_arr[scale_base + pair_idx] = updated_sums[pair_idx]
         return sum_arr
 
+    @cute.jit
+    def _compute_softmax_loop_sparse_keeps_kv256(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        sparse_origin0: Int32,
+        sparse_origin1: Int32,
+        sparse_route_flags: Int32,
+        sparse_token_word0: Uint32,
+        sparse_token_word1: Uint32,
+        sparse_token_word2: Uint32,
+        sparse_token_word3: Uint32,
+    ) -> tuple[object, object, object, object]:
+        """Reduce one sparse KV256 route as four bounded K32 fragments.
 
-@dataclass(kw_only=True)
-class TmemSBlockSparseResource(TmemSResource):
-    """Block-sparse S resource with explicit metadata-to-softmax routing.
+        The full route path only loads and reduces scores. A partial route
+        predicates one native 32-score fragment at a time and writes it back
+        to TMEM, so the later P pass can replay masked scores without keeping
+        the logical 128-score tile live in registers.
+        """
 
-    The dense resource keeps its original work signature.  This specialization
-    makes the metadata dependency visible to TaskManager while preserving the
-    same captured ``compute_softmax_loop`` label and masking implementation.
-    """
+        cfg = self.cfg
+        assert cfg.tile_size_kv == 256
+        task_cache = _decode_gen_task_cache(stage_info)
+        token_words = (
+            sparse_token_word0,
+            sparse_token_word1,
+            sparse_token_word2,
+            sparse_token_word3,
+        )
+        keep_words = cutlass.Array(Uint32, 4, space=cutlass.AddressSpace.rmem)
+        warp_group_thread_idx = Int32(
+            task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        )
+        tile_row_idx = _keeps_row_idx(cfg, warp_group_thread_idx)
+        logical_q_group_idx = _logical_q_group_idx(
+            cfg, stage_info, self.q_group_idx
+        )
+        q_token_idx, _ = _q_row_token_and_local_head(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            tile_row_idx,
+        )
+        q_row_is_valid = _q_row_is_valid_for_seq(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            tile_row_idx,
+            self.seq_len_q,
+        )
+        seq_len_kv = Int32(self.max_seq_len_kv)
+        causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
+        origin0 = Int32(sparse_origin0)
+        origin1 = Int32(sparse_origin1)
+        valid0 = sparse_route_flags & Int32(1)
+        valid1 = (sparse_route_flags >> Int32(1)) & Int32(1)
+        for fragment_idx in cutlass.range_constexpr(4):
+            fragment_origin = origin0 + Int32((fragment_idx % 2) * 32)
+            fragment_valid = valid0
+            if cutlass.const_expr(fragment_idx >= 2):
+                fragment_origin = origin1 + Int32((fragment_idx % 2) * 32)
+                fragment_valid = valid1
+            keep_words[fragment_idx] = _sparse_k32_effective_keep_word(
+                q_row_is_valid,
+                fragment_origin,
+                fragment_valid,
+                Uint32(token_words[fragment_idx]),
+                seq_len_kv,
+                causal_end,
+                apply_causal_mask=cfg.mask_type == CAUSAL,
+                apply_token_mask=cfg.use_kv_valid_bits,
+            )
+
+        warp_scores_are_unmasked = cutlass.Boolean(True)
+        for fragment_idx in cutlass.range_constexpr(4):
+            warp_scores_are_unmasked = cutlass.Boolean(
+                warp_scores_are_unmasked
+                and keep_words[fragment_idx] == Uint32(0xFFFFFFFF)
+            )
+        # The load/store branch must be uniform for each participating warp.
+        warp_scores_are_unmasked = cute.arch.vote_all_sync(
+            warp_scores_are_unmasked
+        )
+
+        score_tmem_addr = (
+            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + self._softmax_loop_stage_slot_offset(stage_info)
+        )
+        max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+        for chain_idx in cutlass.range_constexpr(4):
+            max_chains[chain_idx] = _neg_max_f32()
+
+        if warp_scores_are_unmasked:
+            for fragment_idx in cutlass.range_constexpr(4):
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(
+                        score_tmem_addr + Int32(fragment_idx * 32), Float32
+                    ),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                for score_idx in cutlass.range_constexpr(32):
+                    chain_idx: Constexpr[int] = score_idx % 4
+                    max_chains[chain_idx] = cute.math.max(
+                        max_chains[chain_idx],
+                        Float32(loaded[score_idx]),
+                        ftz=True,
+                    )
+        else:
+            for fragment_idx in cutlass.range_constexpr(4):
+                fragment_addr = score_tmem_addr + Int32(fragment_idx * 32)
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(fragment_addr, Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                masked_scores = cutlass.Array(
+                    Float32, 32, space=cutlass.AddressSpace.rmem
+                )
+                for score_idx in cutlass.range_constexpr(32):
+                    score = Float32(loaded[score_idx])
+                    score_is_kept = (
+                        (keep_words[fragment_idx] >> Int32(score_idx))
+                        & Uint32(1)
+                    ) != Uint32(0)
+                    if not score_is_kept:
+                        score = _neg_max_f32()
+                    masked_scores[score_idx] = score
+                    chain_idx: Constexpr[int] = score_idx % 4
+                    max_chains[chain_idx] = cute.math.max(
+                        max_chains[chain_idx], score, ftz=True
+                    )
+                _keeps_tcgen05_st(
+                    cfg,
+                    prims.make_tmem_ptr(fragment_addr, Float32),
+                    masked_scores.data_ptr().load(count=32, alignment=4),
+                    offset=cfg.tile_size_kv // 2,
+                )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            cute.arch.fence_view_async_tmem_store()
+
+        tile_max = cute.math.max(
+            cute.math.max(max_chains[0], max_chains[1], ftz=True),
+            cute.math.max(max_chains[2], max_chains[3], ftz=True),
+            ftz=True,
+        )
+        old_max = new_max_arr[0]
+        new_max = cute.math.max(old_max, tile_max, ftz=True)
+        if old_max != _neg_max_f32():
+            max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
+            if max_delta_log2 >= Float32(-KV_TILE_256_RESCALE_THRESHOLD_LOG2):
+                new_max = old_max
+        old_max_arr[0] = old_max
+        new_max_arr[0] = new_max
+        return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @cute.jit
+    def _load_block_sparse_softmax_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+        s_arr: cutlass.Array,
+    ) -> cutlass.Array:
+        """Reload one full or already-predicated sparse KV256 fragment for P."""
+
+        assert self.cfg.tile_size_kv == 256
+        task_cache = _decode_gen_task_cache(stage_info)
+        score_tmem_addr = (
+            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + self._softmax_loop_stage_slot_offset(stage_info)
+            + Int32(fragment_idx * 32)
+        )
+        loaded = _keeps_tcgen05_ld(
+            self.cfg,
+            prims.make_tmem_ptr(score_tmem_addr, Float32),
+            num=32,
+            offset=self.cfg.tile_size_kv // 2,
+        )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        for score_idx in cutlass.range_constexpr(32):
+            s_arr[score_idx] = loaded[score_idx]
+        return s_arr
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit
-    def compute_softmax_loop(
+    def compute_block_sparse_softmax_loop(
         self,
         stage_info: StageInfo,
         *,
@@ -2354,6 +2578,21 @@ class TmemSBlockSparseResource(TmemSResource):
 
         assert self.cfg.use_block_sparse
         if cutlass.const_expr(self.cfg.use_keeps_mma_ab):
+            if cutlass.const_expr(self.cfg.tile_size_kv == 256):
+                return self._compute_softmax_loop_sparse_keeps_kv256(
+                    stage_info,
+                    old_max_arr=old_max_arr,
+                    sum_arr=sum_arr,
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                    sparse_origin0=sparse_origin0,
+                    sparse_origin1=sparse_origin1,
+                    sparse_route_flags=sparse_route_flags,
+                    sparse_token_word0=sparse_token_word0,
+                    sparse_token_word1=sparse_token_word1,
+                    sparse_token_word2=sparse_token_word2,
+                    sparse_token_word3=sparse_token_word3,
+                )
             return self._compute_softmax_loop_sparse_keeps(
                 stage_info,
                 old_max_arr=old_max_arr,

@@ -122,16 +122,13 @@ def _schedule_with_optional_resources(
 
 
 def _block_sparse_route_loop_domain(
-    route_count: int | cutlass.Int32,
+    route_count: cutlass.Int32,
     *,
     num_insts_kv: int,
-) -> int | cutlass.Int32:
+) -> cutlass.Int32:
     """Return LOOP iterations after HEAD reserves one candidate per instance."""
 
-    remaining = route_count - num_insts_kv
-    if isinstance(remaining, int):
-        remaining = max(remaining, 0)
-        return (remaining + num_insts_kv - 1) // num_insts_kv
+    remaining = route_count - cutlass.Int32(num_insts_kv)
     remaining = cute.math.max(remaining, cutlass.Int32(0))
     insts = cutlass.Int32(num_insts_kv)
     return (remaining + insts - cutlass.Int32(1)) // insts
@@ -907,7 +904,7 @@ class DecodeGenTask(Task):
         if self.cfg is None:
             return self.domain
 
-        # Sparse rows have a runtime-dependent number of prepared KV128 routes
+        # Sparse rows have a runtime-dependent number of prepared KV routes
         # even when sequence lengths are static. Load their compact header
         # before the fixed-dense early return below. Persistent workers pass
         # the logical WorkQueue tile here, so static and CLC schedules share
@@ -924,34 +921,10 @@ class DecodeGenTask(Task):
                     "num_heads_kv is required to resolve block-sparse rows"
                 )
 
-            q_group_cta_idx = tile_coord[0]
-            h_idx = tile_coord[1]
-            b_idx = tile_coord[2]
-            if not isinstance(q_group_cta_idx, int):
-                q_group_cta_idx = cutlass.Int32(q_group_cta_idx)
-            if not isinstance(h_idx, int):
-                h_idx = cutlass.Int32(h_idx)
-            if not isinstance(b_idx, int):
-                b_idx = cutlass.Int32(b_idx)
-
-            # Sparse profiles currently forbid split-KV, but preserve the
-            # logical-Q coordinate conversion so the addressing contract does
-            # not silently depend on that profile guard.
-            q_group_idx = q_group_cta_idx
-            if self.cfg.use_split_kv:
-                q_group_idx = q_group_cta_idx // self.cfg.splits_kv
-            if isinstance(q_group_idx, int):
-                if self.cfg.uses_nontrivial_grouped_q_layout:
-                    q_token_base = q_group_idx * self.cfg.q_tokens_per_cta
-                elif self.cfg.max_seq_len_q > 1:
-                    head_ctas_per_token = (
-                        self.cfg.heads_q_per_kv + self.cfg.tile_size_q - 1
-                    ) // self.cfg.tile_size_q
-                    q_token_base = q_group_idx // head_ctas_per_token
-                else:
-                    q_token_base = 0
-            else:
-                q_token_base = _q_group_token_base(self.cfg, q_group_idx)
+            q_group_idx = cutlass.Int32(tile_coord[0])
+            h_idx = cutlass.Int32(tile_coord[1])
+            b_idx = cutlass.Int32(tile_coord[2])
+            q_token_base = _q_group_token_base(self.cfg, q_group_idx)
 
             q_block = q_token_base // self.cfg.q_block_size
             num_q_blocks = (
@@ -980,8 +953,6 @@ class DecodeGenTask(Task):
                 route_count,
                 num_insts_kv=self.cfg.num_insts_kv,
             )
-            if isinstance(loop_domain, int):
-                return loop_domain + self.domain_bias
             return loop_domain + cutlass.Int32(self.domain_bias)
 
         # Resolve the sequence length for this work tile. Static-seqlen kernels
@@ -1097,6 +1068,58 @@ class DecodeGenTask(Task):
 # When paged-KV is enabled, each K/V load consumes a page-offsets entry
 # produced ahead of time by PageTableTask.
 # ======================================================================
+def _resolve_and_store_sparse_route(
+    sparse_kv_metadata: MemoryResource | None,
+    section: FmhaStage,
+) -> tuple[Any, Any, Any, Any] | None:
+    """Resolve one prepared route and retain it for the matching K/V pair."""
+
+    if sparse_kv_metadata is None:
+        return None
+    (
+        resolved_origin0,
+        resolved_origin1,
+        resolved_atom_validity,
+        route_record_word_offset,
+    ) = sparse_kv_metadata.resolve_route(section=section)
+    sparse_kv_metadata.store_route(
+        resolved_origin0=resolved_origin0,
+        resolved_origin1=resolved_origin1,
+        resolved_atom_validity=resolved_atom_validity,
+    )
+    return (
+        resolved_origin0,
+        resolved_origin1,
+        resolved_atom_validity,
+        route_record_word_offset,
+    )
+
+
+def _publish_sparse_softmax_route(
+    sparse_softmax_metadata: MemoryResource | None,
+    route: tuple[Any, Any, Any, Any] | None,
+) -> None:
+    """Stage one resolved route for its paired Softmax consumer."""
+
+    if sparse_softmax_metadata is None:
+        return
+    assert route is not None
+    (
+        resolved_origin0,
+        resolved_origin1,
+        resolved_atom_validity,
+        route_record_word_offset,
+    ) = route
+    sparse_softmax_metadata.acquire()
+    sparse_softmax_metadata.store_route(
+        resolved_origin0=resolved_origin0,
+        resolved_origin1=resolved_origin1,
+        resolved_atom_validity=resolved_atom_validity,
+        route_record_word_offset=route_record_word_offset,
+    )
+    sparse_softmax_metadata.commit()
+
+
 def create_load_task(
     smem_q: MemoryResource,
     smem_kv: MemoryResource,
@@ -1107,6 +1130,10 @@ def create_load_task(
     *,
     domain: int | cutlass.Int32,
     smem_page_offsets: MemoryResource | None = None,
+    sparse_kv_metadata0: MemoryResource | None = None,
+    sparse_kv_metadata1: MemoryResource | None = None,
+    sparse_softmax_metadata0: MemoryResource | None = None,
+    sparse_softmax_metadata1: MemoryResource | None = None,
     warp_idx: int | None = None,
     num_warps: int | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
@@ -1121,10 +1148,22 @@ def create_load_task(
         smem_page_offsets: MemoryResource | None,
         schedule_token_throttle: MemoryResource | None,
         smem_kv_reuse_credit: MemoryResource | None,
+        sparse_kv_metadata0: MemoryResource | None = None,
+        sparse_kv_metadata1: MemoryResource | None = None,
+        sparse_softmax_metadata0: MemoryResource | None = None,
+        sparse_softmax_metadata1: MemoryResource | None = None,
     ) -> None:
         """Build the shared-KV load cadence for HEAD, LOOP, and TAIL."""
         smem_q.init_load_state()
         smem_kv.init_load_state()
+        for sparse_resource in (
+            sparse_kv_metadata0,
+            sparse_kv_metadata1,
+            sparse_softmax_metadata0,
+            sparse_softmax_metadata1,
+        ):
+            if sparse_resource is not None:
+                sparse_resource.init_load_state()
         cached_page_ids = None
         if smem_page_offsets is not None:
             if cfg.num_head_dim_stages_kv > 1:
@@ -1158,8 +1197,22 @@ def create_load_task(
                 smem_page_offsets.wait()
             else:
                 _page_offsets_consume(smem_page_offsets)
-        for label in ("load_k0", "load_k1"):
-            _kv_load(label, FmhaStage.Head)
+        if sparse_kv_metadata0 is None:
+            for label in ("load_k0", "load_k1"):
+                _kv_load(label, FmhaStage.Head)
+        else:
+            route0 = _resolve_and_store_sparse_route(
+                sparse_kv_metadata0, FmhaStage.Head
+            )
+            _kv_load("load_k0", FmhaStage.Head)
+            route1 = _resolve_and_store_sparse_route(
+                sparse_kv_metadata1, FmhaStage.Head
+            )
+            _kv_load("load_k1", FmhaStage.Head)
+            # Issue both K tiles before either metadata FIFO can backpressure
+            # the load warp, matching the split-resource sparse cadence.
+            _publish_sparse_softmax_route(sparse_softmax_metadata0, route0)
+            _publish_sparse_softmax_route(sparse_softmax_metadata1, route1)
         if smem_kv_reuse_credit is not None:
             # K0/K1 occupy the two stages disjoint from the previous work's
             # scratch. Acquire only before issuing the third K/V transaction.
@@ -1175,8 +1228,31 @@ def create_load_task(
             else ("load_k0", "load_v0", "load_k1", "load_v1")
         )
         with domain_loop(0, domain, 1, unroll=1):
-            for label in loop_labels:
-                _kv_load(label, FmhaStage.Loop)
+            if sparse_kv_metadata0 is None:
+                for label in loop_labels:
+                    _kv_load(label, FmhaStage.Loop)
+            else:
+                # Follow the dense KV256 stage order exactly. Each V consumes
+                # its retained route before the matching K label replaces it.
+                loop_routes = []
+                for label in loop_labels:
+                    route = None
+                    sparse_softmax_metadata = None
+                    if label == "load_k0":
+                        route = _resolve_and_store_sparse_route(
+                            sparse_kv_metadata0, FmhaStage.Loop
+                        )
+                        sparse_softmax_metadata = sparse_softmax_metadata0
+                    elif label == "load_k1":
+                        route = _resolve_and_store_sparse_route(
+                            sparse_kv_metadata1, FmhaStage.Loop
+                        )
+                        sparse_softmax_metadata = sparse_softmax_metadata1
+                    _kv_load(label, FmhaStage.Loop)
+                    if route is not None:
+                        loop_routes.append((sparse_softmax_metadata, route))
+                for sparse_softmax_metadata, route in loop_routes:
+                    _publish_sparse_softmax_route(sparse_softmax_metadata, route)
 
         # TAIL: after no more future K tiles are needed, load the final two V
         # tiles consumed by the final BMM2 calls.
@@ -1190,38 +1266,21 @@ def create_load_task(
         if hold_page_window:
             _page_offsets_release(smem_page_offsets)
 
-    @schedule
+    @_schedule_with_optional_resources
     def load_schedule(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
-        work_queue: WorkQueue | None = None,
-        schedule_token_throttle: MemoryResource | None = None,
-        smem_kv_reuse_credit: MemoryResource | None = None,
+        smem_page_offsets: MemoryResource | None,
+        sparse_kv_metadata0: MemoryResource | None,
+        sparse_kv_metadata1: MemoryResource | None,
+        sparse_softmax_metadata0: MemoryResource | None,
+        sparse_softmax_metadata1: MemoryResource | None,
+        work_queue: WorkQueue | None,
+        schedule_token_throttle: MemoryResource | None,
+        smem_kv_reuse_credit: MemoryResource | None,
     ) -> None:
-        """Schedule dense shared-KV loads without page-offset resources."""
-        _decode_work_tile_schedule(
-            cfg,
-            work_queue,
-            lambda: load_schedule_body(
-                smem_q,
-                smem_kv,
-                None,
-                schedule_token_throttle,
-                smem_kv_reuse_credit,
-            ),
-            lambda: _schedule_token_throttle_head(schedule_token_throttle),
-        )
+        """Schedule shared-KV loads with only the resources in this profile."""
 
-    @schedule
-    def load_page_offsets_schedule(
-        smem_q: MemoryResource,
-        smem_kv: MemoryResource,
-        smem_page_offsets: MemoryResource,
-        work_queue: WorkQueue | None = None,
-        schedule_token_throttle: MemoryResource | None = None,
-        smem_kv_reuse_credit: MemoryResource | None = None,
-    ) -> None:
-        """Schedule shared-KV loads with paged-KV offset consumption."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
@@ -1231,59 +1290,53 @@ def create_load_task(
                 smem_page_offsets,
                 schedule_token_throttle,
                 smem_kv_reuse_credit,
+                sparse_kv_metadata0,
+                sparse_kv_metadata1,
+                sparse_softmax_metadata0,
+                sparse_softmax_metadata1,
             ),
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
 
-    if smem_page_offsets is None:
-        if work_queue is None:
-            captured_schedule = load_schedule(smem_q, smem_kv)
-        elif schedule_token_throttle is None:
-            captured_schedule = load_schedule(smem_q, smem_kv, work_queue)
-        elif smem_kv_reuse_credit is None:
-            captured_schedule = load_schedule(
-                smem_q, smem_kv, work_queue, schedule_token_throttle
-            )
-        else:
-            captured_schedule = load_schedule(
-                smem_q,
-                smem_kv,
-                work_queue,
-                schedule_token_throttle,
-                smem_kv_reuse_credit,
-            )
-    else:
-        if work_queue is None:
-            captured_schedule = load_page_offsets_schedule(
-                smem_q, smem_kv, smem_page_offsets
-            )
-        elif schedule_token_throttle is None:
-            captured_schedule = load_page_offsets_schedule(
-                smem_q, smem_kv, smem_page_offsets, work_queue
-            )
-        elif smem_kv_reuse_credit is None:
-            captured_schedule = load_page_offsets_schedule(
-                smem_q,
-                smem_kv,
-                smem_page_offsets,
-                work_queue,
-                schedule_token_throttle,
-            )
-        else:
-            captured_schedule = load_page_offsets_schedule(
-                smem_q,
-                smem_kv,
-                smem_page_offsets,
-                work_queue,
-                schedule_token_throttle,
-                smem_kv_reuse_credit,
-            )
+    sparse_resources = (
+        sparse_kv_metadata0,
+        sparse_kv_metadata1,
+        sparse_softmax_metadata0,
+        sparse_softmax_metadata1,
+    )
+    sparse_resources_present = tuple(
+        resource is not None for resource in sparse_resources
+    )
+    has_sparse_metadata = any(sparse_resources_present)
+    if has_sparse_metadata and not all(sparse_resources_present):
+        raise ValueError("shared sparse K/V requires both route/Softmax pairs")
+    if has_sparse_metadata and smem_page_offsets is not None:
+        raise ValueError("block-sparse and paged-KV cannot share a load task")
+
+    captured_schedule = load_schedule(
+        smem_q,
+        smem_kv,
+        smem_page_offsets,
+        sparse_kv_metadata0,
+        sparse_kv_metadata1,
+        sparse_softmax_metadata0,
+        sparse_softmax_metadata1,
+        work_queue,
+        schedule_token_throttle,
+        smem_kv_reuse_credit,
+    )
     src = []
+    for sparse_kv_metadata in (sparse_kv_metadata0, sparse_kv_metadata1):
+        if sparse_kv_metadata is not None:
+            src.append(sparse_kv_metadata)
     if smem_page_offsets is not None:
         src.append(smem_page_offsets)
     if work_queue is not None:
         src.append(work_queue)
     dst = [smem_q, smem_kv]
+    for sparse_resource in sparse_resources:
+        if sparse_resource is not None and sparse_resource not in dst:
+            dst.append(sparse_resource)
     if schedule_token_throttle is not None:
         dst.append(schedule_token_throttle)
     if smem_kv_reuse_credit is not None:
@@ -1642,56 +1695,6 @@ def create_load_task_split_kv(
                 resource.commit()
             _page_offsets_release(offsets)
 
-        def resolve_and_store_kv_route(
-            sparse_kv_metadata: MemoryResource | None,
-            section: FmhaStage,
-        ) -> tuple[Any, Any, Any, Any] | None:
-            """Load one prepared route and retain it for the matching K/V pair."""
-
-            if sparse_kv_metadata is None:
-                return None
-            (
-                resolved_origin0,
-                resolved_origin1,
-                resolved_atom_validity,
-                route_record_word_offset,
-            ) = sparse_kv_metadata.resolve_route(section=section)
-            sparse_kv_metadata.store_route(
-                resolved_origin0=resolved_origin0,
-                resolved_origin1=resolved_origin1,
-                resolved_atom_validity=resolved_atom_validity,
-            )
-            return (
-                resolved_origin0,
-                resolved_origin1,
-                resolved_atom_validity,
-                route_record_word_offset,
-            )
-
-        def store_softmax_route(
-            sparse_softmax_metadata: MemoryResource | None,
-            route: tuple[Any, Any, Any, Any] | None,
-        ) -> None:
-            """Stage one resolved route for its Softmax consumer."""
-
-            if sparse_softmax_metadata is None:
-                return
-            assert route is not None
-            (
-                resolved_origin0,
-                resolved_origin1,
-                resolved_atom_validity,
-                route_record_word_offset,
-            ) = route
-            sparse_softmax_metadata.acquire()
-            sparse_softmax_metadata.store_route(
-                resolved_origin0=resolved_origin0,
-                resolved_origin1=resolved_origin1,
-                resolved_atom_validity=resolved_atom_validity,
-                route_record_word_offset=route_record_word_offset,
-            )
-            sparse_softmax_metadata.commit()
-
         if smem_q is not None:
             smem_q.acquire()
             smem_q.tma_load()
@@ -1703,7 +1706,7 @@ def create_load_task_split_kv(
         ):
             if smem_k is None:
                 continue
-            route = resolve_and_store_kv_route(
+            route = _resolve_and_store_sparse_route(
                 sparse_kv_metadata, FmhaStage.Head
             )
             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
@@ -1711,7 +1714,7 @@ def create_load_task_split_kv(
         # In the combined task, preserve both K issues ahead of Softmax
         # backpressure. A per-instance task naturally stages its sole route.
         for sparse_softmax_metadata, route in head_routes:
-            store_softmax_route(sparse_softmax_metadata, route)
+            _publish_sparse_softmax_route(sparse_softmax_metadata, route)
 
         with domain_loop(0, domain, 1, unroll=1):
             # V consumes the retained route before the next K overwrites it.
@@ -1733,13 +1736,13 @@ def create_load_task_split_kv(
                     smem_page_offsets_v_local,
                     FmhaStage.Loop,
                 )
-                route = resolve_and_store_kv_route(
+                route = _resolve_and_store_sparse_route(
                     sparse_kv_metadata, FmhaStage.Loop
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
                 loop_routes.append((sparse_softmax_metadata, route))
             for sparse_softmax_metadata, route in loop_routes:
-                store_softmax_route(sparse_softmax_metadata, route)
+                _publish_sparse_softmax_route(sparse_softmax_metadata, route)
 
         for _, smem_v, _, _, _, load_v in active_instances:
             if smem_v is not None:
@@ -2885,18 +2888,20 @@ def create_softmax0_task(
                     sparse_token_word3,
                 ) = sparse_softmax_metadata.load_route()
                 sparse_softmax_metadata.release()
-                old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s0.compute_softmax_loop(
-                    old_max_arr=old_max_arr,
-                    sum_arr=sum_arr,
-                    new_max_arr=new_max_arr,
-                    s_arr=s_arr,
-                    sparse_origin0=sparse_origin0,
-                    sparse_origin1=sparse_origin1,
-                    sparse_route_flags=sparse_route_flags,
-                    sparse_token_word0=sparse_token_word0,
-                    sparse_token_word1=sparse_token_word1,
-                    sparse_token_word2=sparse_token_word2,
-                    sparse_token_word3=sparse_token_word3,
+                old_max_arr, sum_arr, new_max_arr, s_arr = (
+                    tmem_s0.compute_block_sparse_softmax_loop(
+                        old_max_arr=old_max_arr,
+                        sum_arr=sum_arr,
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                        sparse_origin0=sparse_origin0,
+                        sparse_origin1=sparse_origin1,
+                        sparse_route_flags=sparse_route_flags,
+                        sparse_token_word0=sparse_token_word0,
+                        sparse_token_word1=sparse_token_word1,
+                        sparse_token_word2=sparse_token_word2,
+                        sparse_token_word3=sparse_token_word3,
+                    )
                 )
             else:
                 old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s0.compute_softmax_loop(
@@ -3105,18 +3110,20 @@ def create_softmax1_task(
                     sparse_token_word3,
                 ) = sparse_softmax_metadata.load_route()
                 sparse_softmax_metadata.release()
-                old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s1.compute_softmax_loop(
-                    old_max_arr=old_max_arr,
-                    sum_arr=sum_arr,
-                    new_max_arr=new_max_arr,
-                    s_arr=s_arr,
-                    sparse_origin0=sparse_origin0,
-                    sparse_origin1=sparse_origin1,
-                    sparse_route_flags=sparse_route_flags,
-                    sparse_token_word0=sparse_token_word0,
-                    sparse_token_word1=sparse_token_word1,
-                    sparse_token_word2=sparse_token_word2,
-                    sparse_token_word3=sparse_token_word3,
+                old_max_arr, sum_arr, new_max_arr, s_arr = (
+                    tmem_s1.compute_block_sparse_softmax_loop(
+                        old_max_arr=old_max_arr,
+                        sum_arr=sum_arr,
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                        sparse_origin0=sparse_origin0,
+                        sparse_origin1=sparse_origin1,
+                        sparse_route_flags=sparse_route_flags,
+                        sparse_token_word0=sparse_token_word0,
+                        sparse_token_word1=sparse_token_word1,
+                        sparse_token_word2=sparse_token_word2,
+                        sparse_token_word3=sparse_token_word3,
+                    )
                 )
             else:
                 old_max_arr, sum_arr, new_max_arr, s_arr = tmem_s1.compute_softmax_loop(

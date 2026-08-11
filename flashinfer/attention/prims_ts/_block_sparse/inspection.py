@@ -60,16 +60,6 @@ def _validate_int32_extent(value: int, name: str) -> None:
         raise OverflowError(f"{name} must fit in signed int32")
 
 
-def _validate_device_int32_product(name: str, *factors: int) -> None:
-    """Reject linearized extents that the kernel cannot address with Int32."""
-
-    product = 1
-    for factor in factors:
-        product *= factor
-        if product > _SIGNED_INT32_MAX:
-            raise OverflowError(f"{name} must fit in signed int32")
-
-
 def _raise_for_noncanonical_bsr(summary_values: tuple[int, ...]) -> None:
     """Translate the device validation code after the one packed copy."""
 
@@ -118,21 +108,6 @@ def _inspect_block_sparse_bsr(
     ):
         _validate_int32_extent(value, name)
 
-    num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
-    if block_indices.numel() > _SIGNED_INT32_MAX:
-        raise OverflowError("block_indices.numel() must fit in signed int32")
-    _validate_device_int32_product(
-        "number of raw BSR rows",
-        batch_size,
-        num_kv_heads,
-        num_q_block_rows,
-    )
-    _validate_device_int32_product(
-        "block_indptr.numel()",
-        batch_size,
-        num_kv_heads,
-        num_q_block_rows + 1,
-    )
     device = block_indptr.device
     device_index = device.index
     if device_index is None:

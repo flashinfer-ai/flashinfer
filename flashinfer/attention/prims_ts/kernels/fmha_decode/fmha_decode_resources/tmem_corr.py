@@ -2363,6 +2363,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         serializing the complete D128 upper and lower halves.
         """
         cfg = self.cfg
+        partial_o_uses_bf16 = (
+            cfg.use_bf16_separate_partial_o
+            if cfg.use_separate_reduction_kernel
+            else cfg.use_bf16_output
+        )
         output_exchange_base = Int32(
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
         )
@@ -2470,13 +2475,17 @@ class TmemCorrResource(DecodeGenResourceBase):
                                     (partial_scale, partial_scale),
                                     (output_vals[elem], output_vals[elem + 1]),
                                 )
-                            packed = (
-                                cutlass.Vector.from_elements(
-                                    scaled_values, Float32
-                                )
-                                .to(cutlass.BFloat16)
-                                .bitcast(Int32)
+                            scaled_vector = cutlass.Vector.from_elements(
+                                scaled_values, Float32
                             )
+                            if cutlass.const_expr(partial_o_uses_bf16):
+                                packed = scaled_vector.to(
+                                    cutlass.BFloat16
+                                ).bitcast(Int32)
+                            else:
+                                packed = scaled_vector.to(cutlass.Float16).bitcast(
+                                    Int32
+                                )
                             partial_o_dst = cutlass.inttoptr(
                                 self.partial_o_ptr.toint()
                                 + partial_row_base
