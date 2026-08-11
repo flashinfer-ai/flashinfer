@@ -121,3 +121,28 @@ The patched header SHA-256 is
 `3f33fdd122e5f7d81cba3d2a1ad2c3a3e2771e8d99a31f469fc5dcfbd876626d`.
 The target Static BF16 cubin remains immutable at
 `7bb1c7081725d4884296c6071705d9744768f0b4eb909cce4d7f5e2932727c3a`.
+
+## H3 interleaved PackedQkv diagnostic
+
+The artifact's canonical PackedQkv host layout is planar within each token:
+`[all Q heads, all K heads, all V heads, D]`. Its default K/V base offsets for
+H7 D128 are therefore 896 and 1792 BF16 elements. That is not the H3 inference
+allocation, which is `[token, head, Q|K|V]` and has K/V base offsets 128 and
+256 elements. The Packed-v2 diagnostic never reinterprets one as the other and
+never repacks.
+
+The launcher admits the Packed cubin only after proving exact BF16 H7 D128,
+Q/K/V base offsets `0/128/256`, and token/head strides `2688/384` for all three
+views. It then builds three explicit descriptors:
+
+| operand | base offset (BF16) | TMA shape | TMA stride | tile shape |
+| --- | ---: | --- | --- | --- |
+| Q | 0 | `(128,1,7,T)` | `(1,384,384,2688)` | `(64,1,1,128)` |
+| K | 128 | `(128,T,7,1)` | `(1,2688,384,0)` | `(64,128,1,1)` |
+| V | 256 | `(128,T,7,1)` | `(1,2688,384,0)` | `(64,128,1,1)` |
+
+The cubin receives only these tensor maps, not the host marker used to select
+explicit bases. Descriptor construction repeats the exact shape/stride checks
+immediately before encoding. Any layout drift fails before launch. C48 must
+still prove that the Packed cubin is descriptor-generic; otherwise this route
+is rejected without timing.

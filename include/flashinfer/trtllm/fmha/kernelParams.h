@@ -505,13 +505,23 @@ struct KernelParams {
 
     // Set Q, K and V pointer from packed QKV tensor.
     if (isPackedQkv(runnerParams.mQkvLayout)) {
-      qPtr = runnerParams.qkvPtr;
-      kPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr) +
-                                           runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk *
-                                               bitsPerElt / 8 /*bits*/);
-      vPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr) +
-                                           (runnerParams.mNumHeadsQ + runnerParams.mNumHeadsKv) *
-                                               runnerParams.mHeadDimQk * bitsPerElt / 8 /*bits*/);
+      if (runnerParams.qkvPtr != nullptr) {
+        // Canonical PackedQkv is [token, all-Q-heads, all-K-heads, all-V-heads, head-dim].
+        qPtr = runnerParams.qkvPtr;
+        kPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr) +
+                                             runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk *
+                                                 bitsPerElt / 8 /*bits*/);
+        vPtr = reinterpret_cast<void const*>(
+            reinterpret_cast<char const*>(runnerParams.qkvPtr) +
+            (runnerParams.mNumHeadsQ + runnerParams.mNumHeadsKv) * runnerParams.mHeadDimQk *
+                bitsPerElt / 8 /*bits*/);
+      } else {
+        // The H3 diagnostic uses the PackedQkv cubin with three explicit TMA bases for its
+        // interleaved [token, head, Q|K|V] allocation. The launcher validates every base and
+        // stride before using nullptr as this fail-closed host-only marker.
+        FLASHINFER_CHECK(qPtr != nullptr && kPtr != nullptr && vPtr != nullptr,
+                         "interleaved PackedQkv requires explicit Q/K/V descriptor bases");
+      }
     }
     // Set K and V pointer from pagedKv tensor.
     else if (isPagedKv(runnerParams.mQkvLayout)) {
@@ -669,6 +679,17 @@ struct KernelParams {
         makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
                             kernelMeta.mTileSizeQ, kernelMeta.mStepQ,
                             numEltsInClampedHeadDimQ);
+    bool const usesH3InterleavedPackedQkv =
+        isPackedQkv(options.mQkvLayout) && options.qkvPtr == nullptr;
+    if (usesH3InterleavedPackedQkv) {
+      std::vector<uint64_t> const expectedShapeQ{
+          128, 1, 7, static_cast<uint64_t>(options.mSumOfSeqLensQ)};
+      std::vector<uint64_t> const expectedStrideQ{1, 384, 384, 2688};
+      std::vector<uint32_t> const expectedTileShapeQ{64, 1, 1, 128};
+      FLASHINFER_CHECK(shapeQ == expectedShapeQ && strideQ == expectedStrideQ &&
+                           tileShapeQ == expectedTileShapeQ,
+                       "H3 interleaved PackedQkv Q descriptor contract drifted");
+    }
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));
@@ -720,6 +741,14 @@ struct KernelParams {
     auto [shapeV, strideV] =
         makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeV,
                              /*isK*/ false, storeTransformedKvInTmem, reshapeFactorKv);
+    if (usesH3InterleavedPackedQkv) {
+      std::vector<uint64_t> const expectedShapeKv{
+          128, static_cast<uint64_t>(options.mSumOfSeqLensKv), 7, 1};
+      std::vector<uint64_t> const expectedStrideKv{1, 2688, 384, 0};
+      FLASHINFER_CHECK(shapeK == expectedShapeKv && shapeV == expectedShapeKv &&
+                           strideK == expectedStrideKv && strideV == expectedStrideKv,
+                       "H3 interleaved PackedQkv K/V descriptor contract drifted");
+    }
     // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
     auto const numEltsDivisor =
         kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;

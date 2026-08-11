@@ -622,27 +622,38 @@ void trtllm_ragged_attention_launcher(
   runner_params.mSupportsVarSeqLens = true;
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mQkvLayout = QkvLayout::SeparateQkv;
+  bool packed_interleaved_qkv = false;
   if (char const* layout = std::getenv("FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT")) {
     if (std::strcmp(layout, "packed") == 0) {
       if (q_data_type != DATA_TYPE_BF16 || q_data_type != k_data_type ||
           q_data_type != v_data_type ||
-          num_qo_heads != num_kv_heads || head_dim_qk != head_dim_v) {
+          num_qo_heads != 7 || num_kv_heads != 7 || head_dim_qk != 128 || head_dim_v != 128) {
         FLASHINFER_ERROR(
-            "packed ragged QKV diagnostic requires BF16 Q/K/V with matching head counts and "
-            "head dimensions");
+            "interleaved PackedQkv diagnostic requires exact H3 BF16 H7 D128 Q/K/V");
       }
       int64_t const bytes_per_element = get_size_in_bits(q_data_type) / 8;
       auto const* q_bytes = reinterpret_cast<char const*>(query);
-      auto const* expected_k =
-          q_bytes + num_qo_heads * head_dim_qk * bytes_per_element;
-      auto const* expected_v =
-          q_bytes + (num_qo_heads + num_kv_heads) * head_dim_qk * bytes_per_element;
+      auto const* expected_k = q_bytes + head_dim_qk * bytes_per_element;
+      auto const* expected_v = q_bytes + 2 * head_dim_qk * bytes_per_element;
       if (reinterpret_cast<char const*>(key) != expected_k ||
           reinterpret_cast<char const*>(value) != expected_v) {
         FLASHINFER_ERROR(
-            "packed ragged QKV requires Q/K/V views of one head-major fused allocation");
+            "interleaved PackedQkv requires Q/K/V base offsets 0/128/256 BF16 elements");
+      }
+      int64_t const expected_head_stride = 3 * head_dim_qk;
+      int64_t const expected_token_stride = num_qo_heads * expected_head_stride;
+      if (q_stride_tokens != expected_token_stride ||
+          k_stride_keys_values != expected_token_stride ||
+          v_stride_keys_values != expected_token_stride || q_stride_heads != expected_head_stride ||
+          k_stride_heads != expected_head_stride || v_stride_heads != expected_head_stride) {
+        FLASHINFER_ERROR(
+            "interleaved PackedQkv requires token/head strides 2688/384 for Q, K, and V");
       }
       runner_params.mQkvLayout = QkvLayout::PackedQkv;
+      // nullptr selects explicit qPtr/kPtr/vPtr bases in getDevicePtrs. It is never passed to the
+      // cubin; the cubin receives only the three validated TMA descriptors.
+      runner_params.qkvPtr = nullptr;
+      packed_interleaved_qkv = true;
     } else if (std::strcmp(layout, "separate") != 0) {
       FLASHINFER_ERROR(
           "FLASHINFER_TRTLLM_RAGGED_QKV_LAYOUT must be 'separate' or 'packed'");
@@ -672,10 +683,10 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.kStrideKeysValues = k_stride_keys_values;
   runner_params.kStrideHeads = k_stride_heads;
-  runner_params.kStrideBatch = k_stride_batch;
+  runner_params.kStrideBatch = packed_interleaved_qkv ? 0 : k_stride_batch;
   runner_params.vStrideKeysValues = v_stride_keys_values;
   runner_params.vStrideHeads = v_stride_heads;
-  runner_params.vStrideBatch = v_stride_batch;
+  runner_params.vStrideBatch = packed_interleaved_qkv ? 0 : v_stride_batch;
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
