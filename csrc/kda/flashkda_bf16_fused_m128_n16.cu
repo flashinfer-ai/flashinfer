@@ -15,8 +15,8 @@
  */
 
 // Frozen Cake export; do not edit by hand.
-// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_4bcf5545f6.
-// Cake revision: 3e3e3a7e1fb610f4292ca389647118b36eb42b81; raw SHA-256: 945db8ca7de704ea0c4c6e454a0525028fca115ee70472775f6e6e7558877b46.
+// Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_8672e4378b.
+// Cake revision: 600583dab4705976911a9384c59aeaed9d354979; raw SHA-256: 5419508467bf64918d3b517950235ab4e943836fd4717da81475d94fc1f3ae98.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -69,7 +69,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_INV_OFF 15360
 #define SMEM_SMEM_INV_STAGE_BYTES 512
 #define SMEM_SMEM_INV_STRIDE 41984
-#define SMEM_SMEM_V_OFF 16448
+#define SMEM_SMEM_V_OFF 16512
 #define SMEM_SMEM_V_STAGE_BYTES 4096
 #define SMEM_SMEM_V_STRIDE 41984
 #define SMEM_SMEM_KI_OFF 9216
@@ -81,7 +81,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_BETA_RAW_OFF 21504
 #define SMEM_SMEM_BETA_RAW_STAGE_BYTES 256
 #define SMEM_SMEM_BETA_RAW_STRIDE 41984
-#define SMEM_SMEM_INV_WORK_OFF 16448
+#define SMEM_SMEM_INV_WORK_OFF 16512
 #define SMEM_SMEM_INV_WORK_STAGE_BYTES 4096
 #define SMEM_SMEM_INV_WORK_STRIDE 41984
 #define SMEM_SMEM_OUT_OFF 210944
@@ -102,7 +102,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_GATE_RATE_ALL_OFF 22084
 #define SMEM_SMEM_GATE_RATE_ALL_STAGE_BYTES 167940
 #define SMEM_SMEM_GATE_RATE_ALL_STRIDE 167940
-#define SMEM_SMEM_V_ALL_OFF 16448
+#define SMEM_SMEM_V_ALL_OFF 16512
 #define SMEM_SMEM_V_ALL_STAGE_BYTES 172032
 #define SMEM_SMEM_V_ALL_STRIDE 172032
 #define SMEM_SMEM_GATE_ALL_OFF 13312
@@ -557,16 +557,16 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
     const int smem_mqk_trans_addr = smem + 13312;
     __nv_bfloat16* smem_inv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 15360);
     const int smem_inv_addr = smem + 15360;
-    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16448);
-    const int smem_v_addr = smem + 16448;
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16512);
+    const int smem_v_addr = smem + 16512;
     __nv_bfloat16* smem_ki = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
     const int smem_ki_addr = smem + 9216;
     float* smem_gate = reinterpret_cast<float*>(smem_raw + 13312);
     const int smem_gate_addr = smem + 13312;
     __nv_bfloat16* smem_beta_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 21504);
     const int smem_beta_raw_addr = smem + 21504;
-    __nv_bfloat16* smem_inv_work = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16448);
-    const int smem_inv_work_addr = smem + 16448;
+    __nv_bfloat16* smem_inv_work = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16512);
+    const int smem_inv_work_addr = smem + 16512;
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 210944);
     const int smem_out_addr = smem + 210944;
     float* smem_restore_factor_all = reinterpret_cast<float*>(smem_raw + 21504);
@@ -579,8 +579,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, LoomTensorMap con
     const int smem_prep_beta_all_addr = smem + 22020;
     float* smem_gate_rate_all = reinterpret_cast<float*>(smem_raw + 22084);
     const int smem_gate_rate_all_addr = smem + 22084;
-    __nv_bfloat16* smem_v_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16448);
-    const int smem_v_all_addr = smem + 16448;
+    __nv_bfloat16* smem_v_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16512);
+    const int smem_v_all_addr = smem + 16512;
     float* smem_gate_all = reinterpret_cast<float*>(smem_raw + 13312);
     const int smem_gate_all_addr = smem + 13312;
 

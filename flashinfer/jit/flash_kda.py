@@ -50,7 +50,7 @@ _FLASH_KDA_TARGET_DEFINE = {
 # satisfying either refreshed schedule after an in-place package upgrade.
 _FLASH_KDA_M128_MODULE_IDENTS = {
     "m128": "c0c5dc1a67",
-    "m128_n16": "4bcf5545f6",
+    "m128_n16": "8672e4378b",
 }
 
 

@@ -16,7 +16,7 @@
 
 // Frozen Cake export; do not edit by hand.
 // Provenance: generated Loom schedule 'flashkda_bf16_fused_m128'; module flashkda_bf16_fused_m128_c0c5dc1a67.
-// Cake revision: 3e3e3a7e1fb610f4292ca389647118b36eb42b81; raw SHA-256: d92ddc58b2f07d95a85d7de25950e1f1722af35fcf511ffc0ed22faf4ffff2c9.
+// Cake revision: 600583dab4705976911a9384c59aeaed9d354979; raw SHA-256: d92ddc58b2f07d95a85d7de25950e1f1722af35fcf511ffc0ed22faf4ffff2c9.
 // clang-format off
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
