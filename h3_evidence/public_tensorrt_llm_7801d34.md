@@ -117,8 +117,21 @@ slot 2 as its O TMA descriptor. The H3 branch therefore restores the immutable
 pack's descriptor order and rejects sliding-window-K and dynamic sparse-MLA
 launches that require the newer host ABI.
 
-The patched header SHA-256 is
-`3f33fdd122e5f7d81cba3d2a1ad2c3a3e2771e8d99a31f469fc5dcfbd876626d`.
+The descriptor-only repair was tested by B200 job `1662912` and reproduced
+the prior C48 failure bit-for-bit, including the first damaged QKV element and
+the exact mismatch counts. This falsifies descriptor order as the active cause
+for this H3 cubin. A complete declaration diff against `9035311e` found the
+remaining byte drift: two later DSv4 pointers inserted after `ptrDebugO` and
+one DSv4 `int64_t` inserted after `mChunkedAttentionSizeLog2`. Those additions
+shift the static scheduler's scalar block by 28 bytes even though DSv4 is
+disabled. They belong to the separate TensorRT-LLM 7801d34 artifact lane, not
+the immutable 158f pack, and are removed in this diagnostic.
+
+Additional compile-time offsets now pin
+`ptrFirstSparseMaskOffsetsKv=976`, reserved state `=1104`,
+`mAttentionWindowSize=1112`, `mInflateMax=1124`, `mNumHeadsQ=1168`, and
+`mNumTokensPerCtaQ=1204`. The full-ABI patched header SHA-256 is
+`e9cce119067e50655589876821af36024276b1038bed2d18fe280bea2f6d95df`.
 The target Static BF16 cubin remains immutable at
 `7bb1c7081725d4884296c6071705d9744768f0b4eb909cce4d7f5e2932727c3a`.
 
