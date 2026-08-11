@@ -32,6 +32,7 @@
 #include <cuda/iterator>
 #include <cuda/std/limits>
 
+#include "topk_transform_checks.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
@@ -91,16 +92,35 @@ struct CUBPageTranslate {
 // The output mode is a compile-time switch so each mode keeps its own iterator type (and
 // kernel instantiation) while sharing one definition; raw_base is unused (pass nullptr)
 // when WithRawIndices is false.
+//
+// The three per-row metadata pointers are nullable (identity/zero defaults), so packed
+// layouts add no instantiation axis:
+//   - row_to_batch: score row i gathers through page-table row row_to_batch[i] (many score
+//     rows of one request share its table row); nullptr => table row i.
+//   - page_table_row_starts / row_starts: the lookup's base offset within the table row, in
+//     TABLE-SLOT units (the winning index is window-local; the table row describes the whole
+//     request). Fallback chain mirrors the native kernel (topk.cuh):
+//     page_table_start = page_table_row_starts ? : row_starts ? : 0.
+//     The offset is folded into the row's base pointer here, so the write functor is
+//     oblivious to it.
 template <bool WithRawIndices>
 struct CUBMakePageTableRowOut {
   int32_t* out_base;
   int32_t* raw_base;
   const int32_t* src_page_table;
+  const int32_t* row_to_batch;           // nullptr => table row i
+  const int32_t* row_starts;             // fallback for page_table_row_starts
+  const int32_t* page_table_row_starts;  // nullptr => row_starts (or 0)
   int64_t page_stride;
   uint32_t page_bits;
   int64_t top_k;
   __host__ __device__ auto operator()(int64_t row) const {
-    const CUBPageTranslate<WithRawIndices> translate{src_page_table + row * page_stride, page_bits};
+    const int64_t batch = (row_to_batch != nullptr) ? row_to_batch[row] : row;
+    const int64_t page_table_start = (page_table_row_starts != nullptr) ? page_table_row_starts[row]
+                                     : (row_starts != nullptr)          ? row_starts[row]
+                                                                        : int64_t{0};
+    const CUBPageTranslate<WithRawIndices> translate{
+        src_page_table + batch * page_stride + page_table_start, page_bits};
     if constexpr (WithRawIndices) {
       return cuda::make_transform_output_iterator(
           cuda::make_zip_iterator(out_base + row * top_k, raw_base + row * top_k), translate);
@@ -110,18 +130,29 @@ struct CUBMakePageTableRowOut {
   }
 };
 
+// Per-segment input rows with a per-row window start: d_keys_in[row] points at
+// input[row, row_starts[row]:] (row_starts read on the device at outer dereference, like the
+// deferred lengths). Used only when row_starts is present; the whole-row case uses a plain
+// strided iterator (a separate instantiation). Must stay __host__ __device__:
+// cuda::transform_iterator deduces its reference type via host-side invoke_result.
+template <typename DType>
+struct CUBMakeRowIn {
+  const DType* input;
+  int64_t row_stride;
+  const int32_t* row_starts;
+  __device__ const DType* operator()(int64_t row) const {
+    return input + row * row_stride + row_starts[row];
+  }
+};
+
 // When query_bytes_out is non-null, only the workspace-size query runs (nothing is
 // launched); the result is written there and the outputs/workspace are not touched.
 template <int64_t MAX_LEN_BOUND, typename DType, typename ValuesOutItItT, typename RequirementsT>
-cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, ValuesOutItItT d_values_out,
-                              const int32_t* lengths, Optional<TensorView>& maybe_workspace_buffer,
-                              int64_t num_rows, int64_t max_len, int64_t top_k,
-                              const RequirementsT& requirements, size_t* query_bytes_out,
-                              cudaStream_t stream) {
-  // Per-segment iterator over the dense (num_rows, max_len) input: d_keys_in[i] yields a
-  // pointer to row i. The values-out iterator comes from the caller (the fused page-table
-  // writers).
-  auto d_keys_in = cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride);
+cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, const int32_t* row_starts,
+                              ValuesOutItItT d_values_out, const int32_t* lengths,
+                              Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
+                              int64_t max_len, int64_t top_k, const RequirementsT& requirements,
+                              size_t* query_bytes_out, cudaStream_t stream) {
   // The keys (score values) are not returned by the transform API: every segment gets the
   // same discard iterator (the outer constant level satisfies the iterator-of-iterators
   // contract; a bare discard_iterator's reference is not an iterator and does not compile).
@@ -135,8 +166,10 @@ cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, ValuesOutI
 
   auto env = cuda::std::execution::env{requirements, cuda::stream_ref{stream}};
 
-  // Two-phase workspace flow (CUB's "temporary storage"): size query, then run.
-  auto run_with = [&](auto segment_sizes) -> cudaError_t {
+  // Two-phase workspace flow (CUB's "temporary storage"): size query, then run. Generic in
+  // the keys-in iterator: the plain path uses a strided iterator, the row_starts path a
+  // per-row windowed one (see the branch at the bottom); each gets its own instantiation.
+  auto run_with = [&](auto d_keys_in, auto segment_sizes) -> cudaError_t {
     size_t workspace_bytes = 0;
     if (const auto error = cub::DeviceBatchedTopK::MaxPairs(nullptr, workspace_bytes, d_keys_in,
                                                             d_keys_out, d_values_in, d_values_out,
@@ -191,15 +224,28 @@ cudaError_t CUBBatchedTopKRun(const DType* input, int64_t row_stride, ValuesOutI
   // is a valid empty segment — CUB selects nothing for it, so with the caller's -1 prefill
   // the whole output row reads as padding. The lower bound plays no role in launch sizing
   // (only the upper bound does), so this costs nothing.
-  constexpr int32_t kLengthsFloor = cuda::std::numeric_limits<int32_t>::min();
-  return run_with(cuda::args::deferred_sequence{
-      lengths, cuda::args::bounds<kLengthsFloor, int32_t{MAX_LEN_BOUND}>(),
-      cuda::args::bounds(kLengthsFloor, static_cast<int32_t>(max_len))});
+  constexpr int32_t k_lengths_floor = cuda::std::numeric_limits<int32_t>::min();
+  const auto segment_sizes = cuda::args::deferred_sequence{
+      lengths, cuda::args::bounds<k_lengths_floor, int32_t{MAX_LEN_BOUND}>(),
+      cuda::args::bounds(k_lengths_floor, static_cast<int32_t>(max_len))};
+
+  // Per-segment iterator over the dense (num_rows, max_len) input: d_keys_in[i] yields a
+  // pointer to row i's selection window. The common whole-row case keeps the plain strided
+  // iterator (pure pointer arithmetic); only windowed calls pay the per-row device read.
+  if (row_starts != nullptr) {
+    return run_with(
+        cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
+                                      CUBMakeRowIn<DType>{input, row_stride, row_starts}),
+        segment_sizes);
+  }
+  return run_with(cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride),
+                  segment_sizes);
 }
 
 template <typename DType, typename ValuesOutItItT, typename RequirementsT>
 cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
-                                        ValuesOutItItT d_values_out, const int32_t* lengths,
+                                        const int32_t* row_starts, ValuesOutItItT d_values_out,
+                                        const int32_t* lengths,
                                         Optional<TensorView>& maybe_workspace_buffer,
                                         int64_t num_rows, int64_t max_len, int64_t top_k,
                                         const RequirementsT& requirements, size_t* query_bytes_out,
@@ -209,7 +255,7 @@ cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
   // therefore SM90+, so without this tier pre-SM90 GPUs couldn't run cub_topk at all. 8192 is
   // the largest bound the single-block backend accepts for our key/value types.
   if (max_len <= 8192) {
-    return CUBBatchedTopKRun<int64_t{8192}>(input, row_stride, d_values_out, lengths,
+    return CUBBatchedTopKRun<int64_t{8192}>(input, row_stride, row_starts, d_values_out, lengths,
                                             maybe_workspace_buffer, num_rows, max_len, top_k,
                                             requirements, query_bytes_out, stream);
   } else {
@@ -219,7 +265,7 @@ cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
     // cub_topk() turns into an exception. The Python dispatcher is expected to route these
     // calls to the radix backend instead, so reaching this branch pre-SM90 means someone
     // forced the CUB backend explicitly.
-    return CUBBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, d_values_out, lengths,
+    return CUBBatchedTopKRun<CUB_TOPK_MAX_LEN>(input, row_stride, row_starts, d_values_out, lengths,
                                                maybe_workspace_buffer, num_rows, max_len, top_k,
                                                requirements, query_bytes_out, stream);
   }
@@ -227,7 +273,8 @@ cudaError_t CUBBatchedTopKDispatchBound(const DType* input, int64_t row_stride,
 
 template <typename DType, typename ValuesOutItItT>
 cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
-                                   ValuesOutItItT d_values_out, const int32_t* lengths,
+                                   const int32_t* row_starts, ValuesOutItItT d_values_out,
+                                   const int32_t* lengths,
                                    Optional<TensorView>& maybe_workspace_buffer, int64_t num_rows,
                                    int64_t max_len, int64_t top_k, int64_t tie_break,
                                    size_t* query_bytes_out, cudaStream_t stream) {
@@ -236,7 +283,7 @@ cudaError_t CUBBatchedTopKDispatch(const DType* input, int64_t row_stride,
   // the runtime flag must fan out into separate branches; the generic lambda factors out the
   // otherwise-identical call.
   auto run = [&](auto requirements) {
-    return CUBBatchedTopKDispatchBound(input, row_stride, d_values_out, lengths,
+    return CUBBatchedTopKDispatchBound(input, row_stride, row_starts, d_values_out, lengths,
                                        maybe_workspace_buffer, num_rows, max_len, top_k,
                                        requirements, query_bytes_out, stream);
   };
@@ -292,41 +339,42 @@ void CheckCUBTopKArgs(const TensorView& input, const TensorView& lengths, int64_
 // inside CUB's own kernel via the output iterators — no epilogue launch. Rows with
 // lengths[i] < top_k leave both output tails untouched; the Python wrapper pre-fills them
 // with -1 (matching the native kernels, which write -1 in-kernel).
-void cub_topk_page_table_transform(TensorView input, TensorView output_page_table,
-                                   TensorView src_page_table, TensorView lengths,
-                                   Optional<TensorView> maybe_output_raw_indices,
-                                   Optional<TensorView> maybe_workspace_buffer, int64_t top_k,
-                                   int64_t tie_break, int64_t page_size) {
-  CheckCUBTopKArgs(input, lengths, top_k, tie_break);
-  const int32_t* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
-  CHECK_INPUT(output_page_table);
-  CHECK_DIM(2, output_page_table);  // (num_rows, top_k)
-  CHECK_INPUT_TYPE(output_page_table, dl_int32);
-  TVM_FFI_ICHECK(output_page_table.size(0) == input.size(0) && output_page_table.size(1) == top_k)
-      << "cub_topk output_page_table must have shape (num_rows, top_k) = (" << input.size(0) << ", "
-      << top_k << "), got (" << output_page_table.size(0) << ", " << output_page_table.size(1)
-      << ")";
-  CHECK_CUDA(src_page_table);
-  CHECK_LAST_DIM_CONTIGUOUS(src_page_table);
-  CHECK_DIM(2, src_page_table);
-  CHECK_INPUT_TYPE(src_page_table, dl_int32);
-  TVM_FFI_ICHECK(src_page_table.size(0) == input.size(0))
-      << "cub_topk src_page_table must have one row per input row (identity mapping): expected "
-      << input.size(0) << ", got " << src_page_table.size(0);
+void cub_topk_page_table_transform(
+    TensorView input, TensorView output_page_table, TensorView src_page_table, TensorView lengths,
+    Optional<TensorView> maybe_output_raw_indices, Optional<TensorView> maybe_workspace_buffer,
+    int64_t top_k, int64_t tie_break, int64_t page_size, Optional<TensorView> maybe_row_to_batch,
+    Optional<TensorView> maybe_row_starts, Optional<TensorView> maybe_page_table_row_starts) {
+  CheckPageTableTransformArgs(input, output_page_table, src_page_table, lengths, maybe_row_to_batch,
+                              maybe_row_starts, maybe_page_table_row_starts,
+                              maybe_output_raw_indices, top_k, page_size);
+  // CUB-specific constraints; everything shared with the radix launcher lives in
+  // CheckPageTableTransformArgs.
+  TVM_FFI_ICHECK(tie_break >= 0 && tie_break <= 2)
+      << "Invalid tie_break mode " << tie_break
+      << ", expected 0 (none), 1 (prefer small indices), or 2 (prefer large indices)";
+  TVM_FFI_ICHECK(top_k <= input.size(1))
+      << "cub_topk requires top_k <= d, got top_k=" << top_k << ", d=" << input.size(1);
+  TVM_FFI_ICHECK(input.size(1) <= CUB_TOPK_MAX_LEN)
+      << "cub_topk supports d <= " << CUB_TOPK_MAX_LEN << ", got d=" << input.size(1);
 
-  int32_t* output_raw_indices = nullptr;
-  if (maybe_output_raw_indices.has_value()) {
-    const auto& raw = maybe_output_raw_indices.value();
-    CHECK_INPUT(raw);
-    CHECK_DIM(2, raw);
-    CHECK_INPUT_TYPE(raw, dl_int32);
-    CHECK_SHAPE(raw, output_page_table);
-    output_raw_indices = static_cast<int32_t*>(raw.data_ptr());
-  }
+  const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
+  const auto* row_to_batch_ptr =
+      maybe_row_to_batch.has_value()
+          ? static_cast<const int32_t*>(maybe_row_to_batch.value().data_ptr())
+          : nullptr;
+  const auto* row_starts_ptr =
+      maybe_row_starts.has_value()
+          ? static_cast<const int32_t*>(maybe_row_starts.value().data_ptr())
+          : nullptr;
+  const auto* page_table_row_starts_ptr =
+      maybe_page_table_row_starts.has_value()
+          ? static_cast<const int32_t*>(maybe_page_table_row_starts.value().data_ptr())
+          : nullptr;
 
-  TVM_FFI_ICHECK(page_size > 0 && cuda::is_power_of_two(page_size) &&
-                 page_size <= (int64_t{1} << 30))
-      << "cub_topk page_size must be a power of two in [1, 2^30], got " << page_size;
+  auto* output_raw_indices =
+      maybe_output_raw_indices.has_value()
+          ? static_cast<int32_t*>(maybe_output_raw_indices.value().data_ptr())
+          : nullptr;
 
   const auto page_bits = static_cast<uint32_t>(cuda::ilog2(page_size));
 
@@ -350,17 +398,19 @@ void cub_topk_page_table_transform(TensorView input, TensorView output_page_tabl
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
       status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                                      d_values_out, lengths_ptr, maybe_workspace_buffer, num_rows,
-                                      max_len, top_k, tie_break,
+                                      row_starts_ptr, d_values_out, lengths_ptr,
+                                      maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
                                       /*query_bytes_out=*/nullptr, stream);
       return true;
     });
   };
   if (output_raw_indices != nullptr) {
-    run(CUBMakePageTableRowOut<true>{out_ptr, output_raw_indices, src_ptr, page_stride, page_bits,
-                                     top_k});
+    run(CUBMakePageTableRowOut<true>{out_ptr, output_raw_indices, src_ptr, row_to_batch_ptr,
+                                     row_starts_ptr, page_table_row_starts_ptr, page_stride,
+                                     page_bits, top_k});
   } else {
-    run(CUBMakePageTableRowOut<false>{out_ptr, nullptr, src_ptr, page_stride, page_bits, top_k});
+    run(CUBMakePageTableRowOut<false>{out_ptr, nullptr, src_ptr, row_to_batch_ptr, row_starts_ptr,
+                                      page_table_row_starts_ptr, page_stride, page_bits, top_k});
   }
 
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -374,7 +424,7 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
                                                      int64_t top_k, int64_t tie_break,
                                                      bool with_raw_indices) {
   CheckCUBTopKArgs(input, lengths, top_k, tie_break);
-  const int32_t* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
+  const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
 
   const int64_t num_rows = input.size(0);
   const int64_t max_len = input.size(1);
@@ -393,16 +443,19 @@ int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorVie
     auto d_values_out =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}), row_out_maker);
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), c_type, [&] {
-      status = CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
-                                      d_values_out, lengths_ptr, no_workspace, num_rows, max_len,
-                                      top_k, tie_break, &workspace_bytes, stream);
+      status =
+          CUBBatchedTopKDispatch(static_cast<const c_type*>(input.data_ptr()), input.stride(0),
+                                 /*row_starts=*/nullptr, d_values_out, lengths_ptr, no_workspace,
+                                 num_rows, max_len, top_k, tie_break, &workspace_bytes, stream);
       return true;
     });
   };
   if (with_raw_indices) {
-    query(CUBMakePageTableRowOut<true>{nullptr, nullptr, nullptr, 0, 0, top_k});
+    query(CUBMakePageTableRowOut<true>{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                                       top_k});
   } else {
-    query(CUBMakePageTableRowOut<false>{nullptr, nullptr, nullptr, 0, 0, top_k});
+    query(CUBMakePageTableRowOut<false>{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                                        top_k});
   }
 
   TVM_FFI_ICHECK(status == cudaSuccess)

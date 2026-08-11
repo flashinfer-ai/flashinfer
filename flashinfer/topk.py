@@ -368,6 +368,9 @@ def get_topk_module():
         out: torch.Tensor,
         out_raw_indices: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
+        row_to_batch: Optional[torch.Tensor] = None,
+        row_starts: Optional[torch.Tensor] = None,
+        page_table_row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # The binding leaves short rows' output tails untouched; pre-fill with -1
         # so the padding contract matches the native fused transforms. The fill
@@ -386,6 +389,9 @@ def get_topk_module():
             top_k,
             tie_break,
             page_size,
+            row_to_batch,
+            row_starts,
+            page_table_row_starts,
         )
         return out
 
@@ -400,6 +406,9 @@ def get_topk_module():
         out: torch.Tensor,
         out_raw_indices: Optional[torch.Tensor],
         workspace_buffer: Optional[torch.Tensor],
+        row_to_batch: Optional[torch.Tensor] = None,
+        row_starts: Optional[torch.Tensor] = None,
+        page_table_row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return out
 
@@ -892,13 +901,7 @@ def top_k_page_table_transform(
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
 
-    if (
-        can_use_cub_topk(input, tie_break)
-        and row_to_batch is None
-        and row_starts is None
-        and page_table_row_starts is None
-        and not deterministic
-    ):
+    if can_use_cub_topk(input, tie_break) and not deterministic:
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
@@ -921,6 +924,9 @@ def top_k_page_table_transform(
             out,
             out_raw_indices,
             workspace_buffer,
+            row_to_batch,
+            row_starts,
+            page_table_row_starts,
         )
 
     if (

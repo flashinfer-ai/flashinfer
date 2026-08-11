@@ -3281,7 +3281,9 @@ def test_cub_page_table_transform_workspace_paths(set_topk_algo):
     out = torch.full((num_rows, k), -1, dtype=torch.int32, device="cuda")
 
     # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
-    module.cub_topk_page_table_transform(scores, out, pt, lengths, None, None, k, 0, 1)
+    module.cub_topk_page_table_transform(
+        scores, out, pt, lengths, None, None, k, 0, 1, None, None, None
+    )
     torch.cuda.synchronize()
     _, ref_idx = torch.topk(scores, k)
     for i in range(num_rows):
@@ -3297,7 +3299,7 @@ def test_cub_page_table_transform_workspace_paths(set_topk_algo):
         tiny = torch.empty(1, dtype=torch.uint8, device="cuda")
         with pytest.raises(RuntimeError, match="workspace too small"):
             module.cub_topk_page_table_transform(
-                scores, out, pt, lengths, None, tiny, k, 0, 1
+                scores, out, pt, lengths, None, tiny, k, 0, 1, None, None, None
             )
 
 
