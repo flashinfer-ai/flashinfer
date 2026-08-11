@@ -1078,6 +1078,7 @@ struct GemmProfilerBackend {
     mNeedWeights = need_weights;
     mParallelismConfig = parallelism_config;
     mEnableAlltoall = enable_alltoall;
+    mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mSm90Wfp4Afp8Mode = sm90_wfp4afp8_mode;
     mSM = common::getSMVersion();
 
@@ -1144,6 +1145,7 @@ struct GemmProfilerBackend {
   bool mUseLora{};
   bool mMinLatencyMode{};
   bool mNeedWeights{};
+  bool mUseMxfp8ActScaling{};
   Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = Sm90Wfp4Afp8ScaleMode::kDisabled;
 
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
