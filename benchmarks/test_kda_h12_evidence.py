@@ -1570,7 +1570,9 @@ def test_runner_oracle_role_matrix(
     state = _FakeTensor(1)
     runtime = SimpleNamespace(
         candidate_reset=lambda: events.append("candidate_reset"),
-        candidate_run=lambda: (events.append("candidate_run") or (_FakeTensor(2), state)),
+        candidate_run=lambda: (
+            events.append("candidate_run") or (_FakeTensor(2), state)
+        ),
         candidate_state_pool=[state],
         flash_kda_raw_run=lambda: events.append("pinned_run"),
         flash_kda_output=_FakeTensor(3),
@@ -1637,9 +1639,7 @@ def test_runner_pinned_gate_alone_controls_timing(
             {
                 "flashinfer_public": {"median_gpu_span_ms": 2.0},
                 "flash_kda_raw": {"median_gpu_span_ms": 4.0},
-                "flash_kda_public_semantics_adapted": {
-                    "median_gpu_span_ms": 5.0
-                },
+                "flash_kda_public_semantics_adapted": {"median_gpu_span_ms": 5.0},
                 "fla_triton": {"median_gpu_span_ms": 6.0},
             },
             [],

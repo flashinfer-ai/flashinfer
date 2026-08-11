@@ -162,9 +162,7 @@ def _chunk16_debug_reference(inputs, *, lower_bound=-5.0, scale=None):
     batch_size, seq_len, num_heads, head_dim = q.shape
     scale = head_dim**-0.5 if scale is None else scale
     q_flat = F.normalize(q.float(), dim=-1).reshape(-1, num_heads, head_dim)
-    k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(
-        -1, num_heads, head_dim
-    )
+    k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(-1, num_heads, head_dim)
     v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
     g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
     beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))

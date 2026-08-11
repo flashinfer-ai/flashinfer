@@ -31,14 +31,8 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
     manifest = json.loads(manifest_path.read_text())
 
     assert manifest["schema_version"] == 1
-    assert (
-        manifest["cake_revision"]
-        == "600583dab4705976911a9384c59aeaed9d354979"
-    )
-    assert (
-        manifest["cake_tree"]
-        == "4fe94713724464c0f6e877a3131eda55b823059f"
-    )
+    assert manifest["cake_revision"] == "600583dab4705976911a9384c59aeaed9d354979"
+    assert manifest["cake_tree"] == "4fe94713724464c0f6e877a3131eda55b823059f"
     assert manifest["architecture_artifacts_are_separate"] is True
     assert manifest["generated_source_text_equal_across_architectures"] is True
     assert set(manifest["profiles"]) == {
@@ -47,9 +41,10 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         "sm100_n32",
         "sm103_n32",
     }
-    assert {
-        profile["arch"] for profile in manifest["profiles"].values()
-    } == {"sm_100a", "sm_103a"}
+    assert {profile["arch"] for profile in manifest["profiles"].values()} == {
+        "sm_100a",
+        "sm_103a",
+    }
     assert [patch["id"] for patch in manifest["integration_patches"]] == [
         "allow_exact_state_alias"
     ]
@@ -80,23 +75,19 @@ def test_flash_kda_frozen_import_manifest_matches_checked_in_sources():
         assert record["module_ident"] == module_ident
         assert record["smem_bytes"] == smem_bytes
         assert record["frozen_path"] == f"csrc/kda/{filename}"
-        assert hashlib.sha256(frozen.read_bytes()).hexdigest() == record[
-            "frozen_sha256"
-        ]
+        assert (
+            hashlib.sha256(frozen.read_bytes()).hexdigest() == record["frozen_sha256"]
+        )
 
     import_tool = (
-        Path(__file__).resolve().parents[2]
-        / "tools"
-        / "import-cake-flashkda-prefill"
+        Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
     )
     assert import_tool.is_file()
 
 
 def test_flash_kda_import_tool_constants_and_fail_closed_inputs(tmp_path):
     import_tool = (
-        Path(__file__).resolve().parents[2]
-        / "tools"
-        / "import-cake-flashkda-prefill"
+        Path(__file__).resolve().parents[2] / "tools" / "import-cake-flashkda-prefill"
     )
     namespace = runpy.run_path(
         str(import_tool), run_name="flashinfer_flash_kda_import_test"
@@ -251,10 +242,7 @@ def test_flash_kda_uri_and_jit_spec(
         assert "FLASHINFER INTEGRATION BEGIN: acquire global tensor maps" not in (
             generated_body
         )
-        assert (
-            generated_body.count("fence.proxy.tensormap::generic.acquire.sys")
-            == 6
-        )
+        assert generated_body.count("fence.proxy.tensormap::generic.acquire.sys") == 6
         assert generated_body.count("__syncthreads();") >= 1
         generated_body_without_tma_integration = generated_body
     else:
@@ -267,15 +255,13 @@ def test_flash_kda_uri_and_jit_spec(
         generated_prefix, begin_marker, integration_tail = generated_body.partition(
             integration_begin
         )
-        integration_prologue, end_marker, generated_suffix = (
-            integration_tail.partition(integration_end)
+        integration_prologue, end_marker, generated_suffix = integration_tail.partition(
+            integration_end
         )
         assert begin_marker == integration_begin
         assert end_marker == integration_end
         assert (
-            integration_prologue.count(
-                "fence.proxy.tensormap::generic.acquire.gpu"
-            )
+            integration_prologue.count("fence.proxy.tensormap::generic.acquire.gpu")
             == 6
         )
         assert integration_prologue.count("], 128;") == 6
@@ -333,8 +319,7 @@ def test_flash_kda_uri_and_jit_spec(
             binding_text
         )
         assert (
-            "reinterpret_cast<flashkda_generated_LoomTensorMap const*>"
-            in binding_text
+            "reinterpret_cast<flashkda_generated_LoomTensorMap const*>" in binding_text
         )
 
 
@@ -381,8 +366,7 @@ def test_flash_kda_descriptor_workspace_contract():
     assert "EncodeTmaPointers<128, 32>" in m128_binding
 
     m128_n16_binding = (
-        flash_kda._get_flash_kda_csrc_dir()
-        / "flashkda_bf16_fused_m128_n16_binding.cu"
+        flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_n16_binding.cu"
     ).read_text()
     assert "PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, stream);" in (
         m128_n16_binding
@@ -428,14 +412,8 @@ def test_flash_kda_exact_targets_have_independent_cache_keys(monkeypatch):
     assert sm103a.name == "flash_kda_bf16_fused_m128_c0c5dc1a67_sm103a"
     assert sm103a is sm103a_cached
     assert n16_sm100a is not n16_sm103a
-    assert (
-        n16_sm100a.name
-        == "flash_kda_bf16_fused_m128_n16_8672e4378b_sm100a"
-    )
-    assert (
-        n16_sm103a.name
-        == "flash_kda_bf16_fused_m128_n16_8672e4378b_sm103a"
-    )
+    assert n16_sm100a.name == "flash_kda_bf16_fused_m128_n16_8672e4378b_sm100a"
+    assert n16_sm103a.name == "flash_kda_bf16_fused_m128_n16_8672e4378b_sm103a"
 
 
 @pytest.mark.parametrize(
